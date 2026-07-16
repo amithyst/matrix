@@ -8,6 +8,8 @@ export MATRIX_PROJECT_ROOT="$PROJECT_ROOT"
 PROFILE="${MATRIX_PROFILE:-}"
 ARTIFACT_SOURCE="${MATRIX_ARTIFACT_SOURCE:-}"
 RELEASE_CACHE="${MATRIX_RELEASE_CACHE:-}"
+RUNTIME_OVERRIDE=""
+WRITE_LOCAL_ENV=0
 SKIP_ASSETS=0
 SKIP_PYTHON=0
 VERIFY_ONLY=0
@@ -19,6 +21,8 @@ Usage: bash scripts/bootstrap_matrix_sonic.sh --profile heyuan|trna [options]
 Options:
   --artifact-source PATH|HOST:PATH  Locked runtime bundle source
   --release-cache PATH              Existing Matrix 0.1.2 archives
+  --runtime-root PATH               Use an existing host-local runtime directory
+  --write-local-env                 Persist --runtime-root in ignored .matrix/local.env
   --skip-assets                     Do not install Matrix release/map packages
   --skip-python                     Do not create/update .venv-audit
   --verify-only                     Do not copy/install; run full verification
@@ -30,6 +34,8 @@ while [[ $# -gt 0 ]]; do
         --profile) PROFILE="$2"; shift 2 ;;
         --artifact-source) ARTIFACT_SOURCE="$2"; shift 2 ;;
         --release-cache) RELEASE_CACHE="$2"; shift 2 ;;
+        --runtime-root) RUNTIME_OVERRIDE="$2"; shift 2 ;;
+        --write-local-env) WRITE_LOCAL_ENV=1; shift ;;
         --skip-assets) SKIP_ASSETS=1; shift ;;
         --skip-python) SKIP_PYTHON=1; shift ;;
         --verify-only) VERIFY_ONLY=1; shift ;;
@@ -42,6 +48,10 @@ if [[ "$PROFILE" != "heyuan" && "$PROFILE" != "trna" ]]; then
     echo "[ERROR] --profile must be heyuan or trna" >&2
     exit 2
 fi
+if [[ "$WRITE_LOCAL_ENV" == "1" && -z "$RUNTIME_OVERRIDE" ]]; then
+    echo "[ERROR] --write-local-env requires --runtime-root" >&2
+    exit 2
+fi
 
 # shellcheck disable=SC1090
 source "$PROJECT_ROOT/config/hosts/$PROFILE.env"
@@ -50,7 +60,8 @@ if [[ -f "$PROJECT_ROOT/.matrix/local.env" ]]; then
     source "$PROJECT_ROOT/.matrix/local.env"
 fi
 
-RUNTIME_ROOT="${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-v1}"
+RUNTIME_ROOT="${RUNTIME_OVERRIDE:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-v1}}"
+RUNTIME_ROOT="$(realpath -m "$RUNTIME_ROOT")"
 LOCK_FILE="$PROJECT_ROOT/config/runtime/matrix-sonic.lock.json"
 mkdir -p "$PROJECT_ROOT/outputs/logs" "$PROJECT_ROOT/releases" "$(dirname "$RUNTIME_ROOT")"
 
@@ -128,4 +139,10 @@ if [[ "$SKIP_ASSETS" == "1" ]]; then
 fi
 
 python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" "${VERIFY_ARGS[@]}"
+if [[ "$WRITE_LOCAL_ENV" == "1" ]]; then
+    mkdir -p "$PROJECT_ROOT/.matrix"
+    printf 'export MATRIX_RUNTIME_ROOT=%q\n' "$RUNTIME_ROOT" \
+        > "$PROJECT_ROOT/.matrix/local.env"
+    echo "[INFO] Wrote ignored host override: $PROJECT_ROOT/.matrix/local.env"
+fi
 echo "[PASS] Matrix SONIC bootstrap complete: profile=$PROFILE runtime=$RUNTIME_ROOT"

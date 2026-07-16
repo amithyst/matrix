@@ -78,6 +78,14 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("refusing to replace", text)
         self.assertIn("matrix-sonic-v1", text)
 
+    def test_bootstrap_can_persist_an_ignored_runtime_path(self) -> None:
+        text = (REPO_ROOT / "scripts/bootstrap_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--runtime-root", text)
+        self.assertIn("--write-local-env", text)
+        self.assertIn(".matrix/local.env", text)
+
 
 if __name__ == "__main__":
     unittest.main()

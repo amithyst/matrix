@@ -58,10 +58,13 @@ cd ~/matrix
 bash scripts/bootstrap_matrix_sonic.sh \
   --profile heyuan \
   --release-cache /home/kaijie/matrix-eval/releases \
-  --artifact-source /home/kaijie/matrix-artifacts/matrix-sonic-v1
+  --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-v1-heyuan \
+  --write-local-env
 ```
 
-TRNA uses the same command with `--profile trna` and its local cache paths.
+Use `--artifact-source` instead of `--runtime-root` when the bundle must first be
+copied from a local or SSH source. TRNA uses the same command with
+`--profile trna` and its local cache paths.
 Bootstrap is idempotent: archives and runtime files are SHA-checked, the Python
 environment is pinned, and the full native dependency closure is tested.
 
