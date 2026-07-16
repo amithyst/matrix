@@ -45,6 +45,11 @@ bin/log.txt
 **/*_ue.log
 /outputs/
 
+# Per-machine overrides. Shared non-secret defaults live in config/hosts/.
+/.matrix/
+.env
+.env.local
+
 # IDE files
 .vscode/
 .idea/

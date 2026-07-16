@@ -676,7 +676,12 @@ if [ "$manifest_valid" = true ] && [ -f "$MANIFEST_FILE" ] && command -v jq &> /
 echo "输入要下载的地图（支持数字索引或地图名称，用空格分隔）:"
 echo "  例如: 0 1 2  或  CustomWorld SceneWorld Town10World  或  0 SceneWorld 2"
 echo "  输入 'all' 下载全部，直接回车跳过"
+if [[ -v MATRIX_MAPS ]]; then
+    maps_input="$MATRIX_MAPS"
+    log "使用 MATRIX_MAPS 的非交互选择: ${maps_input:-<none>}"
+else
     read -r maps_input
+fi
 
 SELECTED_MAPS=()
 if [ -z "$maps_input" ]; then
@@ -727,7 +732,17 @@ log "  - 共享资源包: ✓ (默认)"
 log "  - 地图包: ${#SELECTED_MAPS[@]} 个"
 log "=========================================="
 echo ""
-read -p "按回车键开始下载，或 Ctrl+C 取消..." -r
+case "${MATRIX_ASSUME_YES:-0}" in
+    1|true|yes|on)
+        log "MATRIX_ASSUME_YES 已启用，跳过确认提示"
+        ;;
+    0|false|no|off|"")
+        read -p "按回车键开始下载，或 Ctrl+C 取消..." -r
+        ;;
+    *)
+        error_exit "MATRIX_ASSUME_YES 必须是布尔值"
+        ;;
+esac
 echo ""
 
 # ============================================================================

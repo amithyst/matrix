@@ -35,6 +35,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--physics-hz", type=float, default=200.0)
     parser.add_argument("--control-hz", type=float, default=50.0)
     parser.add_argument("--max-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--fail-on-fall",
+        action="store_true",
+        help="Return a non-zero exit code if the root height/orientation fall gate trips",
+    )
+    parser.add_argument(
+        "--min-active-seconds",
+        type=float,
+        default=0.0,
+        help="Return a non-zero exit code unless fresh lowcmd remains active for this long",
+    )
     parser.add_argument("--walk-after", type=float, default=-1.0)
     parser.add_argument("--vx", type=float, default=0.30)
     parser.add_argument("--vy", type=float, default=0.0)
@@ -103,6 +114,26 @@ def _apply_spawn_pose(
         qpos[3:7] = [math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)]
 
 
+def _acceptance_failures(
+    *,
+    unstable: bool,
+    fall_detected: bool,
+    fail_on_fall: bool,
+    active_elapsed_s: float,
+    min_active_seconds: float,
+) -> list[str]:
+    failures = []
+    if unstable:
+        failures.append("numerical_instability")
+    if fail_on_fall and fall_detected:
+        failures.append("fall_detected")
+    if active_elapsed_s + 1e-6 < min_active_seconds:
+        failures.append(
+            f"active_lowcmd_too_short:{active_elapsed_s:.3f}<{min_active_seconds:.3f}"
+        )
+    return failures
+
+
 def _configure_reused_runtime(args: argparse.Namespace) -> None:
     aue_src = args.aue_root.resolve() / "src"
     if not (aue_src / "androidtwin/control/sonic_sim/fused_sink.py").is_file():
@@ -149,6 +180,8 @@ def main() -> int:
         raise SystemExit(f"composed Matrix model is missing: {model_path}")
     if args.control_hz <= 0.0:
         raise SystemExit("--control-hz must be positive")
+    if args.min_active_seconds < 0.0:
+        raise SystemExit("--min-active-seconds must be non-negative")
     if args.startup_band_hold < 0.0 or args.startup_band_fade < 0.0:
         raise SystemExit("startup band hold/fade durations must be non-negative")
 
@@ -243,6 +276,7 @@ def main() -> int:
         min_root_z = float(data.qpos[2])
         active_started_wall = None
         walking = False
+        latest_status: dict[str, object] = {}
 
         while running:
             frame_wall = time.perf_counter()
@@ -348,6 +382,7 @@ def main() -> int:
                     "startup_band_fade_s": args.startup_band_fade,
                     "walking_commanded": walking,
                 }
+                latest_status = status
                 print(f"matrix-sonic-runtime status={json.dumps(status, sort_keys=True)}", flush=True)
                 _atomic_json(args.status_file, status)
                 last_print_wall = now
@@ -362,13 +397,49 @@ def main() -> int:
             elif sleep_s < -(2.0 / args.control_hz):
                 next_frame_wall = time.perf_counter()
 
+        finished_wall = time.perf_counter()
+        elapsed_wall_s = finished_wall - started_wall
+        active_elapsed_s = (
+            finished_wall - active_started_wall
+            if active_started_wall is not None
+            else 0.0
+        )
+        acceptance_failures = _acceptance_failures(
+            unstable=unstable,
+            fall_detected=fall_detected,
+            fail_on_fall=args.fail_on_fall,
+            active_elapsed_s=active_elapsed_s,
+            min_active_seconds=args.min_active_seconds,
+        )
+        final_status = dict(latest_status)
+        final_status.update(
+            {
+                "acceptance_failures": acceptance_failures,
+                "active_elapsed_s": round(active_elapsed_s, 3),
+                "completed": True,
+                "elapsed_wall_s": round(elapsed_wall_s, 3),
+                "fall_detected": fall_detected,
+                "instability_resets": instability_resets,
+                "passed": not acceptance_failures,
+                "physics_step_hz_aggregate": round(
+                    physics_steps / max(active_elapsed_s, 1e-9), 3
+                ),
+                "rtf_aggregate": round(
+                    (physics_steps * float(model.opt.timestep))
+                    / max(active_elapsed_s, 1e-9),
+                    4,
+                ),
+            }
+        )
+        _atomic_json(args.status_file, final_status)
         print(
             "matrix-sonic-runtime stopped "
-            f"wall_s={time.perf_counter() - started_wall:.2f} "
-            f"sim_s={data.time:.2f} frames={control_frames} active_frames={active_frames}",
+            f"wall_s={elapsed_wall_s:.2f} sim_s={data.time:.2f} "
+            f"frames={control_frames} active_frames={active_frames} "
+            f"passed={not acceptance_failures} failures={acceptance_failures}",
             flush=True,
         )
-        return 1 if unstable else 0
+        return 0 if not acceptance_failures else 2
     finally:
         if planner is not None:
             planner.close()

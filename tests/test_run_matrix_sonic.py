@@ -35,6 +35,29 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         MODULE._apply_spawn_pose(qpos, x=1.0, y=None, z=None, yaw=None)
         self.assertEqual(qpos[3:7], [0.5, 0.5, 0.5, 0.5])
 
+    def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
+        failures = MODULE._acceptance_failures(
+            unstable=False,
+            fall_detected=True,
+            fail_on_fall=True,
+            active_elapsed_s=12.0,
+            min_active_seconds=30.0,
+        )
+        self.assertEqual(failures[0], "fall_detected")
+        self.assertTrue(failures[1].startswith("active_lowcmd_too_short:"))
+
+    def test_acceptance_allows_interactive_run_without_minimum(self) -> None:
+        self.assertEqual(
+            MODULE._acceptance_failures(
+                unstable=False,
+                fall_detected=False,
+                fail_on_fall=True,
+                active_elapsed_s=0.0,
+                min_active_seconds=0.0,
+            ),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

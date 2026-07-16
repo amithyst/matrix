@@ -624,6 +624,18 @@ if $MATRIX_SONIC_ENABLED; then
             exit 1
             ;;
     esac
+    SONIC_ACCEPTANCE_ARGS=()
+    case "${MATRIX_SONIC_FAIL_ON_FALL:-1}" in
+        1|true|yes|on) SONIC_ACCEPTANCE_ARGS+=(--fail-on-fall) ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_SONIC_FAIL_ON_FALL must be a boolean" >&2
+            exit 1
+            ;;
+    esac
+    if [[ "${MATRIX_SONIC_MIN_ACTIVE_SECONDS:-0}" != "0" ]]; then
+        SONIC_ACCEPTANCE_ARGS+=(--min-active-seconds "${MATRIX_SONIC_MIN_ACTIVE_SECONDS}")
+    fi
     echo "[INFO] Starting external AndroidTwin/SONIC MuJoCo runtime"
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         --model "$SONIC_PHYSICS_DIR/$SCENE" \
@@ -638,6 +650,7 @@ if $MATRIX_SONIC_ENABLED; then
         --vy "${MATRIX_SONIC_VY:-0.0}" \
         --yaw-rate "${MATRIX_SONIC_YAW_RATE:-0.0}" \
         --max-seconds "${MATRIX_SONIC_MAX_SECONDS:-0}" \
+        "${SONIC_ACCEPTANCE_ARGS[@]}" \
         "${SONIC_STARTUP_ARGS[@]}" \
         --startup-band-hold "${MATRIX_SONIC_STARTUP_BAND_HOLD:-4}" \
         --startup-band-fade "${MATRIX_SONIC_STARTUP_BAND_FADE:-3}" \
