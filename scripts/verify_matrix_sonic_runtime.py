@@ -193,6 +193,12 @@ def main() -> int:
         actual = sha256_file(path)
         record(str(path), actual == entry["sha256"], f"sha256={actual}")
 
+    wheelhouse_manifest = runtime_root / "python-wheelhouse/SHA256SUMS"
+    if wheelhouse_manifest.exists():
+        actual = sha256_file(wheelhouse_manifest)
+        expected = lock["python"]["wheelhouse_manifest_sha256"]
+        record("Python wheelhouse manifest", actual == expected, f"sha256={actual}")
+
     if args.release_cache:
         cache = args.release_cache.resolve()
         for package in lock["matrix_release"]["packages"]:

@@ -42,7 +42,9 @@
     ]
   },
   "python": {
+    "version": "3.10",
     "requirements": "research/sonic_integration/requirements-trna.txt",
+    "wheelhouse_manifest_sha256": "579068ca7842f1a600314eb05a1df0c4be30b0582b8c81f08ed328885786eb8e",
     "mujoco": "3.3.0",
     "urdf2mjcf": "0.1.3"
   },

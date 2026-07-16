@@ -80,9 +80,62 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
     fi
 
     if [[ "$SKIP_PYTHON" != "1" ]]; then
-        python3 -m venv "$PROJECT_ROOT/.venv-audit"
+        BOOTSTRAP_PYTHON="${MATRIX_BOOTSTRAP_PYTHON:-python3}"
+        if ! command -v "$BOOTSTRAP_PYTHON" >/dev/null; then
+            echo "[ERROR] Bootstrap interpreter is unavailable: $BOOTSTRAP_PYTHON" >&2
+            exit 1
+        fi
+        expected_python="$($BOOTSTRAP_PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        if [[ -x "$PROJECT_ROOT/.venv-audit/bin/python" ]]; then
+            actual_python="$($PROJECT_ROOT/.venv-audit/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+            if [[ "$actual_python" != "$expected_python" ]]; then
+                echo "[INFO] Recreating .venv-audit: Python $actual_python -> $expected_python"
+                rm -rf "$PROJECT_ROOT/.venv-audit"
+            fi
+        fi
+        if [[ ! -x "$PROJECT_ROOT/.venv-audit/bin/python" ]]; then
+            "$BOOTSTRAP_PYTHON" -m venv "$PROJECT_ROOT/.venv-audit"
+        fi
+        WHEELHOUSE="$RUNTIME_ROOT/python-wheelhouse"
+        PIP_ARGS=()
+        if [[ -d "$WHEELHOUSE" ]]; then
+            expected_manifest="$(python3 - "$LOCK_FILE" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["python"]["wheelhouse_manifest_sha256"])
+PY
+            )"
+            actual_manifest="$(sha256sum "$WHEELHOUSE/SHA256SUMS" | awk '{print $1}')"
+            if [[ "$actual_manifest" != "$expected_manifest" ]]; then
+                echo "[ERROR] Wheelhouse manifest SHA256 mismatch" >&2
+                exit 1
+            fi
+            (cd "$WHEELHOUSE" && sha256sum -c SHA256SUMS)
+            PIP_ARGS+=(--no-index --find-links "$WHEELHOUSE")
+            echo "[INFO] Installing Python dependencies from locked offline wheelhouse"
+        else
+            echo "[WARN] Locked wheelhouse is absent; using configured Python package index"
+        fi
         "$PROJECT_ROOT/.venv-audit/bin/python" -m pip install \
+            "${PIP_ARGS[@]}" \
             -r "$PROJECT_ROOT/research/sonic_integration/requirements-trna.txt"
+        "$PROJECT_ROOT/.venv-audit/bin/python" - \
+            "$PROJECT_ROOT/research/sonic_integration/requirements-trna.txt" <<'PY'
+import importlib.metadata
+import pathlib
+import sys
+
+requirements = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+for line in requirements:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    name, expected = line.split("==", 1)
+    actual = importlib.metadata.version(name)
+    if actual != expected:
+        raise SystemExit(f"{name}: expected {expected}, got {actual}")
+print("[PASS] Python dependency versions match requirements lock")
+PY
     fi
 
     if [[ -n "$RELEASE_CACHE" ]]; then

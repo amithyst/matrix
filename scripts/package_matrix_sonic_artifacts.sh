@@ -11,6 +11,7 @@ VISUAL_ROOT=""
 BRIDGE=""
 ROS_PREFIX=""
 NATIVE_DEPS=""
+WHEELHOUSE=""
 OUTPUT=""
 
 usage() {
@@ -28,6 +29,7 @@ Required:
 Optional:
   --ros-prefix PATH       Isolated ROS2 ament prefix
   --native-deps PATH      Isolated native dependency root
+  --wheelhouse PATH       Offline Python wheelhouse with SHA256SUMS
 EOF
 }
 
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --bridge) BRIDGE="$2"; shift 2 ;;
         --ros-prefix) ROS_PREFIX="$2"; shift 2 ;;
         --native-deps) NATIVE_DEPS="$2"; shift 2 ;;
+        --wheelhouse) WHEELHOUSE="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "[ERROR] Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -106,6 +109,9 @@ if [[ -n "$ROS_PREFIX" ]]; then
 fi
 if [[ -n "$NATIVE_DEPS" ]]; then
     rsync -aL "$NATIVE_DEPS/" "$STAGING/matrix-native-deps/"
+fi
+if [[ -n "$WHEELHOUSE" ]]; then
+    rsync -aL "$WHEELHOUSE/" "$STAGING/python-wheelhouse/"
 fi
 
 python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" \

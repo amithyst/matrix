@@ -45,6 +45,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertFalse(acceptance["fall_detected"])
         self.assertGreaterEqual(acceptance["physics_hz_min"], 195.0)
         self.assertGreaterEqual(acceptance["active_lowcmd_seconds_min"], 30.0)
+        self.assertEqual(self.lock["python"]["version"], "3.10")
 
     def test_two_host_profiles_use_repo_local_runtime(self) -> None:
         for profile in ("heyuan", "trna"):
@@ -85,6 +86,8 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("--runtime-root", text)
         self.assertIn("--write-local-env", text)
         self.assertIn(".matrix/local.env", text)
+        self.assertIn("--no-index", text)
+        self.assertIn("python-wheelhouse", text)
 
 
 if __name__ == "__main__":
