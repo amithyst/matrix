@@ -16,12 +16,19 @@ releases/chunks/
 
 # UeSim content (filled by downloading releases)
 # Keep directory structure but ignore content
+src/UeSim/Linux/Engine/*
+!src/UeSim/Linux/Engine/.gitkeep
 src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks/*
 src/UeSim/Linux/zsibot_mujoco_ue/Content/model/*
-src/UeSim/Linux/zsibot_mujoco_ue/Binaries/*
-!src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/
-!src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue-Linux-Shipping
+src/UeSim/Linux/zsibot_mujoco_ue/Binaries/
+src/UeSim/Linux/zsibot_mujoco_ue/Samples/
 !src/UeSim/Linux/zsibot_mujoco_ue/.gitkeep
+
+# Release-installed launchers and generated dynamic map caches
+bin/*
+!bin/.gitkeep
+dynamicmaps/*
+!dynamicmaps/.gitkeep
 
 # MuJoCo robot model mirror generated from UeSim Content/model during install
 src/robot_mujoco/zsibot_robots/*
@@ -32,6 +39,7 @@ src/robot_mujoco/zsibot_robots/*
 *.tmp
 *.py[cod]
 __pycache__/
+.venv*/
 bin/*.log
 bin/log.txt
 

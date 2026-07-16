@@ -60,6 +60,18 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             self.assertNotIn("TOKEN", text.upper())
             self.assertNotIn("PASSWORD", text.upper())
 
+    def test_release_installs_do_not_dirty_the_checkout(self) -> None:
+        text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        for pattern in (
+            ".venv*/",
+            "bin/*",
+            "dynamicmaps/*",
+            "src/UeSim/Linux/Engine/*",
+            "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/",
+            "src/UeSim/Linux/zsibot_mujoco_ue/Samples/",
+        ):
+            self.assertIn(pattern, text)
+
     def test_launcher_preserves_git_managed_config(self) -> None:
         text = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
             encoding="utf-8"
