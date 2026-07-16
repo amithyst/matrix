@@ -32,6 +32,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             urban["visual_source"]["release_sha256"],
         )
         self.assertEqual(sum(item["size"] for item in packages.values()), 7757662559)
+        self.assertIn(
+            "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue",
+            self.lock["matrix_release"]["installed_files"],
+        )
 
     def test_runtime_file_identities_are_unique(self) -> None:
         identities = [

@@ -37,7 +37,7 @@
     "installed_files": [
       "bin/sim_launcher.bin",
       "src/UeSim/Linux/Engine/Content/Renderer/TessellationTable.bin",
-      "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue-Linux-Shipping",
+      "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue",
       "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_t10.xml"
     ]
   },
