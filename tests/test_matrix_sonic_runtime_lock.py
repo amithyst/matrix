@@ -79,6 +79,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("restore_tracked_config", text)
         self.assertIn(".matrix-sonic-launch.lock", text)
         self.assertIn("MATRIX_CPUSET_APPLIED", text)
+        self.assertIn("/usr/bin/env MATRIX_CPUSET_APPLIED=1", text)
 
         run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(encoding="utf-8")
         self.assertIn('case "${MATRIX_SONIC,,}"', run_sim)
@@ -122,6 +123,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("cp --reflink=auto", bootstrap)
         self.assertNotIn('ln -sfn "$source_path"', bootstrap)
         self.assertIn("MATRIX_OFFLINE=1", bootstrap)
+        self.assertIn('/usr/bin/env "${INSTALL_ENV[@]}"', bootstrap)
         self.assertIn('MATRIX_OFFLINE="${MATRIX_OFFLINE:-0}"', installer)
         self.assertIn("离线模式下禁止下载", installer)
 

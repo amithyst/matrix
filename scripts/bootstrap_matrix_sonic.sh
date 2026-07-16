@@ -237,7 +237,7 @@ PY
         if [[ -n "$RELEASE_CACHE" ]]; then
             INSTALL_ENV+=(MATRIX_OFFLINE=1)
         fi
-        env "${INSTALL_ENV[@]}" \
+        /usr/bin/env "${INSTALL_ENV[@]}" \
             bash "$PROJECT_ROOT/scripts/release_manager/install_chunks.sh" 0.1.2
     fi
 

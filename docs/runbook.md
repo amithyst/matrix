@@ -20,6 +20,10 @@ systems), generates the installer manifest from the lock, and disables network
 downloads. A cache hit therefore does not consume another 7.76 GB of network
 traffic.
 
+Launch and bootstrap scripts call `/usr/bin/env` explicitly. This prevents a
+host-local executable named `env` earlier on `PATH` from turning NUMA re-entry
+or offline package installation into a false successful no-op.
+
 ## Checkout policy
 
 Use `~/matrix` as the active checkout on both hosts. Keep historical
