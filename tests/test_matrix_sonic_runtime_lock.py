@@ -89,6 +89,32 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("--no-index", text)
         self.assertIn("python-wheelhouse", text)
 
+    def test_local_runtime_override_precedes_profile_derived_paths(self) -> None:
+        for script_name in ("bootstrap_matrix_sonic.sh", "run_matrix_sonic.sh"):
+            text = (REPO_ROOT / "scripts" / script_name).read_text(
+                encoding="utf-8"
+            )
+            local_env_source = text.index(
+                'source "$PROJECT_ROOT/.matrix/local.env"'
+            )
+            profile_source = text.index(
+                'source "$PROJECT_ROOT/config/hosts/$PROFILE.env"'
+                if script_name == "bootstrap_matrix_sonic.sh"
+                else 'source "$PROFILE_FILE"'
+            )
+            self.assertLess(local_env_source, profile_source, script_name)
+
+        bootstrap = (
+            REPO_ROOT / "scripts/bootstrap_matrix_sonic.sh"
+        ).read_text(encoding="utf-8")
+        override_assignment = bootstrap.index(
+            'export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"'
+        )
+        profile_source = bootstrap.index(
+            'source "$PROJECT_ROOT/config/hosts/$PROFILE.env"'
+        )
+        self.assertLess(override_assignment, profile_source)
+
 
 if __name__ == "__main__":
     unittest.main()

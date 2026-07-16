@@ -53,12 +53,17 @@ if [[ "$WRITE_LOCAL_ENV" == "1" && -z "$RUNTIME_OVERRIDE" ]]; then
     exit 2
 fi
 
-# shellcheck disable=SC1090
-source "$PROJECT_ROOT/config/hosts/$PROFILE.env"
 if [[ -f "$PROJECT_ROOT/.matrix/local.env" ]]; then
     # shellcheck disable=SC1091
     source "$PROJECT_ROOT/.matrix/local.env"
 fi
+if [[ -n "$RUNTIME_OVERRIDE" ]]; then
+    export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"
+fi
+# Load profile defaults after host-local overrides so paths derived from
+# MATRIX_RUNTIME_ROOT always follow the selected runtime bundle.
+# shellcheck disable=SC1090
+source "$PROJECT_ROOT/config/hosts/$PROFILE.env"
 
 RUNTIME_ROOT="${RUNTIME_OVERRIDE:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-v1}}"
 RUNTIME_ROOT="$(realpath -m "$RUNTIME_ROOT")"

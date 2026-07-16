@@ -6,7 +6,8 @@
 - Stable branch: `main`
 - Runtime lock: `config/runtime/matrix-sonic.lock.json`
 - Host defaults: `config/hosts/heyuan.env`, `config/hosts/trna.env`
-- Local non-secret overrides: `.matrix/local.env` (ignored by Git)
+- Local non-secret overrides: `.matrix/local.env` (ignored by Git and loaded
+  before profile defaults, so runtime-derived dependency paths stay coherent)
 
 Git stores source, scripts, profiles, tests, and checksums. It does not store the
 7.76 GB Matrix release packages, the internal SONIC models, TensorRT libraries,

@@ -17,18 +17,20 @@ for ((index = 0; index < ${#ORIGINAL_ARGS[@]}; index++)); do
     fi
 done
 
+if [[ -f "$PROJECT_ROOT/.matrix/local.env" ]]; then
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/.matrix/local.env"
+fi
 if [[ -n "$PROFILE" ]]; then
     PROFILE_FILE="$PROJECT_ROOT/config/hosts/$PROFILE.env"
     if [[ ! -f "$PROFILE_FILE" ]]; then
         echo "[ERROR] Unknown host profile: $PROFILE" >&2
         exit 2
     fi
+    # Profile files provide defaults with ${VAR:-...}; loading them after the
+    # local file keeps explicit host overrides while recomputing runtime paths.
     # shellcheck disable=SC1090
     source "$PROFILE_FILE"
-fi
-if [[ -f "$PROJECT_ROOT/.matrix/local.env" ]]; then
-    # shellcheck disable=SC1091
-    source "$PROJECT_ROOT/.matrix/local.env"
 fi
 
 SCENE_ID=21
