@@ -62,6 +62,11 @@
     "tensorrt_api_version": 101303,
     "onnxruntime_version": "1.16.3"
   },
+  "bridge": {
+    "build_baseline": "Ubuntu 22.04 x86_64",
+    "max_required_glibc": "2.34",
+    "max_required_glibcxx": "3.4.29"
+  },
   "runtime_files": [
     {
       "root": "aue",
@@ -111,7 +116,7 @@
     {
       "root": "bridge",
       "path": "g1_sonic_sim_udp_dds_bridge_accepted",
-      "sha256": "0a18515a9267c778c162c4399b69e7b3dc6ebd9a158eb8c1d59b56ff16f625f3"
+      "sha256": "ca765ea25b2956a080af6d9f0aa6ba7ebe5e3038daeb78381f0d02b4e099bcc9"
     },
     {
       "root": "inference",

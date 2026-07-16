@@ -264,6 +264,56 @@ def main() -> int:
                     resolved or "not present in ldd output",
                 )
 
+        bridge = roots["bridge"] / "g1_sonic_sim_udp_dds_bridge_accepted"
+        if bridge.is_file():
+            result = subprocess.run(
+                ["ldd", str(bridge)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            output = "\n".join((result.stdout, result.stderr))
+            issues = [
+                line.strip()
+                for line in output.splitlines()
+                if "not found" in line.lower()
+            ]
+            record(
+                "SONIC UDP/DDS bridge dependency closure",
+                result.returncode == 0 and not issues,
+                "; ".join(issues) or "complete",
+            )
+            expected_sdk = (
+                roots["gear"]
+                / "gear_sonic_deploy/thirdparty/unitree_sdk2"
+            ).resolve()
+            for soname in ("libddscxx.so.0", "libddsc.so.0"):
+                line = next(
+                    (
+                        item.strip()
+                        for item in result.stdout.splitlines()
+                        if item.strip().startswith(f"{soname} =>")
+                    ),
+                    "",
+                )
+                resolved = (
+                    line.split("=>", 1)[1].strip().split(" ", 1)[0]
+                    if line
+                    else ""
+                )
+                try:
+                    exact = (
+                        Path(resolved).resolve().is_relative_to(expected_sdk)
+                    )
+                except (OSError, RuntimeError):
+                    exact = False
+                record(
+                    f"bridge {soname} resolution",
+                    exact,
+                    resolved or "not present in ldd output",
+                )
+
         trt = roots["inference"] / "TensorRT/lib/libnvinfer.so.10"
         if trt.is_file():
             ok, detail = check_tensorrt_version(

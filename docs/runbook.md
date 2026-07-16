@@ -47,6 +47,7 @@ The path supplied to `--artifact-source` has this layout:
 
 ```text
 aue-sim/
+aue-sim/scripts/g1_sonic_sim_udp_dds_bridge.cpp
 GR00T-WholeBodyControl/
 inference/TensorRT/lib/
 inference/onnxruntime/lib/
@@ -56,6 +57,11 @@ ros2-humble-prefix/           # required by the isolated Heyuan profile
 matrix-native-deps/           # isolated native libraries
 python-wheelhouse/            # CPython 3.10 x86_64 wheels plus SHA256SUMS
 ```
+
+The accepted bridge is built on the older TRNA Ubuntu 22.04 ABI baseline and is
+locked to at most `GLIBC_2.34` and `GLIBCXX_3.4.29`. Build shared native tools on
+the oldest supported host; verifier runs `ldd` on both the deploy binary and the
+bridge, so a newer-host-only binary is rejected before launch.
 
 The artifact source may be a local directory or an rsync-compatible SSH source.
 Because the GitHub repository is public and the SONIC model is internal, do not

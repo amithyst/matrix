@@ -44,12 +44,21 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         ]
         self.assertEqual(len(identities), len(set(identities)))
 
+        verifier = SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("SONIC UDP/DDS bridge dependency closure", verifier)
+        self.assertIn(
+            'for soname in ("libddscxx.so.0", "libddsc.so.0")',
+            verifier,
+        )
+
     def test_locked_acceptance_requires_no_fall(self) -> None:
         acceptance = self.lock["acceptance"]
         self.assertFalse(acceptance["fall_detected"])
         self.assertGreaterEqual(acceptance["physics_hz_min"], 195.0)
         self.assertGreaterEqual(acceptance["active_lowcmd_seconds_min"], 30.0)
         self.assertEqual(self.lock["python"]["version"], "3.10")
+        self.assertEqual(self.lock["bridge"]["max_required_glibc"], "2.34")
+        self.assertEqual(self.lock["bridge"]["max_required_glibcxx"], "3.4.29")
 
     def test_two_host_profiles_use_repo_local_runtime(self) -> None:
         for profile in ("heyuan", "trna"):
