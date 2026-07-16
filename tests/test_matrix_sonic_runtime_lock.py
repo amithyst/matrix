@@ -78,6 +78,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "src/UeSim/Linux/Engine/*",
             "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/",
             "src/UeSim/Linux/zsibot_mujoco_ue/Samples/",
+            "src/UeSim/Linux/zsibot_mujoco_ue/Saved/",
         ):
             self.assertIn(pattern, text)
 

@@ -22,6 +22,7 @@ src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks/*
 src/UeSim/Linux/zsibot_mujoco_ue/Content/model/*
 src/UeSim/Linux/zsibot_mujoco_ue/Binaries/
 src/UeSim/Linux/zsibot_mujoco_ue/Samples/
+src/UeSim/Linux/zsibot_mujoco_ue/Saved/
 !src/UeSim/Linux/zsibot_mujoco_ue/.gitkeep
 
 # Release-installed launchers and generated dynamic map caches
