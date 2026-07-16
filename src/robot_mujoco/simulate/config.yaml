@@ -1,0 +1,6 @@
+robot: "xgb"
+robot_scene: "scene_terrain_moon_dynamic.xml"
+
+print_scene_information: 1 # Print link, joint and sensors information of robot
+
+enable_elastic_band: 0 # Virtual spring band, used for lifting h1

@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "profile_id": "aue_g1_v1",
+  "description": "AUE G1 three-surface appearance projected into Matrix custom-robot materials.",
+  "provenance": {
+    "repository": "aue-sim",
+    "commit": "13463d586ef01c9c4bde0907d9069f02d02724a0",
+    "path": "src/aue/scenes/g1_visual_overlay.py",
+    "symbol": "install_g1_material_overrides"
+  },
+  "matcher": {
+    "required_links": [
+      "pelvis",
+      "left_hip_pitch_link",
+      "right_hip_pitch_link",
+      "left_ankle_roll_link",
+      "right_ankle_roll_link",
+      "torso_link",
+      "head_link",
+      "left_shoulder_pitch_link",
+      "right_shoulder_pitch_link"
+    ]
+  },
+  "materials": {
+    "black_soft": {
+      "rgba": [0.035, 0.035, 0.035, 1.0],
+      "roughness": 0.62,
+      "metallic": 0.0
+    },
+    "dark_structure": {
+      "rgba": [0.16, 0.16, 0.16, 1.0],
+      "roughness": 0.58,
+      "metallic": 0.0
+    },
+    "warm_white_shell": {
+      "rgba": [0.72, 0.72, 0.68, 1.0],
+      "roughness": 0.52,
+      "metallic": 0.0
+    }
+  },
+  "rules": [
+    {
+      "material": "black_soft",
+      "tokens": [
+        "pelvis",
+        "ankle",
+        "wrist",
+        "hand_",
+        "thumb",
+        "index",
+        "middle",
+        "ring",
+        "little"
+      ]
+    },
+    {
+      "material": "dark_structure",
+      "tokens": ["head", "logo", "hip_pitch"]
+    }
+  ],
+  "default_material": "warm_white_shell",
+  "renderer_contract": {
+    "mujoco_3_3": ["rgba", "roughness", "metallic"],
+    "matrix_ue_0_1_2": ["rgba"],
+    "textures": false,
+    "texture_reason": "The canonical STL visual meshes have no UV coordinates and the released Matrix UE bridge exposes only FLinearColor."
+  }
+}

@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "run_id": "trna-matrix-sonic-video-20260715",
+  "date": "2026-07-15",
+  "host": "trna",
+  "purpose": "Validate native-resolution operator video capture around the canonical Matrix SONIC launcher.",
+  "matrix": {
+    "repository": "https://github.com/floodsung/matrix",
+    "candidate_branch": "research/overworld-adjacent-v1",
+    "candidate_base_commit": "83872f6e0e3c6c7ca5359c47ff12a245d03eb469",
+    "scene_id": 21,
+    "scene_name": "ApartmentWorld",
+    "is_overworld_visual": false
+  },
+  "command": "MATRIX_UE_MAX_FPS=30 bash scripts/record_matrix_sonic_video.sh --output outputs/videos/matrix_sonic_apartment_record_final_20260715.mp4 --duration 10 --fps 30 --ready active --ready-active-seconds 8 --notes=final-main-chain-ApartmentWorld-planner-walk -- bash scripts/run_matrix_sonic.sh --scene 21 --urdf /home/trna/matrix-sonic-assets/g1_29dof/g1_29dof.urdf --control-source planner --walk-after 10 --vx 0.25 --max-seconds 65",
+  "launcher_contract": {
+    "mode": "launch",
+    "chain": [
+      "scripts/record_matrix_sonic_video.sh",
+      "scripts/run_matrix_sonic.sh",
+      "scripts/run_sim.sh"
+    ],
+    "ready_condition": "fresh active_lowcmd=true status with active_elapsed_s >= 8.0",
+    "stopped_by_recorder": true,
+    "launcher_return_code_after_stop": 143
+  },
+  "video": {
+    "path": "/home/trna/matrix-eval/outputs/videos/matrix_sonic_apartment_record_final_20260715.mp4",
+    "sha256": "0ba061ab141a238f79f45a4bf207194b7591436e80b0c1b5b972c25b0283454b",
+    "size_bytes": 2639942,
+    "codec": "h264",
+    "encoder": "libx264",
+    "pixel_format": "yuv420p",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30.0,
+    "duration_s": 10.0,
+    "decoded_frames": 300,
+    "sampled_frames": 50,
+    "unique_sample_hashes": 50,
+    "first_frame_luma": {
+      "min": 20.0,
+      "average": 148.096,
+      "max": 225.0
+    },
+    "preview": {
+      "path": "/home/trna/matrix-eval/outputs/videos/matrix_sonic_apartment_record_final_20260715.preview.jpg",
+      "sha256": "492f0e71b12de5fb566777663b9ee5b42a1123ba66ca34fe9d19c335782cebd3",
+      "size_bytes": 90747,
+      "frames": 5
+    }
+  },
+  "window": {
+    "title": "zsibot_mujoco_ue (64-bit Development SF_VULKAN_SM6) ",
+    "width": 1920,
+    "height": 1080,
+    "video_matches_native_window": true,
+    "desktop_or_border_captured": false
+  },
+  "visual_inspection": {
+    "passed": true,
+    "method": "five-frame preview strip from the accepted MP4",
+    "observed": "ApartmentWorld, walking G1, and a native NPC are visible; framing is stable and contains no desktop or window border."
+  },
+  "quality_gates": {
+    "passed": true,
+    "failures": [],
+    "resolution_matches_window": true,
+    "duration_ratio": 1.0,
+    "fps_ratio": 1.0,
+    "decoded_frame_ratio": 1.0,
+    "nonblank_first_frame": true,
+    "dynamic_samples": true
+  },
+  "sonic_status": {
+    "before": {
+      "active_elapsed_s": 8.421,
+      "active_lowcmd": true,
+      "physics_step_hz": 200.017,
+      "render_hz": 50.004,
+      "real_time_factor": 1.0001,
+      "root_displacement_xy_m": 0.04015,
+      "fall_detected": false,
+      "instability_resets": 0
+    },
+    "after": {
+      "active_elapsed_s": 18.481,
+      "active_lowcmd": true,
+      "physics_step_hz": 199.965,
+      "render_hz": 49.991,
+      "real_time_factor": 0.9998,
+      "root_displacement_xy_m": 1.23001,
+      "fall_detected": false,
+      "instability_resets": 0
+    }
+  },
+  "source_provenance": {
+    "recorder_python_sha256": "ab3e5a4ad4c9a3b32822dc4cb0b23c92a19e10e9cf96df08335c86b5c16b8b63",
+    "recorder_shell_sha256": "380e8b15950de12bde4db271e51b627ebd43503fe1709183774df251feb19880",
+    "requirements_sha256": "b7c6d46a5fb5128a28912f80426faec696b4377b1757a9e08f3075db0e0a788c",
+    "matrix_sonic_launcher_sha256": "406499f920986c8697352a19452185f242df6f3d8ecafb313d89c4ffab937055",
+    "matrix_launcher_sha256": "3f2878d269a4bca6ec99327b6f2269ebd2ff30e532790ba55d668eb600958237",
+    "matrix_sonic_runtime_sha256": "6262a55832b28977ed9247aaebd472e46a8622d40a5c099d661b2e960014832b",
+    "visual_urdf_sha256": "56d0c7b4e44351ee8e89e7b1f1fcc8b02d5ec5cd191e43239d2b06f039e75860",
+    "physics_model_sha256": "515d47a7d146d58f705172b714a4bca47658005cc1a69b53a5aead83d4f60aff"
+  },
+  "raw_sidecar": {
+    "path": "/home/trna/matrix-eval/outputs/videos/matrix_sonic_apartment_record_final_20260715.json",
+    "sha256": "de0b4218d56d415d0f8da223fe4f316ba74cd701cf3e6c219b6c1c29ead06a84",
+    "size_bytes": 8049
+  },
+  "known_gaps": [
+    "The footage is native ApartmentWorld evidence, not a six-map visual Overworld recording.",
+    "Planner control exercised the SONIC path; a live PICO device was not part of this run.",
+    "The bundled imageio-ffmpeg binary has no NVENC support, so this accepted run used CPU libx264.",
+    "Attach mode is covered by code and unit-level contracts but has not received a separate runtime smoke.",
+    "The TRNA evaluation checkout reported an older branch and a dirty worktree because candidate files were synchronized into the long-lived audit tree; exact source SHA256 values above bind the executed files to this candidate."
+  ]
+}

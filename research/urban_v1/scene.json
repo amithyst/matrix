@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "world_name": "urban-v1",
+  "narrative_year": 2080,
+  "visual_source": {
+    "kind": "matrix_native_cooked_map",
+    "launcher_scene_id": 2,
+    "package_name": "Town10World",
+    "ue_map": "/Game/Maps/Town10World",
+    "preview": "demo_gif/Maps/TOWN10.png",
+    "release_file": "Town10World-0.1.2.tar.gz",
+    "release_sha256": "246cc4f96571022f19f7e5cf35aa2788c3c8420a2bf2535b56a6aa2e33a05801"
+  },
+  "physics_source": {
+    "mujoco_scene": "scene_terrain_t10.xml",
+    "environment_geom_count": 869,
+    "dynamic_environment_body_count": 0,
+    "robot_physics": "canonical SONIC G1 29-DOF model"
+  },
+  "robot_visual": {
+    "color_source": "canonical G1 URDF material colors",
+    "expected_named_colors": {
+      "white": "0.7 0.7 0.7 1",
+      "dark": "0.2 0.2 0.2 1"
+    },
+    "pipeline_version": 14
+  },
+  "interaction_contract": {
+    "robot": "dynamic SONIC MuJoCo physics",
+    "roads_curbs_buildings": "static native MuJoCo collision proxies",
+    "people_vehicles": "UE presentation only; not synchronized dynamic MuJoCo actors",
+    "game_mechanics": "out of scope"
+  },
+  "future_layer": {
+    "status": "not_authored_in_v1",
+    "reason": "The release contains cooked UE 5.5.4 maps, not the editable source project required for a trustworthy 2080 material and prop pass.",
+    "rule": "Do not label unmodified Town10 assets as custom cyberpunk content."
+  }
+}

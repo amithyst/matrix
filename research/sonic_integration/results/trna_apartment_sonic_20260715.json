@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "run_id": "trna-apartment-sonic-20260715",
+  "date": "2026-07-15",
+  "host": "trna",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 5080 Laptop GPU",
+    "driver": "580.159.03",
+    "memory_mib": 16303
+  },
+  "matrix": {
+    "repository": "https://github.com/floodsung/matrix",
+    "branch": "research/sonic-integration-audit",
+    "base_commit": "53940c2212b6ca3d64e8b71e269b818379438b58",
+    "scene_id": 21,
+    "scene_name": "ApartmentWorld",
+    "native_scene": "scene_terrain_apart2.xml"
+  },
+  "command": "MATRIX_UE_MAX_FPS=60 MATRIX_UE_EXTRA_EXEC_CMDS='stat fps,stat unit' bash scripts/run_matrix_sonic.sh --scene 21 --urdf /home/trna/matrix-sonic-assets/g1_29dof/g1_29dof.urdf --control-source planner --walk-after 10 --vx 0.25 --max-seconds 90",
+  "runtime_roots": {
+    "matrix": "/home/trna/matrix-eval",
+    "aue_sim": "/home/trna/aue-split-lab/repos/aue-sim",
+    "gr00t_whole_body_control": "/home/trna/code_bryce/GR00T-WholeBodyControl",
+    "python": "/home/trna/matrix-eval/.venv-audit/bin/python"
+  },
+  "runtime_provenance": {
+    "matrix_integration_commit": "45d022af88218185da11b5a2747c9c7c967117b1",
+    "aue_sim_commit": "dde7746b989ec6c3554f0f7b89e513b8abf2d359",
+    "fused_sink_sha256": "70cf1a0669540acd1a5557fc17afd232942f4d56ebbc53ee5b7d4bda51a53c0b",
+    "gr00t_whole_body_control_commit": "34b1c75be600b0a2df17001a32fc8dc213d0cc5c",
+    "gr00t_worktree_clean": false,
+    "gr00t_dirty_paths_not_used_by_planner_smoke": [
+      "gear_sonic/scripts/pico_manager_thread_server.py",
+      "gear_sonic/scripts/run_data_exporter.py"
+    ],
+    "sonic_deploy_binary_sha256": "bf9b2362ed750b6b3f67c33197517474cd18a331d7e3d1c652cfdd740203c21e",
+    "canonical_mjcf_sha256": "978421e9c7f42cf58a7bf74ab15e8fedb6ae5907ff85b83263d86f5a4d48d31f",
+    "unitree_sdk2_static_library_sha256": "c1c784a9a727715c8c73b6214697d976d5b81e240aa781bdf5cb63b0184e9678",
+    "g1_visual_urdf_sha256": "56d0c7b4e44351ee8e89e7b1f1fcc8b02d5ec5cd191e43239d2b06f039e75860"
+  },
+  "physics_model": {
+    "source": "gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml",
+    "nq": 36,
+    "nv": 35,
+    "nu": 29,
+    "ngeom": 177,
+    "timestep_s": 0.005,
+    "matrix_native_environment_geoms": 74,
+    "ue_packet_bytes": 820
+  },
+  "walk_smoke": {
+    "launcher_exit_code": 0,
+    "runtime_wall_s": 90.0,
+    "status_sample_wall_s": 88.522,
+    "active_lowcmd": true,
+    "active_elapsed_s": 66.941,
+    "physics_step_hz": 200.307,
+    "ue_state_sync_hz": 50.077,
+    "real_time_factor": 1.0015,
+    "final_sim_time_s": 68.42,
+    "control_frames": 4500,
+    "active_control_frames": 3421,
+    "fall_detected": false,
+    "instability_resets": 0,
+    "min_root_z_m": 0.76529,
+    "root_up_z": 0.99929,
+    "root_displacement_xy_m": 1.76436,
+    "root_xyz_m": [
+      1.75724,
+      -0.15834,
+      0.79588
+    ],
+    "startup_band": {
+      "enabled": true,
+      "hold_s": 4.0,
+      "fade_s": 3.0,
+      "fully_disabled_after_fade": true
+    },
+    "cleanup_residual_processes": 0
+  },
+  "ue_fps_probe": {
+    "cap_fps": 60,
+    "method": "UE log frame-counter deltas over intervals between 0.8 and 1.2 seconds with stat fps and stat unit enabled",
+    "steady_intervals": 84,
+    "mean_fps": 56.618,
+    "median_fps": 56.331,
+    "min_fps": 54.217,
+    "max_fps": 59.898
+  },
+  "visual_evidence": {
+    "local_path": "outputs/screenshots/matrix_sonic_apartment_walk_20260715.png",
+    "trna_path": "/home/trna/matrix-eval/outputs/screenshots/matrix_sonic_apartment_walk_20260715.png",
+    "width": 1870,
+    "height": 1110,
+    "sha256": "ecb603acb7dcef258168b20d737d832579120d2b858478df183ad767a9e5c43f",
+    "capture_note": "Captured during the same-day equivalent planner smoke before the final commit rerun; scene, URDF, physics model, and render path are unchanged."
+  },
+  "known_gaps": [
+    "Live PICO device input was not available on TRNA, so control-source pico still needs a device-backed acceptance run.",
+    "The imported G1 visual is geometry-correct enough for state inspection but still uses plain gray engineering materials.",
+    "ApartmentWorld has high visual detail but only 74 native MuJoCo environment collision geoms.",
+    "UE emitted one non-fatal Vulkan RHICopyTexture format ensure; RGB, depth, and LiDAR publication remain unverified."
+  ]
+}

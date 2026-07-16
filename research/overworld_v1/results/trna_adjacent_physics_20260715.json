@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "run_id": "trna-overworld-adjacent-physics-20260715",
+  "date": "2026-07-15",
+  "host": "trna",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 5080 Laptop GPU",
+    "driver": "580.159.03",
+    "memory_mib": 16303
+  },
+  "matrix": {
+    "repository": "https://github.com/floodsung/matrix",
+    "candidate_branch": "research/overworld-adjacent-v1",
+    "base_commit": "46cb70d7cccdb8f127c61b2c9984ca739c198dfa",
+    "layout": "research/overworld_v1/layout.json",
+    "layout_sha256": "1c26f944d5a4654e5f847e64deb8b701d31e30be76cf91044fe6a5961359e1ea"
+  },
+  "command": "bash scripts/run_matrix_sonic_overworld_v1.sh",
+  "runtime_roots": {
+    "matrix": "/home/trna/matrix-eval",
+    "aue_sim": "/home/trna/aue-split-lab/repos/aue-sim",
+    "gr00t_whole_body_control": "/home/trna/code_bryce/GR00T-WholeBodyControl",
+    "python": "/home/trna/matrix-eval/.venv-audit/bin/python"
+  },
+  "runtime_provenance": {
+    "aue_sim_commit": "dde7746b989ec6c3554f0f7b89e513b8abf2d359",
+    "fused_sink_sha256": "70cf1a0669540acd1a5557fc17afd232942f4d56ebbc53ee5b7d4bda51a53c0b",
+    "gr00t_whole_body_control_commit": "34b1c75be600b0a2df17001a32fc8dc213d0cc5c",
+    "gr00t_worktree_clean": false,
+    "gr00t_dirty_paths_not_used_by_planner_smoke": [
+      "gear_sonic/scripts/pico_manager_thread_server.py",
+      "gear_sonic/scripts/run_data_exporter.py"
+    ],
+    "sonic_deploy_binary_sha256": "bf9b2362ed750b6b3f67c33197517474cd18a331d7e3d1c652cfdd740203c21e",
+    "canonical_mjcf_sha256": "978421e9c7f42cf58a7bf74ab15e8fedb6ae5907ff85b83263d86f5a4d48d31f",
+    "canonical_meshes_sha256": "22a236aa7927c5e940e9378ad5fb95927ee0a3c04b987b8849fb022db59a785b",
+    "unitree_sdk2_static_library_sha256": "c1c784a9a727715c8c73b6214697d976d5b81e240aa781bdf5cb63b0184e9678"
+  },
+  "composed_world": {
+    "world_name": "overworld",
+    "scene_count": 6,
+    "scenes": [
+      "town10",
+      "warehouse",
+      "office",
+      "yard",
+      "apartment",
+      "meet_room"
+    ],
+    "environment_geoms": 1404,
+    "shared_ground_planes": 1,
+    "native_scene_sha256": "de3c4d26a68503f0aba6c6c9f84b351ff8b21fbb1abe33bb10c1469fb16819d1",
+    "native_manifest_sha256": "fe1c1df60220ec3aea3db34a487b048e161cdcd2f3e934b2b7e0d26ef42e18ea"
+  },
+  "physics_model": {
+    "nq": 36,
+    "nv": 35,
+    "nu": 29,
+    "nbody": 51,
+    "ngeom": 1507,
+    "nsite": 6,
+    "timestep_s": 0.005,
+    "sha256": "c6caf5133951810586935254ab3507b1e19f53b68f22372639ba437380d53e20"
+  },
+  "walk_smoke": {
+    "launcher_exit_code": 0,
+    "runtime_wall_s": 70.0,
+    "final_sim_time_s": 48.56,
+    "control_frames": 3500,
+    "active_control_frames": 2428,
+    "last_status_sample": {
+      "elapsed_wall_s": 68.382,
+      "active_elapsed_s": 46.941,
+      "physics_step_hz": 200.027,
+      "real_time_factor": 1.0001,
+      "root_xyz_m": [
+        129.52382,
+        -105.32781,
+        0.78306
+      ],
+      "root_displacement_xy_m": 5.5308,
+      "root_up_z": 0.99934
+    },
+    "fall_detected": false,
+    "instability_resets": 0,
+    "min_root_z_m": 0.75883,
+    "startup_band": {
+      "enabled": true,
+      "hold_s": 4.0,
+      "fade_s": 3.0,
+      "fully_disabled_after_fade": true
+    },
+    "boundary_acceptance": {
+      "connector": "town10_to_warehouse",
+      "start_root_x_m": 124.0,
+      "warehouse_west_boundary_x_m": 128.0,
+      "first_observed_crossing_root_x_m": 128.14327,
+      "first_observed_crossing_elapsed_wall_s": 58.301,
+      "first_observed_crossing_active_s": 36.861,
+      "last_sample_crossing_margin_m": 1.52382,
+      "passed": true
+    },
+    "render_sync_enabled": false,
+    "residual_listeners_on_5556_5860_5861_9999": 0
+  },
+  "visual_contract": {
+    "status": "blocked_cooked_maps",
+    "engine_version": "5.5.4",
+    "probe_log": "/home/trna/matrix-eval/outputs/logs/overworld_streammap_probe2.log",
+    "observed": "STREAMMAP can add ApartmentWorld at identity transform beside Town10, but the cooked runtime has no supported independent transform contract for all six maps.",
+    "required_to_unblock": "Obtain the matching editable UE 5.5 project and source maps, author /Game/Maps/Overworld with level instances at the committed layout transforms, then package and rerun visual/physics alignment acceptance."
+  },
+  "known_gaps": [
+    "This run proves continuous MuJoCo/SONIC traversal from Town10 into Warehouse; the other four connector corridors have layout and overlap checks but no individual SONIC traversal smoke yet.",
+    "The six cooked UE maps are not visually composed, so there is intentionally no six-map screenshot or UE render FPS claim for V1.",
+    "All six imported environment proxies are static; native people and props do not become MuJoCo-interactive objects in this V1.",
+    "Live PICO input was not available for this run; planner control used the same SONIC physics path.",
+    "The status file is sampled every two seconds, so the last structured pose is at 68.382 seconds while the process completed at 70.0 seconds."
+  ]
+}

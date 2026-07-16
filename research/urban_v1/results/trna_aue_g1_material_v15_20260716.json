@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "status": "pass",
+  "tested_at": "2026-07-16",
+  "host": "trna",
+  "scene": {
+    "contract": "research/urban_v1/scene.json",
+    "native_scene_id": 2,
+    "native_scene_name": "Town10World"
+  },
+  "source": {
+    "urdf": "/home/trna/matrix-sonic-assets/g1_29dof/g1_29dof.urdf",
+    "urdf_sha256": "56d0c7b4e44351ee8e89e7b1f1fcc8b02d5ec5cd191e43239d2b06f039e75860",
+    "profile": "config/materials/aue_g1_v1.json",
+    "profile_sha256": "b1510c989201ee6d7341018a8d3d2c69e251845ee317e0c4225b03bd613edd89",
+    "aue_sim_commit": "13463d586ef01c9c4bde0907d9069f02d02724a0",
+    "aue_sim_symbol": "src/aue/scenes/g1_visual_overlay.py::install_g1_material_overrides"
+  },
+  "conversion": {
+    "pipeline_version": 15,
+    "profile_id": "aue_g1_v1",
+    "source_visuals": 36,
+    "styled_geoms": 41,
+    "unmatched_visual_geoms": 0,
+    "materials": [
+      {
+        "name": "black_soft",
+        "rgba": [0.035, 0.035, 0.035, 1.0],
+        "roughness": 0.62,
+        "metallic": 0.0,
+        "geoms": 12
+      },
+      {
+        "name": "dark_structure",
+        "rgba": [0.16, 0.16, 0.16, 1.0],
+        "roughness": 0.58,
+        "metallic": 0.0,
+        "geoms": 6
+      },
+      {
+        "name": "warm_white_shell",
+        "rgba": [0.72, 0.72, 0.68, 1.0],
+        "roughness": 0.52,
+        "metallic": 0.0,
+        "geoms": 23
+      }
+    ]
+  },
+  "physics_invariants": {
+    "nq": 36,
+    "nv": 35,
+    "nu": 29,
+    "nbody": 39,
+    "robot_ngeom": 97,
+    "exact_equal_arrays": [
+      "body_mass",
+      "body_inertia",
+      "jnt_type",
+      "jnt_range",
+      "actuator_gear",
+      "actuator_ctrlrange",
+      "geom_contype",
+      "geom_conaffinity",
+      "geom_friction",
+      "geom_size",
+      "geom_pos",
+      "geom_quat"
+    ]
+  },
+  "sonic_runtime": {
+    "control_source": "planner",
+    "physics_hz_before": 200.016,
+    "physics_hz_after": 199.979,
+    "rtf_before": 1.0001,
+    "rtf_after": 0.9999,
+    "ue_state_sync_hz_after": 49.995,
+    "root_displacement_xy_m": 1.49294,
+    "fall_detected": false,
+    "instability_resets": 0
+  },
+  "evidence": {
+    "walking_video": {
+      "path": "outputs/videos/matrix_sonic_urban_v1_aue_material_v15_20260716.mp4",
+      "sha256": "d1073c2b2c115c9f0994130693f374ff943d08d0cc326bac40e8cb3718a5c743",
+      "resolution": [1920, 1080],
+      "fps": 30,
+      "duration_s": 10,
+      "decoded_frames": 300,
+      "unique_sample_hashes": 50,
+      "sampled_frames": 50
+    },
+    "closeup_video": {
+      "path": "outputs/videos/matrix_sonic_urban_v1_aue_material_v15_closeup_candidate.mp4",
+      "sha256": "611ee0a2f01f605214fdd56b46a87492c90d5321f29c4bfdca03e1fb001c2f68",
+      "resolution": [1920, 1080],
+      "fps": 30,
+      "duration_s": 2,
+      "decoded_frames": 60
+    },
+    "closeup_frame": {
+      "path": "outputs/videos/matrix_sonic_urban_v1_aue_material_v15_closeup_candidate.frame.png",
+      "sha256": "0e2e1085a9e70a457fd3759bb7334d94a7d4191efb5056ad0c0ae5ae2f121ff7"
+    }
+  },
+  "renderer_boundary": {
+    "mujoco_3_3_channels": ["rgba", "roughness", "metallic"],
+    "matrix_ue_0_1_2_channels": ["rgba"],
+    "texture_assets": false,
+    "reason": "The source AUE material is procedural and the canonical STL meshes have no UV coordinates. The released Matrix UE bridge exposes only per-geom FLinearColor."
+  }
+}

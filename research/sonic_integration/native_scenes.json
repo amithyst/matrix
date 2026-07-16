@@ -1,0 +1,434 @@
+{
+  "schema_version": 1,
+  "scope": {
+    "repository": "https://github.com/zsibot/matrix",
+    "repository_commit": "918fae3",
+    "release": "0.1.2",
+    "release_manifest": "https://github.com/zsibot/matrix/releases/download/v0.1.2/manifest-0.1.2.json",
+    "launcher_mapping": "scripts/run_sim.sh",
+    "excluded_external_scenes": [
+      "aue-sim overworld"
+    ]
+  },
+  "counts": {
+    "curated_selectable_scenes": 18,
+    "custom_templates": 1,
+    "unique_selectable_map_packages": 19,
+    "launcher_scene_ids": 21,
+    "internal_base_maps": 1,
+    "total_packaged_map_assets": 20
+  },
+  "selectable_scenes": [
+    {
+      "package_name": "CustomWorld",
+      "display_name": "CustomWorld",
+      "kind": "template",
+      "launcher_ids": [0],
+      "ue_map": "/Game/Maps/CustomWorld",
+      "mujoco_scene": "scene_terrain_custom.xml",
+      "preview": "demo_gif/Maps/Custom.png",
+      "release_package": {
+        "file": "CustomWorld-0.1.2.tar.gz",
+        "size_bytes": 20845269,
+        "sha256": "ae997be0a9a5cb521f85c9f5f5253d7e862db57f536cb933e625489e0345276c"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 3,
+        "geom_types": {"plane": 1, "box": 2},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "SceneWorld",
+      "display_name": "Warehouse",
+      "kind": "curated",
+      "launcher_ids": [1],
+      "ue_map": "/Game/Maps/SceneWorld",
+      "mujoco_scene": "scene_terrain_wh.xml",
+      "preview": "demo_gif/Maps/WAREHOUSE.png",
+      "release_package": {
+        "file": "SceneWorld-0.1.2.tar.gz",
+        "size_bytes": 398747908,
+        "sha256": "2f1286123a6e0a13a7f23e1d479307217c155cc7c38db32cfffb0db5d9757ad4"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 210,
+        "geom_types": {"plane": 1, "box": 201, "cylinder": 8},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "Town10World",
+      "display_name": "Town10World",
+      "kind": "curated",
+      "launcher_ids": [2],
+      "ue_map": "/Game/Maps/Town10World",
+      "mujoco_scene": "scene_terrain_t10.xml",
+      "preview": "demo_gif/Maps/TOWN10.png",
+      "release_package": {
+        "file": "Town10World-0.1.2.tar.gz",
+        "size_bytes": 1159597956,
+        "sha256": "246cc4f96571022f19f7e5cf35aa2788c3c8420a2bf2535b56a6aa2e33a05801"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 869,
+        "geom_types": {"plane": 1, "mesh": 9, "box": 686, "cylinder": 173},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "YardWorld",
+      "display_name": "YardWorld",
+      "kind": "curated",
+      "launcher_ids": [3],
+      "ue_map": "/Game/Maps/YardWorld",
+      "mujoco_scene": "scene_terrain_yard.xml",
+      "preview": "demo_gif/Maps/YARD.png",
+      "release_package": {
+        "file": "YardWorld-0.1.2.tar.gz",
+        "size_bytes": 687750590,
+        "sha256": "98aa43e7ffc245286e8c83ca20c824c4cecbb71d7bff8f8cd266783f8a967254"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 63,
+        "geom_types": {"plane": 1, "box": 57, "cylinder": 5},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "CrowdWorld",
+      "display_name": "CrowdWorld",
+      "kind": "curated",
+      "launcher_ids": [4],
+      "ue_map": "/Game/Maps/CrowdWorld",
+      "mujoco_scene": "scene_terrain_crowd.xml",
+      "preview": "demo_gif/Maps/CROWD.png",
+      "release_package": {
+        "file": "CrowdWorld-0.1.2.tar.gz",
+        "size_bytes": 42156549,
+        "sha256": "8b65ce4308cc3737b7af26098f52e5f4a163d46b19ca0644bd904a3d570fbd0a"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 131,
+        "geom_types": {"plane": 1, "cylinder": 130},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "VeniceWorld",
+      "display_name": "VeniceWorld",
+      "kind": "curated",
+      "launcher_ids": [5],
+      "ue_map": "/Game/Maps/VeniceWorld",
+      "mujoco_scene": "scene_terrain_venice.xml",
+      "preview": "demo_gif/Maps/VENICE.png",
+      "release_package": {
+        "file": "VeniceWorld-0.1.2.tar.gz",
+        "size_bytes": 343978106,
+        "sha256": "2d0d8c11bb83b2883ba4930b018da40c68f5d556562ddd441b4f48f1cbbebe36"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 1276,
+        "geom_types": {"plane": 1, "box": 1172, "cylinder": 103},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "HouseWorld",
+      "display_name": "HouseWorld",
+      "kind": "curated",
+      "launcher_ids": [6],
+      "ue_map": "/Game/Maps/HouseWorld",
+      "mujoco_scene": "scene_terrain_house.xml",
+      "preview": "demo_gif/Maps/HOUSE.png",
+      "release_package": {
+        "file": "HouseWorld-0.1.2.tar.gz",
+        "size_bytes": 402917615,
+        "sha256": "489d8db9c8471bc652bbebb5f0555c1bf50ea5854a90490cecc157667e150822"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 97,
+        "geom_types": {"plane": 1, "box": 88, "cylinder": 8},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "RunningWorld",
+      "display_name": "RunningWorld",
+      "kind": "curated",
+      "launcher_ids": [7],
+      "ue_map": "/Game/Maps/RunningWorld",
+      "mujoco_scene": "scene_terrain_rw.xml",
+      "preview": "demo_gif/Maps/RUNNINGGAME.png",
+      "release_package": {
+        "file": "RunningWorld-0.1.2.tar.gz",
+        "size_bytes": 37558630,
+        "sha256": "89103ccb2b5970f42a39ee92204d6d176253dae0792602834f6cb91ce8afdc8c"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 41,
+        "geom_types": {"plane": 1, "box": 40},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "Town10Zombie",
+      "display_name": "Town10Zombie",
+      "kind": "curated",
+      "launcher_ids": [8],
+      "ue_map": "/Game/Maps/Town10Zombie",
+      "mujoco_scene": "scene_terrain_zombie.xml",
+      "preview": "demo_gif/Maps/ZOMBIE.png",
+      "release_package": {
+        "file": "Town10Zombie-0.1.2.tar.gz",
+        "size_bytes": 660992713,
+        "sha256": "bd806b6d2095dd124e87d12a8461a1cc4716f9485f5837f70463a85f6c6aba4d"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 866,
+        "geom_types": {"plane": 1, "mesh": 9, "box": 683, "cylinder": 173},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "IROSFlatWorld",
+      "display_name": "IROSFlatWorld",
+      "kind": "curated",
+      "launcher_ids": [9],
+      "ue_map": "/Game/Maps/IROSFlatWorld",
+      "mujoco_scene": "scene_terrain_flat.xml",
+      "preview": "demo_gif/Maps/IROSFLAT2024.png",
+      "release_package": {
+        "file": "IROSFlatWorld-0.1.2.tar.gz",
+        "size_bytes": 306915,
+        "sha256": "f0b17a1b5293bcf591c6b34c6b3cd516b232c10ea171b9b1d854a682f04ef610"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 184,
+        "geom_types": {"plane": 1, "box": 183},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "IROSSlopedWorld",
+      "display_name": "IROSSlopedWorld",
+      "kind": "curated",
+      "launcher_ids": [10],
+      "ue_map": "/Game/Maps/IROSSlopedWorld",
+      "mujoco_scene": "scene_terrain_sloped.xml",
+      "preview": "demo_gif/Maps/IROSSLOP2024.png",
+      "release_package": {
+        "file": "IROSSlopedWorld-0.1.2.tar.gz",
+        "size_bytes": 262746704,
+        "sha256": "4980a008de2ce647f9d943129791699431e390a69bdf77cf32f1d27867ed8858"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 222,
+        "geom_types": {"plane": 1, "box": 221},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "IROSFlatWorld2025",
+      "display_name": "IROSFlatWorld2025",
+      "kind": "curated",
+      "launcher_ids": [11],
+      "ue_map": "/Game/Maps/IROSFlatWorld2025",
+      "mujoco_scene": "scene_terrain_flat25.xml",
+      "preview": "demo_gif/Maps/IROSFLAT2025.png",
+      "release_package": {
+        "file": "IROSFlatWorld2025-0.1.2.tar.gz",
+        "size_bytes": 162550,
+        "sha256": "8fca374867ce4d85feb35626b02177a89096da39cfeb030476c1f21deddc4eaa"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 207,
+        "geom_types": {"plane": 1, "box": 198, "cylinder": 8},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 205
+      }
+    },
+    {
+      "package_name": "IROSSloppedWorld2025",
+      "display_name": "IROSSloppedWorld2025",
+      "kind": "curated",
+      "launcher_ids": [12],
+      "ue_map": "/Game/Maps/IROSSloppedWorld2025",
+      "mujoco_scene": "scene_terrain_sloped25.xml",
+      "preview": "demo_gif/Maps/IROSSLOP2025.png",
+      "release_package": {
+        "file": "IROSSloppedWorld2025-0.1.2.tar.gz",
+        "size_bytes": 163410,
+        "sha256": "4f4f5f9776c89e3de284ae601d46f22e6b63de2b3a20d5a85c41be6e57750b3a"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 226,
+        "geom_types": {"plane": 1, "box": 217, "cylinder": 8},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 224
+      }
+    },
+    {
+      "package_name": "OfficeWorld",
+      "display_name": "OfficeWorld",
+      "kind": "curated",
+      "launcher_ids": [13],
+      "ue_map": "/Game/Maps/OfficeWorld",
+      "mujoco_scene": "scene_terrain_office.xml",
+      "preview": "demo_gif/Maps/OFFICE.png",
+      "release_package": {
+        "file": "OfficeWorld-0.1.2.tar.gz",
+        "size_bytes": 433884001,
+        "sha256": "2184289422989eed14398763833cc9e9dabb62e447cbaed7fd7b81f71e9342ed"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 146,
+        "geom_types": {"plane": 1, "box": 145},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "3DGSWorld",
+      "display_name": "3DGSWorld",
+      "kind": "curated",
+      "launcher_ids": [14, 16, 17],
+      "ue_map": "/Game/Maps/3DGSWorld",
+      "mujoco_scene": "3dgs.xml",
+      "preview": "demo_gif/Maps/3DGS.png",
+      "release_package": {
+        "file": "3DGSWorld-0.1.2.tar.gz",
+        "size_bytes": 216649218,
+        "sha256": "e4541ec5245895ebe010d836196df33c24e7662bb84a13693536efc22b6056a1"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 11,
+        "geom_types": {"plane": 1, "box": 10},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "MoonWorld",
+      "display_name": "MoonWorld",
+      "kind": "curated",
+      "launcher_ids": [15],
+      "ue_map": "/Game/Maps/MoonWorld",
+      "mujoco_scene": "scene_terrain_moon_dynamic.xml",
+      "preview": "demo_gif/Maps/Moon.png",
+      "release_package": {
+        "file": "MoonWorld-0.1.2.tar.gz",
+        "size_bytes": 633678813,
+        "sha256": "c4e3dee47ffa434712b0238d08b0b68067f1b1c9820e2ddb455f996f04e364b1"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 256,
+        "geom_types": {"box": 256},
+        "dynamic_body_count": 256,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "CaliWorld",
+      "display_name": "Cali Room",
+      "kind": "curated",
+      "launcher_ids": [20],
+      "ue_map": "/Game/Maps/CaliWorld",
+      "mujoco_scene": "scene_terrain_cali.xml",
+      "preview": "demo_gif/Maps/CALIBRATION.png",
+      "release_package": {
+        "file": "CaliWorld-0.1.2.tar.gz",
+        "size_bytes": 15730293,
+        "sha256": "95730f452432725d7b21c8b827c942dffeac6840595b2b5525c0e5594d3c80c4"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 1,
+        "geom_types": {"plane": 1},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "ApartmentWorld",
+      "display_name": "Home",
+      "kind": "curated",
+      "launcher_ids": [21],
+      "ue_map": "/Game/Maps/ApartmentWorld",
+      "mujoco_scene": "scene_terrain_apart2.xml",
+      "preview": "demo_gif/Maps/HOME.png",
+      "release_package": {
+        "file": "ApartmentWorld-0.1.2.tar.gz",
+        "size_bytes": 527976283,
+        "sha256": "2a9bce05d5d48d19993f49e8ede3298ba8e88fdd220fd95e8a3937e09692e8ff"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 74,
+        "geom_types": {"plane": 1, "box": 68, "cylinder": 5},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    },
+    {
+      "package_name": "MeetRoomWorld",
+      "display_name": "Laboratory",
+      "kind": "curated",
+      "launcher_ids": [22],
+      "ue_map": "/Game/Maps/MeetRoomWorld",
+      "mujoco_scene": "scene_terrain_meet.xml",
+      "preview": "demo_gif/Maps/LABORATORY.png",
+      "release_package": {
+        "file": "MeetRoomWorld-0.1.2.tar.gz",
+        "size_bytes": 157391979,
+        "sha256": "23efa12d2f6985ee7135210be79084a20edfeb12d4af1498d2acaab96e110f5f"
+      },
+      "physics_proxy": {
+        "source_release": "0.1.2",
+        "geom_count": 48,
+        "geom_types": {"plane": 1, "box": 41, "cylinder": 6},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 0
+      }
+    }
+  ],
+  "internal_base_maps": [
+    {
+      "package_name": "EmptyWorld",
+      "selectable": false,
+      "ue_map": "/Game/Maps/EmptyWorld",
+      "release_package": {
+        "file": "base-0.1.2.tar.gz",
+        "size_bytes": 2116244298,
+        "sha256": "2cbb40861e89c40735cd64b24e8b64d88d012f335bdb405b5ed52db86f8b4e38"
+      }
+    }
+  ]
+}
