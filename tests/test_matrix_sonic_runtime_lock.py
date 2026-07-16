@@ -80,6 +80,11 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn(".matrix-sonic-launch.lock", text)
         self.assertIn("MATRIX_CPUSET_APPLIED", text)
 
+        run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(encoding="utf-8")
+        self.assertIn('case "${MATRIX_SONIC,,}"', run_sim)
+        self.assertIn("checked_mujoco=0", run_sim)
+        self.assertIn('--mujoco "$checked_mujoco"', run_sim)
+
     def test_chunk_installer_has_noninteractive_contract(self) -> None:
         text = (
             REPO_ROOT / "scripts/release_manager/install_chunks.sh"

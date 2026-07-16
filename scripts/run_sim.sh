@@ -88,10 +88,19 @@ run_env_check() {
         return 0
     fi
 
+    local checked_mujoco="$MUJOCORUNNING"
+    case "${MATRIX_SONIC,,}" in
+        1|true|yes|on)
+            # SONIC owns the external MuJoCo process. The bundled robot_mujoco
+            # executable and /opt/ros are not part of this launch topology.
+            checked_mujoco=0
+            ;;
+    esac
+
     "$checker" runtime \
         --robot "$ROBOT_ARG" \
         --scene "$SCENE_ID" \
-        --mujoco "$MUJOCORUNNING" \
+        --mujoco "$checked_mujoco" \
         --offscreen "$OFFSCREEN"
 }
 
