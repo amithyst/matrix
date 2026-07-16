@@ -65,6 +65,11 @@ if [[ ! -f "$BRIDGE" ]]; then
     echo "[ERROR] Bridge binary is missing: $BRIDGE" >&2
     exit 1
 fi
+BRIDGE_SOURCE="$AUE_ROOT/scripts/g1_sonic_sim_udp_dds_bridge.cpp"
+if [[ ! -f "$BRIDGE_SOURCE" ]]; then
+    echo "[ERROR] Bridge source required by sim_bridge.py is missing: $BRIDGE_SOURCE" >&2
+    exit 1
+fi
 if [[ -e "$OUTPUT" ]]; then
     echo "[ERROR] Output already exists; refusing to replace it: $OUTPUT" >&2
     exit 1
@@ -85,6 +90,8 @@ rsync -aL --exclude='__pycache__/' "$AUE_ROOT/src/androidtwin" "$STAGING/aue-sim
 if [[ -d "$AUE_ROOT/src/aue" ]]; then
     rsync -aL --exclude='__pycache__/' "$AUE_ROOT/src/aue" "$STAGING/aue-sim/src/"
 fi
+mkdir -p "$STAGING/aue-sim/scripts"
+cp -aL "$BRIDGE_SOURCE" "$STAGING/aue-sim/scripts/"
 
 GEAR_TARGET="$STAGING/GR00T-WholeBodyControl"
 rsync -aL \

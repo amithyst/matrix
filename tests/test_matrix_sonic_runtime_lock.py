@@ -100,6 +100,16 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("verify_matrix_sonic_runtime.py", text)
         self.assertIn("refusing to replace", text)
         self.assertIn("matrix-sonic-v1", text)
+        self.assertIn("g1_sonic_sim_udp_dds_bridge.cpp", text)
+
+        runtime_paths = {
+            (entry["root"], entry["path"])
+            for entry in self.lock["runtime_files"]
+        }
+        self.assertIn(
+            ("aue", "scripts/g1_sonic_sim_udp_dds_bridge.cpp"),
+            runtime_paths,
+        )
 
     def test_bootstrap_can_persist_an_ignored_runtime_path(self) -> None:
         text = (REPO_ROOT / "scripts/bootstrap_matrix_sonic.sh").read_text(
