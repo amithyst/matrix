@@ -14,6 +14,12 @@ Git stores source, scripts, profiles, tests, and checksums. It does not store th
 generated engines, logs, or recordings. Those files are copied from a controlled
 artifact source and verified against the tracked lock.
 
+When `--release-cache` is supplied, bootstrap verifies every archive against the
+runtime lock, reuses it with a hard link (or a local reflink/copy across file
+systems), generates the installer manifest from the lock, and disables network
+downloads. A cache hit therefore does not consume another 7.76 GB of network
+traffic.
+
 ## Checkout policy
 
 Use `~/matrix` as the active checkout on both hosts. Keep historical

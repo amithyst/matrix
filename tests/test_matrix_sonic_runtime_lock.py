@@ -89,6 +89,21 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("--no-index", text)
         self.assertIn("python-wheelhouse", text)
 
+    def test_release_cache_is_materialized_without_network_or_symlinks(self) -> None:
+        bootstrap = (
+            REPO_ROOT / "scripts/bootstrap_matrix_sonic.sh"
+        ).read_text(encoding="utf-8")
+        installer = (
+            REPO_ROOT / "scripts/release_manager/install_chunks.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('ln "$source_path" "$destination_path"', bootstrap)
+        self.assertIn("cp --reflink=auto", bootstrap)
+        self.assertNotIn('ln -sfn "$source_path"', bootstrap)
+        self.assertIn("MATRIX_OFFLINE=1", bootstrap)
+        self.assertIn('MATRIX_OFFLINE="${MATRIX_OFFLINE:-0}"', installer)
+        self.assertIn("离线模式下禁止下载", installer)
+
     def test_local_runtime_override_precedes_profile_derived_paths(self) -> None:
         for script_name in ("bootstrap_matrix_sonic.sh", "run_matrix_sonic.sh"):
             text = (REPO_ROOT / "scripts" / script_name).read_text(

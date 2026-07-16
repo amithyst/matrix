@@ -67,6 +67,9 @@ source "$PROJECT_ROOT/config/hosts/$PROFILE.env"
 
 RUNTIME_ROOT="${RUNTIME_OVERRIDE:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-v1}}"
 RUNTIME_ROOT="$(realpath -m "$RUNTIME_ROOT")"
+if [[ -n "$RELEASE_CACHE" ]]; then
+    RELEASE_CACHE="$(realpath -m "$RELEASE_CACHE")"
+fi
 LOCK_FILE="$PROJECT_ROOT/config/runtime/matrix-sonic.lock.json"
 mkdir -p "$PROJECT_ROOT/outputs/logs" "$PROJECT_ROOT/releases" "$(dirname "$RUNTIME_ROOT")"
 
@@ -145,14 +148,39 @@ PY
 
     if [[ -n "$RELEASE_CACHE" ]]; then
         python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" \
-            --schema-only --lock "$LOCK_FILE"
+            --lock "$LOCK_FILE" \
+            --runtime-root "$RUNTIME_ROOT" \
+            --matrix-root "$PROJECT_ROOT" \
+            --release-cache "$RELEASE_CACHE" \
+            --skip-dynamic \
+            --skip-installed-assets \
+            --fast
+
+        materialize_release_package() {
+            local source_path="$1"
+            local destination_path="$2"
+
+            if [[ "$source_path" == "$destination_path" ]]; then
+                return 0
+            fi
+            rm -f "$destination_path" "${destination_path}.aria2"
+            if ln "$source_path" "$destination_path" 2>/dev/null; then
+                echo "[INFO] Reused release package by hard link: $(basename "$destination_path")"
+            else
+                cp --reflink=auto --preserve=mode,timestamps \
+                    "$source_path" "$destination_path"
+                echo "[INFO] Materialized release package locally: $(basename "$destination_path")"
+            fi
+        }
+
         while IFS= read -r package; do
             source_path="${RELEASE_CACHE%/}/$package"
             if [[ ! -f "$source_path" ]]; then
                 echo "[ERROR] Release cache is missing: $source_path" >&2
                 exit 1
             fi
-            ln -sfn "$source_path" "$PROJECT_ROOT/releases/$package"
+            materialize_release_package \
+                "$source_path" "$PROJECT_ROOT/releases/$package"
         done < <(python3 - "$LOCK_FILE" <<'PY'
 import json
 import sys
@@ -160,10 +188,56 @@ for item in json.load(open(sys.argv[1], encoding="utf-8"))["matrix_release"]["pa
     print(item["file"])
 PY
         )
+
+        python3 - "$LOCK_FILE" "$PROJECT_ROOT/releases" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+release = lock["matrix_release"]
+packages = {item["name"]: dict(item) for item in release["packages"]}
+
+def package(name: str, *, required: bool) -> dict[str, object]:
+    item = packages[name]
+    return {
+        "file": item["file"],
+        "required": required,
+        "size": item["size"],
+        "sha256": item["sha256"],
+    }
+
+payload = {
+    "version": release["version"],
+    "packages": {
+        "base": package("base", required=True),
+        "assets": package("assets", required=True),
+        "shared": {
+            **package("shared", required=False),
+            "is_split": False,
+        },
+        "maps": [
+            {
+                "name": "Town10World",
+                **package("Town10World", required=False),
+            }
+        ],
+    },
+}
+destination = Path(sys.argv[2]) / f"manifest-{release['version']}.json"
+temporary = destination.with_suffix(destination.suffix + f".tmp.{os.getpid()}")
+temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+os.replace(temporary, destination)
+PY
     fi
 
     if [[ "$SKIP_ASSETS" != "1" ]]; then
-        MATRIX_MAPS=Town10World MATRIX_ASSUME_YES=1 \
+        INSTALL_ENV=(MATRIX_MAPS=Town10World MATRIX_ASSUME_YES=1)
+        if [[ -n "$RELEASE_CACHE" ]]; then
+            INSTALL_ENV+=(MATRIX_OFFLINE=1)
+        fi
+        env "${INSTALL_ENV[@]}" \
             bash "$PROJECT_ROOT/scripts/release_manager/install_chunks.sh" 0.1.2
     fi
 
