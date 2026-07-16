@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "runtime_id": "matrix-sonic-v1",
+  "source": {
+    "repository": "https://github.com/amithyst/matrix",
+    "base_commit": "b268d604fca57af1495b1e5941e08f02e73598a6"
+  },
+  "matrix_release": {
+    "version": "0.1.2",
+    "base_url": "https://github.com/zsibot/matrix/releases/download/v0.1.2",
+    "packages": [
+      {
+        "name": "assets",
+        "file": "assets-0.1.2.tar.gz",
+        "size": 1030738643,
+        "sha256": "c4af445e468bb919909176113a8b8e9b0ede5dabf80be7112a5e7e86085bb369"
+      },
+      {
+        "name": "base",
+        "file": "base-0.1.2.tar.gz",
+        "size": 2116244298,
+        "sha256": "2cbb40861e89c40735cd64b24e8b64d88d012f335bdb405b5ed52db86f8b4e38"
+      },
+      {
+        "name": "shared",
+        "file": "shared-0.1.2.tar.gz",
+        "size": 3451081662,
+        "sha256": "b460ca1ab7560ff0ef78ee4d6a18013accd4f16d6bab2e0dd9cb4fff1849256c"
+      },
+      {
+        "name": "Town10World",
+        "file": "Town10World-0.1.2.tar.gz",
+        "size": 1159597956,
+        "sha256": "246cc4f96571022f19f7e5cf35aa2788c3c8420a2bf2535b56a6aa2e33a05801"
+      }
+    ],
+    "installed_files": [
+      "bin/sim_launcher.bin",
+      "src/UeSim/Linux/Engine/Content/Renderer/TessellationTable.bin",
+      "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue",
+      "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_t10.xml"
+    ]
+  },
+  "python": {
+    "version": "3.10",
+    "requirements": "research/sonic_integration/requirements-trna.txt",
+    "wheelhouse_manifest_sha256": "579068ca7842f1a600314eb05a1df0c4be30b0582b8c81f08ed328885786eb8e",
+    "mujoco": "3.3.0",
+    "urdf2mjcf": "0.1.3"
+  },
+  "source_revisions": {
+    "aue_sim": {
+      "commit": "dde7746b989ec6c3554f0f7b89e513b8abf2d359"
+    },
+    "gr00t_whole_body_control": {
+      "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/GR00T-WholeBodyControl.git",
+      "commit": "34b1c75be600b0a2df17001a32fc8dc213d0cc5c"
+    }
+  },
+  "inference": {
+    "tensorrt_version": "10.13.3",
+    "tensorrt_api_version": 101303,
+    "onnxruntime_version": "1.16.3"
+  },
+  "bridge": {
+    "build_baseline": "Ubuntu 22.04 x86_64",
+    "max_required_glibc": "2.34",
+    "max_required_glibcxx": "3.4.29"
+  },
+  "runtime_files": [
+    {
+      "root": "aue",
+      "path": "src/androidtwin/control/sonic_sim/fused_sink.py",
+      "sha256": "70cf1a0669540acd1a5557fc17afd232942f4d56ebbc53ee5b7d4bda51a53c0b"
+    },
+    {
+      "root": "aue",
+      "path": "scripts/g1_sonic_sim_udp_dds_bridge.cpp",
+      "sha256": "b71c50b123a0f299ac74c669553342878dcb199cdc5f9131a056c0b37e543b9d"
+    },
+    {
+      "root": "gear",
+      "path": "gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
+      "sha256": "bf9b2362ed750b6b3f67c33197517474cd18a331d7e3d1c652cfdd740203c21e"
+    },
+    {
+      "root": "gear",
+      "path": "gear_sonic_deploy/policy/release/model_encoder.onnx",
+      "sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
+    },
+    {
+      "root": "gear",
+      "path": "gear_sonic_deploy/policy/release/model_decoder.onnx",
+      "sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
+    },
+    {
+      "root": "gear",
+      "path": "gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx",
+      "sha256": "39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea"
+    },
+    {
+      "root": "gear",
+      "path": "gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml",
+      "sha256": "978421e9c7f42cf58a7bf74ab15e8fedb6ae5907ff85b83263d86f5a4d48d31f"
+    },
+    {
+      "root": "gear",
+      "path": "gear_sonic_deploy/thirdparty/unitree_sdk2/lib/x86_64/libunitree_sdk2.a",
+      "sha256": "c1c784a9a727715c8c73b6214697d976d5b81e240aa781bdf5cb63b0184e9678"
+    },
+    {
+      "root": "visual",
+      "path": "g1_29dof.urdf",
+      "sha256": "56d0c7b4e44351ee8e89e7b1f1fcc8b02d5ec5cd191e43239d2b06f039e75860"
+    },
+    {
+      "root": "bridge",
+      "path": "g1_sonic_sim_udp_dds_bridge_accepted",
+      "sha256": "ca765ea25b2956a080af6d9f0aa6ba7ebe5e3038daeb78381f0d02b4e099bcc9"
+    },
+    {
+      "root": "inference",
+      "path": "TensorRT/lib/libnvinfer.so.10",
+      "sha256": "022bfbf194d47ccea3126add0c0c63c5ed56d3a164d43311e5bd99349465c013"
+    },
+    {
+      "root": "inference",
+      "path": "TensorRT/lib/libnvonnxparser.so.10",
+      "sha256": "c6bb75be8b294aca64640e9ec00b3d4c7dae27dae0e575f30a7146265de2bcb2"
+    },
+    {
+      "root": "inference",
+      "path": "TensorRT/lib/libnvinfer_plugin.so.10",
+      "sha256": "68383ab15187b509048cbb580debfafc27accda9cb0bcd13bf6dc8098c760762"
+    },
+    {
+      "root": "inference",
+      "path": "TensorRT/lib/libnvinfer_builder_resource.so.10.13.3",
+      "sha256": "acac931b446486c7cfc634a9779ee7c37c2f09ec47c174fc6b6f50e080fe0b77"
+    },
+    {
+      "root": "inference",
+      "path": "onnxruntime/lib/libonnxruntime.so.1.16.3",
+      "sha256": "ce3752ba35018ee6d8127ff4cba955b68b9c8b8b0fed8798a8f2e5c4c5a35fa5"
+    }
+  ],
+  "acceptance": {
+    "physics_hz_min": 195.0,
+    "rtf_min": 0.95,
+    "active_lowcmd_seconds_min": 30.0,
+    "fall_detected": false,
+    "instability_resets_max": 0
+  }
+}

@@ -47,6 +47,10 @@ bash scripts/check_env.sh runtime
 *Full offline package: [matrix_0.1.2.zip (Artifactory)](http://192.168.50.40:8081/artifactory/jszrsim/github/matrix_0.1.2.zip) / [Google Drive](https://drive.google.com/file/d/1d4q28AgSwmfv7x07oE-YF8xVOdSva9ll/view?usp=drive_link) / [Baidu Netdisk, code: `jbk3`](https://pan.baidu.com/s/12k5XJwD53ax3we3_1Gulmw?pwd=jbk3).*
 *See [Chunk Packages Guide](docs/CHUNK_PACKAGES_GUIDE.md) for offline/manual installation.*
 
+For the locked G1 SONIC development runtime shared by TRNA and Heyuan, use the
+[two-host runbook](docs/runbook.md). It separates Git-managed source from
+SHA-verified private runtime artifacts and provides one bootstrap/preflight path.
+
 ### 3. Run Simulation
 ```bash
 ./bin/sim_launcher
@@ -74,6 +78,7 @@ To keep this README concise, detailed guides have been organized into the `docs/
 - [Matrix Overworld Adjacent V1](docs/OVERWORLD_ADJACENT_V1_CN.md) - Six-scene SONIC physics composition and its explicit UE visual gate
 - [Matrix SONIC Video Capture](docs/MATRIX_VIDEO_CAPTURE_CN.md) - Native-resolution main-launcher recording with provenance and quality gates
 - [Matrix Urban V1](docs/URBAN_V1_CN.md) - Native Town10 city baseline and URDF-preserved G1 materials
+- [Matrix + SONIC Two-Host Runbook](docs/runbook.md) - Git sync, locked artifacts, bootstrap, and host profiles
 
 **Advanced Features**
 - [🌐 Multi-Robot Tutorial](docs/Multi_Robot_Tutorial.md) - Simulating multiple robots simultaneously

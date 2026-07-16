@@ -16,6 +16,12 @@ GITHUB_REPO="zsibot/matrix"
 GITHUB_RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}"
 TARGET_DIR="${PROJECT_ROOT}/src/UeSim/Linux/zsibot_mujoco_ue"
 PAK_DIR="${TARGET_DIR}/Content/Paks"
+MATRIX_OFFLINE="${MATRIX_OFFLINE:-0}"
+
+case "$MATRIX_OFFLINE" in
+    0|1) ;;
+    *) error_exit "MATRIX_OFFLINE 必须是 0 或 1" ;;
+esac
 
 handle_interrupt() {
     log "收到中断信号，停止安装"
@@ -74,12 +80,16 @@ check_and_install_download_tools() {
     return 1
 }
 
-# 检查下载工具
-check_and_install_download_tools
+if [ "$MATRIX_OFFLINE" = "0" ]; then
+    # 检查下载工具
+    check_and_install_download_tools
 
-# 最终检查：至少需要一个下载工具
-if ! command -v aria2c &> /dev/null && ! command -v axel &> /dev/null && ! command -v wget &> /dev/null && ! command -v curl &> /dev/null; then
-    error_exit "未找到任何下载工具。请安装: sudo apt install aria2 或 sudo apt install wget curl"
+    # 最终检查：至少需要一个下载工具
+    if ! command -v aria2c &> /dev/null && ! command -v axel &> /dev/null && ! command -v wget &> /dev/null && ! command -v curl &> /dev/null; then
+        error_exit "未找到任何下载工具。请安装: sudo apt install aria2 或 sudo apt install wget curl"
+    fi
+else
+    log "离线模式已启用，只使用 releases/ 中经过校验的本地包"
 fi
 
 # 获取代理设置（从 Git 配置）
@@ -240,6 +250,11 @@ download_and_extract_stream() {
         fi
     fi
 
+    if [ "$MATRIX_OFFLINE" = "1" ]; then
+        log "离线模式下禁止下载缺失或损坏的包: $(basename "$final_file")"
+        return 1
+    fi
+
     # 获取代理设置
     local proxy
     proxy="$(get_proxy)"
@@ -392,6 +407,11 @@ download_file() {
     local url=$1
     local output=$2
     log "下载: $(basename "$output")"
+
+    if [ "$MATRIX_OFFLINE" = "1" ]; then
+        log "离线模式下跳过远端下载: $(basename "$output")"
+        return 1
+    fi
 
     if [ -f "${output}.aria2" ] && [ ! -f "$output" ]; then
         log "清理无对应数据文件的 aria2 断点文件: $(basename "${output}.aria2")"
@@ -676,7 +696,12 @@ if [ "$manifest_valid" = true ] && [ -f "$MANIFEST_FILE" ] && command -v jq &> /
 echo "输入要下载的地图（支持数字索引或地图名称，用空格分隔）:"
 echo "  例如: 0 1 2  或  CustomWorld SceneWorld Town10World  或  0 SceneWorld 2"
 echo "  输入 'all' 下载全部，直接回车跳过"
+if [[ -v MATRIX_MAPS ]]; then
+    maps_input="$MATRIX_MAPS"
+    log "使用 MATRIX_MAPS 的非交互选择: ${maps_input:-<none>}"
+else
     read -r maps_input
+fi
 
 SELECTED_MAPS=()
 if [ -z "$maps_input" ]; then
@@ -727,7 +752,17 @@ log "  - 共享资源包: ✓ (默认)"
 log "  - 地图包: ${#SELECTED_MAPS[@]} 个"
 log "=========================================="
 echo ""
-read -p "按回车键开始下载，或 Ctrl+C 取消..." -r
+case "${MATRIX_ASSUME_YES:-0}" in
+    1|true|yes|on)
+        log "MATRIX_ASSUME_YES 已启用，跳过确认提示"
+        ;;
+    0|false|no|off|"")
+        read -p "按回车键开始下载，或 Ctrl+C 取消..." -r
+        ;;
+    *)
+        error_exit "MATRIX_ASSUME_YES 必须是布尔值"
+        ;;
+esac
 echo ""
 
 # ============================================================================

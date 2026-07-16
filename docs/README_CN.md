@@ -43,6 +43,9 @@ bash scripts/check_env.sh runtime
 ```
 *`scripts/run_sim.sh` 和 `scripts/run_custom_urdf.sh` 在启动前会自动执行运行时环境检查。*
 *如果 ROS apt 源访问受限，可使用 `ROS_APT_REPO_URL=<可访问的ros2 apt镜像> bash scripts/install_deps.sh` 指定镜像后重试。*
+
+TRNA 与河源共享的 G1 SONIC 锁定运行时、Git 同步和一键预检流程见
+[双机运行手册](runbook.md)。源码由 Git 管理，大模型和引擎由 SHA256 清单管理。
 *如果网络环境下 aria2/wget 出现 TLS 错误，可使用 `SKIP_ARIA2=1 bash scripts/release_manager/install_chunks.sh 0.1.2` 强制走备用下载路径。*
 *完整离线包：[matrix_0.1.2.zip（Artifactory）](http://192.168.50.40:8081/artifactory/jszrsim/github/matrix_0.1.2.zip) / [Google Drive](https://drive.google.com/file/d/1d4q28AgSwmfv7x07oE-YF8xVOdSva9ll/view?usp=drive_link) / [百度网盘，提取码：`jbk3`](https://pan.baidu.com/s/12k5XJwD53ax3we3_1Gulmw?pwd=jbk3)。*
 *无法访问 GitHub？请参阅 [Chunk Packages 使用指南](CHUNK_PACKAGES_GUIDE_CN.md) 了解离线手动安装方法。*
@@ -74,6 +77,7 @@ bash scripts/check_env.sh runtime
 - [Matrix Overworld 相邻场景 V1](OVERWORLD_ADJACENT_V1_CN.md) - 六场景 SONIC 物理拼接与明确的 UE 视觉门禁
 - [Matrix SONIC 视频录制](MATRIX_VIDEO_CAPTURE_CN.md) - 主启动链路原生分辨率录制、来源记录与质量门禁
 - [Matrix 都市场景 V1](URBAN_V1_CN.md) - 原生 Town10 城市基底与保留 URDF 配色的 G1 材质
+- [Matrix + SONIC 双机运行手册](runbook.md) - Git 同步、锁定资产、bootstrap 与主机 profile
 
 **高级功能**
 - [🌐 多机器人仿真](Multi_Robot_Tutorial.md) - 在同一场景中配置和控制多个机器人
