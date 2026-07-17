@@ -44,8 +44,9 @@ bash scripts/check_env.sh runtime
 *`scripts/run_sim.sh` 和 `scripts/run_custom_urdf.sh` 在启动前会自动执行运行时环境检查。*
 *如果 ROS apt 源访问受限，可使用 `ROS_APT_REPO_URL=<可访问的ros2 apt镜像> bash scripts/install_deps.sh` 指定镜像后重试。*
 
-TRNA 与河源共享的 G1 SONIC 锁定运行时、Git 同步和一键预检流程见
-[双机运行手册](runbook.md)。源码由 Git 管理，大模型和引擎由 SHA256 清单管理。
+ZZA、河源与 TRNA 共享的原生 G1 SONIC 锁定运行时、Git 同步和一键预检流程见
+[多机运行手册](runbook.md)。Matrix 直接调用锁定提交的原始 `gear_sonic`
+仿真/DDS 栈；源码由 Git 管理，大模型和引擎由 SHA256 清单管理。
 *如果网络环境下 aria2/wget 出现 TLS 错误，可使用 `SKIP_ARIA2=1 bash scripts/release_manager/install_chunks.sh 0.1.2` 强制走备用下载路径。*
 *完整离线包：[matrix_0.1.2.zip（Artifactory）](http://192.168.50.40:8081/artifactory/jszrsim/github/matrix_0.1.2.zip) / [Google Drive](https://drive.google.com/file/d/1d4q28AgSwmfv7x07oE-YF8xVOdSva9ll/view?usp=drive_link) / [百度网盘，提取码：`jbk3`](https://pan.baidu.com/s/12k5XJwD53ax3we3_1Gulmw?pwd=jbk3)。*
 *无法访问 GitHub？请参阅 [Chunk Packages 使用指南](CHUNK_PACKAGES_GUIDE_CN.md) 了解离线手动安装方法。*

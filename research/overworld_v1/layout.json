@@ -27,7 +27,8 @@
       0.793
     ],
     "spawn_yaw_rad": 0.0,
-    "walk_vx_mps": 0.25
+    "walk_vx_mps": 0.25,
+    "final_x_min": 128.0
   },
   "scenes": [
     {

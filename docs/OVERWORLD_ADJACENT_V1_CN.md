@@ -10,6 +10,11 @@
 
 ## 验收状态
 
+> 2026-07-17：启动入口已迁移为 Matrix 直接调用原始 `gear_sonic` 的
+> `create_simulator()/step_once()`，不再经过 AndroidTwin。下表和后文的
+> 2026-07-15 动态结果来自旧链路，只保留为回归对照；原生 SONIC direct-v2
+> 仍需按最终 Matrix/SONIC commit 重新验收。
+
 | 层 | 状态 | 证据 |
 | --- | --- | --- |
 | 六场景 MuJoCo 物理拼接 | 通过 | 1404 个环境 geom、1 张共享地面、无包围盒重叠 |
@@ -56,13 +61,18 @@ TRNA 上使用现有 `matrix-sonic-eval` tmux：
 
 ```bash
 cd /home/trna/matrix-eval
-bash scripts/run_matrix_sonic_overworld_v1.sh
+bash scripts/run_matrix_sonic_overworld_v1.sh --profile trna
 ```
 
 默认从 Town10 到 Warehouse 的连接口内侧启动，等 SONIC lowcmd 生效 2 秒后以
-`0.25 m/s` 向东行走，默认 smoke 为 70 秒；验收要求机器人根位置从 `x=124`
-越过 Warehouse 西边界 `x=128`。该入口明确传入 `--no-render-sync`，状态写入
-`outputs/matrix_overworld_v1_status.json`。物理模型和组合 manifest 写入
+`0.25 m/s` 向东行走，默认 smoke 为 70 秒；验收复用 runtime lock 的 fresh
+lowcmd、持续时长、物理频率、RTF、位移和 reset 门禁，并要求机器人根位置从
+`x=124` 正向移动至少 4 米并越过 Warehouse 西边界 `x=128`，横向或反方向移动
+不能通过。bounded 验收只接受已提交的 canonical layout、锁定出生点和通过 runtime
+verifier 的 host profile；自定义 layout/spawn 不再是该入口的验收参数。初始位姿在生成阶段写入组合后的 SONIC XML，
+运行时不再直接修改原生 simulator 的 qpos。该入口明确传入 `--no-render-sync`，状态写入
+`outputs/matrix_overworld_v1_status.json`，并记录 `runtime_verified`、profile、Matrix
+commit、runtime lock SHA 与 layout SHA。物理模型和组合 manifest 写入
 `outputs/runtime/matrix_overworld_v1/`。
 
 2026-07-15 的最终 TRNA 运行正常退出：总墙钟 70 秒，MuJoCo 稳态

@@ -1,5 +1,24 @@
 # Matrix 原生场景与 SONIC 集成审计
 
+## 2026-07-17 原生 SONIC 直连迁移
+
+本文后续章节保留 2026-07-15 至 2026-07-17 的历史验收事实；其中
+AndroidTwin `FusedSink` 和 UDP/DDS bridge 是旧 `matrix-sonic-v1` 基线，不再是
+活动架构。新架构由 Matrix 直接调用原始 `GR00T-WholeBodyControl/gear_sonic`：
+
+```text
+Matrix planner/PICO --ZMQ--> SONIC deploy --DDS lowcmd/lowstate--> gear_sonic MuJoCo
+                                                        |
+                                      Matrix UE 9999 状态同步与验收
+```
+
+原始 SONIC 的最终候选 API 提交为
+`de083d71af8346b0124ab1ae79fd3623b52c3c9b`，提供外部 `robot_scene`、
+`create_simulator()`、`step_once()`、body-only 29-actuator 合同、fresh lowcmd
+年龄，以及权威 `fall_detected/reset_count/last_reset_reason` 快照；ElasticBand
+按首次 fresh lowcmd 后 hold/fade。活动 lock 已升级为 `matrix-sonic-native-v2`。在 ZZA、
+Heyuan、TRNA 完成新链路运行验收前，旧 v1 结果只作为回滚对照，不能冒充新架构证据。
+
 ## 范围
 
 本审计只评估 Matrix 0.1.2 自带的原生地图，不导入 AUE 当前的

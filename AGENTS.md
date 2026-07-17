@@ -3,6 +3,11 @@
 ## Source Of Truth
 
 - The canonical repository is `https://github.com/amithyst/matrix`.
+- Native control and MuJoCo execution come directly from the original private
+  `GR00T-WholeBodyControl`/`gear_sonic` repository at the commit pinned by the
+  runtime lock. Host defaults point to clean Git checkouts; an archived source
+  snapshot is only an offline deployment mirror. Do not copy AndroidTwin control
+  code or restore its UDP/DDS bridge.
 - `main` is the stable integration branch. Use short-lived feature branches on
   TRNA, Heyuan, and ZZA; do not create long-lived machine-specific branches.
 - Runtime binaries, models, release archives, generated robot files, logs, and
@@ -10,7 +15,8 @@
 
 ## Reproducible Runtime
 
-- `config/runtime/matrix-sonic.lock.json` is the version and SHA256 authority.
+- `config/runtime/matrix-sonic.lock.json` is the Matrix asset, native SONIC
+  commit, inference ABI, and SHA256 authority.
 - `config/hosts/trna.env`, `config/hosts/heyuan.env`, and
   `config/hosts/zza.env` contain non-secret host defaults. Put local overrides
   in `.matrix/local.env`.

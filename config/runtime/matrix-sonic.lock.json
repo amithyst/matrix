@@ -1,9 +1,9 @@
 {
-  "schema_version": 1,
-  "runtime_id": "matrix-sonic-v1",
+  "schema_version": 2,
+  "runtime_id": "matrix-sonic-native-v2",
   "source": {
     "repository": "https://github.com/amithyst/matrix",
-    "base_commit": "b268d604fca57af1495b1e5941e08f02e73598a6"
+    "base_commit": "6609ad59e65b8a360b0de288d126477ea6034c34"
   },
   "matrix_release": {
     "version": "0.1.2",
@@ -43,18 +43,40 @@
   },
   "python": {
     "version": "3.10",
+    "soabi": "cpython-310-x86_64-linux-gnu",
+    "machine": "x86_64",
     "requirements": "research/sonic_integration/requirements-trna.txt",
-    "wheelhouse_manifest_sha256": "579068ca7842f1a600314eb05a1df0c4be30b0582b8c81f08ed328885786eb8e",
-    "mujoco": "3.3.0",
-    "urdf2mjcf": "0.1.3"
+    "requirements_sha256": "37cee2b833328bd6dcb5b45038d9bc1b5daa1533917b7684f2da757de9f2a7b0",
+    "wheelhouse_manifest_sha256": "1044d7c4e04648ef2e58a87b201b247082d4a8ec2bcc265611d5e3a344c8304b",
+    "mujoco": "3.10.0"
+  },
+  "pico": {
+    "delivery": "external-controlled-environment",
+    "python_version": "3.10",
+    "python_soabi": "cpython-310-x86_64-linux-gnu",
+    "machine": "x86_64",
+    "distribution": "xrobotoolkit-sdk",
+    "version": "1.0.2",
+    "wheel_filename": "xrobotoolkit_sdk-1.0.2-cp310-cp310-linux_x86_64.whl",
+    "wheel_sha256": "6dda05341c23bcf1986148324fa86ce07b972705645b5582838259fe4ce1287c",
+    "runtime_overlay": "external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib/libPXREARobotSDK.so",
+    "runtime_overlay_sha256": "2348e1b0bf7f05cd13d95d628f04237b6b9fc50c6008b82f9bf4b046fc9373e6"
   },
   "source_revisions": {
-    "aue_sim": {
-      "commit": "dde7746b989ec6c3554f0f7b89e513b8abf2d359"
-    },
     "gr00t_whole_body_control": {
       "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/GR00T-WholeBodyControl.git",
-      "commit": "34b1c75be600b0a2df17001a32fc8dc213d0cc5c"
+      "commit": "de083d71af8346b0124ab1ae79fd3623b52c3c9b",
+      "critical_source_paths": [
+        "gear_sonic/scripts/run_sim_loop.py",
+        "gear_sonic/utils/mujoco_sim/configs.py",
+        "gear_sonic/utils/mujoco_sim/base_sim.py",
+        "gear_sonic/utils/mujoco_sim/simulator_factory.py",
+        "gear_sonic/utils/mujoco_sim/unitree_sdk2py_bridge.py",
+        "gear_sonic/utils/teleop/zmq/zmq_planner_sender.py",
+        "gear_sonic/scripts/pico_manager_thread_server.py",
+        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
+        "gear_sonic_deploy/policy/release/observation_config.yaml"
+      ]
     }
   },
   "inference": {
@@ -62,61 +84,96 @@
     "tensorrt_api_version": 101303,
     "onnxruntime_version": "1.16.3"
   },
-  "bridge": {
-    "build_baseline": "Ubuntu 22.04 x86_64",
-    "max_required_glibc": "2.34",
-    "max_required_glibcxx": "3.4.29"
-  },
   "runtime_files": [
     {
-      "root": "aue",
-      "path": "src/androidtwin/control/sonic_sim/fused_sink.py",
-      "sha256": "70cf1a0669540acd1a5557fc17afd232942f4d56ebbc53ee5b7d4bda51a53c0b"
+      "root": "sonic",
+      "path": "gear_sonic/scripts/run_sim_loop.py",
+      "sha256": "7406dcd7c66dc4c64594f93096b477c65ff215bdc5cd2600ec4ee32f717120dd"
     },
     {
-      "root": "aue",
-      "path": "scripts/g1_sonic_sim_udp_dds_bridge.cpp",
-      "sha256": "b71c50b123a0f299ac74c669553342878dcb199cdc5f9131a056c0b37e543b9d"
+      "root": "sonic",
+      "path": "gear_sonic/utils/mujoco_sim/configs.py",
+      "sha256": "e07d6b9f128c32c9f37e24aa12ef73a1d7e8789d9c97347f2aa0d5df21b1577d"
     },
     {
-      "root": "gear",
+      "root": "sonic",
+      "path": "gear_sonic/utils/mujoco_sim/base_sim.py",
+      "sha256": "675772ddf30f1e63dc69d5c02cbefaccb77013114422b057245054f5f6a5dfaf"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/utils/mujoco_sim/simulator_factory.py",
+      "sha256": "b503df6c15ad7ac5411167be75265b63232f1e0efabedd2547e8a6c117728e29"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/utils/mujoco_sim/unitree_sdk2py_bridge.py",
+      "sha256": "b1f38bbaa584c4754a7d04384e08c469e1c2d167990ea920ad4e5384f7046359"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/utils/teleop/zmq/zmq_planner_sender.py",
+      "sha256": "b29b26f1ea7b707bcd31fb84101129163fe21c00a8181f9333a6198f66f53217"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/scripts/pico_manager_thread_server.py",
+      "sha256": "11bf33d33d39e7aadaf3bb6c15a799f259b2328e9debd9f93bcb457e45db255d"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
+      "sha256": "00b4e3d74fcc4a63aae8cc26466a99c33eaa1e6683f2858b059486d9a0f147b5"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic_deploy/policy/release/observation_config.yaml",
+      "sha256": "466d05947c78af6c76388adfb86e3a2a77b2a1d921a64883ed3d085ebf58de1b"
+    },
+    {
+      "root": "sonic",
       "path": "gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
       "sha256": "bf9b2362ed750b6b3f67c33197517474cd18a331d7e3d1c652cfdd740203c21e"
     },
     {
-      "root": "gear",
+      "root": "sonic",
       "path": "gear_sonic_deploy/policy/release/model_encoder.onnx",
       "sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
     },
     {
-      "root": "gear",
+      "root": "sonic",
       "path": "gear_sonic_deploy/policy/release/model_decoder.onnx",
       "sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
     },
     {
-      "root": "gear",
+      "root": "sonic",
       "path": "gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx",
       "sha256": "39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea"
     },
     {
-      "root": "gear",
+      "root": "sonic",
       "path": "gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml",
       "sha256": "978421e9c7f42cf58a7bf74ab15e8fedb6ae5907ff85b83263d86f5a4d48d31f"
     },
     {
-      "root": "gear",
+      "root": "sonic",
       "path": "gear_sonic_deploy/thirdparty/unitree_sdk2/lib/x86_64/libunitree_sdk2.a",
       "sha256": "c1c784a9a727715c8c73b6214697d976d5b81e240aa781bdf5cb63b0184e9678"
+    },
+    {
+      "root": "sonic",
+      "path": "external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib/libPXREARobotSDK.so",
+      "sha256": "2348e1b0bf7f05cd13d95d628f04237b6b9fc50c6008b82f9bf4b046fc9373e6"
+    },
+    {
+      "root": "sonic",
+      "path": "external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib/aarch64/libPXREARobotSDK.so",
+      "sha256": "e50fd4d5194e545414442da59f699266433c74ee56f00f2d4f91b1871718c1d4"
     },
     {
       "root": "visual",
       "path": "g1_29dof.urdf",
       "sha256": "56d0c7b4e44351ee8e89e7b1f1fcc8b02d5ec5cd191e43239d2b06f039e75860"
-    },
-    {
-      "root": "bridge",
-      "path": "g1_sonic_sim_udp_dds_bridge_accepted",
-      "sha256": "ca765ea25b2956a080af6d9f0aa6ba7ebe5e3038daeb78381f0d02b4e099bcc9"
     },
     {
       "root": "inference",
@@ -144,10 +201,29 @@
       "sha256": "ce3752ba35018ee6d8127ff4cba955b68b9c8b8b0fed8798a8f2e5c4c5a35fa5"
     }
   ],
+  "runtime_trees": [
+    {
+      "root": "sonic",
+      "path": "gear_sonic/data/robot_model/model_data/g1/meshes",
+      "sha256": "22a236aa7927c5e940e9378ad5fb95927ee0a3c04b987b8849fb022db59a785b"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic_deploy/thirdparty/unitree_sdk2/thirdparty/lib/x86_64",
+      "sha256": "0aa8e679307aebc41d9112a49fd575626f67c169ec4ae4825f9da4aee35c3ca4"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic_deploy/reference/example",
+      "sha256": "72306b8c835773b81db1c4287553ebcb154ca2abae0a3510a8d7d23848a9db51"
+    }
+  ],
   "acceptance": {
     "physics_hz_min": 195.0,
     "rtf_min": 0.95,
+    "low_cmd_fresh_timeout_seconds": 0.1,
     "active_lowcmd_seconds_min": 30.0,
+    "root_displacement_xy_min_m": 0.5,
     "fall_detected": false,
     "instability_resets_max": 0
   }

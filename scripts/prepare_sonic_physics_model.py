@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -19,7 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from compose_custom_scene import compose_custom_scene  # noqa: E402
 
 
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 G1_BODY_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -81,6 +82,8 @@ def _source_contract(
     native_scene: Path,
     *,
     body_joint_names: tuple[str, ...],
+    spawn_xyz: tuple[float, float, float] | None,
+    spawn_yaw: float | None,
 ) -> dict[str, object]:
     return {
         "pipeline_version": PIPELINE_VERSION,
@@ -91,6 +94,8 @@ def _source_contract(
         "native_scene": str(native_scene.resolve()),
         "native_scene_sha256": _file_sha256(native_scene),
         "body_joint_names": list(body_joint_names),
+        "spawn_xyz": list(spawn_xyz) if spawn_xyz is not None else None,
+        "spawn_yaw_rad": spawn_yaw,
     }
 
 
@@ -99,6 +104,8 @@ def _strip_non_body_joints(
     output_model: Path,
     *,
     body_joint_names: tuple[str, ...],
+    spawn_xyz: tuple[float, float, float] | None,
+    spawn_yaw: float | None,
 ) -> tuple[str, ...]:
     try:
         tree = ET.parse(canonical_model)
@@ -127,6 +134,31 @@ def _strip_non_body_joints(
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise SonicPhysicsModelError("canonical SONIC model has no worldbody")
+    if spawn_xyz is not None or spawn_yaw is not None:
+        root_body = next(
+            (
+                body
+                for body in worldbody.iter("body")
+                if any(
+                    child.tag == "freejoint"
+                    or (child.tag == "joint" and child.get("type") == "free")
+                    for child in list(body)
+                )
+            ),
+            None,
+        )
+        if root_body is None:
+            raise SonicPhysicsModelError(
+                "canonical SONIC model has no body with a free root joint"
+            )
+        if spawn_xyz is not None:
+            root_body.set("pos", " ".join(f"{value:.12g}" for value in spawn_xyz))
+        if spawn_yaw is not None:
+            root_body.set(
+                "quat",
+                f"{math.cos(spawn_yaw / 2.0):.12g} 0 0 "
+                f"{math.sin(spawn_yaw / 2.0):.12g}",
+            )
     for parent in worldbody.iter():
         for child in list(parent):
             if child.tag != "joint":
@@ -202,6 +234,8 @@ def prepare_sonic_physics_model(
     output_dir: Path,
     *,
     body_joint_names: tuple[str, ...] = G1_BODY_JOINT_NAMES,
+    spawn_xyz: tuple[float, float, float] | None = None,
+    spawn_yaw: float | None = None,
 ) -> Path:
     canonical_model = canonical_model.resolve()
     canonical_meshes = canonical_meshes.resolve()
@@ -215,12 +249,27 @@ def prepare_sonic_physics_model(
         raise SonicPhysicsModelError(f"Matrix native scene is missing: {native_scene}")
     if not body_joint_names:
         raise SonicPhysicsModelError("body joint contract must not be empty")
+    if spawn_xyz is not None and (
+        len(spawn_xyz) != 3
+        or not all(math.isfinite(float(value)) for value in spawn_xyz)
+    ):
+        raise SonicPhysicsModelError("spawn_xyz must contain three finite values")
+    if spawn_yaw is not None and not math.isfinite(float(spawn_yaw)):
+        raise SonicPhysicsModelError("spawn_yaw must be finite")
+    normalized_spawn_xyz = (
+        tuple(float(value) for value in spawn_xyz)
+        if spawn_xyz is not None
+        else None
+    )
+    normalized_spawn_yaw = float(spawn_yaw) if spawn_yaw is not None else None
 
     contract = _source_contract(
         canonical_model,
         canonical_meshes,
         native_scene,
         body_joint_names=body_joint_names,
+        spawn_xyz=normalized_spawn_xyz,
+        spawn_yaw=normalized_spawn_yaw,
     )
     manifest_path = output_dir / "manifest.json"
     scene_path = output_dir / native_scene.name
@@ -247,6 +296,8 @@ def prepare_sonic_physics_model(
             canonical_model,
             temporary_dir / "robot.xml",
             body_joint_names=body_joint_names,
+            spawn_xyz=normalized_spawn_xyz,
+            spawn_yaw=normalized_spawn_yaw,
         )
         compose_custom_scene(
             native_scene,
@@ -275,17 +326,33 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--canonical-meshes", type=Path, required=True)
     parser.add_argument("--native-scene", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--spawn-x", type=float)
+    parser.add_argument("--spawn-y", type=float)
+    parser.add_argument("--spawn-z", type=float)
+    parser.add_argument("--spawn-yaw", type=float)
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
+    spawn_components = (args.spawn_x, args.spawn_y, args.spawn_z)
+    if any(value is not None for value in spawn_components) and not all(
+        value is not None for value in spawn_components
+    ):
+        raise SystemExit("[ERROR] --spawn-x, --spawn-y, and --spawn-z must be set together")
+    spawn_xyz = (
+        tuple(float(value) for value in spawn_components)
+        if all(value is not None for value in spawn_components)
+        else None
+    )
     try:
         scene = prepare_sonic_physics_model(
             args.canonical_model,
             args.canonical_meshes,
             args.native_scene,
             args.output_dir,
+            spawn_xyz=spawn_xyz,
+            spawn_yaw=args.spawn_yaw,
         )
     except SonicPhysicsModelError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc

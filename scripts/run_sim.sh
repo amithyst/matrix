@@ -134,6 +134,8 @@ PIDS=()
 WATCHDOG_PID=""
 FORCED_CLEANUP_PID=""
 SONIC_PID=""
+RUN_SIM_PARENT_PID="${MATRIX_SONIC_LAUNCHER_PID:-$PPID}"
+CLEANUP_STARTED=0
 
 schedule_forced_cleanup() {
     (
@@ -147,15 +149,22 @@ schedule_forced_cleanup() {
 }
 
 start_parent_watchdog() {
-    local parent_pid="$$"
+    local run_sim_pid="$$"
+    local launcher_pid="$RUN_SIM_PARENT_PID"
     (
         trap 'exit 0' TERM INT
         trap '' HUP
-        while kill -0 "${parent_pid}" 2>/dev/null; do
+        while kill -0 "${run_sim_pid}" 2>/dev/null \
+            && kill -0 "${launcher_pid}" 2>/dev/null; do
             sleep 1
         done
 
-        echo "[INFO] Parent launcher process exited unexpectedly, cleaning child processes..."
+        if kill -0 "${run_sim_pid}" 2>/dev/null; then
+            echo "[INFO] Top-level launcher exited unexpectedly; stopping run_sim..."
+            kill -TERM "${run_sim_pid}" 2>/dev/null || true
+            exit 0
+        fi
+        echo "[INFO] run_sim exited unexpectedly, cleaning known child processes..."
         schedule_forced_cleanup
         kill_known_processes TERM
     ) &
@@ -170,6 +179,10 @@ stop_parent_watchdog() {
 }
 
 cleanup() {
+    if [[ "$CLEANUP_STARTED" == "1" ]]; then
+        return
+    fi
+    CLEANUP_STARTED=1
     echo "[INFO] ===== Cleaning up processes ====="
 
     stop_parent_watchdog
@@ -186,10 +199,12 @@ cleanup() {
     # 2. 兜底清理（仅限本项目）
     kill_known_processes TERM
 
-    # Give the SONIC Python runtime time to close its exact deploy/bridge
+    # Give the SONIC Python runtime time to close its exact native deploy/PICO
     # children. Never pattern-kill those names: TRNA may also host a real robot.
     local attempt
-    for ((attempt = 0; attempt < 50; attempt++)); do
+    # NativeProcessGroup can spend about nine seconds on native stop, TERM, and
+    # KILL before closing the renderer/simulator. Leave a clear outer margin.
+    for ((attempt = 0; attempt < 150; attempt++)); do
         local any_alive=0
         for pid in "${PIDS[@]:-}"; do
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -217,7 +232,20 @@ cleanup() {
 
     echo "[INFO] ===== Cleanup finished ====="
 }
-trap cleanup EXIT SIGINT SIGTERM SIGHUP
+
+handle_signal() {
+    local exit_code="$1"
+    if [[ "$CLEANUP_STARTED" == "1" ]]; then
+        return
+    fi
+    cleanup
+    exit "$exit_code"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 130' SIGINT
+trap 'handle_signal 143' SIGTERM
+trap 'handle_signal 129' SIGHUP
 start_parent_watchdog
 
 #######################################
@@ -436,7 +464,7 @@ case "${MATRIX_SONIC,,}" in
             echo "[ERROR] MATRIX_SONIC requires MuJoCo mode to be enabled" >&2
             exit 1
         fi
-        echo "[INFO] External AndroidTwin/SONIC MuJoCo driver enabled"
+        echo "[INFO] Native gear_sonic MuJoCo/DDS driver enabled"
         ;;
     0|false|no|off|"")
         MATRIX_SONIC_ENABLED=false
@@ -594,16 +622,16 @@ sleep 7
 
 if $MATRIX_SONIC_ENABLED; then
     MATRIX_SONIC_PYTHON="${MATRIX_SONIC_PYTHON:-python3}"
-    MATRIX_AUE_ROOT="${MATRIX_AUE_ROOT:-}"
-    MATRIX_GEAR_SONIC_ROOT="${MATRIX_GEAR_SONIC_ROOT:-}"
+    MATRIX_SONIC_ROOT="${MATRIX_SONIC_ROOT:-}"
     MATRIX_UNITREE_SDK2_ROOT="${MATRIX_UNITREE_SDK2_ROOT:-}"
-    MATRIX_SONIC_CANONICAL_MODEL="${MATRIX_SONIC_CANONICAL_MODEL:-$MATRIX_GEAR_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml}"
-    MATRIX_SONIC_CANONICAL_MESHES="${MATRIX_SONIC_CANONICAL_MESHES:-$MATRIX_GEAR_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/meshes}"
+    MATRIX_SONIC_CANONICAL_MODEL="${MATRIX_SONIC_CANONICAL_MODEL:-$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml}"
+    MATRIX_SONIC_CANONICAL_MESHES="${MATRIX_SONIC_CANONICAL_MESHES:-$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/meshes}"
     for required in \
         "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
-        "$MATRIX_AUE_ROOT/src/androidtwin/control/sonic_sim/fused_sink.py" \
-        "$MATRIX_GEAR_SONIC_ROOT/gear_sonic_deploy/target/release/g1_deploy_onnx_ref" \
+        "$MATRIX_SONIC_ROOT/gear_sonic/scripts/run_sim_loop.py" \
+        "$MATRIX_SONIC_ROOT/gear_sonic/utils/mujoco_sim/base_sim.py" \
+        "$MATRIX_SONIC_ROOT/gear_sonic_deploy/target/release/g1_deploy_onnx_ref" \
         "$MATRIX_SONIC_CANONICAL_MODEL" \
         "$MATRIX_UNITREE_SDK2_ROOT/lib/x86_64/libunitree_sdk2.a"; do
         if [[ ! -f "$required" ]]; then
@@ -623,6 +651,7 @@ if $MATRIX_SONIC_ENABLED; then
         --native-scene "$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/xgb/$SCENE" \
         --output-dir "$SONIC_PHYSICS_DIR"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
+    rm -f -- "$SONIC_STATUS_FILE"
     SONIC_STARTUP_ARGS=()
     SONIC_STARTUP_BAND_VALUE="${MATRIX_SONIC_STARTUP_BAND:-1}"
     case "${SONIC_STARTUP_BAND_VALUE,,}" in
@@ -645,21 +674,39 @@ if $MATRIX_SONIC_ENABLED; then
     if [[ "${MATRIX_SONIC_MIN_ACTIVE_SECONDS:-0}" != "0" ]]; then
         SONIC_ACCEPTANCE_ARGS+=(--min-active-seconds "${MATRIX_SONIC_MIN_ACTIVE_SECONDS}")
     fi
-    echo "[INFO] Starting external AndroidTwin/SONIC MuJoCo runtime"
+    if [[ "${MATRIX_SONIC_MIN_DISPLACEMENT_M:-0}" != "0" ]]; then
+        SONIC_ACCEPTANCE_ARGS+=(--min-displacement-m "${MATRIX_SONIC_MIN_DISPLACEMENT_M}")
+    fi
+    SONIC_QUALIFICATION_ARGS=()
+    if [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]]; then
+        SONIC_QUALIFICATION_ARGS+=(
+            --qualified-runtime
+            --qualification-profile "${MATRIX_SONIC_QUALIFICATION_PROFILE}"
+            --runtime-lock-sha256 "${MATRIX_SONIC_RUNTIME_LOCK_SHA256}"
+            --matrix-commit "${MATRIX_SONIC_MATRIX_COMMIT}"
+            --verification-receipt "${MATRIX_SONIC_VERIFICATION_RECEIPT}"
+        )
+    fi
+    echo "[INFO] Starting native gear_sonic MuJoCo/DDS runtime"
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         --model "$SONIC_PHYSICS_DIR/$SCENE" \
-        --aue-root "$MATRIX_AUE_ROOT" \
-        --gear-sonic-root "$MATRIX_GEAR_SONIC_ROOT" \
-        --unitree-sdk-root "$MATRIX_UNITREE_SDK2_ROOT" \
+        --sonic-root "$MATRIX_SONIC_ROOT" \
         --control-source "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" \
-        --planner-bind "${MATRIX_SONIC_PLANNER_BIND:-tcp://0.0.0.0:5556}" \
+        --planner-bind "${MATRIX_SONIC_PLANNER_BIND:-tcp://127.0.0.1:5556}" \
+        --pico-python "${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}" \
+        --expected-parent-pid "$$" \
         --physics-hz "${MATRIX_SONIC_PHYSICS_HZ:-200}" \
         --walk-after "${MATRIX_SONIC_WALK_AFTER:--1}" \
         --vx "${MATRIX_SONIC_VX:-0.30}" \
         --vy "${MATRIX_SONIC_VY:-0.0}" \
         --yaw-rate "${MATRIX_SONIC_YAW_RATE:-0.0}" \
         --max-seconds "${MATRIX_SONIC_MAX_SECONDS:-0}" \
+        --low-cmd-fresh-timeout-seconds "${MATRIX_SONIC_LOW_CMD_FRESH_TIMEOUT_SECONDS:-0.1}" \
+        --min-physics-hz "${MATRIX_SONIC_MIN_PHYSICS_HZ:-195}" \
+        --min-rtf "${MATRIX_SONIC_MIN_RTF:-0.95}" \
+        --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
+        "${SONIC_QUALIFICATION_ARGS[@]}" \
         "${SONIC_STARTUP_ARGS[@]}" \
         --startup-band-hold "${MATRIX_SONIC_STARTUP_BAND_HOLD:-4}" \
         --startup-band-fade "${MATRIX_SONIC_STARTUP_BAND_FADE:-3}" \

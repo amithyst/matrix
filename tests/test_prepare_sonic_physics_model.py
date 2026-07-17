@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,7 +32,7 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             canonical.write_text(
                 """<mujoco><compiler meshdir="meshes" />
 <asset><mesh name="body" file="body.stl" /></asset>
-<worldbody><body name="pelvis"><joint name="floating" type="free" />
+<worldbody><body name="pelvis"><freejoint name="floating" />
 <joint name="joint_a" /><joint name="joint_b" /><body name="finger">
 <joint name="finger_joint" /></body></body></worldbody>
 <actuator><motor name="a" joint="joint_a" /><motor name="b" joint="joint_b" />
@@ -62,8 +64,9 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             )
             self.assertEqual(
                 [item.get("name") for item in robot.iter("joint")],
-                ["floating", "joint_a", "joint_b"],
+                ["joint_a", "joint_b"],
             )
+            self.assertEqual(robot.find("worldbody/body/freejoint").get("name"), "floating")
             self.assertEqual(
                 [item.get("joint") for item in robot.find("sensor")],
                 ["joint_a"],
@@ -71,6 +74,27 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             self.assertEqual(ET.parse(output_scene).getroot().find("include").get("file"), "robot.xml")
             self.assertTrue((output / "meshes" / "body.stl").is_file())
             self.assertTrue((output / "height.png").is_file())
+
+            MODULE.prepare_sonic_physics_model(
+                canonical,
+                meshes,
+                scene,
+                output,
+                body_joint_names=("joint_a", "joint_b"),
+                spawn_xyz=(124.0, -105.05, 0.793),
+                spawn_yaw=math.pi / 2.0,
+            )
+            root_body = ET.parse(output / "robot.xml").getroot().find(
+                "worldbody/body"
+            )
+            self.assertEqual(root_body.get("pos"), "124 -105.05 0.793")
+            quaternion = [float(value) for value in root_body.get("quat").split()]
+            self.assertAlmostEqual(quaternion[0], math.sqrt(0.5))
+            self.assertEqual(quaternion[1:3], [0.0, 0.0])
+            self.assertAlmostEqual(quaternion[3], math.sqrt(0.5))
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["spawn_xyz"], [124.0, -105.05, 0.793])
+            self.assertAlmostEqual(manifest["spawn_yaw_rad"], math.pi / 2.0)
 
 
 if __name__ == "__main__":

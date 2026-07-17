@@ -13,6 +13,7 @@ WRITE_LOCAL_ENV=0
 SKIP_ASSETS=0
 SKIP_PYTHON=0
 VERIFY_ONLY=0
+AUDIT_VENV="$PROJECT_ROOT/.venv-audit"
 
 usage() {
     cat <<'EOF'
@@ -70,12 +71,85 @@ fi
 # shellcheck disable=SC1090
 source "$PROFILE_FILE"
 
-RUNTIME_ROOT="${RUNTIME_OVERRIDE:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-v1}}"
+RUNTIME_ROOT="${RUNTIME_OVERRIDE:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-native-v2}}"
 RUNTIME_ROOT="$(realpath -m "$RUNTIME_ROOT")"
+MATRIX_SONIC_ROOT="${MATRIX_SONIC_ROOT:-$RUNTIME_ROOT/GR00T-WholeBodyControl}"
+MATRIX_SONIC_ROOT="$(realpath -m "$MATRIX_SONIC_ROOT")"
 if [[ -n "$RELEASE_CACHE" ]]; then
     RELEASE_CACHE="$(realpath -m "$RELEASE_CACHE")"
 fi
 LOCK_FILE="$PROJECT_ROOT/config/runtime/matrix-sonic.lock.json"
+for required_command in python3 sha256sum; do
+    command -v "$required_command" >/dev/null || {
+        echo "[ERROR] Required bootstrap command is unavailable: $required_command" >&2
+        exit 1
+    }
+done
+python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" \
+    --lock "$LOCK_FILE" \
+    --schema-only
+mapfile -t LOCK_PYTHON_METADATA < <(python3 - "$LOCK_FILE" "$PROJECT_ROOT" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+lock_path = Path(sys.argv[1]).resolve()
+project_root = Path(sys.argv[2]).resolve()
+lock_bytes = lock_path.read_bytes()
+lock = json.loads(lock_bytes)
+python_lock = lock["python"]
+requirements = (project_root / python_lock["requirements"]).resolve()
+if not requirements.is_relative_to(project_root):
+    raise SystemExit("python.requirements escapes the Matrix project")
+requirements_bytes = requirements.read_bytes()
+digest = hashlib.sha256()
+digest.update(lock_bytes)
+digest.update(b"\0")
+digest.update(requirements_bytes)
+print(requirements)
+print(python_lock["requirements_sha256"])
+print(digest.hexdigest())
+print(python_lock["version"])
+PY
+)
+if [[ "${#LOCK_PYTHON_METADATA[@]}" != "4" ]]; then
+    echo "[ERROR] Failed to read Python metadata from runtime lock" >&2
+    exit 1
+fi
+REQUIREMENTS_FILE="${LOCK_PYTHON_METADATA[0]}"
+EXPECTED_REQUIREMENTS_SHA256="${LOCK_PYTHON_METADATA[1]}"
+EXPECTED_VENV_DIGEST="${LOCK_PYTHON_METADATA[2]}"
+LOCKED_PYTHON_VERSION="${LOCK_PYTHON_METADATA[3]}"
+actual_requirements_sha256="$(sha256sum "$REQUIREMENTS_FILE" | awk '{print $1}')"
+if [[ "$actual_requirements_sha256" != "$EXPECTED_REQUIREMENTS_SHA256" ]]; then
+    echo "[ERROR] Python requirements SHA256 does not match runtime lock" >&2
+    echo "[ERROR] expected=$EXPECTED_REQUIREMENTS_SHA256 actual=$actual_requirements_sha256" >&2
+    exit 1
+fi
+
+select_runtime_python() {
+    if [[ -n "${MATRIX_SONIC_PYTHON:-}" ]]; then
+        RUNTIME_PYTHON="$MATRIX_SONIC_PYTHON"
+    elif [[ -x "$AUDIT_VENV/bin/python" ]]; then
+        RUNTIME_PYTHON="$AUDIT_VENV/bin/python"
+    else
+        echo "[ERROR] No actual runtime Python is available; set MATRIX_SONIC_PYTHON or bootstrap .venv-audit" >&2
+        exit 1
+    fi
+    if [[ "$RUNTIME_PYTHON" == "$AUDIT_VENV/bin/python" ]]; then
+        local digest_marker="$AUDIT_VENV/.matrix-lock-requirements.sha256"
+        local actual_digest=""
+        if [[ -f "$digest_marker" ]]; then
+            actual_digest="$(<"$digest_marker")"
+        fi
+        if [[ "$actual_digest" != "$EXPECTED_VENV_DIGEST" ]]; then
+            echo "[ERROR] .venv-audit does not match the current runtime lock; rerun without --skip-python" >&2
+            exit 1
+        fi
+    fi
+}
+
 mkdir -p "$PROJECT_ROOT/outputs/logs" "$PROJECT_ROOT/releases" "$(dirname "$RUNTIME_ROOT")"
 
 if [[ "$VERIFY_ONLY" != "1" ]]; then
@@ -94,17 +168,31 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
 
     if [[ "$SKIP_PYTHON" != "1" ]]; then
         BOOTSTRAP_PYTHON="${MATRIX_BOOTSTRAP_PYTHON:-python3}"
-        AUDIT_VENV="$PROJECT_ROOT/.venv-audit"
         EXTERNAL_PIP_MARKER="$AUDIT_VENV/.matrix-external-pip"
+        VENV_DIGEST_MARKER="$AUDIT_VENV/.matrix-lock-requirements.sha256"
         if ! command -v "$BOOTSTRAP_PYTHON" >/dev/null; then
             echo "[ERROR] Bootstrap interpreter is unavailable: $BOOTSTRAP_PYTHON" >&2
             exit 1
         fi
-        expected_python="$($BOOTSTRAP_PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        bootstrap_python_version="$($BOOTSTRAP_PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        if [[ "$bootstrap_python_version" != "$LOCKED_PYTHON_VERSION" ]]; then
+            echo "[ERROR] Bootstrap Python does not match runtime lock: expected=$LOCKED_PYTHON_VERSION actual=$bootstrap_python_version" >&2
+            exit 1
+        fi
+        if [[ -x "$AUDIT_VENV/bin/python" ]]; then
+            actual_venv_digest=""
+            if [[ -f "$VENV_DIGEST_MARKER" ]]; then
+                actual_venv_digest="$(<"$VENV_DIGEST_MARKER")"
+            fi
+            if [[ "$actual_venv_digest" != "$EXPECTED_VENV_DIGEST" ]]; then
+                echo "[INFO] Recreating .venv-audit: runtime lock or requirements changed"
+                rm -rf "$AUDIT_VENV"
+            fi
+        fi
         if [[ -x "$AUDIT_VENV/bin/python" ]]; then
             actual_python="$($AUDIT_VENV/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-            if [[ "$actual_python" != "$expected_python" ]]; then
-                echo "[INFO] Recreating .venv-audit: Python $actual_python -> $expected_python"
+            if [[ "$actual_python" != "$LOCKED_PYTHON_VERSION" ]]; then
+                echo "[INFO] Recreating .venv-audit: Python $actual_python -> $LOCKED_PYTHON_VERSION"
                 rm -rf "$AUDIT_VENV"
             fi
         fi
@@ -144,8 +232,8 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
             PIP_COMMAND=("$AUDIT_VENV/bin/python" -m pip install)
         fi
         WHEELHOUSE="$RUNTIME_ROOT/python-wheelhouse"
-        PIP_ARGS=()
-        if [[ -d "$WHEELHOUSE" ]]; then
+        PIP_ARGS=(--no-index --only-binary=:all: --find-links "$WHEELHOUSE")
+        if [[ -d "$WHEELHOUSE" && -f "$WHEELHOUSE/SHA256SUMS" ]]; then
             expected_manifest="$(python3 - "$LOCK_FILE" <<'PY'
 import json
 import sys
@@ -157,17 +245,38 @@ PY
                 echo "[ERROR] Wheelhouse manifest SHA256 mismatch" >&2
                 exit 1
             fi
-            (cd "$WHEELHOUSE" && sha256sum -c SHA256SUMS)
-            PIP_ARGS+=(--no-index --find-links "$WHEELHOUSE")
+            PYTHONDONTWRITEBYTECODE=1 \
+                python3 - "$SCRIPT_DIR" "$WHEELHOUSE" "$expected_manifest" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import verify_matrix_sonic_runtime as verifier
+
+checks = verifier.verify_wheelhouse(Path(sys.argv[2]), sys.argv[3])
+for name, ok, detail in checks:
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+if not all(ok for _, ok, _ in checks):
+    raise SystemExit("locked offline wheelhouse verification failed")
+PY
             echo "[INFO] Installing Python dependencies from locked offline wheelhouse"
         else
-            echo "[WARN] Locked wheelhouse is absent; using configured Python package index"
+            echo "[ERROR] Locked offline Python wheelhouse is absent: $WHEELHOUSE" >&2
+            exit 1
         fi
         "${PIP_COMMAND[@]}" \
             "${PIP_ARGS[@]}" \
-            -r "$PROJECT_ROOT/research/sonic_integration/requirements-trna.txt"
+            -r "$REQUIREMENTS_FILE"
+        if [[ -f "$EXTERNAL_PIP_MARKER" ]]; then
+            external_pip_root="$($BOOTSTRAP_PYTHON -c \
+                'import pathlib,pip; print(pathlib.Path(pip.__file__).resolve().parent.parent)')"
+            PYTHONPATH="$audit_site_packages:$external_pip_root" \
+                "$AUDIT_VENV/bin/python" -m pip check
+        else
+            "$AUDIT_VENV/bin/python" -m pip check
+        fi
         "$AUDIT_VENV/bin/python" - \
-            "$PROJECT_ROOT/research/sonic_integration/requirements-trna.txt" <<'PY'
+            "$REQUIREMENTS_FILE" <<'PY'
 import importlib.metadata
 import pathlib
 import sys
@@ -183,13 +292,20 @@ for line in requirements:
         raise SystemExit(f"{name}: expected {expected}, got {actual}")
 print("[PASS] Python dependency versions match requirements lock")
 PY
+        temporary_digest_marker="${VENV_DIGEST_MARKER}.tmp.$$"
+        printf '%s\n' "$EXPECTED_VENV_DIGEST" > "$temporary_digest_marker"
+        mv "$temporary_digest_marker" "$VENV_DIGEST_MARKER"
     fi
+
+    select_runtime_python
 
     if [[ -n "$RELEASE_CACHE" ]]; then
         python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" \
             --lock "$LOCK_FILE" \
             --runtime-root "$RUNTIME_ROOT" \
             --matrix-root "$PROJECT_ROOT" \
+            --sonic-root "$MATRIX_SONIC_ROOT" \
+            --python "$RUNTIME_PYTHON" \
             --release-cache "$RELEASE_CACHE" \
             --skip-dynamic \
             --skip-installed-assets \
@@ -280,10 +396,8 @@ PY
             bash "$PROJECT_ROOT/scripts/release_manager/install_chunks.sh" 0.1.2
     fi
 
-    deploy="$RUNTIME_ROOT/GR00T-WholeBodyControl/gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
-    bridge="$RUNTIME_ROOT/bridge/g1_sonic_sim_udp_dds_bridge_accepted"
+    deploy="$MATRIX_SONIC_ROOT/gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
     [[ -f "$deploy" ]] && chmod +x "$deploy"
-    [[ -f "$bridge" ]] && chmod +x "$bridge"
 
     if [[ "$MATRIX_ROS_PREFIX" == "$RUNTIME_ROOT/ros2-humble-prefix" ]]; then
         rmw_dir="$RUNTIME_ROOT/ros2-humble-prefix/lib"
@@ -295,11 +409,17 @@ PY
     fi
 fi
 
+if [[ -z "${RUNTIME_PYTHON:-}" ]]; then
+    select_runtime_python
+fi
+
 VERIFY_ARGS=(
     --lock "$LOCK_FILE"
     --runtime-root "$RUNTIME_ROOT"
     --matrix-root "$PROJECT_ROOT"
+    --sonic-root "$MATRIX_SONIC_ROOT"
     --profile "$PROFILE"
+    --python "$RUNTIME_PYTHON"
     --json-output "$PROJECT_ROOT/outputs/runtime-verification-$PROFILE.json"
 )
 if [[ -n "$RELEASE_CACHE" ]]; then

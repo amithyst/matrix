@@ -3,6 +3,8 @@
 ## Authority
 
 - Source: `https://github.com/amithyst/matrix`
+- Native SONIC source: original private `GR00T-WholeBodyControl` repository;
+  use the exact commit under `source_revisions.gr00t_whole_body_control`.
 - Stable branch: `main`
 - Runtime lock: `config/runtime/matrix-sonic.lock.json`
 - Host defaults: `config/hosts/heyuan.env`, `config/hosts/trna.env`,
@@ -10,7 +12,12 @@
 - Local non-secret overrides: `.matrix/local.env` (ignored by Git and loaded
   before profile defaults, so runtime-derived dependency paths stay coherent)
 
-Git stores source, scripts, profiles, tests, and checksums. It does not store the
+Matrix Git stores integration source, scripts, profiles, tests, and checksums.
+Each host normally runs a clean Git checkout of the original SONIC repository
+at the pinned commit. An offline private bundle may contain an exact `git archive`
+deployment mirror of that commit plus its private runtime assets; it is not a
+second source repository and must pass the same source-file hashes. Neither Git
+repository stores the
 7.76 GB Matrix release packages, the internal SONIC models, TensorRT libraries,
 generated engines, logs, or recordings. Those files are copied from a controlled
 artifact source and verified against the tracked lock.
@@ -27,7 +34,8 @@ or offline package installation into a false successful no-op.
 
 ## Checkout policy
 
-Use `~/matrix` as the active checkout on every host. Keep historical
+Use `~/matrix` as the active Matrix checkout on every host and keep one clean,
+pinned original SONIC checkout at the path in `config/hosts/<host>.env`. Keep historical
 `matrix-eval` directories read-only as evidence or package caches.
 
 ```bash
@@ -36,6 +44,14 @@ cd ~/matrix
 git fetch origin --prune
 git switch <shared-feature-branch>
 git pull --ff-only
+```
+
+Verify the SONIC checkout separately before launch:
+
+```bash
+git -C "$MATRIX_SONIC_ROOT" fetch --all --prune
+git -C "$MATRIX_SONIC_ROOT" switch --detach <locked-sonic-commit>
+git -C "$MATRIX_SONIC_ROOT" status --short
 ```
 
 Do not maintain machine-specific implementation branches. Heyuan, TRNA, and
@@ -47,26 +63,42 @@ host gates have been recorded.
 The path supplied to `--artifact-source` has this layout:
 
 ```text
-aue-sim/
-aue-sim/scripts/g1_sonic_sim_udp_dds_bridge.cpp
-GR00T-WholeBodyControl/
+GR00T-WholeBodyControl/       # optional read-only offline mirror + SONIC_COMMIT
 inference/TensorRT/lib/
 inference/onnxruntime/lib/
 g1-visual/g1_29dof.urdf
-bridge/g1_sonic_sim_udp_dds_bridge_accepted
 ros2-humble-prefix/           # required by isolated Heyuan and ZZA profiles
 matrix-native-deps/           # isolated native libraries
 python-wheelhouse/            # CPython 3.10 x86_64 wheels plus SHA256SUMS
 ```
 
-The accepted bridge is built on the older TRNA Ubuntu 22.04 ABI baseline and is
-locked to at most `GLIBC_2.34` and `GLIBCXX_3.4.29`. Build shared native tools on
-the oldest supported host; verifier runs `ldd` on both the deploy binary and the
-bridge, so a newer-host-only binary is rejected before launch.
+The native simulator closure contains 17 exact direct pins and 71 binary
+CPython 3.10/x86_64 wheels. The locked `SHA256SUMS` digest is
+`1044d7c4e04648ef2e58a87b201b247082d4a8ec2bcc265611d5e3a344c8304b`.
+It was verified by a clean offline install, `pip check`, import-origin checks,
+and a two-step Warehouse DDS smoke. PICO remains a separate interpreter via
+`MATRIX_PICO_PYTHON`: set `MATRIX_PICO_WHEEL` to the locked
+`xrobotoolkit_sdk-1.0.2-cp310-cp310-linux_x86_64.whl` artifact. The verifier
+checks that wheel's filename and SHA256, the controlled `libPXREARobotSDK.so`
+overlay, the interpreter ABI/package origin, and `pip check` whenever
+`--control-source pico` is selected with a host profile.
+
+Matrix imports the original checkout's `gear_sonic` simulator API. Native
+`UnitreeSdk2Bridge` owns DDS `rt/lowcmd`/`rt/lowstate`; SONIC deploy is the only
+lowcmd writer. There is no intermediate AndroidTwin or UDP-to-DDS process.
+Matrix executes the SHA-verified SONIC release binary directly; it does not run
+SONIC's install/build/prompt workflow during an acceptance launch.
+Build shared native tools on the oldest supported host; the verifier checks the
+SONIC commit, Python API, deploy dependency closure, and inference ABI.
 
 The artifact source may be a local directory or an rsync-compatible SSH source.
 Because the GitHub repository is public and the SONIC model is internal, do not
 upload this bundle to the public GitHub release.
+
+Bundles produced on this feature branch are acceptance candidates, with
+`bundle.json.release_ready=false`. Before formal publication, add complete tree
+attestation for visual meshes, the inference closure, ROS, and native support
+libraries, then run the packager/LFS smoke from a clean pinned SONIC checkout.
 
 ## Bootstrap
 
@@ -77,7 +109,7 @@ cd ~/matrix
 bash scripts/bootstrap_matrix_sonic.sh \
   --profile heyuan \
   --release-cache /home/kaijie/matrix-eval/releases \
-  --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-v1-heyuan \
+  --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
   --write-local-env
 ```
 
@@ -97,7 +129,7 @@ cd /home/ununtu/matrix
 bash scripts/bootstrap_matrix_sonic.sh \
   --profile zza \
   --release-cache /data/user_data/matrix-release-cache/0.1.2 \
-  --runtime-root /data/user_data/matrix-artifacts/matrix-sonic-v1-zza \
+  --runtime-root /data/user_data/matrix-artifacts/matrix-sonic-native-v2-zza \
   --write-local-env
 ```
 
@@ -124,10 +156,26 @@ For a bounded acceptance run, add:
 --max-seconds 90 --min-active-seconds 60
 ```
 
-The launcher fails on a detected fall, numerical reset, insufficient active
-lowcmd duration, missing artifact, SHA mismatch, wrong TensorRT ABI, or failed
-ROS2 RMW load. It also serializes launches per checkout and restores tracked
-configuration files on exit.
+The launcher fails on a detected fall, numerical reset, stale/insufficient
+lowcmd duration, low physics rate/RTF, insufficient commanded displacement,
+missing artifact, SHA mismatch, wrong TensorRT ABI, or failed ROS2 RMW load.
+It serializes SONIC launches per host and restores tracked
+configuration files on exit. Signal forwarding and Linux parent-death guards
+cover the launcher, `run_sim`, Python supervisor, and exact native process
+groups; a hard exit cannot leave deploy/PICO holding DDS or ZMQ in the
+background after any single launcher layer dies.
+
+A bounded run can set `passed=true` only from a clean Matrix checkout after the
+selected host verifier succeeds. The runner consumes that launch's JSON receipt
+and records the Matrix commit, profile, runtime-lock SHA, and optional scenario
+layout SHA in its final status. The receipt uses a per-launch path and its SHA is
+recorded as well; direct or verification-disabled bounded runs are
+explicitly unqualified.
+
+`MATRIX_VERIFY_RUNTIME=0`, `scripts/run_sim.sh`, and direct
+`scripts/run_matrix_sonic.py` invocation are low-level debugging escape hatches.
+Runs that use any of them without the canonical profile verifier do not qualify
+as locked acceptance evidence.
 
 ## Host-specific behavior
 
@@ -140,7 +188,16 @@ configuration files on exit.
 - Override a value in `.matrix/local.env`; do not edit the tracked host profile
   for a one-off experiment.
 
-## Current Heyuan evidence
+## Historical v1 evidence (rollback comparison only)
+
+The Heyuan and ZZA numbers below were recorded on the former
+AndroidTwin/UDP-to-DDS `matrix-sonic-v1` path. They are retained as regression
+targets and rollback evidence. They do **not** qualify the direct native-v2
+architecture described above. Native-v2 remains unaccepted until a result names
+the same final Matrix commit, final SONIC commit, body-only model contract, fresh
+lowcmd evidence, and authoritative fall/reset counters.
+
+### Historical Heyuan evidence
 
 The accepted full-sensor Town10 run used the locked TensorRT 10.13.3 runtime:
 
@@ -155,7 +212,7 @@ The accepted full-sensor Town10 run used the locked TensorRT 10.13.3 runtime:
 Sensor disabling is an operator-render profile tradeoff, not the AI-data default.
 It must not be presented as a no-cost optimization.
 
-## Current ZZA evidence
+### Historical ZZA evidence
 
 ZZA reproduced the locked Town10 SONIC path on commit `8719bed` with an RTX
 4090. The 120-second bounded acceptance produced:
