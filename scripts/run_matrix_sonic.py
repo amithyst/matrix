@@ -195,6 +195,53 @@ def _validate_qualification_receipt(args: argparse.Namespace) -> None:
     args.verification_receipt_sha256 = _sha256_file(args.verification_receipt)
 
 
+def _validate_qualified_acceptance(args: argparse.Namespace) -> None:
+    """Reject any bounded gate that is weaker than the active runtime lock."""
+    if not args.qualified_runtime:
+        return
+    lock_path = Path(__file__).resolve().parents[1] / "config/runtime/matrix-sonic.lock.json"
+    try:
+        acceptance = json.loads(lock_path.read_text(encoding="utf-8"))["acceptance"]
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SystemExit(f"cannot read qualified acceptance lock: {exc}") from exc
+
+    weaker: list[str] = []
+    minimums = (
+        ("min_active_seconds", "active_lowcmd_seconds_min"),
+        ("min_displacement_m", "root_displacement_xy_min_m"),
+        ("min_physics_hz", "physics_hz_min"),
+        ("min_rtf", "rtf_min"),
+    )
+    for argument, lock_key in minimums:
+        actual = float(getattr(args, argument))
+        expected = float(acceptance[lock_key])
+        if not math.isfinite(actual) or actual + 1e-12 < expected:
+            weaker.append(f"{argument}={actual!r} < lock {lock_key}={expected!r}")
+
+    actual_freshness = float(args.low_cmd_fresh_timeout_seconds)
+    locked_freshness = float(acceptance["low_cmd_fresh_timeout_seconds"])
+    if (
+        not math.isfinite(actual_freshness)
+        or actual_freshness <= 0.0
+        or actual_freshness - 1e-12 > locked_freshness
+    ):
+        weaker.append(
+            "low_cmd_fresh_timeout_seconds="
+            f"{actual_freshness!r} > lock={locked_freshness!r}"
+        )
+
+    locked_resets = int(acceptance["instability_resets_max"])
+    if args.max_resets > locked_resets:
+        weaker.append(f"max_resets={args.max_resets} > lock={locked_resets}")
+    if acceptance["fall_detected"] is False and not args.fail_on_fall:
+        weaker.append("fail_on_fall=false while lock requires no detected fall")
+    if weaker:
+        raise SystemExit(
+            "qualified acceptance gates cannot weaken the runtime lock:\n  "
+            + "\n  ".join(weaker)
+        )
+
+
 def _root_up_z(qpos) -> float:
     """Diagnostic world-Z component of the floating base's local up axis."""
     _, x, y, _ = [float(value) for value in qpos[3:7]]
@@ -828,6 +875,7 @@ def main() -> int:
     ):
         raise SystemExit("qualification metadata requires --qualified-runtime")
     _validate_qualification_receipt(args)
+    _validate_qualified_acceptance(args)
     if (
         not math.isfinite(args.low_cmd_fresh_timeout_seconds)
         or args.low_cmd_fresh_timeout_seconds <= 0.0

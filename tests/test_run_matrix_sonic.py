@@ -99,6 +99,59 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         sleep.assert_not_called()
         self.assertAlmostEqual(next_deadline, 10.016)
 
+    def test_absolute_physics_pacing_does_not_accumulate_sleep_overshoot(self) -> None:
+        clock = [0.0]
+
+        def sleep_with_overshoot(duration: float) -> None:
+            clock[0] += duration + 0.00025
+
+        deadline = 0.005
+        with mock.patch.object(
+            MODULE.time, "perf_counter", side_effect=lambda: clock[0]
+        ), mock.patch.object(MODULE.time, "sleep", side_effect=sleep_with_overshoot):
+            for _ in range(200):
+                deadline = MODULE._pace_absolute_deadline(deadline, 0.005)
+
+        self.assertAlmostEqual(clock[0], 1.00025)
+        self.assertAlmostEqual(deadline, 1.005)
+
+    def test_qualified_acceptance_rejects_weaker_lock_gates(self) -> None:
+        lock = json.loads(
+            (REPO_ROOT / "config/runtime/matrix-sonic.lock.json").read_text(
+                encoding="utf-8"
+            )
+        )["acceptance"]
+        base = {
+            "qualified_runtime": True,
+            "min_active_seconds": lock["active_lowcmd_seconds_min"],
+            "min_displacement_m": lock["root_displacement_xy_min_m"],
+            "min_physics_hz": lock["physics_hz_min"],
+            "min_rtf": lock["rtf_min"],
+            "low_cmd_fresh_timeout_seconds": lock[
+                "low_cmd_fresh_timeout_seconds"
+            ],
+            "max_resets": lock["instability_resets_max"],
+            "fail_on_fall": True,
+        }
+        MODULE._validate_qualified_acceptance(SimpleNamespace(**base))
+
+        weaker_values = {
+            "min_active_seconds": 0.0,
+            "min_displacement_m": 0.0,
+            "min_physics_hz": 0.0,
+            "min_rtf": 0.0,
+            "low_cmd_fresh_timeout_seconds": 1.0,
+            "max_resets": lock["instability_resets_max"] + 1,
+            "fail_on_fall": False,
+        }
+        for argument, weaker in weaker_values.items():
+            values = dict(base)
+            values[argument] = weaker
+            with self.subTest(argument=argument), self.assertRaisesRegex(
+                SystemExit, argument
+            ):
+                MODULE._validate_qualified_acceptance(SimpleNamespace(**values))
+
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
         failures = MODULE._acceptance_failures(
             unstable=False,
