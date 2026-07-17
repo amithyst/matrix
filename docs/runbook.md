@@ -155,6 +155,36 @@ The accepted full-sensor Town10 run used the locked TensorRT 10.13.3 runtime:
 Sensor disabling is an operator-render profile tradeoff, not the AI-data default.
 It must not be presented as a no-cost optimization.
 
+## Current ZZA evidence
+
+ZZA reproduced the locked Town10 SONIC path on commit `8719bed` with an RTX
+4090. The 120-second bounded acceptance produced:
+
+- SONIC physics: 200.003 Hz aggregate
+- real-time factor: 1.0 aggregate
+- active lowcmd: 90.339 s
+- displacement: 10.771 m
+- fall/reset: none
+- UE state synchronization: about 50 Hz
+- exit cleanup: no Matrix child processes or listeners remained
+
+The full verifier passed TensorRT 10.13.3, ONNX Runtime 1.16.3, the dedicated
+CUDA 12.1 runtime, ROS2 RMW, and UDP/DDS dependency closure. Two 1920x1080
+frames confirm Town10 and the white/dark G1 visual rendered while the robot
+walked. The cooked camera still leaves G1 near the right edge, and UE emitted a
+non-fatal Vulkan texture-layout ensure; treat both as visual-runtime follow-up
+items rather than physics acceptance failures.
+
+Tracked metrics are in
+`research/urban_v1/results/zza_town10_sonic_20260717.json`. The private logs,
+verifier report, and screenshots are in
+`/data/user_data/matrix-artifacts/evidence/zza-town10-20260717` on ZZA. Inspect
+the retained operator panes with:
+
+```bash
+ssh zza-ubuntu -t 'tmux attach -t matrix-zza-acceptance'
+```
+
 ## Sync and delivery
 
 ### Three-host collaboration contract

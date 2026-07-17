@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "run_id": "zza-matrix-sonic-town10-20260717",
+  "date": "2026-07-17",
+  "host": {
+    "name": "zza-ubuntu",
+    "os": "Ubuntu 22.04",
+    "kernel": "6.8.0-111-generic",
+    "cpu": "Intel Xeon w5-2455X",
+    "cpu_count": 24,
+    "numa_nodes": 1,
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_memory_mib": 24564,
+    "driver": "580.159.03",
+    "display": ":1"
+  },
+  "source": {
+    "repository": "https://github.com/amithyst/matrix",
+    "branch": "infra/zza-runtime-profile-20260717",
+    "commit": "8719bed9237daed9328afe8b7ef6cd4619fb4df6",
+    "profile": "config/hosts/zza.env",
+    "worktree_clean_after_run": true
+  },
+  "runtime": {
+    "root": "/data/user_data/matrix-artifacts/matrix-sonic-v1-zza",
+    "release_cache": "/data/user_data/matrix-release-cache/0.1.2",
+    "bootstrap_passed": true,
+    "offline_release_install": true,
+    "python": {
+      "version": "3.10.12",
+      "mujoco": "3.3.0",
+      "numpy": "2.2.6",
+      "isolated_from_host_site_packages": true
+    },
+    "dependency_checks": {
+      "tensorrt_abi": 101303,
+      "onnxruntime": "1.16.3",
+      "cuda_runtime": "/data/user_data/matrix-tools/cuda-runtime-12.1/lib64/libcudart.so.12",
+      "ros2_rmw_dlopen": true,
+      "sonic_deploy_closure": true,
+      "udp_dds_bridge_closure": true
+    },
+    "release_sha256": {
+      "assets": "c4af445e468bb919909176113a8b8e9b0ede5dabf80be7112a5e7e86085bb369",
+      "base": "2cbb40861e89c40735cd64b24e8b64d88d012f335bdb405b5ed52db86f8b4e38",
+      "shared": "b460ca1ab7560ff0ef78ee4d6a18013accd4f16d6bab2e0dd9cb4fff1849256c",
+      "Town10World": "246cc4f96571022f19f7e5cf35aa2788c3c8420a2bf2535b56a6aa2e33a05801"
+    }
+  },
+  "acceptance": {
+    "command": "bash scripts/run_matrix_sonic_urban_v1.sh --profile zza --control-source planner --walk-after 10 --vx 0.25 --max-seconds 120 --min-active-seconds 60",
+    "tmux": "matrix-zza-acceptance:town10",
+    "exit_code": 0,
+    "passed": true,
+    "acceptance_failures": [],
+    "elapsed_wall_s": 120.01,
+    "active_lowcmd_s": 90.339,
+    "control_hz": 50.0,
+    "physics_hz_target": 200.0,
+    "physics_hz_aggregate": 200.003,
+    "rtf_aggregate": 1.0,
+    "ue_state_sync_hz": 49.99,
+    "root_displacement_xy_m": 10.77056,
+    "min_root_z": 0.75883,
+    "final_root_up_z": 0.9998,
+    "fall_detected": false,
+    "instability_resets": 0,
+    "ngeom": 972,
+    "cleanup": {
+      "residual_matrix_processes": 0,
+      "residual_listeners_on_5556_5860_5861_9999": 0
+    }
+  },
+  "visual_smoke": {
+    "command": "bash scripts/run_matrix_sonic_urban_v1.sh --profile zza --control-source planner --walk-after 10 --vx 0.25 --max-seconds 75 --min-active-seconds 30",
+    "passed": true,
+    "active_lowcmd_s": 51.799,
+    "physics_hz_aggregate": 200.002,
+    "rtf_aggregate": 1.0,
+    "root_displacement_xy_m": 5.69956,
+    "fall_detected": false,
+    "instability_resets": 0,
+    "observed": [
+      "Town10 buildings, roads, trees, pedestrians, and vehicle presentation assets rendered",
+      "G1 white and dark URDF materials rendered at the right side of the frame",
+      "G1 pose changed between frames while SONIC lowcmd remained active"
+    ],
+    "screenshots": {
+      "before_v": {
+        "path": "/data/user_data/matrix-artifacts/evidence/zza-town10-20260717/zza_town10_camera_final_before_v.png",
+        "sha256": "89e1d6be4e6f23502578fba053116400c212acb6b4f27fb2a7a7eaedf3450370",
+        "size_bytes": 4301088,
+        "width": 1920,
+        "height": 1080
+      },
+      "after_v": {
+        "path": "/data/user_data/matrix-artifacts/evidence/zza-town10-20260717/zza_town10_camera_final_after_v.png",
+        "sha256": "987b49ab362f537c38c8c26ccda6244deee262ce1d82e293ee2b8d274cdf371a",
+        "size_bytes": 4227655,
+        "width": 1920,
+        "height": 1080
+      }
+    }
+  },
+  "verification": {
+    "unittest": "47 PASS",
+    "shell_syntax": "PASS",
+    "runtime_lock_schema": "PASS",
+    "runtime_verifier": "PASS",
+    "runtime_verifier_sha256": "c24c59be2651c1a7d71cd3fef6644112cd7513530c0160c37a83efdd5ce4c5ff",
+    "artifact_bundle": "/data/user_data/matrix-artifacts/evidence/zza-town10-20260717"
+  },
+  "known_gaps": [
+    "The cooked UE camera keeps G1 near the right edge; sending V did not produce a clearly different follow-camera composition.",
+    "UE logged a non-fatal Vulkan copy-layout ensure while continuing to render and receive state packets.",
+    "Town10 pedestrians and vehicles are UE presentation assets, not synchronized dynamic MuJoCo actors.",
+    "This run used the planner control source; live PICO control remains a TRNA device gate."
+  ]
+}
