@@ -101,6 +101,11 @@ bash scripts/bootstrap_matrix_sonic.sh \
   --write-local-env
 ```
 
+ZZA's profile prepends `$HOME/.local/bin` for user-installed operator tools.
+Install `jq` there from a pinned upstream release when system package access is
+unavailable; verify its published checksum before bootstrap. Do not copy a sudo
+password or another host's credentials to satisfy this prerequisite.
+
 ## Launch
 
 Town10 main path:

@@ -73,6 +73,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         zza = (REPO_ROOT / "config/hosts/zza.env").read_text(encoding="utf-8")
         self.assertIn('DISPLAY="${DISPLAY:-:1}"', zza)
         self.assertIn("MATRIX_RUNTIME_ROOT/ros2-humble-prefix", zza)
+        self.assertIn('PATH="$MATRIX_TOOLS_ROOT/bin:$PATH"', zza)
 
     def test_release_installs_do_not_dirty_the_checkout(self) -> None:
         text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
