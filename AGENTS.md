@@ -4,15 +4,16 @@
 
 - The canonical repository is `https://github.com/amithyst/matrix`.
 - `main` is the stable integration branch. Use short-lived feature branches on
-  both TRNA and Heyuan; do not create long-lived machine-specific branches.
+  TRNA, Heyuan, and ZZA; do not create long-lived machine-specific branches.
 - Runtime binaries, models, release archives, generated robot files, logs, and
   recordings belong below ignored runtime/cache directories. Do not commit them.
 
 ## Reproducible Runtime
 
 - `config/runtime/matrix-sonic.lock.json` is the version and SHA256 authority.
-- `config/hosts/trna.env` and `config/hosts/heyuan.env` contain non-secret host
-  defaults. Put local overrides in `.matrix/local.env`.
+- `config/hosts/trna.env`, `config/hosts/heyuan.env`, and
+  `config/hosts/zza.env` contain non-secret host defaults. Put local overrides
+  in `.matrix/local.env`.
 - Bootstrap with `scripts/bootstrap_matrix_sonic.sh`; launch through
   `scripts/run_matrix_sonic*.sh --profile <host>`.
 - Build or refresh private runtime artifacts with

@@ -1,11 +1,12 @@
-# Matrix + SONIC two-host runbook
+# Matrix + SONIC multi-host runbook
 
 ## Authority
 
 - Source: `https://github.com/amithyst/matrix`
 - Stable branch: `main`
 - Runtime lock: `config/runtime/matrix-sonic.lock.json`
-- Host defaults: `config/hosts/heyuan.env`, `config/hosts/trna.env`
+- Host defaults: `config/hosts/heyuan.env`, `config/hosts/trna.env`,
+  `config/hosts/zza.env`
 - Local non-secret overrides: `.matrix/local.env` (ignored by Git and loaded
   before profile defaults, so runtime-derived dependency paths stay coherent)
 
@@ -26,7 +27,7 @@ or offline package installation into a false successful no-op.
 
 ## Checkout policy
 
-Use `~/matrix` as the active checkout on both hosts. Keep historical
+Use `~/matrix` as the active checkout on every host. Keep historical
 `matrix-eval` directories read-only as evidence or package caches.
 
 ```bash
@@ -37,9 +38,9 @@ git switch <shared-feature-branch>
 git pull --ff-only
 ```
 
-Do not maintain `heyuan` and `trna` implementation branches. Both machines test
-the same commit. A feature branch is merged only after both required host gates
-have been recorded.
+Do not maintain machine-specific implementation branches. Heyuan, TRNA, and
+ZZA test the same commit. A feature branch is merged only after its required
+host gates have been recorded.
 
 ## Runtime bundle layout
 
@@ -53,7 +54,7 @@ inference/TensorRT/lib/
 inference/onnxruntime/lib/
 g1-visual/g1_29dof.urdf
 bridge/g1_sonic_sim_udp_dds_bridge_accepted
-ros2-humble-prefix/           # required by the isolated Heyuan profile
+ros2-humble-prefix/           # required by isolated Heyuan and ZZA profiles
 matrix-native-deps/           # isolated native libraries
 python-wheelhouse/            # CPython 3.10 x86_64 wheels plus SHA256SUMS
 ```
@@ -88,6 +89,18 @@ is installed from the offline wheelhouse, and the full native dependency closure
 is tested. Do not bypass TLS errors with `--trusted-host`; refresh the wheelhouse
 on a trusted network instead.
 
+ZZA keeps large private artifacts on its data volume while the active checkout
+remains `/home/ununtu/matrix`:
+
+```bash
+cd /home/ununtu/matrix
+bash scripts/bootstrap_matrix_sonic.sh \
+  --profile zza \
+  --release-cache /data/user_data/matrix-release-cache/0.1.2 \
+  --runtime-root /data/user_data/matrix-artifacts/matrix-sonic-v1-zza \
+  --write-local-env
+```
+
 ## Launch
 
 Town10 main path:
@@ -115,6 +128,8 @@ configuration files on exit.
 
 - Heyuan uses GPU0 and CPU set `0-63,128-191`, the NUMA node local to that GPU.
 - TRNA does not apply a CPU set by default.
+- ZZA uses GPU0, X11 display `:1`, and its single 24-core NUMA node without an
+  explicit CPU set. Its ROS2 RMW closure is isolated in the runtime bundle.
 - Override a value in `.matrix/local.env`; do not edit the tracked host profile
   for a one-off experiment.
 

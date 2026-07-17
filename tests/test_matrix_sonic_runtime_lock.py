@@ -60,14 +60,19 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertEqual(self.lock["bridge"]["max_required_glibc"], "2.34")
         self.assertEqual(self.lock["bridge"]["max_required_glibcxx"], "3.4.29")
 
-    def test_two_host_profiles_use_repo_local_runtime(self) -> None:
-        for profile in ("heyuan", "trna"):
+    def test_host_profiles_use_repo_local_runtime(self) -> None:
+        for profile in ("heyuan", "trna", "zza"):
             text = (REPO_ROOT / f"config/hosts/{profile}.env").read_text(
                 encoding="utf-8"
             )
             self.assertIn("MATRIX_PROJECT_ROOT/outputs/runtime/matrix-sonic-v1", text)
             self.assertNotIn("TOKEN", text.upper())
             self.assertNotIn("PASSWORD", text.upper())
+
+        self.assertEqual(MODULE.HOST_PROFILES, ("heyuan", "trna", "zza"))
+        zza = (REPO_ROOT / "config/hosts/zza.env").read_text(encoding="utf-8")
+        self.assertIn('DISPLAY="${DISPLAY:-:1}"', zza)
+        self.assertIn("MATRIX_RUNTIME_ROOT/ros2-humble-prefix", zza)
 
     def test_release_installs_do_not_dirty_the_checkout(self) -> None:
         text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -130,6 +135,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn(".matrix/local.env", text)
         self.assertIn("--no-index", text)
         self.assertIn("python-wheelhouse", text)
+        self.assertIn('PROFILE_FILE="$PROJECT_ROOT/config/hosts/$PROFILE.env"', text)
 
     def test_release_cache_is_materialized_without_network_or_symlinks(self) -> None:
         bootstrap = (
@@ -156,7 +162,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 'source "$PROJECT_ROOT/.matrix/local.env"'
             )
             profile_source = text.index(
-                'source "$PROJECT_ROOT/config/hosts/$PROFILE.env"'
+                'source "$PROFILE_FILE"'
                 if script_name == "bootstrap_matrix_sonic.sh"
                 else 'source "$PROFILE_FILE"'
             )
@@ -169,7 +175,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             'export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"'
         )
         profile_source = bootstrap.index(
-            'source "$PROJECT_ROOT/config/hosts/$PROFILE.env"'
+            'source "$PROFILE_FILE"'
         )
         self.assertLess(override_assignment, profile_source)
 

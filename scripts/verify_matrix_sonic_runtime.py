@@ -18,6 +18,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK = REPO_ROOT / "config/runtime/matrix-sonic.lock.json"
 DEFAULT_RUNTIME = REPO_ROOT / "outputs/runtime/matrix-sonic-v1"
 LARGE_FILE_THRESHOLD = 64 * 1024 * 1024
+HOST_PROFILES = tuple(
+    sorted(path.stem for path in (REPO_ROOT / "config/hosts").glob("*.env"))
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -144,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime-root", type=Path, default=DEFAULT_RUNTIME)
     parser.add_argument("--matrix-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--release-cache", type=Path)
-    parser.add_argument("--profile", choices=("heyuan", "trna"))
+    parser.add_argument("--profile", choices=HOST_PROFILES)
     parser.add_argument("--schema-only", action="store_true")
     parser.add_argument("--skip-dynamic", action="store_true")
     parser.add_argument("--skip-installed-assets", action="store_true")

@@ -50,7 +50,7 @@ STARTUP_BAND_FADE="3"
 
 usage() {
     printf '%s\n' \
-        "Usage: bash scripts/run_matrix_sonic.sh [--profile heyuan|trna] [options]" \
+        "Usage: bash scripts/run_matrix_sonic.sh [--profile NAME] [options]" \
         "" \
         "Options:" \
         "  --profile NAME             Load config/hosts/NAME.env" \

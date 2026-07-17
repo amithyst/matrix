@@ -16,7 +16,7 @@ VERIFY_ONLY=0
 
 usage() {
     cat <<'EOF'
-Usage: bash scripts/bootstrap_matrix_sonic.sh --profile heyuan|trna [options]
+Usage: bash scripts/bootstrap_matrix_sonic.sh --profile NAME [options]
 
 Options:
   --artifact-source PATH|HOST:PATH  Locked runtime bundle source
@@ -44,8 +44,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$PROFILE" != "heyuan" && "$PROFILE" != "trna" ]]; then
-    echo "[ERROR] --profile must be heyuan or trna" >&2
+if [[ -z "$PROFILE" ]]; then
+    echo "[ERROR] --profile is required" >&2
+    exit 2
+fi
+PROFILE_FILE="$PROJECT_ROOT/config/hosts/$PROFILE.env"
+if [[ ! -f "$PROFILE_FILE" ]]; then
+    echo "[ERROR] Unknown host profile: $PROFILE" >&2
     exit 2
 fi
 if [[ "$WRITE_LOCAL_ENV" == "1" && -z "$RUNTIME_OVERRIDE" ]]; then
@@ -63,7 +68,7 @@ fi
 # Load profile defaults after host-local overrides so paths derived from
 # MATRIX_RUNTIME_ROOT always follow the selected runtime bundle.
 # shellcheck disable=SC1090
-source "$PROJECT_ROOT/config/hosts/$PROFILE.env"
+source "$PROFILE_FILE"
 
 RUNTIME_ROOT="${RUNTIME_OVERRIDE:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-v1}}"
 RUNTIME_ROOT="$(realpath -m "$RUNTIME_ROOT")"
@@ -246,7 +251,7 @@ PY
     [[ -f "$deploy" ]] && chmod +x "$deploy"
     [[ -f "$bridge" ]] && chmod +x "$bridge"
 
-    if [[ "$PROFILE" == "heyuan" ]]; then
+    if [[ "$MATRIX_ROS_PREFIX" == "$RUNTIME_ROOT/ros2-humble-prefix" ]]; then
         rmw_dir="$RUNTIME_ROOT/ros2-humble-prefix/lib"
         ue_rmw="$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/librmw_fastrtps_cpp.so"
         mkdir -p "$rmw_dir"
