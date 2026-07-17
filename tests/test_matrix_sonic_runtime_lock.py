@@ -158,6 +158,15 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("python-wheelhouse", text)
         self.assertIn('PROFILE_FILE="$PROJECT_ROOT/config/hosts/$PROFILE.env"', text)
 
+    def test_bootstrap_supports_python_without_ensurepip(self) -> None:
+        text = (REPO_ROOT / "scripts/bootstrap_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("import ensurepip", text)
+        self.assertIn("--without-pip --system-site-packages", text)
+        self.assertIn("--ignore-installed", text)
+        self.assertIn("Recreating incomplete .venv-audit", text)
+
     def test_release_cache_is_materialized_without_network_or_symlinks(self) -> None:
         bootstrap = (
             REPO_ROOT / "scripts/bootstrap_matrix_sonic.sh"

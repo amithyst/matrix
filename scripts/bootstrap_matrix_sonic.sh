@@ -94,20 +94,37 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
 
     if [[ "$SKIP_PYTHON" != "1" ]]; then
         BOOTSTRAP_PYTHON="${MATRIX_BOOTSTRAP_PYTHON:-python3}"
+        AUDIT_VENV="$PROJECT_ROOT/.venv-audit"
         if ! command -v "$BOOTSTRAP_PYTHON" >/dev/null; then
             echo "[ERROR] Bootstrap interpreter is unavailable: $BOOTSTRAP_PYTHON" >&2
             exit 1
         fi
         expected_python="$($BOOTSTRAP_PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-        if [[ -x "$PROJECT_ROOT/.venv-audit/bin/python" ]]; then
-            actual_python="$($PROJECT_ROOT/.venv-audit/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        if [[ -x "$AUDIT_VENV/bin/python" ]]; then
+            actual_python="$($AUDIT_VENV/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
             if [[ "$actual_python" != "$expected_python" ]]; then
                 echo "[INFO] Recreating .venv-audit: Python $actual_python -> $expected_python"
-                rm -rf "$PROJECT_ROOT/.venv-audit"
+                rm -rf "$AUDIT_VENV"
             fi
         fi
-        if [[ ! -x "$PROJECT_ROOT/.venv-audit/bin/python" ]]; then
-            "$BOOTSTRAP_PYTHON" -m venv "$PROJECT_ROOT/.venv-audit"
+        if [[ -x "$AUDIT_VENV/bin/python" ]] \
+            && ! "$AUDIT_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+            echo "[INFO] Recreating incomplete .venv-audit: pip is unavailable"
+            rm -rf "$AUDIT_VENV"
+        fi
+        if [[ ! -x "$AUDIT_VENV/bin/python" ]]; then
+            if "$BOOTSTRAP_PYTHON" -c 'import ensurepip' >/dev/null 2>&1; then
+                "$BOOTSTRAP_PYTHON" -m venv "$AUDIT_VENV"
+            else
+                if ! "$BOOTSTRAP_PYTHON" -m pip --version >/dev/null 2>&1; then
+                    echo "[ERROR] Python has neither ensurepip nor a system pip fallback" >&2
+                    echo "[ERROR] Install python3-venv or make pip available to $BOOTSTRAP_PYTHON" >&2
+                    exit 1
+                fi
+                echo "[WARN] ensurepip is unavailable; creating .venv-audit with system pip"
+                "$BOOTSTRAP_PYTHON" -m venv \
+                    --without-pip --system-site-packages "$AUDIT_VENV"
+            fi
         fi
         WHEELHOUSE="$RUNTIME_ROOT/python-wheelhouse"
         PIP_ARGS=()
@@ -125,14 +142,19 @@ PY
             fi
             (cd "$WHEELHOUSE" && sha256sum -c SHA256SUMS)
             PIP_ARGS+=(--no-index --find-links "$WHEELHOUSE")
+            if grep -Eq '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' \
+                "$AUDIT_VENV/pyvenv.cfg"; then
+                # Do not let host packages satisfy the lock in the fallback venv.
+                PIP_ARGS+=(--ignore-installed)
+            fi
             echo "[INFO] Installing Python dependencies from locked offline wheelhouse"
         else
             echo "[WARN] Locked wheelhouse is absent; using configured Python package index"
         fi
-        "$PROJECT_ROOT/.venv-audit/bin/python" -m pip install \
+        "$AUDIT_VENV/bin/python" -m pip install \
             "${PIP_ARGS[@]}" \
             -r "$PROJECT_ROOT/research/sonic_integration/requirements-trna.txt"
-        "$PROJECT_ROOT/.venv-audit/bin/python" - \
+        "$AUDIT_VENV/bin/python" - \
             "$PROJECT_ROOT/research/sonic_integration/requirements-trna.txt" <<'PY'
 import importlib.metadata
 import pathlib

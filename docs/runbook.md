@@ -187,8 +187,11 @@ On the other host:
 git fetch origin --prune
 git switch <same-branch>
 git pull --ff-only
+export MATRIX_PROJECT_ROOT="$PWD"
+if [[ -f .matrix/local.env ]]; then source .matrix/local.env; fi
+source config/hosts/<host>.env
 python3 scripts/verify_matrix_sonic_runtime.py \
-  --runtime-root outputs/runtime/matrix-sonic-v1 \
+  --runtime-root "$MATRIX_RUNTIME_ROOT" \
   --profile <host> --fast
 ```
 
