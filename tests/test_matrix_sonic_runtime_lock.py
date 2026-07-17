@@ -465,6 +465,9 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("update_matrix_local_env.py", text)
         self.assertIn("--no-index", text)
         self.assertIn("--only-binary=:all:", text)
+        self.assertIn("--no-compile", text)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", text)
+        self.assertIn("matrix-wheel-record-v3-no-compile", text)
         self.assertIn("python-wheelhouse", text)
         self.assertIn('python_lock["requirements_sha256"]', text)
         self.assertIn("EXPECTED_REQUIREMENTS_SHA256", text)
@@ -604,6 +607,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             root = Path(temporary)
             wheelhouse = root / "wheelhouse"
             site_packages = root / "venv/lib/python3.10/site-packages"
+            runtime_python = root / "venv/bin/python"
             wheelhouse.mkdir()
             site_packages.mkdir(parents=True)
             metadata = b"Metadata-Version: 2.1\nName: demo-pkg\nVersion: 1.0\n"
@@ -631,7 +635,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             external_pip.write_text("# installer only\n", encoding="utf-8")
 
             checks = MODULE.verify_python_wheel_records(
-                wheelhouse, site_packages, {"demo-pkg": ("demo-pkg", "1.0")}
+                wheelhouse,
+                site_packages,
+                {"demo-pkg": ("demo-pkg", "1.0")},
+                runtime_python,
             )
             self.assertTrue(all(ok for _, ok, _ in checks), checks)
 
@@ -643,6 +650,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                     wheelhouse,
                     site_packages,
                     {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
                 )
             }
             self.assertFalse(results["native runtime Python installed wheel files"])
@@ -657,6 +665,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                     wheelhouse,
                     site_packages,
                     {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
                 )
             }
             self.assertFalse(
@@ -668,15 +677,355 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             cache.parent.mkdir()
             cache.write_bytes(b"generated cache")
             checks = MODULE.verify_python_wheel_records(
-                wheelhouse, site_packages, {"demo-pkg": ("demo-pkg", "1.0")}
+                wheelhouse,
+                site_packages,
+                {"demo-pkg": ("demo-pkg", "1.0")},
+                runtime_python,
+            )
+            results = {name: ok for name, ok, _ in checks}
+            self.assertFalse(
+                results["native runtime Python site-packages inventory"]
+            )
+
+    def test_target_wheel_records_map_scripts_data_and_owned_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wheelhouse = root / "wheelhouse"
+            site_packages = root / "site-packages"
+            runtime_python = root / "venv/bin/python"
+            wheelhouse.mkdir()
+            site_packages.mkdir()
+            stem = "demo_pkg-1.0"
+            owned_cache = "demo_pkg/__pycache__/locked.cpython-310.pyc"
+            wheel_script = f"{stem}.data/scripts/native-helper"
+            wheel_pythonw_script = f"{stem}.data/scripts/gui-helper"
+            wheel_data = f"{stem}.data/data/share/man/man1/demo.1"
+            wheel, _, archived = write_test_wheel(
+                wheelhouse,
+                "demo_pkg-1.0-py3-none-any.whl",
+                {
+                    "demo_pkg/__init__.py": b"VALUE = 1\n",
+                    owned_cache: b"locked pyc bytes",
+                    wheel_script: b"#!python\nfrom demo_pkg import main\nmain()",
+                    wheel_pythonw_script: (
+                        b"#!pythonw\r\nfrom demo_pkg import gui\ngui()"
+                    ),
+                    wheel_data: b"locked manual page",
+                    f"{stem}.dist-info/entry_points.txt": (
+                        b"[console_scripts]\n"
+                        b"demo-tool = demo_pkg:main\n"
+                    ),
+                },
+            )
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (wheelhouse / "SHA256SUMS").write_text(
+                f"{digest}  {wheel.name}\n", encoding="utf-8"
+            )
+            installed_contents: dict[str, bytes] = {}
+            rewritten_scripts = {
+                wheel_script: b"from demo_pkg import main\nmain()",
+                wheel_pythonw_script: b"from demo_pkg import gui\ngui()",
+            }
+            for source_path, content in archived.items():
+                installed_path = MODULE._wheel_record_site_path(
+                    source_path, stem, target_install=True
+                )
+                if installed_path is None:
+                    continue
+                if source_path in rewritten_scripts:
+                    content = (
+                        f"#!{runtime_python}\n".encode("utf-8")
+                        + rewritten_scripts[source_path]
+                    )
+                destination = site_packages / installed_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+                installed_contents[installed_path] = content
+
+            generated_entry_point = site_packages / "bin/demo-tool"
+            generated_entry_point.parent.mkdir(parents=True, exist_ok=True)
+            generated_wrapper = MODULE._entry_point_wrapper_bytes(
+                "demo_pkg:main", os.fsencode(str(runtime_python))
+            )
+            generated_entry_point.write_bytes(generated_wrapper)
+            checks = MODULE.verify_python_wheel_records(
+                wheelhouse,
+                site_packages,
+                {"demo-pkg": ("demo-pkg", "1.0")},
+                runtime_python,
             )
             self.assertTrue(all(ok for _, ok, _ in checks), checks)
+
+            generated_cache = (
+                site_packages / "demo_pkg/__pycache__/__init__.cpython-310.pyc"
+            )
+            generated_cache.write_bytes(b"unowned executable cache")
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
+                )
+            }
+            self.assertFalse(
+                results["native runtime Python site-packages inventory"]
+            )
+            generated_cache.unlink()
+
+            generated_entry_point.write_bytes(b"#!/bin/sh\nmalicious\n")
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
+                )
+            }
+            self.assertFalse(
+                results["native runtime Python installed wheel files"]
+            )
+            generated_entry_point.write_bytes(generated_wrapper)
+
+            generated_entry_point.unlink()
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
+                )
+            }
+            self.assertFalse(
+                results["native runtime Python installed wheel files"]
+            )
+            generated_entry_point.write_bytes(generated_wrapper)
+
+            for installed_path, source_path in (
+                (owned_cache, owned_cache),
+                ("bin/native-helper", wheel_script),
+                ("bin/gui-helper", wheel_pythonw_script),
+                ("share/man/man1/demo.1", wheel_data),
+            ):
+                with self.subTest(installed_path=installed_path):
+                    destination = site_packages / installed_path
+                    destination.write_bytes(b"modified")
+                    results = {
+                        name: ok
+                        for name, ok, _ in MODULE.verify_python_wheel_records(
+                            wheelhouse,
+                            site_packages,
+                            {"demo-pkg": ("demo-pkg", "1.0")},
+                            runtime_python,
+                        )
+                    }
+                    self.assertFalse(
+                        results["native runtime Python installed wheel files"]
+                    )
+                    destination.write_bytes(installed_contents[installed_path])
+
+            owned_cache_path = site_packages / owned_cache
+            owned_cache_path.unlink()
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
+                )
+            }
+            self.assertFalse(
+                results["native runtime Python installed wheel files"]
+            )
+            owned_cache_path.write_bytes(installed_contents[owned_cache])
+
+            for source_path in (
+                f"{stem}.data/headers/demo.h",
+                f"{stem}.data/data/lib/python3.10/site-packages/demo.py",
+            ):
+                with self.subTest(source_path=source_path), self.assertRaises(
+                    ValueError
+                ):
+                    MODULE._wheel_record_site_path(
+                        source_path, stem, target_install=True
+                    )
+
+            undeclared = site_packages / "bin/evil"
+            undeclared.write_bytes(b"not declared by locked metadata")
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
+                )
+            }
+            self.assertFalse(
+                results["native runtime Python site-packages inventory"]
+            )
+
+            undeclared.unlink()
+            cache_payload = site_packages / "demo_pkg/__pycache__/evil.so"
+            cache_payload.write_bytes(b"loadable cache payload")
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                    runtime_python,
+                )
+            }
+            self.assertFalse(
+                results["native runtime Python site-packages inventory"]
+            )
+
+    def test_entry_point_script_allowlist_rejects_unsafe_names(self) -> None:
+        self.assertEqual(
+            MODULE._wheel_entry_point_script_paths(
+                b"[console_scripts]\ncli-tool = package.cli:main\n"
+                b"[gui_scripts]\nviewer = package.gui:main\n"
+                b"[unrelated]\nplugin = package.plugin:value\n"
+            ),
+            {
+                "bin/cli-tool": "package.cli:main",
+                "bin/viewer": "package.gui:main",
+            },
+        )
+        self.assertEqual(
+            MODULE._entry_point_wrapper_bytes(
+                "package.cli:main", b"/locked/bin/python"
+            ),
+            (
+                b"#!/locked/bin/python\n"
+                b"# -*- coding: utf-8 -*-\n"
+                b"import re\n"
+                b"import sys\n"
+                b"from package.cli import main\n"
+                b"if __name__ == '__main__':\n"
+                b"    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', "
+                b"sys.argv[0])\n"
+                b"    sys.exit(main())\n"
+            ),
+        )
+        for content in (
+            b"[console_scripts]\nevil.py = package:main\n",
+            b"[console_scripts]\n../evil = package:main\n",
+            (
+                b"[console_scripts]\nsame = package:main\n"
+                b"[gui_scripts]\nsame = package:main\n"
+            ),
+            b"[DEFAULT]\nimplicit = package:main\n[console_scripts]\nok = p:m\n",
+        ):
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                MODULE._wheel_entry_point_script_paths(content)
+
+    def test_entry_point_paths_reject_cross_wheel_and_record_collisions(self) -> None:
+        for collision in ("cross-wheel", "record"):
+            with self.subTest(collision=collision), tempfile.TemporaryDirectory(
+            ) as temporary:
+                root = Path(temporary)
+                wheelhouse = root / "wheelhouse"
+                site_packages = root / "site-packages"
+                wheelhouse.mkdir()
+                site_packages.mkdir()
+                wheel_one, _, _ = write_test_wheel(
+                    wheelhouse,
+                    "first-1.0-py3-none-any.whl",
+                    {
+                        "first-1.0.dist-info/entry_points.txt": (
+                            b"[console_scripts]\nshared = first:main\n"
+                        ),
+                        **(
+                            {
+                                "first-1.0.data/scripts/shared": (
+                                    b"#!python\nfrom first import main\nmain()"
+                                )
+                            }
+                            if collision == "record"
+                            else {}
+                        ),
+                    },
+                )
+                wheels = [wheel_one]
+                pins = {"first": ("first", "1.0")}
+                if collision == "cross-wheel":
+                    wheel_two, _, _ = write_test_wheel(
+                        wheelhouse,
+                        "second-1.0-py3-none-any.whl",
+                        {
+                            "second-1.0.dist-info/entry_points.txt": (
+                                b"[gui_scripts]\nshared = second:main\n"
+                            )
+                        },
+                    )
+                    wheels.append(wheel_two)
+                    pins["second"] = ("second", "1.0")
+                (wheelhouse / "SHA256SUMS").write_text(
+                    "".join(
+                        f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  "
+                        f"{wheel.name}\n"
+                        for wheel in wheels
+                    ),
+                    encoding="utf-8",
+                )
+                results = {
+                    name: ok
+                    for name, ok, _ in MODULE.verify_python_wheel_records(
+                        wheelhouse,
+                        site_packages,
+                        pins,
+                        root / "venv/bin/python",
+                    )
+                }
+                self.assertFalse(results["Python wheel RECORD metadata"])
+
+    def test_python_identity_probe_is_executable_json(self) -> None:
+        marker = "MATRIX_TEST_IDENTITY_JSON="
+        result = subprocess.run(
+            [sys.executable, "-c", MODULE.python_identity_probe_code(marker)],
+            env={**os.environ, "PYTHONNOUSERSITE": "1"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line = next(
+            value for value in result.stdout.splitlines() if value.startswith(marker)
+        )
+        identity = json.loads(line[len(marker) :])
+        self.assertEqual(
+            set(identity),
+            {
+                "version",
+                "soabi",
+                "machine",
+                "prefix",
+                "base_prefix",
+                "executable",
+                "path",
+                "purelib",
+                "platlib",
+                "stdlib",
+                "platstdlib",
+                "user_site_enabled",
+            },
+        )
+        self.assertIs(identity["user_site_enabled"], False)
+        with self.assertRaises(ValueError):
+            MODULE.python_identity_probe_code("unsafe marker=")
 
     def test_wheel_records_reject_unhashed_or_unlocked_distributions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             wheelhouse = root / "wheelhouse"
             site_packages = root / "site-packages"
+            runtime_python = root / "venv/bin/python"
             wheelhouse.mkdir()
             site_packages.mkdir()
             wheel, _, _ = write_test_wheel(
@@ -690,7 +1039,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             )
 
             checks = MODULE.verify_python_wheel_records(
-                wheelhouse, site_packages, {"missing": ("missing", "1.0")}
+                wheelhouse,
+                site_packages,
+                {"missing": ("missing", "1.0")},
+                runtime_python,
             )
             results = {name: ok for name, ok, _ in checks}
             self.assertFalse(results["Python wheel RECORD metadata"])
@@ -718,7 +1070,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 f"{digest}  {wheel.name}\n", encoding="utf-8"
             )
             checks = MODULE.verify_python_wheel_records(
-                wheelhouse, site_packages, {"demo": ("demo", "1.0")}
+                wheelhouse,
+                site_packages,
+                {"demo": ("demo", "1.0")},
+                runtime_python,
             )
             results = {name: ok for name, ok, _ in checks}
             self.assertFalse(results["Python wheel RECORD metadata"])
@@ -794,6 +1149,19 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 wheel, site_packages, pico_lock
             )
             self.assertTrue(ok, detail)
+
+            generated_cache = (
+                site_packages
+                / "xrobotoolkit_sdk/__pycache__/generated.cpython-310.pyc"
+            )
+            generated_cache.parent.mkdir(parents=True)
+            generated_cache.write_bytes(b"runtime-generated cache")
+            ok, detail = MODULE.verify_installed_pico_wheel(
+                wheel, site_packages, pico_lock
+            )
+            self.assertFalse(ok)
+            self.assertIn("unowned PICO import file", detail)
+            generated_cache.unlink()
 
             installed_extension = site_packages / extension
             installed_extension.write_bytes(b"modified extension")
@@ -956,7 +1324,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("import ensurepip", text)
         self.assertIn('"$BOOTSTRAP_PYTHON" -m venv --without-pip', text)
         self.assertIn(".matrix-external-pip", text)
-        self.assertIn("matrix-wheel-record-v2", text)
+        self.assertIn("matrix-wheel-record-v3-no-compile", text)
         self.assertIn("ensurepip did not create a usable pip package", text)
         self.assertIn('find "$audit_site_packages"', text)
         self.assertIn('--target "$audit_site_packages"', text)
@@ -1013,6 +1381,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 "version": "3.10",
                 "prefix": str(venv),
                 "base_prefix": "/usr",
+                "executable": str(venv / "bin/python"),
                 "purelib": str(site_packages),
                 "platlib": str(site_packages),
                 "stdlib": "/usr/lib/python3.10",

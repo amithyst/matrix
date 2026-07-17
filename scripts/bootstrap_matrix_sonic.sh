@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -108,7 +109,7 @@ digest = hashlib.sha256()
 digest.update(lock_bytes)
 digest.update(b"\0")
 digest.update(requirements_bytes)
-digest.update(b"\0matrix-wheel-record-v2")
+digest.update(b"\0matrix-wheel-record-v3-no-compile")
 print(requirements)
 print(python_lock["requirements_sha256"])
 print(digest.hexdigest())
@@ -275,9 +276,11 @@ PY
         audit_site_packages="$($AUDIT_VENV/bin/python -c \
             'import site; print(site.getsitepackages()[0])')"
         PIP_COMMAND=(
-            /usr/bin/env PYTHONPATH="$audit_site_packages:$external_pip_root"
+            /usr/bin/env PYTHONDONTWRITEBYTECODE=1
+            PYTHONPATH="$audit_site_packages:$external_pip_root"
             "$AUDIT_VENV/bin/python" -m pip install
             --target "$audit_site_packages" --upgrade --ignore-installed
+            --no-compile
         )
         WHEELHOUSE="$RUNTIME_ROOT/python-wheelhouse"
         PIP_ARGS=(--no-index --only-binary=:all: --find-links "$WHEELHOUSE")
@@ -315,7 +318,7 @@ PY
         "${PIP_COMMAND[@]}" \
             "${PIP_ARGS[@]}" \
             -r "$REQUIREMENTS_FILE"
-        "$AUDIT_VENV/bin/python" - \
+        PYTHONDONTWRITEBYTECODE=1 "$AUDIT_VENV/bin/python" - \
             "$REQUIREMENTS_FILE" <<'PY'
 import importlib.metadata
 import pathlib
@@ -332,7 +335,8 @@ for line in requirements:
         raise SystemExit(f"{name}: expected {expected}, got {actual}")
 print("[PASS] Python dependency versions match requirements lock")
 PY
-        PYTHONPATH="$audit_site_packages:$external_pip_root" \
+        PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$audit_site_packages:$external_pip_root" \
             "$AUDIT_VENV/bin/python" -m pip check
         temporary_digest_marker="${VENV_DIGEST_MARKER}.tmp.$$"
         printf '%s\n' "$EXPECTED_VENV_DIGEST" > "$temporary_digest_marker"
@@ -342,7 +346,8 @@ PY
     select_runtime_python
 
     if [[ -n "$RELEASE_CACHE" ]]; then
-        python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" \
+        PYTHONDONTWRITEBYTECODE=1 \
+            python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" \
             --lock "$LOCK_FILE" \
             --runtime-root "$RUNTIME_ROOT" \
             --matrix-root "$PROJECT_ROOT" \
@@ -471,7 +476,8 @@ if [[ "$SKIP_ASSETS" == "1" ]]; then
     VERIFY_ARGS+=(--skip-installed-assets)
 fi
 
-python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" "${VERIFY_ARGS[@]}"
+PYTHONDONTWRITEBYTECODE=1 \
+    python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" "${VERIFY_ARGS[@]}"
 if [[ "$WRITE_LOCAL_ENV" == "1" ]]; then
     mkdir -p "$PROJECT_ROOT/.matrix"
     python3 "$SCRIPT_DIR/update_matrix_local_env.py" \

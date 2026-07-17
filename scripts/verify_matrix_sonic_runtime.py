@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import configparser
 import csv
 import hashlib
 import io
@@ -555,7 +556,9 @@ def _compact_failures(values: list[str], *, limit: int = 12) -> str:
     return "; ".join(values[:limit]) + f"; ... ({len(values) - limit} more)"
 
 
-def _wheel_record_site_path(record_path: str, wheel_stem: str) -> str | None:
+def _wheel_record_site_path(
+    record_path: str, wheel_stem: str, *, target_install: bool = False
+) -> str | None:
     """Map a wheel RECORD path into its installed site-packages path."""
 
     parts = Path(record_path).parts
@@ -570,17 +573,105 @@ def _wheel_record_site_path(record_path: str, wheel_stem: str) -> str | None:
         if not is_safe_relative_path(relative):
             raise ValueError(f"unsafe wheel site-packages path: {record_path}")
         return relative
+    if target_install and scheme == "scripts":
+        relative = (Path("bin") / Path(*parts[2:])).as_posix()
+        if not is_safe_relative_path(relative):
+            raise ValueError(f"unsafe wheel target script path: {record_path}")
+        return relative
+    if target_install and scheme == "data":
+        relative = Path(*parts[2:]).as_posix()
+        if not is_safe_relative_path(relative):
+            raise ValueError(f"unsafe wheel target data path: {record_path}")
+        if Path(relative).parts[0] != "share":
+            raise ValueError(
+                f"unsupported wheel target data path outside share/: {record_path}"
+            )
+        return relative
+    if target_install and scheme == "headers":
+        raise ValueError(f"unsupported wheel target headers path: {record_path}")
     if scheme in {"data", "headers", "scripts"}:
         return None
     raise ValueError(f"unknown wheel .data install scheme: {record_path}")
 
 
-def _site_packages_inventory(root: Path) -> tuple[set[str], list[str], int]:
+def _wheel_entry_point_script_paths(content: bytes) -> dict[str, str]:
+    """Return safe script paths/specifications from locked entry-point metadata."""
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError(f"entry_points.txt is not UTF-8: {exc}") from exc
+
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=True,
+        delimiters=("=",),
+    )
+    parser.optionxform = str
+    try:
+        parser.read_string(text)
+    except configparser.Error as exc:
+        raise ValueError(f"invalid entry_points.txt: {exc}") from exc
+    if parser.defaults():
+        raise ValueError("entry_points.txt must not define DEFAULT entries")
+
+    scripts: dict[str, str] = {}
+    for section in ("console_scripts", "gui_scripts"):
+        if not parser.has_section(section):
+            continue
+        for name, value in parser.items(section, raw=True):
+            specification = value.strip()
+            if (
+                re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None
+                or re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_]*"
+                    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*:"
+                    r"[A-Za-z_][A-Za-z0-9_]*"
+                    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*",
+                    specification,
+                )
+                is None
+            ):
+                raise ValueError(f"unsafe {section} entry point: {name!r}")
+            relative = (Path("bin") / name).as_posix()
+            if (
+                not is_safe_relative_path(relative)
+                or _is_loadable_site_packages_file(relative)
+            ):
+                raise ValueError(f"unsafe {section} script path: {relative!r}")
+            if relative in scripts:
+                raise ValueError(f"duplicate generated entry-point path: {relative}")
+            scripts[relative] = specification
+    return scripts
+
+
+def _entry_point_wrapper_bytes(
+    specification: str, encoded_python: bytes
+) -> bytes:
+    """Reproduce pip/distlib's POSIX console-script wrapper exactly."""
+
+    module, callable_path = specification.split(":", 1)
+    import_name = callable_path.split(".", 1)[0]
+    body = (
+        "# -*- coding: utf-8 -*-\n"
+        "import re\n"
+        "import sys\n"
+        f"from {module} import {import_name}\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+        f"    sys.exit({callable_path}())\n"
+    ).encode("utf-8")
+    return b"#!" + encoded_python + b"\n" + body
+
+
+def _site_packages_inventory(
+    root: Path,
+) -> tuple[set[str], list[str], set[str]]:
     """Enumerate regular files without following links.
 
     PEP 3147 cache files are isolated by the qualified launcher's fresh
-    ``PYTHONPYCACHEPREFIX`` and are intentionally excluded from the content
-    closure. Files outside ``__pycache__`` remain visible to the importer.
+    ``PYTHONPYCACHEPREFIX``. They remain in the inventory so wheel-owned cache
+    bytes can be attested and every unowned cache file is rejected.
     """
 
     try:
@@ -592,7 +683,7 @@ def _site_packages_inventory(root: Path) -> tuple[set[str], list[str], int]:
 
     regular_files: set[str] = set()
     non_regular: list[str] = []
-    ignored_cache_files = 0
+    cache_files: set[str] = set()
     pending: list[tuple[Path, bool]] = [(root, False)]
     while pending:
         directory, inside_cache = pending.pop()
@@ -621,12 +712,11 @@ def _site_packages_inventory(root: Path) -> tuple[set[str], list[str], int]:
                 )
             elif stat.S_ISREG(mode):
                 if inside_cache:
-                    ignored_cache_files += 1
-                else:
-                    regular_files.add(relative)
+                    cache_files.add(relative)
+                regular_files.add(relative)
             else:
                 non_regular.append(f"non-regular:{relative}")
-    return regular_files, non_regular, ignored_cache_files
+    return regular_files, non_regular, cache_files
 
 
 def _is_loadable_site_packages_file(relative: str) -> bool:
@@ -642,6 +732,7 @@ def verify_python_wheel_records(
     wheelhouse: Path,
     site_packages: Path,
     pinned_requirements: dict[str, tuple[str, str]],
+    python_executable: Path,
 ) -> list[tuple[str, bool, str]]:
     """Attest installed site-packages against RECORDs in locked wheels."""
 
@@ -652,8 +743,21 @@ def verify_python_wheel_records(
     )
     metadata_errors: list[str] = []
     expected_files: dict[str, tuple[str | None, int | None, str]] = {}
+    generated_entry_point_files: dict[str, tuple[str, bytes]] = {}
     wheel_identities: dict[str, tuple[str, str]] = {}
     installer_metadata_roots: set[str] = set()
+
+    if not python_executable.is_absolute():
+        detail = f"runtime Python path is not absolute: {python_executable}"
+        return [(name, False, detail) for name in check_names]
+    encoded_python = os.fsencode(str(python_executable))
+    if (
+        re.search(rb"\s", encoded_python) is not None
+        or b"\x00" in encoded_python
+        or len(encoded_python) + 3 > 127
+    ):
+        detail = f"runtime Python path is unsafe: {python_executable}"
+        return [(name, False, detail) for name in check_names]
 
     try:
         manifest_entries = parse_sha256_manifest(wheelhouse / "SHA256SUMS")
@@ -679,6 +783,7 @@ def verify_python_wheel_records(
         normalized_distribution = re.sub(r"[-_.]+", "_", distribution)
         wheel_stem = f"{normalized_distribution}-{version}"
         record_path = f"{wheel_stem}.dist-info/RECORD"
+        entry_points_path = f"{wheel_stem}.dist-info/entry_points.txt"
         signature_paths = {
             f"{wheel_stem}.dist-info/RECORD.jws",
             f"{wheel_stem}.dist-info/RECORD.p7s",
@@ -719,9 +824,46 @@ def verify_python_wheel_records(
                     continue
                 installer_metadata_roots.add(f"{wheel_stem}.dist-info")
                 record_bytes = archive.read(record_path)
+                entry_points_bytes = (
+                    archive.read(entry_points_path)
+                    if entry_points_path in archive_files
+                    else None
+                )
+                target_script_bytes = {
+                    name: archive.read(name)
+                    for name in archive_files
+                    if len(Path(name).parts) >= 3
+                    and Path(name).parts[0] == f"{wheel_stem}.data"
+                    and Path(name).parts[1] == "scripts"
+                }
         except (OSError, KeyError, zipfile.BadZipFile, RuntimeError) as exc:
             metadata_errors.append(f"{relative}:cannot read RECORD:{exc}")
             continue
+
+        if entry_points_bytes is not None:
+            try:
+                generated_scripts = _wheel_entry_point_script_paths(
+                    entry_points_bytes
+                )
+            except ValueError as exc:
+                metadata_errors.append(f"{relative}:{exc}")
+            else:
+                for installed_path, specification in sorted(
+                    generated_scripts.items()
+                ):
+                    previous = generated_entry_point_files.get(installed_path)
+                    if previous is not None:
+                        metadata_errors.append(
+                            f"generated entry-point collision:{installed_path}:"
+                            f"{previous[0]},{relative}"
+                        )
+                    else:
+                        generated_entry_point_files[installed_path] = (
+                            relative,
+                            _entry_point_wrapper_bytes(
+                                specification, encoded_python
+                            ),
+                        )
 
         try:
             record_text = record_bytes.decode("utf-8")
@@ -754,7 +896,9 @@ def verify_python_wheel_records(
                 saw_record_self = True
 
             try:
-                installed_path = _wheel_record_site_path(source_path, wheel_stem)
+                installed_path = _wheel_record_site_path(
+                    source_path, wheel_stem, target_install=True
+                )
             except ValueError as exc:
                 metadata_errors.append(f"{relative}:{exc}")
                 continue
@@ -765,13 +909,39 @@ def verify_python_wheel_records(
             expected_size: int | None
             if encoded_hash or encoded_size:
                 match = re.fullmatch(r"sha256=([A-Za-z0-9_-]{43})", encoded_hash)
-                if match is None or re.fullmatch(r"0|[1-9][0-9]*", encoded_size) is None:
+                if match is None or re.fullmatch(
+                    r"0|[1-9][0-9]*", encoded_size
+                ) is None:
                     metadata_errors.append(
                         f"{relative}:RECORD lacks sha256/size:{source_path}"
                     )
                     continue
                 expected_hash = match.group(1)
                 expected_size = int(encoded_size)
+                script_source = target_script_bytes.get(source_path)
+                if script_source is not None:
+                    source_hash = base64.urlsafe_b64encode(
+                        hashlib.sha256(script_source).digest()
+                    ).rstrip(b"=").decode("ascii")
+                    if (
+                        len(script_source) != expected_size
+                        or source_hash != expected_hash
+                    ):
+                        metadata_errors.append(
+                            f"{relative}:RECORD does not attest archive script:"
+                            f"{source_path}"
+                        )
+                        continue
+                    first_line, separator, remainder = script_source.partition(b"\n")
+                    if first_line.startswith(b"#!python"):
+                        transformed = (
+                            b"#!" + encoded_python + os.linesep.encode("ascii")
+                            + (remainder if separator else b"")
+                        )
+                        expected_hash = base64.urlsafe_b64encode(
+                            hashlib.sha256(transformed).digest()
+                        ).rstrip(b"=").decode("ascii")
+                        expected_size = len(transformed)
             else:
                 if source_path != record_path and source_path not in signature_paths:
                     metadata_errors.append(
@@ -809,6 +979,25 @@ def verify_python_wheel_records(
                 + ",".join(record_missing[:4])
             )
 
+    for installed_path in sorted(
+        set(expected_files) & set(generated_entry_point_files)
+    ):
+        metadata_errors.append(
+            f"generated entry point collides with RECORD file:{installed_path}"
+        )
+    for installed_path, (wheel_name, content) in sorted(
+        generated_entry_point_files.items()
+    ):
+        if installed_path in expected_files:
+            continue
+        expected_files[installed_path] = (
+            base64.urlsafe_b64encode(hashlib.sha256(content).digest())
+            .rstrip(b"=")
+            .decode("ascii"),
+            len(content),
+            f"{wheel_name}:generated-entry-point",
+        )
+
     for canonical, (distribution, expected_version) in pinned_requirements.items():
         wheel_identity = wheel_identities.get(canonical)
         if wheel_identity is None:
@@ -833,7 +1022,7 @@ def verify_python_wheel_records(
         ]
 
     try:
-        actual_files, non_regular, ignored_cache_files = _site_packages_inventory(
+        actual_files, non_regular, _cache_files = _site_packages_inventory(
             site_packages
         )
     except ValueError as exc:
@@ -889,11 +1078,16 @@ def verify_python_wheel_records(
     }
     unowned_loadable = sorted(
         relative
-        for relative in unexpected_files - allowed_generated_metadata
+        for relative in (
+            unexpected_files
+            - allowed_generated_metadata
+        )
         if _is_loadable_site_packages_file(relative)
     )
     unowned_other = sorted(
-        unexpected_files - allowed_generated_metadata - set(unowned_loadable)
+        unexpected_files
+        - allowed_generated_metadata
+        - set(unowned_loadable)
     )
     inventory_errors = list(non_regular)
     inventory_errors.extend(
@@ -903,7 +1097,8 @@ def verify_python_wheel_records(
     inventory_ok = not inventory_errors
     inventory_detail = (
         f"exact content closure; installer-metadata={len(allowed_generated_metadata)}; "
-        f"ignored-pycache-files={ignored_cache_files}"
+        f"entry-point-wrappers={len(generated_entry_point_files)}; "
+        "unowned-pycache-files=0"
         if inventory_ok
         else _compact_failures(inventory_errors)
     )
@@ -1084,7 +1279,7 @@ def verify_installed_pico_wheel(
         return False, _compact_failures(errors)
 
     try:
-        actual_files, non_regular, ignored_cache_files = _site_packages_inventory(
+        actual_files, non_regular, _cache_files = _site_packages_inventory(
             site_packages
         )
     except ValueError as exc:
@@ -1168,7 +1363,7 @@ def verify_installed_pico_wheel(
         (
             f"verified={verified} files={len(expected_files)} "
             f"top-level={','.join(sorted(top_level_names))} "
-            f"ignored-pycache-files={ignored_cache_files}"
+            "unowned-sdk-pycache-files=0"
             if not errors
             else _compact_failures(errors)
         ),
@@ -1295,6 +1490,27 @@ def pip_check_environment(
     return env, None
 
 
+def python_identity_probe_code(marker: str) -> str:
+    """Build the shared runtime/PICO interpreter identity probe."""
+
+    if re.fullmatch(r"[A-Z0-9_]+=", marker) is None:
+        raise ValueError(f"invalid Python identity marker: {marker!r}")
+    return (
+        "import json,platform,site,sys,sysconfig; "
+        f"print({marker!r} + json.dumps({{'version': "
+        "f'{sys.version_info.major}.{sys.version_info.minor}', "
+        "'soabi': sysconfig.get_config_var('SOABI') or '', "
+        "'machine': platform.machine(), 'prefix': sys.prefix, "
+        "'base_prefix': sys.base_prefix, 'executable': sys.executable, "
+        "'path': sys.path, "
+        "'purelib': sysconfig.get_path('purelib'), "
+        "'platlib': sysconfig.get_path('platlib'), "
+        "'stdlib': sysconfig.get_path('stdlib'), "
+        "'platstdlib': sysconfig.get_path('platstdlib'), "
+        "'user_site_enabled': site.ENABLE_USER_SITE}))"
+    )
+
+
 def verify_python_isolation(
     venv_root: Path,
     site_packages: Path,
@@ -1335,6 +1551,7 @@ def verify_python_isolation(
     expected_matrix = matrix_root.absolute()
     prefix = identity.get("prefix")
     base_prefix = identity.get("base_prefix")
+    executable = identity.get("executable")
     purelib = identity.get("purelib")
     platlib = identity.get("platlib")
     stdlib = identity.get("stdlib")
@@ -1346,6 +1563,14 @@ def verify_python_isolation(
         failures.append(f"invalid base_prefix: {base_prefix!r}")
     elif Path(base_prefix).absolute() == venv_root.absolute():
         failures.append("runtime Python is not a venv")
+    expected_executable = venv_root.absolute() / "bin/python"
+    if (
+        not isinstance(executable, str)
+        or Path(executable).absolute() != expected_executable
+    ):
+        failures.append(
+            f"runtime executable escapes venv: {executable!r}"
+        )
     for label, value in (("purelib", purelib), ("platlib", platlib)):
         if not isinstance(value, str) or Path(value).absolute() != expected_site:
             failures.append(f"runtime {label} escapes locked site-packages: {value!r}")
@@ -1732,23 +1957,12 @@ def main() -> int:
 
     identity_env = os.environ.copy()
     identity_env["PYTHONNOUSERSITE"] = "1"
+    identity_env["PYTHONDONTWRITEBYTECODE"] = "1"
     python_identity: dict[str, Any] = {}
     identity_error = "runtime Python is unavailable"
     if python_executable is not None:
         identity_prefix = "MATRIX_VERIFY_PYTHON_JSON="
-        identity_code = (
-            "import json,platform,site,sys,sysconfig; "
-            f"print('{identity_prefix}' + json.dumps({{'version': "
-            "f'{sys.version_info.major}.{sys.version_info.minor}', "
-            "'soabi': sysconfig.get_config_var('SOABI') or '', "
-            "'machine': platform.machine(), 'prefix': sys.prefix, "
-            "'base_prefix': sys.base_prefix, 'path': sys.path, "
-            "'purelib': sysconfig.get_path('purelib'), "
-            "'platlib': sysconfig.get_path('platlib'), "
-            "'stdlib': sysconfig.get_path('stdlib'), "
-            "'platstdlib': sysconfig.get_path('platstdlib'), "
-            "'user_site_enabled': site.ENABLE_USER_SITE}}))"
-        )
+        identity_code = python_identity_probe_code(identity_prefix)
         identity_result = subprocess.run(
             [python_executable, "-c", identity_code],
             env=identity_env,
@@ -2089,7 +2303,10 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
             record(name, False, "runtime Python is unavailable")
     else:
         for name, ok, detail in verify_python_wheel_records(
-            wheelhouse, python_site_packages, pinned_requirements
+            wheelhouse,
+            python_site_packages,
+            pinned_requirements,
+            Path(python_executable).absolute(),
         ):
             record(name, ok, detail)
 
@@ -2173,6 +2390,7 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
     if not args.skip_dynamic:
         env = dynamic_environment(runtime_root, matrix_root, sonic_root)
         env["PYTHONNOUSERSITE"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         if python_executable is None:
             record("native SONIC Python API", False, "runtime Python is unavailable")
             record("gear_sonic import origin", False, "runtime Python is unavailable")
@@ -2336,18 +2554,8 @@ print("MATRIX_VERIFY_IMPORT_JSON=" + json.dumps(payload, sort_keys=True))
                     / "site-packages"
                 )
                 pico_identity_marker = "MATRIX_VERIFY_PICO_IDENTITY_JSON="
-                pico_identity_code = (
-                    "import json,platform,site,sys,sysconfig; "
-                    f"print('{pico_identity_marker}' + json.dumps({{'version': "
-                    "f'{sys.version_info.major}.{sys.version_info.minor}', "
-                    "'soabi': sysconfig.get_config_var('SOABI') or '', "
-                    "'machine': platform.machine(), 'prefix': sys.prefix, "
-                    "'base_prefix': sys.base_prefix, 'path': sys.path, "
-                    "'purelib': sysconfig.get_path('purelib'), "
-                    "'platlib': sysconfig.get_path('platlib'), "
-                    "'stdlib': sysconfig.get_path('stdlib'), "
-                    "'platstdlib': sysconfig.get_path('platstdlib'), "
-                    "'user_site_enabled': site.ENABLE_USER_SITE}}))"
+                pico_identity_code = python_identity_probe_code(
+                    pico_identity_marker
                 )
                 pico_identity_env = env.copy()
                 pico_identity_env.pop("PYTHONPATH", None)
