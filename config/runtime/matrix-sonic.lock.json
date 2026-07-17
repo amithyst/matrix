@@ -46,8 +46,8 @@
     "soabi": "cpython-310-x86_64-linux-gnu",
     "machine": "x86_64",
     "requirements": "research/sonic_integration/requirements-trna.txt",
-    "requirements_sha256": "37cee2b833328bd6dcb5b45038d9bc1b5daa1533917b7684f2da757de9f2a7b0",
-    "wheelhouse_manifest_sha256": "1044d7c4e04648ef2e58a87b201b247082d4a8ec2bcc265611d5e3a344c8304b",
+    "requirements_sha256": "21100ad473975c9e4e3e9eb1b268e3777f63dea879ac97166c935b73576c1785",
+    "wheelhouse_manifest_sha256": "49a5f8f138793a78dd7339b77d8df887af14ffaa34acdb25b0c01e3cbf1265f7",
     "mujoco": "3.10.0"
   },
   "pico": {

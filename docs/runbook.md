@@ -72,11 +72,13 @@ matrix-native-deps/           # isolated native libraries
 python-wheelhouse/            # CPython 3.10 x86_64 wheels plus SHA256SUMS
 ```
 
-The native simulator closure contains 17 exact direct pins and 71 binary
+The native simulator and Matrix visual-import closure contains 18 exact direct
+pins and 72 binary
 CPython 3.10/x86_64 wheels. The locked `SHA256SUMS` digest is
-`1044d7c4e04648ef2e58a87b201b247082d4a8ec2bcc265611d5e3a344c8304b`.
+`49a5f8f138793a78dd7339b77d8df887af14ffaa34acdb25b0c01e3cbf1265f7`.
 It was verified by a clean offline install, `pip check`, import-origin checks,
-and a two-step Warehouse DDS smoke. PICO remains a separate interpreter via
+the Matrix custom-URDF import, and a two-step Warehouse DDS smoke. PICO remains
+a separate interpreter via
 `MATRIX_PICO_PYTHON`: set `MATRIX_PICO_WHEEL` to the locked
 `xrobotoolkit_sdk-1.0.2-cp310-cp310-linux_x86_64.whl` artifact. The verifier
 checks that wheel's filename and SHA256, the controlled `libPXREARobotSDK.so`

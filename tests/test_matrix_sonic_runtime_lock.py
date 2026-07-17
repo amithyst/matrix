@@ -197,6 +197,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         for distribution, version in (
             ("torch", "2.12.1"),
             ("mujoco", "3.10.0"),
+            ("urdf2mjcf", "0.1.3"),
             ("pyzmq", "27.1.0"),
             ("cyclonedds", "0.10.2"),
             ("unitree-sdk2py", "1.0.1"),
@@ -207,7 +208,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         )
         self.assertEqual(
             self.lock["python"]["wheelhouse_manifest_sha256"],
-            "1044d7c4e04648ef2e58a87b201b247082d4a8ec2bcc265611d5e3a344c8304b",
+            "49a5f8f138793a78dd7339b77d8df887af14ffaa34acdb25b0c01e3cbf1265f7",
         )
         self.assertEqual(self.lock["pico"]["version"], "1.0.2")
         self.assertEqual(
