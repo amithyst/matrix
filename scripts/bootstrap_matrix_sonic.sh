@@ -95,6 +95,7 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
     if [[ "$SKIP_PYTHON" != "1" ]]; then
         BOOTSTRAP_PYTHON="${MATRIX_BOOTSTRAP_PYTHON:-python3}"
         AUDIT_VENV="$PROJECT_ROOT/.venv-audit"
+        EXTERNAL_PIP_MARKER="$AUDIT_VENV/.matrix-external-pip"
         if ! command -v "$BOOTSTRAP_PYTHON" >/dev/null; then
             echo "[ERROR] Bootstrap interpreter is unavailable: $BOOTSTRAP_PYTHON" >&2
             exit 1
@@ -108,6 +109,12 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
             fi
         fi
         if [[ -x "$AUDIT_VENV/bin/python" ]] \
+            && grep -Eq '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' \
+                "$AUDIT_VENV/pyvenv.cfg"; then
+            echo "[INFO] Recreating non-isolated .venv-audit"
+            rm -rf "$AUDIT_VENV"
+        fi
+        if [[ -x "$AUDIT_VENV/bin/python" && ! -f "$EXTERNAL_PIP_MARKER" ]] \
             && ! "$AUDIT_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
             echo "[INFO] Recreating incomplete .venv-audit: pip is unavailable"
             rm -rf "$AUDIT_VENV"
@@ -121,10 +128,20 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
                     echo "[ERROR] Install python3-venv or make pip available to $BOOTSTRAP_PYTHON" >&2
                     exit 1
                 fi
-                echo "[WARN] ensurepip is unavailable; creating .venv-audit with system pip"
-                "$BOOTSTRAP_PYTHON" -m venv \
-                    --without-pip --system-site-packages "$AUDIT_VENV"
+                echo "[WARN] ensurepip is unavailable; using system pip as an isolated installer"
+                "$BOOTSTRAP_PYTHON" -m venv --without-pip "$AUDIT_VENV"
+                : > "$EXTERNAL_PIP_MARKER"
             fi
+        fi
+        if [[ -f "$EXTERNAL_PIP_MARKER" ]]; then
+            audit_site_packages="$($AUDIT_VENV/bin/python -c \
+                'import site; print(site.getsitepackages()[0])')"
+            PIP_COMMAND=(
+                "$BOOTSTRAP_PYTHON" -m pip install
+                --target "$audit_site_packages" --upgrade --ignore-installed
+            )
+        else
+            PIP_COMMAND=("$AUDIT_VENV/bin/python" -m pip install)
         fi
         WHEELHOUSE="$RUNTIME_ROOT/python-wheelhouse"
         PIP_ARGS=()
@@ -142,16 +159,11 @@ PY
             fi
             (cd "$WHEELHOUSE" && sha256sum -c SHA256SUMS)
             PIP_ARGS+=(--no-index --find-links "$WHEELHOUSE")
-            if grep -Eq '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' \
-                "$AUDIT_VENV/pyvenv.cfg"; then
-                # Do not let host packages satisfy the lock in the fallback venv.
-                PIP_ARGS+=(--ignore-installed)
-            fi
             echo "[INFO] Installing Python dependencies from locked offline wheelhouse"
         else
             echo "[WARN] Locked wheelhouse is absent; using configured Python package index"
         fi
-        "$AUDIT_VENV/bin/python" -m pip install \
+        "${PIP_COMMAND[@]}" \
             "${PIP_ARGS[@]}" \
             -r "$PROJECT_ROOT/research/sonic_integration/requirements-trna.txt"
         "$AUDIT_VENV/bin/python" - \

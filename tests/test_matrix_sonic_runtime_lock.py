@@ -163,8 +163,11 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("import ensurepip", text)
-        self.assertIn("--without-pip --system-site-packages", text)
+        self.assertIn('"$BOOTSTRAP_PYTHON" -m venv --without-pip', text)
+        self.assertIn(".matrix-external-pip", text)
+        self.assertIn('--target "$audit_site_packages"', text)
         self.assertIn("--ignore-installed", text)
+        self.assertIn("Recreating non-isolated .venv-audit", text)
         self.assertIn("Recreating incomplete .venv-audit", text)
 
     def test_release_cache_is_materialized_without_network_or_symlinks(self) -> None:
