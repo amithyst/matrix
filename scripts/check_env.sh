@@ -350,6 +350,24 @@ robot_needs_mc() {
     esac
 }
 
+motion_controller_is_disabled() {
+    local disabled="${MATRIX_DISABLE_MC:-0}"
+    local sonic="${MATRIX_SONIC:-0}"
+    case "${disabled,,}" in
+        1|true|yes|on)
+            return 0
+            ;;
+    esac
+    case "${sonic,,}" in
+        1|true|yes|on)
+            # Native SONIC owns the DDS controller/deploy path, and run_sim.sh
+            # disables the legacy Matrix motion controller for this topology.
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 check_runtime_env() {
     echo "[INFO] Checking MATRiX runtime environment"
     check_common_commands
@@ -400,7 +418,9 @@ check_runtime_env() {
         fi
     fi
 
-    if robot_needs_mc "$ROBOT_ARG"; then
+    if robot_needs_mc "$ROBOT_ARG" && motion_controller_is_disabled; then
+        log_ok "Matrix motion controller: disabled by selected runtime topology"
+    elif robot_needs_mc "$ROBOT_ARG"; then
         local mc_bin="$PROJECT_ROOT/src/robot_mc/build/export/mc/bin/mc_ctrl"
         require_file "$PROJECT_ROOT/src/robot_mc/run_mc.sh" "Restore src/robot_mc/run_mc.sh."
         require_executable_file "$mc_bin" "Install the assets package; it should provide src/robot_mc/build/export/mc/bin/mc_ctrl."

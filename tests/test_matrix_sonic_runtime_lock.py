@@ -380,6 +380,62 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("Bounded qualification requires --profile", text)
         self.assertIn("MATRIX_SONIC_QUALIFIED_RUNTIME", text)
 
+        check_env = (REPO_ROOT / "scripts/check_env.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("motion_controller_is_disabled", check_env)
+        self.assertIn(
+            "Matrix motion controller: disabled by selected runtime topology",
+            check_env,
+        )
+
+    def test_env_check_skips_mc_only_for_external_control_topology(self) -> None:
+        command = [
+            "bash",
+            str(REPO_ROOT / "scripts/check_env.sh"),
+            "runtime",
+            "--robot",
+            "custom",
+            "--scene",
+            "2",
+            "--mujoco",
+            "0",
+            "--offscreen",
+            "1",
+            "--skip-ldd",
+        ]
+        for overrides in (
+            {"MATRIX_DISABLE_MC": "1", "MATRIX_SONIC": "0"},
+            {"MATRIX_DISABLE_MC": "0", "MATRIX_SONIC": "TrUe"},
+        ):
+            with self.subTest(overrides=overrides):
+                result = subprocess.run(
+                    command,
+                    env={**os.environ, **overrides},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                output = result.stdout + result.stderr
+                self.assertIn(
+                    "Matrix motion controller: disabled by selected runtime topology",
+                    output,
+                )
+                self.assertNotIn("src/robot_mc/run_mc.sh", output)
+
+        result = subprocess.run(
+            command,
+            env={
+                **os.environ,
+                "MATRIX_DISABLE_MC": "0",
+                "MATRIX_SONIC": "0",
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertIn("src/robot_mc/run_mc.sh", result.stdout + result.stderr)
+
     def test_chunk_installer_has_noninteractive_contract(self) -> None:
         text = (
             REPO_ROOT / "scripts/release_manager/install_chunks.sh"
