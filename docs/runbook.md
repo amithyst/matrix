@@ -135,7 +135,8 @@ configuration files on exit.
 - TRNA does not apply a CPU set by default.
 - ZZA uses GPU0, X11 display `:1`, and its single 24-core NUMA node without an
   explicit CPU set. Its ROS2 RMW closure is isolated in the runtime bundle;
-  `MATRIX_CUDA_ROOT` points at its user-managed CUDA 12 runtime.
+  `MATRIX_CUDA_ROOT` points at a dedicated user-managed CUDA 12 runtime instead
+  of prepending a complete Conda library directory.
 - Override a value in `.matrix/local.env`; do not edit the tracked host profile
   for a one-off experiment.
 
@@ -155,6 +156,23 @@ Sensor disabling is an operator-render profile tradeoff, not the AI-data default
 It must not be presented as a no-cost optimization.
 
 ## Sync and delivery
+
+### Three-host collaboration contract
+
+Heyuan, TRNA, and ZZA are peers of one repository, not separate forks:
+
+1. Create one short-lived feature branch on whichever host starts the change.
+2. Push the branch, then use `fetch`, `switch`, and `pull --ff-only` on the
+   other required hosts so every result names the same commit.
+3. Keep host paths and display/NUMA defaults in `config/hosts/*.env`; keep local
+   runtime locations in ignored `.matrix/local.env`.
+4. Synchronize private runtime bundles and release archives through bootstrap
+   plus the tracked lock. Never synchronize an active Git worktree with rsync.
+5. Choose gates by impact: PICO/device changes require TRNA device evidence;
+   generic launcher/runtime changes require the affected host profiles; shared
+   physics or packaging changes require more than one host before merge.
+6. Merge through one PR only after source checks, artifact verification,
+   runtime acceptance, cleanup, and evidence links are recorded.
 
 Before switching hosts:
 

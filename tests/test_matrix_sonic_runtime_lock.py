@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +91,15 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "src/UeSim/Linux/zsibot_mujoco_ue/Saved/",
         ):
             self.assertIn(pattern, text)
+
+    def test_library_paths_use_profile_cuda_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cuda_lib = root / "cuda/lib64"
+            cuda_lib.mkdir(parents=True)
+            with mock.patch.dict(os.environ, {"MATRIX_CUDA_ROOT": str(root / "cuda")}):
+                paths = MODULE.library_paths(root / "runtime", REPO_ROOT)
+            self.assertIn(cuda_lib, paths)
 
     def test_launcher_preserves_git_managed_config(self) -> None:
         text = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
