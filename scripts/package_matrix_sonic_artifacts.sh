@@ -22,13 +22,13 @@ Required:
   --sonic-root PATH       Original GR00T-WholeBodyControl checkout at the pinned commit
   --inference-root PATH   Root containing TensorRT/ and onnxruntime/
   --visual-root PATH      Canonical G1 visual URDF and meshes
+  --native-deps PATH      Isolated native dependency root
   --wheelhouse PATH       Offline Python wheelhouse with SHA256SUMS
   --python PATH           Actual CPython interpreter for the locked runtime
   --output PATH           New matrix-sonic-native-v2 artifact directory
 
 Optional:
   --ros-prefix PATH       Isolated ROS2 ament prefix
-  --native-deps PATH      Isolated native dependency root
 EOF
 }
 
@@ -47,19 +47,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-for value_name in SONIC_ROOT INFERENCE_ROOT VISUAL_ROOT WHEELHOUSE RUNTIME_PYTHON OUTPUT; do
+for value_name in SONIC_ROOT INFERENCE_ROOT VISUAL_ROOT NATIVE_DEPS WHEELHOUSE RUNTIME_PYTHON OUTPUT; do
     if [[ -z "${!value_name}" ]]; then
         echo "[ERROR] --${value_name,,} is required" >&2
         exit 2
     fi
 done
-for directory in "$SONIC_ROOT" "$INFERENCE_ROOT" "$VISUAL_ROOT" "$WHEELHOUSE"; do
+for directory in "$SONIC_ROOT" "$INFERENCE_ROOT" "$VISUAL_ROOT" "$NATIVE_DEPS" "$WHEELHOUSE"; do
     if [[ ! -d "$directory" ]]; then
         echo "[ERROR] Source directory is missing: $directory" >&2
         exit 1
     fi
 done
-for directory in "$ROS_PREFIX" "$NATIVE_DEPS"; do
+for directory in "$ROS_PREFIX"; do
     if [[ -n "$directory" && ! -d "$directory" ]]; then
         echo "[ERROR] Optional source directory is missing: $directory" >&2
         exit 1
@@ -87,9 +87,7 @@ done
 if [[ -n "$ROS_PREFIX" ]]; then
     ROS_PREFIX="$(realpath "$ROS_PREFIX")"
 fi
-if [[ -n "$NATIVE_DEPS" ]]; then
-    NATIVE_DEPS="$(realpath "$NATIVE_DEPS")"
-fi
+NATIVE_DEPS="$(realpath "$NATIVE_DEPS")"
 OUTPUT="$(realpath -m "$OUTPUT")"
 STAGING="${OUTPUT}.tmp.$$"
 
@@ -103,9 +101,7 @@ INPUT_ROOTS=("$SONIC_ROOT" "$INFERENCE_ROOT" "$VISUAL_ROOT" "$WHEELHOUSE")
 if [[ -n "$ROS_PREFIX" ]]; then
     INPUT_ROOTS+=("$ROS_PREFIX")
 fi
-if [[ -n "$NATIVE_DEPS" ]]; then
-    INPUT_ROOTS+=("$NATIVE_DEPS")
-fi
+INPUT_ROOTS+=("$NATIVE_DEPS")
 for input_root in "${INPUT_ROOTS[@]}"; do
     if path_is_within "$OUTPUT" "$input_root" \
         || path_is_within "$STAGING" "$input_root"; then
@@ -214,9 +210,7 @@ rsync -aL "$VISUAL_ROOT/" "$STAGING/g1-visual/"
 if [[ -n "$ROS_PREFIX" ]]; then
     rsync -aL "$ROS_PREFIX/" "$STAGING/ros2-humble-prefix/"
 fi
-if [[ -n "$NATIVE_DEPS" ]]; then
-    rsync -aL "$NATIVE_DEPS/" "$STAGING/matrix-native-deps/"
-fi
+rsync -aL "$NATIVE_DEPS/" "$STAGING/matrix-native-deps/"
 if [[ ! -f "$WHEELHOUSE/SHA256SUMS" ]]; then
     echo "[ERROR] Wheelhouse SHA256SUMS is missing: $WHEELHOUSE" >&2
     exit 1

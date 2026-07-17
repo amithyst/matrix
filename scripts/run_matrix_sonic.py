@@ -101,6 +101,13 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--external-failure-file",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--ue-pid", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--print-every", type=float, default=2.0)
     parser.add_argument(
         "--startup-band",
@@ -123,6 +130,76 @@ def _atomic_json(path: Path | None, payload: dict[str, object]) -> None:
         stream.write("\n")
         temporary_path = Path(stream.name)
     os.replace(temporary_path, path)
+
+
+_UNKNOWN_EXTERNAL_EXIT_CODE = 255
+
+
+def _read_external_failure(path: Path | None) -> tuple[str, int] | None:
+    """Consume one atomic external-child failure record without inventing success."""
+    if path is None or not path.exists():
+        return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("failure channel is not a regular file")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("name") != "ue":
+            raise ValueError("failure channel does not identify the UE child")
+        exit_code = payload.get("exit_code")
+        if type(exit_code) is not int or not 0 <= exit_code <= 255:
+            raise ValueError("failure channel has an invalid exit code")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        print(
+            "matrix-sonic-runtime ERROR invalid UE failure channel: "
+            f"{path}: {exc}",
+            flush=True,
+        )
+        return "ue", _UNKNOWN_EXTERNAL_EXIT_CODE
+    return "ue", exit_code
+
+
+def _record_external_child_failure(
+    path: Path | None, failure: tuple[str, int]
+) -> None:
+    """Idempotently publish a late UE exit, even if no status was written yet."""
+    if path is None:
+        return
+    payload: dict[str, object] = {}
+    if path.exists():
+        if not path.is_file():
+            print(
+                "matrix-sonic-runtime ERROR status path for UE failure is not a file: "
+                f"{path}",
+                flush=True,
+            )
+            return
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            print(
+                f"matrix-sonic-runtime ERROR reading status for UE failure: {exc}",
+                flush=True,
+            )
+            return
+        if not isinstance(loaded, dict):
+            return
+        payload = loaded
+    name, exit_code = failure
+    failure_label = f"native_child_exit:{name}:{exit_code}"
+    failures = payload.get("acceptance_failures")
+    if not isinstance(failures, list):
+        failures = []
+    if failure_label not in failures:
+        failures.append(failure_label)
+    payload["acceptance_failures"] = failures
+    payload["failed_child_name"] = name
+    payload["failed_child_exit_code"] = exit_code
+    payload["passed"] = False
+    payload["completed"] = False
+    if payload.get("termination_reason") != "child_exit":
+        payload["pre_external_termination_reason"] = payload.get("termination_reason")
+    payload["termination_reason"] = "child_exit"
+    _atomic_json(path, payload)
 
 
 def _arm_supervisor_parent_death(expected_parent_pid: int | None) -> None:
@@ -149,9 +226,51 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_qualification_receipt(args: argparse.Namespace) -> None:
+def _expected_receipt_roots(
+    profile: str, runtime_root: Path, sonic_root: Path
+) -> dict[str, str]:
+    if profile == "trna":
+        ros_prefix = Path("/opt/ros/humble")
+        cuda_root = Path("/usr/local/cuda")
+    elif profile == "heyuan":
+        ros_prefix = runtime_root / "ros2-humble-prefix"
+        cuda_root = Path("/usr/local/cuda")
+    elif profile == "zza":
+        ros_prefix = runtime_root / "ros2-humble-prefix"
+        cuda_root = Path("/data/user_data/matrix-tools/cuda-runtime-12.1")
+    else:
+        raise SystemExit(f"unsupported qualification profile: {profile}")
+    return {
+        "inference": str((runtime_root / "inference").resolve()),
+        "visual_urdf": str((runtime_root / "g1-visual/g1_29dof.urdf").resolve()),
+        "unitree_sdk2": str(
+            (
+                sonic_root / "gear_sonic_deploy/thirdparty/unitree_sdk2"
+            ).resolve()
+        ),
+        "canonical_model": str(
+            (
+                sonic_root
+                / "gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml"
+            ).resolve()
+        ),
+        "canonical_meshes": str(
+            (
+                sonic_root
+                / "gear_sonic/data/robot_model/model_data/g1/meshes"
+            ).resolve()
+        ),
+        "native_deps": str((runtime_root / "matrix-native-deps").resolve()),
+        "ros_prefix": str(ros_prefix.resolve()),
+        "cuda": str(cuda_root.resolve()),
+    }
+
+
+def _validate_qualification_receipt(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
     if not args.qualified_runtime:
-        return
+        return None
     matrix_root = Path(__file__).resolve().parents[1]
     lock_path = matrix_root / "config/runtime/matrix-sonic.lock.json"
     if _sha256_file(lock_path) != args.runtime_lock_sha256:
@@ -175,7 +294,101 @@ def _validate_qualification_receipt(args: argparse.Namespace) -> None:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SystemExit(f"invalid runtime verification receipt: {exc}") from exc
-    checks = receipt.get("checks") if isinstance(receipt, dict) else None
+    if not isinstance(receipt, dict):
+        raise SystemExit("runtime verification receipt must be a JSON object")
+    checks = receipt.get("checks")
+    try:
+        active_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid active runtime lock: {exc}") from exc
+    if not isinstance(active_lock, dict):
+        raise SystemExit("active runtime lock must be a JSON object")
+    expected_flags = {
+        "fast": False,
+        "skip_dynamic": False,
+        "skip_installed_assets": False,
+        "require_git_sonic": True,
+    }
+    expected_inventory = {
+        "runtime_files_expected": len(active_lock["runtime_files"]),
+        "runtime_files_checked": len(active_lock["runtime_files"]),
+        "runtime_trees_expected": len(active_lock["runtime_trees"]),
+        "runtime_trees_checked": len(active_lock["runtime_trees"]),
+        "installed_files_expected": len(
+            active_lock["matrix_release"]["installed_files"]
+        ),
+        "installed_files_checked": len(
+            active_lock["matrix_release"]["installed_files"]
+        ),
+        "installed_trees_expected": len(
+            active_lock["matrix_release"]["installed_trees"]
+        ),
+        "installed_trees_checked": len(
+            active_lock["matrix_release"]["installed_trees"]
+        ),
+        "dynamic_checks_performed": True,
+    }
+    core_required_checks = {
+        "Matrix source commit",
+        "Matrix tracked source clean",
+        "Matrix ignored source overlays absent",
+        "native runtime Python",
+        "native runtime Python prefix",
+        "native runtime Python isolation",
+        "native SONIC source clean",
+        "native SONIC ignored source overlays absent",
+        "native SONIC Git checkout required",
+        "native SONIC commit",
+        "native SONIC Python API",
+        "gear_sonic import origin",
+        "SONIC deploy dependency closure",
+        "Matrix UE dependency closure",
+        "TensorRT ABI",
+    }
+    if args.control_source == "pico":
+        core_required_checks.update(
+            {
+                "native PICO wheel artifact",
+                "native PICO Python isolation",
+                "native PICO SDK wheel installation",
+                "native PICO Python API",
+                "native PICO pip check",
+            }
+        )
+    receipt_required_checks = receipt.get("qualification_required_checks")
+    check_names = {
+        str(item.get("name"))
+        for item in checks or []
+        if isinstance(item, dict)
+    }
+    receipt_inventory_complete = (
+        isinstance(receipt_required_checks, list)
+        and all(isinstance(name, str) for name in receipt_required_checks)
+        and core_required_checks.issubset(receipt_required_checks)
+        and set(receipt_required_checks).issubset(check_names)
+    )
+    runtime_root = Path(str(receipt.get("runtime_root", ""))).resolve()
+    expected_roots = _expected_receipt_roots(
+        args.qualification_profile, runtime_root, args.sonic_root.resolve()
+    )
+    expected_environment = {
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+        "pythonpath": os.environ.get("PYTHONPATH", ""),
+        "tensorrt_root": os.environ.get("TensorRT_ROOT", ""),
+        "python_pycache_prefix": os.environ.get("PYTHONPYCACHEPREFIX", ""),
+        "python_dont_write_bytecode": os.environ.get(
+            "PYTHONDONTWRITEBYTECODE", ""
+        ),
+    }
+    pico_identity_matches = (
+        receipt.get("pico_python") is None and receipt.get("pico_wheel") is None
+        if args.control_source != "pico"
+        else (
+            Path(str(receipt.get("pico_python", ""))).absolute()
+            == Path(args.pico_python or "").expanduser().absolute()
+            and bool(receipt.get("pico_wheel"))
+        )
+    )
     receipt_ok = (
         receipt.get("passed") is True
         and isinstance(checks, list)
@@ -188,11 +401,328 @@ def _validate_qualification_receipt(args: argparse.Namespace) -> None:
         and receipt.get("matrix_commit") == args.matrix_commit
         and Path(str(receipt.get("sonic_root", ""))).resolve()
         == args.sonic_root.resolve()
+        and receipt.get("full_hashes") is True
+        and receipt.get("sonic_git_checkout") is True
+        and receipt.get("qualification_eligible") is True
+        and receipt.get("verification_flags") == expected_flags
+        and receipt.get("verification_inventory") == expected_inventory
+        and receipt.get("missing_qualification_checks") == []
+        and receipt_inventory_complete
+        and Path(str(receipt.get("python", ""))).absolute()
+        == Path(sys.executable).absolute()
+        == (matrix_root / ".venv-audit/bin/python").absolute()
+        and Path(str(receipt.get("python_prefix", ""))).absolute()
+        == Path(sys.prefix).absolute()
+        == (matrix_root / ".venv-audit").absolute()
+        and receipt.get("launch_roots") == expected_roots
+        and receipt.get("launch_environment") == expected_environment
+        and pico_identity_matches
     )
     if not receipt_ok:
         raise SystemExit("runtime verification receipt does not match this launch")
     args.verification_receipt = receipt_path.resolve()
     args.verification_receipt_sha256 = _sha256_file(args.verification_receipt)
+    return receipt
+
+
+def _sha256_tree(root: Path) -> str:
+    if not root.is_dir() or root.is_symlink():
+        raise SystemExit(f"qualified runtime requires a regular tree: {root}")
+    digest = hashlib.sha256()
+    paths = sorted(root.rglob("*"))
+    if any(path.is_symlink() for path in paths):
+        raise SystemExit(f"qualified runtime tree contains a symlink: {root}")
+    for path in (item for item in paths if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _regular_json(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"qualified runtime requires regular {label}: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid {label} {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"invalid {label} object: {path}")
+    return payload
+
+
+def _validate_qualified_model(
+    args: argparse.Namespace,
+    model_path: Path,
+    receipt: dict[str, Any] | None,
+) -> dict[str, object]:
+    model_sha256 = _sha256_file(model_path)
+    manifest_path = model_path.parent / "manifest.json"
+    basic = {
+        "model_sha256": model_sha256,
+        "model_manifest": str(manifest_path.resolve()) if manifest_path.is_file() else None,
+        "model_manifest_sha256": (
+            _sha256_file(manifest_path) if manifest_path.is_file() else None
+        ),
+        "model_reproduced_from_locked_inputs": False,
+    }
+    if not args.qualified_runtime:
+        return basic
+    if receipt is None:
+        raise SystemExit("qualified runtime is missing its verifier receipt")
+
+    matrix_root = Path(__file__).resolve().parents[1]
+    lock = _regular_json(
+        matrix_root / "config/runtime/matrix-sonic.lock.json", "runtime lock"
+    )
+    manifest = _regular_json(manifest_path, "physics model manifest")
+    launch_roots = receipt["launch_roots"]
+    canonical_model = Path(str(manifest.get("canonical_model", ""))).resolve()
+    canonical_meshes = Path(str(manifest.get("canonical_meshes", ""))).resolve()
+    if canonical_model != Path(launch_roots["canonical_model"]):
+        raise SystemExit("qualified model canonical path does not match receipt")
+    if canonical_meshes != Path(launch_roots["canonical_meshes"]):
+        raise SystemExit("qualified model mesh path does not match receipt")
+
+    runtime_files = {
+        (entry["root"], entry["path"]): entry["sha256"]
+        for entry in lock["runtime_files"]
+    }
+    runtime_trees = {
+        (entry["root"], entry["path"]): entry["sha256"]
+        for entry in lock["runtime_trees"]
+    }
+    canonical_model_relative = (
+        "gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml"
+    )
+    canonical_meshes_relative = (
+        "gear_sonic/data/robot_model/model_data/g1/meshes"
+    )
+    expected_model_sha = runtime_files[("sonic", canonical_model_relative)]
+    expected_meshes_sha = runtime_trees[("sonic", canonical_meshes_relative)]
+    if (
+        manifest.get("canonical_model_sha256") != expected_model_sha
+        or _sha256_file(canonical_model) != expected_model_sha
+    ):
+        raise SystemExit("qualified model canonical SHA does not match runtime lock")
+    if (
+        manifest.get("canonical_meshes_sha256") != expected_meshes_sha
+        or _sha256_tree(canonical_meshes) != expected_meshes_sha
+    ):
+        raise SystemExit("qualified model mesh tree does not match runtime lock")
+
+    native_scene = Path(str(manifest.get("native_scene", ""))).resolve()
+    installed_files = {
+        (matrix_root / entry["path"]).resolve(): entry
+        for entry in lock["matrix_release"]["installed_files"]
+    }
+    installed_trees = {
+        (matrix_root / entry["path"]).resolve(): entry
+        for entry in lock["matrix_release"]["installed_trees"]
+    }
+    from prepare_sonic_physics_model import (
+        G1_BODY_JOINT_NAMES,
+        SonicPhysicsModelError,
+        _bundle_sha256,
+        _native_scene_asset_inventory,
+        prepare_sonic_physics_model,
+    )
+
+    try:
+        active_scene_assets = _native_scene_asset_inventory(native_scene)
+    except SonicPhysicsModelError as exc:
+        raise SystemExit(f"qualified native-scene asset inventory failed: {exc}") from exc
+    if manifest.get("native_scene_assets") != active_scene_assets:
+        raise SystemExit("qualified native-scene asset inventory is stale")
+    if args.scenario_layout_sha256 is None:
+        if manifest.get("spawn_xyz") is not None or manifest.get("spawn_yaw_rad") is not None:
+            raise SystemExit("qualified Matrix native scene cannot override spawn")
+        native_entry = installed_files.get(native_scene)
+        if native_entry is None:
+            raise SystemExit("qualified model uses an unlocked Matrix native scene")
+        if (
+            manifest.get("native_scene_sha256") != native_entry["sha256"]
+            or _sha256_file(native_scene) != native_entry["sha256"]
+        ):
+            raise SystemExit("qualified Matrix native scene SHA does not match lock")
+        native_assets = Path(str(manifest.get("native_assets", ""))).resolve()
+        assets_entry = installed_trees.get(native_assets)
+        if assets_entry is None or (
+            manifest.get("native_assets_sha256") != assets_entry["sha256"]
+            or _sha256_tree(native_assets) != assets_entry["sha256"]
+        ):
+            raise SystemExit("qualified Matrix native asset tree does not match lock")
+        for asset in active_scene_assets:
+            source = Path(str(asset["path"])).resolve()
+            try:
+                inside_assets = source.is_relative_to(native_assets)
+            except (OSError, RuntimeError):
+                inside_assets = False
+            if not inside_assets:
+                source_entry = installed_files.get(source)
+                if source_entry is None or (
+                    asset.get("sha256") != source_entry["sha256"]
+                    or asset.get("size") != source_entry["size"]
+                ):
+                    raise SystemExit(
+                        "qualified Matrix scene uses an unlocked sibling asset"
+                    )
+        reproduction_native_scene = native_scene
+    else:
+        layout_path = matrix_root / "research/overworld_v1/layout.json"
+        if _sha256_file(layout_path) != args.scenario_layout_sha256:
+            raise SystemExit("qualified Overworld layout does not match active source")
+        layout = _regular_json(layout_path, "Overworld layout")
+        expected_spawn = layout["acceptance"]["spawn_xyz"]
+        expected_yaw = layout["acceptance"]["spawn_yaw_rad"]
+        if (
+            manifest.get("spawn_xyz") != expected_spawn
+            or manifest.get("spawn_yaw_rad") != expected_yaw
+        ):
+            raise SystemExit("qualified Overworld spawn does not match layout")
+        composed_manifest_path = native_scene.parent / "manifest.json"
+        composed = _regular_json(composed_manifest_path, "Overworld manifest")
+        if (
+            composed.get("layout_sha256") != args.scenario_layout_sha256
+            or Path(str(composed.get("output_scene", ""))).resolve() != native_scene
+            or composed.get("output_scene_sha256") != _sha256_file(native_scene)
+            or manifest.get("native_scene_sha256")
+            != composed.get("output_scene_sha256")
+        ):
+            raise SystemExit("qualified Overworld scene manifest does not match output")
+        composed_scenes = composed.get("scenes")
+        if not isinstance(composed_scenes, list) or len(composed_scenes) != len(
+            layout["scenes"]
+        ):
+            raise SystemExit("qualified Overworld source-scene inventory is incomplete")
+        for scene in composed_scenes:
+            if not isinstance(scene, dict):
+                raise SystemExit("qualified Overworld source-scene entry is invalid")
+            source = Path(str(scene.get("source_scene", ""))).resolve()
+            entry = installed_files.get(source)
+            if entry is None or (
+                scene.get("source_sha256") != entry["sha256"]
+                or _sha256_file(source) != entry["sha256"]
+            ):
+                raise SystemExit("qualified Overworld contains an unlocked source scene")
+            source_assets = scene.get("source_assets")
+            if not isinstance(source_assets, list):
+                raise SystemExit(
+                    "qualified Overworld source-asset inventory is incomplete"
+                )
+            locked_asset_root = (
+                matrix_root / "src/robot_mujoco/zsibot_robots/xgb/assets"
+            ).resolve()
+            locked_asset_entry = installed_trees.get(locked_asset_root)
+            if locked_asset_entry is None or (
+                _sha256_tree(locked_asset_root) != locked_asset_entry["sha256"]
+            ):
+                raise SystemExit("qualified Matrix source asset tree is not locked")
+            for asset in source_assets:
+                if not isinstance(asset, dict):
+                    raise SystemExit("qualified Overworld source asset is invalid")
+                source_asset = Path(str(asset.get("path", ""))).resolve()
+                if (
+                    not source_asset.is_file()
+                    or source_asset.is_symlink()
+                    or asset.get("sha256") != _sha256_file(source_asset)
+                    or asset.get("size") != source_asset.stat().st_size
+                ):
+                    raise SystemExit("qualified Overworld source asset is stale")
+                if not source_asset.is_relative_to(locked_asset_root):
+                    source_entry = installed_files.get(source_asset)
+                    if source_entry is None or (
+                        source_entry["sha256"] != asset.get("sha256")
+                        or source_entry["size"] != asset.get("size")
+                    ):
+                        raise SystemExit(
+                            "qualified Overworld contains an unlocked sibling asset"
+                        )
+        native_assets = native_scene.parent / "assets"
+        if (
+            Path(str(manifest.get("native_assets", ""))).resolve() != native_assets
+            or
+            composed.get("output_assets_sha256") != _sha256_tree(native_assets)
+            or manifest.get("native_assets_sha256")
+            != composed.get("output_assets_sha256")
+        ):
+            raise SystemExit("qualified Overworld asset tree does not match manifest")
+
+        from compose_overworld_scene import compose_overworld_scene
+
+        with tempfile.TemporaryDirectory(prefix="matrix-overworld-recheck.") as temporary:
+            reproduction_native_scene = Path(temporary) / native_scene.name
+            reproduced_composed = compose_overworld_scene(
+                layout_path,
+                matrix_root / "src/robot_mujoco/zsibot_robots/xgb",
+                reproduction_native_scene,
+            )
+            if (
+                _sha256_file(reproduction_native_scene) != _sha256_file(native_scene)
+                or _sha256_tree(reproduction_native_scene.parent / "assets")
+                != _sha256_tree(native_assets)
+            ):
+                raise SystemExit("qualified Overworld scene is not reproducible")
+            if reproduced_composed.get("scenes") != composed_scenes:
+                raise SystemExit(
+                    "qualified Overworld source inventory is not reproducible"
+                )
+            reproduction_native_files = {
+                path.relative_to(reproduction_native_scene.parent): path.read_bytes()
+                for path in reproduction_native_scene.parent.rglob("*")
+                if path.is_file() and path.name != "manifest.json"
+            }
+        # The temporary composition is removed above; reconstruct it below in
+        # the model-reproduction temporary directory from the verified bytes.
+
+    if manifest.get("body_joint_names") != list(G1_BODY_JOINT_NAMES):
+        raise SystemExit("qualified model body-joint contract is not canonical")
+    spawn_xyz_value = manifest.get("spawn_xyz")
+    spawn_xyz = tuple(spawn_xyz_value) if spawn_xyz_value is not None else None
+    spawn_yaw = manifest.get("spawn_yaw_rad")
+    with tempfile.TemporaryDirectory(prefix="matrix-sonic-model-recheck.") as temporary:
+        temporary_root = Path(temporary)
+        if args.scenario_layout_sha256 is not None:
+            reproduction_native_root = temporary_root / "native"
+            for relative, content in reproduction_native_files.items():
+                target = reproduction_native_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            reproduction_native_scene = reproduction_native_root / native_scene.name
+        expected_output = temporary_root / "sonic"
+        expected_scene = prepare_sonic_physics_model(
+            canonical_model,
+            canonical_meshes,
+            reproduction_native_scene,
+            expected_output,
+            spawn_xyz=spawn_xyz,
+            spawn_yaw=spawn_yaw,
+        )
+        actual_robot = model_path.parent / "robot.xml"
+        actual_meshes = model_path.parent / "meshes"
+        if not actual_robot.is_file() or actual_robot.is_symlink() or not actual_meshes.is_dir():
+            raise SystemExit("qualified physics model bundle is incomplete")
+        if (
+            _sha256_file(expected_scene) != model_sha256
+            or _sha256_file(expected_output / "robot.xml")
+            != _sha256_file(actual_robot)
+            or _sha256_tree(expected_output / "meshes")
+            != _sha256_tree(actual_meshes)
+            or _bundle_sha256(expected_output)
+            != _bundle_sha256(model_path.parent)
+        ):
+            raise SystemExit("qualified physics model is not reproducible")
+    if (
+        manifest.get("derived_scene_sha256") != model_sha256
+        or manifest.get("derived_robot_sha256") != _sha256_file(model_path.parent / "robot.xml")
+        or manifest.get("derived_meshes_sha256") != _sha256_tree(model_path.parent / "meshes")
+        or manifest.get("derived_bundle_sha256")
+        != _bundle_sha256(model_path.parent)
+    ):
+        raise SystemExit("qualified physics model manifest has stale derived hashes")
+    basic["model_reproduced_from_locked_inputs"] = True
+    return basic
 
 
 def _validate_qualified_acceptance(args: argparse.Namespace) -> None:
@@ -612,6 +1142,30 @@ class NativePlannerClient:
             raise RuntimeError(f"failed to send native planner stop: {stop_error}")
 
 
+def _peek_child_returncode(process: subprocess.Popen[bytes]) -> int | None:
+    """Observe a direct child without releasing its PID/process-group identity."""
+
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    while True:
+        try:
+            result = os.waitid(os.P_PID, process.pid, flags)
+            break
+        except InterruptedError:
+            continue
+        except ChildProcessError as exc:
+            cached = process.returncode
+            if type(cached) is int:
+                return cached
+            raise RuntimeError(
+                f"native child {process.pid} is no longer waitable"
+            ) from exc
+    if result is None:
+        return None
+    if result.si_code == os.CLD_EXITED:
+        return int(result.si_status)
+    return -int(result.si_status)
+
+
 class NativeProcessGroup:
     """Own native SONIC deploy/PICO children without touching unrelated processes."""
 
@@ -646,6 +1200,8 @@ class NativeProcessGroup:
                 ) from exc
             self.pass_fds = (lock_fd,)
         self.children: list[tuple[str, subprocess.Popen[bytes]]] = []
+        self._stopping = False
+        self._boundary_failure: tuple[str, int] | None = None
         self._closed = False
 
     def _start(self, name: str, command: list[str], cwd: Path) -> None:
@@ -709,11 +1265,22 @@ class NativeProcessGroup:
         )
 
     def failed_child(self) -> tuple[str, int] | None:
+        if self._stopping:
+            return None
         for name, process in self.children:
-            code = process.poll()
+            code = _peek_child_returncode(process)
             if code is not None:
                 return name, code
         return None
+
+    def begin_expected_stop(self) -> tuple[str, int] | None:
+        """Set the authoritative stop boundary after one final non-reaping peek."""
+
+        if self._stopping:
+            return self._boundary_failure
+        self._boundary_failure = self.failed_child()
+        self._stopping = True
+        return self._boundary_failure
 
     def wait_for_child(self, name: str, *, timeout: float) -> bool:
         """Give a native child time to finish its own stop/cleanup path."""
@@ -721,7 +1288,7 @@ class NativeProcessGroup:
         if not matching:
             return True
         deadline = time.monotonic() + max(timeout, 0.0)
-        while any(process.poll() is None for process in matching):
+        while any(_peek_child_returncode(process) is None for process in matching):
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
@@ -731,6 +1298,12 @@ class NativeProcessGroup:
     def close(self) -> None:
         if self._closed:
             return
+        cleanup_errors: list[str] = []
+        try:
+            self.begin_expected_stop()
+        except Exception as exc:
+            # A supervision error must not prevent teardown of retained PGIDs.
+            cleanup_errors.append(f"stop boundary: {exc}")
         self._closed = True
         process_groups = {process.pid for _, process in self.children}
         for process_group in process_groups:
@@ -738,53 +1311,42 @@ class NativeProcessGroup:
                 # The session leader may already have exited while one of its
                 # descendants remains. Always address the whole process group.
                 os.killpg(process_group, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
                 pass
+            except PermissionError as exc:
+                cleanup_errors.append(f"SIGTERM pgid={process_group}: {exc}")
 
-        remaining_groups = self._wait_for_groups(
-            process_groups, deadline=time.monotonic() + 5.0
-        )
-        for process_group in remaining_groups:
+        deadline = time.monotonic() + 5.0
+        while self.children and time.monotonic() < deadline:
+            try:
+                if all(
+                    _peek_child_returncode(process) is not None
+                    for _, process in self.children
+                ):
+                    break
+            except RuntimeError as exc:
+                cleanup_errors.append(str(exc))
+                break
+            time.sleep(min(0.05, max(deadline - time.monotonic(), 0.0)))
+
+        # Kill every retained group before reaping any leader. Even when a
+        # leader exited during the grace period, an ignoring descendant can
+        # still occupy that group; the unreaped leader prevents PGID reuse.
+        for process_group in process_groups:
             try:
                 os.killpg(process_group, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
                 pass
-        surviving_groups = self._wait_for_groups(
-            remaining_groups, deadline=time.monotonic() + 2.0
-        )
+            except PermissionError as exc:
+                cleanup_errors.append(f"SIGKILL pgid={process_group}: {exc}")
 
-        for _, process in reversed(self.children):
+        for name, process in reversed(self.children):
             try:
-                process.wait(timeout=0.0)
+                process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                # Both group waits above are bounded; never hang cleanup on a
-                # misbehaving or unobservable child.
-                pass
-        if surviving_groups:
-            formatted = ",".join(str(value) for value in sorted(surviving_groups))
-            raise RuntimeError(f"native process groups survived SIGKILL: {formatted}")
-
-    def _wait_for_groups(self, groups: set[int], *, deadline: float) -> set[int]:
-        remaining = set(groups)
-        while remaining:
-            for _, process in self.children:
-                process.poll()
-            alive = set()
-            for process_group in remaining:
-                try:
-                    os.killpg(process_group, 0)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    alive.add(process_group)
-                else:
-                    alive.add(process_group)
-            remaining = alive
-            wait_s = min(0.05, deadline - time.monotonic())
-            if not remaining or wait_s <= 0.0:
-                break
-            time.sleep(wait_s)
-        return remaining
+                cleanup_errors.append(f"{name} did not exit after SIGKILL")
+        if cleanup_errors:
+            raise RuntimeError("; ".join(cleanup_errors))
 
 
 def _close_runtime_resource(name: str, resource) -> str | None:
@@ -848,6 +1410,8 @@ def main() -> int:
         raise SystemExit("--min-physics-hz and --min-rtf must be non-negative")
     if args.max_resets < 0:
         raise SystemExit("--max-resets must be non-negative")
+    if args.ue_pid is not None and args.ue_pid <= 1:
+        raise SystemExit("--ue-pid must identify a live UE process")
     sha256_pattern = r"[0-9a-f]{64}"
     if args.qualified_runtime:
         if not args.qualification_profile:
@@ -874,8 +1438,11 @@ def main() -> int:
         )
     ):
         raise SystemExit("qualification metadata requires --qualified-runtime")
-    _validate_qualification_receipt(args)
+    qualification_receipt = _validate_qualification_receipt(args)
     _validate_qualified_acceptance(args)
+    model_attestation = _validate_qualified_model(
+        args, model_path, qualification_receipt
+    )
     if (
         not math.isfinite(args.low_cmd_fresh_timeout_seconds)
         or args.low_cmd_fresh_timeout_seconds <= 0.0
@@ -960,6 +1527,34 @@ def main() -> int:
             else MatrixRenderPublisher(args.render_host, args.render_port)
         )
         processes = NativeProcessGroup(sonic_root, os.environ.copy())
+
+        def register_child_failure(failure: tuple[str, int] | None) -> bool:
+            nonlocal child_failure, running, termination_reason
+            if failure is None:
+                return False
+            if child_failure is None:
+                child_failure = failure
+                name, code = failure
+                print(
+                    "matrix-sonic-runtime ERROR child exited: "
+                    f"{name}={code}",
+                    flush=True,
+                )
+            running = False
+            if termination_reason != "numerical_instability":
+                termination_reason = "child_exit"
+            return True
+
+        def poll_failed_child() -> bool:
+            failure = _read_external_failure(args.external_failure_file)
+            if failure is None:
+                failure = processes.failed_child()
+            return register_child_failure(failure)
+
+        # The parent shell supervises UE from the instant it is spawned. A UE
+        # failure during the historical seven-second startup window is already
+        # present here and must prevent deploy/PICO from starting.
+        poll_failed_child()
         if running and args.control_source == "planner":
             planner = NativePlannerClient(
                 args.planner_bind,
@@ -975,24 +1570,6 @@ def main() -> int:
             processes.start_deploy(
                 interface=args.dds_interface, zmq_port=planner_port
             )
-
-        def poll_failed_child() -> bool:
-            nonlocal child_failure, running, termination_reason
-            failure = processes.failed_child()
-            if failure is None:
-                return False
-            if child_failure is None:
-                child_failure = failure
-                name, code = failure
-                print(
-                    "matrix-sonic-runtime ERROR native SONIC child exited: "
-                    f"{name}={code}",
-                    flush=True,
-                )
-            running = False
-            if termination_reason != "numerical_instability":
-                termination_reason = "child_exit"
-            return True
 
         expected_packet_size = packet_size(
             nq=len(snapshot.qpos), nv=len(snapshot.qvel), nu=len(snapshot.ctrl)
@@ -1149,6 +1726,7 @@ def main() -> int:
                     "control_hz": args.control_hz,
                     "elapsed_wall_s": round(now - started_wall, 3),
                     "model": str(model_path),
+                    **model_attestation,
                     "nu": len(snapshot.ctrl),
                     "low_cmd_age_s": (
                         round(float(low_cmd_age_s), 6)
@@ -1168,6 +1746,7 @@ def main() -> int:
                     "render_packet_bytes": expected_packet_size,
                     "render_sync_enabled": renderer is not None,
                     "ue_state_sync_hz": round(window_render / window_wall, 3),
+                    "ue_pid": args.ue_pid,
                     "root_xyz": [round(float(value), 5) for value in snapshot.qpos[:3]],
                     "root_displacement_xy_m": round(
                         float(
@@ -1216,8 +1795,14 @@ def main() -> int:
                 last_physics_steps = physics_steps
                 next_print = now + max(args.print_every, 0.1)
 
-        # One final poll closes the race between the last loop poll and final
-        # status publication, including the max_seconds boundary.
+        # One final poll followed by a non-reaping stop boundary closes the race
+        # between the last loop poll and final status publication. Any native
+        # exit observed before this boundary is a failure, including exit 0.
+        poll_failed_child()
+        register_child_failure(processes.begin_expected_stop())
+        # The UE supervisor has its own exact stop boundary. Re-read its atomic
+        # channel after committing the native boundary so neither child class
+        # can hide in the handoff between loop completion and acceptance.
         poll_failed_child()
         if termination_reason is None:
             termination_reason = "signal" if not running else "unknown"
@@ -1315,6 +1900,7 @@ def main() -> int:
             ),
             "verification_receipt_sha256": args.verification_receipt_sha256,
             "model": str(model_path),
+            **model_attestation,
             "nq": len(snapshot.qpos),
             "nu": len(snapshot.ctrl),
             "numerical_error": numerical_error,
@@ -1352,6 +1938,7 @@ def main() -> int:
             "termination_reason": termination_reason,
             "termination_signal": termination_signal,
             "ue_state_sync_hz": round(render_hz_aggregate, 3),
+            "ue_pid": args.ue_pid,
             "walking_commanded": walking,
         }
         _atomic_json(args.status_file, final_status)

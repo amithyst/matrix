@@ -20,7 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from compose_custom_scene import compose_custom_scene  # noqa: E402
 
 
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 G1_BODY_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -68,12 +68,75 @@ def _file_sha256(path: Path) -> str:
 
 def _tree_sha256(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    paths = sorted(root.rglob("*"))
+    if any(path.is_symlink() for path in paths):
+        raise SonicPhysicsModelError(f"source tree contains a symlink: {root}")
+    for path in (item for item in paths if item.is_file()):
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         digest.update(b"\0")
         digest.update(_file_sha256(path).encode("ascii"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _bundle_sha256(root: Path) -> str:
+    """Hash every derived file except the self-describing manifest."""
+    digest = hashlib.sha256()
+    paths = sorted(root.rglob("*"))
+    if any(path.is_symlink() for path in paths):
+        raise SonicPhysicsModelError(f"derived bundle contains a symlink: {root}")
+    for path in (item for item in paths if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if relative == "manifest.json":
+            continue
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_file_sha256(path).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _native_scene_asset_inventory(native_scene: Path) -> list[dict[str, object]]:
+    """Resolve every native scene file input, including assets/../ siblings."""
+    try:
+        root = ET.parse(native_scene).getroot()
+    except ET.ParseError as exc:
+        raise SonicPhysicsModelError(
+            f"invalid Matrix native scene {native_scene}: {exc}"
+        ) from exc
+    scene_root = native_scene.parent.resolve()
+    asset_root = scene_root / "assets"
+    assets = root.find("asset")
+    if assets is None:
+        return []
+    sources: dict[Path, dict[str, object]] = {}
+    for element in assets.iter():
+        file_name = element.get("file")
+        if not file_name:
+            continue
+        relative = Path(file_name)
+        if relative.is_absolute():
+            raise SonicPhysicsModelError(
+                f"native scene asset must be relative: {file_name}"
+            )
+        source = (asset_root / relative).resolve()
+        try:
+            source_relative = source.relative_to(scene_root)
+        except ValueError as exc:
+            raise SonicPhysicsModelError(
+                f"native scene asset escapes its robot root: {file_name}"
+            ) from exc
+        if not source.is_file() or source.is_symlink():
+            raise SonicPhysicsModelError(
+                f"native scene asset is not a regular file: {source}"
+            )
+        sources[source] = {
+            "path": str(source),
+            "relative_path": source_relative.as_posix(),
+            "size": source.stat().st_size,
+            "sha256": _file_sha256(source),
+        }
+    return [sources[path] for path in sorted(sources)]
 
 
 def _source_contract(
@@ -85,6 +148,7 @@ def _source_contract(
     spawn_xyz: tuple[float, float, float] | None,
     spawn_yaw: float | None,
 ) -> dict[str, object]:
+    native_assets = native_scene.parent / "assets"
     return {
         "pipeline_version": PIPELINE_VERSION,
         "canonical_model": str(canonical_model.resolve()),
@@ -93,6 +157,11 @@ def _source_contract(
         "canonical_meshes_sha256": _tree_sha256(canonical_meshes),
         "native_scene": str(native_scene.resolve()),
         "native_scene_sha256": _file_sha256(native_scene),
+        "native_assets": str(native_assets.resolve()) if native_assets.is_dir() else None,
+        "native_assets_sha256": (
+            _tree_sha256(native_assets) if native_assets.is_dir() else None
+        ),
+        "native_scene_assets": _native_scene_asset_inventory(native_scene),
         "body_joint_names": list(body_joint_names),
         "spawn_xyz": list(spawn_xyz) if spawn_xyz is not None else None,
         "spawn_yaw_rad": spawn_yaw,
@@ -284,7 +353,25 @@ def prepare_sonic_physics_model(
             else None
         )
         if existing_contract == contract:
-            return scene_path
+            derived_outputs = {
+                "derived_robot_sha256": output_dir / "robot.xml",
+                "derived_scene_sha256": scene_path,
+                "derived_meshes_sha256": output_dir / "meshes",
+                "derived_bundle_sha256": output_dir,
+            }
+            derived_match = True
+            for key, path in derived_outputs.items():
+                if key == "derived_meshes_sha256":
+                    actual = _tree_sha256(path) if path.is_dir() else None
+                elif key == "derived_bundle_sha256":
+                    actual = _bundle_sha256(path) if path.is_dir() else None
+                else:
+                    actual = _file_sha256(path) if path.is_file() else None
+                if existing.get(key) != actual:
+                    derived_match = False
+                    break
+            if derived_match:
+                return scene_path
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(
@@ -307,6 +394,12 @@ def prepare_sonic_physics_model(
             target_asset_root=temporary_dir / "meshes",
         )
         contract["body_joint_names"] = list(body_joint_names)
+        contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")
+        contract["derived_scene_sha256"] = _file_sha256(
+            temporary_dir / native_scene.name
+        )
+        contract["derived_meshes_sha256"] = _tree_sha256(temporary_dir / "meshes")
+        contract["derived_bundle_sha256"] = _bundle_sha256(temporary_dir)
         (temporary_dir / "manifest.json").write_text(
             json.dumps(contract, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

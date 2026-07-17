@@ -16,7 +16,7 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 REFERENCE_TAGS = {
     "mesh": "mesh",
     "material": "material",
@@ -34,6 +34,16 @@ def _sha256(path: Path) -> str:
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_sha256(path).encode("ascii"))
+        digest.update(b"\n")
     return digest.hexdigest()
 
 
@@ -187,10 +197,10 @@ def _copy_file_asset(
     scene_key: str,
     source_scene_root: Path,
     target_asset_root: Path,
-) -> None:
+) -> dict[str, Any] | None:
     file_name = element.get("file")
     if not file_name:
-        return
+        return None
     relative = Path(file_name)
     if relative.is_absolute():
         raise OverworldCompositionError(
@@ -222,6 +232,12 @@ def _copy_file_asset(
     if not target.exists():
         shutil.copy2(source, target)
     element.set("file", target_relative.as_posix())
+    return {
+        "path": str(source),
+        "relative_path": source.relative_to(source_scene_root).as_posix(),
+        "size": source.stat().st_size,
+        "sha256": _sha256(source),
+    }
 
 
 def _copy_referenced_assets(
@@ -231,14 +247,16 @@ def _copy_referenced_assets(
     scene_key: str,
     source_scene_root: Path,
     target_asset_root: Path,
-) -> tuple[list[ET.Element], dict[tuple[str, str], str]]:
+) -> tuple[
+    list[ET.Element], dict[tuple[str, str], str], list[dict[str, Any]]
+]:
     source_asset = source_root.find("asset")
     if source_asset is None:
         if _collect_asset_references(world_elements):
             raise OverworldCompositionError(
                 f"scene {scene_key} references assets but has no asset section"
             )
-        return [], {}
+        return [], {}, []
 
     by_key: dict[tuple[str, str], ET.Element] = {}
     for element in source_asset:
@@ -268,6 +286,7 @@ def _copy_referenced_assets(
         reference: f"{scene_key}__{reference[1]}" for reference in sorted(selected)
     }
     copied: list[ET.Element] = []
+    source_files: dict[str, dict[str, Any]] = {}
     for reference in sorted(selected):
         element = copy.deepcopy(by_key[reference])
         element.set("name", names[reference])
@@ -275,14 +294,16 @@ def _copy_referenced_assets(
             value = element.get(attribute)
             if value and (tag, value) in names:
                 element.set(attribute, names[(tag, value)])
-        _copy_file_asset(
+        source_file = _copy_file_asset(
             element,
             scene_key=scene_key,
             source_scene_root=source_scene_root,
             target_asset_root=target_asset_root,
         )
+        if source_file is not None:
+            source_files[str(source_file["path"])] = source_file
         copied.append(element)
-    return copied, names
+    return copied, names, [source_files[path] for path in sorted(source_files)]
 
 
 def _namespace_world_elements(
@@ -429,7 +450,7 @@ def _build_overworld_bundle(
                 f"scene {scene_key} removed {removed_geoms}/{len(remove_geoms)} requested geoms"
             )
 
-        copied_assets, asset_names = _copy_referenced_assets(
+        copied_assets, asset_names, source_assets = _copy_referenced_assets(
             source_root,
             copied_world,
             scene_key=scene_key,
@@ -467,6 +488,7 @@ def _build_overworld_bundle(
                 "copied_geoms": copied_geoms,
                 "removed_geoms": sorted(remove_geoms),
                 "copied_assets": len(copied_assets),
+                "source_assets": source_assets,
             }
         )
 
@@ -574,6 +596,10 @@ def compose_overworld_scene(
             robot_include=robot_include,
         )
         _atomic_write_xml(tree, staging_root / output_scene.name)
+        manifest["output_scene_sha256"] = _sha256(
+            staging_root / output_scene.name
+        )
+        manifest["output_assets_sha256"] = _tree_sha256(staging_root / "assets")
         _atomic_write_json(manifest, staging_root / "manifest.json")
         _publish_staged_bundle(staging_root, output_scene)
     return manifest

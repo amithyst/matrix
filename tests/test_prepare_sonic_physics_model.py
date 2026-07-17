@@ -95,6 +95,45 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["spawn_xyz"], [124.0, -105.05, 0.793])
             self.assertAlmostEqual(manifest["spawn_yaw_rad"], math.pi / 2.0)
+            self.assertEqual(
+                manifest["derived_robot_sha256"],
+                MODULE._file_sha256(output / "robot.xml"),
+            )
+            self.assertEqual(
+                manifest["derived_scene_sha256"],
+                MODULE._file_sha256(output / scene.name),
+            )
+            self.assertEqual(
+                manifest["derived_meshes_sha256"],
+                MODULE._tree_sha256(output / "meshes"),
+            )
+            self.assertEqual(
+                manifest["derived_bundle_sha256"],
+                MODULE._bundle_sha256(output),
+            )
+            self.assertEqual(
+                manifest["native_scene_assets"],
+                [
+                    {
+                        "path": str((native / "height.png").resolve()),
+                        "relative_path": "height.png",
+                        "size": len(b"height"),
+                        "sha256": MODULE._file_sha256(native / "height.png"),
+                    }
+                ],
+            )
+
+            (output / "height.png").write_bytes(b"tampered")
+            MODULE.prepare_sonic_physics_model(
+                canonical,
+                meshes,
+                scene,
+                output,
+                body_joint_names=("joint_a", "joint_b"),
+                spawn_xyz=(124.0, -105.05, 0.793),
+                spawn_yaw=math.pi / 2.0,
+            )
+            self.assertEqual((output / "height.png").read_bytes(), b"height")
 
 
 if __name__ == "__main__":

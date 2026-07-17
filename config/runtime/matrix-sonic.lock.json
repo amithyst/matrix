@@ -35,10 +35,88 @@
       }
     ],
     "installed_files": [
-      "bin/sim_launcher.bin",
-      "src/UeSim/Linux/Engine/Content/Renderer/TessellationTable.bin",
-      "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue",
-      "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_t10.xml"
+      {
+        "path": "bin/sim_launcher.bin",
+        "size": 65677368,
+        "sha256": "adaf1e572b3ff6b23c612bcb422eaa33f06dbf5e6195d234c738ffab9912e881"
+      },
+      {
+        "path": "src/UeSim/Linux/Engine/Content/Renderer/TessellationTable.bin",
+        "size": 259568,
+        "sha256": "edc4f3b628a139c5e185bbaeca661c95c1f427368d3b92892c5cff36c56dd941"
+      },
+      {
+        "path": "src/UeSim/Linux/Engine/Binaries/Linux/libEOSSDK-Linux-Shipping.so",
+        "size": 28487160,
+        "sha256": "f93accfc264dfcf533de33ec7561acaaeb64f489e4143a60d07b4b3a390a272d"
+      },
+      {
+        "path": "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue",
+        "size": 322263440,
+        "sha256": "155aeb0dd43e154839a2ec7795f83aecfb461f84fe72cdf9f5f4cd8e9158d022"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_t10.xml",
+        "size": 110961,
+        "sha256": "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_wh.xml",
+        "size": 27221,
+        "sha256": "c8e1ae43fe412503c2d4d49d0a3effd31de05be3fa16b42e03b9157eca78c040"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_office.xml",
+        "size": 25227,
+        "sha256": "09f74da727c60814a2c59bea89832b0c1fb49643bed0eaf32fbfc5f741fa8cd5"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_yard.xml",
+        "size": 8579,
+        "sha256": "f50054bac0dece96e7882708d38d8977b7068cb7f9112390eb353c8f93234b6e"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_apart2.xml",
+        "size": 13547,
+        "sha256": "4492e48e800e46ccfe9eb7511baa7a5c05d4fb73bb99b24d9e2694ce10da16ba"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_meet.xml",
+        "size": 9066,
+        "sha256": "17a2370eacfaefd4fe682a040d8543c4a34c46c0d1aa81652704af469486e494"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/height_field.png",
+        "size": 4865,
+        "sha256": "996b940ec9fcbe5551d436f76040f6b3690e90fb056ff8f2ba8c650c91f39e10"
+      },
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/unitree_hfield.png",
+        "size": 14273,
+        "sha256": "8a3f9777e096c5e8b6a5f8b2ca9382d5b25e2cacc15be7b5ac41f1e432e61a6c"
+      }
+    ],
+    "installed_trees": [
+      {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/assets",
+        "sha256": "9ebc024fa07ddf2deb6a9939bb276dea03b1c6d9e5dfee932b181800b7811232"
+      },
+      {
+        "path": "src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks",
+        "sha256": "cacda21aee5cccc24dd940d1220be5ab804daa1971c391c03ce813ffc26b920c"
+      },
+      {
+        "path": "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",
+        "sha256": "df2f1688f2a532f4d31b92a66f1afa5a772225ad6821e142adbc8e01d3580c2d"
+      },
+      {
+        "path": "src/UeSim/Linux/Engine/Plugins/Runtime/OpenCV/Binaries/ThirdParty/Linux",
+        "sha256": "034f92f80448bff64abbab6d5de5c0e2ccd2ab1509e14f7617c610e36f494b5f"
+      },
+      {
+        "path": "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb",
+        "sha256": "c56882d2bd06832a8a78009780508572d44aa72bf1f2b887928121f4cbb24b73"
+      }
     ]
   },
   "python": {
@@ -72,7 +150,14 @@
         "gear_sonic/utils/mujoco_sim/base_sim.py",
         "gear_sonic/utils/mujoco_sim/simulator_factory.py",
         "gear_sonic/utils/mujoco_sim/unitree_sdk2py_bridge.py",
+        "gear_sonic/utils/mujoco_sim/metric_utils.py",
+        "gear_sonic/utils/mujoco_sim/robot.py",
+        "gear_sonic/utils/mujoco_sim/sim_utils.py",
+        "gear_sonic/utils/network/network_utils.py",
         "gear_sonic/utils/teleop/zmq/zmq_planner_sender.py",
+        "gear_sonic/utils/teleop/zmq/zmq_poller.py",
+        "gear_sonic/trl/utils/rotation_conversion.py",
+        "gear_sonic/trl/utils/torch_transform.py",
         "gear_sonic/scripts/pico_manager_thread_server.py",
         "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
         "gear_sonic_deploy/policy/release/observation_config.yaml"
@@ -112,8 +197,43 @@
     },
     {
       "root": "sonic",
+      "path": "gear_sonic/utils/mujoco_sim/metric_utils.py",
+      "sha256": "ce725c41c67140816aa980eb5e57b33e19b55d53af63056372506a82f294254e"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/utils/mujoco_sim/robot.py",
+      "sha256": "9edd458c8c9397b57166f9f00ce951171b951d19144a47c2f1ef411e1ee224aa"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/utils/mujoco_sim/sim_utils.py",
+      "sha256": "e99ca73a9403a3bfb0e87b4add2da09f403a0b2486f8ea508a66fa39f20a5ce5"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/utils/network/network_utils.py",
+      "sha256": "23ec93b11e81f1e86f59303f18052ab5b4a3e1506d7255e93230c08d2d0fe911"
+    },
+    {
+      "root": "sonic",
       "path": "gear_sonic/utils/teleop/zmq/zmq_planner_sender.py",
       "sha256": "b29b26f1ea7b707bcd31fb84101129163fe21c00a8181f9333a6198f66f53217"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/utils/teleop/zmq/zmq_poller.py",
+      "sha256": "2e445f7eb27691e075f47c81d915b420e3124f3bb278d106b7a7f00b49ef37b4"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/trl/utils/rotation_conversion.py",
+      "sha256": "a2c350e42cc4e7eb906755867f1d977733d190925f22419e4b2e285ffac2bfa1"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/trl/utils/torch_transform.py",
+      "sha256": "4d40e3ac765cb2541aacd8af60f1162914e4ce97b4cc8fadc871a7c6a2fe7b41"
     },
     {
       "root": "sonic",
@@ -211,6 +331,16 @@
       "root": "sonic",
       "path": "gear_sonic_deploy/reference/example",
       "sha256": "72306b8c835773b81db1c4287553ebcb154ca2abae0a3510a8d7d23848a9db51"
+    },
+    {
+      "root": "visual",
+      "path": "meshes",
+      "sha256": "90aafb9dc270689f77e5a2a2c6ec7637c07b23440f18869f154a3e1536ed6b6e"
+    },
+    {
+      "root": "native",
+      "path": "usr/lib",
+      "sha256": "b5f237d328dace856641593e55dc587c55f3c6e4c8515550a5fc9fc6ba4a1853"
     }
   ],
   "acceptance": {

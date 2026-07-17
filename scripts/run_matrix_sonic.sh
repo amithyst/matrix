@@ -17,9 +17,10 @@ for ((index = 0; index < ${#ORIGINAL_ARGS[@]}; index++)); do
     fi
 done
 
-if [[ -f "$PROJECT_ROOT/.matrix/local.env" ]]; then
-    # shellcheck disable=SC1091
-    source "$PROJECT_ROOT/.matrix/local.env"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/matrix_local_env.sh"
+if ! load_matrix_local_env "$PROJECT_ROOT"; then
+    exit 2
 fi
 if [[ -n "$PROFILE" ]]; then
     PROFILE_FILE="$PROJECT_ROOT/config/hosts/$PROFILE.env"
@@ -44,7 +45,7 @@ YAW_RATE="0.0"
 MAX_SECONDS="0"
 LOCK_FILE="$PROJECT_ROOT/config/runtime/matrix-sonic.lock.json"
 read_acceptance_lock() {
-    python3 - "$LOCK_FILE" "$1" <<'PY'
+    /usr/bin/python3 -I - "$LOCK_FILE" "$1" <<'PY'
 import json
 import sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["acceptance"][sys.argv[2]])
@@ -139,7 +140,7 @@ export MATRIX_SONIC_HOST_LOCK_FD=9
 MATRIX_SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
 export MATRIX_SONIC_STATUS_FILE
 rm -f -- "$MATRIX_SONIC_STATUS_FILE"
-if ! QUALIFICATION_REQUESTED="$(python3 - "$MAX_SECONDS" <<'PY'
+if ! QUALIFICATION_REQUESTED="$(/usr/bin/python3 -I - "$MAX_SECONDS" <<'PY'
 import math
 import sys
 try:
@@ -167,6 +168,28 @@ if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
         echo "[ERROR] Bounded qualification cannot disable runtime verification" >&2
         exit 2
     fi
+    for launcher_root in "${SIM_LAUNCHER_ROOT:-}" "${MATRIX_ROOT:-}"; do
+        if [[ -n "$launcher_root" ]] \
+            && [[ "$(realpath -m "$launcher_root")" != "$PROJECT_ROOT" ]]; then
+            echo "[ERROR] Bounded qualification rejects an alternate Matrix launcher root: $launcher_root" >&2
+            exit 2
+        fi
+    done
+    if [[ "${SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER:-0}" == "1" \
+        || "${MATRIX_SKIP_ENV_CHECK:-0}" == "1" ]]; then
+        echo "[ERROR] Bounded qualification rejects launcher skip overrides" >&2
+        exit 2
+    fi
+    # Pin every launcher hop to this verified checkout. The custom wrapper sets
+    # its private recursion flag only for the final handoff back to run_sim.sh.
+    export SIM_LAUNCHER_ROOT="$PROJECT_ROOT"
+    export MATRIX_ROOT="$PROJECT_ROOT"
+    export SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=0
+    export MATRIX_SKIP_ENV_CHECK=0
+    # Ignore any historical source-tree __pycache__ and prevent this run from
+    # creating new bytecode beside the pinned SONIC sources.
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPYCACHEPREFIX="$(mktemp -d /tmp/matrix-qualified-pycache.XXXXXX)"
     if ! command -v git >/dev/null 2>&1 \
         || [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal)" ]]; then
         echo "[ERROR] Bounded qualification requires a clean Matrix Git checkout" >&2
@@ -174,7 +197,7 @@ if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
     fi
     MATRIX_SONIC_QUALIFIED_RUNTIME=1
     MATRIX_SONIC_QUALIFICATION_PROFILE="$PROFILE"
-    MATRIX_SONIC_RUNTIME_LOCK_SHA256="$(python3 - "$LOCK_FILE" <<'PY'
+    MATRIX_SONIC_RUNTIME_LOCK_SHA256="$(/usr/bin/python3 -I - "$LOCK_FILE" <<'PY'
 import hashlib
 from pathlib import Path
 import sys
@@ -231,6 +254,102 @@ for required in \
     fi
 done
 
+require_qualified_path() {
+    local label="$1"
+    local actual="$2"
+    local expected="$3"
+    local actual_resolved expected_resolved
+    actual_resolved="$(realpath -m "$actual")"
+    expected_resolved="$(realpath -m "$expected")"
+    if [[ "$actual_resolved" != "$expected_resolved" ]]; then
+        echo "[ERROR] Bounded qualification requires locked $label: expected=$expected_resolved actual=$actual_resolved" >&2
+        exit 2
+    fi
+}
+
+require_qualified_executable_path() {
+    local label="$1"
+    local actual="$2"
+    local expected="$3"
+    local actual_absolute expected_absolute
+    actual_absolute="$(cd "$(dirname "$actual")" && pwd -P)/$(basename "$actual")"
+    expected_absolute="$(cd "$(dirname "$expected")" && pwd -P)/$(basename "$expected")"
+    if [[ "$actual_absolute" != "$expected_absolute" ]]; then
+        echo "[ERROR] Bounded qualification requires locked $label: expected=$expected_absolute actual=$actual_absolute" >&2
+        exit 2
+    fi
+}
+
+if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
+    if [[ -n "${LD_LIBRARY_PATH:-}" || -n "${PYTHONPATH:-}" ]]; then
+        echo "[ERROR] Bounded qualification rejects inherited LD_LIBRARY_PATH/PYTHONPATH" >&2
+        exit 2
+    fi
+    require_qualified_path "Unitree SDK root" \
+        "$MATRIX_UNITREE_SDK2_ROOT" \
+        "$MATRIX_SONIC_ROOT/gear_sonic_deploy/thirdparty/unitree_sdk2"
+    require_qualified_path "inference root" \
+        "$MATRIX_INFERENCE_ROOT" "$RUNTIME_ROOT/inference"
+    require_qualified_path "canonical model" \
+        "$MATRIX_SONIC_CANONICAL_MODEL" \
+        "$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml"
+    require_qualified_path "canonical meshes" \
+        "$MATRIX_SONIC_CANONICAL_MESHES" \
+        "$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/meshes"
+    require_qualified_path "visual URDF" \
+        "$CUSTOM_URDF" "$RUNTIME_ROOT/g1-visual/g1_29dof.urdf"
+    require_qualified_executable_path "runtime Python" \
+        "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/.venv-audit/bin/python"
+    require_qualified_path "native dependency root" \
+        "${MATRIX_NATIVE_DEPS_ROOT:-$RUNTIME_ROOT/matrix-native-deps}" \
+        "$RUNTIME_ROOT/matrix-native-deps"
+    case "$PROFILE" in
+        trna)
+            expected_ros_prefix="/opt/ros/humble"
+            expected_cuda_root="/usr/local/cuda"
+            ;;
+        heyuan)
+            expected_ros_prefix="$RUNTIME_ROOT/ros2-humble-prefix"
+            expected_cuda_root="/usr/local/cuda"
+            ;;
+        zza)
+            expected_ros_prefix="$RUNTIME_ROOT/ros2-humble-prefix"
+            expected_cuda_root="/data/user_data/matrix-tools/cuda-runtime-12.1"
+            ;;
+        *)
+            echo "[ERROR] Unsupported bounded qualification profile: $PROFILE" >&2
+            exit 2
+            ;;
+    esac
+    require_qualified_path "ROS prefix" \
+        "${MATRIX_ROS_PREFIX:-}" "$expected_ros_prefix"
+    require_qualified_path "CUDA root" \
+        "${MATRIX_CUDA_ROOT:-/usr/local/cuda}" "$expected_cuda_root"
+    require_qualified_path "TensorRT root" \
+        "${TensorRT_ROOT:-$MATRIX_INFERENCE_ROOT/TensorRT}" \
+        "$RUNTIME_ROOT/inference/TensorRT"
+    readarray -t VISUAL_LOCK_HASHES < <(/usr/bin/python3 -I - "$LOCK_FILE" <<'PY'
+import json
+import sys
+
+lock = json.load(open(sys.argv[1], encoding="utf-8"))
+files = {(entry["root"], entry["path"]): entry["sha256"] for entry in lock["runtime_files"]}
+trees = {(entry["root"], entry["path"]): entry["sha256"] for entry in lock["runtime_trees"]}
+print(files[("visual", "g1_29dof.urdf")])
+print(trees[("visual", "meshes")])
+PY
+    )
+    if [[ "${#VISUAL_LOCK_HASHES[@]}" != "2" ]]; then
+        echo "[ERROR] Runtime lock is missing the qualified G1 visual closure" >&2
+        exit 2
+    fi
+    export MATRIX_G1_VISUAL_URDF_SHA256="${VISUAL_LOCK_HASHES[0]}"
+    export MATRIX_G1_VISUAL_MESHES_SHA256="${VISUAL_LOCK_HASHES[1]}"
+    # A bounded run always rebuilds the visual cache from the just-verified
+    # source closure; an older or locally tampered conversion is never reused.
+    export SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF=1
+fi
+
 prepend_library_dir() {
     local directory="$1"
     if [[ -d "$directory" ]]; then
@@ -248,7 +367,6 @@ if [[ -n "${MATRIX_ROS_PREFIX:-}" ]]; then
     prepend_library_dir "$MATRIX_ROS_PREFIX/lib"
 fi
 if [[ -n "${MATRIX_NATIVE_DEPS_ROOT:-}" ]]; then
-    prepend_library_dir "$MATRIX_NATIVE_DEPS_ROOT/usr/local/lib"
     prepend_library_dir "$MATRIX_NATIVE_DEPS_ROOT/usr/lib/x86_64-linux-gnu"
     prepend_library_dir "$MATRIX_NATIVE_DEPS_ROOT/usr/lib"
 fi
@@ -278,7 +396,6 @@ if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]; then
         --sonic-root "$MATRIX_SONIC_ROOT"
         --python "$MATRIX_SONIC_PYTHON"
         --profile "$PROFILE"
-        --fast
     )
     if [[ "$CONTROL_SOURCE" == "pico" ]]; then
         if [[ -z "${MATRIX_PICO_WHEEL:-}" ]]; then
@@ -291,9 +408,14 @@ if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]; then
         )
     fi
     if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
-        VERIFY_RUNTIME_ARGS+=(--json-output "$MATRIX_SONIC_VERIFICATION_RECEIPT")
+        VERIFY_RUNTIME_ARGS+=(
+            --require-git-sonic
+            --json-output "$MATRIX_SONIC_VERIFICATION_RECEIPT"
+        )
+    else
+        VERIFY_RUNTIME_ARGS+=(--fast)
     fi
-    python3 "$PROJECT_ROOT/scripts/verify_matrix_sonic_runtime.py" \
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/verify_matrix_sonic_runtime.py" \
         "${VERIFY_RUNTIME_ARGS[@]}"
 fi
 

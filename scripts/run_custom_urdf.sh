@@ -9,7 +9,8 @@ MUJOCORUNNING="${5:-0}"
 CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 FORCE_REIMPORT="${SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF:-0}"
-PIPELINE_VERSION=15
+MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
+PIPELINE_VERSION=16
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
 
@@ -295,7 +296,7 @@ preflight_custom_urdf() {
     local urdf_path="$1"
     local asset_dir="$2"
 
-    python3 - "$urdf_path" "$asset_dir" <<'PY'
+    "$MATRIX_PYTHON" - "$urdf_path" "$asset_dir" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -384,7 +385,7 @@ normalize_mesh_aliases() {
     local target_file="$1"
     local asset_dir="$2"
 
-    python3 - "$target_file" "$asset_dir" <<'PY'
+    "$MATRIX_PYTHON" - "$target_file" "$asset_dir" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -442,7 +443,7 @@ PY
 normalize_link_aliases() {
     local target_file="$1"
 
-    python3 - "$target_file" <<'PY'
+    "$MATRIX_PYTHON" - "$target_file" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -478,7 +479,7 @@ write_bbox_stl_proxy_from_binary_stl() {
     local src_stl="$1"
     local dst_stl="$2"
 
-    python3 - "$src_stl" "$dst_stl" <<'PY'
+    "$MATRIX_PYTHON" - "$src_stl" "$dst_stl" <<'PY'
 import math
 import struct
 import sys
@@ -595,7 +596,7 @@ normalize_mjcf() {
 
     sed -i 's/meshdir="meshes"/meshdir="assets"/g' "$target_xml"
 
-    python3 - "$target_xml" <<'PY'
+    "$MATRIX_PYTHON" - "$target_xml" <<'PY'
 import sys, re
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -747,7 +748,7 @@ sync_runtime_layout() {
         restore_urdf_fixed_links "$cache_urdf" "$active_xml"
         echo "[INFO] restoring generic runtime layout in: $active_xml"
         restore_generic_runtime_layout "$active_xml" "$cache_urdf"
-        python3 "$SCRIPT_DIR/apply_urdf_visual_materials.py" \
+        "$MATRIX_PYTHON" "$SCRIPT_DIR/apply_urdf_visual_materials.py" \
             --urdf "$cache_urdf" \
             --mjcf "$active_xml"
     fi
@@ -788,7 +789,7 @@ sync_runtime_layout() {
         if [[ -z "$REFERENCE_PROFILE" && -f "$cache_urdf" ]]; then
             _validate_args+=("$cache_urdf")
         fi
-        if python3 "$_validate_script" "${_validate_args[@]}"; then
+        if "$MATRIX_PYTHON" "$_validate_script" "${_validate_args[@]}"; then
             : # PASS — nothing to do
         else
             echo "[WARN] Contract validation FAILED for $active_xml (profile: $_profile)" >&2
@@ -804,7 +805,7 @@ restore_urdf_visual_meshes() {
         return
     fi
 
-    python3 - "$urdf_path" "$mjcf_path" <<'PY'
+    "$MATRIX_PYTHON" - "$urdf_path" "$mjcf_path" <<'PY'
 from pathlib import Path
 import math
 import sys
@@ -949,7 +950,7 @@ restore_urdf_fixed_links() {
         return
     fi
 
-    python3 - "$urdf_path" "$mjcf_path" <<'PY'
+    "$MATRIX_PYTHON" - "$urdf_path" "$mjcf_path" <<'PY'
 from pathlib import Path
 import math
 import sys
@@ -1169,7 +1170,7 @@ restore_generic_runtime_layout() {
         return
     fi
 
-    python3 - "$mjcf_path" "$urdf_path" <<'PY'
+    "$MATRIX_PYTHON" - "$mjcf_path" "$urdf_path" <<'PY'
 from pathlib import Path
 import math
 import re
@@ -1672,9 +1673,47 @@ print(f"[INFO] restored generic runtime markers and sensors in xml: {mjcf_path}"
 PY
 }
 
+strict_tree_sha256() {
+    "$MATRIX_PYTHON" - "$1" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit(f"not a regular tree: {root}")
+paths = sorted(root.rglob("*"))
+symlinks = [path for path in paths if path.is_symlink()]
+if symlinks:
+    raise SystemExit(f"tree contains symlink: {symlinks[0]}")
+digest = hashlib.sha256()
+for path in (item for item in paths if item.is_file()):
+    file_digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            file_digest.update(chunk)
+    digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(file_digest.hexdigest().encode("ascii"))
+    digest.update(b"\n")
+print(digest.hexdigest())
+PY
+}
+
 write_import_metadata() {
     local metadata_path="$1"
     local source_sha256="$2"
+    local source_assets_sha256="$3"
+    local derived_xml="$4"
+    local derived_urdf="$5"
+    local derived_assets="$6"
+    local derived_xml_sha256 derived_urdf_sha256 derived_assets_sha256
+    derived_xml_sha256="$(sha256sum "$derived_xml" | awk '{print $1}')"
+    derived_urdf_sha256="$(sha256sum "$derived_urdf" | awk '{print $1}')"
+    derived_assets_sha256=""
+    if [[ -d "$derived_assets" ]]; then
+        derived_assets_sha256="$(strict_tree_sha256 "$derived_assets")"
+    fi
     jq -n \
         --arg schema_version "1" \
         --argjson generator_version "$PIPELINE_VERSION" \
@@ -1682,6 +1721,10 @@ write_import_metadata() {
         --arg source_path "$CUSTOM_URDF" \
         --arg source_file "$URDF_BASENAME" \
         --arg source_sha256 "$source_sha256" \
+        --arg source_assets_sha256 "$source_assets_sha256" \
+        --arg derived_xml_sha256 "$derived_xml_sha256" \
+        --arg derived_urdf_sha256 "$derived_urdf_sha256" \
+        --arg derived_assets_sha256 "$derived_assets_sha256" \
         --arg reference_profile "${REFERENCE_PROFILE:-}" \
         --arg map_key "$MAP_KEY" \
         --arg map_asset "$MAP_ASSET" \
@@ -1693,6 +1736,10 @@ write_import_metadata() {
             source_path: $source_path,
             source_file: $source_file,
             source_sha256: $source_sha256,
+            source_assets_sha256: $source_assets_sha256,
+            derived_xml_sha256: $derived_xml_sha256,
+            derived_urdf_sha256: $derived_urdf_sha256,
+            derived_assets_sha256: $derived_assets_sha256,
             reference_profile: $reference_profile,
             map_key: $map_key,
             map_asset: $map_asset,
@@ -1741,7 +1788,34 @@ if [[ -n "$REFERENCE_PROFILE" ]]; then
 fi
 
 CURRENT_SOURCE_SHA256="$(sha256sum "$CUSTOM_URDF" | awk '{print $1}')"
+MUJOCO_SOURCE_ASSETS_SHA256=""
+UE_SOURCE_ASSETS_SHA256=""
+if [[ -n "$MUJOCO_IMPORT_ASSET_SRC" ]]; then
+    MUJOCO_SOURCE_ASSETS_SHA256="$(strict_tree_sha256 "$MUJOCO_IMPORT_ASSET_SRC")"
+fi
+if [[ -n "$UE_IMPORT_ASSET_SRC" ]]; then
+    UE_SOURCE_ASSETS_SHA256="$(strict_tree_sha256 "$UE_IMPORT_ASSET_SRC")"
+fi
 echo "[INFO] source sha256: $CURRENT_SOURCE_SHA256"
+echo "[INFO] source asset tree sha256: ${MUJOCO_SOURCE_ASSETS_SHA256:-none}"
+
+if [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]]; then
+    if [[ -z "${MATRIX_G1_VISUAL_URDF_SHA256:-}" \
+        || -z "${MATRIX_G1_VISUAL_MESHES_SHA256:-}" ]]; then
+        echo "[ERROR] Qualified visual source hashes were not provided" >&2
+        exit 2
+    fi
+    if [[ "$CURRENT_SOURCE_SHA256" != "$MATRIX_G1_VISUAL_URDF_SHA256" \
+        || "$MUJOCO_SOURCE_ASSETS_SHA256" != "$MATRIX_G1_VISUAL_MESHES_SHA256" \
+        || "$UE_SOURCE_ASSETS_SHA256" != "$MATRIX_G1_VISUAL_MESHES_SHA256" ]]; then
+        echo "[ERROR] Qualified G1 visual source closure does not match the runtime lock" >&2
+        exit 2
+    fi
+    if [[ "$FORCE_REIMPORT" != "1" ]]; then
+        echo "[ERROR] Qualified G1 visual import must force regeneration" >&2
+        exit 2
+    fi
+fi
 
 REUSE_EXISTING_IMPORT=0
 if [[ "$FORCE_REIMPORT" != "1" && -f "$TARGET_XML" && -f "$UE_TARGET_XML" ]]; then
@@ -1749,9 +1823,14 @@ if [[ "$FORCE_REIMPORT" != "1" && -f "$TARGET_XML" && -f "$UE_TARGET_XML" ]]; th
 fi
 
 if [[ "$REUSE_EXISTING_IMPORT" == "1" ]]; then
+    CURRENT_DERIVED_ASSETS_SHA256=""
+    if [[ -d "$TMP_ASSET_DIR" ]]; then
+        CURRENT_DERIVED_ASSETS_SHA256="$(strict_tree_sha256 "$TMP_ASSET_DIR")"
+    fi
     if [[ -f "$TARGET_METADATA" ]]; then
         PREVIOUS_SOURCE="$(read_metadata_value "$TARGET_METADATA" "source_path")"
         PREVIOUS_SHA256="$(read_metadata_value "$TARGET_METADATA" "source_sha256")"
+        PREVIOUS_ASSETS_SHA256="$(read_metadata_value "$TARGET_METADATA" "source_assets_sha256")"
         PREVIOUS_PIPELINE_VERSION="$(read_metadata_value "$TARGET_METADATA" "generator_version")"
         if [[ -n "$PREVIOUS_SOURCE" && "$PREVIOUS_SOURCE" != "$CUSTOM_URDF" ]]; then
             echo "[WARN] Existing import '$CUSTOM_NAME' was created from: $PREVIOUS_SOURCE"
@@ -1769,6 +1848,41 @@ if [[ "$REUSE_EXISTING_IMPORT" == "1" ]]; then
             echo "[WARN] Previous: $PREVIOUS_SHA256"
             echo "[WARN] Current : $CURRENT_SOURCE_SHA256"
             echo "[WARN] Regenerating to avoid reusing stale conversion output."
+            REUSE_EXISTING_IMPORT=0
+        elif [[ "$PREVIOUS_ASSETS_SHA256" != "$MUJOCO_SOURCE_ASSETS_SHA256" ]]; then
+            echo "[WARN] Existing import '$CUSTOM_NAME' source asset tree changed. Regenerating."
+            REUSE_EXISTING_IMPORT=0
+        fi
+        if [[ "$REUSE_EXISTING_IMPORT" == "1" ]] && [[ \
+            "$(read_metadata_value "$TARGET_METADATA" "derived_xml_sha256")" \
+            != "$(sha256sum "$TARGET_XML" | awk '{print $1}')" \
+            || "$(read_metadata_value "$TARGET_METADATA" "derived_urdf_sha256")" \
+            != "$(sha256sum "$TARGET_URDF" | awk '{print $1}')" \
+            || "$(read_metadata_value "$TARGET_METADATA" "derived_assets_sha256")" \
+            != "$CURRENT_DERIVED_ASSETS_SHA256" ]]; then
+            echo "[WARN] Existing import '$CUSTOM_NAME' derived cache attestation failed. Regenerating."
+            REUSE_EXISTING_IMPORT=0
+        fi
+    else
+        REUSE_EXISTING_IMPORT=0
+    fi
+    if [[ "$REUSE_EXISTING_IMPORT" == "1" ]]; then
+        UE_CURRENT_DERIVED_ASSETS_SHA256=""
+        if [[ -d "$UE_ASSET_DIR" ]]; then
+            UE_CURRENT_DERIVED_ASSETS_SHA256="$(strict_tree_sha256 "$UE_ASSET_DIR")"
+        fi
+        if [[ ! -f "$UE_TARGET_METADATA" \
+            || "$(read_metadata_value "$UE_TARGET_METADATA" "source_sha256")" \
+                != "$CURRENT_SOURCE_SHA256" \
+            || "$(read_metadata_value "$UE_TARGET_METADATA" "source_assets_sha256")" \
+                != "$UE_SOURCE_ASSETS_SHA256" \
+            || "$(read_metadata_value "$UE_TARGET_METADATA" "derived_xml_sha256")" \
+                != "$(sha256sum "$UE_TARGET_XML" | awk '{print $1}')" \
+            || "$(read_metadata_value "$UE_TARGET_METADATA" "derived_urdf_sha256")" \
+                != "$(sha256sum "$UE_TARGET_URDF" | awk '{print $1}')" \
+            || "$(read_metadata_value "$UE_TARGET_METADATA" "derived_assets_sha256")" \
+                != "$UE_CURRENT_DERIVED_ASSETS_SHA256" ]]; then
+            echo "[WARN] Existing UE import '$CUSTOM_NAME' cache attestation failed. Regenerating."
             REUSE_EXISTING_IMPORT=0
         fi
     fi
@@ -1822,7 +1936,7 @@ else
     fi
 
     if [[ -z "$REFERENCE_PROFILE" && "${CUSTOM_NAME,,}" == "lite3" ]]; then
-        python3 - "$TMP_ASSET_DIR/torso.STL" "$UE_ASSET_DIR/torso.STL" <<'PY'
+        "$MATRIX_PYTHON" - "$TMP_ASSET_DIR/torso.STL" "$UE_ASSET_DIR/torso.STL" <<'PY'
 import sys
 from pathlib import Path
 
@@ -1887,7 +2001,7 @@ PY
         echo "[INFO] converting URDF -> MJCF"
         (
             cd "$IMPORT_DIR"
-            python3 - <<PY
+            "$MATRIX_PYTHON" - <<PY
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
@@ -1974,8 +2088,12 @@ PY
     sync_runtime_layout "$TARGET_XML" "$TARGET_URDF" "$TMP_ASSET_DIR" "$MUJOCO_CUSTOM_ROOT" "$MUJOCO_ACTIVE_XML" "$MUJOCO_ACTIVE_SCENE_XML" "$MUJOCO_ACTIVE_ASSETS"
     sync_runtime_layout "$UE_TARGET_XML" "$UE_TARGET_URDF" "$UE_ASSET_DIR" "$UE_CUSTOM_ROOT" "$UE_ACTIVE_XML" "$UE_ACTIVE_SCENE_XML" "$UE_ACTIVE_ASSETS"
 
-    write_import_metadata "$TARGET_METADATA" "$CURRENT_SOURCE_SHA256"
-    write_import_metadata "$UE_TARGET_METADATA" "$CURRENT_SOURCE_SHA256"
+    write_import_metadata \
+        "$TARGET_METADATA" "$CURRENT_SOURCE_SHA256" "$MUJOCO_SOURCE_ASSETS_SHA256" \
+        "$TARGET_XML" "$TARGET_URDF" "$TMP_ASSET_DIR"
+    write_import_metadata \
+        "$UE_TARGET_METADATA" "$CURRENT_SOURCE_SHA256" "$UE_SOURCE_ASSETS_SHA256" \
+        "$UE_TARGET_XML" "$UE_TARGET_URDF" "$UE_ASSET_DIR"
     echo "[INFO] wrote metadata: $TARGET_METADATA"
     echo "[INFO] wrote metadata: $UE_TARGET_METADATA"
 fi

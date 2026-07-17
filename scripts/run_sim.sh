@@ -36,6 +36,14 @@ join_ld_library_path() {
 }
 
 setup_runtime_environment() {
+    case "${MATRIX_SONIC,,}" in
+        1|true|yes|on)
+            # The native SONIC launcher already constructed and verified the
+            # locked ROS/LD environment. Sourcing the legacy system overlay here
+            # would mutate PYTHONPATH after the qualification receipt was issued.
+            return
+            ;;
+    esac
     if [[ -f /opt/ros/humble/setup.bash ]]; then
         set +u
         # shellcheck disable=SC1091
@@ -134,8 +142,111 @@ PIDS=()
 WATCHDOG_PID=""
 FORCED_CLEANUP_PID=""
 SONIC_PID=""
+UE_PID=""
+UE_SUPERVISOR_PID=""
+UE_SUPERVISOR_REAPED=0
+UE_CONTROL_FD=""
+UE_LIFECYCLE_DIR=""
+UE_FAILURE_FILE=""
+UE_PID_FILE=""
 RUN_SIM_PARENT_PID="${MATRIX_SONIC_LAUNCHER_PID:-$PPID}"
 CLEANUP_STARTED=0
+
+record_ue_supervisor_failure() {
+    if [[ -z "${UE_FAILURE_FILE:-}" || -e "$UE_FAILURE_FILE" ]]; then
+        return
+    fi
+    local temporary_failure="${UE_FAILURE_FILE}.tmp.$$"
+    printf '%s\n' '{"name":"ue","exit_code":255}' > "$temporary_failure"
+    mv -f -- "$temporary_failure" "$UE_FAILURE_FILE"
+}
+
+remove_managed_pid() {
+    local target="$1"
+    local -a remaining=()
+    local pid
+    for pid in "${PIDS[@]:-}"; do
+        if [[ -n "$pid" && "$pid" != "$target" ]]; then
+            remaining+=("$pid")
+        fi
+    done
+    PIDS=("${remaining[@]}")
+}
+
+start_supervised_ue() {
+    local ue_log="$1"
+    shift
+    local -a ue_command=("$@")
+
+    mkdir -p "$PROJECT_ROOT/outputs"
+    UE_LIFECYCLE_DIR="$(mktemp -d "$PROJECT_ROOT/outputs/.matrix-ue-lifecycle.XXXXXX")"
+    UE_FAILURE_FILE="$UE_LIFECYCLE_DIR/failure.json"
+    UE_PID_FILE="$UE_LIFECYCLE_DIR/ue.pid"
+    local supervisor_python="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
+    coproc MATRIX_UE_SUPERVISOR {
+        exec "$supervisor_python" "$PROJECT_ROOT/scripts/supervise_matrix_ue.py" \
+            --pid-file "$UE_PID_FILE" \
+            --failure-file "$UE_FAILURE_FILE" \
+            --log "$ue_log" \
+            --expected-parent-pid "$$" \
+            -- "${ue_command[@]}"
+    }
+    UE_SUPERVISOR_PID="$MATRIX_UE_SUPERVISOR_PID"
+    UE_CONTROL_FD="${MATRIX_UE_SUPERVISOR[1]}"
+    local supervisor_output_fd="${MATRIX_UE_SUPERVISOR[0]}"
+    # The helper writes diagnostics to stderr and UE output to ue_log. Close its
+    # otherwise-unused coprocess stdout pipe so no descriptor survives cleanup.
+    exec {supervisor_output_fd}<&-
+
+    local attempt
+    for ((attempt = 0; attempt < 250; attempt++)); do
+        if [[ -s "$UE_PID_FILE" ]]; then
+            UE_PID="$(<"$UE_PID_FILE")"
+            break
+        fi
+        sleep 0.02
+    done
+    if [[ ! "$UE_PID" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[ERROR] UE supervisor failed to publish the UE PID" >&2
+        return 1
+    fi
+    echo "[INFO] UE PID $UE_PID (supervisor PID $UE_SUPERVISOR_PID)"
+}
+
+stop_supervised_ue() {
+    if [[ -z "${UE_SUPERVISOR_PID:-}" ]]; then
+        return
+    fi
+    local stop_delivered=0
+    local supervisor_exit_code=255
+    if [[ "$UE_SUPERVISOR_REAPED" == "1" ]]; then
+        if [[ -n "${UE_CONTROL_FD:-}" ]]; then
+            exec {UE_CONTROL_FD}>&-
+            UE_CONTROL_FD=""
+        fi
+        record_ue_supervisor_failure
+        UE_SUPERVISOR_PID=""
+        return
+    fi
+    if [[ -n "${UE_CONTROL_FD:-}" ]]; then
+        if printf '%s\n' stop >&"$UE_CONTROL_FD" 2>/dev/null; then
+            stop_delivered=1
+        fi
+        exec {UE_CONTROL_FD}>&-
+        UE_CONTROL_FD=""
+    fi
+    if wait "$UE_SUPERVISOR_PID"; then
+        supervisor_exit_code=0
+    else
+        supervisor_exit_code=$?
+    fi
+    if [[ "$stop_delivered" != "1" || "$supervisor_exit_code" == "255" ]]; then
+        record_ue_supervisor_failure
+    elif [[ "$supervisor_exit_code" != "0" && ! -e "$UE_FAILURE_FILE" ]]; then
+        record_ue_supervisor_failure
+    fi
+    UE_SUPERVISOR_PID=""
+}
 
 schedule_forced_cleanup() {
     (
@@ -186,7 +297,6 @@ cleanup() {
     echo "[INFO] ===== Cleaning up processes ====="
 
     stop_parent_watchdog
-    schedule_forced_cleanup
 
     # 1. 优雅关闭脚本启动的进程
     for pid in "${PIDS[@]:-}"; do
@@ -195,9 +305,14 @@ cleanup() {
             kill -TERM "$pid" 2>/dev/null || true
         fi
     done
+    # UE is owned by a dedicated supervisor and is never placed in the generic
+    # PID list. Its control-pipe stop plus exact shell wait cannot target a
+    # recycled UE or supervisor PID.
+    stop_supervised_ue
 
     # 2. 兜底清理（仅限本项目）
     kill_known_processes TERM
+    schedule_forced_cleanup
 
     # Give the SONIC Python runtime time to close its exact native deploy/PICO
     # children. Never pattern-kill those names: TRNA may also host a real robot.
@@ -228,6 +343,10 @@ cleanup() {
     if [[ -n "${FORCED_CLEANUP_PID:-}" ]] && kill -0 "${FORCED_CLEANUP_PID}" 2>/dev/null; then
         kill -TERM "${FORCED_CLEANUP_PID}" 2>/dev/null || true
         wait "${FORCED_CLEANUP_PID}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${UE_LIFECYCLE_DIR:-}" ]]; then
+        rm -rf -- "$UE_LIFECYCLE_DIR"
     fi
 
     echo "[INFO] ===== Cleanup finished ====="
@@ -519,6 +638,7 @@ compose_custom_runtime_scene() {
     fi
 
     local composer="$PROJECT_ROOT/scripts/compose_custom_scene.py"
+    local composer_python="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
     if [[ ! -f "$composer" ]]; then
         echo "[ERROR] Custom scene composer not found: $composer" >&2
         exit 1
@@ -540,8 +660,8 @@ compose_custom_runtime_scene() {
         exit 1
     fi
 
-    python3 "$composer" "$mujoco_source" "$mujoco_target"
-    python3 "$composer" "$ue_source" "$ue_target"
+    "$composer_python" "$composer" "$mujoco_source" "$mujoco_target"
+    "$composer_python" "$composer" "$ue_source" "$ue_target"
     echo "[INFO] Custom robot composed with native scene '$SCENE'"
 }
 
@@ -615,10 +735,20 @@ fi
 
 cd ../../../UeSim/Linux
 echo "[INFO] Starting UE"
-LD_LIBRARY_PATH="$(ue_ld_library_path)" ./zsibot_mujoco_ue.sh -game "$MAPNAME" -ExecCmds="$UE_EXEC_CMDS" $USE_OFFSCREEN $USE_PIXELSTREAMER > zsibot_mujoco_ue.log 2>&1 &
-PIDS+=($!)
+UE_COMMAND=(
+    /usr/bin/env "LD_LIBRARY_PATH=$(ue_ld_library_path)"
+    ./zsibot_mujoco_ue.sh -game "$MAPNAME" "-ExecCmds=$UE_EXEC_CMDS"
+)
+[[ -n "$USE_OFFSCREEN" ]] && UE_COMMAND+=("$USE_OFFSCREEN")
+[[ -n "$USE_PIXELSTREAMER" ]] && UE_COMMAND+=("$USE_PIXELSTREAMER")
+start_supervised_ue "$PWD/zsibot_mujoco_ue.log" "${UE_COMMAND[@]}"
 
-sleep 7
+UE_STARTUP_SECONDS="${MATRIX_UE_STARTUP_SECONDS:-7}"
+if [[ ! "$UE_STARTUP_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "[ERROR] MATRIX_UE_STARTUP_SECONDS must be a non-negative number: $UE_STARTUP_SECONDS" >&2
+    exit 1
+fi
+sleep "$UE_STARTUP_SECONDS"
 
 if $MATRIX_SONIC_ENABLED; then
     MATRIX_SONIC_PYTHON="${MATRIX_SONIC_PYTHON:-python3}"
@@ -695,6 +825,8 @@ if $MATRIX_SONIC_ENABLED; then
         --planner-bind "${MATRIX_SONIC_PLANNER_BIND:-tcp://127.0.0.1:5556}" \
         --pico-python "${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}" \
         --expected-parent-pid "$$" \
+        --external-failure-file "$UE_FAILURE_FILE" \
+        --ue-pid "$UE_PID" \
         --physics-hz "${MATRIX_SONIC_PHYSICS_HZ:-200}" \
         --walk-after "${MATRIX_SONIC_WALK_AFTER:--1}" \
         --vx "${MATRIX_SONIC_VX:-0.30}" \
@@ -744,10 +876,57 @@ fi
 #######################################
 echo "[INFO] All components started."
 if [[ -n "$SONIC_PID" ]]; then
+    if ((BASH_VERSINFO[0] < 5)) \
+        || ((BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1)); then
+        echo "[ERROR] Matrix SONIC supervision requires Bash 5.1 or newer" >&2
+        exit 2
+    fi
     set +e
-    wait "$SONIC_PID"
-    SONIC_EXIT_CODE=$?
+    COMPLETED_PID=""
+    wait -n -p COMPLETED_PID "$SONIC_PID" "$UE_SUPERVISOR_PID"
+    FIRST_EXIT_CODE=$?
+    if [[ "$COMPLETED_PID" == "$UE_SUPERVISOR_PID" ]]; then
+        UE_SUPERVISOR_REAPED=1
+        record_ue_supervisor_failure
+        # Do not signal a numeric PID after wait-n reaped the other child: Bash
+        # may already have reaped a near-simultaneous SONIC exit and that PID can
+        # be reused. The runner polls this sentinel and exits fail-closed.
+        wait "$SONIC_PID"
+        SONIC_EXIT_CODE=$?
+    else
+        SONIC_EXIT_CODE="$FIRST_EXIT_CODE"
+    fi
+    remove_managed_pid "$SONIC_PID"
+    SONIC_PID=""
     set -e
+    # The supervisor stays alive after any unexpected UE exit. Asking it to stop
+    # and waiting for that exact child is the synchronization barrier between
+    # the runner's final poll and the authoritative UE wait status.
+    stop_supervised_ue
+    if [[ -e "$UE_FAILURE_FILE" ]]; then
+        if ! PYTHONPATH="$PROJECT_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}" \
+            "$MATRIX_SONIC_PYTHON" - \
+            "$SONIC_STATUS_FILE" "$UE_FAILURE_FILE" <<'PY'
+import sys
+from pathlib import Path
+
+from run_matrix_sonic import (
+    _read_external_failure,
+    _record_external_child_failure,
+)
+
+failure = _read_external_failure(Path(sys.argv[2]))
+if failure is None:
+    raise RuntimeError("missing UE failure")
+_record_external_child_failure(Path(sys.argv[1]), failure)
+PY
+        then
+            echo "[ERROR] Failed to merge the UE lifecycle failure into status" >&2
+        fi
+        if [[ "$SONIC_EXIT_CODE" == "0" ]]; then
+            SONIC_EXIT_CODE=2
+        fi
+    fi
     echo "[INFO] Matrix SONIC runtime exited with code $SONIC_EXIT_CODE"
     exit "$SONIC_EXIT_CODE"
 fi

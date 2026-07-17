@@ -59,9 +59,10 @@ if [[ "$WRITE_LOCAL_ENV" == "1" && -z "$RUNTIME_OVERRIDE" ]]; then
     exit 2
 fi
 
-if [[ -f "$PROJECT_ROOT/.matrix/local.env" ]]; then
-    # shellcheck disable=SC1091
-    source "$PROJECT_ROOT/.matrix/local.env"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/matrix_local_env.sh"
+if ! load_matrix_local_env "$PROJECT_ROOT"; then
+    exit 2
 fi
 if [[ -n "$RUNTIME_OVERRIDE" ]]; then
     export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"
@@ -79,7 +80,7 @@ if [[ -n "$RELEASE_CACHE" ]]; then
     RELEASE_CACHE="$(realpath -m "$RELEASE_CACHE")"
 fi
 LOCK_FILE="$PROJECT_ROOT/config/runtime/matrix-sonic.lock.json"
-for required_command in python3 sha256sum; do
+for required_command in find python3 sha256sum; do
     command -v "$required_command" >/dev/null || {
         echo "[ERROR] Required bootstrap command is unavailable: $required_command" >&2
         exit 1
@@ -107,6 +108,7 @@ digest = hashlib.sha256()
 digest.update(lock_bytes)
 digest.update(b"\0")
 digest.update(requirements_bytes)
+digest.update(b"\0matrix-wheel-record-v2")
 print(requirements)
 print(python_lock["requirements_sha256"])
 print(digest.hexdigest())
@@ -196,20 +198,61 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
                 rm -rf "$AUDIT_VENV"
             fi
         fi
-        if [[ -x "$AUDIT_VENV/bin/python" ]] \
-            && grep -Eq '^include-system-site-packages[[:space:]]*=[[:space:]]*true$' \
-                "$AUDIT_VENV/pyvenv.cfg"; then
-            echo "[INFO] Recreating non-isolated .venv-audit"
-            rm -rf "$AUDIT_VENV"
+        if [[ -x "$AUDIT_VENV/bin/python" ]]; then
+            if ! /usr/bin/python3 -I - "$AUDIT_VENV/pyvenv.cfg" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if path.is_symlink() or not path.is_file():
+    raise SystemExit(1)
+values = []
+for line in path.read_text(encoding="utf-8").splitlines():
+    if "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.strip().lower() == "include-system-site-packages":
+        values.append(value.strip().lower())
+raise SystemExit(0 if values == ["false"] else 1)
+PY
+            then
+                echo "[INFO] Recreating non-isolated .venv-audit"
+                rm -rf "$AUDIT_VENV"
+            fi
         fi
-        if [[ -x "$AUDIT_VENV/bin/python" && ! -f "$EXTERNAL_PIP_MARKER" ]] \
-            && ! "$AUDIT_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
-            echo "[INFO] Recreating incomplete .venv-audit: pip is unavailable"
+        if [[ -x "$AUDIT_VENV/bin/python" && -f "$EXTERNAL_PIP_MARKER" ]]; then
+            mapfile -t external_pip_roots < "$EXTERNAL_PIP_MARKER"
+            external_pip_root="${external_pip_roots[0]:-}"
+            if [[ "${#external_pip_roots[@]}" != "1" \
+                || "$external_pip_root" != "$AUDIT_VENV/.matrix-pip-runner" \
+                || ! -f "$external_pip_root/pip/__init__.py" ]] \
+                || ! PYTHONPATH="$($AUDIT_VENV/bin/python -c \
+                    'import site; print(site.getsitepackages()[0])'):$external_pip_root" \
+                    "$AUDIT_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+                echo "[INFO] Recreating incomplete .venv-audit: external pip metadata is invalid"
+                rm -rf "$AUDIT_VENV"
+            fi
+        fi
+        if [[ -x "$AUDIT_VENV/bin/python" && ! -f "$EXTERNAL_PIP_MARKER" ]]; then
+            echo "[INFO] Recreating incomplete .venv-audit: isolated pip runner is absent"
             rm -rf "$AUDIT_VENV"
         fi
         if [[ ! -x "$AUDIT_VENV/bin/python" ]]; then
             if "$BOOTSTRAP_PYTHON" -c 'import ensurepip' >/dev/null 2>&1; then
                 "$BOOTSTRAP_PYTHON" -m venv "$AUDIT_VENV"
+                audit_site_packages="$($AUDIT_VENV/bin/python -c \
+                    'import site; print(site.getsitepackages()[0])')"
+                external_pip_root="$AUDIT_VENV/.matrix-pip-runner"
+                mkdir -p "$external_pip_root"
+                if [[ ! -f "$audit_site_packages/pip/__init__.py" ]]; then
+                    echo "[ERROR] ensurepip did not create a usable pip package" >&2
+                    exit 1
+                fi
+                mv "$audit_site_packages/pip" "$external_pip_root/pip"
+                # Remove every ensurepip seed from runtime site-packages. The
+                # locked resolver will reinstall the exact setuptools wheel.
+                find "$audit_site_packages" -mindepth 1 -maxdepth 1 \
+                    -exec rm -rf -- {} +
             else
                 if ! "$BOOTSTRAP_PYTHON" -m pip --version >/dev/null 2>&1; then
                     echo "[ERROR] Python has neither ensurepip nor a system pip fallback" >&2
@@ -218,19 +261,24 @@ if [[ "$VERIFY_ONLY" != "1" ]]; then
                 fi
                 echo "[WARN] ensurepip is unavailable; using system pip as an isolated installer"
                 "$BOOTSTRAP_PYTHON" -m venv --without-pip "$AUDIT_VENV"
-                : > "$EXTERNAL_PIP_MARKER"
+                host_pip_package="$($BOOTSTRAP_PYTHON -c \
+                    'import pathlib,pip; print(pathlib.Path(pip.__file__).resolve().parent)')"
+                external_pip_root="$AUDIT_VENV/.matrix-pip-runner"
+                mkdir -p "$external_pip_root"
+                ln -s "$host_pip_package" "$external_pip_root/pip"
             fi
+            temporary_external_pip_marker="${EXTERNAL_PIP_MARKER}.tmp.$$"
+            printf '%s\n' "$external_pip_root" > "$temporary_external_pip_marker"
+            mv "$temporary_external_pip_marker" "$EXTERNAL_PIP_MARKER"
         fi
-        if [[ -f "$EXTERNAL_PIP_MARKER" ]]; then
-            audit_site_packages="$($AUDIT_VENV/bin/python -c \
-                'import site; print(site.getsitepackages()[0])')"
-            PIP_COMMAND=(
-                "$BOOTSTRAP_PYTHON" -m pip install
-                --target "$audit_site_packages" --upgrade --ignore-installed
-            )
-        else
-            PIP_COMMAND=("$AUDIT_VENV/bin/python" -m pip install)
-        fi
+        external_pip_root="$(<"$EXTERNAL_PIP_MARKER")"
+        audit_site_packages="$($AUDIT_VENV/bin/python -c \
+            'import site; print(site.getsitepackages()[0])')"
+        PIP_COMMAND=(
+            /usr/bin/env PYTHONPATH="$audit_site_packages:$external_pip_root"
+            "$AUDIT_VENV/bin/python" -m pip install
+            --target "$audit_site_packages" --upgrade --ignore-installed
+        )
         WHEELHOUSE="$RUNTIME_ROOT/python-wheelhouse"
         PIP_ARGS=(--no-index --only-binary=:all: --find-links "$WHEELHOUSE")
         if [[ -d "$WHEELHOUSE" && -f "$WHEELHOUSE/SHA256SUMS" ]]; then
@@ -267,14 +315,6 @@ PY
         "${PIP_COMMAND[@]}" \
             "${PIP_ARGS[@]}" \
             -r "$REQUIREMENTS_FILE"
-        if [[ -f "$EXTERNAL_PIP_MARKER" ]]; then
-            external_pip_root="$($BOOTSTRAP_PYTHON -c \
-                'import pathlib,pip; print(pathlib.Path(pip.__file__).resolve().parent.parent)')"
-            PYTHONPATH="$audit_site_packages:$external_pip_root" \
-                "$AUDIT_VENV/bin/python" -m pip check
-        else
-            "$AUDIT_VENV/bin/python" -m pip check
-        fi
         "$AUDIT_VENV/bin/python" - \
             "$REQUIREMENTS_FILE" <<'PY'
 import importlib.metadata
@@ -292,6 +332,8 @@ for line in requirements:
         raise SystemExit(f"{name}: expected {expected}, got {actual}")
 print("[PASS] Python dependency versions match requirements lock")
 PY
+        PYTHONPATH="$audit_site_packages:$external_pip_root" \
+            "$AUDIT_VENV/bin/python" -m pip check
         temporary_digest_marker="${VENV_DIGEST_MARKER}.tmp.$$"
         printf '%s\n' "$EXPECTED_VENV_DIGEST" > "$temporary_digest_marker"
         mv "$temporary_digest_marker" "$VENV_DIGEST_MARKER"
@@ -432,8 +474,8 @@ fi
 python3 "$SCRIPT_DIR/verify_matrix_sonic_runtime.py" "${VERIFY_ARGS[@]}"
 if [[ "$WRITE_LOCAL_ENV" == "1" ]]; then
     mkdir -p "$PROJECT_ROOT/.matrix"
-    printf 'export MATRIX_RUNTIME_ROOT=%q\n' "$RUNTIME_ROOT" \
-        > "$PROJECT_ROOT/.matrix/local.env"
-    echo "[INFO] Wrote ignored host override: $PROJECT_ROOT/.matrix/local.env"
+    python3 "$SCRIPT_DIR/update_matrix_local_env.py" \
+        "$PROJECT_ROOT/.matrix/local.env" MATRIX_RUNTIME_ROOT "$RUNTIME_ROOT"
+    echo "[INFO] Updated ignored host override: $PROJECT_ROOT/.matrix/local.env"
 fi
 echo "[PASS] Matrix SONIC bootstrap complete: profile=$PROFILE runtime=$RUNTIME_ROOT"

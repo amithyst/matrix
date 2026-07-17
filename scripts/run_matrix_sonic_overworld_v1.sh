@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export MATRIX_PROJECT_ROOT="$PROJECT_ROOT"
+ORIGINAL_ARGS=("$@")
 
 LAYOUT="$PROJECT_ROOT/research/overworld_v1/layout.json"
 PROFILE="${MATRIX_PROFILE:-}"
@@ -54,9 +55,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -f "$PROJECT_ROOT/.matrix/local.env" ]]; then
-    # shellcheck disable=SC1091
-    source "$PROJECT_ROOT/.matrix/local.env"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/matrix_local_env.sh"
+if ! load_matrix_local_env "$PROJECT_ROOT"; then
+    exit 2
 fi
 if [[ -n "$PROFILE" ]]; then
     PROFILE_FILE="$PROJECT_ROOT/config/hosts/$PROFILE.env"
@@ -66,6 +68,15 @@ if [[ -n "$PROFILE" ]]; then
     fi
     # shellcheck disable=SC1090
     source "$PROFILE_FILE"
+fi
+
+if [[ -n "${MATRIX_CPUSET:-}" && "${MATRIX_CPUSET_APPLIED:-0}" != "1" ]]; then
+    if ! command -v taskset >/dev/null; then
+        echo "[ERROR] Host profile requires taskset for MATRIX_CPUSET=$MATRIX_CPUSET" >&2
+        exit 1
+    fi
+    exec taskset -c "$MATRIX_CPUSET" /usr/bin/env MATRIX_CPUSET_APPLIED=1 \
+        "$PROJECT_ROOT/scripts/run_matrix_sonic_overworld_v1.sh" "${ORIGINAL_ARGS[@]}"
 fi
 
 if [[ ! -f "$LAYOUT" ]]; then
@@ -88,7 +99,7 @@ export MATRIX_SONIC_HOST_LOCK_FD=9
 STATUS_FILE="${MATRIX_OVERWORLD_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_overworld_v1_status.json}"
 rm -f -- "$STATUS_FILE"
 LOCK_FILE="$PROJECT_ROOT/config/runtime/matrix-sonic.lock.json"
-if ! QUALIFICATION_REQUESTED="$(python3 - "$MAX_SECONDS" <<'PY'
+if ! QUALIFICATION_REQUESTED="$(/usr/bin/python3 -I - "$MAX_SECONDS" <<'PY'
 import math
 import sys
 try:
@@ -112,11 +123,13 @@ if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
         echo "[ERROR] Bounded Overworld qualification cannot disable runtime verification" >&2
         exit 2
     fi
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONPYCACHEPREFIX="$(mktemp -d /tmp/matrix-qualified-pycache.XXXXXX)"
     if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal)" ]]; then
         echo "[ERROR] Bounded Overworld qualification requires a clean Matrix Git checkout" >&2
         exit 2
     fi
-    readarray -t QUALIFICATION_HASHES < <(python3 - "$LOCK_FILE" "$LAYOUT" <<'PY'
+    readarray -t QUALIFICATION_HASHES < <(/usr/bin/python3 -I - "$LOCK_FILE" "$LAYOUT" <<'PY'
 import hashlib
 from pathlib import Path
 import sys
@@ -209,6 +222,83 @@ if [[ ! -d "$MATRIX_SONIC_CANONICAL_MESHES" ]]; then
     exit 1
 fi
 
+require_qualified_path() {
+    local label="$1"
+    local actual="$2"
+    local expected="$3"
+    local actual_resolved expected_resolved
+    actual_resolved="$(realpath -m "$actual")"
+    expected_resolved="$(realpath -m "$expected")"
+    if [[ "$actual_resolved" != "$expected_resolved" ]]; then
+        echo "[ERROR] Bounded qualification requires locked $label: expected=$expected_resolved actual=$actual_resolved" >&2
+        exit 2
+    fi
+}
+
+require_qualified_executable_path() {
+    local label="$1"
+    local actual="$2"
+    local expected="$3"
+    local actual_absolute expected_absolute
+    actual_absolute="$(cd "$(dirname "$actual")" && pwd -P)/$(basename "$actual")"
+    expected_absolute="$(cd "$(dirname "$expected")" && pwd -P)/$(basename "$expected")"
+    if [[ "$actual_absolute" != "$expected_absolute" ]]; then
+        echo "[ERROR] Bounded qualification requires locked $label: expected=$expected_absolute actual=$actual_absolute" >&2
+        exit 2
+    fi
+}
+
+if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
+    if [[ -n "${LD_LIBRARY_PATH:-}" || -n "${PYTHONPATH:-}" ]]; then
+        echo "[ERROR] Bounded qualification rejects inherited LD_LIBRARY_PATH/PYTHONPATH" >&2
+        exit 2
+    fi
+    require_qualified_path "Unitree SDK root" \
+        "$MATRIX_UNITREE_SDK2_ROOT" \
+        "$MATRIX_SONIC_ROOT/gear_sonic_deploy/thirdparty/unitree_sdk2"
+    require_qualified_path "inference root" \
+        "$MATRIX_INFERENCE_ROOT" "$MATRIX_RUNTIME_ROOT/inference"
+    require_qualified_path "native scene root" \
+        "$MATRIX_NATIVE_SCENE_ROOT" \
+        "$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/xgb"
+    require_qualified_path "canonical model" \
+        "$MATRIX_SONIC_CANONICAL_MODEL" \
+        "$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml"
+    require_qualified_path "canonical meshes" \
+        "$MATRIX_SONIC_CANONICAL_MESHES" \
+        "$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/meshes"
+    require_qualified_executable_path "runtime Python" \
+        "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/.venv-audit/bin/python"
+    require_qualified_path "native dependency root" \
+        "${MATRIX_NATIVE_DEPS_ROOT:-$MATRIX_RUNTIME_ROOT/matrix-native-deps}" \
+        "$MATRIX_RUNTIME_ROOT/matrix-native-deps"
+    case "$PROFILE" in
+        trna)
+            expected_ros_prefix="/opt/ros/humble"
+            expected_cuda_root="/usr/local/cuda"
+            ;;
+        heyuan)
+            expected_ros_prefix="$MATRIX_RUNTIME_ROOT/ros2-humble-prefix"
+            expected_cuda_root="/usr/local/cuda"
+            ;;
+        zza)
+            expected_ros_prefix="$MATRIX_RUNTIME_ROOT/ros2-humble-prefix"
+            expected_cuda_root="/data/user_data/matrix-tools/cuda-runtime-12.1"
+            ;;
+        *)
+            echo "[ERROR] Unsupported bounded qualification profile: $PROFILE" >&2
+            exit 2
+            ;;
+    esac
+    require_qualified_path "ROS prefix" \
+        "${MATRIX_ROS_PREFIX:-}" "$expected_ros_prefix"
+    require_qualified_path "CUDA root" \
+        "${MATRIX_CUDA_ROOT:-/usr/local/cuda}" "$expected_cuda_root"
+    require_qualified_path "TensorRT root" \
+        "${TensorRT_ROOT:-$MATRIX_INFERENCE_ROOT/TensorRT}" \
+        "$MATRIX_RUNTIME_ROOT/inference/TensorRT"
+fi
+
 prepend_library_dir() {
     local directory="$1"
     if [[ -d "$directory" ]]; then
@@ -228,7 +318,6 @@ if [[ -n "${MATRIX_ROS_PREFIX:-}" ]]; then
     prepend_library_dir "$MATRIX_ROS_PREFIX/lib"
 fi
 if [[ -n "${MATRIX_NATIVE_DEPS_ROOT:-}" ]]; then
-    prepend_library_dir "$MATRIX_NATIVE_DEPS_ROOT/usr/local/lib"
     prepend_library_dir "$MATRIX_NATIVE_DEPS_ROOT/usr/lib/x86_64-linux-gnu"
     prepend_library_dir "$MATRIX_NATIVE_DEPS_ROOT/usr/lib"
 fi
@@ -249,7 +338,6 @@ if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]; then
         --sonic-root "$MATRIX_SONIC_ROOT"
         --python "$MATRIX_SONIC_PYTHON"
         --profile "$PROFILE"
-        --fast
     )
     if [[ "$CONTROL_SOURCE" == "pico" ]]; then
         if [[ -z "${MATRIX_PICO_WHEEL:-}" ]]; then
@@ -262,9 +350,14 @@ if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]; then
         )
     fi
     if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
-        VERIFY_RUNTIME_ARGS+=(--json-output "$VERIFICATION_RECEIPT")
+        VERIFY_RUNTIME_ARGS+=(
+            --require-git-sonic
+            --json-output "$VERIFICATION_RECEIPT"
+        )
+    else
+        VERIFY_RUNTIME_ARGS+=(--fast)
     fi
-    python3 "$PROJECT_ROOT/scripts/verify_matrix_sonic_runtime.py" \
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/verify_matrix_sonic_runtime.py" \
         "${VERIFY_RUNTIME_ARGS[@]}"
 fi
 

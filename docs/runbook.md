@@ -9,10 +9,15 @@
 - Runtime lock: `config/runtime/matrix-sonic.lock.json`
 - Host defaults: `config/hosts/heyuan.env`, `config/hosts/trna.env`,
   `config/hosts/zza.env`
-- Local non-secret overrides: `.matrix/local.env` (ignored by Git and loaded
-  before profile defaults, so runtime-derived dependency paths stay coherent)
+- Local non-secret overrides: `.matrix/local.env` (ignored by Git and parsed as
+  data through a fixed variable allowlist before profile defaults; it is never
+  evaluated as shell code)
 
 Matrix Git stores integration source, scripts, profiles, tests, and checksums.
+The local override parser accepts only `MATRIX_RUNTIME_ROOT`,
+`MATRIX_SONIC_ROOT`, `MATRIX_PICO_PYTHON`, and `MATRIX_PICO_WHEEL`, each as one
+literal shell-quoted value. Put display/GPU/tool defaults in the tracked host
+profiles rather than adding executable shell to the local file.
 Each host normally runs a clean Git checkout of the original SONIC repository
 at the pinned commit. An offline private bundle may contain an exact `git archive`
 deployment mirror of that commit plus its private runtime assets; it is not a
@@ -66,23 +71,36 @@ The path supplied to `--artifact-source` has this layout:
 GR00T-WholeBodyControl/       # optional read-only offline mirror + SONIC_COMMIT
 inference/TensorRT/lib/
 inference/onnxruntime/lib/
-g1-visual/g1_29dof.urdf
+g1-visual/g1_29dof.urdf + meshes/
 ros2-humble-prefix/           # required by isolated Heyuan and ZZA profiles
 matrix-native-deps/           # isolated native libraries
 python-wheelhouse/            # CPython 3.10 x86_64 wheels plus SHA256SUMS
 ```
 
-The native simulator and Matrix visual-import closure contains 18 exact direct
-pins and 72 binary
+The native simulator and Matrix visual-import closure contains 29 exact runtime
+files, five runtime trees, 12 installed Matrix files, five installed Matrix
+trees, and 72 binary
 CPython 3.10/x86_64 wheels. The locked `SHA256SUMS` digest is
 `49a5f8f138793a78dd7339b77d8df887af14ffaa34acdb25b0c01e3cbf1265f7`.
 It was verified by a clean offline install, `pip check`, import-origin checks,
-the Matrix custom-URDF import, and a two-step Warehouse DDS smoke. PICO remains
+and byte-for-byte attestation of the installed Python files against each
+SHA-locked wheel's archive `RECORD`. The runtime site-packages tree rejects
+unowned files and links; only pip's known dist-info markers and isolated
+`__pycache__` files are excluded. The pip runner lives outside runtime
+site-packages and is exposed only while installing or running `pip check`.
+`pyvenv.cfg`, purelib/platlib, user-site state, and the effective `sys.path`
+must prove that no host/system package directory enters the runtime.
+Verification also
+rejects untracked or Git-ignored Matrix Python/legacy-bytecode overlays and
+unlocked shared objects. The remaining gates include the Matrix custom-URDF
+import and a two-step Warehouse DDS smoke. PICO remains
 a separate interpreter via
 `MATRIX_PICO_PYTHON`: set `MATRIX_PICO_WHEEL` to the locked
 `xrobotoolkit_sdk-1.0.2-cp310-cp310-linux_x86_64.whl` artifact. The verifier
 checks that wheel's filename and SHA256, the controlled `libPXREARobotSDK.so`
-overlay, the interpreter ABI/package origin, and `pip check` whenever
+overlay, every installed SDK file against the locked wheel's archive `RECORD`,
+the interpreter's lexical prefix/purelib/platlib and isolated `sys.path`, the
+ABI/package origin, and `pip check` whenever
 `--control-source pico` is selected with a host profile.
 The locked overlay is the x86_64 library consumed by the three supported hosts;
 the unrelated Orin/aarch64 SDK artifact is not part of this runtime bundle.
@@ -93,16 +111,19 @@ lowcmd writer. There is no intermediate AndroidTwin or UDP-to-DDS process.
 Matrix executes the SHA-verified SONIC release binary directly; it does not run
 SONIC's install/build/prompt workflow during an acceptance launch.
 Build shared native tools on the oldest supported host; the verifier checks the
-SONIC commit, Python API, deploy dependency closure, and inference ABI.
+SONIC commit, Python API, deploy and Matrix UE dependency closures, and inference
+ABI.
 
 The artifact source may be a local directory or an rsync-compatible SSH source.
 Because the GitHub repository is public and the SONIC model is internal, do not
 upload this bundle to the public GitHub release.
 
 Bundles produced on this feature branch are acceptance candidates, with
-`bundle.json.release_ready=false`. Before formal publication, add complete tree
-attestation for visual meshes, the inference closure, ROS, and native support
-libraries, then run the packager/LFS smoke from a clean pinned SONIC checkout.
+`bundle.json.release_ready=false`. Visual meshes, native support libraries, UE
+Paks/binaries/OpenCV dependencies, and the UE model source tree are now locked.
+Before formal publication, finish complete inference and ROS tree attestation,
+cold-start and packager/LFS smoke, and the license review from a clean pinned
+SONIC checkout.
 
 ## Bootstrap
 
@@ -168,6 +189,10 @@ configuration files on exit. Signal forwarding and Linux parent-death guards
 cover the launcher, `run_sim`, Python supervisor, and exact native process
 groups; a hard exit cannot leave deploy/PICO holding DDS or ZMQ in the
 background after any single launcher layer dies.
+Native deploy/PICO exits are observed without reaping their process-group
+leaders. A final pre-stop barrier treats any exit before the boundary,
+including exit code zero, as a failed run; teardown signals every retained
+group before the exact leader reap.
 
 A bounded run can set `passed=true` only from a clean Matrix checkout after the
 selected host verifier succeeds. The runner consumes that launch's JSON receipt
@@ -279,10 +304,14 @@ git fetch origin --prune
 git switch <same-branch>
 git pull --ff-only
 export MATRIX_PROJECT_ROOT="$PWD"
-if [[ -f .matrix/local.env ]]; then source .matrix/local.env; fi
+source scripts/matrix_local_env.sh
+load_matrix_local_env "$PWD"
 source config/hosts/<host>.env
 python3 scripts/verify_matrix_sonic_runtime.py \
   --runtime-root "$MATRIX_RUNTIME_ROOT" \
+  --matrix-root "$MATRIX_PROJECT_ROOT" \
+  --sonic-root "$MATRIX_SONIC_ROOT" \
+  --python "${MATRIX_SONIC_PYTHON:-$MATRIX_PROJECT_ROOT/.venv-audit/bin/python}" \
   --profile <host> --fast
 ```
 

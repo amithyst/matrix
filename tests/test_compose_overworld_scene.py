@@ -21,10 +21,13 @@ class ComposeOverworldSceneTest(unittest.TestCase):
         native = root / "xgb"
         (native / "assets").mkdir(parents=True)
         (native / "assets" / "curb.stl").write_bytes(b"mesh")
+        (native / "texture.png").write_bytes(b"texture")
         (native / "scene_a.xml").write_text(
             """<mujoco><include file="robot.xml" /><asset>
+<texture name="tex" type="2d" file="../texture.png" />
+<material name="mat" texture="tex" />
 <mesh name="curb" file="curb.stl" /></asset><worldbody>
-<geom name="floor_a" type="plane" /><geom name="curb_a" type="mesh" mesh="curb" />
+<geom name="floor_a" type="plane" /><geom name="curb_a" type="mesh" mesh="curb" material="mat" />
 </worldbody></mujoco>""",
             encoding="utf-8",
         )
@@ -92,8 +95,20 @@ class ComposeOverworldSceneTest(unittest.TestCase):
                 world.find(".//geom[@name='a__curb_a']").get("mesh"), "a__curb"
             )
             self.assertTrue((output.parent / "assets" / "a" / "curb.stl").is_file())
+            self.assertTrue(
+                (output.parent / "assets" / "a" / "_root" / "texture.png").is_file()
+            )
+            self.assertEqual(
+                {Path(item["path"]).name for item in manifest["scenes"][0]["source_assets"]},
+                {"curb.stl", "texture.png"},
+            )
             self.assertEqual(manifest["environment_geoms"], 3)
             self.assertEqual(manifest["scenes"][1]["world_bounds_xy"], [3.0, 0.0, 5.0, 2.0])
+            self.assertEqual(manifest["output_scene_sha256"], MODULE._sha256(output))
+            self.assertEqual(
+                manifest["output_assets_sha256"],
+                MODULE._tree_sha256(output.parent / "assets"),
+            )
 
     def test_rejects_overlapping_scene_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

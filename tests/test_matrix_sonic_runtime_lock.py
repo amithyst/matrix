@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import base64
 import copy
+import csv
 import fcntl
 import hashlib
+import io
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +26,38 @@ SPEC = importlib.util.spec_from_file_location("verify_matrix_sonic_runtime", SCR
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+LOCAL_ENV_SCRIPT = REPO_ROOT / "scripts" / "update_matrix_local_env.py"
+LOCAL_ENV_SPEC = importlib.util.spec_from_file_location(
+    "update_matrix_local_env", LOCAL_ENV_SCRIPT
+)
+assert LOCAL_ENV_SPEC is not None and LOCAL_ENV_SPEC.loader is not None
+LOCAL_ENV_MODULE = importlib.util.module_from_spec(LOCAL_ENV_SPEC)
+LOCAL_ENV_SPEC.loader.exec_module(LOCAL_ENV_MODULE)
+
+
+def write_test_wheel(
+    wheelhouse: Path,
+    filename: str,
+    files: dict[str, bytes],
+) -> tuple[Path, str, dict[str, bytes]]:
+    distribution, version, _, _, _ = MODULE.parse_wheel_filename(filename)
+    stem = f"{distribution.replace('.', '_')}-{version}"
+    record_path = f"{stem}.dist-info/RECORD"
+    wheel_files = dict(files)
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    for relative, content in sorted(wheel_files.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=")
+        writer.writerow((relative, f"sha256={digest.decode('ascii')}", len(content)))
+    writer.writerow((record_path, "", ""))
+    wheel_files[record_path] = output.getvalue().encode("utf-8")
+
+    wheel = wheelhouse / filename
+    with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_STORED) as archive:
+        for relative, content in wheel_files.items():
+            archive.writestr(relative, content)
+    return wheel, record_path, wheel_files
 
 
 class MatrixSonicRuntimeLockTest(unittest.TestCase):
@@ -40,10 +78,40 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             urban["visual_source"]["release_sha256"],
         )
         self.assertEqual(sum(item["size"] for item in packages.values()), 7757662559)
+        installed = {
+            entry["path"]: entry
+            for entry in self.lock["matrix_release"]["installed_files"]
+        }
         self.assertIn(
             "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue",
-            self.lock["matrix_release"]["installed_files"],
+            installed,
         )
+        self.assertEqual(
+            installed[
+                "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_t10.xml"
+            ]["sha256"],
+            "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6",
+        )
+        self.assertEqual(
+            self.lock["matrix_release"]["installed_trees"][0]["sha256"],
+            "9ebc024fa07ddf2deb6a9939bb276dea03b1c6d9e5dfee932b181800b7811232",
+        )
+        for required in (
+            "src/UeSim/Linux/Engine/Binaries/Linux/libEOSSDK-Linux-Shipping.so",
+            "src/robot_mujoco/zsibot_robots/xgb/height_field.png",
+            "src/robot_mujoco/zsibot_robots/xgb/unitree_hfield.png",
+        ):
+            self.assertIn(required, installed)
+        installed_trees = {
+            entry["path"] for entry in self.lock["matrix_release"]["installed_trees"]
+        }
+        for required in (
+            "src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks",
+            "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",
+            "src/UeSim/Linux/Engine/Plugins/Runtime/OpenCV/Binaries/ThirdParty/Linux",
+            "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb",
+        ):
+            self.assertIn(required, installed_trees)
 
     def test_runtime_file_identities_are_unique(self) -> None:
         identities = [
@@ -63,6 +131,8 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             ("sonic", "gear_sonic/data/robot_model/model_data/g1/meshes"),
             tree_identities,
         )
+        self.assertIn(("visual", "meshes"), tree_identities)
+        self.assertIn(("native", "usr/lib"), tree_identities)
         self.assertIn(
             (
                 "sonic",
@@ -357,7 +427,13 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             arguments = []
-            for option in ("sonic-root", "inference-root", "visual-root", "wheelhouse"):
+            for option in (
+                "sonic-root",
+                "inference-root",
+                "visual-root",
+                "native-deps",
+                "wheelhouse",
+            ):
                 directory = root / option
                 directory.mkdir()
                 arguments.extend((f"--{option}", str(directory)))
@@ -386,6 +462,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("--runtime-root", text)
         self.assertIn("--write-local-env", text)
         self.assertIn(".matrix/local.env", text)
+        self.assertIn("update_matrix_local_env.py", text)
         self.assertIn("--no-index", text)
         self.assertIn("--only-binary=:all:", text)
         self.assertIn("python-wheelhouse", text)
@@ -410,15 +487,22 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         for value in (
             "native runtime Python SOABI",
             "native runtime machine",
+            "native runtime Python isolation",
             "Python requirements lock",
             "Python wheelhouse inventory",
+            "Python wheel RECORD metadata",
+            "native runtime Python installed wheel files",
+            "native runtime Python site-packages inventory",
             "native PICO wheel artifact",
+            "native PICO Python isolation",
+            "native PICO SDK wheel installation",
             "--pico-wheel",
             "gear_sonic import origin",
             "unitree_sdk2py Python package",
             "cyclonedds Python package",
             "archived SONIC critical source attestation",
             "Matrix tracked source clean",
+            "Matrix ignored source overlays absent",
             "git_checkout_root",
         ):
             self.assertIn(value, verifier)
@@ -515,6 +599,130 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             results = {name: ok for name, ok, _ in checks}
             self.assertFalse(results["Python wheelhouse compatibility"])
 
+    def test_wheel_records_attest_installed_bytes_and_loadable_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wheelhouse = root / "wheelhouse"
+            site_packages = root / "venv/lib/python3.10/site-packages"
+            wheelhouse.mkdir()
+            site_packages.mkdir(parents=True)
+            metadata = b"Metadata-Version: 2.1\nName: demo-pkg\nVersion: 1.0\n"
+            wheel, _, installed = write_test_wheel(
+                wheelhouse,
+                "demo_pkg-1.0-py3-none-any.whl",
+                {
+                    "demo_pkg/__init__.py": b"VALUE = 1\n",
+                    "demo_pkg-1.0.dist-info/METADATA": metadata,
+                },
+            )
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (wheelhouse / "SHA256SUMS").write_text(
+                f"{digest}  {wheel.name}\n", encoding="utf-8"
+            )
+            for relative, content in installed.items():
+                path = site_packages / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            (site_packages / "demo_pkg-1.0.dist-info/INSTALLER").write_text(
+                "pip\n", encoding="utf-8"
+            )
+            external_pip = root / "venv/.matrix-pip-runner/pip/__init__.py"
+            external_pip.parent.mkdir(parents=True)
+            external_pip.write_text("# installer only\n", encoding="utf-8")
+
+            checks = MODULE.verify_python_wheel_records(
+                wheelhouse, site_packages, {"demo-pkg": ("demo-pkg", "1.0")}
+            )
+            self.assertTrue(all(ok for _, ok, _ in checks), checks)
+
+            package = site_packages / "demo_pkg/__init__.py"
+            package.write_text("VALUE = 2\n", encoding="utf-8")
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                )
+            }
+            self.assertFalse(results["native runtime Python installed wheel files"])
+
+            package.write_bytes(installed["demo_pkg/__init__.py"])
+            (site_packages / "injected.py").write_text(
+                "raise RuntimeError('loaded')\n", encoding="utf-8"
+            )
+            results = {
+                name: ok
+                for name, ok, _ in MODULE.verify_python_wheel_records(
+                    wheelhouse,
+                    site_packages,
+                    {"demo-pkg": ("demo-pkg", "1.0")},
+                )
+            }
+            self.assertFalse(
+                results["native runtime Python site-packages inventory"]
+            )
+
+            (site_packages / "injected.py").unlink()
+            cache = site_packages / "demo_pkg/__pycache__/__init__.cpython-310.pyc"
+            cache.parent.mkdir()
+            cache.write_bytes(b"generated cache")
+            checks = MODULE.verify_python_wheel_records(
+                wheelhouse, site_packages, {"demo-pkg": ("demo-pkg", "1.0")}
+            )
+            self.assertTrue(all(ok for _, ok, _ in checks), checks)
+
+    def test_wheel_records_reject_unhashed_or_unlocked_distributions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wheelhouse = root / "wheelhouse"
+            site_packages = root / "site-packages"
+            wheelhouse.mkdir()
+            site_packages.mkdir()
+            wheel, _, _ = write_test_wheel(
+                wheelhouse,
+                "demo-1.0-py3-none-any.whl",
+                {"demo.py": b"VALUE = 1\n"},
+            )
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (wheelhouse / "SHA256SUMS").write_text(
+                f"{digest}  {wheel.name}\n", encoding="utf-8"
+            )
+
+            checks = MODULE.verify_python_wheel_records(
+                wheelhouse, site_packages, {"missing": ("missing", "1.0")}
+            )
+            results = {name: ok for name, ok, _ in checks}
+            self.assertFalse(results["Python wheel RECORD metadata"])
+
+            with zipfile.ZipFile(wheel, "r") as archive:
+                files = {
+                    info.filename: archive.read(info.filename)
+                    for info in archive.infolist()
+                }
+            record_path = "demo-1.0.dist-info/RECORD"
+            rows = list(
+                csv.reader(io.StringIO(files[record_path].decode("utf-8")))
+            )
+            for row in rows:
+                if row[0] == "demo.py":
+                    row[1:] = ["", ""]
+            output = io.StringIO(newline="")
+            csv.writer(output, lineterminator="\n").writerows(rows)
+            files[record_path] = output.getvalue().encode("utf-8")
+            with zipfile.ZipFile(wheel, "w") as archive:
+                for relative, content in files.items():
+                    archive.writestr(relative, content)
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (wheelhouse / "SHA256SUMS").write_text(
+                f"{digest}  {wheel.name}\n", encoding="utf-8"
+            )
+            checks = MODULE.verify_python_wheel_records(
+                wheelhouse, site_packages, {"demo": ("demo", "1.0")}
+            )
+            results = {name: ok for name, ok, _ in checks}
+            self.assertFalse(results["Python wheel RECORD metadata"])
+
     def test_pico_wheel_must_match_locked_filename_and_sha(self) -> None:
         pico_lock = copy.deepcopy(self.lock["pico"])
         with tempfile.TemporaryDirectory() as temporary:
@@ -546,6 +754,72 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 ok, detail = MODULE.verify_pico_wheel(renamed, pico_lock)
             self.assertFalse(ok)
             self.assertIn("cannot hash PICO wheel", detail)
+
+    def test_pico_installed_sdk_bytes_are_bound_to_locked_wheel_record(self) -> None:
+        pico_lock = copy.deepcopy(self.lock["pico"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wheelhouse = root / "wheelhouse"
+            site_packages = root / "venv/lib/python3.10/site-packages"
+            wheelhouse.mkdir()
+            site_packages.mkdir(parents=True)
+            wheel_distribution, _, _, _, _ = MODULE.parse_wheel_filename(
+                pico_lock["wheel_filename"]
+            )
+            stem = f"{wheel_distribution}-{pico_lock['version']}"
+            extension = "xrobotoolkit_sdk.cpython-310-x86_64-linux-gnu.so"
+            wheel, _, installed = write_test_wheel(
+                wheelhouse,
+                pico_lock["wheel_filename"],
+                {
+                    extension: b"locked extension bytes",
+                    f"{stem}.dist-info/top_level.txt": b"xrobotoolkit_sdk\n",
+                    f"{stem}.dist-info/METADATA": (
+                        b"Metadata-Version: 2.1\nName: xrobotoolkit-sdk\n"
+                        b"Version: 1.0.2\n"
+                    ),
+                },
+            )
+            pico_lock["wheel_sha256"] = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            for relative, content in installed.items():
+                path = site_packages / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            (site_packages / "pip").mkdir()
+            (site_packages / "pip/__init__.py").write_text(
+                "# unrelated controlled dependency\n", encoding="utf-8"
+            )
+
+            ok, detail = MODULE.verify_installed_pico_wheel(
+                wheel, site_packages, pico_lock
+            )
+            self.assertTrue(ok, detail)
+
+            installed_extension = site_packages / extension
+            installed_extension.write_bytes(b"modified extension")
+            ok, detail = MODULE.verify_installed_pico_wheel(
+                wheel, site_packages, pico_lock
+            )
+            self.assertFalse(ok)
+            self.assertIn(extension, detail)
+
+            installed_extension.write_bytes(installed[extension])
+            injected = site_packages / "xrobotoolkit_sdk.py"
+            injected.write_text("raise RuntimeError\n", encoding="utf-8")
+            ok, detail = MODULE.verify_installed_pico_wheel(
+                wheel, site_packages, pico_lock
+            )
+            self.assertFalse(ok)
+            self.assertIn("unowned PICO import file", detail)
+
+            injected.unlink()
+            startup_hook = site_packages / "evil.pth"
+            startup_hook.write_text("/tmp/evil\n", encoding="utf-8")
+            ok, detail = MODULE.verify_installed_pico_wheel(
+                wheel, site_packages, pico_lock
+            )
+            self.assertFalse(ok)
+            self.assertIn("evil.pth", detail)
 
     def test_pico_delivery_is_explicitly_external(self) -> None:
         lock = copy.deepcopy(self.lock)
@@ -580,6 +854,66 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             requirements.write_text("numpy>=1.26\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "exact distribution==version"):
                 MODULE.parse_pinned_requirements(requirements)
+
+    def test_matrix_source_overlay_attestation_rejects_importable_code(self) -> None:
+        lock = {
+            "matrix_release": {
+                "installed_files": [
+                    {
+                        "path": "src/UeSim/Linux/Engine/Binaries/Linux/locked.so"
+                    }
+                ],
+                "installed_trees": [
+                    {
+                        "path": "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux"
+                    }
+                ],
+            }
+        }
+        clean_inventory = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                b"scripts/__pycache__/safe.cpython-310.pyc\0"
+                b".venv-audit/lib/python3.10/site-packages/pip/__init__.py\0"
+                b"src/robot_mc/build/generated.so\0"
+                b"src/UeSim/Linux/Engine/Binaries/Linux/locked.so\0"
+            ),
+            stderr=b"",
+        )
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=[clean_inventory, clean_inventory],
+        ):
+            ok, detail = MODULE.matrix_source_overlay_attestation(
+                REPO_ROOT, lock
+            )
+        self.assertTrue(ok, detail)
+
+        empty = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+        injected = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=(
+                b"scripts/json.py\0"
+                b"scripts/payload.pyc\0"
+                b"scripts/native_override.so\0"
+            ),
+            stderr=b"",
+        )
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=[empty, injected],
+        ):
+            ok, detail = MODULE.matrix_source_overlay_attestation(
+                REPO_ROOT, lock
+            )
+        self.assertFalse(ok)
+        self.assertIn("scripts/json.py", detail)
+        self.assertIn("scripts/payload.pyc", detail)
+        self.assertIn("scripts/native_override.so", detail)
 
     def test_archive_marker_requires_locked_critical_source_hashes(self) -> None:
         lock = copy.deepcopy(self.lock)
@@ -622,10 +956,191 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("import ensurepip", text)
         self.assertIn('"$BOOTSTRAP_PYTHON" -m venv --without-pip', text)
         self.assertIn(".matrix-external-pip", text)
+        self.assertIn("matrix-wheel-record-v2", text)
+        self.assertIn("ensurepip did not create a usable pip package", text)
+        self.assertIn('find "$audit_site_packages"', text)
         self.assertIn('--target "$audit_site_packages"', text)
         self.assertIn("--ignore-installed", text)
         self.assertIn("Recreating non-isolated .venv-audit", text)
         self.assertIn("Recreating incomplete .venv-audit", text)
+
+    def test_external_pip_marker_is_scoped_to_pip_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            python = root / "venv/bin/python"
+            python.parent.mkdir(parents=True)
+            python.touch()
+            (root / "venv/lib/python3.10/site-packages").mkdir(parents=True)
+            pip_root = root / "venv/.matrix-pip-runner"
+            (pip_root / "pip").mkdir(parents=True)
+            (pip_root / "pip/__init__.py").write_text("", encoding="utf-8")
+            (root / "venv/.matrix-external-pip").write_text(
+                f"{pip_root}\n", encoding="utf-8"
+            )
+
+            base = {"PYTHONNOUSERSITE": "1"}
+            pip_env, error = MODULE.pip_check_environment(str(python), base)
+            self.assertIsNone(error)
+            self.assertEqual(
+                pip_env["PYTHONPATH"],
+                os.pathsep.join(
+                    (
+                        str(root / "venv/lib/python3.10/site-packages"),
+                        str(pip_root),
+                    )
+                ),
+            )
+            self.assertNotIn("PYTHONPATH", base)
+
+            (root / "venv/.matrix-external-pip").write_text("", encoding="utf-8")
+            _, error = MODULE.pip_check_environment(str(python), base)
+            self.assertIn("must contain one path", error or "")
+
+    def test_runtime_python_isolation_rejects_system_site_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            matrix_root = root / "matrix"
+            venv = matrix_root / ".venv-audit"
+            site_packages = venv / "lib/python3.10/site-packages"
+            site_packages.mkdir(parents=True)
+            matrix_root.mkdir(exist_ok=True)
+            configuration = venv / "pyvenv.cfg"
+            configuration.write_text(
+                "home = /usr/bin\ninclude-system-site-packages = false\n",
+                encoding="utf-8",
+            )
+            identity = {
+                "version": "3.10",
+                "prefix": str(venv),
+                "base_prefix": "/usr",
+                "purelib": str(site_packages),
+                "platlib": str(site_packages),
+                "stdlib": "/usr/lib/python3.10",
+                "platstdlib": "/usr/lib/python3.10",
+                "user_site_enabled": False,
+                "path": [
+                    "",
+                    "/usr/lib/python310.zip",
+                    "/usr/lib/python3.10",
+                    "/usr/lib/python3.10/lib-dynload",
+                    str(site_packages),
+                    str(site_packages / "cmeel.prefix/lib/python3.10/site-packages"),
+                ],
+            }
+
+            ok, detail = MODULE.verify_python_isolation(
+                venv, site_packages, matrix_root, identity
+            )
+            self.assertTrue(ok, detail)
+
+            decoy_identity = copy.deepcopy(identity)
+            decoy_identity["prefix"] = "/actual/venv"
+            decoy_identity["purelib"] = "/actual/venv/lib/python3.10/site-packages"
+            decoy_identity["platlib"] = "/actual/venv/lib/python3.10/site-packages"
+            decoy_identity["path"] = [
+                "",
+                "/usr/lib/python3.10",
+                "/actual/venv/lib/python3.10/site-packages",
+            ]
+            ok, detail = MODULE.verify_python_isolation(
+                venv, site_packages, matrix_root, decoy_identity
+            )
+            self.assertFalse(ok)
+            self.assertIn("runtime prefix escapes venv", detail)
+
+            configuration.write_text(
+                "include-system-site-packages = true\n", encoding="utf-8"
+            )
+            identity["path"].append("/usr/lib/python3/dist-packages")
+            ok, detail = MODULE.verify_python_isolation(
+                venv, site_packages, matrix_root, identity
+            )
+            self.assertFalse(ok)
+            self.assertIn("must occur once as false", detail)
+            self.assertIn("/usr/lib/python3/dist-packages", detail)
+
+    def test_local_env_update_preserves_unrelated_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local_env = Path(temporary) / ".matrix/local.env"
+            local_env.parent.mkdir(parents=True)
+            local_env.write_text(
+                "# host overrides\n"
+                "export MATRIX_RUNTIME_ROOT=/old/runtime\n"
+                "export MATRIX_PICO_PYTHON=/opt/pico/bin/python\n"
+                "MATRIX_PICO_WHEEL='/opt/pico/pico wheel.whl'\n",
+                encoding="utf-8",
+            )
+            os.chmod(local_env, 0o640)
+
+            LOCAL_ENV_MODULE.update_export(
+                local_env, "MATRIX_RUNTIME_ROOT", "/new/runtime root"
+            )
+
+            updated = local_env.read_text(encoding="utf-8")
+            self.assertIn("export MATRIX_RUNTIME_ROOT='/new/runtime root'", updated)
+            self.assertIn("export MATRIX_PICO_PYTHON=/opt/pico/bin/python", updated)
+            self.assertIn("MATRIX_PICO_WHEEL='/opt/pico/pico wheel.whl'", updated)
+            self.assertEqual(updated.count("MATRIX_RUNTIME_ROOT="), 1)
+            self.assertEqual(local_env.stat().st_mode & 0o777, 0o640)
+
+            parsed = LOCAL_ENV_MODULE.parse_local_env(local_env)
+            self.assertEqual(parsed["MATRIX_RUNTIME_ROOT"], "/new/runtime root")
+            self.assertEqual(parsed["MATRIX_PICO_PYTHON"], "/opt/pico/bin/python")
+            self.assertEqual(parsed["MATRIX_PICO_WHEEL"], "/opt/pico/pico wheel.whl")
+
+    def test_local_env_parser_never_evaluates_shell_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_env = root / "local.env"
+            marker = root / "executed"
+            local_env.write_text(
+                f"MATRIX_RUNTIME_ROOT='$(touch {marker})'\n",
+                encoding="utf-8",
+            )
+            parsed = LOCAL_ENV_MODULE.parse_local_env(local_env)
+            self.assertEqual(parsed["MATRIX_RUNTIME_ROOT"], f"$(touch {marker})")
+            self.assertFalse(marker.exists())
+
+            for payload, message in (
+                ("PATH=/tmp/evil\n", "not allowlisted"),
+                ("MATRIX_RUNTIME_ROOT=/tmp; touch /tmp/evil\n", "one shell-quoted word"),
+                ("trap evil EXIT\n", "invalid local env syntax"),
+                (
+                    "MATRIX_RUNTIME_ROOT=/one\nMATRIX_RUNTIME_ROOT=/two\n",
+                    "duplicate",
+                ),
+            ):
+                with self.subTest(payload=payload):
+                    local_env.write_text(payload, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        LOCAL_ENV_MODULE.parse_local_env(local_env)
+
+    def test_shell_local_env_loader_exports_only_parsed_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copy2(LOCAL_ENV_SCRIPT, scripts / LOCAL_ENV_SCRIPT.name)
+            local_env = root / ".matrix/local.env"
+            local_env.parent.mkdir()
+            local_env.write_text(
+                "MATRIX_RUNTIME_ROOT='/runtime with space'\n",
+                encoding="utf-8",
+            )
+            loader = REPO_ROOT / "scripts/matrix_local_env.sh"
+            command = (
+                f"source {shlex.quote(str(loader))}; "
+                f"load_matrix_local_env {shlex.quote(str(root))}; "
+                "printf '%s' \"$MATRIX_RUNTIME_ROOT\""
+            )
+            result = subprocess.run(
+                ["bash", "-c", command],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "/runtime with space")
 
     def test_release_cache_is_materialized_without_network_or_symlinks(self) -> None:
         bootstrap = (
@@ -648,9 +1163,8 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             text = (REPO_ROOT / "scripts" / script_name).read_text(
                 encoding="utf-8"
             )
-            local_env_source = text.index(
-                'source "$PROJECT_ROOT/.matrix/local.env"'
-            )
+            self.assertNotIn('source "$PROJECT_ROOT/.matrix/local.env"', text)
+            local_env_source = text.index('load_matrix_local_env "$PROJECT_ROOT"')
             profile_source = text.index(
                 'source "$PROFILE_FILE"'
                 if script_name == "bootstrap_matrix_sonic.sh"
@@ -734,6 +1248,19 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         )
         self.assertLess(primary_lock, primary_status_cleanup)
         self.assertLess(primary_status_cleanup, primary_verifier)
+        for launcher in (primary, overworld):
+            self.assertIn("--require-git-sonic", launcher)
+            self.assertIn("VERIFY_RUNTIME_ARGS+=(--fast)", launcher)
+            self.assertIn("Bounded qualification requires locked", launcher)
+            self.assertIn(
+                "Bounded qualification rejects inherited LD_LIBRARY_PATH/PYTHONPATH",
+                launcher,
+            )
+            self.assertIn("PYTHONDONTWRITEBYTECODE=1", launcher)
+            self.assertIn(
+                "mktemp -d /tmp/matrix-qualified-pycache.XXXXXX", launcher
+            )
+        self.assertIn("MATRIX_CPUSET_APPLIED", overworld)
 
     def test_rejected_concurrent_launch_preserves_active_status(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -829,6 +1356,43 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(expected_error, result.stderr)
+
+    def test_bounded_launch_rejects_alternate_roots_and_skip_overrides(self) -> None:
+        launcher = REPO_ROOT / "scripts/run_matrix_sonic.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cases = (
+                ({"SIM_LAUNCHER_ROOT": str(root / "other")}, "alternate Matrix"),
+                ({"MATRIX_ROOT": str(root / "other")}, "alternate Matrix"),
+                ({"SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1"}, "skip overrides"),
+                ({"MATRIX_SKIP_ENV_CHECK": "1"}, "skip overrides"),
+            )
+            for overrides, expected in cases:
+                with self.subTest(overrides=overrides):
+                    environment = os.environ.copy()
+                    environment.update(overrides)
+                    environment["MATRIX_SONIC_HOST_LOCK"] = str(
+                        root / f"{next(iter(overrides))}.lock"
+                    )
+                    environment.pop("MATRIX_PROFILE", None)
+                    environment.pop("MATRIX_CPUSET", None)
+                    result = subprocess.run(
+                        [
+                            "bash",
+                            str(launcher),
+                            "--profile",
+                            "trna",
+                            "--max-seconds",
+                            "1",
+                        ],
+                        cwd=REPO_ROOT,
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, result.stderr)
 
 
 if __name__ == "__main__":

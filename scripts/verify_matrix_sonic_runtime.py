@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +17,7 @@ import stat
 import subprocess
 import sys
 from typing import Any
+import zipfile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -291,6 +295,44 @@ def validate_schema(lock: dict[str, Any]) -> None:
     if lock["schema_version"] != 2:
         raise ValueError(f"unsupported runtime lock schema: {lock['schema_version']}")
 
+    matrix_release = lock.get("matrix_release", {})
+    installed_files = matrix_release.get("installed_files")
+    if not isinstance(installed_files, list) or not installed_files:
+        raise ValueError("matrix_release.installed_files must be a non-empty list")
+    installed_paths: set[str] = set()
+    for entry in installed_files:
+        if not isinstance(entry, dict):
+            raise ValueError("matrix_release.installed_files entries must be objects")
+        path = entry.get("path")
+        if (
+            not isinstance(path, str)
+            or not is_safe_relative_path(path)
+            or path in installed_paths
+        ):
+            raise ValueError(f"invalid or duplicate installed file path: {path!r}")
+        installed_paths.add(path)
+        if not isinstance(entry.get("size"), int) or entry["size"] <= 0:
+            raise ValueError(f"invalid installed file size: {path}")
+        if not is_sha256(entry.get("sha256")):
+            raise ValueError(f"invalid installed file SHA256: {path}")
+    installed_trees = matrix_release.get("installed_trees")
+    if not isinstance(installed_trees, list):
+        raise ValueError("matrix_release.installed_trees must be a list")
+    installed_tree_paths: set[str] = set()
+    for entry in installed_trees:
+        if not isinstance(entry, dict):
+            raise ValueError("matrix_release.installed_trees entries must be objects")
+        path = entry.get("path")
+        if (
+            not isinstance(path, str)
+            or not is_safe_relative_path(path)
+            or path in installed_tree_paths
+        ):
+            raise ValueError(f"invalid or duplicate installed tree path: {path!r}")
+        installed_tree_paths.add(path)
+        if not is_sha256(entry.get("sha256")):
+            raise ValueError(f"invalid installed tree SHA256: {path}")
+
     python_lock = lock.get("python", {})
     for key in (
         "version",
@@ -507,6 +549,371 @@ def verify_wheelhouse(
     return checks
 
 
+def _compact_failures(values: list[str], *, limit: int = 12) -> str:
+    if len(values) <= limit:
+        return "; ".join(values)
+    return "; ".join(values[:limit]) + f"; ... ({len(values) - limit} more)"
+
+
+def _wheel_record_site_path(record_path: str, wheel_stem: str) -> str | None:
+    """Map a wheel RECORD path into its installed site-packages path."""
+
+    parts = Path(record_path).parts
+    data_root = f"{wheel_stem}.data"
+    if parts[0] != data_root:
+        return record_path
+    if len(parts) < 3:
+        raise ValueError(f"invalid wheel .data path: {record_path}")
+    scheme = parts[1]
+    if scheme in {"purelib", "platlib"}:
+        relative = Path(*parts[2:]).as_posix()
+        if not is_safe_relative_path(relative):
+            raise ValueError(f"unsafe wheel site-packages path: {record_path}")
+        return relative
+    if scheme in {"data", "headers", "scripts"}:
+        return None
+    raise ValueError(f"unknown wheel .data install scheme: {record_path}")
+
+
+def _site_packages_inventory(root: Path) -> tuple[set[str], list[str], int]:
+    """Enumerate regular files without following links.
+
+    PEP 3147 cache files are isolated by the qualified launcher's fresh
+    ``PYTHONPYCACHEPREFIX`` and are intentionally excluded from the content
+    closure. Files outside ``__pycache__`` remain visible to the importer.
+    """
+
+    try:
+        root_mode = root.lstat().st_mode
+    except OSError as exc:
+        raise ValueError(f"cannot inspect site-packages root {root}: {exc}") from exc
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        raise ValueError(f"site-packages root is not a real directory: {root}")
+
+    regular_files: set[str] = set()
+    non_regular: list[str] = []
+    ignored_cache_files = 0
+    pending: list[tuple[Path, bool]] = [(root, False)]
+    while pending:
+        directory, inside_cache = pending.pop()
+        try:
+            with os.scandir(directory) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except OSError as exc:
+            relative = directory.relative_to(root).as_posix() or "."
+            raise ValueError(
+                f"cannot enumerate site-packages directory {relative}: {exc}"
+            ) from exc
+        for entry in entries:
+            entry_path = Path(entry.path)
+            relative = entry_path.relative_to(root).as_posix()
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot inspect site-packages entry {relative}: {exc}"
+                ) from exc
+            if stat.S_ISLNK(mode):
+                non_regular.append(f"symlink:{relative}")
+            elif stat.S_ISDIR(mode):
+                pending.append(
+                    (entry_path, inside_cache or entry.name == "__pycache__")
+                )
+            elif stat.S_ISREG(mode):
+                if inside_cache:
+                    ignored_cache_files += 1
+                else:
+                    regular_files.add(relative)
+            else:
+                non_regular.append(f"non-regular:{relative}")
+    return regular_files, non_regular, ignored_cache_files
+
+
+def _is_loadable_site_packages_file(relative: str) -> bool:
+    name = Path(relative).name.lower()
+    return (
+        name.endswith((".py", ".pyc", ".pyo", ".pth", ".pyd", ".egg", ".zip"))
+        or name.endswith(".egg-link")
+        or re.search(r"\.so(?:\.|$)", name) is not None
+    )
+
+
+def verify_python_wheel_records(
+    wheelhouse: Path,
+    site_packages: Path,
+    pinned_requirements: dict[str, tuple[str, str]],
+) -> list[tuple[str, bool, str]]:
+    """Attest installed site-packages against RECORDs in locked wheels."""
+
+    check_names = (
+        "Python wheel RECORD metadata",
+        "native runtime Python installed wheel files",
+        "native runtime Python site-packages inventory",
+    )
+    metadata_errors: list[str] = []
+    expected_files: dict[str, tuple[str | None, int | None, str]] = {}
+    wheel_identities: dict[str, tuple[str, str]] = {}
+    installer_metadata_roots: set[str] = set()
+
+    try:
+        manifest_entries = parse_sha256_manifest(wheelhouse / "SHA256SUMS")
+    except (OSError, UnicodeError, ValueError) as exc:
+        detail = f"cannot read locked wheel manifest: {exc}"
+        return [(name, False, detail) for name in check_names]
+
+    for relative in sorted(manifest_entries):
+        wheel = wheelhouse / relative
+        try:
+            distribution, version, _, _, _ = parse_wheel_filename(relative)
+        except ValueError as exc:
+            metadata_errors.append(f"{relative}:{exc}")
+            continue
+        canonical = canonical_distribution_name(distribution)
+        if canonical in wheel_identities:
+            metadata_errors.append(
+                f"duplicate wheel distribution:{canonical}"
+            )
+            continue
+        wheel_identities[canonical] = (distribution, version)
+
+        normalized_distribution = re.sub(r"[-_.]+", "_", distribution)
+        wheel_stem = f"{normalized_distribution}-{version}"
+        record_path = f"{wheel_stem}.dist-info/RECORD"
+        signature_paths = {
+            f"{wheel_stem}.dist-info/RECORD.jws",
+            f"{wheel_stem}.dist-info/RECORD.p7s",
+        }
+        try:
+            with zipfile.ZipFile(wheel) as archive:
+                archive_files: set[str] = set()
+                archive_errors: list[str] = []
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    if not is_safe_relative_path(info.filename):
+                        archive_errors.append(f"unsafe archive path:{info.filename!r}")
+                        continue
+                    if info.filename in archive_files:
+                        archive_errors.append(f"duplicate archive path:{info.filename}")
+                        continue
+                    mode = info.external_attr >> 16
+                    if mode and stat.S_ISLNK(mode):
+                        archive_errors.append(f"archive symlink:{info.filename}")
+                    archive_files.add(info.filename)
+                if archive_errors:
+                    metadata_errors.extend(
+                        f"{relative}:{error}" for error in archive_errors
+                    )
+                    continue
+                top_level_records = sorted(
+                    name
+                    for name in archive_files
+                    if len(Path(name).parts) == 2
+                    and name.endswith(".dist-info/RECORD")
+                )
+                if top_level_records != [record_path]:
+                    metadata_errors.append(
+                        f"{relative}:expected top-level {record_path}, "
+                        f"found={top_level_records}"
+                    )
+                    continue
+                installer_metadata_roots.add(f"{wheel_stem}.dist-info")
+                record_bytes = archive.read(record_path)
+        except (OSError, KeyError, zipfile.BadZipFile, RuntimeError) as exc:
+            metadata_errors.append(f"{relative}:cannot read RECORD:{exc}")
+            continue
+
+        try:
+            record_text = record_bytes.decode("utf-8")
+            rows = list(csv.reader(io.StringIO(record_text), strict=True))
+        except (UnicodeError, csv.Error) as exc:
+            metadata_errors.append(f"{relative}:invalid RECORD CSV:{exc}")
+            continue
+
+        record_archive_paths: set[str] = set()
+        saw_record_self = False
+        for line_number, row in enumerate(rows, start=1):
+            if len(row) != 3:
+                metadata_errors.append(
+                    f"{relative}:RECORD line {line_number} has {len(row)} fields"
+                )
+                continue
+            source_path, encoded_hash, encoded_size = row
+            if not is_safe_relative_path(source_path):
+                metadata_errors.append(
+                    f"{relative}:unsafe RECORD path:{source_path!r}"
+                )
+                continue
+            if source_path in record_archive_paths:
+                metadata_errors.append(
+                    f"{relative}:duplicate RECORD path:{source_path}"
+                )
+                continue
+            record_archive_paths.add(source_path)
+            if source_path == record_path:
+                saw_record_self = True
+
+            try:
+                installed_path = _wheel_record_site_path(source_path, wheel_stem)
+            except ValueError as exc:
+                metadata_errors.append(f"{relative}:{exc}")
+                continue
+            if installed_path is None:
+                continue
+
+            expected_hash: str | None
+            expected_size: int | None
+            if encoded_hash or encoded_size:
+                match = re.fullmatch(r"sha256=([A-Za-z0-9_-]{43})", encoded_hash)
+                if match is None or re.fullmatch(r"0|[1-9][0-9]*", encoded_size) is None:
+                    metadata_errors.append(
+                        f"{relative}:RECORD lacks sha256/size:{source_path}"
+                    )
+                    continue
+                expected_hash = match.group(1)
+                expected_size = int(encoded_size)
+            else:
+                if source_path != record_path and source_path not in signature_paths:
+                    metadata_errors.append(
+                        f"{relative}:unhashed RECORD entry:{source_path}"
+                    )
+                    continue
+                expected_hash = None
+                expected_size = None
+
+            if installed_path in expected_files:
+                metadata_errors.append(
+                    f"installed path collision:{installed_path}"
+                )
+                continue
+            expected_files[installed_path] = (
+                expected_hash,
+                expected_size,
+                relative,
+            )
+
+        if not saw_record_self:
+            metadata_errors.append(f"{relative}:RECORD does not list itself")
+        archive_unlisted = sorted(
+            archive_files - record_archive_paths - signature_paths
+        )
+        record_missing = sorted(record_archive_paths - archive_files)
+        if archive_unlisted:
+            metadata_errors.append(
+                f"{relative}:archive files absent from RECORD:"
+                + ",".join(archive_unlisted[:4])
+            )
+        if record_missing:
+            metadata_errors.append(
+                f"{relative}:RECORD files absent from archive:"
+                + ",".join(record_missing[:4])
+            )
+
+    for canonical, (distribution, expected_version) in pinned_requirements.items():
+        wheel_identity = wheel_identities.get(canonical)
+        if wheel_identity is None:
+            metadata_errors.append(f"missing pinned wheel:{distribution}")
+        elif wheel_identity[1] != expected_version:
+            metadata_errors.append(
+                f"pinned wheel mismatch:{distribution}:"
+                f"expected={expected_version},actual={wheel_identity[1]}"
+            )
+
+    metadata_ok = not metadata_errors
+    metadata_detail = (
+        f"wheels={len(wheel_identities)} files={len(expected_files)}"
+        if metadata_ok
+        else _compact_failures(metadata_errors)
+    )
+    if not metadata_ok:
+        return [
+            (check_names[0], False, metadata_detail),
+            (check_names[1], False, "RECORD metadata is invalid"),
+            (check_names[2], False, "RECORD metadata is invalid"),
+        ]
+
+    try:
+        actual_files, non_regular, ignored_cache_files = _site_packages_inventory(
+            site_packages
+        )
+    except ValueError as exc:
+        return [
+            (check_names[0], True, metadata_detail),
+            (check_names[1], False, str(exc)),
+            (check_names[2], False, str(exc)),
+        ]
+
+    missing = sorted(set(expected_files) - actual_files)
+    mismatches: list[str] = []
+    verified_hashed_files = 0
+    for relative in sorted(set(expected_files) & actual_files):
+        expected_hash, expected_size, wheel_name = expected_files[relative]
+        if expected_hash is None or expected_size is None:
+            continue
+        path = site_packages / relative
+        try:
+            actual_size = path.stat().st_size
+            if actual_size != expected_size:
+                mismatches.append(
+                    f"{relative}:size={actual_size},expected={expected_size}"
+                )
+                continue
+            actual_hash = base64.urlsafe_b64encode(
+                bytes.fromhex(sha256_file(path))
+            ).rstrip(b"=").decode("ascii")
+        except OSError as exc:
+            mismatches.append(f"{relative}:{wheel_name}:{exc}")
+            continue
+        if actual_hash != expected_hash:
+            mismatches.append(f"{relative}:sha256 mismatch")
+        else:
+            verified_hashed_files += 1
+
+    installed_errors = [f"missing:{value}" for value in missing]
+    installed_errors.extend(mismatches)
+    installed_ok = not installed_errors
+    installed_detail = (
+        f"verified={verified_hashed_files} present={len(expected_files)}"
+        if installed_ok
+        else _compact_failures(installed_errors)
+    )
+
+    generated_metadata_names = {"INSTALLER", "REQUESTED", "direct_url.json"}
+    unexpected_files = actual_files - set(expected_files)
+    allowed_generated_metadata = {
+        relative
+        for relative in unexpected_files
+        if len(Path(relative).parts) == 2
+        and Path(relative).parts[0] in installer_metadata_roots
+        and Path(relative).name in generated_metadata_names
+    }
+    unowned_loadable = sorted(
+        relative
+        for relative in unexpected_files - allowed_generated_metadata
+        if _is_loadable_site_packages_file(relative)
+    )
+    unowned_other = sorted(
+        unexpected_files - allowed_generated_metadata - set(unowned_loadable)
+    )
+    inventory_errors = list(non_regular)
+    inventory_errors.extend(
+        f"unowned-loadable:{relative}" for relative in unowned_loadable
+    )
+    inventory_errors.extend(f"unowned-file:{relative}" for relative in unowned_other)
+    inventory_ok = not inventory_errors
+    inventory_detail = (
+        f"exact content closure; installer-metadata={len(allowed_generated_metadata)}; "
+        f"ignored-pycache-files={ignored_cache_files}"
+        if inventory_ok
+        else _compact_failures(inventory_errors)
+    )
+    return [
+        (check_names[0], True, metadata_detail),
+        (check_names[1], installed_ok, installed_detail),
+        (check_names[2], inventory_ok, inventory_detail),
+    ]
+
+
 def verify_pico_wheel(
     wheel: Path, pico_lock: dict[str, Any]
 ) -> tuple[bool, str]:
@@ -538,11 +945,242 @@ def verify_pico_wheel(
     return not details, "; ".join(details) or f"sha256={actual_sha256}"
 
 
+def verify_installed_pico_wheel(
+    wheel: Path,
+    site_packages: Path,
+    pico_lock: dict[str, Any],
+) -> tuple[bool, str]:
+    """Bind the installed PICO SDK package bytes to its locked wheel RECORD.
+
+    PICO remains an externally controlled environment, so this check does not
+    claim ownership of unrelated dependency distributions. It does reject
+    extra importable files in the SDK namespace and global startup hooks that
+    could replace the locked extension module.
+    """
+
+    wheel_ok, wheel_detail = verify_pico_wheel(wheel, pico_lock)
+    if not wheel_ok:
+        return False, wheel_detail
+    try:
+        distribution, version, _, _, _ = parse_wheel_filename(wheel.name)
+    except ValueError as exc:
+        return False, str(exc)
+    normalized_distribution = re.sub(r"[-_.]+", "_", distribution)
+    wheel_stem = f"{normalized_distribution}-{version}"
+    record_path = f"{wheel_stem}.dist-info/RECORD"
+    top_level_path = f"{wheel_stem}.dist-info/top_level.txt"
+    signature_paths = {
+        f"{wheel_stem}.dist-info/RECORD.jws",
+        f"{wheel_stem}.dist-info/RECORD.p7s",
+    }
+    errors: list[str] = []
+    expected_files: dict[str, tuple[str | None, int | None]] = {}
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            archive_files: set[str] = set()
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                if not is_safe_relative_path(info.filename):
+                    errors.append(f"unsafe archive path:{info.filename!r}")
+                    continue
+                if info.filename in archive_files:
+                    errors.append(f"duplicate archive path:{info.filename}")
+                    continue
+                mode = info.external_attr >> 16
+                if mode and stat.S_ISLNK(mode):
+                    errors.append(f"archive symlink:{info.filename}")
+                archive_files.add(info.filename)
+            top_records = sorted(
+                name
+                for name in archive_files
+                if len(Path(name).parts) == 2
+                and name.endswith(".dist-info/RECORD")
+            )
+            if top_records != [record_path]:
+                errors.append(
+                    f"expected top-level {record_path}, found={top_records}"
+                )
+                record_bytes = b""
+            else:
+                record_bytes = archive.read(record_path)
+            if top_level_path not in archive_files:
+                errors.append(f"wheel lacks {top_level_path}")
+                top_level_bytes = b""
+            else:
+                top_level_bytes = archive.read(top_level_path)
+    except (OSError, KeyError, zipfile.BadZipFile, RuntimeError) as exc:
+        return False, f"cannot read locked PICO wheel RECORD: {exc}"
+    if errors:
+        return False, _compact_failures(errors)
+
+    try:
+        rows = list(
+            csv.reader(
+                io.StringIO(record_bytes.decode("utf-8")), strict=True
+            )
+        )
+        top_level_names = {
+            line.strip()
+            for line in top_level_bytes.decode("utf-8").splitlines()
+            if line.strip()
+        }
+    except (UnicodeError, csv.Error) as exc:
+        return False, f"invalid PICO wheel metadata: {exc}"
+    if not top_level_names or any(
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None
+        for value in top_level_names
+    ):
+        return False, f"invalid PICO top_level.txt: {sorted(top_level_names)}"
+
+    record_archive_paths: set[str] = set()
+    saw_record_self = False
+    for line_number, row in enumerate(rows, start=1):
+        if len(row) != 3:
+            errors.append(f"RECORD line {line_number} has {len(row)} fields")
+            continue
+        source_path, encoded_hash, encoded_size = row
+        if not is_safe_relative_path(source_path):
+            errors.append(f"unsafe RECORD path:{source_path!r}")
+            continue
+        if source_path in record_archive_paths:
+            errors.append(f"duplicate RECORD path:{source_path}")
+            continue
+        record_archive_paths.add(source_path)
+        saw_record_self = saw_record_self or source_path == record_path
+        try:
+            installed_path = _wheel_record_site_path(source_path, wheel_stem)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if installed_path is None:
+            continue
+        if encoded_hash or encoded_size:
+            match = re.fullmatch(r"sha256=([A-Za-z0-9_-]{43})", encoded_hash)
+            if match is None or re.fullmatch(r"0|[1-9][0-9]*", encoded_size) is None:
+                errors.append(f"RECORD lacks sha256/size:{source_path}")
+                continue
+            expected_hash: str | None = match.group(1)
+            expected_size: int | None = int(encoded_size)
+        else:
+            if source_path != record_path and source_path not in signature_paths:
+                errors.append(f"unhashed RECORD entry:{source_path}")
+                continue
+            expected_hash = None
+            expected_size = None
+        if installed_path in expected_files:
+            errors.append(f"installed path collision:{installed_path}")
+            continue
+        expected_files[installed_path] = (expected_hash, expected_size)
+    if not saw_record_self:
+        errors.append("RECORD does not list itself")
+    archive_unlisted = sorted(archive_files - record_archive_paths - signature_paths)
+    record_missing = sorted(record_archive_paths - archive_files)
+    if archive_unlisted:
+        errors.append("archive files absent from RECORD:" + ",".join(archive_unlisted))
+    if record_missing:
+        errors.append("RECORD files absent from archive:" + ",".join(record_missing))
+    if errors:
+        return False, _compact_failures(errors)
+
+    try:
+        actual_files, non_regular, ignored_cache_files = _site_packages_inventory(
+            site_packages
+        )
+    except ValueError as exc:
+        return False, str(exc)
+    missing = sorted(set(expected_files) - actual_files)
+    for relative in missing:
+        errors.append(f"missing:{relative}")
+    verified = 0
+    for relative in sorted(set(expected_files) & actual_files):
+        expected_hash, expected_size = expected_files[relative]
+        if expected_hash is None or expected_size is None:
+            continue
+        path = site_packages / relative
+        try:
+            actual_size = path.stat().st_size
+        except OSError as exc:
+            errors.append(f"{relative}:{exc}")
+            continue
+        if actual_size != expected_size:
+            errors.append(
+                f"{relative}:size={actual_size},expected={expected_size}"
+            )
+            continue
+        try:
+            actual_hash = base64.urlsafe_b64encode(
+                bytes.fromhex(sha256_file(path))
+            ).rstrip(b"=").decode("ascii")
+        except OSError as exc:
+            errors.append(f"{relative}:{exc}")
+            continue
+        if actual_hash != expected_hash:
+            errors.append(f"{relative}:sha256 mismatch")
+        else:
+            verified += 1
+
+    def sdk_related(relative: str) -> bool:
+        parts = Path(relative).parts
+        if not parts:
+            return False
+        if parts[0] in top_level_names:
+            return True
+        if len(parts) != 1:
+            return False
+        name = parts[0]
+        return any(
+            name == top_level
+            or name.startswith(f"{top_level}.")
+            for top_level in top_level_names
+        ) and _is_loadable_site_packages_file(relative)
+
+    generated_metadata_names = {"INSTALLER", "REQUESTED", "direct_url.json"}
+
+    def global_startup_hook(relative: str) -> bool:
+        parts = Path(relative).parts
+        if len(parts) != 1:
+            return False
+        name = parts[0].lower()
+        return name.endswith(".pth") or (
+            (name == "sitecustomize.py" or name.startswith("sitecustomize."))
+            or (name == "usercustomize.py" or name.startswith("usercustomize."))
+        ) and _is_loadable_site_packages_file(relative)
+
+    unexpected = actual_files - set(expected_files)
+    for relative in sorted(unexpected):
+        parts = Path(relative).parts
+        generated_metadata = (
+            len(parts) == 2
+            and parts[0] == f"{wheel_stem}.dist-info"
+            and parts[1] in generated_metadata_names
+        )
+        if not generated_metadata and (
+            sdk_related(relative) or global_startup_hook(relative)
+        ):
+            errors.append(f"unowned PICO import file:{relative}")
+    for value in non_regular:
+        relative = value.split(":", 1)[-1]
+        if sdk_related(relative) or global_startup_hook(relative):
+            errors.append(value)
+    return (
+        not errors,
+        (
+            f"verified={verified} files={len(expected_files)} "
+            f"top-level={','.join(sorted(top_level_names))} "
+            f"ignored-pycache-files={ignored_cache_files}"
+            if not errors
+            else _compact_failures(errors)
+        ),
+    )
+
+
 def runtime_roots(runtime_root: Path, sonic_root: Path) -> dict[str, Path]:
     return {
         "sonic": sonic_root,
         "visual": runtime_root / "g1-visual",
         "inference": runtime_root / "inference",
+        "native": runtime_root / "matrix-native-deps",
     }
 
 
@@ -580,8 +1218,14 @@ def runtime_tree_attestation(
 
 
 def library_paths(runtime_root: Path, matrix_root: Path, sonic_root: Path) -> list[Path]:
-    native = runtime_root / "matrix-native-deps"
-    ros = runtime_root / "ros2-humble-prefix"
+    native = Path(
+        os.environ.get(
+            "MATRIX_NATIVE_DEPS_ROOT", runtime_root / "matrix-native-deps"
+        )
+    )
+    ros = Path(
+        os.environ.get("MATRIX_ROS_PREFIX", runtime_root / "ros2-humble-prefix")
+    )
     cuda = Path(os.environ.get("MATRIX_CUDA_ROOT", "/usr/local/cuda"))
     candidates = [
         runtime_root / "inference/TensorRT/lib",
@@ -591,7 +1235,6 @@ def library_paths(runtime_root: Path, matrix_root: Path, sonic_root: Path) -> li
         / "external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib",
         native / "usr/lib",
         native / "usr/lib/x86_64-linux-gnu",
-        native / "usr/local/lib",
         ros / "lib",
         matrix_root / "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",
         matrix_root / "src/UeSim/Linux/Engine/Binaries/Linux",
@@ -612,6 +1255,154 @@ def dynamic_environment(
         paths.append(env["LD_LIBRARY_PATH"])
     env["LD_LIBRARY_PATH"] = ":".join(paths)
     return env
+
+
+def pip_check_environment(
+    python_executable: str, base_env: dict[str, str]
+) -> tuple[dict[str, str], str | None]:
+    """Expose an attested host pip only to ``python -m pip check``.
+
+    Bootstrap keeps pip in a dedicated module root next to the venv (moving an
+    ensurepip seed there or linking a host fallback). Runtime imports remain
+    isolated; only installer/dependency-consistency subprocesses receive this
+    extra path.
+    """
+
+    env = base_env.copy()
+    marker = Path(python_executable).expanduser().parent.parent / ".matrix-external-pip"
+    if not marker.exists():
+        return env, None
+    if marker.is_symlink() or not marker.is_file():
+        return env, f"invalid external pip marker: {marker}"
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return env, f"cannot read external pip marker: {exc}"
+    if len(lines) != 1 or not lines[0]:
+        return env, f"external pip marker must contain one path: {marker}"
+    root = Path(lines[0])
+    venv_root = marker.parent
+    if root != venv_root / ".matrix-pip-runner" or not (
+        root / "pip/__init__.py"
+    ).is_file():
+        return env, f"external pip module root is invalid: {root}"
+    site_packages = sorted((venv_root / "lib").glob("python*/site-packages"))
+    if len(site_packages) != 1 or not site_packages[0].is_dir():
+        return env, f"external pip venv site-packages is invalid: {venv_root}"
+    env["PYTHONPATH"] = os.pathsep.join((str(site_packages[0]), str(root))) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    return env, None
+
+
+def verify_python_isolation(
+    venv_root: Path,
+    site_packages: Path,
+    matrix_root: Path,
+    identity: dict[str, Any],
+) -> tuple[bool, str]:
+    """Prove the runtime venv cannot import unverified host/user packages."""
+
+    failures: list[str] = []
+    try:
+        root_mode = venv_root.lstat().st_mode
+    except OSError as exc:
+        return False, f"cannot inspect venv root {venv_root}: {exc}"
+    if stat.S_ISLNK(root_mode) or not stat.S_ISDIR(root_mode):
+        failures.append("venv root is not a real directory")
+
+    configuration = venv_root / "pyvenv.cfg"
+    include_system_values: list[str] = []
+    try:
+        configuration_mode = configuration.lstat().st_mode
+        if stat.S_ISLNK(configuration_mode) or not stat.S_ISREG(configuration_mode):
+            raise ValueError("pyvenv.cfg is not a regular non-symlink file")
+        for raw_line in configuration.read_text(encoding="utf-8").splitlines():
+            if "=" not in raw_line:
+                continue
+            key, value = raw_line.split("=", 1)
+            if key.strip().lower() == "include-system-site-packages":
+                include_system_values.append(value.strip().lower())
+    except (OSError, UnicodeError, ValueError) as exc:
+        failures.append(str(exc))
+    if include_system_values != ["false"]:
+        failures.append(
+            "pyvenv.cfg include-system-site-packages must occur once as false: "
+            f"actual={include_system_values}"
+        )
+
+    expected_site = site_packages.absolute()
+    expected_matrix = matrix_root.absolute()
+    prefix = identity.get("prefix")
+    base_prefix = identity.get("base_prefix")
+    purelib = identity.get("purelib")
+    platlib = identity.get("platlib")
+    stdlib = identity.get("stdlib")
+    platstdlib = identity.get("platstdlib")
+    paths = identity.get("path")
+    if not isinstance(prefix, str) or Path(prefix).absolute() != venv_root.absolute():
+        failures.append(f"runtime prefix escapes venv: {prefix!r}")
+    if not isinstance(base_prefix, str) or not Path(base_prefix).is_absolute():
+        failures.append(f"invalid base_prefix: {base_prefix!r}")
+    elif Path(base_prefix).absolute() == venv_root.absolute():
+        failures.append("runtime Python is not a venv")
+    for label, value in (("purelib", purelib), ("platlib", platlib)):
+        if not isinstance(value, str) or Path(value).absolute() != expected_site:
+            failures.append(f"runtime {label} escapes locked site-packages: {value!r}")
+    if identity.get("user_site_enabled") is not False:
+        failures.append(
+            f"user site is enabled: {identity.get('user_site_enabled')!r}"
+        )
+    if not isinstance(paths, list) or not all(isinstance(value, str) for value in paths):
+        failures.append("runtime sys.path is not a string list")
+        paths = []
+
+    standard_roots: set[Path] = set()
+    standard_zip_paths: set[Path] = set()
+    for value in (stdlib, platstdlib):
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            failures.append(f"invalid standard-library root: {value!r}")
+            continue
+        standard_root = Path(value).absolute()
+        standard_roots.add(standard_root)
+        version = identity.get("version")
+        if isinstance(version, str):
+            major_minor = version.replace(".", "")
+            standard_zip_paths.add(
+                standard_root.parent / f"python{major_minor}.zip"
+            )
+
+    saw_site_packages = False
+    unauthorized_paths: list[str] = []
+    for raw_path in paths:
+        candidate = (
+            expected_matrix if raw_path == "" else Path(raw_path).absolute()
+        )
+        if candidate == expected_site or candidate.is_relative_to(expected_site):
+            saw_site_packages = saw_site_packages or candidate == expected_site
+            continue
+        if candidate == expected_matrix:
+            continue
+        lowered_parts = {part.lower() for part in candidate.parts}
+        if "site-packages" in lowered_parts or "dist-packages" in lowered_parts:
+            unauthorized_paths.append(str(candidate))
+            continue
+        if candidate in standard_zip_paths or any(
+            candidate == root or candidate.is_relative_to(root)
+            for root in standard_roots
+        ):
+            continue
+        unauthorized_paths.append(str(candidate))
+    if not saw_site_packages:
+        failures.append(f"locked site-packages is absent from sys.path: {expected_site}")
+    if unauthorized_paths:
+        failures.append(
+            "unauthorized sys.path entries: " + ",".join(unauthorized_paths)
+        )
+    return (
+        not failures,
+        "isolated venv and sys.path" if not failures else _compact_failures(failures),
+    )
 
 
 def git_checkout_root(path: Path) -> Path | None:
@@ -661,6 +1452,85 @@ def archived_source_attestation(
     return (
         not failures,
         "; ".join(failures) if failures else "critical source files match runtime lock",
+    )
+
+
+def matrix_source_overlay_attestation(
+    matrix_root: Path, lock: dict[str, Any]
+) -> tuple[bool, str]:
+    """Reject uncommitted Matrix code that can shadow qualified runtime inputs."""
+
+    inventories: list[tuple[str, list[str]]] = []
+    for label, extra_arguments in (
+        ("untracked", ["--exclude-standard"]),
+        ("ignored", ["--ignored", "--exclude-standard"]),
+    ):
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(matrix_root),
+                "ls-files",
+                "--others",
+                *extra_arguments,
+                "-z",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            return False, f"git {label} inventory failed: {detail or result.returncode}"
+        inventories.append(
+            (
+                label,
+                [
+                    value.decode("utf-8", errors="surrogateescape")
+                    for value in result.stdout.split(b"\0")
+                    if value
+                ],
+            )
+        )
+
+    installed_files = {
+        Path(entry["path"]) for entry in lock["matrix_release"]["installed_files"]
+    }
+    installed_trees = [
+        Path(entry["path"]) for entry in lock["matrix_release"]["installed_trees"]
+    ]
+    excluded_roots = {".matrix", ".venv-audit", "outputs", "releases"}
+    disabled_mc_build = Path("src/robot_mc/build")
+
+    def locked_shared_object(candidate: Path) -> bool:
+        return candidate in installed_files or any(
+            candidate.is_relative_to(tree) for tree in installed_trees
+        )
+
+    failures: list[str] = []
+    for label, paths in inventories:
+        for value in paths:
+            candidate = Path(value)
+            if not is_safe_relative_path(value) or not candidate.parts:
+                failures.append(f"{label}:unsafe-path:{value!r}")
+                continue
+            if (
+                candidate.parts[0] in excluded_roots
+                or candidate.parts[0].startswith(".chunk_downloads_")
+                or candidate.is_relative_to(disabled_mc_build)
+            ):
+                continue
+            suffix = candidate.suffix.lower()
+            code_overlay = suffix in {".py", ".pyi"}
+            legacy_bytecode = suffix == ".pyc" and "__pycache__" not in candidate.parts
+            shared_object = re.search(r"\.so(?:\.|$)", candidate.name) is not None
+            if code_overlay or legacy_bytecode or (
+                shared_object and not locked_shared_object(candidate)
+            ):
+                failures.append(f"{label}:{value}")
+    return (
+        not failures,
+        "none" if not failures else _compact_failures(sorted(set(failures))),
     )
 
 
@@ -726,6 +1596,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--release-cache", type=Path)
     parser.add_argument("--profile", choices=HOST_PROFILES)
+    parser.add_argument(
+        "--require-git-sonic",
+        action="store_true",
+        help="Reject an archived SONIC mirror; required by bounded qualification",
+    )
     parser.add_argument("--schema-only", action="store_true")
     parser.add_argument("--skip-dynamic", action="store_true")
     parser.add_argument("--skip-installed-assets", action="store_true")
@@ -788,6 +1663,14 @@ def main() -> int:
         matrix_clean_result.returncode == 0,
         "clean" if matrix_clean_result.returncode == 0 else "tracked changes present",
     )
+    matrix_overlays_ok, matrix_overlays_detail = matrix_source_overlay_attestation(
+        matrix_root, lock
+    )
+    record(
+        "Matrix ignored source overlays absent",
+        matrix_overlays_ok,
+        matrix_overlays_detail,
+    )
 
     python_executable: str | None = None
     if args.python:
@@ -849,20 +1732,27 @@ def main() -> int:
 
     identity_env = os.environ.copy()
     identity_env["PYTHONNOUSERSITE"] = "1"
-    python_identity: dict[str, str] = {}
+    python_identity: dict[str, Any] = {}
     identity_error = "runtime Python is unavailable"
     if python_executable is not None:
         identity_prefix = "MATRIX_VERIFY_PYTHON_JSON="
         identity_code = (
-            "import json,platform,sys,sysconfig; "
+            "import json,platform,site,sys,sysconfig; "
             f"print('{identity_prefix}' + json.dumps({{'version': "
             "f'{sys.version_info.major}.{sys.version_info.minor}', "
             "'soabi': sysconfig.get_config_var('SOABI') or '', "
-            "'machine': platform.machine()}))"
+            "'machine': platform.machine(), 'prefix': sys.prefix, "
+            "'base_prefix': sys.base_prefix, 'path': sys.path, "
+            "'purelib': sysconfig.get_path('purelib'), "
+            "'platlib': sysconfig.get_path('platlib'), "
+            "'stdlib': sysconfig.get_path('stdlib'), "
+            "'platstdlib': sysconfig.get_path('platstdlib'), "
+            "'user_site_enabled': site.ENABLE_USER_SITE}}))"
         )
         identity_result = subprocess.run(
             [python_executable, "-c", identity_code],
             env=identity_env,
+            cwd=matrix_root,
             text=True,
             capture_output=True,
             check=False,
@@ -880,10 +1770,7 @@ def main() -> int:
             try:
                 candidate_identity = json.loads(identity_line)
                 if isinstance(candidate_identity, dict):
-                    python_identity = {
-                        key: str(candidate_identity.get(key, ""))
-                        for key in ("version", "soabi", "machine")
-                    }
+                    python_identity = candidate_identity
             except json.JSONDecodeError:
                 identity_error = f"invalid JSON: {identity_result.stdout!r}"
     for key, label in (
@@ -891,7 +1778,8 @@ def main() -> int:
         ("soabi", "native runtime Python SOABI"),
         ("machine", "native runtime machine"),
     ):
-        actual_identity = python_identity.get(key, "")
+        candidate_identity = python_identity.get(key, "")
+        actual_identity = candidate_identity if isinstance(candidate_identity, str) else ""
         expected_identity = lock["python"][key]
         record(
             label,
@@ -902,6 +1790,41 @@ def main() -> int:
                 else identity_error
             ),
         )
+    expected_python_prefix = (
+        Path(python_executable).absolute().parent.parent
+        if python_executable is not None
+        else Path()
+    )
+    python_site_packages = (
+        expected_python_prefix
+        / "lib"
+        / f"python{lock['python']['version']}"
+        / "site-packages"
+        if python_executable is not None
+        else None
+    )
+    identity_prefix_value = python_identity.get("prefix", "")
+    actual_python_prefix = Path(
+        identity_prefix_value if isinstance(identity_prefix_value, str) else ""
+    ).absolute()
+    record(
+        "native runtime Python prefix",
+        python_executable is not None
+        and isinstance(identity_prefix_value, str)
+        and identity_prefix_value != ""
+        and actual_python_prefix == expected_python_prefix,
+        f"expected={expected_python_prefix} actual={actual_python_prefix}",
+    )
+    if python_site_packages is None:
+        isolation_ok, isolation_detail = False, "runtime Python is unavailable"
+    else:
+        isolation_ok, isolation_detail = verify_python_isolation(
+            expected_python_prefix,
+            python_site_packages,
+            matrix_root,
+            python_identity,
+        )
+    record("native runtime Python isolation", isolation_ok, isolation_detail)
 
     if python_executable is not None and pinned_requirements:
         metadata_prefix = "MATRIX_VERIFY_DISTRIBUTIONS_JSON="
@@ -963,20 +1886,26 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
             else result.stderr.strip() or "distribution query failed",
         )
 
-        pip_check = subprocess.run(
-            [python_executable, "-m", "pip", "check"],
-            env=identity_env,
-            text=True,
-            capture_output=True,
-            check=False,
+        pip_env, pip_env_error = pip_check_environment(
+            python_executable, identity_env
         )
-        record(
-            "native runtime pip check",
-            pip_check.returncode == 0,
-            pip_check.stdout.strip()
-            or pip_check.stderr.strip()
-            or "pip check succeeded",
-        )
+        if pip_env_error is not None:
+            record("native runtime pip check", False, pip_env_error)
+        else:
+            pip_check = subprocess.run(
+                [python_executable, "-m", "pip", "check"],
+                env=pip_env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            record(
+                "native runtime pip check",
+                pip_check.returncode == 0,
+                pip_check.stdout.strip()
+                or pip_check.stderr.strip()
+                or "pip check succeeded",
+            )
 
     sonic_lock = lock["source_revisions"]["gr00t_whole_body_control"]
     expected_sonic_commit = sonic_lock["commit"]
@@ -997,8 +1926,6 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
                 "status",
                 "--porcelain=v1",
                 "--untracked-files=all",
-                "--",
-                *sonic_lock["critical_source_paths"],
             ],
             text=True,
             capture_output=True,
@@ -1007,7 +1934,7 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
         dirty_lines = dirty_result.stdout.strip().splitlines()
         source_clean = dirty_result.returncode == 0 and not dirty_lines
         record(
-            "native SONIC critical source clean",
+            "native SONIC source clean",
             source_clean,
             (
                 "clean"
@@ -1017,7 +1944,69 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
                 or "git status failed"
             ),
         )
-        commit_trusted = source_clean
+        ignored_result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout_root),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        ignored_paths = [
+            value.decode("utf-8", errors="surrogateescape")
+            for value in ignored_result.stdout.split(b"\0")
+            if value
+        ]
+        locked_sonic_files = {
+            Path(entry["path"])
+            for entry in lock["runtime_files"]
+            if entry["root"] == "sonic"
+        }
+        locked_sonic_trees = [
+            Path(entry["path"])
+            for entry in lock["runtime_trees"]
+            if entry["root"] == "sonic"
+        ]
+
+        def ignored_shared_object_is_locked(path: str) -> bool:
+            candidate = Path(path)
+            return candidate in locked_sonic_files or any(
+                candidate.is_relative_to(tree) for tree in locked_sonic_trees
+            )
+
+        ignored_overlays = [
+            path
+            for path in ignored_paths
+            if Path(path).suffix.lower() in {".py", ".pyi"}
+            or (
+                re.search(r"\.so(?:\.|$)", Path(path).name) is not None
+                and not ignored_shared_object_is_locked(path)
+            )
+            or (
+                Path(path).suffix.lower() == ".pyc"
+                and "__pycache__" not in Path(path).parts
+            )
+        ]
+        ignored_clean = ignored_result.returncode == 0 and not ignored_overlays
+        record(
+            "native SONIC ignored source overlays absent",
+            ignored_clean,
+            (
+                "none"
+                if ignored_clean
+                else "; ".join(ignored_overlays)
+                or ignored_result.stderr.decode("utf-8", errors="replace").strip()
+                or "git ignored-source inventory failed"
+            ),
+        )
+        commit_trusted = source_clean and ignored_clean
         commit_detail = f"HEAD={actual_sonic_commit}" if actual_sonic_commit else "HEAD unavailable"
     else:
         marker = sonic_root / "SONIC_COMMIT"
@@ -1041,6 +2030,12 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
             f"SONIC_COMMIT={actual_sonic_commit}; source_attested={commit_trusted}"
             if actual_sonic_commit
             else f"missing regular marker {marker}"
+        )
+    if args.require_git_sonic:
+        record(
+            "native SONIC Git checkout required",
+            checkout_root is not None,
+            str(checkout_root) if checkout_root is not None else "archived mirror",
         )
     record(
         "native SONIC commit",
@@ -1085,6 +2080,18 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
         wheelhouse, lock["python"]["wheelhouse_manifest_sha256"]
     ):
         record(name, ok, detail)
+    if python_site_packages is None:
+        for name in (
+            "Python wheel RECORD metadata",
+            "native runtime Python installed wheel files",
+            "native runtime Python site-packages inventory",
+        ):
+            record(name, False, "runtime Python is unavailable")
+    else:
+        for name, ok, detail in verify_python_wheel_records(
+            wheelhouse, python_site_packages, pinned_requirements
+        ):
+            record(name, ok, detail)
 
     if args.pico_wheel:
         pico_wheel_ok, pico_wheel_detail = verify_pico_wheel(
@@ -1121,10 +2128,48 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
             )
 
     if not args.skip_installed_assets:
-        for relative in lock["matrix_release"]["installed_files"]:
+        for entry in lock["matrix_release"]["installed_files"]:
+            relative = entry["path"]
             path = matrix_root / relative
-            record(f"installed {relative}", path.is_file(), str(path))
+            try:
+                inside_root = path.resolve().is_relative_to(matrix_root)
+            except (OSError, RuntimeError):
+                inside_root = False
+            if not inside_root or not path.is_file() or path.is_symlink():
+                record(f"installed {relative}", False, "missing regular file")
+                continue
+            actual_size = path.stat().st_size
+            if actual_size != entry["size"]:
+                record(
+                    f"installed {relative}",
+                    False,
+                    f"size={actual_size} expected={entry['size']}",
+                )
+                continue
+            if args.fast and actual_size > LARGE_FILE_THRESHOLD:
+                record(
+                    f"installed {relative}",
+                    True,
+                    f"present ({actual_size} bytes; fast mode)",
+                )
+                continue
+            actual = sha256_file(path)
+            record(
+                f"installed {relative}",
+                actual == entry["sha256"],
+                f"sha256={actual}",
+            )
+        for entry in lock["matrix_release"]["installed_trees"]:
+            ok, detail = runtime_tree_attestation(
+                matrix_root, entry["path"], entry["sha256"]
+            )
+            record(f"installed tree {matrix_root / entry['path']}", ok, detail)
 
+    native_deps_root = Path(
+        os.environ.get(
+            "MATRIX_NATIVE_DEPS_ROOT", runtime_root / "matrix-native-deps"
+        )
+    ).resolve()
     if not args.skip_dynamic:
         env = dynamic_environment(runtime_root, matrix_root, sonic_root)
         env["PYTHONNOUSERSITE"] = "1"
@@ -1259,14 +2304,95 @@ print("MATRIX_VERIFY_IMPORT_JSON=" + json.dumps(payload, sort_keys=True))
             if pico_python is None:
                 candidate = Path(args.pico_python).expanduser()
                 if candidate.is_file() and os.access(candidate, os.X_OK):
-                    pico_python = str(candidate.resolve())
+                    pico_python = str(candidate.absolute())
             if pico_python is None:
+                record(
+                    "native PICO Python isolation",
+                    False,
+                    f"unavailable interpreter: {args.pico_python}",
+                )
+                record(
+                    "native PICO SDK wheel installation",
+                    False,
+                    f"unavailable interpreter: {args.pico_python}",
+                )
                 record(
                     "native PICO Python API",
                     False,
                     f"unavailable interpreter: {args.pico_python}",
                 )
+                record(
+                    "native PICO pip check",
+                    False,
+                    f"unavailable interpreter: {args.pico_python}",
+                )
             else:
+                pico_lock = lock["pico"]
+                pico_lexical_prefix = Path(pico_python).absolute().parent.parent
+                pico_site_packages = (
+                    pico_lexical_prefix
+                    / "lib"
+                    / f"python{pico_lock['python_version']}"
+                    / "site-packages"
+                )
+                pico_identity_marker = "MATRIX_VERIFY_PICO_IDENTITY_JSON="
+                pico_identity_code = (
+                    "import json,platform,site,sys,sysconfig; "
+                    f"print('{pico_identity_marker}' + json.dumps({{'version': "
+                    "f'{sys.version_info.major}.{sys.version_info.minor}', "
+                    "'soabi': sysconfig.get_config_var('SOABI') or '', "
+                    "'machine': platform.machine(), 'prefix': sys.prefix, "
+                    "'base_prefix': sys.base_prefix, 'path': sys.path, "
+                    "'purelib': sysconfig.get_path('purelib'), "
+                    "'platlib': sysconfig.get_path('platlib'), "
+                    "'stdlib': sysconfig.get_path('stdlib'), "
+                    "'platstdlib': sysconfig.get_path('platstdlib'), "
+                    "'user_site_enabled': site.ENABLE_USER_SITE}}))"
+                )
+                pico_identity_env = env.copy()
+                pico_identity_env.pop("PYTHONPATH", None)
+                pico_identity_env["PYTHONNOUSERSITE"] = "1"
+                pico_identity_result = subprocess.run(
+                    [pico_python, "-c", pico_identity_code],
+                    env=pico_identity_env,
+                    cwd=matrix_root,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                pico_identity_line = next(
+                    (
+                        line[len(pico_identity_marker) :]
+                        for line in reversed(pico_identity_result.stdout.splitlines())
+                        if line.startswith(pico_identity_marker)
+                    ),
+                    "",
+                )
+                try:
+                    pico_identity = (
+                        json.loads(pico_identity_line) if pico_identity_line else {}
+                    )
+                except json.JSONDecodeError:
+                    pico_identity = {}
+                if not isinstance(pico_identity, dict):
+                    pico_identity = {}
+                pico_isolation_ok, pico_isolation_detail = verify_python_isolation(
+                    pico_lexical_prefix,
+                    pico_site_packages,
+                    matrix_root,
+                    pico_identity,
+                )
+                if pico_identity_result.returncode != 0:
+                    pico_isolation_ok = False
+                    pico_isolation_detail = (
+                        pico_identity_result.stderr.strip()
+                        or "PICO identity query failed"
+                    )
+                record(
+                    "native PICO Python isolation",
+                    pico_isolation_ok,
+                    pico_isolation_detail,
+                )
                 pico_env = env.copy()
                 pico_env["PYTHONPATH"] = str(sonic_root) + (
                     os.pathsep + pico_env["PYTHONPATH"]
@@ -1287,13 +2413,28 @@ payload = {
     "soabi": sysconfig.get_config_var("SOABI") or "",
     "machine": platform.machine(),
     "prefix": str(Path(sys.prefix).resolve()),
+    "purelib": str(Path(sysconfig.get_path("purelib")).resolve()),
+    "platlib": str(Path(sysconfig.get_path("platlib")).resolve()),
     "distribution_version": importlib.metadata.version(sys.argv[1]),
 }
 import xrobotoolkit_sdk
 payload["origin"] = str(Path(xrobotoolkit_sdk.__file__).resolve())
 print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
 """
-                pico_lock = lock["pico"]
+                if args.pico_wheel is None:
+                    pico_install_ok = False
+                    pico_install_detail = "--pico-wheel is required"
+                else:
+                    pico_install_ok, pico_install_detail = verify_installed_pico_wheel(
+                        args.pico_wheel.expanduser(),
+                        pico_site_packages,
+                        pico_lock,
+                    )
+                record(
+                    "native PICO SDK wheel installation",
+                    pico_install_ok,
+                    pico_install_detail,
+                )
                 result = subprocess.run(
                     [
                         pico_python,
@@ -1321,9 +2462,7 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                 try:
                     origin_inside_prefix = Path(
                         str(pico_payload.get("origin", ""))
-                    ).resolve().is_relative_to(
-                        Path(str(pico_payload.get("prefix", ""))).resolve()
-                    )
+                    ).resolve().is_relative_to(pico_lexical_prefix.resolve())
                 except (OSError, RuntimeError):
                     origin_inside_prefix = False
                 pico_mismatches = []
@@ -1336,6 +2475,23 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                     if pico_payload.get(actual_key) != pico_lock[lock_key]:
                         pico_mismatches.append(
                             f"{actual_key}:expected={pico_lock[lock_key]},"
+                            f"actual={pico_payload.get(actual_key)}"
+                        )
+                for actual_key, expected_path in (
+                    ("prefix", pico_lexical_prefix),
+                    ("purelib", pico_site_packages),
+                    ("platlib", pico_site_packages),
+                ):
+                    try:
+                        actual_path = Path(
+                            str(pico_payload.get(actual_key, ""))
+                        ).resolve()
+                        path_matches = actual_path == expected_path.resolve()
+                    except (OSError, RuntimeError):
+                        path_matches = False
+                    if not path_matches:
+                        pico_mismatches.append(
+                            f"{actual_key}:expected={expected_path},"
                             f"actual={pico_payload.get(actual_key)}"
                         )
                 if not origin_inside_prefix:
@@ -1428,6 +2584,52 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                 resolved or "not present in ldd output",
             )
 
+        ue_binary = (
+            matrix_root
+            / "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue"
+        )
+        if ue_binary.is_file():
+            ue_ldd = subprocess.run(
+                ["ldd", str(ue_binary)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            missing = [
+                line.strip()
+                for line in ue_ldd.stdout.splitlines()
+                if "not found" in line
+            ]
+            private_roots = [
+                matrix_root
+                / "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",
+                matrix_root / "src/UeSim/Linux/Engine/Binaries/Linux",
+                matrix_root
+                / "src/UeSim/Linux/Engine/Plugins/Runtime/OpenCV/Binaries/ThirdParty/Linux",
+                native_deps_root / "usr/lib",
+            ]
+            system_roots = [Path("/lib"), Path("/usr/lib")]
+            unauthorized: list[str] = []
+            for line in ue_ldd.stdout.splitlines():
+                if "=>" not in line:
+                    continue
+                resolved = line.split("=>", 1)[1].strip().split(" ", 1)[0]
+                if not resolved.startswith("/"):
+                    continue
+                resolved_path = Path(resolved).resolve()
+                if not any(
+                    resolved_path.is_relative_to(root.resolve())
+                    for root in (*private_roots, *system_roots)
+                    if root.exists()
+                ):
+                    unauthorized.append(str(resolved_path))
+            record(
+                "Matrix UE dependency closure",
+                ue_ldd.returncode == 0 and not missing and not unauthorized,
+                "; ".join(missing + unauthorized) or "complete and rooted",
+            )
+
         trt = roots["inference"] / "TensorRT/lib/libnvinfer.so.10"
         if trt.is_file():
             if python_executable is None:
@@ -1441,8 +2643,13 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                 )
             record("TensorRT ABI", ok, detail)
 
-        rmw = runtime_root / "ros2-humble-prefix/lib/librmw_fastrtps_cpp.so"
-        if args.profile == "heyuan" or rmw.exists():
+        ros_prefix = Path(
+            os.environ.get(
+                "MATRIX_ROS_PREFIX", runtime_root / "ros2-humble-prefix"
+            )
+        )
+        rmw = ros_prefix / "lib/librmw_fastrtps_cpp.so"
+        if args.profile in {"heyuan", "trna"} or rmw.exists():
             if not rmw.exists():
                 record("ROS2 RMW", False, f"missing {rmw}")
             elif python_executable is None:
@@ -1451,6 +2658,106 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                 ok, detail = check_dlopen(rmw, env, python_executable)
                 record("ROS2 RMW", ok, detail)
 
+    native_deps_root = Path(
+        os.environ.get(
+            "MATRIX_NATIVE_DEPS_ROOT", runtime_root / "matrix-native-deps"
+        )
+    ).resolve()
+    ros_prefix = Path(
+        os.environ.get("MATRIX_ROS_PREFIX", runtime_root / "ros2-humble-prefix")
+    ).resolve()
+    cuda_root = Path(os.environ.get("MATRIX_CUDA_ROOT", "/usr/local/cuda")).resolve()
+    verification_flags = {
+        "fast": bool(args.fast),
+        "skip_dynamic": bool(args.skip_dynamic),
+        "skip_installed_assets": bool(args.skip_installed_assets),
+        "require_git_sonic": bool(args.require_git_sonic),
+    }
+    verification_inventory = {
+        "runtime_files_expected": len(lock["runtime_files"]),
+        "runtime_files_checked": len(lock["runtime_files"]),
+        "runtime_trees_expected": len(lock["runtime_trees"]),
+        "runtime_trees_checked": len(lock["runtime_trees"]),
+        "installed_files_expected": len(lock["matrix_release"]["installed_files"]),
+        "installed_files_checked": (
+            0
+            if args.skip_installed_assets
+            else len(lock["matrix_release"]["installed_files"])
+        ),
+        "installed_trees_expected": len(lock["matrix_release"]["installed_trees"]),
+        "installed_trees_checked": (
+            0
+            if args.skip_installed_assets
+            else len(lock["matrix_release"]["installed_trees"])
+        ),
+        "dynamic_checks_performed": not args.skip_dynamic,
+    }
+    core_qualification_checks = {
+        "Matrix source commit",
+        "Matrix tracked source clean",
+        "Matrix ignored source overlays absent",
+        "native runtime Python",
+        "Python requirements lock",
+        "Python requirements exact pins",
+        "Python lock scalar consistency",
+        "native runtime Python version",
+        "native runtime Python SOABI",
+        "native runtime machine",
+        "native runtime Python prefix",
+        "native runtime Python isolation",
+        "native runtime Python distributions",
+        "native runtime pip check",
+        "native SONIC source clean",
+        "native SONIC ignored source overlays absent",
+        "native SONIC Git checkout required",
+        "native SONIC commit",
+        "Python wheelhouse manifest",
+        "Python wheelhouse inventory",
+        "Python wheelhouse compatibility",
+        "Python wheelhouse contents",
+        "Python wheel RECORD metadata",
+        "native runtime Python installed wheel files",
+        "native runtime Python site-packages inventory",
+        "native SONIC Python API",
+        "gear_sonic import origin",
+        "unitree_sdk2py Python package",
+        "cyclonedds Python package",
+        "SONIC deploy dependency closure",
+        "Matrix UE dependency closure",
+        "libonnxruntime.so.1.16.3 resolution",
+        "libnvinfer.so.10 resolution",
+        "libnvonnxparser.so.10 resolution",
+        "libcudart.so.12 resolution",
+        "TensorRT ABI",
+    }
+    if args.profile in {"heyuan", "trna"} or (
+        ros_prefix / "lib/librmw_fastrtps_cpp.so"
+    ).exists():
+        core_qualification_checks.add("ROS2 RMW")
+    if args.pico_python or args.pico_wheel:
+        core_qualification_checks.update(
+            {
+                "native PICO wheel artifact",
+                "native PICO Python isolation",
+                "native PICO SDK wheel installation",
+                "native PICO Python API",
+                "native PICO pip check",
+            }
+        )
+    check_names = {
+        str(item.get("name")) for item in checks if isinstance(item, dict)
+    }
+    missing_qualification_checks = sorted(core_qualification_checks - check_names)
+    full_verification = not (
+        args.fast or args.skip_dynamic or args.skip_installed_assets
+    )
+    qualification_eligible = (
+        full_verification
+        and args.require_git_sonic
+        and checkout_root is not None
+        and not missing_qualification_checks
+        and all(item["ok"] for item in checks)
+    )
     payload = {
         "lock": str(args.lock.resolve()),
         "lock_sha256": sha256_file(args.lock.resolve()),
@@ -1458,7 +2765,62 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
         "matrix_root": str(matrix_root),
         "runtime_root": str(runtime_root),
         "sonic_root": str(sonic_root),
+        "launch_roots": {
+            "inference": str((runtime_root / "inference").resolve()),
+            "visual_urdf": str((runtime_root / "g1-visual/g1_29dof.urdf").resolve()),
+            "unitree_sdk2": str(
+                (
+                    sonic_root
+                    / "gear_sonic_deploy/thirdparty/unitree_sdk2"
+                ).resolve()
+            ),
+            "canonical_model": str(
+                (
+                    sonic_root
+                    / "gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml"
+                ).resolve()
+            ),
+            "canonical_meshes": str(
+                (
+                    sonic_root
+                    / "gear_sonic/data/robot_model/model_data/g1/meshes"
+                ).resolve()
+            ),
+            "native_deps": str(native_deps_root),
+            "ros_prefix": str(ros_prefix),
+            "cuda": str(cuda_root),
+        },
+        "launch_environment": {
+            "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+            "pythonpath": os.environ.get("PYTHONPATH", ""),
+            "tensorrt_root": os.environ.get("TensorRT_ROOT", ""),
+            "python_pycache_prefix": os.environ.get("PYTHONPYCACHEPREFIX", ""),
+            "python_dont_write_bytecode": os.environ.get(
+                "PYTHONDONTWRITEBYTECODE", ""
+            ),
+        },
         "profile": args.profile,
+        "python": str(Path(python_executable).absolute()) if python_executable else None,
+        "python_prefix": (
+            str(Path(identity_prefix_value).absolute())
+            if isinstance(identity_prefix_value, str) and identity_prefix_value
+            else None
+        ),
+        "pico_python": (
+            str(Path(args.pico_python).expanduser().absolute())
+            if args.pico_python
+            else None
+        ),
+        "pico_wheel": (
+            str(args.pico_wheel.expanduser().resolve()) if args.pico_wheel else None
+        ),
+        "full_hashes": full_verification,
+        "sonic_git_checkout": checkout_root is not None,
+        "verification_flags": verification_flags,
+        "verification_inventory": verification_inventory,
+        "qualification_required_checks": sorted(core_qualification_checks),
+        "missing_qualification_checks": missing_qualification_checks,
+        "qualification_eligible": qualification_eligible,
         "passed": all(item["ok"] for item in checks),
         "checks": checks,
     }
