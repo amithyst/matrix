@@ -134,7 +134,8 @@ configuration files on exit.
 - Heyuan uses GPU0 and CPU set `0-63,128-191`, the NUMA node local to that GPU.
 - TRNA does not apply a CPU set by default.
 - ZZA uses GPU0, X11 display `:1`, and its single 24-core NUMA node without an
-  explicit CPU set. Its ROS2 RMW closure is isolated in the runtime bundle.
+  explicit CPU set. Its ROS2 RMW closure is isolated in the runtime bundle;
+  `MATRIX_CUDA_ROOT` points at its user-managed CUDA 12 runtime.
 - Override a value in `.matrix/local.env`; do not edit the tracked host profile
   for a one-off experiment.
 

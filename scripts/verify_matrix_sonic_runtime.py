@@ -81,6 +81,7 @@ def library_paths(runtime_root: Path, matrix_root: Path) -> list[Path]:
     gear = runtime_root / "GR00T-WholeBodyControl"
     native = runtime_root / "matrix-native-deps"
     ros = runtime_root / "ros2-humble-prefix"
+    cuda = Path(os.environ.get("MATRIX_CUDA_ROOT", "/usr/local/cuda"))
     candidates = [
         runtime_root / "inference/TensorRT/lib",
         runtime_root / "inference/onnxruntime/lib",
@@ -91,7 +92,8 @@ def library_paths(runtime_root: Path, matrix_root: Path) -> list[Path]:
         ros / "lib",
         matrix_root / "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",
         matrix_root / "src/UeSim/Linux/Engine/Binaries/Linux",
-        Path("/usr/local/cuda/lib64"),
+        cuda / "lib64",
+        cuda / "lib",
     ]
     return [path for path in candidates if path.is_dir()]
 
@@ -266,6 +268,33 @@ def main() -> int:
                     exact,
                     resolved or "not present in ldd output",
                 )
+
+            soname = "libcudart.so.12"
+            line = next(
+                (
+                    item.strip()
+                    for item in result.stdout.splitlines()
+                    if item.strip().startswith(f"{soname} =>")
+                ),
+                "",
+            )
+            resolved = (
+                line.split("=>", 1)[1].strip().split(" ", 1)[0]
+                if line
+                else ""
+            )
+            expected_cuda = Path(
+                os.environ.get("MATRIX_CUDA_ROOT", "/usr/local/cuda")
+            ).resolve()
+            try:
+                exact = Path(resolved).resolve().is_relative_to(expected_cuda)
+            except (OSError, RuntimeError):
+                exact = False
+            record(
+                f"{soname} resolution",
+                exact,
+                resolved or "not present in ldd output",
+            )
 
         bridge = roots["bridge"] / "g1_sonic_sim_udp_dds_bridge_accepted"
         if bridge.is_file():

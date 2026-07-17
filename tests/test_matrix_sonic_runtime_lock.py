@@ -73,6 +73,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         zza = (REPO_ROOT / "config/hosts/zza.env").read_text(encoding="utf-8")
         self.assertIn('DISPLAY="${DISPLAY:-:1}"', zza)
         self.assertIn("MATRIX_RUNTIME_ROOT/ros2-humble-prefix", zza)
+        self.assertIn("MATRIX_CUDA_ROOT", zza)
         self.assertIn('PATH="$MATRIX_TOOLS_ROOT/bin:$PATH"', zza)
 
     def test_release_installs_do_not_dirty_the_checkout(self) -> None:
@@ -96,6 +97,13 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn(".matrix-sonic-launch.lock", text)
         self.assertIn("MATRIX_CPUSET_APPLIED", text)
         self.assertIn("/usr/bin/env MATRIX_CPUSET_APPLIED=1", text)
+        self.assertIn('prepend_library_dir "$MATRIX_CUDA_ROOT/lib"', text)
+
+        verifier = (
+            REPO_ROOT / "scripts/verify_matrix_sonic_runtime.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('soname = "libcudart.so.12"', verifier)
+        self.assertIn('os.environ.get("MATRIX_CUDA_ROOT", "/usr/local/cuda")', verifier)
 
         run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(encoding="utf-8")
         self.assertIn('case "${MATRIX_SONIC,,}"', run_sim)

@@ -156,7 +156,9 @@ prepend_library_dir() {
 }
 
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
-prepend_library_dir "/usr/local/cuda/lib64"
+MATRIX_CUDA_ROOT="${MATRIX_CUDA_ROOT:-/usr/local/cuda}"
+prepend_library_dir "$MATRIX_CUDA_ROOT/lib64"
+prepend_library_dir "$MATRIX_CUDA_ROOT/lib"
 prepend_library_dir "$PROJECT_ROOT/src/UeSim/Linux/Engine/Binaries/Linux"
 prepend_library_dir "$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux"
 if [[ -n "${MATRIX_ROS_PREFIX:-}" ]]; then
