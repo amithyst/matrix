@@ -76,6 +76,29 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
 
+    def test_absolute_physics_pacing_compensates_sleep_overshoot(self) -> None:
+        with mock.patch.object(
+            MODULE.time, "perf_counter", side_effect=[9.996, 10.00025]
+        ), mock.patch.object(MODULE.time, "sleep") as sleep:
+            next_deadline = MODULE._pace_absolute_deadline(10.0, 0.005)
+
+        sleep.assert_called_once()
+        self.assertAlmostEqual(sleep.call_args.args[0], 0.004)
+        self.assertAlmostEqual(next_deadline, 10.005)
+        self.assertIn(
+            "simulator.step_once(rate_limit=False)",
+            SCRIPT_PATH.read_text(encoding="utf-8"),
+        )
+
+    def test_absolute_physics_pacing_resets_after_sustained_overrun(self) -> None:
+        with mock.patch.object(
+            MODULE.time, "perf_counter", return_value=10.011
+        ), mock.patch.object(MODULE.time, "sleep") as sleep:
+            next_deadline = MODULE._pace_absolute_deadline(10.0, 0.005)
+
+        sleep.assert_not_called()
+        self.assertAlmostEqual(next_deadline, 10.016)
+
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
         failures = MODULE._acceptance_failures(
             unstable=False,

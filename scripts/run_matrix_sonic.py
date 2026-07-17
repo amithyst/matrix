@@ -201,6 +201,24 @@ def _root_up_z(qpos) -> float:
     return 1.0 - 2.0 * (x * x + y * y)
 
 
+def _pace_absolute_deadline(deadline_s: float, period_s: float) -> float:
+    """Wait for one absolute tick and return the following tick deadline.
+
+    A relative ``sleep(period - work)`` accumulates scheduler overshoot on
+    every 5 ms SONIC step. Keeping the deadline on an absolute timeline lets
+    the following sleep compensate for that overshoot while still resetting
+    after a sustained overrun instead of emitting a catch-up burst.
+    """
+    now = time.perf_counter()
+    remaining_s = deadline_s - now
+    if remaining_s > 0.0:
+        time.sleep(remaining_s)
+        now = time.perf_counter()
+    if now - deadline_s > 2.0 * period_s:
+        return now + period_s
+    return deadline_s + period_s
+
+
 def _acceptance_failures(
     *,
     unstable: bool,
@@ -948,7 +966,8 @@ def main() -> int:
         )
 
         started_wall = time.perf_counter()
-        next_frame_wall = started_wall
+        physics_period_s = 1.0 / physics_hz
+        next_physics_wall = started_wall + physics_period_s
         next_print = started_wall
         last_print_wall = started_wall
         last_render_count = 0
@@ -998,7 +1017,9 @@ def main() -> int:
                     break
                 # Keep native DDS lowstate and MuJoCo cadence at 200 Hz instead
                 # of emitting four back-to-back steps once per 50 Hz frame.
-                next_snapshot = simulator.step_once(rate_limit=True)
+                # Matrix owns the absolute deadline because SONIC's relative
+                # per-step sleep otherwise accumulates scheduler overshoot.
+                next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
                 step_error = _snapshot_validation_error(next_snapshot, snapshot)
                 if step_error is not None:
@@ -1023,6 +1044,9 @@ def main() -> int:
                     running = False
                     termination_reason = "reset_detected"
                     break
+                next_physics_wall = _pace_absolute_deadline(
+                    next_physics_wall, physics_period_s
+                )
 
             if not running:
                 break
@@ -1143,13 +1167,6 @@ def main() -> int:
                 last_render_count = render_count
                 last_physics_steps = physics_steps
                 next_print = now + max(args.print_every, 0.1)
-
-            next_frame_wall += 1.0 / args.control_hz
-            sleep_s = next_frame_wall - time.perf_counter()
-            if sleep_s > 0.0:
-                time.sleep(sleep_s)
-            elif sleep_s < -(2.0 / args.control_hz):
-                next_frame_wall = time.perf_counter()
 
         # One final poll closes the race between the last loop poll and final
         # status publication, including the max_seconds boundary.
