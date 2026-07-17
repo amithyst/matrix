@@ -82,6 +82,8 @@ and a two-step Warehouse DDS smoke. PICO remains a separate interpreter via
 checks that wheel's filename and SHA256, the controlled `libPXREARobotSDK.so`
 overlay, the interpreter ABI/package origin, and `pip check` whenever
 `--control-source pico` is selected with a host profile.
+The locked overlay is the x86_64 library consumed by the three supported hosts;
+the unrelated Orin/aarch64 SDK artifact is not part of this runtime bundle.
 
 Matrix imports the original checkout's `gear_sonic` simulator API. Native
 `UnitreeSdk2Bridge` owns DDS `rt/lowcmd`/`rt/lowstate`; SONIC deploy is the only

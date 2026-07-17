@@ -166,11 +166,6 @@
       "sha256": "2348e1b0bf7f05cd13d95d628f04237b6b9fc50c6008b82f9bf4b046fc9373e6"
     },
     {
-      "root": "sonic",
-      "path": "external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib/aarch64/libPXREARobotSDK.so",
-      "sha256": "e50fd4d5194e545414442da59f699266433c74ee56f00f2d4f91b1871718c1d4"
-    },
-    {
       "root": "visual",
       "path": "g1_29dof.urdf",
       "sha256": "56d0c7b4e44351ee8e89e7b1f1fcc8b02d5ec5cd191e43239d2b06f039e75860"

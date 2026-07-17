@@ -80,6 +80,24 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         for legacy in ("androidtwin", "aue-sim", "g1_sonic_sim_udp_dds_bridge"):
             self.assertNotIn(legacy, serialized)
 
+        runtime_files = {
+            (entry["root"], entry["path"]): entry["sha256"]
+            for entry in self.lock["runtime_files"]
+        }
+        pico = self.lock["pico"]
+        self.assertEqual(
+            runtime_files[("sonic", pico["runtime_overlay"])],
+            pico["runtime_overlay_sha256"],
+        )
+        if self.lock["python"]["machine"] == "x86_64":
+            self.assertFalse(
+                any(
+                    "/aarch64/" in path
+                    for root, path in runtime_files
+                    if root == "sonic"
+                )
+            )
+
     def test_runtime_tree_schema_requires_safe_unique_entries(self) -> None:
         for mutation in ("empty", "duplicate", "unsafe_root", "unsafe_path", "bad_sha"):
             lock = copy.deepcopy(self.lock)
