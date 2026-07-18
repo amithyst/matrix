@@ -6,11 +6,13 @@ import os
 from pathlib import Path
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +25,15 @@ SPEC.loader.exec_module(MODULE)
 
 
 class OverlayLayoutTest(unittest.TestCase):
+    @staticmethod
+    def intersects(left, right) -> bool:
+        return bool(
+            left[0] < right[0] + right[2]
+            and right[0] < left[0] + left[2]
+            and left[1] < right[1] + right[3]
+            and right[1] < left[1] + left[3]
+        )
+
     def test_crosshair_intersects_exact_client_centre(self) -> None:
         geometry = MODULE.WindowGeometry(
             window=41,
@@ -45,16 +56,97 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertLessEqual(vertical[1], centre_y)
         self.assertGreater(vertical[1] + vertical[3], centre_y)
 
-    def test_hint_flips_above_centre_when_client_bottom_is_tight(self) -> None:
+    def test_large_panel_and_controls_stay_inside_normal_client(self) -> None:
         geometry = MODULE.WindowGeometry(
             window=1,
             x=10,
             y=20,
-            width=500,
-            height=100,
+            width=1280,
+            height=800,
         )
-        hint = MODULE.overlay_layout(geometry)["hint"]
-        self.assertLess(hint[1], geometry.centre[1])
+        layout = MODULE.overlay_layout(geometry)
+        panel = layout["panel"]
+        self.assertGreaterEqual(panel[2], 800)
+        self.assertGreaterEqual(panel[3], 560)
+        self.assertEqual(
+            (panel[0] + panel[2] // 2, panel[1] + panel[3] // 2),
+            geometry.centre,
+        )
+        for action in MODULE._PANEL_ACTIONS:
+            x, y, width, height = layout[action]
+            self.assertGreaterEqual(width, 100)
+            self.assertGreaterEqual(height, 60)
+            self.assertTrue(MODULE.point_in_rectangle((x, y), panel))
+            self.assertTrue(
+                MODULE.point_in_rectangle((x + width - 1, y + height - 1), panel)
+            )
+        for name in (
+            "profile_local",
+            "profile_remote",
+            "speed_down",
+            "speed_value",
+            "speed_up",
+            "apply_return",
+        ):
+            self.assertFalse(
+                self.intersects(layout[name], layout["crosshair_safe"]),
+                msg=f"{name} intersects the centre calibration clearance",
+            )
+
+    def test_large_desktop_panel_reaches_requested_scale(self) -> None:
+        for width, height in ((2560, 1600), (1920, 1200)):
+            layout = MODULE.overlay_layout(
+                MODULE.WindowGeometry(1, 0, 0, width, height)
+            )
+            panel = layout["panel"]
+            self.assertGreaterEqual(panel[2], 1100)
+            self.assertLessEqual(panel[2], 1200)
+            self.assertGreaterEqual(panel[3], 760)
+            self.assertLessEqual(panel[3], 800)
+
+    def test_compact_layout_is_bounded_and_too_small_client_hides_safely(self) -> None:
+        geometry = MODULE.WindowGeometry(1, 20, 30, 640, 420)
+        self.assertTrue(MODULE.overlay_supported(geometry))
+        layout = MODULE.overlay_layout(geometry)
+        panel = layout["panel"]
+        for name in MODULE._PANEL_ACTIONS + ("speed_value", "crosshair_safe"):
+            rectangle = layout[name]
+            self.assertTrue(MODULE.point_in_rectangle(rectangle[:2], panel))
+            self.assertTrue(
+                MODULE.point_in_rectangle(
+                    (
+                        rectangle[0] + rectangle[2] - 1,
+                        rectangle[1] + rectangle[3] - 1,
+                    ),
+                    panel,
+                )
+            )
+        for name in (
+            "profile_local",
+            "profile_remote",
+            "speed_down",
+            "speed_value",
+            "speed_up",
+            "apply_return",
+        ):
+            self.assertFalse(
+                self.intersects(layout[name], layout["crosshair_safe"])
+            )
+        tiny = MODULE.WindowGeometry(1, 0, 0, 479, 359)
+        self.assertFalse(MODULE.overlay_supported(tiny))
+        with self.assertRaisesRegex(ValueError, "too small"):
+            MODULE.overlay_layout(tiny)
+
+    def test_root_coordinate_hit_test_handles_offset_remote_desktop_client(self) -> None:
+        geometry = MODULE.WindowGeometry(1, -640, 120, 1600, 900)
+        layout = MODULE.overlay_layout(geometry)
+        for action in MODULE._PANEL_ACTIONS:
+            x, y, width, height = layout[action]
+            self.assertEqual(
+                MODULE.panel_action_at(layout, x + width // 2, y + height // 2),
+                action,
+            )
+        self.assertIsNone(MODULE.panel_action_at(layout, geometry.x + 3, geometry.y + 3))
 
 
 class CursorShapeTest(unittest.TestCase):
@@ -129,7 +221,159 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn(b"NEXT LAUNCH: Remote 0.50x", lines[0])
         self.assertIn(b"PENDING RESTART", lines[0])
         self.assertIn(b"base 0.120 -> effective 0.120", lines[1])
-        self.assertIn(b"F9: Apply & Restart", lines[2])
+        self.assertIn(b"Enter: RETURN TO GAME & APPLY", lines[2])
+        self.assertIn(b"F9: fallback", lines[2])
+
+    def test_panel_model_surfaces_restart_progress_and_errors(self) -> None:
+        restarting = MODULE.settings_panel_model(
+            {
+                "mouse_settings": {"pending_restart": True},
+                "restart": {"requested": True},
+            }
+        )
+        self.assertEqual(restarting.status, "restarting")
+        self.assertEqual(restarting.apply_label, "RELOADING MATRIX...")
+        failed = MODULE.settings_panel_model(
+            {
+                "mouse_settings": {
+                    "pending_restart": True,
+                    "persistence_error": "read-only config",
+                },
+                "apply_return": {"status": "error"},
+            }
+        )
+        self.assertEqual(failed.status, "error")
+        self.assertEqual(failed.error, "read-only config")
+
+        unavailable = MODULE.settings_panel_model(
+            {
+                "mouse_settings": {"pending_restart": True},
+                "restart": {"available": False, "requested": False},
+            }
+        )
+        self.assertEqual(unavailable.apply_label, "APPLY UNAVAILABLE")
+        self.assertIn("unavailable", unavailable.error)
+        self.assertFalse(unavailable.action_enabled("apply_return"))
+
+    def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
+        def model(scale: float):
+            return MODULE.settings_panel_model(
+                {
+                    "mouse_settings": {
+                        "next_launch": {
+                            "profile": "remote",
+                            "effective_scale": scale,
+                        }
+                    },
+                    "restart": {"available": True, "requested": False},
+                }
+            )
+
+        minimum = model(0.2)
+        self.assertFalse(minimum.action_enabled("speed_down"))
+        self.assertTrue(minimum.action_enabled("speed_up"))
+        maximum = model(1.0)
+        self.assertTrue(maximum.action_enabled("speed_down"))
+        self.assertFalse(maximum.action_enabled("speed_up"))
+
+    def test_font_fallbacks_match_heyuan_xlsfonts_probe(self) -> None:
+        self.assertEqual(MODULE._LARGE_FONT_CANDIDATES[0], b"12x24")
+        self.assertEqual(MODULE._BODY_FONT_CANDIDATES[:2], (b"10x20", b"9x15"))
+
+
+class PointerActionPublisherTest(unittest.TestCase):
+    def test_packets_are_bounded_ordered_and_session_bound(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish("profile_remote")
+            publisher.publish("speed_down")
+            first = json.loads(receiver.recv(1024).decode("ascii"))
+            second = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(first["session"], "known-session")
+            self.assertEqual((first["sequence"], second["sequence"]), (1, 2))
+            self.assertEqual(second["action"], "speed_down")
+            with self.assertRaisesRegex(ValueError, "unsupported"):
+                publisher.publish("restart_directly")
+        finally:
+            publisher.close()
+            receiver.close()
+
+
+class OverlayRenderCacheTest(unittest.TestCase):
+    @staticmethod
+    def state(*, scale: float = 0.5) -> dict[str, object]:
+        return {
+            "version": 1,
+            "active": True,
+            "mouse_settings": {
+                "current": {"profile": "remote", "effective_scale": 0.5},
+                "next_launch": {
+                    "profile": "remote",
+                    "effective_scale": scale,
+                },
+                "pending_restart": scale != 0.5,
+            },
+            "restart": {"available": True, "requested": False},
+        }
+
+    def make_overlay(self):
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._windows = {
+            name: index
+            for index, name in enumerate(MODULE.X11CalibrationOverlay._WINDOW_ORDER, 10)
+        }
+        overlay._visible = False
+        overlay._cursor_visible = False
+        overlay._last_layout = None
+        overlay._last_geometry = None
+        overlay._last_panel_model = None
+        overlay._last_pointer = None
+        overlay._last_raise_s = None
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        overlay._draw_panel = mock.Mock()
+        return overlay
+
+    def test_steady_30hz_frames_only_move_cursor_and_do_not_redraw(self) -> None:
+        overlay = self.make_overlay()
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        state = self.state()
+        overlay.show(geometry, (300, 300), state, now_s=10.0)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+        initial_static_moves = overlay._x11.XMoveResizeWindow.call_count
+        self.assertEqual(initial_static_moves, 8)
+
+        # Provider heartbeat-only JSON changes are intentionally absent from
+        # the validated render key.  Only the proxy cursor moves at 30 Hz.
+        heartbeat = {**state, "updated_monotonic_s": 99.0}
+        overlay.show(geometry, (301, 302), heartbeat, now_s=10.03)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+        self.assertEqual(
+            overlay._x11.XMoveResizeWindow.call_count,
+            initial_static_moves + 2,
+        )
+        raises = overlay._x11.XRaiseWindow.call_count
+        overlay.show(geometry, (301, 302), heartbeat, now_s=10.06)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+        self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
+        self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises)
+
+        # A low-frequency stack repair raises all eight windows without
+        # clearing/redrawing the 1180x736 panel.
+        overlay.show(geometry, (301, 302), heartbeat, now_s=11.1)
+        self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises + 8)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+
+        changed = self.state(scale=0.4)
+        overlay.show(geometry, (301, 302), changed, now_s=11.2)
+        self.assertEqual(overlay._draw_panel.call_count, 2)
+        self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
 
 
 class TargetCacheTest(unittest.TestCase):
@@ -226,7 +470,10 @@ class ParentDeathTest(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    all(shutil.which(command) for command in ("Xvfb", "xdotool", "xmessage", "xprop", "xwininfo")),
+    all(
+        shutil.which(command)
+        for command in ("Xvfb", "xdotool", "xev", "stdbuf", "xprop", "xwininfo")
+    ),
     "Xvfb and X11 smoke-test tools are required",
 )
 class X11IntegrationTest(unittest.TestCase):
@@ -277,14 +524,21 @@ class X11IntegrationTest(unittest.TestCase):
             "Absolute upper-left Y": "Y",
             "Width": "WIDTH",
             "Height": "HEIGHT",
+            "Border width": "BORDER",
         }
         values: dict[str, int] = {}
         for line in output.splitlines():
             label, separator, value = line.strip().partition(":")
             if separator and label in labels:
                 values[labels[label]] = int(value.strip())
-        if set(values) != {"X", "Y", "WIDTH", "HEIGHT"}:
+        if set(values) != {"X", "Y", "WIDTH", "HEIGHT", "BORDER"}:
             raise ValueError(f"incomplete client geometry: {output!r}")
+        # xwininfo's absolute origin is the outside of this window's border,
+        # whereas XTranslateCoordinates(window, root, 0, 0) returns the
+        # drawable client origin followed by the overlay implementation.
+        values["X"] += values["BORDER"]
+        values["Y"] += values["BORDER"]
+        del values["BORDER"]
         return values
 
     @classmethod
@@ -314,22 +568,39 @@ class X11IntegrationTest(unittest.TestCase):
         environment = {**os.environ, "DISPLAY": f":{display_number}"}
         target: subprocess.Popen[bytes] | None = None
         overlay: subprocess.Popen[bytes] | None = None
+        action_receiver: socket.socket | None = None
+        action_sender: socket.socket | None = None
+        target_events = bytearray()
         try:
             target = subprocess.Popen(
                 [
-                    "xmessage",
-                    "-title",
+                    "stdbuf",
+                    "-oL",
+                    "xev",
+                    "-name",
                     "MatrixSmoke",
-                    "-borderwidth",
-                    "0",
                     "-geometry",
                     "800x600+100+80",
-                    "target",
+                    "-event",
+                    "button",
                 ],
                 env=environment,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
+            assert target.stdout is not None
+            os.set_blocking(target.stdout.fileno(), False)
+
+            def read_target_events() -> bytes:
+                while True:
+                    try:
+                        chunk = os.read(target.stdout.fileno(), 65536)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    target_events.extend(chunk)
+                return bytes(target_events)
             target_window = self.wait_until(
                 lambda: self.run_x11(
                     environment, "xdotool", "search", "--name", "^MatrixSmoke$"
@@ -353,7 +624,23 @@ class X11IntegrationTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 state = Path(temporary) / "state.json"
                 status = Path(temporary) / "status.json"
-                MODULE.atomic_json(state, {"version": 1, "active": True})
+                MODULE.atomic_json(
+                    state,
+                    {
+                        "version": 1,
+                        "active": True,
+                        "mouse_settings": {
+                            "current": {"profile": "local", "effective_scale": 1.0},
+                            "next_launch": {"profile": "local", "effective_scale": 1.0},
+                            "pending_restart": False,
+                        },
+                        "restart": {"available": True, "requested": False},
+                    },
+                )
+                action_receiver, action_sender = socket.socketpair(
+                    socket.AF_UNIX, socket.SOCK_SEQPACKET
+                )
+                action_receiver.setblocking(False)
                 overlay = subprocess.Popen(
                     [
                         sys.executable,
@@ -366,6 +653,10 @@ class X11IntegrationTest(unittest.TestCase):
                         str(target.pid),
                         "--expected-parent-pid",
                         str(os.getpid()),
+                        "--action-fd",
+                        str(action_sender.fileno()),
+                        "--action-session",
+                        "xvfb-test-session",
                         "--display",
                         environment["DISPLAY"],
                         "--poll-hz",
@@ -374,10 +665,21 @@ class X11IntegrationTest(unittest.TestCase):
                     env=environment,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
+                    pass_fds=(action_sender.fileno(),),
                 )
-                self.wait_until(
+                action_sender.close()
+                action_sender = None
+                ready_status = self.wait_until(
                     lambda: status.is_file()
-                    and json.loads(status.read_text(encoding="utf-8")).get("ready") is True
+                    and (
+                        value := json.loads(status.read_text(encoding="utf-8"))
+                    ).get("ready")
+                    is True
+                    and value
+                )
+                self.assertIn(
+                    ready_status["fonts"]["large"],
+                    [name.decode("ascii") for name in MODULE._LARGE_FONT_CANDIDATES],
                 )
                 horizontal = self.wait_until(
                     lambda: self.run_x11(
@@ -390,10 +692,11 @@ class X11IntegrationTest(unittest.TestCase):
                 )
                 overlay_windows = {"horizontal": int(horizontal)}
                 for role in (
+                    "shield",
+                    "panel",
                     "horizontal-shadow",
                     "vertical-shadow",
                     "vertical",
-                    "hint",
                     "cursor-shadow",
                     "cursor",
                 ):
@@ -433,6 +736,144 @@ class X11IntegrationTest(unittest.TestCase):
                 focus_after = self.run_x11(environment, "xdotool", "getwindowfocus").strip()
                 self.assertEqual(focus_after, focus_before)
 
+                layout = MODULE.overlay_layout(
+                    MODULE.WindowGeometry(
+                        int(target_window),
+                        target_geometry["X"],
+                        target_geometry["Y"],
+                        target_geometry["WIDTH"],
+                        target_geometry["HEIGHT"],
+                    )
+                )
+                remote_button = layout["profile_remote"]
+                remote_point = (
+                    remote_button[0] + remote_button[2] // 2,
+                    remote_button[1] + remote_button[3] // 2,
+                )
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(remote_point[0]),
+                    str(remote_point[1]),
+                    "click",
+                    "1",
+                )
+
+                def pointer_action():
+                    try:
+                        return json.loads(action_receiver.recv(1024).decode("ascii"))
+                    except BlockingIOError:
+                        return None
+
+                action = self.wait_until(pointer_action)
+                self.assertEqual(action["session"], "xvfb-test-session")
+                self.assertEqual(action["action"], "profile_remote")
+                focus_after_click = self.run_x11(
+                    environment, "xdotool", "getwindowfocus"
+                ).strip()
+                self.assertEqual(focus_after_click, focus_before)
+                time.sleep(0.08)
+                self.assertNotIn(b"ButtonPress event", read_target_events())
+
+                def assert_no_pointer_action() -> None:
+                    assert action_receiver is not None
+                    with self.assertRaises(BlockingIOError):
+                        action_receiver.recv(1024)
+
+                # A non-button part of the visible panel consumes the click but
+                # emits no provider action and never reaches the UE target.
+                panel = layout["panel"]
+                panel_blank = (panel[0] + 8, panel[1] + 8)
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(panel_blank[0]),
+                    str(panel_blank[1]),
+                    "click",
+                    "1",
+                )
+                time.sleep(0.08)
+                self.assertEqual(
+                    self.pointer_location(environment)["WINDOW"],
+                    overlay_windows["panel"],
+                )
+                assert_no_pointer_action()
+                self.assertNotIn(b"ButtonPress event", read_target_events())
+
+                # The transparent modal shield outside the panel also consumes
+                # ButtonPress/Release instead of leaking them into the target.
+                shield_blank = (
+                    target_geometry["X"] + 3,
+                    target_geometry["Y"] + 3,
+                )
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(shield_blank[0]),
+                    str(shield_blank[1]),
+                    "click",
+                    "1",
+                )
+                time.sleep(0.08)
+                self.assertEqual(
+                    self.pointer_location(environment)["WINDOW"],
+                    overlay_windows["shield"],
+                )
+                assert_no_pointer_action()
+                self.assertNotIn(b"ButtonPress event", read_target_events())
+                self.assertEqual(
+                    self.run_x11(
+                        environment, "xdotool", "getwindowfocus"
+                    ).strip(),
+                    focus_before,
+                )
+
+                # Every crosshair layer has an empty XFixes InputShape.  Moving
+                # onto each mapped rectangle still resolves pointer input to
+                # the interactive panel underneath, never to a visual window.
+                click_through_roles = (
+                    "horizontal-shadow",
+                    "vertical-shadow",
+                    "horizontal",
+                    "vertical",
+                )
+                for role in click_through_roles:
+                    rectangle = self.geometry(
+                        environment, str(overlay_windows[role])
+                    )
+                    point = (
+                        rectangle["X"] + rectangle["WIDTH"] // 2,
+                        rectangle["Y"] + rectangle["HEIGHT"] // 2,
+                    )
+                    self.run_x11(
+                        environment,
+                        "xdotool",
+                        "mousemove",
+                        str(point[0]),
+                        str(point[1]),
+                    )
+                    self.wait_until(
+                        lambda point=point: (
+                            pointer
+                            if (
+                                (pointer := self.pointer_location(environment))["X"],
+                                pointer["Y"],
+                            )
+                            == point
+                            else None
+                        )
+                    )
+                    self.assertNotIn(
+                        self.pointer_location(environment)["WINDOW"],
+                        {overlay_windows[name] for name in click_through_roles},
+                    )
+
                 centre_x = target_geometry["X"] + target_geometry["WIDTH"] // 2
                 centre_y = target_geometry["Y"] + target_geometry["HEIGHT"] // 2
                 expected_pointer = (centre_x + 113, centre_y + 71)
@@ -460,7 +901,17 @@ class X11IntegrationTest(unittest.TestCase):
                     return None
 
                 pointer = self.wait_until(cursor_follows_hotspot)
-                self.assertNotIn(pointer["WINDOW"], set(overlay_windows.values()))
+                self.assertNotIn(
+                    pointer["WINDOW"],
+                    {
+                        overlay_windows["horizontal"],
+                        overlay_windows["horizontal-shadow"],
+                        overlay_windows["vertical"],
+                        overlay_windows["vertical-shadow"],
+                        overlay_windows["cursor"],
+                        overlay_windows["cursor-shadow"],
+                    },
+                )
                 focus_after_pointer = self.run_x11(
                     environment, "xdotool", "getwindowfocus"
                 ).strip()
@@ -487,6 +938,7 @@ class X11IntegrationTest(unittest.TestCase):
                 MODULE.atomic_json(state, {"version": 1, "active": False})
 
                 def all_are_unmapped():
+                    self.assertEqual(len(overlay_windows), 8)
                     return all(
                         "Map State: IsUnMapped"
                         in self.run_x11(
@@ -496,7 +948,24 @@ class X11IntegrationTest(unittest.TestCase):
                     )
 
                 self.wait_until(all_are_unmapped)
+                hidden_target = self.client_geometry(environment, target_window)
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(hidden_target["X"] + hidden_target["WIDTH"] // 2),
+                    str(hidden_target["Y"] + hidden_target["HEIGHT"] // 2),
+                    "click",
+                    "1",
+                )
+                self.wait_until(
+                    lambda: b"ButtonPress event" in read_target_events()
+                )
         finally:
+            for connection in (action_receiver, action_sender):
+                if connection is not None:
+                    connection.close()
             for process in (overlay, target):
                 if process is not None and process.poll() is None:
                     process.terminate()
@@ -507,6 +976,8 @@ class X11IntegrationTest(unittest.TestCase):
                         process.wait(timeout=2.0)
             if overlay is not None and overlay.stderr is not None:
                 overlay.stderr.close()
+            if target is not None and target.stdout is not None:
+                target.stdout.close()
             if xvfb.poll() is None:
                 xvfb.terminate()
                 try:

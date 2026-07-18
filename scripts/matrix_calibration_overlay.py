@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Show a supervised, click-through X11 calibration overlay above Matrix UE.
+"""Show a supervised, MC-style X11 settings overlay above Matrix UE.
 
 The cooked Matrix build has no project sources with which to add a native UMG
-pause widget.  This process therefore renders four tiny crosshair bars, one
-hint window, and a shaped visible proxy for UE's hidden cursor directly on X11.
-Every overlay window is override-redirect and has an empty XFixes input shape:
-it neither takes keyboard focus nor receives mouse clicks.  The windows follow
-the mapped UE client carrying ``_NET_WM_PID``.
+pause widget.  This process therefore renders a large pointer-driven panel, a
+modal InputOnly shield, four click-through crosshair bars, and a shaped visible
+proxy for UE's hidden cursor directly on X11.  The override-redirect controls do
+not take keyboard focus.  The child can publish bounded pointer *intents* over
+an inherited socket, while the provider remains the sole owner of persistence,
+the neutral-frame gate, calibration state, and restart authority.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import socket
 import tempfile
 import time
 from typing import Any, Callable
@@ -27,11 +29,21 @@ from typing import Any, Callable
 
 _IS_VIEWABLE = 2
 _CW_OVERRIDE_REDIRECT = 1 << 9
+_CW_EVENT_MASK = 1 << 11
 _SHAPE_BOUNDING = 0
 _SHAPE_INPUT = 2
+_INPUT_ONLY = 2
+_BUTTON_PRESS = 4
+_BUTTON_RELEASE = 5
+_BUTTON_PRESS_MASK = 1 << 2
+_BUTTON_RELEASE_MASK = 1 << 3
 _PR_SET_PDEATHSIG = 1
 _CURSOR_WIDTH = 20
 _CURSOR_HEIGHT = 28
+_MIN_CLIENT_WIDTH = 480
+_MIN_CLIENT_HEIGHT = 360
+_BODY_FONT_CANDIDATES = (b"10x20", b"9x15", b"fixed")
+_LARGE_FONT_CANDIDATES = (b"12x24", b"10x20", b"fixed")
 
 
 class XWindowAttributes(ctypes.Structure):
@@ -102,6 +114,39 @@ class XRectangle(ctypes.Structure):
     ]
 
 
+class XButtonEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("button", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("xbutton", XButtonEvent),
+        ("padding", ctypes.c_long * 24),
+    ]
+
+
+class XFontStruct(ctypes.Structure):
+    # Only the leading fields are accessed; Xlib owns the full allocation.
+    _fields_ = [("ext_data", ctypes.c_void_p), ("fid", ctypes.c_ulong)]
+
+
 @dataclass(frozen=True)
 class WindowGeometry:
     window: int
@@ -156,23 +201,118 @@ _CURSOR_FOREGROUND_RECTANGLES = polygon_scanline_rectangles(
 )
 
 
-def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, int]]:
-    """Return screen-space rectangles whose bars intersect the exact centre."""
+def overlay_supported(geometry: WindowGeometry) -> bool:
+    """Small clients fail safely instead of presenting overlapping controls."""
 
+    return bool(
+        geometry.width >= _MIN_CLIENT_WIDTH
+        and geometry.height >= _MIN_CLIENT_HEIGHT
+    )
+
+
+def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, int]]:
+    """Return root-coordinate geometry for the panel and generous controls."""
+
+    if not overlay_supported(geometry):
+        raise ValueError("Matrix client is too small for the safe settings panel")
     centre_x, centre_y = geometry.centre
-    hint_width = min(900, max(240, geometry.width - 32))
-    hint_height = 70
-    hint_x = centre_x - hint_width // 2
-    hint_y = centre_y + 48
-    if hint_y + hint_height > geometry.y + geometry.height:
-        hint_y = centre_y - 48 - hint_height
+    compact = geometry.width < 900 or geometry.height < 650
+    outer_margin = 16 if compact else 32
+    panel_width = min(1180, geometry.width - 2 * outer_margin)
+    panel_height = min(790, geometry.height - 2 * outer_margin)
+    panel_x = centre_x - panel_width // 2
+    panel_y = centre_y - panel_height // 2
+    margin = max(18, min(64, panel_width // 18))
+    gap = max(10, min(28, panel_width // 36))
+    button_height = max(
+        36,
+        min(52 if compact else 76, panel_height // 8),
+    )
+    safe_half_size = 50
+    speed_y = panel_y + panel_height // 2 - safe_half_size - button_height
+    profile_y = speed_y - gap - button_height
+    profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
+    speed_width = max(48, min(132, (panel_width - 2 * margin) // 4))
+    apply_height = max(42, min(80, button_height + 6))
+    footer_space = 30 if compact else 42
+    apply_y = panel_y + panel_height - footer_space - apply_height
+    speed_value = (
+        panel_x + margin + speed_width,
+        speed_y,
+        panel_width - 2 * margin - 2 * speed_width,
+        button_height,
+    )
     return {
+        "shield": (geometry.x, geometry.y, geometry.width, geometry.height),
+        "panel": (panel_x, panel_y, panel_width, panel_height),
         "horizontal-shadow": (centre_x - 34, centre_y - 3, 69, 7),
         "vertical-shadow": (centre_x - 3, centre_y - 34, 7, 69),
         "horizontal": (centre_x - 32, centre_y - 1, 65, 3),
         "vertical": (centre_x - 1, centre_y - 32, 3, 65),
-        "hint": (hint_x, hint_y, hint_width, hint_height),
+        "profile_local": (
+            panel_x + margin,
+            profile_y,
+            profile_width,
+            button_height,
+        ),
+        "profile_remote": (
+            panel_x + margin + profile_width + gap,
+            profile_y,
+            profile_width,
+            button_height,
+        ),
+        "speed_down": (panel_x + margin, speed_y, speed_width, button_height),
+        "speed_value": speed_value,
+        "speed_up": (
+            panel_x + panel_width - margin - speed_width,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "apply_return": (
+            panel_x + margin,
+            apply_y,
+            max(1, panel_width - 2 * margin),
+            apply_height,
+        ),
+        "crosshair_safe": (
+            centre_x - safe_half_size,
+            centre_y - safe_half_size,
+            safe_half_size * 2,
+            safe_half_size * 2,
+        ),
     }
+
+
+_PANEL_ACTIONS = (
+    "profile_local",
+    "profile_remote",
+    "speed_down",
+    "speed_up",
+    "apply_return",
+)
+
+
+def point_in_rectangle(
+    point: tuple[int, int], rectangle: tuple[int, int, int, int]
+) -> bool:
+    x, y = point
+    left, top, width, height = rectangle
+    return left <= x < left + width and top <= y < top + height
+
+
+def panel_action_at(
+    layout: dict[str, tuple[int, int, int, int]],
+    root_x: int,
+    root_y: int,
+) -> str | None:
+    """Hit-test X11 root coordinates, including remote-desktop absolute input."""
+
+    for action in _PANEL_ACTIONS:
+        rectangle = layout.get(action)
+        if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
+            return action
+    return None
 
 
 def read_active_state(path: Path) -> bool:
@@ -199,8 +339,56 @@ def read_overlay_state(path: Path) -> dict[str, object] | None:
     return value
 
 
-def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
-    """Render only validated state supplied by the supervised provider."""
+@dataclass(frozen=True)
+class SettingsPanelModel:
+    current_profile: str
+    current_scale: float
+    next_profile: str
+    next_scale: float
+    pending_restart: bool
+    restart_available: bool
+    restart_requested: bool
+    base_mirror_gain: float
+    effective_mirror_gain: float
+    status: str
+    error: str | None
+
+    @property
+    def apply_label(self) -> str:
+        if self.restart_requested or self.status == "restarting":
+            return "RELOADING MATRIX..."
+        if self.pending_restart and not self.restart_available:
+            return "APPLY UNAVAILABLE"
+        if self.pending_restart:
+            return "RETURN TO GAME & APPLY"
+        return "RETURN TO GAME"
+
+    def action_enabled(self, action: str) -> bool:
+        controls_disabled = self.restart_requested or self.status == "restarting"
+        if action in {"profile_local", "profile_remote"}:
+            return not controls_disabled
+        if action == "speed_down":
+            return bool(
+                not controls_disabled
+                and self.next_profile == "Remote"
+                and self.next_scale > 0.2
+            )
+        if action == "speed_up":
+            return bool(
+                not controls_disabled
+                and self.next_profile == "Remote"
+                and self.next_scale < 1.0
+            )
+        if action == "apply_return":
+            return bool(
+                not controls_disabled
+                and (not self.pending_restart or self.restart_available)
+            )
+        return False
+
+
+def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
+    """Validate untrusted JSON state before it reaches any drawing primitive."""
 
     settings = state.get("mouse_settings")
     settings = settings if isinstance(settings, dict) else {}
@@ -212,6 +400,8 @@ def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
     restart = restart if isinstance(restart, dict) else {}
     mirror = state.get("mirror_sensitivity")
     mirror = mirror if isinstance(mirror, dict) else {}
+    apply_return = state.get("apply_return")
+    apply_return = apply_return if isinstance(apply_return, dict) else {}
 
     def profile(value: object) -> str:
         return "Remote" if value == "remote" else "Local"
@@ -222,33 +412,65 @@ def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
         number = float(value)
         return number if math.isfinite(number) else fallback
 
-    current_scale = finite(current.get("effective_scale"), 1.0)
-    next_scale = finite(next_launch.get("effective_scale"), 1.0)
+    current_scale = max(0.2, min(1.0, finite(current.get("effective_scale"), 1.0)))
+    next_scale = max(0.2, min(1.0, finite(next_launch.get("effective_scale"), 1.0)))
     pending = settings.get("pending_restart") is True
     requested = restart.get("requested") is True
     restart_available = restart.get("available") is True
     persistence_error = settings.get("persistence_error")
-    line1 = (
-        f"CURRENT APPLIED (SDL): {profile(current.get('profile'))} "
-        f"{current_scale:.2f}x | "
-        f"NEXT LAUNCH: {profile(next_launch.get('profile'))} {next_scale:.2f}x | "
-        f"{'PENDING RESTART' if pending else 'CURRENT'}"
+    restart_error = restart.get("error")
+    action_error = apply_return.get("error")
+    error_value = next(
+        (
+            value
+            for value in (persistence_error, restart_error, action_error)
+            if isinstance(value, str) and value
+        ),
+        None,
     )
-    base = finite(mirror.get("base_deg_per_px"), 0.0)
-    effective = finite(mirror.get("effective_deg_per_px"), 0.0)
-    line2 = (
-        f"x11 mirror: base {base:.3f} -> effective {effective:.3f} deg/px | "
-        f"{'SAVE ERROR' if persistence_error else 'SAVED'}"
-    )
+    if pending and not requested and not restart_available and error_value is None:
+        error_value = "whole-runtime reload is unavailable"
+    action_status = apply_return.get("status")
+    status = action_status if isinstance(action_status, str) else "idle"
     if requested:
-        action = "RESTART REQUESTED - keep controls released"
-    elif pending and restart_available and not persistence_error:
-        action = "F9: Apply & Restart"
-    else:
-        action = "F9: unavailable"
+        status = "restarting"
+    elif error_value is not None:
+        status = "error"
+    elif status not in {"waiting_neutral", "returning", "restarting", "error"}:
+        status = "pending" if pending else "ready"
+    return SettingsPanelModel(
+        current_profile=profile(current.get("profile")),
+        current_scale=current_scale,
+        next_profile=profile(next_launch.get("profile")),
+        next_scale=next_scale,
+        pending_restart=pending,
+        restart_available=restart_available,
+        restart_requested=requested,
+        base_mirror_gain=finite(mirror.get("base_deg_per_px"), 0.0),
+        effective_mirror_gain=finite(mirror.get("effective_deg_per_px"), 0.0),
+        status=status,
+        error=error_value,
+    )
+
+
+def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
+    """Keep a compact textual representation for logs and unit diagnostics."""
+
+    model = settings_panel_model(state)
+    line1 = (
+        f"CURRENT APPLIED (SDL): {model.current_profile} "
+        f"{model.current_scale:.2f}x | "
+        f"NEXT LAUNCH: {model.next_profile} {model.next_scale:.2f}x | "
+        f"{'PENDING RESTART' if model.pending_restart else 'CURRENT'}"
+    )
+    line2 = (
+        f"x11 mirror: base {model.base_mirror_gain:.3f} -> effective "
+        f"{model.effective_mirror_gain:.3f} deg/px | "
+        f"{'ERROR' if model.error else 'SAVED'}"
+    )
     line3 = (
-        f"M: Local/Remote  -/+: next speed  {action} | "
-        "F10: center  F12: MouseLock  ESC: return"
+        f"Click or M/-/+ to configure | Enter: {model.apply_label} | "
+        "F9: fallback  F10/F12: MouseLock  ESC: return"
     )
     encoded = tuple(
         line.encode("ascii", errors="replace")
@@ -270,6 +492,44 @@ def atomic_json(path: Path, payload: dict[str, object]) -> None:
         stream.write("\n")
         temporary = Path(stream.name)
     os.replace(temporary, path)
+
+
+class PointerActionPublisher:
+    """Publish one bounded JSON packet per completed pointer click."""
+
+    def __init__(self, *, file_descriptor: int, session: str) -> None:
+        if file_descriptor < 0:
+            raise ValueError("action file descriptor must be non-negative")
+        if not session or len(session) > 128:
+            raise ValueError("action session must be non-empty and bounded")
+        self._socket = socket.socket(fileno=file_descriptor)
+        self._socket.setblocking(False)
+        self._session = session
+        self._sequence = 0
+
+    def publish(self, action: str) -> None:
+        if action not in _PANEL_ACTIONS:
+            raise ValueError(f"unsupported pointer action: {action}")
+        self._sequence += 1
+        payload = json.dumps(
+            {
+                "version": 1,
+                "session": self._session,
+                "sequence": self._sequence,
+                "action": action,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        if len(payload) >= 1024:
+            raise RuntimeError("pointer action packet is oversized")
+        try:
+            self._socket.send(payload)
+        except BlockingIOError as exc:
+            raise RuntimeError("pointer action channel is full") from exc
+
+    def close(self) -> None:
+        self._socket.close()
 
 
 def arm_parent_death_signal(expected_parent_pid: int) -> None:
@@ -301,15 +561,17 @@ def arm_parent_death_signal(expected_parent_pid: int) -> None:
 class X11CalibrationOverlay:
     """Raw Xlib/XFixes overlay with no Python GUI-package dependency."""
 
-    _STATIC_WINDOW_ORDER = (
+    _RAISE_INTERVAL_S = 1.0
+
+    _VISUAL_WINDOW_ORDER = (
+        "panel",
         "horizontal-shadow",
         "vertical-shadow",
         "horizontal",
         "vertical",
-        "hint",
     )
     _CURSOR_WINDOW_ORDER = ("cursor-shadow", "cursor")
-    _WINDOW_ORDER = _STATIC_WINDOW_ORDER + _CURSOR_WINDOW_ORDER
+    _WINDOW_ORDER = ("shield",) + _VISUAL_WINDOW_ORDER + _CURSOR_WINDOW_ORDER
 
     def __init__(
         self,
@@ -355,10 +617,21 @@ class X11CalibrationOverlay:
             raise RuntimeError("XFixes extension is unavailable")
         self.expected_ue_pid = expected_ue_pid
         self._windows: dict[str, int] = {}
-        self._hint_gc: int | None = None
+        self._panel_gc: int | None = None
+        self._body_font: ctypes.POINTER(XFontStruct) | None = None
+        self._large_font: ctypes.POINTER(XFontStruct) | None = None
+        self._body_font_name: str | None = None
+        self._large_font_name: str | None = None
+        self._colours: dict[str, int] = {}
         self._visible = False
         self._cursor_visible = False
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
+        self._last_geometry: WindowGeometry | None = None
+        self._last_panel_model: SettingsPanelModel | None = None
+        self._last_pointer: tuple[int, int] | None = None
+        self._last_raise_s: float | None = None
+        self._pressed_action: str | None = None
+        self._pressed_window: int | None = None
         self._target_window: int | None = None
         self._create_windows()
 
@@ -457,6 +730,23 @@ class X11CalibrationOverlay:
                 ],
                 ctypes.c_ulong,
             ),
+            "XCreateWindow": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.POINTER(XSetWindowAttributes),
+                ],
+                ctypes.c_ulong,
+            ),
             "XChangeWindowAttributes": (
                 [
                     ctypes.c_void_p,
@@ -464,6 +754,10 @@ class X11CalibrationOverlay:
                     ctypes.c_ulong,
                     ctypes.POINTER(XSetWindowAttributes),
                 ],
+                ctypes.c_int,
+            ),
+            "XSelectInput": (
+                [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long],
                 ctypes.c_int,
             ),
             "XStoreName": (
@@ -476,6 +770,22 @@ class X11CalibrationOverlay:
             ),
             "XSetForeground": (
                 [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
+            "XSetFont": (
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
+            "XLoadQueryFont": (
+                [ctypes.c_void_p, ctypes.c_char_p],
+                ctypes.POINTER(XFontStruct),
+            ),
+            "XFreeFont": (
+                [ctypes.c_void_p, ctypes.POINTER(XFontStruct)],
+                ctypes.c_int,
+            ),
+            "XTextWidth": (
+                [ctypes.POINTER(XFontStruct), ctypes.c_char_p, ctypes.c_int],
                 ctypes.c_int,
             ),
             "XMoveResizeWindow": (
@@ -493,6 +803,30 @@ class X11CalibrationOverlay:
             "XRaiseWindow": ([ctypes.c_void_p, ctypes.c_ulong], ctypes.c_int),
             "XUnmapWindow": ([ctypes.c_void_p, ctypes.c_ulong], ctypes.c_int),
             "XClearWindow": ([ctypes.c_void_p, ctypes.c_ulong], ctypes.c_int),
+            "XFillRectangle": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                ],
+                ctypes.c_int,
+            ),
+            "XDrawRectangle": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                ],
+                ctypes.c_int,
+            ),
             "XDrawString": (
                 [
                     ctypes.c_void_p,
@@ -503,6 +837,11 @@ class X11CalibrationOverlay:
                     ctypes.c_char_p,
                     ctypes.c_int,
                 ],
+                ctypes.c_int,
+            ),
+            "XPending": ([ctypes.c_void_p], ctypes.c_int),
+            "XNextEvent": (
+                [ctypes.c_void_p, ctypes.POINTER(XEvent)],
                 ctypes.c_int,
             ),
             "XFlush": ([ctypes.c_void_p], ctypes.c_int),
@@ -588,6 +927,22 @@ class X11CalibrationOverlay:
         finally:
             self._xfixes.XFixesDestroyRegion(self._display, empty)
 
+    def _make_interactive(self, window: int) -> None:
+        attributes = XSetWindowAttributes()
+        attributes.override_redirect = 1
+        attributes.event_mask = _BUTTON_PRESS_MASK | _BUTTON_RELEASE_MASK
+        self._x11.XChangeWindowAttributes(
+            self._display,
+            window,
+            _CW_OVERRIDE_REDIRECT | _CW_EVENT_MASK,
+            ctypes.byref(attributes),
+        )
+        self._x11.XSelectInput(
+            self._display,
+            window,
+            _BUTTON_PRESS_MASK | _BUTTON_RELEASE_MASK,
+        )
+
     def _set_bounding_shape(
         self,
         window: int,
@@ -619,14 +974,26 @@ class X11CalibrationOverlay:
         black = int(self._x11.XBlackPixel(self._display, self._screen))
         white = int(self._x11.XWhitePixel(self._display, self._screen))
         accent = self._named_colour(b"#ff3158", white)
+        panel_background = self._named_colour(b"#151a24", black)
         colours = {
+            "panel": panel_background,
             "horizontal-shadow": black,
             "vertical-shadow": black,
             "horizontal": accent,
             "vertical": accent,
-            "hint": black,
             "cursor-shadow": black,
             "cursor": white,
+        }
+        self._colours = {
+            "white": white,
+            "muted": self._named_colour(b"#aeb8ca", white),
+            "button": self._named_colour(b"#293345", white),
+            "selected": self._named_colour(b"#3975e8", white),
+            "disabled": self._named_colour(b"#343946", white),
+            "apply": self._named_colour(b"#25845c", white),
+            "pending": self._named_colour(b"#c07a28", white),
+            "error": self._named_colour(b"#cf4655", white),
+            "outline": self._named_colour(b"#71809a", white),
         }
         try:
             for name in self._WINDOW_ORDER:
@@ -635,8 +1002,28 @@ class X11CalibrationOverlay:
                     if name in self._CURSOR_WINDOW_ORDER
                     else (1, 1)
                 )
-                window = int(
-                    self._x11.XCreateSimpleWindow(
+                if name == "shield":
+                    attributes = XSetWindowAttributes()
+                    attributes.override_redirect = 1
+                    attributes.event_mask = _BUTTON_PRESS_MASK | _BUTTON_RELEASE_MASK
+                    window = int(
+                        self._x11.XCreateWindow(
+                            self._display,
+                            self._root,
+                            -100,
+                            -100,
+                            width,
+                            height,
+                            0,
+                            0,
+                            _INPUT_ONLY,
+                            None,
+                            _CW_OVERRIDE_REDIRECT | _CW_EVENT_MASK,
+                            ctypes.byref(attributes),
+                        )
+                    )
+                else:
+                    window = int(self._x11.XCreateSimpleWindow(
                         self._display,
                         self._root,
                         -100,
@@ -646,8 +1033,7 @@ class X11CalibrationOverlay:
                         0,
                         black,
                         colours[name],
-                    )
-                )
+                    ))
                 if not window:
                     raise RuntimeError(f"cannot create overlay window {name}")
                 self._windows[name] = window
@@ -656,21 +1042,46 @@ class X11CalibrationOverlay:
                     window,
                     f"Matrix Calibration {name}".encode("ascii"),
                 )
-                self._make_click_through(window)
+                if name in {"shield", "panel"}:
+                    self._make_interactive(window)
+                else:
+                    self._make_click_through(window)
                 if name == "cursor-shadow":
                     self._set_bounding_shape(window, _CURSOR_SHADOW_RECTANGLES)
                 elif name == "cursor":
                     self._set_bounding_shape(window, _CURSOR_FOREGROUND_RECTANGLES)
-            hint = self._windows["hint"]
-            gc = self._x11.XCreateGC(self._display, hint, 0, None)
+            panel = self._windows["panel"]
+            gc = self._x11.XCreateGC(self._display, panel, 0, None)
             if not gc:
-                raise RuntimeError("cannot create overlay hint graphics context")
-            self._hint_gc = int(gc)
+                raise RuntimeError("cannot create overlay panel graphics context")
+            self._panel_gc = int(gc)
             self._x11.XSetForeground(self._display, gc, white)
+            self._body_font, self._body_font_name = self._load_font(
+                _BODY_FONT_CANDIDATES
+            )
+            self._large_font, self._large_font_name = self._load_font(
+                _LARGE_FONT_CANDIDATES
+            )
             self._x11.XSync(self._display, 0)
         except Exception:
             self.close()
             raise
+
+    def _load_font(
+        self, candidates: tuple[bytes, ...]
+    ) -> tuple[ctypes.POINTER(XFontStruct), str]:
+        for name in candidates:
+            font = self._x11.XLoadQueryFont(self._display, name)
+            if font:
+                return (font, name.decode("ascii"))
+        raise RuntimeError("cannot load an X11 overlay font")
+
+    @property
+    def font_diagnostics(self) -> dict[str, str | None]:
+        return {
+            "body": self._body_font_name,
+            "large": self._large_font_name,
+        }
 
     def _window_pid(self, window: int) -> int | None:
         if not self._pid_atom:
@@ -803,52 +1214,319 @@ class X11CalibrationOverlay:
             return None
         return (root_x.value, root_y.value)
 
+    def _panel_rectangle(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        name: str,
+    ) -> tuple[int, int, int, int]:
+        panel_x, panel_y, _panel_width, _panel_height = layout["panel"]
+        x, y, width, height = layout[name]
+        return (x - panel_x, y - panel_y, width, height)
+
+    def _draw_text(
+        self,
+        message: str,
+        *,
+        x: int,
+        y: int,
+        colour: int,
+        large: bool = False,
+        centred_in: tuple[int, int, int, int] | None = None,
+    ) -> None:
+        gc = ctypes.c_void_p(self._panel_gc)
+        font = self._large_font if large else self._body_font
+        assert font is not None
+        encoded = message.encode("ascii", errors="replace")[:160]
+        self._x11.XSetForeground(self._display, gc, colour)
+        self._x11.XSetFont(self._display, gc, font.contents.fid)
+        if centred_in is not None:
+            left, top, width, height = centred_in
+            text_width = int(self._x11.XTextWidth(font, encoded, len(encoded)))
+            x = left + max(4, (width - text_width) // 2)
+            y = top + height // 2 + (9 if large else 6)
+        self._x11.XDrawString(
+            self._display,
+            self._windows["panel"],
+            gc,
+            x,
+            y,
+            encoded,
+            len(encoded),
+        )
+
+    def _draw_button(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        name: str,
+        label: str,
+        *,
+        fill: int,
+        disabled: bool = False,
+    ) -> None:
+        x, y, width, height = self._panel_rectangle(layout, name)
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._x11.XSetForeground(self._display, gc, fill)
+        self._x11.XFillRectangle(
+            self._display, panel, gc, x, y, width, height
+        )
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["disabled" if disabled else "outline"],
+        )
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
+        )
+        self._draw_text(
+            label,
+            x=0,
+            y=0,
+            colour=self._colours["muted" if disabled else "white"],
+            large=True,
+            centred_in=(x, y, width, height),
+        )
+
+    def _draw_panel(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: SettingsPanelModel,
+    ) -> None:
+        _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
+        compact = panel_height < 600
+        panel = self._windows["panel"]
+        self._x11.XClearWindow(self._display, panel)
+        self._draw_text(
+            "MATRIX MOUSE CONTROLS",
+            x=24 if compact else 40,
+            y=20 if compact else max(36, panel_height // 14),
+            colour=self._colours["white"],
+            large=True,
+        )
+        if not compact:
+            self._draw_text(
+                f"Currently applied: {model.current_profile} "
+                f"{model.current_scale:.2f}x",
+                x=40,
+                y=max(64, panel_height // 9),
+                colour=self._colours["muted"],
+            )
+        local_selected = model.next_profile == "Local"
+        controls_disabled = model.restart_requested or model.status == "restarting"
+        self._draw_button(
+            layout,
+            "profile_local",
+            "LOCAL",
+            fill=self._colours["selected" if local_selected else "button"],
+            disabled=controls_disabled,
+        )
+        self._draw_button(
+            layout,
+            "profile_remote",
+            "REMOTE",
+            fill=self._colours["selected" if not local_selected else "button"],
+            disabled=controls_disabled,
+        )
+        speed_down_disabled = not model.action_enabled("speed_down")
+        speed_up_disabled = not model.action_enabled("speed_up")
+        self._draw_button(
+            layout,
+            "speed_down",
+            "-",
+            fill=self._colours["disabled" if speed_down_disabled else "button"],
+            disabled=speed_down_disabled,
+        )
+        self._draw_button(
+            layout,
+            "speed_up",
+            "+",
+            fill=self._colours["disabled" if speed_up_disabled else "button"],
+            disabled=speed_up_disabled,
+        )
+        speed_value = self._panel_rectangle(layout, "speed_value")
+        self._draw_text(
+            "REMOTE SPEED",
+            x=0,
+            y=0,
+            colour=self._colours["muted"],
+            centred_in=(
+                speed_value[0],
+                speed_value[1] - 10,
+                speed_value[2],
+                speed_value[3],
+            ),
+        )
+        self._draw_text(
+            f"{model.next_scale:.2f}x",
+            x=0,
+            y=0,
+            colour=self._colours["white"],
+            large=True,
+            centred_in=(
+                speed_value[0],
+                speed_value[1] + 12,
+                speed_value[2],
+                speed_value[3],
+            ),
+        )
+        status_y = panel_height // 2 + (62 if compact else 72)
+        if model.status == "restarting":
+            status_text = "Reloading the complete Matrix runtime - keep controls released"
+            status_colour = self._colours["pending"]
+        elif model.status == "waiting_neutral":
+            status_text = "Preparing a safe neutral frame..."
+            status_colour = self._colours["pending"]
+        elif model.error is not None:
+            status_text = f"Could not apply: {model.error}"
+            status_colour = self._colours["error"]
+        elif model.pending_restart:
+            status_text = "Apply/Return will reload Matrix with the saved changes"
+            status_colour = self._colours["pending"]
+        else:
+            status_text = "No reload needed"
+            status_colour = self._colours["muted"]
+        self._draw_text(
+            status_text,
+            x=32,
+            y=status_y,
+            colour=status_colour,
+        )
+        apply_disabled = not model.action_enabled("apply_return")
+        apply_fill = self._colours[
+            "disabled"
+            if apply_disabled
+            else ("pending" if model.pending_restart else "apply")
+        ]
+        self._draw_button(
+            layout,
+            "apply_return",
+            model.apply_label,
+            fill=apply_fill,
+            disabled=apply_disabled,
+        )
+        footer = "Enter: Apply/Return   Esc: Back   F9: fallback   F10/F12: MouseLock"
+        self._draw_text(
+            footer,
+            x=20 if compact else 40,
+            y=max(18, panel_height - 10),
+            colour=self._colours["muted"],
+        )
+
+    def drain_pointer_actions(self, publisher: PointerActionPublisher) -> int:
+        """Commit only a left-button release inside its original large button."""
+
+        emitted = 0
+        while self._x11.XPending(self._display) > 0:
+            event = XEvent()
+            self._x11.XNextEvent(self._display, ctypes.byref(event))
+            button = event.xbutton
+            if button.button != 1:
+                continue
+            layout = self._last_layout
+            action = (
+                panel_action_at(layout, button.x_root, button.y_root)
+                if layout is not None
+                else None
+            )
+            if event.type == _BUTTON_PRESS:
+                self._pressed_action = action
+                self._pressed_window = int(button.window)
+            elif event.type == _BUTTON_RELEASE:
+                pressed = self._pressed_action
+                pressed_window = self._pressed_window
+                self._pressed_action = None
+                self._pressed_window = None
+                if (
+                    pressed is not None
+                    and action == pressed
+                    and pressed_window == int(button.window)
+                    and self._last_panel_model is not None
+                    and self._last_panel_model.action_enabled(action)
+                ):
+                    publisher.publish(action)
+                    emitted += 1
+        return emitted
+
     def show(
         self,
         geometry: WindowGeometry,
         pointer: tuple[int, int],
-        hint_lines: tuple[bytes, bytes, bytes],
+        state: dict[str, object],
+        *,
+        now_s: float | None = None,
     ) -> None:
-        layout = overlay_layout(geometry)
-        for name in self._STATIC_WINDOW_ORDER:
-            window = self._windows[name]
-            x, y, width, height = layout[name]
-            self._x11.XMoveResizeWindow(
-                self._display, window, x, y, width, height
-            )
-            if not self._visible:
-                self._x11.XMapRaised(self._display, window)
-            else:
-                self._x11.XRaiseWindow(self._display, window)
-        hint = self._windows["hint"]
-        self._x11.XClearWindow(self._display, hint)
-        for index, message in enumerate(hint_lines):
-            self._x11.XDrawString(
-                self._display,
-                hint,
-                ctypes.c_void_p(self._hint_gc),
-                12,
-                18 + index * 21,
-                message,
-                len(message),
-            )
+        now = time.monotonic() if now_s is None else now_s
+        first_show = not self._visible
+        geometry_changed = geometry != self._last_geometry
+        model = settings_panel_model(state)
+        model_changed = model != self._last_panel_model
+        if geometry_changed or self._last_layout is None:
+            layout = overlay_layout(geometry)
+        else:
+            layout = self._last_layout
+        static_order = ("shield",) + self._VISUAL_WINDOW_ORDER
+        if first_show or geometry_changed:
+            for name in static_order:
+                window = self._windows[name]
+                x, y, width, height = layout[name]
+                self._x11.XMoveResizeWindow(
+                    self._display, window, x, y, width, height
+                )
+        raise_due = bool(
+            first_show
+            or geometry_changed
+            or self._last_raise_s is None
+            or now - self._last_raise_s >= self._RAISE_INTERVAL_S
+        )
+        if first_show:
+            for name in static_order:
+                self._x11.XMapRaised(self._display, self._windows[name])
+        elif raise_due:
+            for name in static_order:
+                self._x11.XRaiseWindow(self._display, self._windows[name])
+        if first_show or geometry_changed or model_changed:
+            self._draw_panel(layout, model)
         pointer_x, pointer_y = pointer
-        for name in self._CURSOR_WINDOW_ORDER:
-            window = self._windows[name]
-            self._x11.XMoveResizeWindow(
-                self._display,
-                window,
-                pointer_x,
-                pointer_y,
-                _CURSOR_WIDTH,
-                _CURSOR_HEIGHT,
-            )
-            if not self._cursor_visible:
+        pointer_changed = pointer != self._last_pointer
+        if not self._cursor_visible or pointer_changed:
+            for name in self._CURSOR_WINDOW_ORDER:
+                window = self._windows[name]
+                self._x11.XMoveResizeWindow(
+                    self._display,
+                    window,
+                    pointer_x,
+                    pointer_y,
+                    _CURSOR_WIDTH,
+                    _CURSOR_HEIGHT,
+                )
+        if not self._cursor_visible:
+            for name in self._CURSOR_WINDOW_ORDER:
+                window = self._windows[name]
                 self._x11.XMapRaised(self._display, window)
-            else:
+        elif raise_due:
+            for name in self._CURSOR_WINDOW_ORDER:
+                window = self._windows[name]
                 self._x11.XRaiseWindow(self._display, window)
-        self._x11.XFlush(self._display)
+        if (
+            first_show
+            or geometry_changed
+            or model_changed
+            or pointer_changed
+            or raise_due
+        ):
+            self._x11.XFlush(self._display)
         self._last_layout = layout
+        self._last_geometry = geometry
+        self._last_panel_model = model
+        self._last_pointer = pointer
+        if raise_due:
+            self._last_raise_s = now
         self._visible = True
         self._cursor_visible = True
 
@@ -861,14 +1539,25 @@ class X11CalibrationOverlay:
         self._visible = False
         self._cursor_visible = False
         self._last_layout = None
+        self._last_geometry = None
+        self._last_panel_model = None
+        self._last_pointer = None
+        self._last_raise_s = None
+        self._pressed_action = None
+        self._pressed_window = None
 
     def close(self) -> None:
         display = getattr(self, "_display", None)
         if not display:
             return
-        if self._hint_gc is not None:
-            self._x11.XFreeGC(display, ctypes.c_void_p(self._hint_gc))
-            self._hint_gc = None
+        if self._panel_gc is not None:
+            self._x11.XFreeGC(display, ctypes.c_void_p(self._panel_gc))
+            self._panel_gc = None
+        for attribute in ("_body_font", "_large_font"):
+            font = getattr(self, attribute, None)
+            if font is not None:
+                self._x11.XFreeFont(display, font)
+                setattr(self, attribute, None)
         for window in self._windows.values():
             self._x11.XDestroyWindow(display, window)
         self._windows.clear()
@@ -883,6 +1572,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status-file", type=Path, required=True)
     parser.add_argument("--expected-ue-pid", type=int, required=True)
     parser.add_argument("--expected-parent-pid", type=int, required=True)
+    parser.add_argument("--action-fd", type=int, required=True)
+    parser.add_argument("--action-session", required=True)
     parser.add_argument("--display", default=os.environ.get("DISPLAY"))
     parser.add_argument("--poll-hz", type=float, default=30.0)
     return parser.parse_args()
@@ -901,6 +1592,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--expected-ue-pid must be greater than 1")
     if args.expected_parent_pid <= 1:
         raise SystemExit("--expected-parent-pid must be greater than 1")
+    if args.action_fd < 0:
+        raise SystemExit("--action-fd must be non-negative")
+    if not args.action_session or len(args.action_session) > 128:
+        raise SystemExit("--action-session must be non-empty and bounded")
     if not math.isfinite(args.poll_hz) or not 1.0 <= args.poll_hz <= 120.0:
         raise SystemExit("--poll-hz must be finite and in [1, 120]")
 
@@ -919,20 +1614,28 @@ def main() -> int:
         for signum in (signal.SIGINT, signal.SIGTERM)
     }
     overlay: X11CalibrationOverlay | None = None
+    action_publisher: PointerActionPublisher | None = None
+    font_diagnostics: dict[str, str | None] | None = None
     return_code = 0
     exit_reason = "signal"
     try:
         arm_parent_death_signal(args.expected_parent_pid)
+        action_publisher = PointerActionPublisher(
+            file_descriptor=args.action_fd,
+            session=args.action_session,
+        )
         overlay = X11CalibrationOverlay(
             display_name=args.display,
             expected_ue_pid=args.expected_ue_pid,
         )
+        font_diagnostics = overlay.font_diagnostics
         atomic_json(
             args.status_file,
             {
                 "ready": True,
                 "pid": os.getpid(),
                 "expected_ue_pid": args.expected_ue_pid,
+                "fonts": font_diagnostics,
             },
         )
         interval = 1.0 / args.poll_hz
@@ -944,12 +1647,20 @@ def main() -> int:
             if state is not None and state.get("active") is True:
                 target = overlay.find_target()
                 pointer = overlay.pointer_position()
-                if target is None or pointer is None:
+                if (
+                    target is None
+                    or pointer is None
+                    or not overlay_supported(target)
+                ):
                     overlay.hide()
                 else:
-                    overlay.show(target, pointer, settings_hint_lines(state))
+                    overlay.show(target, pointer, state)
+                assert action_publisher is not None
+                overlay.drain_pointer_actions(action_publisher)
             else:
                 overlay.hide()
+                assert action_publisher is not None
+                overlay.drain_pointer_actions(action_publisher)
             time.sleep(interval)
     except Exception as exc:
         return_code = 1
@@ -958,6 +1669,8 @@ def main() -> int:
     finally:
         if overlay is not None:
             overlay.close()
+        if action_publisher is not None:
+            action_publisher.close()
         try:
             atomic_json(
                 args.status_file,
@@ -966,6 +1679,7 @@ def main() -> int:
                     "pid": os.getpid(),
                     "expected_ue_pid": args.expected_ue_pid,
                     "exit_reason": exit_reason,
+                    "fonts": font_diagnostics,
                 },
             )
         except OSError:

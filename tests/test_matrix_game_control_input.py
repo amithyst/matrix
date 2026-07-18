@@ -58,6 +58,135 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 command[:4],
                 ["/locked/venv/bin/python", "-B", "-I", "-u"],
             )
+            self.assertIn("--action-fd", command)
+            self.assertIn("--action-session", command)
+            self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 1)
+            assert supervisor._action_socket is not None
+            supervisor._action_socket.close()
+            supervisor._action_socket = None
+            supervisor.process = None
+
+    def test_private_action_socket_drains_ordered_validated_intents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            packets = (
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 1,
+                    "action": "profile_remote",
+                },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 2,
+                    "action": "speed_down",
+                },
+            )
+            try:
+                for packet in packets:
+                    sender.send(json.dumps(packet).encode("ascii"))
+                self.assertEqual(
+                    supervisor.drain_actions(),
+                    ("profile_remote", "speed_down"),
+                )
+                self.assertEqual(supervisor.drain_actions(), ())
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
+    def test_pointer_packet_drains_into_atomic_mouse_settings_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            settings_file = root / "config/mouse.json"
+            controller = MODULE.MouseSettingsController(
+                path=settings_file,
+                desired=MODULE.MouseSettings(),
+                load_status="missing",
+                load_error=None,
+            )
+            packet = {
+                "version": 1,
+                "session": supervisor._action_session,
+                "sequence": 1,
+                "action": "profile_remote",
+            }
+            try:
+                sender.send(json.dumps(packet).encode("ascii"))
+                actions = supervisor.drain_actions()
+                self.assertEqual(actions, ("profile_remote",))
+                for action in actions:
+                    self.assertTrue(
+                        controller.apply_panel_action(action, active=True)
+                    )
+                self.assertEqual(
+                    json.loads(settings_file.read_text(encoding="utf-8")),
+                    {"profile": "remote", "speed_scale": 0.5, "version": 1},
+                )
+                self.assertEqual(settings_file.stat().st_mode & 0o777, 0o600)
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
+    def test_private_action_socket_rejects_wrong_session_and_direct_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            for packet in (
+                {"version": 1, "session": "wrong", "sequence": 1, "action": "speed_up"},
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "action": "restart_directly",
+                },
+            ):
+                supervisor = MODULE.CalibrationOverlaySupervisor(
+                    state_file=root / "state.json",
+                    display_name=None,
+                    expected_ue_pid=41,
+                    script=script,
+                )
+                if packet["session"] == "placeholder":
+                    packet["session"] = supervisor._action_session
+                receiver, sender = socket.socketpair(
+                    socket.AF_UNIX, socket.SOCK_SEQPACKET
+                )
+                receiver.setblocking(False)
+                supervisor._action_socket = receiver
+                try:
+                    sender.send(json.dumps(packet).encode("ascii"))
+                    with self.assertRaisesRegex(RuntimeError, "identity"):
+                        supervisor.drain_actions()
+                finally:
+                    sender.close()
+                    receiver.close()
+                    supervisor._action_socket = None
 
 
 class SourceArbitrationTest(unittest.TestCase):
@@ -366,6 +495,95 @@ class CalibrationModeTest(unittest.TestCase):
         self.assertFalse(controller.update(escape_pressed=True, ue_focused=False))
         self.assertFalse(controller.active)
 
+    def test_ui_and_escape_exit_frames_drop_release_delta_and_require_rearm(self) -> None:
+        for exit_kind in ("ui", "escape"):
+            with self.subTest(exit_kind=exit_kind):
+                calibration = MODULE.CalibrationModeController()
+                calibration.active = True
+                if exit_kind == "ui":
+                    self.assertTrue(calibration.exit())
+                else:
+                    self.assertTrue(
+                        calibration.update(escape_pressed=True, ue_focused=False)
+                    )
+                self.assertFalse(calibration.active)
+                self.assertTrue(
+                    MODULE.calibration_interlock_required(
+                        panel_was_active=True,
+                        panel_active=calibration.active,
+                    )
+                )
+                release_sample = MODULE.KeyboardMouseSample(
+                    w=True,
+                    mouse_dx=73.0,
+                    mouse_dy=-11.0,
+                    camera_dragging=False,
+                    focused=True,
+                )
+                keyboard, pad = MODULE.apply_calibration_interlock(
+                    release_sample,
+                    MODULE.GamepadSample(),
+                    active=True,
+                )
+                self.assertFalse(keyboard.focused)
+                self.assertEqual((keyboard.mouse_dx, keyboard.mouse_dy), (0.0, 0.0))
+                tracker = MODULE.CameraYawTracker(
+                    0.0,
+                    mouse_radians_per_pixel=0.1,
+                    gamepad_radians_per_second=0.0,
+                )
+                self.assertEqual(
+                    tracker.update(
+                        dt=0.02,
+                        mouse_dx=keyboard.mouse_dx,
+                        gamepad_look_yaw=0.0,
+                    ),
+                    0.0,
+                )
+
+                core = CORE.GameControlCore()
+                core.accept_snapshot(
+                    self.snapshot(
+                        1,
+                        10.0,
+                        MODULE.KeyboardMouseSample(focused=True),
+                    ),
+                    received_at_s=10.0,
+                )
+                core.accept_snapshot(
+                    self.snapshot(
+                        2,
+                        10.01,
+                        MODULE.KeyboardMouseSample(w=True, focused=True),
+                    ),
+                    received_at_s=10.01,
+                )
+                self.assertEqual(core.command(now_s=10.01, dt_s=0.1).mode, "move")
+                core.accept_snapshot(
+                    self.snapshot(3, 10.02, keyboard, pad),
+                    received_at_s=10.02,
+                )
+                self.assertEqual(
+                    core.command(now_s=10.02, dt_s=0.01).reason,
+                    "focus_lost",
+                )
+                # The next frame resumes physical sampling, but held W remains
+                # stopped until a focused neutral frame re-arms the core.
+                self.assertFalse(
+                    MODULE.calibration_interlock_required(
+                        panel_was_active=False,
+                        panel_active=False,
+                    )
+                )
+                core.accept_snapshot(
+                    self.snapshot(4, 10.03, release_sample),
+                    received_at_s=10.03,
+                )
+                self.assertEqual(
+                    core.command(now_s=10.03, dt_s=0.01).reason,
+                    "awaiting_neutral",
+                )
+
 
 class MouseSettingsAndRestartTest(unittest.TestCase):
     def test_startup_requires_escape_and_f9_release_before_arming(self) -> None:
@@ -433,6 +651,248 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             self.assertEqual(controller.desired.effective_scale, 0.4)
             # The current generation remains exactly the launch snapshot.
             self.assertEqual(applied.effective_scale, 1.0)
+
+    def test_panel_selects_profiles_and_speed_without_key_emulation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config/mouse.json"
+            controller = MODULE.MouseSettingsController(
+                path=path,
+                desired=MODULE.MouseSettings(),
+                load_status="missing",
+                load_error=None,
+            )
+            self.assertFalse(
+                controller.apply_panel_action("profile_remote", active=False)
+            )
+            self.assertTrue(
+                controller.apply_panel_action("profile_remote", active=True)
+            )
+            self.assertEqual(controller.desired.profile, "remote")
+            self.assertTrue(controller.apply_panel_action("speed_up", active=True))
+            self.assertEqual(controller.desired.speed_scale, 0.6)
+            self.assertTrue(
+                controller.apply_panel_action("profile_local", active=True)
+            )
+            self.assertEqual(controller.desired.profile, "local")
+            self.assertFalse(controller.apply_panel_action("speed_down", active=True))
+
+    @staticmethod
+    def requester(*, available: bool = True, succeeds: bool = True):
+        class Requester:
+            def __init__(self) -> None:
+                self.available = available
+                self.requested = False
+                self.error = None
+                self.calls = 0
+
+            def request(self) -> bool:
+                self.calls += 1
+                if not self.available or not succeeds:
+                    self.error = "injected restart failure"
+                    return False
+                self.requested = True
+                self.available = False
+                return True
+
+        return Requester()
+
+    def test_apply_return_waits_for_neutral_then_returns_without_reload(self) -> None:
+        calibration = MODULE.CalibrationModeController()
+        calibration.active = True
+        controller = MODULE.ApplyReturnController()
+        requester = self.requester()
+        self.assertEqual(
+            controller.update(
+                enter_pressed=False,
+                clicked=True,
+                ue_focused=True,
+                panel_was_active=True,
+                calibration=calibration,
+                neutral_frame_ready=False,
+                pending_restart=False,
+                persistence_error=None,
+                requester=requester,
+            ),
+            (False, False),
+        )
+        self.assertTrue(controller.pending_intent)
+        self.assertEqual(controller.status, "waiting_neutral")
+        self.assertEqual(
+            controller.update(
+                enter_pressed=False,
+                clicked=False,
+                ue_focused=True,
+                panel_was_active=True,
+                calibration=calibration,
+                neutral_frame_ready=True,
+                pending_restart=False,
+                persistence_error=None,
+                requester=requester,
+            ),
+            (True, False),
+        )
+        self.assertFalse(calibration.active)
+        self.assertEqual(requester.calls, 0)
+
+    def test_apply_return_reuses_restart_requester_once_after_neutral(self) -> None:
+        calibration = MODULE.CalibrationModeController()
+        calibration.active = True
+        controller = MODULE.ApplyReturnController()
+        requester = self.requester()
+        controller.update(
+            enter_pressed=False,
+            clicked=False,
+            ue_focused=True,
+            panel_was_active=True,
+            calibration=calibration,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_error=None,
+            requester=requester,
+        )
+        result = controller.update(
+            enter_pressed=True,
+            clicked=False,
+            ue_focused=True,
+            panel_was_active=True,
+            calibration=calibration,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_error=None,
+            requester=requester,
+        )
+        self.assertEqual(result, (False, True))
+        self.assertTrue(calibration.active)
+        self.assertEqual(controller.status, "restarting")
+        self.assertEqual(requester.calls, 1)
+        controller.update(
+            enter_pressed=False,
+            clicked=True,
+            ue_focused=True,
+            panel_was_active=True,
+            calibration=calibration,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_error=None,
+            requester=requester,
+        )
+        self.assertEqual(requester.calls, 1)
+
+    def test_enter_requires_focused_release_after_each_panel_entry(self) -> None:
+        calibration = MODULE.CalibrationModeController()
+        calibration.active = True
+        controller = MODULE.ApplyReturnController()
+        requester = self.requester()
+
+        def update(*, pressed: bool, focused: bool, was_active: bool):
+            return controller.update(
+                enter_pressed=pressed,
+                clicked=False,
+                ue_focused=focused,
+                panel_was_active=was_active,
+                calibration=calibration,
+                neutral_frame_ready=True,
+                pending_restart=True,
+                persistence_error=None,
+                requester=requester,
+            )
+
+        # ESC+Enter in the entry frame, and the following held frame, are not
+        # a fresh panel key press.
+        self.assertEqual(
+            update(pressed=True, focused=True, was_active=False),
+            (False, False),
+        )
+        self.assertEqual(
+            update(pressed=True, focused=True, was_active=True),
+            (False, False),
+        )
+        self.assertEqual(requester.calls, 0)
+        update(pressed=False, focused=True, was_active=True)
+        self.assertEqual(
+            update(pressed=True, focused=True, was_active=True),
+            (False, True),
+        )
+        self.assertEqual(requester.calls, 1)
+
+    def test_terminal_and_cross_focus_held_enter_cannot_apply(self) -> None:
+        calibration = MODULE.CalibrationModeController()
+        calibration.active = True
+        controller = MODULE.ApplyReturnController()
+        requester = self.requester()
+
+        def update(*, pressed: bool, focused: bool):
+            return controller.update(
+                enter_pressed=pressed,
+                clicked=False,
+                ue_focused=focused,
+                panel_was_active=True,
+                calibration=calibration,
+                neutral_frame_ready=True,
+                pending_restart=True,
+                persistence_error=None,
+                requester=requester,
+            )
+
+        update(pressed=False, focused=True)
+        update(pressed=True, focused=False)  # Enter typed in a terminal.
+        update(pressed=True, focused=True)  # Still held after Alt-Tab back.
+        self.assertEqual(requester.calls, 0)
+        update(pressed=False, focused=True)
+        self.assertEqual(update(pressed=True, focused=True), (False, True))
+        self.assertEqual(requester.calls, 1)
+
+    def test_apply_failure_stays_in_safe_panel_and_is_visible(self) -> None:
+        calibration = MODULE.CalibrationModeController()
+        calibration.active = True
+        controller = MODULE.ApplyReturnController()
+        requester = self.requester()
+        controller.update(
+            enter_pressed=False,
+            clicked=False,
+            ue_focused=True,
+            panel_was_active=True,
+            calibration=calibration,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_error="read-only filesystem",
+            requester=requester,
+        )
+        result = controller.update(
+            enter_pressed=True,
+            clicked=False,
+            ue_focused=True,
+            panel_was_active=True,
+            calibration=calibration,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_error="read-only filesystem",
+            requester=requester,
+        )
+        self.assertEqual(result, (False, False))
+        self.assertTrue(calibration.active)
+        self.assertEqual(controller.status, "error")
+        self.assertIn("read-only filesystem", controller.error)
+        self.assertEqual(requester.calls, 0)
+
+        controller = MODULE.ApplyReturnController()
+        requester = self.requester(succeeds=False)
+        result = controller.update(
+            enter_pressed=False,
+            clicked=True,
+            ue_focused=True,
+            panel_was_active=True,
+            calibration=calibration,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_error=None,
+            requester=requester,
+        )
+        self.assertEqual(result, (False, False))
+        self.assertTrue(calibration.active)
+        self.assertEqual(controller.status, "error")
+        self.assertEqual(controller.error, "injected restart failure")
+        self.assertEqual(requester.calls, 1)
 
     def test_f9_requires_active_pending_saved_and_prior_neutral_send(self) -> None:
         class Requester:
@@ -506,6 +966,56 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             self.assertTrue(request_file.is_file())
             self.assertFalse(requester.available)
             self.assertFalse(requester.request())
+
+    def test_panel_apply_neutral_gate_writes_real_private_restart_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            capability = root / "capability"
+            request_file = root / "request.json"
+            RESTART.atomic_write_capability(capability)
+            requester = MODULE.RuntimeRestartRequester(
+                request_file=request_file,
+                capability_file=capability,
+                launcher_pid=os.getpid(),
+            )
+            calibration = MODULE.CalibrationModeController()
+            calibration.active = True
+            controller = MODULE.ApplyReturnController()
+            self.assertEqual(
+                controller.update(
+                    enter_pressed=False,
+                    clicked=True,
+                    ue_focused=True,
+                    panel_was_active=True,
+                    calibration=calibration,
+                    neutral_frame_ready=False,
+                    pending_restart=True,
+                    persistence_error=None,
+                    requester=requester,
+                ),
+                (False, False),
+            )
+            self.assertFalse(request_file.exists())
+            self.assertEqual(
+                controller.update(
+                    enter_pressed=False,
+                    clicked=False,
+                    ue_focused=True,
+                    panel_was_active=True,
+                    calibration=calibration,
+                    neutral_frame_ready=True,
+                    pending_restart=True,
+                    persistence_error=None,
+                    requester=requester,
+                ),
+                (False, True),
+            )
+            request = json.loads(request_file.read_text(encoding="utf-8"))
+            self.assertEqual(request["action"], "restart-whole-runtime")
+            self.assertEqual(request["launcher_pid"], os.getpid())
+            self.assertEqual(request["provider_pid"], os.getpid())
+            self.assertTrue(calibration.active)
 
 
 class CameraYawTrackerTest(unittest.TestCase):

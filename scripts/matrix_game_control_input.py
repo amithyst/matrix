@@ -98,6 +98,7 @@ class KeyboardMouseSample:
     mouse_speed_down: bool = False
     mouse_speed_up: bool = False
     apply_restart: bool = False
+    apply_return: bool = False
     mouse_dx: float = 0.0
     mouse_dy: float = 0.0
     camera_dragging: bool = False
@@ -156,6 +157,15 @@ class CalibrationModeController:
         self._escape_was_down = escape_pressed
         return toggled
 
+    def exit(self) -> bool:
+        """Leave the ESC interlock without synthesizing an Escape key press."""
+
+        if not self.active:
+            return False
+        self.active = False
+        self.toggle_count += 1
+        return True
+
 
 class StartupShortcutArming:
     """Require release of ESC/F9 once in every newly launched generation."""
@@ -213,6 +223,19 @@ class MouseSettingsController:
         self._down_was_down = False
         self._up_was_down = False
 
+    def _replace(self, replacement: MouseSettings) -> bool:
+        if replacement == self.desired:
+            return False
+        self.desired = replacement
+        self.change_count += 1
+        try:
+            atomic_save_settings(self.path, replacement)
+            self.persistence_error = None
+            self.load_status = "saved"
+        except (OSError, ValueError) as exc:
+            self.persistence_error = str(exc)
+        return True
+
     def update(
         self,
         *,
@@ -243,18 +266,32 @@ class MouseSettingsController:
             _clamp(speed_scale, MIN_REMOTE_SPEED_SCALE, MAX_REMOTE_SPEED_SCALE),
             2,
         )
-        replacement = MouseSettings(profile=profile, speed_scale=speed_scale)
-        if replacement == self.desired:
+        return self._replace(MouseSettings(profile=profile, speed_scale=speed_scale))
+
+    def apply_panel_action(self, action: str, *, active: bool) -> bool:
+        """Apply one validated click without emulating a held keyboard key."""
+
+        if not active:
             return False
-        self.desired = replacement
-        self.change_count += 1
-        try:
-            atomic_save_settings(self.path, replacement)
-            self.persistence_error = None
-            self.load_status = "saved"
-        except (OSError, ValueError) as exc:
-            self.persistence_error = str(exc)
-        return True
+        profile = self.desired.profile
+        speed_scale = self.desired.speed_scale
+        if action == "profile_local":
+            profile = PROFILE_LOCAL
+        elif action == "profile_remote":
+            profile = PROFILE_REMOTE
+        elif action == "speed_down" and profile == PROFILE_REMOTE:
+            speed_scale -= SPEED_SCALE_STEP
+        elif action == "speed_up" and profile == PROFILE_REMOTE:
+            speed_scale += SPEED_SCALE_STEP
+        else:
+            return False
+        speed_scale = round(
+            _clamp(speed_scale, MIN_REMOTE_SPEED_SCALE, MAX_REMOTE_SPEED_SCALE),
+            2,
+        )
+        return self._replace(
+            MouseSettings(profile=profile, speed_scale=speed_scale)
+        )
 
     def pending_restart(self, applied: AppliedMouseSettings) -> bool:
         return bool(
@@ -376,6 +413,108 @@ class ApplyRestartKey:
         ):
             return False
         return requester.request()
+
+
+class ApplyReturnController:
+    """Turn Enter/a panel click into a safe return or deferred restart.
+
+    A click is an intent, not restart authority.  Pending changes remain in the
+    ESC interlock until the provider has successfully delivered a neutral frame
+    and the existing private :class:`RuntimeRestartRequester` accepts them.
+    """
+
+    def __init__(self) -> None:
+        self._enter_armed = False
+        self.pending_intent = False
+        self.status = "idle"
+        self.error: str | None = None
+
+    def update(
+        self,
+        *,
+        enter_pressed: bool,
+        clicked: bool,
+        ue_focused: bool,
+        panel_was_active: bool,
+        calibration: CalibrationModeController,
+        neutral_frame_ready: bool,
+        pending_restart: bool,
+        persistence_error: str | None,
+        requester: RuntimeRestartRequester,
+    ) -> tuple[bool, bool]:
+        """Return ``(left_calibration, requested_restart)`` for this frame."""
+
+        if not calibration.active:
+            self._enter_armed = False
+            self.pending_intent = False
+            self.status = "idle"
+            self.error = None
+            return (False, False)
+        # Enter is globally visible through XQueryKeymap.  Treat it as a panel
+        # key only after this activation has observed a focused release.  This
+        # rejects ESC+Enter entry, terminal Enter, and a key held across an
+        # Alt-Tab/focus transition.
+        keyboard_trigger = False
+        if not panel_was_active or not ue_focused:
+            self._enter_armed = False
+        elif not enter_pressed:
+            self._enter_armed = True
+        elif self._enter_armed:
+            keyboard_trigger = True
+            self._enter_armed = False
+        triggered = bool(clicked or keyboard_trigger)
+        if requester.requested:
+            self.pending_intent = False
+            self.status = "restarting"
+            return (False, False)
+        if triggered:
+            self.pending_intent = True
+            self.error = None
+            self.status = "waiting_neutral"
+        if not self.pending_intent:
+            return (False, False)
+        if not neutral_frame_ready:
+            self.status = "waiting_neutral"
+            return (False, False)
+        if not pending_restart:
+            self.pending_intent = False
+            self.status = "returning"
+            calibration.exit()
+            return (True, False)
+        if persistence_error is not None:
+            self.pending_intent = False
+            self.status = "error"
+            self.error = f"settings were not saved: {persistence_error}"
+            return (False, False)
+        if not requester.available:
+            self.pending_intent = False
+            self.status = "error"
+            self.error = "whole-runtime restart channel is unavailable"
+            return (False, False)
+        self.pending_intent = False
+        if requester.request():
+            self.status = "restarting"
+            self.error = None
+            return (False, True)
+        self.status = "error"
+        self.error = requester.error or "whole-runtime restart request failed"
+        return (False, False)
+
+    def mapping(self) -> dict[str, object]:
+        return {
+            "enter_armed": self._enter_armed,
+            "pending_intent": self.pending_intent,
+            "status": self.status,
+            "error": self.error,
+        }
+
+
+def calibration_interlock_required(
+    *, panel_was_active: bool, panel_active: bool
+) -> bool:
+    """Keep the complete exit frame neutral for both ESC and UI returns."""
+
+    return bool(panel_active or (panel_was_active and not panel_active))
 
 
 def apply_calibration_interlock(
@@ -746,6 +885,7 @@ class X11KeyboardMouse:
         "mouse_speed_down": 0x002D,
         "mouse_speed_up": 0x003D,
         "apply_restart": 0xFFC6,
+        "apply_return": 0xFF0D,
     }
 
     def __init__(
@@ -1057,6 +1197,7 @@ class X11KeyboardMouse:
             mouse_speed_down=pressed.get("mouse_speed_down", False),
             mouse_speed_up=pressed.get("mouse_speed_up", False),
             apply_restart=pressed.get("apply_restart", False),
+            apply_return=pressed.get("apply_return", False),
             mouse_dx=mouse_dx,
             mouse_dy=mouse_dy,
             camera_dragging=look_pressed and focused,
@@ -1304,7 +1445,17 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
 
 
 class CalibrationOverlaySupervisor:
-    """Own the click-through X11 overlay as a fail-closed provider child."""
+    """Own the X11 overlay and its private pointer-intent socket."""
+
+    _ALLOWED_ACTIONS = frozenset(
+        {
+            "profile_local",
+            "profile_remote",
+            "speed_down",
+            "speed_up",
+            "apply_return",
+        }
+    )
 
     def __init__(
         self,
@@ -1326,6 +1477,9 @@ class CalibrationOverlaySupervisor:
         self.python = python
         self.startup_timeout_s = startup_timeout_s
         self.process: subprocess.Popen[bytes] | None = None
+        self._action_socket: socket.socket | None = None
+        self._action_session = os.urandom(16).hex()
+        self._last_action_sequence = 0
 
     def start(self, initial_state: dict[str, object] | None = None) -> None:
         if not self.script.is_file():
@@ -1340,6 +1494,12 @@ class CalibrationOverlaySupervisor:
             self.state_file,
             {"active": False, **(initial_state or {}), "version": 1},
         )
+        parent_socket, child_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        parent_socket.setblocking(False)
+        self._action_socket = parent_socket
         command = [
             self.python,
             # -I ignores PYTHON* environment variables, including the
@@ -1359,14 +1519,27 @@ class CalibrationOverlaySupervisor:
             str(self.expected_ue_pid),
             "--expected-parent-pid",
             str(os.getpid()),
+            "--action-fd",
+            str(child_socket.fileno()),
+            "--action-session",
+            self._action_session,
         ]
         if self.display_name:
             command.extend(("--display", self.display_name))
-        self.process = subprocess.Popen(
-            command,
-            cwd=self.script.parent.parent,
-            stdin=subprocess.DEVNULL,
-        )
+        try:
+            try:
+                self.process = subprocess.Popen(
+                    command,
+                    cwd=self.script.parent.parent,
+                    stdin=subprocess.DEVNULL,
+                    pass_fds=(child_socket.fileno(),),
+                )
+            except Exception:
+                parent_socket.close()
+                self._action_socket = None
+                raise
+        finally:
+            child_socket.close()
         try:
             deadline = time.monotonic() + self.startup_timeout_s
             while time.monotonic() < deadline:
@@ -1396,10 +1569,56 @@ class CalibrationOverlaySupervisor:
         if code is not None:
             raise RuntimeError(f"calibration overlay exited with code {code}")
 
+    def drain_actions(self) -> tuple[str, ...]:
+        """Drain bounded, versioned pointer intents from the known child."""
+
+        connection = self._action_socket
+        if connection is None:
+            raise RuntimeError("calibration overlay action channel is unavailable")
+        actions: list[str] = []
+        for _ in range(32):
+            try:
+                payload = connection.recv(1024)
+            except BlockingIOError:
+                break
+            if not payload:
+                self.ensure_running()
+                raise RuntimeError("calibration overlay action channel closed")
+            if len(payload) >= 1024:
+                raise RuntimeError("calibration overlay action packet is oversized")
+            try:
+                value = json.loads(payload.decode("ascii"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("invalid calibration overlay action packet") from exc
+            if not isinstance(value, dict) or set(value) != {
+                "version",
+                "session",
+                "sequence",
+                "action",
+            }:
+                raise RuntimeError("invalid calibration overlay action schema")
+            sequence = value.get("sequence")
+            action = value.get("action")
+            if (
+                value.get("version") != 1
+                or value.get("session") != self._action_session
+                or type(sequence) is not int
+                or sequence <= self._last_action_sequence
+                or action not in self._ALLOWED_ACTIONS
+            ):
+                raise RuntimeError("invalid calibration overlay action identity")
+            self._last_action_sequence = sequence
+            actions.append(action)
+        return tuple(actions)
+
     def close(self) -> None:
         process = self.process
         self.process = None
+        action_socket = self._action_socket
+        self._action_socket = None
         if process is None:
+            if action_socket is not None:
+                action_socket.close()
             return
         try:
             current = _read_json_object(self.state_file) or {}
@@ -1413,6 +1632,8 @@ class CalibrationOverlaySupervisor:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2.0)
+        if action_socket is not None:
+            action_socket.close()
 
 
 def _wait_until_frame(
@@ -1641,6 +1862,7 @@ def main() -> int:
         launcher_pid=args.restart_launcher_pid,
     )
     apply_restart_key = ApplyRestartKey()
+    apply_return = ApplyReturnController()
     try:
         input_source = effective_input_source(
             args.input_source, args.camera_yaw_source
@@ -1733,6 +1955,7 @@ def main() -> int:
                 {
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "restart": restart_requester.mapping(),
+                    "apply_return": apply_return.mapping(),
                     "mirror_sensitivity": {
                         "base_deg_per_px": args.mouse_sensitivity_deg,
                         "effective_deg_per_px": (
@@ -1766,30 +1989,66 @@ def main() -> int:
                 escape_pressed=raw_keyboard.escape,
                 restart_pressed=raw_keyboard.apply_restart,
             )
+            panel_was_active = calibration.active
             calibration_toggled = calibration.update(
                 escape_pressed=raw_keyboard.escape if shortcuts_armed else False,
                 ue_focused=raw_keyboard.focused,
             )
             if calibration_toggled or not calibration.active:
                 calibration_neutral_frames = 0
+            panel_actions = overlay.drain_actions() if overlay is not None else ()
+            keyboard_panel_active = bool(
+                calibration.active
+                and raw_keyboard.focused
+                and not restart_requester.requested
+            )
             mouse_settings_changed = mouse_settings.update(
-                active=calibration.active,
+                active=keyboard_panel_active,
                 mode_pressed=raw_keyboard.mouse_mode,
                 slower_pressed=raw_keyboard.mouse_speed_down,
                 faster_pressed=raw_keyboard.mouse_speed_up,
             )
+            for panel_action in panel_actions:
+                mouse_settings_changed = bool(
+                    mouse_settings.apply_panel_action(
+                        panel_action,
+                        active=calibration.active and not restart_requester.requested,
+                    )
+                    or mouse_settings_changed
+                )
             restart_requested = apply_restart_key.update(
                 pressed=raw_keyboard.apply_restart,
-                calibration_active=calibration.active,
+                calibration_active=keyboard_panel_active,
                 neutral_frame_ready=calibration_neutral_frames >= 1,
                 pending_restart=mouse_settings.pending_restart(applied_mouse),
                 persistence_ok=mouse_settings.persistence_error is None,
                 requester=restart_requester,
             )
+            left_calibration, ui_restart_requested = apply_return.update(
+                enter_pressed=raw_keyboard.apply_return,
+                clicked="apply_return" in panel_actions,
+                ue_focused=raw_keyboard.focused,
+                panel_was_active=panel_was_active,
+                calibration=calibration,
+                neutral_frame_ready=calibration_neutral_frames >= 1,
+                pending_restart=mouse_settings.pending_restart(applied_mouse),
+                persistence_error=mouse_settings.persistence_error,
+                requester=restart_requester,
+            )
+            restart_requested = restart_requested or ui_restart_requested
+            if left_calibration:
+                calibration_neutral_frames = 0
+            calibration_interlock_active = calibration_interlock_required(
+                panel_was_active=panel_was_active,
+                panel_active=calibration.active,
+            )
             keyboard, pad = apply_calibration_interlock(
                 raw_keyboard,
                 raw_pad,
-                active=calibration.active,
+                # The ButtonRelease/Enter exit frame can still carry the final
+                # held-pointer delta sampled before the UI intent was drained.
+                # Keep that whole frame neutral; normal input resumes next frame.
+                active=calibration_interlock_active,
             )
             pointer_telemetry = x11.pointer_telemetry
             teleport_rejections = int(pointer_telemetry["teleport_rejections"])
@@ -1797,6 +2056,8 @@ def main() -> int:
                 overlay.ensure_running()
                 if (
                     calibration_toggled
+                    or left_calibration
+                    or bool(panel_actions)
                     or mouse_settings_changed
                     or restart_requested
                     or teleport_rejections != last_teleport_rejections
@@ -1809,13 +2070,14 @@ def main() -> int:
                             "updated_monotonic_s": now,
                             "expected_ue_pid": args.expected_ue_pid,
                             "raw_ue_focused": raw_keyboard.focused,
-                            "snapshot_forced_unfocused": calibration.active,
+                            "snapshot_forced_unfocused": calibration_interlock_active,
                             "shortcuts_armed": shortcuts_armed,
                             "neutral_frames": calibration_neutral_frames,
                             "mouse_settings": mouse_settings.live_mapping(
                                 applied_mouse
                             ),
                             "restart": restart_requester.mapping(),
+                            "apply_return": apply_return.mapping(),
                             "mirror_sensitivity": {
                                 "base_deg_per_px": args.mouse_sensitivity_deg,
                                 "effective_deg_per_px": (
@@ -1930,6 +2192,7 @@ def main() -> int:
                     ),
                 },
                 "restart": restart_requester.mapping(),
+                "apply_return": apply_return.mapping(),
                 "gamepad_camera": {
                     "driver": "carla-spectator"
                     if args.camera_yaw_source == "carla"

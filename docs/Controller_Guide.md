@@ -57,23 +57,30 @@ movement input once, then press it again; this is the neutral re-arm interlock.
 ### ESC local/remote mouse settings
 
 In `game` mode, **ESC** immediately hard-zeros locomotion and shows the centre
-crosshair, a visible pointer, and the settings panel. The panel distinguishes
-the configuration applied to the current process from the next-launch value:
+crosshair, a visible pointer, and a large MC-style settings panel. An X11 modal
+shield intercepts core ButtonPress/Release outside the panel. Because cooked UE
+may also subscribe to XI2 raw input, confirm on the deployed desktop that panel
+clicks/drags do not rotate a fixed landmark. The panel distinguishes the
+configuration applied to the current process from the next-launch value:
 
 | Key | Behavior |
 |---|---|
 | **M** | Toggle the next-launch profile between `Local` and `Remote` |
 | **- / +** | Adjust the Remote scale in 0.1 steps from 0.2x through 1.0x |
-| **F9** | After a successful save and while a change is pending, safely restart the complete Matrix/SONIC topology and apply it |
+| **Mouse** | Click `Local`/`Remote`, `-`/`+`, or the large `Return to Game & Apply` button |
+| **Enter** | Keyboard equivalent of `Return to Game & Apply`; returns directly when nothing changed |
+| **F9** | Keyboard fallback: safely restart the complete Matrix/SONIC topology when a saved change is pending |
 | **F10 / F12** | Reserved for the external MouseLock center/toggle actions; Matrix does not intercept them |
 | **ESC** | Leave the panel; locomotion still requires a neutral re-arm |
 
 `Local` is always 1.0x; the default saved Remote preset is 0.5x. Changes are
 atomically persisted to `~/.config/matrix/mouse-control.json`, but they do not
-mutate the current UE process. F9 is accepted only after ESC/F9 have first been
-released, the panel is active, a safe neutral frame has been sent, and the
-setting was saved. The outer launcher then restarts the **whole** runtime; do
-not restart UE alone. Keep all controls released during the restart.
+mutate the current UE process. Apply/Enter waits for a successfully delivered
+neutral frame, then asks the existing private restart channel to reload the
+**whole** runtime. The old generation remains in the safe panel and displays
+reload progress; a save/request failure leaves the panel open with an error.
+F9 applies the same gate as a fallback. Do not restart UE alone, and keep all
+controls released during the reload.
 
 The visible UE camera receives `SDL_MOUSE_RELATIVE_SPEED_SCALE` at process
 startup. With `x11-mirror`, the same applied scale also changes the mirror gain,
