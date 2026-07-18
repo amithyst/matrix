@@ -151,6 +151,131 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(snapshot.keys.w)
 
 
+class CalibrationModeTest(unittest.TestCase):
+    @staticmethod
+    def snapshot(
+        sequence: int,
+        timestamp: float,
+        keyboard: MODULE.KeyboardMouseSample,
+        gamepad: MODULE.GamepadSample | None = None,
+    ):
+        return MODULE.build_snapshot(
+            sequence=sequence,
+            timestamp_monotonic_s=timestamp,
+            keyboard=keyboard,
+            gamepad=gamepad or MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.0,
+            camera_available=True,
+        )
+
+    def test_active_mode_is_unfocused_and_fully_neutral(self) -> None:
+        keyboard = MODULE.KeyboardMouseSample(
+            w=True,
+            a=True,
+            s=True,
+            d=True,
+            q=True,
+            e=True,
+            v=True,
+            ctrl=True,
+            shift=True,
+            escape=True,
+            mouse_dx=12.0,
+            mouse_dy=-4.0,
+            camera_dragging=True,
+            focused=True,
+            focus_title="Matrix",
+            focus_pid=1234,
+        )
+        gamepad = MODULE.GamepadSample(
+            forward=0.8,
+            right=-0.4,
+            look_yaw=0.6,
+            look_pitch=-0.2,
+            connected=True,
+        )
+
+        neutral_keyboard, neutral_pad = MODULE.apply_calibration_interlock(
+            keyboard, gamepad, active=True
+        )
+        snapshot = self.snapshot(1, 10.0, neutral_keyboard, neutral_pad)
+
+        self.assertFalse(snapshot.focused)
+        self.assertFalse(any(snapshot.keys.to_mapping().values()))
+        self.assertEqual(
+            (snapshot.move_stick.right, snapshot.move_stick.forward), (0.0, 0.0)
+        )
+        self.assertEqual((neutral_keyboard.mouse_dx, neutral_keyboard.mouse_dy), (0.0, 0.0))
+        self.assertFalse(neutral_keyboard.camera_dragging)
+        self.assertFalse(neutral_keyboard.escape)
+        self.assertEqual(neutral_keyboard.focus_title, "Matrix")
+        self.assertEqual(neutral_keyboard.focus_pid, 1234)
+        self.assertFalse(neutral_pad.connected)
+
+    def test_second_escape_exits_after_ue_releases_focus_and_w_must_rearm(self) -> None:
+        controller = MODULE.CalibrationModeController()
+        core = CORE.GameControlCore()
+
+        entered = controller.update(escape_pressed=True, ue_focused=True)
+        self.assertTrue(entered)
+        self.assertTrue(controller.active)
+        keyboard, pad = MODULE.apply_calibration_interlock(
+            MODULE.KeyboardMouseSample(w=True, escape=True, focused=True),
+            MODULE.GamepadSample(),
+            active=controller.active,
+        )
+        core.accept_snapshot(self.snapshot(1, 10.0, keyboard, pad), received_at_s=10.0)
+        self.assertEqual(core.command(now_s=10.0, dt_s=0.01).reason, "focus_lost")
+
+        # Releasing Escape does not toggle.  The cooked UE is allowed to drop
+        # capture/focus while the click-through overlay remains active.
+        self.assertFalse(controller.update(escape_pressed=False, ue_focused=False))
+        self.assertTrue(controller.active)
+        self.assertTrue(controller.update(escape_pressed=True, ue_focused=False))
+        self.assertFalse(controller.active)
+
+        # A held pre-calibration W cannot become motion on focus recovery.
+        core.accept_snapshot(
+            self.snapshot(
+                2,
+                10.01,
+                MODULE.KeyboardMouseSample(w=True, focused=False),
+            ),
+            received_at_s=10.01,
+        )
+        core.accept_snapshot(
+            self.snapshot(
+                3,
+                10.02,
+                MODULE.KeyboardMouseSample(w=True, focused=True),
+            ),
+            received_at_s=10.02,
+        )
+        self.assertEqual(
+            core.command(now_s=10.02, dt_s=0.01).reason, "awaiting_neutral"
+        )
+        core.accept_snapshot(
+            self.snapshot(4, 10.03, MODULE.KeyboardMouseSample(focused=True)),
+            received_at_s=10.03,
+        )
+        self.assertEqual(core.command(now_s=10.03, dt_s=0.01).mode, "idle")
+        core.accept_snapshot(
+            self.snapshot(
+                5,
+                10.04,
+                MODULE.KeyboardMouseSample(w=True, focused=True),
+            ),
+            received_at_s=10.04,
+        )
+        self.assertEqual(core.command(now_s=10.04, dt_s=0.1).mode, "move")
+
+    def test_escape_from_another_application_cannot_enter_calibration(self) -> None:
+        controller = MODULE.CalibrationModeController()
+        self.assertFalse(controller.update(escape_pressed=True, ue_focused=False))
+        self.assertFalse(controller.active)
+
+
 class CameraYawTrackerTest(unittest.TestCase):
     def test_mouse_has_per_frame_priority_over_right_stick(self) -> None:
         tracker = MODULE.CameraYawTracker(
@@ -316,6 +441,66 @@ class CarlaSpectatorCameraTest(unittest.TestCase):
 
 
 class X11KeyboardMouseSafetyTest(unittest.TestCase):
+    def test_teleport_is_rejected_and_rebaselined_without_clamping(self) -> None:
+        samples = iter(
+            (
+                (0, 1 << 8),
+                (200, 1 << 8),
+                (401, 1 << 8),
+                (406, 1 << 8),
+            )
+        )
+
+        class FakeX11:
+            @staticmethod
+            def XQueryKeymap(_display, _buffer) -> int:
+                return 1
+
+            @staticmethod
+            def XQueryPointer(*args) -> int:
+                x, button_mask = next(samples)
+                args[4]._obj.value = x
+                args[5]._obj.value = 0
+                args[8]._obj.value = button_mask
+                return 1
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 1
+        backend._root = 2
+        backend._keycodes = {
+            name: index
+            for index, name in enumerate(MODULE.X11KeyboardMouse._KEYSYMS, start=8)
+        }
+        backend._pressed = lambda _keymap, _code: False
+        backend._focus_pattern = None
+        backend._look_mask = 1 << 8
+        backend._previous_pointer = None
+        backend._previous_look_pressed = False
+        backend._maximum_mouse_delta = 200.0
+        backend._teleport_rejections = 0
+        backend._last_teleport_delta = None
+        backend._expected_ue_pid = 1234
+        backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
+
+        baseline = backend.poll()
+        exact_boundary = backend.poll()
+        teleport = backend.poll()
+        after_rebaseline = backend.poll()
+
+        self.assertEqual(baseline.mouse_dx, 0.0)
+        self.assertEqual(exact_boundary.mouse_dx, 200.0)
+        self.assertEqual(teleport.mouse_dx, 0.0)
+        self.assertEqual(after_rebaseline.mouse_dx, 5.0)
+        self.assertEqual(
+            backend.pointer_telemetry,
+            {
+                "teleport_rejections": 1,
+                "last_teleport_delta": [201, 0],
+                "maximum_mouse_delta_px": 200.0,
+            },
+        )
+
     def test_release_sample_keeps_final_held_drag_delta(self) -> None:
         samples = iter(((0, 1 << 8), (10, 1 << 8), (30, 0)))
 

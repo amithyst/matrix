@@ -609,6 +609,9 @@ else:
                 ),
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
                 "MATRIX_SKIP_ENV_CHECK": "1",
+                # The fixture must not contend with a real Matrix runtime on
+                # the host that happens to execute this integration test.
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
                 "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
                 "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
                 "MATRIX_UE_STARTUP_SECONDS": "0",

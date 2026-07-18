@@ -29,6 +29,7 @@ import re
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -76,6 +77,7 @@ class KeyboardMouseSample:
     v: bool = False
     ctrl: bool = False
     shift: bool = False
+    escape: bool = False
     mouse_dx: float = 0.0
     mouse_dy: float = 0.0
     camera_dragging: bool = False
@@ -105,6 +107,54 @@ class GamepadSample:
     look_yaw: float = 0.0
     look_pitch: float = 0.0
     connected: bool = False
+
+
+class CalibrationModeController:
+    """Toggle a fail-closed calibration mode on focused Escape press edges.
+
+    Escape is deliberately handled outside the wire protocol.  While active,
+    :func:`apply_calibration_interlock` publishes an unfocused, fully neutral
+    snapshot.  The existing control core therefore performs its immediate
+    safe-stop and owns the neutral re-arm sequence when calibration ends.
+    """
+
+    def __init__(self) -> None:
+        self.active = False
+        self._escape_was_down = False
+        self.toggle_count = 0
+
+    def update(self, *, escape_pressed: bool, ue_focused: bool) -> bool:
+        toggled = False
+        if (
+            escape_pressed
+            and not self._escape_was_down
+            and (ue_focused or self.active)
+        ):
+            self.active = not self.active
+            self.toggle_count += 1
+            toggled = True
+        self._escape_was_down = escape_pressed
+        return toggled
+
+
+def apply_calibration_interlock(
+    keyboard: KeyboardMouseSample,
+    gamepad: GamepadSample,
+    *,
+    active: bool,
+) -> tuple[KeyboardMouseSample, GamepadSample]:
+    """Return fully neutral, unfocused physical inputs while calibrating."""
+
+    if not active:
+        return keyboard, gamepad
+    return (
+        KeyboardMouseSample(
+            focused=False,
+            focus_title=keyboard.focus_title,
+            focus_pid=keyboard.focus_pid,
+        ),
+        GamepadSample(),
+    )
 
 
 def select_physical_inputs(
@@ -442,6 +492,7 @@ class X11KeyboardMouse:
         "ctrl_right": 0xFFE4,
         "shift_left": 0xFFE1,
         "shift_right": 0xFFE2,
+        "escape": 0xFF1B,
     }
 
     def __init__(
@@ -490,6 +541,18 @@ class X11KeyboardMouse:
         self._previous_pointer: tuple[int, int] | None = None
         self._previous_look_pressed = False
         self._maximum_mouse_delta = maximum_mouse_delta
+        self._teleport_rejections = 0
+        self._last_teleport_delta: tuple[int, int] | None = None
+
+    @property
+    def pointer_telemetry(self) -> dict[str, object]:
+        return {
+            "teleport_rejections": self._teleport_rejections,
+            "last_teleport_delta": list(self._last_teleport_delta)
+            if self._last_teleport_delta is not None
+            else None,
+            "maximum_mouse_delta_px": self._maximum_mouse_delta,
+        }
 
     def _configure_signatures(self) -> None:
         signatures = {
@@ -688,16 +751,21 @@ class X11KeyboardMouse:
         # pointer motion cannot be separated from drag motion by polling alone.
         if self._previous_look_pressed and pointer is not None:
             if self._previous_pointer is not None:
-                mouse_dx = _clamp(
-                    pointer[0] - self._previous_pointer[0],
-                    -self._maximum_mouse_delta,
-                    self._maximum_mouse_delta,
-                )
-                mouse_dy = _clamp(
-                    pointer[1] - self._previous_pointer[1],
-                    -self._maximum_mouse_delta,
-                    self._maximum_mouse_delta,
-                )
+                raw_dx = pointer[0] - self._previous_pointer[0]
+                raw_dy = pointer[1] - self._previous_pointer[1]
+                # Relative-mode UE windows commonly warp the server cursor to
+                # their centre.  Absolute-coordinate remote desktops can then
+                # reassert the client position, producing a teleport loop.
+                # Saturating that jump (the old behaviour) still injected as
+                # much as 200 px into the mirrored camera yaw.  Reject the
+                # whole discontinuity and use the new position as the next
+                # baseline instead; ordinary in-range motion is unchanged.
+                if max(abs(raw_dx), abs(raw_dy)) > self._maximum_mouse_delta:
+                    self._teleport_rejections += 1
+                    self._last_teleport_delta = (raw_dx, raw_dy)
+                else:
+                    mouse_dx = float(raw_dx)
+                    mouse_dy = float(raw_dy)
         self._previous_pointer = pointer
         self._previous_look_pressed = look_pressed
 
@@ -731,6 +799,7 @@ class X11KeyboardMouse:
             or pressed.get("ctrl_right", False),
             shift=pressed.get("shift_left", False)
             or pressed.get("shift_right", False),
+            escape=pressed.get("escape", False),
             mouse_dx=mouse_dx,
             mouse_dy=mouse_dy,
             camera_dragging=look_pressed and focused,
@@ -969,6 +1038,117 @@ def _atomic_json(path: Path | None, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def _read_json_object(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+class CalibrationOverlaySupervisor:
+    """Own the click-through X11 overlay as a fail-closed provider child."""
+
+    def __init__(
+        self,
+        *,
+        state_file: Path,
+        display_name: str | None,
+        expected_ue_pid: int,
+        script: Path | None = None,
+        python: str = sys.executable,
+        startup_timeout_s: float = 3.0,
+    ) -> None:
+        self.state_file = state_file
+        self.ready_file = state_file.with_name(f".{state_file.name}.overlay-status.json")
+        self.display_name = display_name
+        self.expected_ue_pid = expected_ue_pid
+        self.script = script or Path(__file__).with_name(
+            "matrix_calibration_overlay.py"
+        )
+        self.python = python
+        self.startup_timeout_s = startup_timeout_s
+        self.process: subprocess.Popen[bytes] | None = None
+
+    def start(self) -> None:
+        if not self.script.is_file():
+            raise RuntimeError(f"calibration overlay is missing: {self.script}")
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        for stale in (self.state_file, self.ready_file):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+        _atomic_json(self.state_file, {"version": 1, "active": False})
+        command = [
+            self.python,
+            "-I",
+            "-u",
+            os.fspath(self.script),
+            "--state-file",
+            os.fspath(self.state_file),
+            "--status-file",
+            os.fspath(self.ready_file),
+            "--expected-ue-pid",
+            str(self.expected_ue_pid),
+            "--expected-parent-pid",
+            str(os.getpid()),
+        ]
+        if self.display_name:
+            command.extend(("--display", self.display_name))
+        self.process = subprocess.Popen(
+            command,
+            cwd=self.script.parent.parent,
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + self.startup_timeout_s
+            while time.monotonic() < deadline:
+                code = self.process.poll()
+                if code is not None:
+                    raise RuntimeError(
+                        "calibration overlay exited during startup "
+                        f"with code {code}"
+                    )
+                status = _read_json_object(self.ready_file)
+                if status is not None and status.get("ready") is True:
+                    return
+                time.sleep(0.02)
+            raise RuntimeError("calibration overlay did not become ready in time")
+        except Exception:
+            self.close()
+            raise
+
+    def publish(self, payload: dict[str, object]) -> None:
+        self.ensure_running()
+        _atomic_json(self.state_file, {"version": 1, **payload})
+
+    def ensure_running(self) -> None:
+        if self.process is None:
+            raise RuntimeError("calibration overlay was not started")
+        code = self.process.poll()
+        if code is not None:
+            raise RuntimeError(f"calibration overlay exited with code {code}")
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        try:
+            current = _read_json_object(self.state_file) or {}
+            _atomic_json(self.state_file, {**current, "active": False})
+        except OSError:
+            pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+
+
 def _wait_until_frame(
     now: float,
     deadline: float,
@@ -1065,6 +1245,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gamepad-look-min-pitch-deg", type=float, default=-80.0)
     parser.add_argument("--gamepad-look-max-pitch-deg", type=float, default=60.0)
     parser.add_argument("--status-file", type=Path)
+    parser.add_argument(
+        "--calibration-state-file",
+        type=Path,
+        help=(
+            "Live ESC calibration/overlay state; defaults beside --socket in "
+            "the launcher's private runtime directory"
+        ),
+    )
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print canonical packets; do not connect"
@@ -1119,6 +1307,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--expected-ue-pid must be greater than 1")
     if args.expected_ue_pid is None and not args.dry_run:
         raise SystemExit("--expected-ue-pid is required outside --dry-run")
+    if args.calibration_state_file is not None:
+        if not args.calibration_state_file.is_absolute():
+            raise SystemExit("--calibration-state-file must be an absolute path")
+        if not args.calibration_state_file.parent.is_dir():
+            raise SystemExit(
+                "--calibration-state-file parent does not exist: "
+                f"{args.calibration_state_file.parent}"
+            )
 
 
 def main() -> int:
@@ -1140,6 +1336,16 @@ def main() -> int:
         )
     except (OSError, RuntimeError, re.error) as exc:
         raise SystemExit(f"Matrix game-control input cannot initialize X11: {exc}") from exc
+    overlay: CalibrationOverlaySupervisor | None = None
+    if args.expected_ue_pid is not None:
+        calibration_state_file = args.calibration_state_file or args.socket.with_name(
+            f"{args.socket.name}.calibration.json"
+        )
+        overlay = CalibrationOverlaySupervisor(
+            state_file=calibration_state_file,
+            display_name=args.display,
+            expected_ue_pid=args.expected_ue_pid,
+        )
     gamepad = LinuxJoystick(
         args.gamepad,
         left_x_axis=args.gamepad_left_x_axis,
@@ -1169,6 +1375,7 @@ def main() -> int:
             maximum_pitch_rad=math.radians(args.gamepad_look_max_pitch_deg),
         )
     publisher = None if args.dry_run else UnixSeqpacketPublisher(args.socket)
+    calibration = CalibrationModeController()
 
     running = True
 
@@ -1193,7 +1400,11 @@ def main() -> int:
     exit_reason = "unknown"
     return_code = 0
     previous_gamepad_connected: bool | None = None
+    next_overlay_heartbeat = started
+    last_teleport_rejections = 0
     try:
+        if overlay is not None:
+            overlay.start()
         while running:
             now = time.monotonic()
             if args.max_seconds > 0.0 and now - started >= args.max_seconds:
@@ -1211,9 +1422,40 @@ def main() -> int:
             previous_frame = now
             next_frame = max(next_frame + 1.0 / args.rate_hz, now)
 
-            keyboard = x11.poll()
-            last_keyboard = keyboard
-            pad = gamepad.poll(now)
+            raw_keyboard = x11.poll()
+            last_keyboard = raw_keyboard
+            raw_pad = gamepad.poll(now)
+            calibration_toggled = calibration.update(
+                escape_pressed=raw_keyboard.escape,
+                ue_focused=raw_keyboard.focused,
+            )
+            keyboard, pad = apply_calibration_interlock(
+                raw_keyboard,
+                raw_pad,
+                active=calibration.active,
+            )
+            pointer_telemetry = x11.pointer_telemetry
+            teleport_rejections = int(pointer_telemetry["teleport_rejections"])
+            if overlay is not None:
+                overlay.ensure_running()
+                if (
+                    calibration_toggled
+                    or teleport_rejections != last_teleport_rejections
+                    or now >= next_overlay_heartbeat
+                ):
+                    overlay.publish(
+                        {
+                            "active": calibration.active,
+                            "toggle_count": calibration.toggle_count,
+                            "updated_monotonic_s": now,
+                            "expected_ue_pid": args.expected_ue_pid,
+                            "raw_ue_focused": raw_keyboard.focused,
+                            "snapshot_forced_unfocused": calibration.active,
+                            "pointer": pointer_telemetry,
+                        }
+                    )
+                    next_overlay_heartbeat = now + 1.0
+            last_teleport_rejections = teleport_rejections
             input_available = gamepad_input_available(
                 input_source,
                 connected=pad.connected,
@@ -1318,6 +1560,9 @@ def main() -> int:
                 "gamepad": gamepad.path,
                 "focus": {
                     "expected_ue_pid": args.expected_ue_pid,
+                    "raw_ue_focused": last_keyboard.focused
+                    if last_keyboard is not None
+                    else False,
                     "actual_pid": last_keyboard.focus_pid
                     if last_keyboard is not None
                     else None,
@@ -1325,12 +1570,23 @@ def main() -> int:
                     if last_keyboard is not None
                     else None,
                 },
+                "calibration": {
+                    "active": calibration.active,
+                    "toggle_count": calibration.toggle_count,
+                    "snapshot_forced_unfocused": calibration.active,
+                    "state_file": os.fspath(overlay.state_file)
+                    if overlay is not None
+                    else None,
+                },
+                "pointer": x11.pointer_telemetry,
                 "last_snapshot": last_snapshot.to_mapping()
                 if last_snapshot is not None
                 else None,
             },
         )
         gamepad.close()
+        if overlay is not None:
+            overlay.close()
         x11.close()
         if publisher is not None:
             publisher.close()
