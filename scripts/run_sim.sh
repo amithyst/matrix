@@ -594,6 +594,32 @@ case "${MATRIX_SONIC,,}" in
         ;;
 esac
 
+if $MATRIX_SONIC_ENABLED \
+    && [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]] \
+    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+    if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "fixed" ]]; then
+        echo "[ERROR] Qualified game control rejects a fixed camera yaw source" >&2
+        exit 1
+    fi
+    if [[ -n "${MATRIX_GAME_INPUT_PYTHON:-}" \
+        && "${MATRIX_GAME_INPUT_PYTHON}" != "${MATRIX_SONIC_PYTHON:-}" ]]; then
+        echo "[ERROR] Qualified game control requires MATRIX_GAME_INPUT_PYTHON to match the verified runtime Python" >&2
+        exit 1
+    fi
+    GAME_NO_INPUT_PROVIDER_VALUE="${MATRIX_GAME_NO_INPUT_PROVIDER:-0}"
+    case "${GAME_NO_INPUT_PROVIDER_VALUE,,}" in
+        1|true|yes|on)
+            echo "[ERROR] Qualified game control requires the supervised input provider" >&2
+            exit 1
+            ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_GAME_NO_INPUT_PROVIDER must be a boolean" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 sed -i "s/^robot: .*/robot: \"$ROBOTTYPE\"/" src/robot_mujoco/simulate/config.yaml
 
 #######################################
@@ -758,6 +784,7 @@ if $MATRIX_SONIC_ENABLED; then
     MATRIX_SONIC_CANONICAL_MESHES="${MATRIX_SONIC_CANONICAL_MESHES:-$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/meshes}"
     for required in \
         "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
+        "$PROJECT_ROOT/scripts/matrix_game_control.py" \
         "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
         "$MATRIX_SONIC_ROOT/gear_sonic/scripts/run_sim_loop.py" \
         "$MATRIX_SONIC_ROOT/gear_sonic/utils/mujoco_sim/base_sim.py" \
@@ -769,6 +796,11 @@ if $MATRIX_SONIC_ENABLED; then
             exit 1
         fi
     done
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" \
+        && ! -f "$PROJECT_ROOT/scripts/matrix_game_control_input.py" ]]; then
+        echo "[ERROR] Matrix game-control input provider is missing: $PROJECT_ROOT/scripts/matrix_game_control_input.py" >&2
+        exit 1
+    fi
     if [[ ! -d "$MATRIX_SONIC_CANONICAL_MESHES" ]]; then
         echo "[ERROR] Canonical SONIC G1 meshes are missing: $MATRIX_SONIC_CANONICAL_MESHES" >&2
         exit 1
@@ -782,6 +814,10 @@ if $MATRIX_SONIC_ENABLED; then
         --output-dir "$SONIC_PHYSICS_DIR"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
+    GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+        rm -f -- "$GAME_INPUT_STATUS_FILE"
+    fi
     SONIC_STARTUP_ARGS=()
     SONIC_STARTUP_BAND_VALUE="${MATRIX_SONIC_STARTUP_BAND:-1}"
     case "${SONIC_STARTUP_BAND_VALUE,,}" in
@@ -818,6 +854,49 @@ if $MATRIX_SONIC_ENABLED; then
         )
     fi
     echo "[INFO] Starting native gear_sonic MuJoCo/DDS runtime"
+    GAME_INPUT_PROVIDER_PYTHON="${MATRIX_GAME_INPUT_PYTHON:-$MATRIX_SONIC_PYTHON}"
+    if [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" \
+        && "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+        GAME_INPUT_PROVIDER_PYTHON="$MATRIX_SONIC_PYTHON"
+    fi
+    GAME_INPUT_ARGS=(
+        --game-input-socket "${MATRIX_GAME_INPUT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}.sock}"
+        --game-input-provider "$PROJECT_ROOT/scripts/matrix_game_control_input.py"
+        --game-input-provider-python "$GAME_INPUT_PROVIDER_PYTHON"
+        --game-input-source "${MATRIX_GAME_INPUT_SOURCE:-auto}"
+        --game-camera-yaw-source "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}"
+        --game-look-button "${MATRIX_GAME_LOOK_BUTTON:-left}"
+        --game-initial-camera-yaw-deg "${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
+        --game-mouse-sensitivity-deg "${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
+        --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
+        --game-camera-yaw-offset-deg "${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
+        --game-carla-host "${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
+        --game-carla-port "${MATRIX_GAME_CARLA_PORT:-2000}"
+        --gamepad-look-yaw-rate-deg-s "${MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S:-120.0}"
+        --gamepad-look-pitch-rate-deg-s "${MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S:-90.0}"
+        --gamepad-look-deadzone "${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
+        --gamepad-look-min-pitch-deg "${MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG:--80.0}"
+        --gamepad-look-max-pitch-deg "${MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG:-60.0}"
+        --game-focus-title "${MATRIX_GAME_FOCUS_TITLE:-(zsibot|matrix|unreal)}"
+        --game-input-status-file "$GAME_INPUT_STATUS_FILE"
+        --game-max-speed "${MATRIX_GAME_MAX_SPEED:-0.30}"
+        --game-max-acceleration "${MATRIX_GAME_MAX_ACCELERATION:-1.20}"
+        --game-max-deceleration "${MATRIX_GAME_MAX_DECELERATION:-2.40}"
+        --game-max-turn-rate "${MATRIX_GAME_MAX_TURN_RATE:-2.50}"
+        --game-stick-deadzone "${MATRIX_GAME_STICK_DEADZONE:-0.15}"
+        --game-input-timeout "${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
+        --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
+        --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
+    )
+    GAME_NO_INPUT_PROVIDER_VALUE="${MATRIX_GAME_NO_INPUT_PROVIDER:-0}"
+    case "${GAME_NO_INPUT_PROVIDER_VALUE,,}" in
+        1|true|yes|on) GAME_INPUT_ARGS+=(--no-game-input-provider) ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_GAME_NO_INPUT_PROVIDER must be a boolean" >&2
+            exit 1
+            ;;
+    esac
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         --model "$SONIC_PHYSICS_DIR/$SCENE" \
         --sonic-root "$MATRIX_SONIC_ROOT" \
@@ -842,6 +921,7 @@ if $MATRIX_SONIC_ENABLED; then
         "${SONIC_STARTUP_ARGS[@]}" \
         --startup-band-hold "${MATRIX_SONIC_STARTUP_BAND_HOLD:-4}" \
         --startup-band-fade "${MATRIX_SONIC_STARTUP_BAND_FADE:-3}" \
+        "${GAME_INPUT_ARGS[@]}" \
         --status-file "$SONIC_STATUS_FILE" \
         > "$PROJECT_ROOT/outputs/logs/matrix_sonic_runtime.log" 2>&1 &
     SONIC_PID=$!

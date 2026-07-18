@@ -47,7 +47,8 @@ bash scripts/check_env.sh runtime
 *Full offline package: [matrix_0.1.2.zip (Artifactory)](http://192.168.50.40:8081/artifactory/jszrsim/github/matrix_0.1.2.zip) / [Google Drive](https://drive.google.com/file/d/1d4q28AgSwmfv7x07oE-YF8xVOdSva9ll/view?usp=drive_link) / [Baidu Netdisk, code: `jbk3`](https://pan.baidu.com/s/12k5XJwD53ax3we3_1Gulmw?pwd=jbk3).*
 *See [Chunk Packages Guide](docs/CHUNK_PACKAGES_GUIDE.md) for offline/manual installation.*
 
-For the locked native G1 SONIC runtime shared by ZZA, Heyuan, and TRNA, use the
+For the locked native G1 SONIC runtime used by the Heyuan primary and TRNA/ZZA
+backup profiles, use the
 [multi-host runbook](docs/runbook.md). Matrix calls the pinned original
 `gear_sonic` simulator/DDS stack directly; Git-managed source is separated from
 SHA-verified private runtime artifacts behind one bootstrap/preflight path.
@@ -68,7 +69,8 @@ To keep this README concise, detailed guides have been organized into the `docs/
 
 **Basics & Setup**
 - [📦 Chunk Packages Guide](docs/CHUNK_PACKAGES_GUIDE.md) - Modular package deployment & offline install
-- [🎮 Controller Guide](docs/Controller_Guide.md) - Gamepad & Keyboard control mappings
+- [🎮 Controller Guide](docs/Controller_Guide.md) - Native and camera-relative game-control mappings
+- [Matrix Camera-Relative Control Runbook](docs/MATRIX_GAME_CONTROL_RUNBOOK.md) - Heyuan calibration, deadman tests, and cooked-camera limits
 - [🛠️ Scripts Guide](docs/Scripts_Guide.md) - Detailed CLI scripts usage
 
 **Simulation & Customization**

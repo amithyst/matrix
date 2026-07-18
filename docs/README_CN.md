@@ -44,7 +44,8 @@ bash scripts/check_env.sh runtime
 *`scripts/run_sim.sh` 和 `scripts/run_custom_urdf.sh` 在启动前会自动执行运行时环境检查。*
 *如果 ROS apt 源访问受限，可使用 `ROS_APT_REPO_URL=<可访问的ros2 apt镜像> bash scripts/install_deps.sh` 指定镜像后重试。*
 
-ZZA、河源与 TRNA 共享的原生 G1 SONIC 锁定运行时、Git 同步和一键预检流程见
+河源主开发机以及 TRNA/ZZA 备份 profile 使用的原生 G1 SONIC 锁定运行时、Git 管理和
+一键预检流程见
 [多机运行手册](runbook.md)。Matrix 直接调用锁定提交的原始 `gear_sonic`
 仿真/DDS 栈；源码由 Git 管理，大模型和引擎由 SHA256 清单管理。
 *如果网络环境下 aria2/wget 出现 TLS 错误，可使用 `SKIP_ARIA2=1 bash scripts/release_manager/install_chunks.sh 0.1.2` 强制走备用下载路径。*
@@ -67,7 +68,8 @@ ZZA、河源与 TRNA 共享的原生 G1 SONIC 锁定运行时、Git 同步和一
 
 **基础与设置**
 - [📦 分块包部署指南](CHUNK_PACKAGES_GUIDE_CN.md) - 模块化打包部署与离线安装说明
-- [🎮 遥控器说明](Controller_Guide_CN.md) - 手柄与键盘控制快捷键映射
+- [🎮 遥控器说明](Controller_Guide_CN.md) - 原生与相机相对控制按键语义
+- [Matrix 相机相对二游式控制运行手册](MATRIX_GAME_CONTROL_RUNBOOK_CN.md) - 河源标定、deadman 验收与 cooked 相机边界
 - [🛠️ 脚本使用指南](Scripts_Guide_CN.md) - 构建、运行与发布脚本的详细说明
 
 **仿真与自定义**

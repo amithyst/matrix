@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ SPEC = importlib.util.spec_from_file_location("run_matrix_sonic", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+GAME_CONTROL = sys.modules["matrix_game_control"]
 
 
 class MatrixSonicRuntimeTest(unittest.TestCase):
@@ -57,6 +59,43 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             elastic_band_scale=elastic_band_scale,
         )
 
+    @classmethod
+    def snapshot_with_yaw(cls, yaw_rad: float, **kwargs) -> SimpleNamespace:
+        snapshot = cls.snapshot(**kwargs)
+        snapshot.qpos[3] = math.cos(yaw_rad / 2.0)
+        snapshot.qpos[6] = math.sin(yaw_rad / 2.0)
+        return snapshot
+
+    @staticmethod
+    def game_input_snapshot(
+        sequence: int,
+        timestamp_monotonic_s: float,
+        *,
+        w: bool = False,
+        camera_yaw_rad: float = 0.0,
+    ):
+        return GAME_CONTROL.InputSnapshot.from_mapping(
+            {
+                "protocol": GAME_CONTROL.PROTOCOL_NAME,
+                "sequence": sequence,
+                "timestamp_monotonic_s": timestamp_monotonic_s,
+                "focused": True,
+                "camera_yaw_rad": camera_yaw_rad,
+                "keys": {
+                    "w": w,
+                    "a": False,
+                    "s": False,
+                    "d": False,
+                    "q": False,
+                    "e": False,
+                    "v": False,
+                    "ctrl": False,
+                    "shift": False,
+                },
+                "move_stick": {"right": 0.0, "forward": 0.0},
+            }
+        )
+
     @staticmethod
     def process_is_running(pid: int) -> bool:
         try:
@@ -83,6 +122,402 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
+
+    def test_root_yaw_uses_normalized_mujoco_wxyz_quaternion(self) -> None:
+        half = math.pi / 4.0
+        qpos = [
+            0.0,
+            0.0,
+            0.0,
+            2.0 * math.cos(half),
+            0.0,
+            0.0,
+            2.0 * math.sin(half),
+        ]
+        self.assertAlmostEqual(MODULE._root_yaw_rad(qpos), math.pi / 2.0)
+        with self.assertRaisesRegex(ValueError, "zero"):
+            MODULE._root_yaw_rad([0.0] * 7)
+
+    def test_heading_anchor_captures_only_first_fresh_lowcmd_edge(self) -> None:
+        initial = self.snapshot_with_yaw(
+            0.25,
+            step_index=3,
+            sim_time=0.015,
+            low_cmd_fresh=False,
+        )
+        telemetry = MODULE._HeadingAnchorTelemetry(0.25, initial)
+        self.assertIsNone(
+            telemetry.status_fields()["root_yaw_first_fresh_lowcmd_rad"]
+        )
+
+        still_stale = self.snapshot_with_yaw(
+            0.30,
+            step_index=4,
+            sim_time=0.020,
+            low_cmd_fresh=False,
+        )
+        self.assertFalse(telemetry.observe(still_stale, wall_elapsed_s=0.10))
+        first_fresh = self.snapshot_with_yaw(
+            0.40,
+            step_index=5,
+            sim_time=0.025,
+            low_cmd_fresh=True,
+        )
+        self.assertTrue(telemetry.observe(first_fresh, wall_elapsed_s=0.125))
+        captured = telemetry.status_fields()
+        self.assertEqual(captured["heading_anchor_source"], "initial_snapshot")
+        self.assertEqual(captured["root_yaw_initial_rad"], 0.25)
+        self.assertEqual(captured["root_yaw_first_fresh_lowcmd_rad"], 0.4)
+        self.assertEqual(captured["root_yaw_startup_delta_rad"], 0.15)
+        self.assertEqual(captured["first_fresh_lowcmd_step_index"], 5)
+        self.assertEqual(captured["first_fresh_lowcmd_sim_time_s"], 0.025)
+        self.assertEqual(captured["first_fresh_lowcmd_wall_elapsed_s"], 0.125)
+
+        stale_again = self.snapshot_with_yaw(
+            1.0,
+            step_index=6,
+            sim_time=0.030,
+            low_cmd_fresh=False,
+        )
+        fresh_again = self.snapshot_with_yaw(
+            1.2,
+            step_index=7,
+            sim_time=0.035,
+            low_cmd_fresh=True,
+        )
+        self.assertFalse(telemetry.observe(stale_again, wall_elapsed_s=0.15))
+        self.assertFalse(telemetry.observe(fresh_again, wall_elapsed_s=0.175))
+        self.assertEqual(telemetry.status_fields(), captured)
+
+    def test_heading_anchor_records_initially_fresh_snapshot_explicitly(self) -> None:
+        initial = self.snapshot_with_yaw(
+            -0.75,
+            step_index=12,
+            sim_time=0.06,
+            low_cmd_fresh=True,
+        )
+        telemetry = MODULE._HeadingAnchorTelemetry(-0.75, initial)
+
+        self.assertEqual(
+            telemetry.status_fields(),
+            {
+                "heading_anchor_source": "initial_snapshot",
+                "root_yaw_initial_rad": -0.75,
+                "root_yaw_first_fresh_lowcmd_rad": -0.75,
+                "root_yaw_startup_delta_rad": 0.0,
+                "first_fresh_lowcmd_step_index": 12,
+                "first_fresh_lowcmd_sim_time_s": 0.06,
+                "first_fresh_lowcmd_wall_elapsed_s": 0.0,
+            },
+        )
+
+    def test_heading_anchor_startup_delta_wraps_across_pi(self) -> None:
+        initial_yaw = math.pi - 0.05
+        telemetry = MODULE._HeadingAnchorTelemetry(
+            initial_yaw,
+            self.snapshot_with_yaw(initial_yaw, low_cmd_fresh=False),
+        )
+        fresh_yaw = -math.pi + 0.05
+        telemetry.observe(
+            self.snapshot_with_yaw(
+                fresh_yaw,
+                step_index=1,
+                sim_time=0.005,
+                low_cmd_fresh=True,
+            ),
+            wall_elapsed_s=0.02,
+        )
+
+        self.assertAlmostEqual(
+            telemetry.status_fields()["root_yaw_startup_delta_rad"], 0.1
+        )
+
+    def test_heading_anchor_telemetry_does_not_change_control_command(self) -> None:
+        core = GAME_CONTROL.GameControlCore(
+            GAME_CONTROL.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+        initial_yaw = 0.5
+        current_yaw = 0.75
+        measured_heading = GAME_CONTROL.wrap_angle_rad(current_yaw - initial_yaw)
+        core.synchronize_heading(measured_heading)
+
+        def input_snapshot(sequence: int, timestamp: float, *, w: bool):
+            return GAME_CONTROL.InputSnapshot.from_mapping(
+                {
+                    "protocol": GAME_CONTROL.PROTOCOL_NAME,
+                    "sequence": sequence,
+                    "timestamp_monotonic_s": timestamp,
+                    "focused": True,
+                    "camera_yaw_rad": 0.4,
+                    "keys": {
+                        "w": w,
+                        "a": False,
+                        "s": False,
+                        "d": False,
+                        "q": False,
+                        "e": False,
+                        "v": False,
+                        "ctrl": False,
+                        "shift": False,
+                    },
+                    "move_stick": {"right": 0.0, "forward": 0.0},
+                }
+            )
+
+        core.accept_snapshot(input_snapshot(1, 10.0, w=False), received_at_s=10.0)
+        self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "idle")
+        core.accept_snapshot(input_snapshot(2, 10.01, w=True), received_at_s=10.01)
+        heading_before_telemetry = core.heading_rad
+
+        telemetry = MODULE._HeadingAnchorTelemetry(
+            initial_yaw,
+            self.snapshot_with_yaw(initial_yaw, low_cmd_fresh=False),
+        )
+        telemetry.observe(
+            self.snapshot_with_yaw(
+                current_yaw,
+                step_index=4,
+                sim_time=0.02,
+                low_cmd_fresh=True,
+            ),
+            wall_elapsed_s=0.1,
+        )
+
+        self.assertAlmostEqual(core.heading_rad, heading_before_telemetry)
+        command = core.command(now_s=10.01, dt_s=0.1)
+        self.assertEqual(command.mode, "move")
+        self.assertAlmostEqual(command.movement[0], math.cos(0.4))
+        self.assertAlmostEqual(command.movement[1], math.sin(0.4))
+
+        source_lines = [
+            line.strip()
+            for line in SCRIPT_PATH.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(
+            source_lines.count(
+                "status.update(heading_anchor_telemetry.status_fields())"
+            ),
+            1,
+        )
+        self.assertEqual(
+            source_lines.count(
+                "final_status.update(heading_anchor_telemetry.status_fields())"
+            ),
+            1,
+        )
+
+    def test_game_control_waits_for_fresh_lowcmd_and_released_startup_band(
+        self,
+    ) -> None:
+        core = GAME_CONTROL.GameControlCore(
+            GAME_CONTROL.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+        startup = self.snapshot(low_cmd_fresh=False, elastic_band_scale=1.0)
+        gate = MODULE._GameSonicReadinessGate(startup)
+
+        def command_for(
+            sonic_snapshot: SimpleNamespace,
+            input_sequence: int,
+            now_s: float,
+            *,
+            w: bool,
+        ):
+            gate.begin_frame(sonic_snapshot, core)
+            core.accept_snapshot(
+                self.game_input_snapshot(input_sequence, now_s, w=w),
+                received_at_s=now_s,
+            )
+            return gate.apply(core.command(now_s=now_s, dt_s=0.02), core)
+
+        startup_stop = command_for(startup, 1, 10.0, w=False)
+        self.assertEqual(startup_stop.reason, "sonic_not_ready")
+        self.assertTrue(startup_stop.safe_stop)
+        self.assertEqual(startup_stop.speed_mps, 0.0)
+
+        # A fresh LowCmd is not sufficient while the startup restraint still
+        # has a material scale. Holding W during this phase stays hard-zero.
+        band_fading = self.snapshot(
+            low_cmd_fresh=True,
+            elastic_band_scale=(
+                2.0 * MODULE._GameSonicReadinessGate.ELASTIC_BAND_ZERO_ABS_TOL
+            ),
+        )
+        fading_stop = command_for(band_fading, 2, 10.01, w=True)
+        self.assertEqual(fading_stop.reason, "sonic_not_ready")
+        self.assertEqual(fading_stop.speed_mps, 0.0)
+
+        # Near-zero is considered released, but W held across readiness cannot
+        # bypass the core's neutral re-arm latch.
+        ready = self.snapshot(
+            low_cmd_fresh=True,
+            elastic_band_scale=(
+                0.5 * MODULE._GameSonicReadinessGate.ELASTIC_BAND_ZERO_ABS_TOL
+            ),
+        )
+        held_at_release = command_for(ready, 3, 10.02, w=True)
+        self.assertEqual(held_at_release.reason, "awaiting_neutral")
+        self.assertEqual(held_at_release.speed_mps, 0.0)
+
+        self.assertEqual(command_for(ready, 4, 10.03, w=False).mode, "idle")
+        moving = command_for(ready, 5, 10.04, w=True)
+        self.assertEqual(moving.mode, "move")
+        self.assertGreater(moving.speed_mps, 0.0)
+
+    def test_game_control_lowcmd_dropout_requires_neutral_after_recovery(
+        self,
+    ) -> None:
+        core = GAME_CONTROL.GameControlCore(
+            GAME_CONTROL.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+        ready = self.snapshot(low_cmd_fresh=True, elastic_band_scale=0.0)
+        gate = MODULE._GameSonicReadinessGate(ready)
+
+        def command_for(
+            sonic_snapshot: SimpleNamespace,
+            input_sequence: int,
+            now_s: float,
+            *,
+            w: bool,
+        ):
+            gate.begin_frame(sonic_snapshot, core)
+            core.accept_snapshot(
+                self.game_input_snapshot(input_sequence, now_s, w=w),
+                received_at_s=now_s,
+            )
+            return gate.apply(core.command(now_s=now_s, dt_s=0.02), core)
+
+        self.assertEqual(command_for(ready, 1, 20.0, w=False).mode, "idle")
+        self.assertEqual(command_for(ready, 2, 20.01, w=True).mode, "move")
+
+        stale = self.snapshot(low_cmd_fresh=False, elastic_band_scale=0.0)
+        with mock.patch.object(
+            core, "invalidate_input", wraps=core.invalidate_input
+        ) as invalidate_input:
+            dropped = command_for(stale, 3, 20.02, w=True)
+        self.assertEqual(
+            invalidate_input.call_args_list,
+            [mock.call("low_cmd_stale"), mock.call("sonic_not_ready")],
+        )
+        self.assertEqual(dropped.reason, "sonic_not_ready")
+        self.assertEqual(dropped.speed_mps, 0.0)
+
+        # The provider keeps reporting W, but fresh LowCmd recovery alone must
+        # not restart locomotion. A neutral frame is required first.
+        held_after_recovery = command_for(ready, 4, 20.03, w=True)
+        self.assertEqual(held_after_recovery.reason, "awaiting_neutral")
+        self.assertEqual(held_after_recovery.speed_mps, 0.0)
+        self.assertEqual(command_for(ready, 5, 20.04, w=False).mode, "idle")
+        resumed = command_for(ready, 6, 20.05, w=True)
+        self.assertEqual(resumed.mode, "move")
+        self.assertGreater(resumed.speed_mps, 0.0)
+
+    def test_not_ready_batch_neutral_then_w_cannot_prearm_recovery(self) -> None:
+        core = GAME_CONTROL.GameControlCore(
+            GAME_CONTROL.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+        stale = self.snapshot(low_cmd_fresh=False, elastic_band_scale=0.0)
+        gate = MODULE._GameSonicReadinessGate(stale)
+        core.synchronize_heading(0.0)
+        gate.begin_frame(stale, core)
+
+        # Model two packets drained in one control poll: neutral first clears
+        # the core latch, then held W becomes the latest snapshot.
+        core.accept_snapshot(
+            self.game_input_snapshot(1, 30.0, w=False),
+            received_at_s=30.0,
+        )
+        core.accept_snapshot(
+            self.game_input_snapshot(
+                2,
+                30.001,
+                w=True,
+                camera_yaw_rad=math.pi / 2.0,
+            ),
+            received_at_s=30.001,
+        )
+        candidate = core.command(now_s=30.001, dt_s=0.02)
+        stopped = gate.apply(candidate, core)
+        self.assertEqual(stopped.reason, "sonic_not_ready")
+        self.assertEqual(stopped.speed_mps, 0.0)
+        self.assertAlmostEqual(stopped.facing[0], 1.0)
+        self.assertAlmostEqual(stopped.facing[1], 0.0)
+        self.assertAlmostEqual(core.heading_rad, 0.0)
+
+        ready = self.snapshot(low_cmd_fresh=True, elastic_band_scale=0.0)
+        gate.begin_frame(ready, core)
+        core.accept_snapshot(
+            self.game_input_snapshot(3, 30.02, w=True),
+            received_at_s=30.02,
+        )
+        recovered = gate.apply(
+            core.command(now_s=30.02, dt_s=0.02),
+            core,
+        )
+        self.assertEqual(recovered.reason, "awaiting_neutral")
+        self.assertEqual(recovered.speed_mps, 0.0)
+
+        core.accept_snapshot(
+            self.game_input_snapshot(4, 30.03, w=False),
+            received_at_s=30.03,
+        )
+        neutral = gate.apply(
+            core.command(now_s=30.03, dt_s=0.02),
+            core,
+        )
+        self.assertEqual(neutral.mode, "idle")
+        self.assertAlmostEqual(neutral.facing[0], 1.0)
+        self.assertAlmostEqual(neutral.facing[1], 0.0)
+
+    def test_readiness_and_snapshot_validation_reject_non_boolean_freshness(
+        self,
+    ) -> None:
+        for invalid in (1, "false", None):
+            with self.subTest(invalid=invalid):
+                snapshot = self.snapshot(low_cmd_fresh=invalid)
+                self.assertFalse(
+                    MODULE._GameSonicReadinessGate.snapshot_ready(snapshot)
+                )
+                self.assertEqual(
+                    MODULE._snapshot_validation_error(snapshot),
+                    f"snapshot_invalid_low_cmd_fresh:{invalid!r}",
+                )
+        for invalid in (0, "0", "0.0", True):
+            with self.subTest(invalid_elastic_band=invalid):
+                snapshot = self.snapshot(
+                    low_cmd_fresh=True,
+                    elastic_band_scale=invalid,
+                )
+                self.assertFalse(
+                    MODULE._GameSonicReadinessGate.snapshot_ready(snapshot)
+                )
+                self.assertEqual(
+                    MODULE._snapshot_validation_error(snapshot),
+                    f"snapshot_invalid_elastic_band_scale:{invalid!r}",
+                )
 
     def test_absolute_physics_pacing_compensates_sleep_overshoot(self) -> None:
         with mock.patch.object(
@@ -160,6 +595,110 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             ):
                 MODULE._validate_qualified_acceptance(SimpleNamespace(**values))
 
+    def test_qualified_game_rejects_provider_bypass_and_fixed_camera(self) -> None:
+        valid = SimpleNamespace(
+            qualified_runtime=True,
+            control_source="game",
+            no_game_input_provider=False,
+            game_camera_yaw_source="x11-mirror",
+            game_look_button="right",
+            game_focus_title="matrix",
+            ue_pid=4242,
+            game_mouse_sensitivity_deg=0.12,
+            game_input_provider=REPO_ROOT / "scripts/matrix_game_control_input.py",
+            game_input_provider_python=sys.executable,
+        )
+        MODULE._validate_qualified_game_control(valid)
+
+        bypass = SimpleNamespace(**vars(valid))
+        bypass.no_game_input_provider = True
+        with self.assertRaisesRegex(SystemExit, "supervised input provider"):
+            MODULE._validate_qualified_game_control(bypass)
+
+        fixed = SimpleNamespace(**vars(valid))
+        fixed.game_camera_yaw_source = "fixed"
+        with self.assertRaisesRegex(SystemExit, "fixed camera yaw"):
+            MODULE._validate_qualified_game_control(fixed)
+
+        fixed.qualified_runtime = False
+        MODULE._validate_qualified_game_control(fixed)
+
+        wrong_script = SimpleNamespace(**vars(valid))
+        wrong_script.game_input_provider = REPO_ROOT / "scripts/run_matrix_sonic.py"
+        with self.assertRaisesRegex(SystemExit, "bundled input provider"):
+            MODULE._validate_qualified_game_control(wrong_script)
+
+        wrong_python = SimpleNamespace(**vars(valid))
+        wrong_python.game_input_provider_python = "/tmp/unverified-python"
+        with self.assertRaisesRegex(SystemExit, "verified runtime Python"):
+            MODULE._validate_qualified_game_control(wrong_python)
+
+        zero_sensitivity = SimpleNamespace(**vars(valid))
+        zero_sensitivity.game_mouse_sensitivity_deg = 0.0
+        with self.assertRaisesRegex(SystemExit, "positive mouse sensitivity"):
+            MODULE._validate_qualified_game_control(zero_sensitivity)
+
+    def test_game_control_status_records_camera_claim_and_calibration(self) -> None:
+        args = SimpleNamespace(
+            game_input_source="auto",
+            game_max_speed=0.30,
+            game_max_acceleration=1.20,
+            game_max_deceleration=2.40,
+            game_max_turn_rate=2.50,
+            game_stick_deadzone=0.15,
+            game_input_timeout=0.15,
+            game_max_snapshot_age=0.15,
+            game_max_future_skew=0.05,
+            game_camera_yaw_source="x11-mirror",
+            game_look_button="right",
+            game_focus_title="matrix",
+            ue_pid=4242,
+            game_camera_yaw_sign=-1,
+            game_camera_yaw_offset_deg=90.0,
+            game_initial_camera_yaw_deg=5.0,
+            game_mouse_sensitivity_deg=0.12,
+            game_carla_host="127.0.0.2",
+            game_carla_port=2100,
+            gamepad_look_yaw_rate_deg_s=140.0,
+            gamepad_look_pitch_rate_deg_s=95.0,
+            gamepad_look_deadzone=0.13,
+            gamepad_look_min_pitch_deg=-70.0,
+            gamepad_look_max_pitch_deg=50.0,
+        )
+
+        status = MODULE._game_control_status_fields(args)
+
+        self.assertEqual(status["input_source_requested"], "auto")
+        self.assertEqual(status["input_protocol"], "matrix-game-input/v2")
+        self.assertEqual(status["input_source_effective"], "keyboard")
+        self.assertEqual(status["camera_yaw_source"], "x11-mirror")
+        self.assertEqual(status["camera_look_button"], "right")
+        self.assertEqual(status["expected_ue_pid"], 4242)
+        self.assertEqual(
+            status["camera_yaw_observation"],
+            "configured_pointer_delta_mirror",
+        )
+        self.assertEqual(status["native_gait"], "SLOW_WALK")
+        self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
+        self.assertEqual(status["keyboard_walk_speed_mps"], 0.20)
+        self.assertEqual(status["keyboard_run_speed_mps"], 0.30)
+        self.assertEqual(status["maximum_acceleration_mps2"], 1.20)
+        self.assertEqual(status["maximum_deceleration_mps2"], 2.40)
+        self.assertEqual(status["maximum_turn_rate_rad_s"], 2.50)
+        self.assertEqual(status["stick_deadzone"], 0.15)
+        self.assertEqual(status["input_timeout_s"], 0.15)
+        self.assertEqual(status["camera_yaw_sign"], -1)
+        self.assertEqual(status["camera_yaw_offset_deg"], 90.0)
+        self.assertEqual(status["mouse_sensitivity_deg_per_px"], 0.12)
+        self.assertEqual(status["carla_host"], "127.0.0.2")
+        self.assertEqual(status["carla_port"], 2100)
+        self.assertFalse(status["visible_follow_camera_verified"])
+        self.assertTrue(status["external_visual_evidence_required"])
+        self.assertEqual(
+            status["qualification_scope"],
+            "runtime_input_and_motion_path_only",
+        )
+
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
         failures = MODULE._acceptance_failures(
             unstable=False,
@@ -191,6 +730,48 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 min_rtf=0.0,
             ),
             [],
+        )
+
+    def test_qualified_game_acceptance_requires_clean_exercised_input(self) -> None:
+        self.assertEqual(
+            MODULE._game_input_acceptance_failures(
+                accepted_connections=1,
+                packets_applied=10,
+                moving_command_frames=5,
+                protocol_errors=0,
+                rejected_packets=0,
+                peer_pid_mismatches=0,
+                connected_at_boundary=True,
+                input_age_s=0.05,
+                maximum_boundary_age_s=0.17,
+                safe_stop_at_boundary=False,
+            ),
+            [],
+        )
+        self.assertEqual(
+            MODULE._game_input_acceptance_failures(
+                accepted_connections=0,
+                packets_applied=0,
+                moving_command_frames=0,
+                protocol_errors=2,
+                rejected_packets=3,
+                peer_pid_mismatches=4,
+                connected_at_boundary=False,
+                input_age_s=None,
+                maximum_boundary_age_s=0.17,
+                safe_stop_at_boundary=True,
+            ),
+            [
+                "game_input_no_connection",
+                "game_input_no_applied_packets",
+                "game_input_no_moving_command_frames",
+                "game_input_protocol_errors:2",
+                "game_input_rejected_packets:3",
+                "game_input_peer_pid_mismatches:4",
+                "game_input_disconnected_at_boundary",
+                "game_input_stale_at_boundary",
+                "game_input_safe_stop_at_boundary",
+            ],
         )
 
     def test_acceptance_rejects_stale_lowcmd_and_slow_physics(self) -> None:
@@ -522,6 +1103,24 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "snapshot_reset_count_decreased:1,previous=2",
         )
 
+    def test_snapshot_validates_lowcmd_and_startup_band_fields(self) -> None:
+        invalid_received = self.snapshot()
+        invalid_received.low_cmd_received = 1
+        self.assertEqual(
+            MODULE._snapshot_validation_error(invalid_received),
+            "snapshot_invalid_low_cmd_received:1",
+        )
+        self.assertEqual(
+            MODULE._snapshot_validation_error(self.snapshot(low_cmd_age_s=-0.1)),
+            "snapshot_invalid_low_cmd_age_s:-0.1",
+        )
+        self.assertEqual(
+            MODULE._snapshot_validation_error(
+                self.snapshot(elastic_band_scale=math.nan)
+            ),
+            "snapshot_invalid_elastic_band_scale:nan",
+        )
+
     def test_only_normal_bounded_completion_can_pass(self) -> None:
         completed = MODULE._qualification_state(
             max_seconds=120.0,
@@ -826,6 +1425,52 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(planners[0]["facing"][1], math.sin(0.1))
         self.assertEqual(planners[0]["speed"], 1.0)
 
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=9,
+                movement=(0.0, 1.0, 0.0),
+                facing=(0.0, 1.0, 0.0),
+                speed_mps=0.3,
+                mode="move",
+                safe_stop=False,
+                reason=None,
+            )
+        )
+        self.assertEqual(planners[1]["mode"], 1)
+        self.assertEqual(planners[1]["movement"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[1]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[1]["speed"], 0.3)
+
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=10,
+                movement=(0.0, 0.0, 0.0),
+                facing=(0.0, 1.0, 0.0),
+                speed_mps=0.0,
+                mode="deadman",
+                safe_stop=True,
+                reason="sonic_not_ready",
+            )
+        )
+        self.assertTrue(commands[2]["start"])
+        self.assertFalse(commands[2]["stop"])
+        self.assertEqual(planners[2]["mode"], 0)
+        self.assertEqual(planners[2]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[2]["speed"], -1.0)
+
+        with self.assertRaisesRegex(ValueError, "SLOW_WALK"):
+            client.send_game_command(
+                MODULE.RobotMotionCommand(
+                    sequence=11,
+                    movement=(1.0, 0.0, 0.0),
+                    facing=(1.0, 0.0, 0.0),
+                    speed_mps=0.81,
+                    mode="move",
+                    safe_stop=False,
+                    reason=None,
+                )
+            )
+
         with mock.patch.object(MODULE.time, "sleep") as sleep:
             client.close()
         self.assertTrue(commands[-1]["stop"])
@@ -870,6 +1515,97 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(planners[0]["facing"][0], math.cos(0.1))
         client.close()
 
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_game_input_runtime_applies_authenticated_camera_relative_input(self) -> None:
+        config = GAME_CONTROL.ControlConfig(
+            max_speed_mps=0.3,
+            max_acceleration_mps2=100.0,
+            max_deceleration_mps2=100.0,
+            max_turn_rate_rad_s=100.0,
+            max_step_s=1.0,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "game.sock"
+            runtime = MODULE.GameInputRuntime(
+                path,
+                GAME_CONTROL.GameControlCore(config),
+            )
+            runtime.open()
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                client.connect(os.fspath(path))
+                neutral = GAME_CONTROL.InputSnapshot.from_mapping(
+                    {
+                        "protocol": GAME_CONTROL.PROTOCOL_NAME,
+                        "sequence": 7,
+                        "timestamp_monotonic_s": 10.0,
+                        "focused": True,
+                        "camera_yaw_rad": math.pi / 2.0,
+                        "keys": {
+                            "w": False,
+                            "a": False,
+                            "s": False,
+                            "d": False,
+                            "q": False,
+                            "e": False,
+                            "v": False,
+                            "ctrl": False,
+                            "shift": False,
+                        },
+                        "move_stick": {"right": 0.0, "forward": 0.0},
+                    }
+                )
+                client.sendall(GAME_CONTROL.encode_input_packet(neutral))
+                self.assertEqual(
+                    runtime.poll(now_s=10.0, dt_s=0.1).mode,
+                    "idle",
+                )
+                moving = GAME_CONTROL.InputSnapshot.from_mapping(
+                    {
+                        **neutral.to_mapping(),
+                        "sequence": 8,
+                        "timestamp_monotonic_s": 10.01,
+                        "keys": {**neutral.to_mapping()["keys"], "w": True},
+                    }
+                )
+                client.sendall(GAME_CONTROL.encode_input_packet(moving))
+                command = runtime.poll(now_s=10.01, dt_s=0.1)
+                self.assertEqual(command.mode, "move")
+                self.assertAlmostEqual(command.movement[0], 0.0, places=7)
+                self.assertAlmostEqual(command.movement[1], 1.0, places=7)
+                self.assertEqual(command.movement, command.facing)
+                telemetry = runtime.telemetry(now_s=10.05)
+                self.assertTrue(telemetry["connected"])
+                self.assertEqual(telemetry["packets_applied"], 2)
+                self.assertEqual(telemetry["sequence"], 8)
+
+                # The final duration check may end the main loop with a packet
+                # already queued.  A zero-dt boundary poll must still observe
+                # focus loss before acceptance telemetry is captured.
+                focus_lost = GAME_CONTROL.InputSnapshot.from_mapping(
+                    {
+                        **neutral.to_mapping(),
+                        "sequence": 9,
+                        "timestamp_monotonic_s": 10.06,
+                        "focused": False,
+                        "keys": {**neutral.to_mapping()["keys"], "w": True},
+                    }
+                )
+                client.sendall(GAME_CONTROL.encode_input_packet(focus_lost))
+                boundary_command = runtime.poll(now_s=10.06, dt_s=0.0)
+                boundary_telemetry = runtime.telemetry(now_s=10.06)
+                self.assertTrue(boundary_command.safe_stop)
+                self.assertEqual(boundary_command.reason, "focus_lost")
+                self.assertTrue(boundary_telemetry["safe_stop"])
+                self.assertEqual(boundary_telemetry["packets_applied"], 3)
+            finally:
+                client.close()
+                runtime.close()
+            self.assertFalse(path.exists())
+
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_native_process_group_runs_locked_binary_directly(self, popen) -> None:
         process = mock.Mock()
@@ -896,6 +1632,79 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(group.env["ROS_LOCALHOST_ONLY"], "1")
         self.assertEqual(group.env["PYTHONNOUSERSITE"], "1")
         self.assertEqual(group.env["PYTHONPATH"], "/sonic")
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_native_process_group_starts_the_exact_game_input_adapter(self, popen) -> None:
+        process = mock.Mock()
+        process.pid = 4243
+        popen.return_value = process
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        provider_pid = group.start_game_input(
+            "/runtime/python",
+            Path("/matrix/scripts/matrix_game_control_input.py"),
+            input_socket=Path("/run/user/1000/matrix-game.sock"),
+            input_source="auto",
+            camera_yaw_source="x11-mirror",
+            look_button="left",
+            initial_camera_yaw_deg=5.0,
+            mouse_sensitivity_deg=0.12,
+            camera_yaw_sign=-1,
+            camera_yaw_offset_deg=90.0,
+            carla_host="127.0.0.2",
+            carla_port=2100,
+            gamepad_look_yaw_rate_deg_s=140.0,
+            gamepad_look_pitch_rate_deg_s=95.0,
+            gamepad_look_deadzone=0.13,
+            gamepad_look_min_pitch_deg=-70.0,
+            gamepad_look_max_pitch_deg=50.0,
+            focus_title="matrix",
+            expected_ue_pid=4242,
+            status_file=Path("/matrix/outputs/game-input.json"),
+        )
+
+        guarded = popen.call_args.args[0]
+        self.assertIn("--exec-command", guarded[: guarded.index("--")])
+        self.assertEqual(provider_pid, 4243)
+        command = guarded[guarded.index("--") + 1 :]
+        self.assertEqual(command[:3], [
+            "/runtime/python",
+            "-u",
+            "/matrix/scripts/matrix_game_control_input.py",
+        ])
+        self.assertEqual(
+            command[command.index("--socket") + 1],
+            "/run/user/1000/matrix-game.sock",
+        )
+        self.assertEqual(
+            command[command.index("--camera-yaw-source") + 1], "x11-mirror"
+        )
+        self.assertEqual(command[command.index("--camera-yaw-sign") + 1], "-1")
+        self.assertEqual(
+            command[command.index("--camera-yaw-offset-deg") + 1], "90.0"
+        )
+        self.assertEqual(command[command.index("--expected-ue-pid") + 1], "4242")
+        self.assertEqual(command[command.index("--carla-host") + 1], "127.0.0.2")
+        self.assertEqual(command[command.index("--carla-port") + 1], "2100")
+        self.assertEqual(
+            command[command.index("--gamepad-look-yaw-rate-deg-s") + 1],
+            "140.0",
+        )
+        self.assertEqual(
+            command[command.index("--gamepad-look-pitch-rate-deg-s") + 1],
+            "95.0",
+        )
+        self.assertEqual(
+            command[command.index("--gamepad-look-deadzone") + 1], "0.13"
+        )
+        self.assertEqual(
+            command[command.index("--gamepad-look-min-pitch-deg") + 1],
+            "-70.0",
+        )
+        self.assertEqual(
+            command[command.index("--gamepad-look-max-pitch-deg") + 1],
+            "50.0",
+        )
+        self.assertEqual(popen.call_args.kwargs["cwd"], Path("/matrix"))
 
     def test_process_group_prepends_sonic_to_existing_pythonpath(self) -> None:
         group = MODULE.NativeProcessGroup(
@@ -1011,6 +1820,103 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 supervisor.stdout.close()
                 try:
                     os.killpg(group_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_parent_death_guardian_exec_mode_preserves_leaf_pid(self) -> None:
+        guardian = REPO_ROOT / "scripts/exec_with_parent_death_signal.py"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                os.fspath(guardian),
+                "--expected-parent",
+                str(os.getpid()),
+                "--exec-command",
+                "--",
+                sys.executable,
+                "-c",
+                "import os; print(os.getpid(), flush=True)",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        try:
+            executed_pid = int(process.stdout.readline().strip())
+            self.assertEqual(executed_pid, process.pid)
+            self.assertEqual(process.wait(timeout=5.0), 0)
+        finally:
+            process.stdout.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5.0)
+
+    def test_parent_death_guardian_exec_mode_hard_kills_stuck_leaf(self) -> None:
+        guardian = REPO_ROOT / "scripts/exec_with_parent_death_signal.py"
+        leaf_code = "\n".join(
+            (
+                "import os",
+                "from pathlib import Path",
+                "import signal",
+                "import sys",
+                "import time",
+                "signal.signal(signal.SIGTERM, lambda *_args: None)",
+                "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')",
+                "time.sleep(60)",
+            )
+        )
+        supervisor_code = "\n".join(
+            (
+                "import os",
+                "import subprocess",
+                "import sys",
+                "import time",
+                "process = subprocess.Popen([sys.executable, sys.argv[1], '--expected-parent', str(os.getpid()), '--exec-command', '--', sys.executable, '-c', sys.argv[2], sys.argv[3]], start_new_session=True)",
+                "print(process.pid, flush=True)",
+                "time.sleep(60)",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_file = Path(temporary) / "leaf-pid"
+            supervisor = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    supervisor_code,
+                    os.fspath(guardian),
+                    leaf_code,
+                    os.fspath(pid_file),
+                ],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            assert supervisor.stdout is not None
+            leaf_pid = int(supervisor.stdout.readline().strip())
+            try:
+                deadline = time.monotonic() + 5.0
+                while not pid_file.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(pid_file.is_file(), "exec leaf did not start")
+                self.assertEqual(int(pid_file.read_text(encoding="utf-8")), leaf_pid)
+
+                os.kill(supervisor.pid, signal.SIGKILL)
+                supervisor.wait(timeout=5.0)
+                deadline = time.monotonic() + 5.0
+                while self.process_is_running(leaf_pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(
+                    self.process_is_running(leaf_pid),
+                    f"exec leaf survived supervisor death: {leaf_pid}",
+                )
+            finally:
+                if supervisor.poll() is None:
+                    supervisor.kill()
+                    supervisor.wait(timeout=5.0)
+                supervisor.stdout.close()
+                try:
+                    os.killpg(leaf_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 

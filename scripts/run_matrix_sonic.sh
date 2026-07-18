@@ -38,6 +38,22 @@ SCENE_ID=21
 CUSTOM_URDF="${MATRIX_G1_URDF:-}"
 CUSTOM_NAME="g1_29dof"
 CONTROL_SOURCE="planner"
+GAME_INPUT_SOURCE="${MATRIX_GAME_INPUT_SOURCE:-auto}"
+GAME_CAMERA_YAW_SOURCE="${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}"
+GAME_LOOK_BUTTON="${MATRIX_GAME_LOOK_BUTTON:-left}"
+GAME_INITIAL_CAMERA_YAW_DEG="${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
+GAME_MOUSE_SENSITIVITY_DEG="${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
+GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
+GAME_CAMERA_YAW_OFFSET_DEG="${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
+GAME_CARLA_HOST="${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
+GAME_CARLA_PORT="${MATRIX_GAME_CARLA_PORT:-2000}"
+GAMEPAD_LOOK_YAW_RATE_DEG_S="${MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S:-120.0}"
+GAMEPAD_LOOK_PITCH_RATE_DEG_S="${MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S:-90.0}"
+GAMEPAD_LOOK_DEADZONE="${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
+GAMEPAD_LOOK_MIN_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG:--80.0}"
+GAMEPAD_LOOK_MAX_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG:-60.0}"
+GAME_MAX_SPEED="${MATRIX_GAME_MAX_SPEED:-0.30}"
+GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
 WALK_AFTER="-1"
 VX="0.30"
 VY="0.0"
@@ -71,7 +87,23 @@ usage() {
         "  --scene ID                 Matrix native scene id (default: 21 ApartmentWorld)" \
         "  --urdf PATH                G1 visual URDF; defaults to the locked runtime" \
         "  --name NAME                Custom robot cache name (default: g1_29dof)" \
-        "  --control-source SOURCE    planner, pico, or external (default: planner)" \
+        "  --control-source SOURCE    planner, game, pico, or external (default: planner)" \
+        "  --game-input-source SOURCE auto, keyboard, or gamepad (default: auto)" \
+        "  --game-camera-yaw-source S x11-mirror, carla, or fixed (default: fixed)" \
+        "  --game-look-button BUTTON  Camera drag button: left, middle, or right" \
+        "  --game-initial-yaw DEG     Initial provider/UE camera yaw before sign and offset" \
+        "  --game-mouse-sensitivity DEG_PER_PX  Calibrated mirror scale (default: 0.12)" \
+        "  --game-camera-yaw-sign N   Provider-to-SONIC sign: -1 or 1" \
+        "  --game-camera-yaw-offset DEG  Provider-to-SONIC zero-frame offset" \
+        "  --game-carla-host HOST     Optional fail-closed CARLA spectator host" \
+        "  --game-carla-port PORT     Optional CARLA spectator RPC port" \
+        "  --gamepad-look-yaw-rate DEG_S    Full-stick spectator yaw rate" \
+        "  --gamepad-look-pitch-rate DEG_S  Full-stick spectator pitch rate" \
+        "  --gamepad-look-deadzone VALUE    Radial right-stick deadzone" \
+        "  --gamepad-look-min-pitch DEG     Spectator pitch lower limit" \
+        "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
+        "  --game-max-speed MPS       Maximum interactive speed (default: 0.30)" \
+        "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -96,6 +128,22 @@ while [[ $# -gt 0 ]]; do
         --urdf) CUSTOM_URDF="$2"; shift 2 ;;
         --name) CUSTOM_NAME="$2"; shift 2 ;;
         --control-source) CONTROL_SOURCE="$2"; shift 2 ;;
+        --game-input-source) GAME_INPUT_SOURCE="$2"; shift 2 ;;
+        --game-camera-yaw-source) GAME_CAMERA_YAW_SOURCE="$2"; shift 2 ;;
+        --game-look-button) GAME_LOOK_BUTTON="$2"; shift 2 ;;
+        --game-initial-yaw) GAME_INITIAL_CAMERA_YAW_DEG="$2"; shift 2 ;;
+        --game-mouse-sensitivity) GAME_MOUSE_SENSITIVITY_DEG="$2"; shift 2 ;;
+        --game-camera-yaw-sign) GAME_CAMERA_YAW_SIGN="$2"; shift 2 ;;
+        --game-camera-yaw-offset) GAME_CAMERA_YAW_OFFSET_DEG="$2"; shift 2 ;;
+        --game-carla-host) GAME_CARLA_HOST="$2"; shift 2 ;;
+        --game-carla-port) GAME_CARLA_PORT="$2"; shift 2 ;;
+        --gamepad-look-yaw-rate) GAMEPAD_LOOK_YAW_RATE_DEG_S="$2"; shift 2 ;;
+        --gamepad-look-pitch-rate) GAMEPAD_LOOK_PITCH_RATE_DEG_S="$2"; shift 2 ;;
+        --gamepad-look-deadzone) GAMEPAD_LOOK_DEADZONE="$2"; shift 2 ;;
+        --gamepad-look-min-pitch) GAMEPAD_LOOK_MIN_PITCH_DEG="$2"; shift 2 ;;
+        --gamepad-look-max-pitch) GAMEPAD_LOOK_MAX_PITCH_DEG="$2"; shift 2 ;;
+        --game-max-speed) GAME_MAX_SPEED="$2"; shift 2 ;;
+        --game-input-timeout) GAME_INPUT_TIMEOUT="$2"; shift 2 ;;
         --walk-after) WALK_AFTER="$2"; shift 2 ;;
         --vx) VX="$2"; shift 2 ;;
         --vy) VY="$2"; shift 2 ;;
@@ -167,6 +215,28 @@ if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
     if [[ "${MATRIX_VERIFY_RUNTIME:-1}" == "0" ]]; then
         echo "[ERROR] Bounded qualification cannot disable runtime verification" >&2
         exit 2
+    fi
+    if [[ "$CONTROL_SOURCE" == "game" ]]; then
+        if [[ "$GAME_CAMERA_YAW_SOURCE" == "fixed" ]]; then
+            echo "[ERROR] Bounded game-control qualification requires an observed or calibrated camera yaw source; fixed is not admissible" >&2
+            exit 2
+        fi
+        if [[ -n "${MATRIX_GAME_INPUT_PYTHON:-}" ]]; then
+            echo "[ERROR] Bounded game-control qualification rejects MATRIX_GAME_INPUT_PYTHON; the provider uses the verified runtime Python" >&2
+            exit 2
+        fi
+        GAME_NO_INPUT_PROVIDER_VALUE="${MATRIX_GAME_NO_INPUT_PROVIDER:-0}"
+        case "${GAME_NO_INPUT_PROVIDER_VALUE,,}" in
+            1|true|yes|on)
+                echo "[ERROR] Bounded game-control qualification cannot disable the supervised input provider" >&2
+                exit 2
+                ;;
+            0|false|no|off|"") ;;
+            *)
+                echo "[ERROR] MATRIX_GAME_NO_INPUT_PROVIDER must be a boolean" >&2
+                exit 2
+                ;;
+        esac
     fi
     for launcher_root in "${SIM_LAUNCHER_ROOT:-}" "${MATRIX_ROOT:-}"; do
         if [[ -n "$launcher_root" ]] \
@@ -241,6 +311,7 @@ MATRIX_SONIC_PYTHON="${MATRIX_SONIC_PYTHON:-$DEFAULT_PYTHON}"
 MATRIX_PICO_PYTHON="${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}"
 
 for required in \
+    "$PROJECT_ROOT/scripts/matrix_game_control.py" \
     "$CUSTOM_URDF" \
     "$MATRIX_SONIC_ROOT/gear_sonic/scripts/run_sim_loop.py" \
     "$MATRIX_SONIC_ROOT/gear_sonic/utils/mujoco_sim/base_sim.py" \
@@ -253,6 +324,11 @@ for required in \
         exit 1
     fi
 done
+if [[ "$CONTROL_SOURCE" == "game" \
+    && ! -f "$PROJECT_ROOT/scripts/matrix_game_control_input.py" ]]; then
+    echo "[ERROR] Matrix game-control input provider is missing: $PROJECT_ROOT/scripts/matrix_game_control_input.py" >&2
+    exit 1
+fi
 
 require_qualified_path() {
     local label="$1"
@@ -427,6 +503,26 @@ export MATRIX_SONIC_ROOT MATRIX_UNITREE_SDK2_ROOT
 export MATRIX_SONIC_PYTHON MATRIX_PICO_PYTHON
 export MATRIX_SONIC_CANONICAL_MODEL MATRIX_SONIC_CANONICAL_MESHES
 export MATRIX_SONIC_CONTROL_SOURCE="$CONTROL_SOURCE"
+export MATRIX_GAME_INPUT_SOURCE="$GAME_INPUT_SOURCE"
+export MATRIX_GAME_CAMERA_YAW_SOURCE="$GAME_CAMERA_YAW_SOURCE"
+export MATRIX_GAME_LOOK_BUTTON="$GAME_LOOK_BUTTON"
+export MATRIX_GAME_INITIAL_CAMERA_YAW_DEG="$GAME_INITIAL_CAMERA_YAW_DEG"
+export MATRIX_GAME_MOUSE_SENSITIVITY_DEG="$GAME_MOUSE_SENSITIVITY_DEG"
+export MATRIX_GAME_CAMERA_YAW_SIGN="$GAME_CAMERA_YAW_SIGN"
+export MATRIX_GAME_CAMERA_YAW_OFFSET_DEG="$GAME_CAMERA_YAW_OFFSET_DEG"
+export MATRIX_GAME_CARLA_HOST="$GAME_CARLA_HOST"
+export MATRIX_GAME_CARLA_PORT="$GAME_CARLA_PORT"
+export MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S="$GAMEPAD_LOOK_YAW_RATE_DEG_S"
+export MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S="$GAMEPAD_LOOK_PITCH_RATE_DEG_S"
+export MATRIX_GAMEPAD_LOOK_DEADZONE="$GAMEPAD_LOOK_DEADZONE"
+export MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG="$GAMEPAD_LOOK_MIN_PITCH_DEG"
+export MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG="$GAMEPAD_LOOK_MAX_PITCH_DEG"
+export MATRIX_GAME_MAX_SPEED="$GAME_MAX_SPEED"
+export MATRIX_GAME_INPUT_TIMEOUT="$GAME_INPUT_TIMEOUT"
+export MATRIX_GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
+if [[ "$CONTROL_SOURCE" == "game" ]]; then
+    rm -f -- "$MATRIX_GAME_INPUT_STATUS_FILE"
+fi
 export MATRIX_SONIC_WALK_AFTER="$WALK_AFTER"
 export MATRIX_SONIC_VX="$VX"
 export MATRIX_SONIC_VY="$VY"
@@ -451,6 +547,12 @@ export MATRIX_SONIC_STARTUP_BAND_FADE="$STARTUP_BAND_FADE"
 # Matrix's upstream launcher rewrites these tracked files. Restore the exact
 # pre-launch bytes so switching the same feature branch on two hosts stays clean.
 CONFIG_BACKUP="$(mktemp -d /tmp/matrix-sonic-config.XXXXXX)"
+GAME_RUNTIME_DIR=""
+if [[ "$CONTROL_SOURCE" == "game" && -z "${MATRIX_GAME_INPUT_SOCKET:-}" ]]; then
+    GAME_RUNTIME_DIR="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}.XXXXXX")"
+    chmod 700 "$GAME_RUNTIME_DIR"
+    export MATRIX_GAME_INPUT_SOCKET="$GAME_RUNTIME_DIR/input.sock"
+fi
 MUTABLE_FILES=(
     "config/config.json"
     "src/robot_mujoco/simulate/config.yaml"
@@ -471,6 +573,9 @@ restore_tracked_config() {
         fi
     done
     rm -rf "$CONFIG_BACKUP"
+    if [[ -n "$GAME_RUNTIME_DIR" ]]; then
+        rm -rf "$GAME_RUNTIME_DIR"
+    fi
 }
 trap restore_tracked_config EXIT
 

@@ -1,0 +1,661 @@
+from __future__ import annotations
+
+import importlib
+import importlib.util
+import math
+import os
+from pathlib import Path
+import socket
+import tempfile
+import unittest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = REPO_ROOT / "scripts"
+if os.fspath(SCRIPTS) not in os.sys.path:
+    os.sys.path.insert(0, os.fspath(SCRIPTS))
+CORE = importlib.import_module("matrix_game_control")
+SCRIPT_PATH = SCRIPTS / "matrix_game_control_input.py"
+SPEC = importlib.util.spec_from_file_location("matrix_game_control_input", SCRIPT_PATH)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+os.sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+class SourceArbitrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.keyboard = MODULE.KeyboardMouseSample(
+            w=True, q=True, v=True, ctrl=True, shift=True, focused=True
+        )
+        self.gamepad = MODULE.GamepadSample(
+            forward=0.75, right=-0.25, look_yaw=0.5, connected=True
+        )
+
+    def test_auto_carries_both_and_core_owns_digital_priority(self) -> None:
+        keys, stick, look = MODULE.select_physical_inputs(
+            self.keyboard, self.gamepad, source="auto"
+        )
+        self.assertTrue(keys.w)
+        self.assertTrue(keys.q)
+        self.assertTrue(keys.ctrl)
+        self.assertTrue(keys.shift)
+        self.assertEqual((stick.right, stick.forward), (-0.25, 0.75))
+        self.assertEqual(look, 0.5)
+
+    def test_gamepad_requires_actual_camera_readback(self) -> None:
+        self.assertEqual(
+            MODULE.effective_input_source("auto", "fixed"), "keyboard"
+        )
+        self.assertEqual(
+            MODULE.effective_input_source("auto", "x11-mirror"), "keyboard"
+        )
+        self.assertEqual(
+            MODULE.effective_input_source("gamepad", "carla"), "gamepad"
+        )
+        with self.assertRaisesRegex(ValueError, "observed CARLA"):
+            MODULE.effective_input_source("gamepad", "fixed")
+
+    def test_gamepad_hotplug_edges_are_safety_interlocks(self) -> None:
+        self.assertTrue(
+            MODULE.gamepad_input_available(
+                "auto", connected=False, previous_connected=None
+            )
+        )
+        self.assertFalse(
+            MODULE.gamepad_input_available(
+                "auto", connected=True, previous_connected=False
+            )
+        )
+        self.assertFalse(
+            MODULE.gamepad_input_available(
+                "auto", connected=False, previous_connected=True
+            )
+        )
+        self.assertFalse(
+            MODULE.gamepad_input_available(
+                "gamepad", connected=False, previous_connected=False
+            )
+        )
+        self.assertTrue(
+            MODULE.gamepad_input_available(
+                "gamepad", connected=True, previous_connected=True
+            )
+        )
+
+    def test_explicit_sources_never_mix_locomotion_axes(self) -> None:
+        keys, stick, look = MODULE.select_physical_inputs(
+            self.keyboard, self.gamepad, source="keyboard"
+        )
+        self.assertTrue(keys.w)
+        self.assertTrue(keys.q)
+        self.assertTrue(keys.v)
+        self.assertTrue(keys.ctrl)
+        self.assertTrue(keys.shift)
+        self.assertEqual((stick.right, stick.forward, look), (0.0, 0.0, 0.0))
+
+        keys, stick, look = MODULE.select_physical_inputs(
+            self.keyboard, self.gamepad, source="gamepad"
+        )
+        self.assertFalse(keys.w)
+        self.assertTrue(keys.q)
+        self.assertTrue(keys.v)
+        self.assertFalse(keys.ctrl)
+        self.assertFalse(keys.shift)
+        self.assertEqual((stick.right, stick.forward), (-0.25, 0.75))
+        self.assertEqual(look, 0.5)
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_client_uses_the_core_protocol_encoder_without_schema_drift(self) -> None:
+        snapshot = MODULE.build_snapshot(
+            sequence=7,
+            timestamp_monotonic_s=12.5,
+            keyboard=MODULE.KeyboardMouseSample(w=True, focused=True),
+            gamepad=MODULE.GamepadSample(),
+            input_source="auto",
+            camera_yaw_rad=math.pi / 2,
+            camera_available=True,
+        )
+        payload = CORE.encode_input_packet(snapshot)
+        self.assertEqual(CORE.decode_input_packet(payload), snapshot)
+        self.assertEqual(snapshot.protocol, CORE.PROTOCOL_NAME)
+        self.assertFalse(snapshot.keys.ctrl)
+        self.assertFalse(snapshot.keys.shift)
+
+    def test_missing_actual_camera_yaw_disables_operator(self) -> None:
+        snapshot = MODULE.build_snapshot(
+            sequence=1,
+            timestamp_monotonic_s=1.0,
+            keyboard=MODULE.KeyboardMouseSample(w=True, focused=True),
+            gamepad=MODULE.GamepadSample(),
+            input_source="auto",
+            camera_yaw_rad=0.25,
+            camera_available=False,
+        )
+        self.assertFalse(snapshot.focused)
+
+    def test_native_camera_drag_interlocks_robot_movement(self) -> None:
+        snapshot = MODULE.build_snapshot(
+            sequence=2,
+            timestamp_monotonic_s=1.0,
+            keyboard=MODULE.KeyboardMouseSample(
+                w=True, focused=True, camera_dragging=True
+            ),
+            gamepad=MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.5,
+            camera_available=True,
+        )
+        self.assertFalse(snapshot.focused)
+        self.assertTrue(snapshot.keys.w)
+
+
+class CameraYawTrackerTest(unittest.TestCase):
+    def test_mouse_has_per_frame_priority_over_right_stick(self) -> None:
+        tracker = MODULE.CameraYawTracker(
+            0.0,
+            mouse_radians_per_pixel=0.1,
+            gamepad_radians_per_second=2.0,
+        )
+        yaw = tracker.update(dt=0.5, mouse_dx=2.0, gamepad_look_yaw=1.0)
+        self.assertAlmostEqual(yaw, 0.2)
+        yaw = tracker.update(dt=0.5, mouse_dx=0.0, gamepad_look_yaw=1.0)
+        self.assertAlmostEqual(yaw, 1.2)
+
+    def test_observed_yaw_is_absolute_and_wrapped(self) -> None:
+        tracker = MODULE.CameraYawTracker(
+            0.0,
+            mouse_radians_per_pixel=0.1,
+            gamepad_radians_per_second=2.0,
+        )
+        yaw = tracker.update(
+            dt=1.0,
+            mouse_dx=100.0,
+            gamepad_look_yaw=1.0,
+            observed_yaw_rad=3.0 * math.pi,
+        )
+        self.assertAlmostEqual(abs(yaw), math.pi)
+
+    def test_provider_sign_and_offset_convert_to_sonic_frame(self) -> None:
+        self.assertAlmostEqual(
+            MODULE.transform_camera_yaw(
+                math.radians(30.0),
+                sign=-1,
+                offset_rad=math.radians(90.0),
+            ),
+            math.radians(60.0),
+        )
+        with self.assertRaisesRegex(ValueError, "sign"):
+            MODULE.transform_camera_yaw(0.0, sign=0, offset_rad=0.0)
+
+
+class CarlaSpectatorCameraTest(unittest.TestCase):
+    class Rotation:
+        def __init__(self, *, yaw: float = 0.0, pitch: float = 0.0) -> None:
+            self.yaw = yaw
+            self.pitch = pitch
+
+    class Transform:
+        def __init__(self, *, yaw: float = 0.0, pitch: float = 0.0) -> None:
+            self.rotation = CarlaSpectatorCameraTest.Rotation(
+                yaw=yaw, pitch=pitch
+            )
+
+    class Spectator:
+        def __init__(self, transform) -> None:
+            self.transform = transform
+            self.set_calls = 0
+            self.fail_writes = False
+            self.ignore_writes = False
+
+        def get_transform(self):
+            return CarlaSpectatorCameraTest.Transform(
+                yaw=self.transform.rotation.yaw,
+                pitch=self.transform.rotation.pitch,
+            )
+
+        def set_transform(self, transform) -> None:
+            if self.fail_writes:
+                raise RuntimeError("write failed")
+            self.set_calls += 1
+            if self.ignore_writes:
+                return
+            self.transform = CarlaSpectatorCameraTest.Transform(
+                yaw=transform.rotation.yaw,
+                pitch=transform.rotation.pitch,
+            )
+
+    class World:
+        def __init__(self, spectator) -> None:
+            self.spectator = spectator
+
+        def get_spectator(self):
+            return self.spectator
+
+    def reader(self, spectator, **overrides):
+        parameters = {
+            "look_yaw_rate_rad_s": math.radians(90.0),
+            "look_pitch_rate_rad_s": math.radians(60.0),
+            "look_deadzone": 0.0,
+            "minimum_pitch_rad": math.radians(-45.0),
+            "maximum_pitch_rad": math.radians(30.0),
+        }
+        parameters.update(overrides)
+        reader = MODULE.CarlaSpectatorYawReader("127.0.0.1", 2000, **parameters)
+        reader._world = self.World(spectator)
+        return reader
+
+    def test_right_stick_writes_spectator_then_returns_absolute_readback(self) -> None:
+        spectator = self.Spectator(self.Transform(yaw=10.0, pitch=0.0))
+        reader = self.reader(spectator)
+
+        yaw = reader.drive(
+            now=1.0, dt=0.5, look_yaw=0.5, look_pitch=0.5
+        )
+
+        self.assertEqual(spectator.set_calls, 1)
+        self.assertAlmostEqual(spectator.transform.rotation.yaw, 32.5)
+        self.assertAlmostEqual(spectator.transform.rotation.pitch, 15.0)
+        self.assertAlmostEqual(yaw, math.radians(32.5))
+
+    def test_pitch_is_clamped_and_zero_stick_is_read_only(self) -> None:
+        spectator = self.Spectator(self.Transform(yaw=-30.0, pitch=25.0))
+        reader = self.reader(spectator)
+
+        driven = reader.drive(
+            now=1.0, dt=1.0, look_yaw=0.0, look_pitch=1.0
+        )
+        polled = reader.drive(
+            now=1.1, dt=1.0, look_yaw=0.0, look_pitch=0.0
+        )
+
+        self.assertEqual(spectator.set_calls, 1)
+        self.assertAlmostEqual(spectator.transform.rotation.pitch, 30.0)
+        self.assertAlmostEqual(driven, math.radians(-30.0))
+        self.assertAlmostEqual(polled, math.radians(-30.0))
+
+    def test_failed_camera_write_drops_readback_and_disconnects(self) -> None:
+        spectator = self.Spectator(self.Transform(yaw=0.0, pitch=0.0))
+        spectator.fail_writes = True
+        reader = self.reader(spectator)
+
+        yaw = reader.drive(
+            now=2.0, dt=0.1, look_yaw=1.0, look_pitch=0.0
+        )
+
+        self.assertIsNone(yaw)
+        self.assertIsNone(reader._world)
+        self.assertEqual(reader._next_connect, 3.0)
+
+    def test_ignored_camera_write_drops_readback_and_disconnects(self) -> None:
+        spectator = self.Spectator(self.Transform(yaw=0.0, pitch=0.0))
+        spectator.ignore_writes = True
+        reader = self.reader(spectator)
+
+        yaw = reader.drive(
+            now=2.0, dt=0.1, look_yaw=1.0, look_pitch=0.0
+        )
+
+        self.assertIsNone(yaw)
+        self.assertEqual(spectator.set_calls, 1)
+        self.assertIsNone(reader._world)
+
+    def test_invalid_camera_tuning_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "deadzone"):
+            MODULE.CarlaSpectatorYawReader(
+                "127.0.0.1", 2000, look_deadzone=1.0
+            )
+        with self.assertRaisesRegex(ValueError, "pitch limits"):
+            MODULE.CarlaSpectatorYawReader(
+                "127.0.0.1",
+                2000,
+                minimum_pitch_rad=1.0,
+                maximum_pitch_rad=0.0,
+            )
+
+
+class X11KeyboardMouseSafetyTest(unittest.TestCase):
+    def test_release_sample_keeps_final_held_drag_delta(self) -> None:
+        samples = iter(((0, 1 << 8), (10, 1 << 8), (30, 0)))
+
+        class FakeX11:
+            @staticmethod
+            def XQueryKeymap(_display, _buffer) -> int:
+                return 1
+
+            @staticmethod
+            def XQueryPointer(*args) -> int:
+                x, button_mask = next(samples)
+                args[4]._obj.value = x
+                args[5]._obj.value = 0
+                args[8]._obj.value = button_mask
+                return 1
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 1
+        backend._root = 2
+        backend._keycodes = {
+            name: index
+            for index, name in enumerate(MODULE.X11KeyboardMouse._KEYSYMS, start=8)
+        }
+        backend._pressed = lambda _keymap, _code: False
+        backend._focus_pattern = None
+        backend._look_mask = 1 << 8
+        backend._previous_pointer = None
+        backend._previous_look_pressed = False
+        backend._maximum_mouse_delta = 200.0
+        backend._expected_ue_pid = 1234
+        backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
+
+        pressed = backend.poll()
+        held = backend.poll()
+        released = backend.poll()
+
+        self.assertEqual(pressed.mouse_dx, 0.0)
+        self.assertEqual(held.mouse_dx, 10.0)
+        self.assertEqual(released.mouse_dx, 20.0)
+        self.assertTrue(pressed.camera_dragging)
+        self.assertTrue(held.camera_dragging)
+        self.assertFalse(released.camera_dragging)
+
+    def test_left_or_right_modifier_keys_are_collapsed(self) -> None:
+        class FakeX11:
+            @staticmethod
+            def XQueryKeymap(_display, _buffer) -> int:
+                return 1
+
+            @staticmethod
+            def XQueryPointer(*_args) -> int:
+                return 1
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 1
+        backend._root = 2
+        backend._keycodes = {
+            name: index
+            for index, name in enumerate(MODULE.X11KeyboardMouse._KEYSYMS, start=8)
+        }
+        pressed_codes = {
+            backend._keycodes["ctrl_left"],
+            backend._keycodes["shift_right"],
+        }
+        backend._pressed = lambda _keymap, code: code in pressed_codes
+        backend._focus_pattern = None
+        backend._look_mask = 1 << 8
+        backend._previous_pointer = None
+        backend._previous_look_pressed = False
+        backend._maximum_mouse_delta = 200.0
+        backend._expected_ue_pid = 1234
+        backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
+
+        sample = backend.poll()
+
+        self.assertTrue(sample.ctrl)
+        self.assertTrue(sample.shift)
+        self.assertTrue(sample.focused)
+
+    def test_pointer_query_failure_disarms_even_when_matrix_has_focus(self) -> None:
+        class FakeX11:
+            @staticmethod
+            def XQueryKeymap(_display, _buffer) -> int:
+                return 1
+
+            @staticmethod
+            def XQueryPointer(*_args) -> int:
+                return 0
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 1
+        backend._root = 2
+        backend._keycodes = {
+            name: 8 for name in ("w", "a", "s", "d", "q", "e", "v")
+        }
+        backend._focus_pattern = None
+        backend._look_mask = 1 << 8
+        backend._previous_pointer = None
+        backend._previous_look_pressed = False
+        backend._maximum_mouse_delta = 200.0
+        backend._expected_ue_pid = 1234
+        backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
+
+        sample = backend.poll()
+
+        self.assertEqual(sample.focus_title, "Matrix")
+        self.assertFalse(sample.focused)
+        self.assertFalse(sample.camera_dragging)
+
+    def test_matching_title_with_wrong_pid_is_not_matrix_focus(self) -> None:
+        class FakeX11:
+            @staticmethod
+            def XQueryKeymap(_display, _buffer) -> int:
+                return 1
+
+            @staticmethod
+            def XQueryPointer(*_args) -> int:
+                return 1
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 1
+        backend._root = 2
+        backend._keycodes = {
+            name: 8 for name in ("w", "a", "s", "d", "q", "e", "v")
+        }
+        backend._focus_pattern = None
+        backend._look_mask = 1 << 8
+        backend._previous_pointer = None
+        backend._previous_look_pressed = False
+        backend._maximum_mouse_delta = 200.0
+        backend._expected_ue_pid = 1234
+        backend._focus_identity = lambda: (
+            True,
+            "matrix-game-control terminal",
+            frozenset({5678}),
+        )
+
+        sample = backend.poll()
+
+        self.assertEqual(sample.focus_pid, 5678)
+        self.assertFalse(sample.focused)
+
+        backend._focus_identity = lambda: (
+            True,
+            "Matrix",
+            frozenset({1234, 5678}),
+        )
+        sample = backend.poll()
+        self.assertEqual(sample.focus_pid, 1234)
+        self.assertTrue(sample.focused)
+
+        # --allow-any-focus disables the title regex, not the UE PID binding.
+        backend._focus_identity = lambda: (True, None, frozenset({1234}))
+        sample = backend.poll()
+        self.assertIsNone(sample.focus_title)
+        self.assertTrue(sample.focused)
+
+
+class FrameWaitTest(unittest.TestCase):
+    def test_shutdown_during_sleep_prevents_an_extra_sample(self) -> None:
+        running = [True]
+
+        def interrupting_sleep(_seconds: float) -> None:
+            running[0] = False
+
+        should_sample, now = MODULE._wait_until_frame(
+            1.0,
+            2.0,
+            keep_running=lambda: running[0],
+            sleeper=interrupting_sleep,
+            clock=lambda: 1.5,
+        )
+
+        self.assertFalse(should_sample)
+        self.assertEqual(now, 1.5)
+
+
+class SequenceTest(unittest.TestCase):
+    def test_restart_uses_later_host_monotonic_nanoseconds(self) -> None:
+        first_client = MODULE.initial_sequence(lambda: 1_000_000_000)
+        second_client = MODULE.initial_sequence(lambda: 1_001_000_000)
+        self.assertGreater(second_client, first_client)
+
+        core = CORE.GameControlCore()
+        first = CORE.InputSnapshot(
+            sequence=first_client,
+            timestamp_monotonic_s=10.0,
+            focused=True,
+            camera_yaw_rad=0.0,
+            keys=CORE.KeySnapshot(False, False, False, False, False, False, False),
+            move_stick=CORE.MoveStickSnapshot(0.0, 0.0),
+        )
+        second = CORE.InputSnapshot(
+            sequence=second_client,
+            timestamp_monotonic_s=10.1,
+            focused=True,
+            camera_yaw_rad=0.0,
+            keys=first.keys,
+            move_stick=first.move_stick,
+        )
+        core.accept_snapshot(first, received_at_s=10.0)
+        core.accept_snapshot(second, received_at_s=10.1)
+        self.assertEqual(core.command(now_s=10.1, dt_s=0.01).sequence, second_client)
+
+    def test_sequence_must_fit_strict_core_protocol(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "protocol range"):
+            MODULE.initial_sequence(lambda: 2**63)
+
+
+class LinuxJoystickTest(unittest.TestCase):
+    def test_axis_events_are_normalized_without_external_packages(self) -> None:
+        events = [
+            MODULE._JS_EVENT.pack(1, 16384, MODULE._JS_EVENT_AXIS, 0),
+            MODULE._JS_EVENT.pack(
+                2, -32767, MODULE._JS_EVENT_AXIS | MODULE._JS_EVENT_INIT, 1
+            ),
+            MODULE._JS_EVENT.pack(3, -16384, MODULE._JS_EVENT_AXIS, 3),
+        ]
+        closed: list[int] = []
+
+        def reader(_fd: int, _size: int) -> bytes:
+            if events:
+                return events.pop(0)
+            raise BlockingIOError()
+
+        joystick = MODULE.LinuxJoystick(
+            "/dev/input/js-test",
+            left_x_axis=0,
+            left_y_axis=1,
+            right_x_axis=3,
+            right_y_axis=4,
+            opener=lambda *_args: 41,
+            reader=reader,
+            closer=closed.append,
+        )
+        sample = joystick.poll(10.0)
+        self.assertTrue(sample.connected)
+        self.assertAlmostEqual(sample.right, 16384 / 32767.0)
+        self.assertEqual(sample.forward, 1.0)
+        self.assertAlmostEqual(sample.look_yaw, -16384 / 32767.0)
+        joystick.close()
+        self.assertEqual(closed, [41])
+
+
+@unittest.skipUnless(
+    hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+    "Linux Unix seqpacket support is required",
+)
+class UnixSeqpacketPublisherTest(unittest.TestCase):
+    @staticmethod
+    def snapshot(sequence: int = 1):
+        return CORE.InputSnapshot(
+            sequence=sequence,
+            timestamp_monotonic_s=10.0,
+            focused=True,
+            camera_yaw_rad=0.0,
+            keys=CORE.KeySnapshot(True, False, False, False, False, False, False),
+            move_stick=CORE.MoveStickSnapshot(0.0, 0.0),
+        )
+
+    def test_publisher_connects_to_authenticated_core_server(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "input.sock"
+            with CORE.UnixSeqpacketInputServer(path) as server:
+                publisher = MODULE.UnixSeqpacketPublisher(path)
+                try:
+                    self.assertTrue(publisher.send(self.snapshot(), now=10.0))
+                    with server.accept(timeout_s=1.0) as connection:
+                        self.assertEqual(
+                            connection.receive(timeout_s=1.0), self.snapshot()
+                        )
+                finally:
+                    publisher.close()
+
+    def test_missing_server_is_nonblocking_and_reconnects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "input.sock"
+            publisher = MODULE.UnixSeqpacketPublisher(path, reconnect_seconds=0.2)
+            try:
+                self.assertFalse(publisher.send(self.snapshot(), now=10.0))
+                with CORE.UnixSeqpacketInputServer(path) as server:
+                    self.assertFalse(publisher.send(self.snapshot(), now=10.1))
+                    self.assertTrue(publisher.send(self.snapshot(2), now=10.21))
+                    with server.accept(timeout_s=1.0) as connection:
+                        self.assertEqual(connection.receive(timeout_s=1.0).sequence, 2)
+            finally:
+                publisher.close()
+
+    def test_connect_has_a_bounded_io_timeout(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        class NeverConnects:
+            def settimeout(self, value: float) -> None:
+                calls.append(("timeout", value))
+
+            def connect(self, path: str) -> None:
+                calls.append(("connect", path))
+                raise socket.timeout("bounded")
+
+            def close(self) -> None:
+                calls.append(("close", None))
+
+        publisher = MODULE.UnixSeqpacketPublisher(
+            "/tmp/never-connects.sock",
+            io_timeout_seconds=0.007,
+            socket_factory=lambda *_args: NeverConnects(),
+        )
+        self.assertFalse(publisher.send(self.snapshot(), now=10.0))
+        self.assertEqual(calls[0], ("timeout", 0.007))
+        self.assertEqual(calls[-1], ("close", None))
+
+    def test_partial_seqpacket_write_drops_the_connection(self) -> None:
+        calls: list[str] = []
+
+        class PartialWriter:
+            def settimeout(self, _value: float) -> None:
+                pass
+
+            def connect(self, _path: str) -> None:
+                pass
+
+            def send(self, payload: bytes) -> int:
+                calls.append("send")
+                return len(payload) - 1
+
+            def close(self) -> None:
+                calls.append("close")
+
+        publisher = MODULE.UnixSeqpacketPublisher(
+            "/tmp/partial-writer.sock",
+            socket_factory=lambda *_args: PartialWriter(),
+        )
+        self.assertFalse(publisher.send(self.snapshot(), now=10.0))
+        self.assertFalse(publisher.connected)
+        self.assertEqual(calls, ["send", "close"])
+
+
+if __name__ == "__main__":
+    unittest.main()

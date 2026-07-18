@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,15 +20,92 @@ from typing import Any, Callable, TypedDict
 from urllib.parse import urlsplit
 import uuid
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from matrix_game_control import (
+    ControlConfig,
+    GameControlCore,
+    InputProtocolError,
+    InputRejectedError,
+    PROTOCOL_NAME,
+    RobotMotionCommand,
+    UnixInputConnection,
+    UnixSeqpacketInputServer,
+    wrap_angle_rad,
+)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--sonic-root", type=Path, required=True)
     parser.add_argument(
-        "--control-source", choices=("planner", "pico", "external"), default="planner"
+        "--control-source",
+        choices=("planner", "game", "pico", "external"),
+        default="planner",
     )
     parser.add_argument("--planner-bind", default="tcp://127.0.0.1:5556")
+    parser.add_argument(
+        "--game-input-socket",
+        type=Path,
+        default=Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+        / f"matrix-game-control-{os.getuid()}-{os.getpid()}.sock",
+        help="User-local Unix socket for camera-relative input snapshots",
+    )
+    parser.add_argument("--game-max-speed", type=float, default=0.30)
+    parser.add_argument("--game-max-acceleration", type=float, default=1.20)
+    parser.add_argument("--game-max-deceleration", type=float, default=2.40)
+    parser.add_argument("--game-max-turn-rate", type=float, default=2.50)
+    parser.add_argument("--game-stick-deadzone", type=float, default=0.15)
+    parser.add_argument("--game-input-timeout", type=float, default=0.15)
+    parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
+    parser.add_argument("--game-max-future-skew", type=float, default=0.05)
+    parser.add_argument(
+        "--game-input-provider",
+        type=Path,
+        default=_SCRIPT_DIR / "matrix_game_control_input.py",
+    )
+    parser.add_argument("--game-input-provider-python", default=sys.executable)
+    parser.add_argument(
+        "--game-input-source",
+        choices=("auto", "keyboard", "gamepad"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--game-camera-yaw-source",
+        choices=("x11-mirror", "carla", "fixed"),
+        default="fixed",
+    )
+    parser.add_argument(
+        "--game-look-button", choices=("left", "middle", "right"), default="left"
+    )
+    parser.add_argument(
+        "--game-initial-camera-yaw-deg",
+        type=float,
+        default=0.0,
+        help="Initial provider/UE yaw before provider-to-SONIC sign and offset",
+    )
+    parser.add_argument("--game-mouse-sensitivity-deg", type=float, default=0.12)
+    parser.add_argument(
+        "--game-camera-yaw-sign", type=int, choices=(-1, 1), default=-1
+    )
+    parser.add_argument("--game-camera-yaw-offset-deg", type=float, default=0.0)
+    parser.add_argument("--game-carla-host", default="127.0.0.1")
+    parser.add_argument("--game-carla-port", type=int, default=2000)
+    parser.add_argument(
+        "--gamepad-look-yaw-rate-deg-s", type=float, default=120.0
+    )
+    parser.add_argument(
+        "--gamepad-look-pitch-rate-deg-s", type=float, default=90.0
+    )
+    parser.add_argument("--gamepad-look-deadzone", type=float, default=0.12)
+    parser.add_argument("--gamepad-look-min-pitch-deg", type=float, default=-80.0)
+    parser.add_argument("--gamepad-look-max-pitch-deg", type=float, default=60.0)
+    parser.add_argument("--game-focus-title", default=r"(zsibot|matrix|unreal)")
+    parser.add_argument("--game-input-status-file", type=Path)
+    parser.add_argument("--no-game-input-provider", action="store_true")
     parser.add_argument(
         "--pico-python",
         default=None,
@@ -772,10 +850,259 @@ def _validate_qualified_acceptance(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_qualified_game_control(args: argparse.Namespace) -> None:
+    """Reject game-control qualification paths that bypass real camera input."""
+
+    if not args.qualified_runtime or args.control_source != "game":
+        return
+    if args.no_game_input_provider:
+        raise SystemExit(
+            "qualified game control requires the supervised input provider"
+        )
+    if args.game_camera_yaw_source == "fixed":
+        raise SystemExit(
+            "qualified game control rejects an unobserved fixed camera yaw"
+        )
+    if (
+        args.game_camera_yaw_source == "x11-mirror"
+        and args.game_mouse_sensitivity_deg <= 0.0
+    ):
+        raise SystemExit(
+            "qualified x11-mirror control requires positive mouse sensitivity"
+        )
+    expected_provider = (_SCRIPT_DIR / "matrix_game_control_input.py").resolve()
+    try:
+        actual_provider = args.game_input_provider.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit(f"qualified game input provider is unavailable: {exc}") from exc
+    if actual_provider != expected_provider:
+        raise SystemExit(
+            "qualified game control requires the bundled input provider: "
+            f"expected={expected_provider} actual={actual_provider}"
+        )
+    expected_python = os.path.abspath(sys.executable)
+    actual_python = os.path.abspath(os.fspath(args.game_input_provider_python))
+    if actual_python != expected_python:
+        raise SystemExit(
+            "qualified game control requires the verified runtime Python for "
+            f"its input provider: expected={expected_python} actual={actual_python}"
+        )
+
+
 def _root_up_z(qpos) -> float:
     """Diagnostic world-Z component of the floating base's local up axis."""
     _, x, y, _ = [float(value) for value in qpos[3:7]]
     return 1.0 - 2.0 * (x * x + y * y)
+
+
+def _root_yaw_rad(qpos) -> float:
+    """Return normalized floating-base yaw from MuJoCo's wxyz quaternion."""
+
+    try:
+        w, x, y, z = [float(value) for value in qpos[3:7]]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("root quaternion must contain four finite numbers") from exc
+    norm = math.sqrt((w * w) + (x * x) + (y * y) + (z * z))
+    if not math.isfinite(norm) or norm <= 1e-12:
+        raise ValueError("root quaternion has zero or non-finite norm")
+    w, x, y, z = (value / norm for value in (w, x, y, z))
+    sine = 2.0 * ((w * z) + (x * y))
+    cosine = 1.0 - (2.0 * ((y * y) + (z * z)))
+    return math.atan2(sine, cosine)
+
+
+class _HeadingAnchorTelemetry:
+    """Audit the startup yaw without changing the game-control frame.
+
+    Native SONIC initializes its planner heading before Matrix can observe the
+    first fresh LowCmd.  Matrix therefore keeps the initial MuJoCo snapshot as
+    its command-frame anchor and records the first freshness edge only as
+    evidence.  In particular, :meth:`observe` never calls the control core and
+    never changes ``root_yaw_initial_rad``.
+    """
+
+    def __init__(self, initial_root_yaw_rad: float, initial_snapshot: Any) -> None:
+        self.root_yaw_initial_rad = float(initial_root_yaw_rad)
+        self.root_yaw_first_fresh_lowcmd_rad: float | None = None
+        self.root_yaw_startup_delta_rad: float | None = None
+        self.first_fresh_lowcmd_step_index: int | None = None
+        self.first_fresh_lowcmd_sim_time_s: float | None = None
+        self.first_fresh_lowcmd_wall_elapsed_s: float | None = None
+        self._previous_low_cmd_fresh = bool(initial_snapshot.low_cmd_fresh)
+
+        # A simulator reused in the same DDS domain may already report a
+        # fresh command in the initial snapshot.  Record that state explicitly
+        # instead of waiting for a false->true edge that may never occur.
+        if self._previous_low_cmd_fresh:
+            self._capture(
+                initial_snapshot,
+                root_yaw_rad=self.root_yaw_initial_rad,
+                wall_elapsed_s=0.0,
+            )
+
+    def _capture(
+        self,
+        snapshot: Any,
+        *,
+        root_yaw_rad: float,
+        wall_elapsed_s: float,
+    ) -> None:
+        if self.root_yaw_first_fresh_lowcmd_rad is not None:
+            return
+        yaw = float(root_yaw_rad)
+        elapsed = float(wall_elapsed_s)
+        if not math.isfinite(yaw):
+            raise ValueError("first fresh LowCmd root yaw must be finite")
+        if not math.isfinite(elapsed) or elapsed < 0.0:
+            raise ValueError("first fresh LowCmd wall elapsed must be nonnegative")
+        self.root_yaw_first_fresh_lowcmd_rad = yaw
+        self.root_yaw_startup_delta_rad = wrap_angle_rad(
+            yaw - self.root_yaw_initial_rad
+        )
+        self.first_fresh_lowcmd_step_index = int(snapshot.step_index)
+        self.first_fresh_lowcmd_sim_time_s = float(snapshot.sim_time)
+        self.first_fresh_lowcmd_wall_elapsed_s = elapsed
+
+    def observe(self, snapshot: Any, *, wall_elapsed_s: float) -> bool:
+        """Capture exactly the first observed false-to-true freshness edge."""
+
+        fresh = bool(snapshot.low_cmd_fresh)
+        captured = False
+        if (
+            self.root_yaw_first_fresh_lowcmd_rad is None
+            and fresh
+            and not self._previous_low_cmd_fresh
+        ):
+            self._capture(
+                snapshot,
+                root_yaw_rad=_root_yaw_rad(snapshot.qpos),
+                wall_elapsed_s=wall_elapsed_s,
+            )
+            captured = True
+        self._previous_low_cmd_fresh = fresh
+        return captured
+
+    def status_fields(self) -> dict[str, Any]:
+        """Return stable JSON fields for periodic and final status payloads."""
+
+        return {
+            "heading_anchor_source": "initial_snapshot",
+            "root_yaw_initial_rad": round(self.root_yaw_initial_rad, 6),
+            "root_yaw_first_fresh_lowcmd_rad": (
+                round(self.root_yaw_first_fresh_lowcmd_rad, 6)
+                if self.root_yaw_first_fresh_lowcmd_rad is not None
+                else None
+            ),
+            "root_yaw_startup_delta_rad": (
+                round(self.root_yaw_startup_delta_rad, 6)
+                if self.root_yaw_startup_delta_rad is not None
+                else None
+            ),
+            "first_fresh_lowcmd_step_index": self.first_fresh_lowcmd_step_index,
+            "first_fresh_lowcmd_sim_time_s": (
+                round(self.first_fresh_lowcmd_sim_time_s, 6)
+                if self.first_fresh_lowcmd_sim_time_s is not None
+                else None
+            ),
+            "first_fresh_lowcmd_wall_elapsed_s": (
+                round(self.first_fresh_lowcmd_wall_elapsed_s, 6)
+                if self.first_fresh_lowcmd_wall_elapsed_s is not None
+                else None
+            ),
+        }
+
+
+class _GameSonicReadinessGate:
+    """Keep interactive motion stopped until native SONIC is ready.
+
+    The input core owns neutral re-arming, while this gate owns readiness of
+    the native deploy path.  ``begin_frame`` deliberately runs before input is
+    drained: invalidating first means a key that remains held across a LowCmd
+    outage cannot clear the re-arm latch on the recovery frame.
+    """
+
+    ELASTIC_BAND_ZERO_ABS_TOL = 1e-6
+
+    def __init__(self, initial_snapshot: Any) -> None:
+        initial_fresh = getattr(initial_snapshot, "low_cmd_fresh", False)
+        self._previous_low_cmd_fresh = (
+            initial_fresh if type(initial_fresh) is bool else False
+        )
+        self._ready = False
+        self._stop_facing = (1.0, 0.0, 0.0)
+
+    @classmethod
+    def snapshot_ready(cls, snapshot: Any) -> bool:
+        if type(getattr(snapshot, "low_cmd_fresh", None)) is not bool:
+            return False
+        elastic_band_scale = getattr(snapshot, "elastic_band_scale", None)
+        if type(elastic_band_scale) is not float:
+            return False
+        return snapshot.low_cmd_fresh and math.isfinite(
+            elastic_band_scale
+        ) and math.isclose(
+            elastic_band_scale,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=cls.ELASTIC_BAND_ZERO_ABS_TOL,
+        )
+
+    def begin_frame(self, snapshot: Any, core: GameControlCore) -> bool:
+        """Invalidate unsafe input before polling and return readiness."""
+
+        fresh_value = getattr(snapshot, "low_cmd_fresh", False)
+        fresh = fresh_value if type(fresh_value) is bool else False
+        self._ready = self.snapshot_ready(snapshot)
+        if not self._ready:
+            reason = (
+                "low_cmd_stale"
+                if self._previous_low_cmd_fresh and not fresh
+                else "sonic_not_ready"
+            )
+            # Repeat invalidation while SONIC is unavailable.  This prevents a
+            # neutral packet observed during startup from arming a key that is
+            # pressed before the elastic band has fully released.
+            core.invalidate_input(reason)
+            # Materialize the core's safety stop before a newly drained
+            # neutral packet can clear the re-arm latch. Besides hard-zeroing
+            # speed, this absorbs measured yaw so IDLE cannot finish an old
+            # turn while LowCmd or the startup restraint is unavailable.
+            stopped = core.command(now_s=0.0, dt_s=0.0)
+            self._stop_facing = stopped.facing
+        self._previous_low_cmd_fresh = fresh
+        return self._ready
+
+    def apply(
+        self,
+        command: RobotMotionCommand,
+        core: GameControlCore,
+    ) -> RobotMotionCommand:
+        """Return ``command`` only when SONIC can accept interactive motion.
+
+        The second invalidation is intentionally after the input drain. A
+        neutral packet followed by a held-key packet can arrive in the same
+        batch; neither may leave the neutral-rearm latch cleared while native
+        readiness is false.
+        """
+
+        if not isinstance(command, RobotMotionCommand):
+            raise TypeError("command must be a RobotMotionCommand")
+        if not isinstance(core, GameControlCore):
+            raise TypeError("core must be a GameControlCore")
+        if self._ready:
+            return command
+        core.invalidate_input("sonic_not_ready")
+        stopped = core.command(now_s=0.0, dt_s=0.0)
+        self._stop_facing = stopped.facing
+        return RobotMotionCommand(
+            sequence=command.sequence,
+            movement=(0.0, 0.0, 0.0),
+            facing=stopped.facing,
+            speed_mps=0.0,
+            mode="deadman",
+            safe_stop=True,
+            reason="sonic_not_ready",
+        )
 
 
 def _pace_absolute_deadline(deadline_s: float, period_s: float) -> float:
@@ -866,6 +1193,99 @@ def _acceptance_failures(
     return failures
 
 
+def _game_input_acceptance_failures(
+    *,
+    accepted_connections: int,
+    packets_applied: int,
+    moving_command_frames: int,
+    protocol_errors: int,
+    rejected_packets: int,
+    peer_pid_mismatches: int,
+    connected_at_boundary: bool,
+    input_age_s: float | None,
+    maximum_boundary_age_s: float,
+    safe_stop_at_boundary: bool,
+) -> list[str]:
+    """Qualified game runs require a clean, exercised operator input path."""
+
+    failures = []
+    if accepted_connections < 1:
+        failures.append("game_input_no_connection")
+    if packets_applied < 1:
+        failures.append("game_input_no_applied_packets")
+    if moving_command_frames < 1:
+        failures.append("game_input_no_moving_command_frames")
+    if protocol_errors:
+        failures.append(f"game_input_protocol_errors:{protocol_errors}")
+    if rejected_packets:
+        failures.append(f"game_input_rejected_packets:{rejected_packets}")
+    if peer_pid_mismatches:
+        failures.append(f"game_input_peer_pid_mismatches:{peer_pid_mismatches}")
+    if not connected_at_boundary:
+        failures.append("game_input_disconnected_at_boundary")
+    if input_age_s is None or input_age_s > maximum_boundary_age_s:
+        failures.append("game_input_stale_at_boundary")
+    if safe_stop_at_boundary:
+        failures.append("game_input_safe_stop_at_boundary")
+    return failures
+
+
+def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
+    """Return the immutable input/camera claim carried by every status frame."""
+
+    source = args.game_camera_yaw_source
+    if source == "fixed":
+        yaw_observation = "constant_unobserved"
+    elif source == "x11-mirror":
+        yaw_observation = "configured_pointer_delta_mirror"
+    else:
+        yaw_observation = "carla_spectator_rpc_write_readback"
+    effective_input_source = args.game_input_source
+    if source != "carla" and effective_input_source == "auto":
+        effective_input_source = "keyboard"
+    return {
+        "input_protocol": PROTOCOL_NAME,
+        "input_source_requested": args.game_input_source,
+        "input_source_effective": effective_input_source,
+        "native_gait": "SLOW_WALK",
+        "keyboard_slow_speed_mps": 0.10,
+        "keyboard_walk_speed_mps": round((0.10 + args.game_max_speed) / 2.0, 6),
+        "keyboard_run_speed_mps": args.game_max_speed,
+        "maximum_speed_mps": args.game_max_speed,
+        "maximum_acceleration_mps2": args.game_max_acceleration,
+        "maximum_deceleration_mps2": args.game_max_deceleration,
+        "maximum_turn_rate_rad_s": args.game_max_turn_rate,
+        "stick_deadzone": args.game_stick_deadzone,
+        "input_timeout_s": args.game_input_timeout,
+        "maximum_snapshot_age_s": args.game_max_snapshot_age,
+        "maximum_future_skew_s": args.game_max_future_skew,
+        "camera_yaw_source": source,
+        "camera_look_button": args.game_look_button,
+        "focus_title_pattern": args.game_focus_title,
+        "expected_ue_pid": args.ue_pid,
+        "camera_yaw_observation": yaw_observation,
+        "camera_yaw_sign": args.game_camera_yaw_sign,
+        "camera_yaw_offset_deg": args.game_camera_yaw_offset_deg,
+        "initial_camera_yaw_deg": args.game_initial_camera_yaw_deg,
+        "mouse_sensitivity_deg_per_px": args.game_mouse_sensitivity_deg,
+        "carla_host": args.game_carla_host,
+        "carla_port": args.game_carla_port,
+        "gamepad_look_yaw_rate_deg_s": args.gamepad_look_yaw_rate_deg_s,
+        "gamepad_look_pitch_rate_deg_s": args.gamepad_look_pitch_rate_deg_s,
+        "gamepad_look_deadzone": args.gamepad_look_deadzone,
+        "gamepad_look_min_pitch_deg": args.gamepad_look_min_pitch_deg,
+        "gamepad_look_max_pitch_deg": args.gamepad_look_max_pitch_deg,
+        "carla_write_readback_tolerance_deg": 0.5,
+        # Neither pointer integration nor a CARLA spectator transform proves
+        # that the cooked Matrix follow camera rendered the same direction.
+        # Qualified status therefore names its scope instead of over-claiming
+        # a visual camera-relative acceptance result.
+        "qualification_scope": "runtime_input_and_motion_path_only",
+        "visible_follow_camera_verified": False,
+        "external_visual_evidence_required": True,
+    }
+
+
 _EXPECTED_SNAPSHOT_DIMS = {
     "qpos": 36,
     "qvel": 35,
@@ -903,6 +1323,33 @@ def _snapshot_validation_error(snapshot, previous_snapshot=None) -> str | None:
 
     if type(getattr(snapshot, "fall_detected", None)) is not bool:
         return f"snapshot_invalid_fall_detected:{getattr(snapshot, 'fall_detected', None)!r}"
+    if type(getattr(snapshot, "low_cmd_fresh", None)) is not bool:
+        return (
+            "snapshot_invalid_low_cmd_fresh:"
+            f"{getattr(snapshot, 'low_cmd_fresh', None)!r}"
+        )
+    if type(getattr(snapshot, "low_cmd_received", None)) is not bool:
+        return (
+            "snapshot_invalid_low_cmd_received:"
+            f"{getattr(snapshot, 'low_cmd_received', None)!r}"
+        )
+    low_cmd_age_s = getattr(snapshot, "low_cmd_age_s", None)
+    if low_cmd_age_s is not None:
+        try:
+            low_cmd_age = float(low_cmd_age_s)
+        except (TypeError, ValueError, OverflowError):
+            low_cmd_age = math.nan
+        if (
+            isinstance(low_cmd_age_s, bool)
+            or not math.isfinite(low_cmd_age)
+            or low_cmd_age < 0.0
+        ):
+            return f"snapshot_invalid_low_cmd_age_s:{low_cmd_age_s!r}"
+    elastic_band_scale = getattr(snapshot, "elastic_band_scale", None)
+    if type(elastic_band_scale) is not float or not math.isfinite(
+        elastic_band_scale
+    ):
+        return f"snapshot_invalid_elastic_band_scale:{elastic_band_scale!r}"
     try:
         reset_count = int(snapshot.reset_count)
     except (AttributeError, TypeError, ValueError, OverflowError):
@@ -1101,6 +1548,38 @@ class NativePlannerClient:
         else:
             movement = [0.0, 0.0, 0.0]
         facing = [math.cos(self._heading), math.sin(self._heading), 0.0]
+        self.send_direction(
+            movement=movement,
+            facing=facing,
+            speed=speed if moving else 0.0,
+            start=start,
+        )
+
+    def send_direction(
+        self,
+        *,
+        movement,
+        facing,
+        speed: float,
+        locomotion_mode: int = 2,
+        start: bool = True,
+    ) -> None:
+        """Send an absolute planner direction in SONIC's normalized XY frame."""
+
+        movement_values = [float(value) for value in movement]
+        facing_values = [float(value) for value in facing]
+        if len(movement_values) != 3 or len(facing_values) != 3:
+            raise ValueError("movement and facing must both have length 3")
+        if not all(math.isfinite(value) for value in (*movement_values, *facing_values)):
+            raise ValueError("movement and facing must be finite")
+        speed_value = float(speed)
+        if not math.isfinite(speed_value) or speed_value < 0.0:
+            raise ValueError("speed must be non-negative and finite")
+        if type(locomotion_mode) is not int or not 1 <= locomotion_mode <= 26:
+            raise ValueError("locomotion_mode must be a native SONIC motion in [1, 26]")
+        moving = speed_value > 1e-6 and math.hypot(
+            movement_values[0], movement_values[1]
+        ) > 1e-6
         self._socket.send(
             self._build_command_message(
                 start=start,
@@ -1111,12 +1590,26 @@ class NativePlannerClient:
         )
         self._socket.send(
             self._build_planner_message(
-                mode=2 if moving else 0,
-                movement=movement,
-                facing=facing,
-                speed=speed if moving else -1.0,
+                mode=locomotion_mode if moving else 0,
+                movement=movement_values if moving else [0.0, 0.0, 0.0],
+                facing=facing_values,
+                speed=speed_value if moving else -1.0,
                 height=-1.0,
             )
+        )
+
+    def send_game_command(self, command: RobotMotionCommand) -> None:
+        if not isinstance(command, RobotMotionCommand):
+            raise TypeError("command must be a RobotMotionCommand")
+        if command.speed_mps > 0.8:
+            raise ValueError("game command exceeds native SLOW_WALK maximum 0.8 m/s")
+        self.send_direction(
+            movement=command.movement,
+            facing=command.facing,
+            speed=command.speed_mps,
+            # Interactive control is capped at 0.30 m/s.  Native SONIC mode 1
+            # is SLOW_WALK (0.1-0.8 m/s); mode 2 starts at 0.8 m/s.
+            locomotion_mode=1,
         )
 
     def close(self) -> None:
@@ -1140,6 +1633,209 @@ class NativePlannerClient:
             self._socket.close(linger=0)
         if stop_error is not None:
             raise RuntimeError(f"failed to send native planner stop: {stop_error}")
+
+
+class GameInputRuntime:
+    """Non-blocking bridge from one authenticated UI peer to the control core."""
+
+    def __init__(
+        self,
+        path: Path,
+        core: GameControlCore,
+        *,
+        expected_peer_pid: int | None = None,
+    ) -> None:
+        self.path = path
+        self.core = core
+        self.server = UnixSeqpacketInputServer(path)
+        self.connection: UnixInputConnection | None = None
+        self.accepted_connections = 0
+        self.disconnects = 0
+        self.packets_received = 0
+        self.packets_applied = 0
+        self.protocol_errors = 0
+        self.rejected_packets = 0
+        self.peer_pid_mismatches = 0
+        self.moving_command_frames = 0
+        self.peer_pid: int | None = None
+        self.expected_peer_pid: int | None = None
+        self.last_packet_at_s: float | None = None
+        self.last_error: str | None = None
+        self.last_command: RobotMotionCommand | None = None
+        if expected_peer_pid is not None:
+            self.bind_expected_peer_pid(expected_peer_pid)
+
+    def open(self) -> None:
+        self.server.open()
+
+    def bind_expected_peer_pid(self, pid: int) -> None:
+        """Pin the only peer allowed to drive this runtime."""
+
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+            raise ValueError("expected game-input peer PID must be greater than 1")
+        if self.connection is not None:
+            raise RuntimeError("cannot bind an expected peer after accepting a connection")
+        if self.expected_peer_pid is not None and self.expected_peer_pid != pid:
+            raise RuntimeError("game-input peer PID is already bound")
+        self.expected_peer_pid = pid
+
+    def _drop_connection(self, reason: str) -> None:
+        connection = self.connection
+        self.connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError as exc:
+                reason = f"{reason}; close_error: {exc}"
+            self.disconnects += 1
+        self.peer_pid = None
+        self.last_error = reason
+        # Invalidating the core is intentionally last and unconditional: even
+        # a broken peer fd that fails close must zero the command this frame.
+        self.core.invalidate_input(reason)
+
+    def _accept_if_ready(self) -> None:
+        if self.connection is not None:
+            return
+        try:
+            connection = self.server.accept(timeout_s=0.0)
+        except (socket.timeout, BlockingIOError):
+            return
+        if (
+            self.expected_peer_pid is not None
+            and connection.credentials.pid != self.expected_peer_pid
+        ):
+            actual_pid = connection.credentials.pid
+            try:
+                connection.close()
+            finally:
+                self.peer_pid_mismatches += 1
+                self.last_error = (
+                    "peer_pid_mismatch: "
+                    f"expected={self.expected_peer_pid} actual={actual_pid}"
+                )
+                self.core.invalidate_input("peer_pid_mismatch")
+            return
+        self.connection = connection
+        self.peer_pid = connection.credentials.pid
+        self.accepted_connections += 1
+        self.last_error = None
+
+    def _drain(self, now_s: float) -> None:
+        self._accept_if_ready()
+        if self.connection is None:
+            return
+        batch_fault_reason: str | None = None
+        for _ in range(64):
+            try:
+                snapshot = self.connection.receive(timeout_s=0.0)
+            except (socket.timeout, BlockingIOError):
+                break
+            except EOFError:
+                self._drop_connection("peer_closed")
+                break
+            except (OSError, InputProtocolError) as exc:
+                self.protocol_errors += 1
+                self.last_error = f"protocol_error: {exc}"
+                if isinstance(exc, OSError):
+                    self._drop_connection(f"peer_error: {exc}")
+                    break
+                self.core.invalidate_input("protocol_error")
+                if batch_fault_reason is None:
+                    batch_fault_reason = "protocol_error"
+                continue
+            self.packets_received += 1
+            try:
+                self.core.accept_snapshot(snapshot, received_at_s=now_s)
+            except InputRejectedError as exc:
+                self.rejected_packets += 1
+                self.last_error = f"rejected: {exc}"
+                self.core.invalidate_input("input_rejected")
+                if batch_fault_reason is None:
+                    batch_fault_reason = "input_rejected"
+                continue
+            self.packets_applied += 1
+            self.last_packet_at_s = now_s
+            self.last_error = None
+        if batch_fault_reason is not None:
+            # A later neutral packet in the same 64-message drain must not
+            # erase a malformed/rejected packet's hard-stop frame, nor may a
+            # following held key pre-arm the next frame. Preserve the first
+            # fault as the authoritative batch outcome after the queue is
+            # drained.
+            self.core.invalidate_input(batch_fault_reason)
+            self.last_error = batch_fault_reason
+
+    def poll(self, *, now_s: float, dt_s: float) -> RobotMotionCommand:
+        self._drain(now_s)
+        self.last_command = self.core.command(now_s=now_s, dt_s=dt_s)
+        return self.last_command
+
+    def record_published_command(self, command: RobotMotionCommand) -> None:
+        """Record commands that actually crossed the native planner boundary."""
+
+        if not isinstance(command, RobotMotionCommand):
+            raise TypeError("published command must be a RobotMotionCommand")
+        movement_norm = math.sqrt(
+            sum(float(component) ** 2 for component in command.movement)
+        )
+        if (
+            command.mode == "move"
+            and command.speed_mps > 0.0
+            and movement_norm > 0.0
+            and not command.safe_stop
+        ):
+            self.moving_command_frames += 1
+
+    def telemetry(self, *, now_s: float) -> dict[str, object]:
+        command = self.last_command
+        return {
+            "accepted_connections": self.accepted_connections,
+            "connected": self.connection is not None,
+            "disconnects": self.disconnects,
+            "free_camera": self.core.free_camera,
+            "free_camera_authoritative": False,
+            "free_camera_inferred": self.core.free_camera,
+            "heading_rad": round(self.core.heading_rad, 6),
+            "measured_heading_rad": (
+                round(self.core.measured_heading_rad, 6)
+                if self.core.measured_heading_rad is not None
+                else None
+            ),
+            "input_age_s": (
+                round(max(0.0, now_s - self.last_packet_at_s), 6)
+                if self.last_packet_at_s is not None
+                else None
+            ),
+            "last_error": self.last_error,
+            "mode": command.mode if command is not None else "deadman",
+            "moving_command_frames": self.moving_command_frames,
+            "packets_applied": self.packets_applied,
+            "packets_received": self.packets_received,
+            "peer_pid": self.peer_pid,
+            "expected_peer_pid": self.expected_peer_pid,
+            "peer_pid_mismatches": self.peer_pid_mismatches,
+            "protocol_errors": self.protocol_errors,
+            "rejected_packets": self.rejected_packets,
+            "safe_stop": command.safe_stop if command is not None else True,
+            "sequence": command.sequence if command is not None else None,
+            "socket": str(self.path),
+            "speed_mps": round(command.speed_mps, 6) if command is not None else 0.0,
+            "stop_reason": command.reason if command is not None else "no_input",
+        }
+
+    def emergency_stop(self, *, now_s: float, reason: str) -> RobotMotionCommand:
+        """Hard-zero without draining any packets that remain queued by a peer."""
+
+        self.core.invalidate_input(reason)
+        self.last_command = self.core.command(now_s=now_s, dt_s=0.0)
+        return self.last_command
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        self.server.close()
 
 
 def _peek_child_returncode(process: subprocess.Popen[bytes]) -> int | None:
@@ -1204,15 +1900,23 @@ class NativeProcessGroup:
         self._boundary_failure: tuple[str, int] | None = None
         self._closed = False
 
-    def _start(self, name: str, command: list[str], cwd: Path) -> None:
+    def _start(
+        self,
+        name: str,
+        command: list[str],
+        cwd: Path,
+        *,
+        exec_command: bool = False,
+    ) -> int:
         guarded_command = [
             sys.executable,
             str(self.guardian),
             "--expected-parent",
             str(os.getpid()),
-            "--",
-            *command,
         ]
+        if exec_command:
+            guarded_command.append("--exec-command")
+        guarded_command.extend(("--", *command))
         process = subprocess.Popen(
             guarded_command,
             cwd=cwd,
@@ -1221,6 +1925,7 @@ class NativeProcessGroup:
             start_new_session=True,
         )
         self.children.append((name, process))
+        return process.pid
 
     def start_pico(self, python: str, *, port: int) -> None:
         self._start(
@@ -1234,6 +1939,78 @@ class NativeProcessGroup:
                 str(port),
             ],
             self.sonic_root,
+        )
+
+    def start_game_input(
+        self,
+        python: str,
+        script: Path,
+        *,
+        input_socket: Path,
+        input_source: str,
+        camera_yaw_source: str,
+        look_button: str,
+        initial_camera_yaw_deg: float,
+        mouse_sensitivity_deg: float,
+        camera_yaw_sign: int,
+        camera_yaw_offset_deg: float,
+        carla_host: str,
+        carla_port: int,
+        gamepad_look_yaw_rate_deg_s: float,
+        gamepad_look_pitch_rate_deg_s: float,
+        gamepad_look_deadzone: float,
+        gamepad_look_min_pitch_deg: float,
+        gamepad_look_max_pitch_deg: float,
+        focus_title: str,
+        expected_ue_pid: int,
+        status_file: Path | None,
+    ) -> int:
+        command = [
+            python,
+            "-u",
+            str(script),
+            "--socket",
+            str(input_socket),
+            "--input-source",
+            input_source,
+            "--camera-yaw-source",
+            camera_yaw_source,
+            "--look-button",
+            look_button,
+            "--initial-camera-yaw-deg",
+            str(initial_camera_yaw_deg),
+            "--mouse-sensitivity-deg",
+            str(mouse_sensitivity_deg),
+            "--camera-yaw-sign",
+            str(camera_yaw_sign),
+            "--camera-yaw-offset-deg",
+            str(camera_yaw_offset_deg),
+            "--carla-host",
+            carla_host,
+            "--carla-port",
+            str(carla_port),
+            "--gamepad-look-yaw-rate-deg-s",
+            str(gamepad_look_yaw_rate_deg_s),
+            "--gamepad-look-pitch-rate-deg-s",
+            str(gamepad_look_pitch_rate_deg_s),
+            "--gamepad-look-deadzone",
+            str(gamepad_look_deadzone),
+            "--gamepad-look-min-pitch-deg",
+            str(gamepad_look_min_pitch_deg),
+            "--gamepad-look-max-pitch-deg",
+            str(gamepad_look_max_pitch_deg),
+            "--focus-title",
+            focus_title,
+            "--expected-ue-pid",
+            str(expected_ue_pid),
+        ]
+        if status_file is not None:
+            command.extend(("--status-file", str(status_file)))
+        return self._start(
+            "game-input",
+            command,
+            script.parent.parent,
+            exec_command=True,
         )
 
     def start_deploy(self, *, interface: str, zmq_port: int) -> None:
@@ -1412,6 +2189,67 @@ def main() -> int:
         raise SystemExit("--max-resets must be non-negative")
     if args.ue_pid is not None and args.ue_pid <= 1:
         raise SystemExit("--ue-pid must identify a live UE process")
+    game_config = None
+    if args.control_source == "game":
+        try:
+            game_config = ControlConfig(
+                max_speed_mps=args.game_max_speed,
+                max_acceleration_mps2=args.game_max_acceleration,
+                max_deceleration_mps2=args.game_max_deceleration,
+                max_turn_rate_rad_s=args.game_max_turn_rate,
+                stick_deadzone=args.game_stick_deadzone,
+                input_timeout_s=args.game_input_timeout,
+                max_snapshot_age_s=args.game_max_snapshot_age,
+                max_future_skew_s=args.game_max_future_skew,
+            )
+        except (InputProtocolError, ValueError) as exc:
+            raise SystemExit(f"invalid game control configuration: {exc}") from exc
+        if args.game_max_speed > 0.8:
+            raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
+        if not args.game_input_socket.is_absolute():
+            raise SystemExit("--game-input-socket must be an absolute path")
+        if not args.game_input_socket.parent.is_dir():
+            raise SystemExit(
+                "--game-input-socket parent does not exist: "
+                f"{args.game_input_socket.parent}"
+            )
+        for name in (
+            "game_initial_camera_yaw_deg",
+            "game_mouse_sensitivity_deg",
+            "game_camera_yaw_offset_deg",
+            "gamepad_look_yaw_rate_deg_s",
+            "gamepad_look_pitch_rate_deg_s",
+            "gamepad_look_deadzone",
+            "gamepad_look_min_pitch_deg",
+            "gamepad_look_max_pitch_deg",
+        ):
+            if not math.isfinite(getattr(args, name)):
+                raise SystemExit(f"--{name.replace('_', '-')} must be finite")
+        if not 1 <= args.game_carla_port <= 65535:
+            raise SystemExit("--game-carla-port must be in [1, 65535]")
+        if (
+            args.gamepad_look_yaw_rate_deg_s <= 0.0
+            or args.gamepad_look_pitch_rate_deg_s <= 0.0
+        ):
+            raise SystemExit("gamepad look rates must be positive")
+        if not 0.0 <= args.gamepad_look_deadzone < 1.0:
+            raise SystemExit("--gamepad-look-deadzone must be in [0, 1)")
+        if args.gamepad_look_min_pitch_deg >= args.gamepad_look_max_pitch_deg:
+            raise SystemExit("gamepad camera pitch limits must be ordered")
+        if not args.no_game_input_provider:
+            if args.ue_pid is None:
+                raise SystemExit(
+                    "game input provider requires --ue-pid for exact X11 focus binding"
+                )
+            if not args.game_input_provider.is_file():
+                raise SystemExit(
+                    f"game input provider is missing: {args.game_input_provider}"
+                )
+            if not Path(args.game_input_provider_python).is_file():
+                raise SystemExit(
+                    "game input provider Python is missing: "
+                    f"{args.game_input_provider_python}"
+                )
     sha256_pattern = r"[0-9a-f]{64}"
     if args.qualified_runtime:
         if not args.qualification_profile:
@@ -1440,6 +2278,7 @@ def main() -> int:
         raise SystemExit("qualification metadata requires --qualified-runtime")
     qualification_receipt = _validate_qualification_receipt(args)
     _validate_qualified_acceptance(args)
+    _validate_qualified_game_control(args)
     model_attestation = _validate_qualified_model(
         args, model_path, qualification_receipt
     )
@@ -1478,6 +2317,9 @@ def main() -> int:
     simulator = create_simulator(config)
     renderer = None
     planner = None
+    game_input = None
+    game_readiness = None
+    game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
     running = True
@@ -1521,6 +2363,12 @@ def main() -> int:
             )
 
         initial_root_xy = np.asarray(qpos[:2], dtype=np.float64).copy()
+        try:
+            initial_root_yaw_rad = (
+                _root_yaw_rad(qpos) if args.control_source == "game" else None
+            )
+        except ValueError as exc:
+            raise SystemExit(f"invalid native SONIC initial root heading: {exc}") from exc
         renderer = (
             None
             if args.no_render_sync
@@ -1555,13 +2403,58 @@ def main() -> int:
         # failure during the historical seven-second startup window is already
         # present here and must prevent deploy/PICO from starting.
         poll_failed_child()
-        if running and args.control_source == "planner":
+        if running and args.control_source in {"planner", "game"}:
             planner = NativePlannerClient(
                 args.planner_bind,
                 zmq_module=zmq,
                 build_command_message=build_command_message,
                 build_planner_message=build_planner_message,
             )
+            if args.control_source == "game":
+                assert game_config is not None
+                game_input = GameInputRuntime(
+                    args.game_input_socket,
+                    GameControlCore(game_config),
+                )
+                game_readiness = _GameSonicReadinessGate(snapshot)
+                try:
+                    game_input.open()
+                except OSError as exc:
+                    raise SystemExit(
+                        f"failed to open game input socket {args.game_input_socket}: {exc}"
+                    ) from exc
+                if not args.no_game_input_provider:
+                    provider_pid = processes.start_game_input(
+                        args.game_input_provider_python,
+                        args.game_input_provider,
+                        input_socket=args.game_input_socket,
+                        input_source=args.game_input_source,
+                        camera_yaw_source=args.game_camera_yaw_source,
+                        look_button=args.game_look_button,
+                        initial_camera_yaw_deg=args.game_initial_camera_yaw_deg,
+                        mouse_sensitivity_deg=args.game_mouse_sensitivity_deg,
+                        camera_yaw_sign=args.game_camera_yaw_sign,
+                        camera_yaw_offset_deg=args.game_camera_yaw_offset_deg,
+                        carla_host=args.game_carla_host,
+                        carla_port=args.game_carla_port,
+                        gamepad_look_yaw_rate_deg_s=(
+                            args.gamepad_look_yaw_rate_deg_s
+                        ),
+                        gamepad_look_pitch_rate_deg_s=(
+                            args.gamepad_look_pitch_rate_deg_s
+                        ),
+                        gamepad_look_deadzone=args.gamepad_look_deadzone,
+                        gamepad_look_min_pitch_deg=(
+                            args.gamepad_look_min_pitch_deg
+                        ),
+                        gamepad_look_max_pitch_deg=(
+                            args.gamepad_look_max_pitch_deg
+                        ),
+                        focus_title=args.game_focus_title,
+                        expected_ue_pid=args.ue_pid,
+                        status_file=args.game_input_status_file,
+                    )
+                    game_input.bind_expected_peer_pid(provider_pid)
         elif running and args.control_source == "pico":
             processes.start_pico(
                 args.pico_python or sys.executable, port=planner_port
@@ -1591,6 +2484,11 @@ def main() -> int:
         )
 
         started_wall = time.perf_counter()
+        heading_anchor_telemetry = (
+            _HeadingAnchorTelemetry(initial_root_yaw_rad, snapshot)
+            if initial_root_yaw_rad is not None
+            else None
+        )
         physics_period_s = 1.0 / physics_hz
         next_physics_wall = started_wall + physics_period_s
         next_print = started_wall
@@ -1630,12 +2528,47 @@ def main() -> int:
                 and active_elapsed >= args.walk_after
             )
             if planner is not None:
-                planner.send_velocity(
-                    args.vx if walking else 0.0,
-                    args.vy if walking else 0.0,
-                    args.yaw_rate if walking else 0.0,
-                    dt=1.0 / args.control_hz,
-                )
+                if game_input is not None:
+                    assert initial_root_yaw_rad is not None
+                    assert game_readiness is not None
+                    try:
+                        measured_heading = wrap_angle_rad(
+                            _root_yaw_rad(snapshot.qpos) - initial_root_yaw_rad
+                        )
+                    except (InputProtocolError, ValueError) as exc:
+                        unstable = True
+                        running = False
+                        termination_reason = "numerical_instability"
+                        numerical_error = f"root_heading:{exc}"
+                        print(
+                            "matrix-sonic-runtime ERROR invalid root heading: "
+                            f"{exc}",
+                            flush=True,
+                        )
+                        break
+                    game_input.core.synchronize_heading(measured_heading)
+                    game_readiness.begin_frame(snapshot, game_input.core)
+                    candidate_game_command = game_input.poll(
+                        now_s=frame_wall,
+                        dt_s=1.0 / args.control_hz,
+                    )
+                    game_command = game_readiness.apply(
+                        candidate_game_command,
+                        game_input.core,
+                    )
+                    # Telemetry must describe the command actually published,
+                    # not the pre-readiness candidate returned by the core.
+                    game_input.last_command = game_command
+                    planner.send_game_command(game_command)
+                    game_input.record_published_command(game_command)
+                    walking = game_command.mode == "move"
+                else:
+                    planner.send_velocity(
+                        args.vx if walking else 0.0,
+                        args.vy if walking else 0.0,
+                        args.yaw_rate if walking else 0.0,
+                        dt=1.0 / args.control_hz,
+                    )
 
             for _ in range(substeps):
                 if not running:
@@ -1659,6 +2592,25 @@ def main() -> int:
                     )
                     break
                 snapshot = next_snapshot
+                if heading_anchor_telemetry is not None:
+                    try:
+                        heading_anchor_telemetry.observe(
+                            snapshot,
+                            wall_elapsed_s=max(
+                                time.perf_counter() - started_wall, 0.0
+                            ),
+                        )
+                    except ValueError as exc:
+                        unstable = True
+                        running = False
+                        termination_reason = "numerical_instability"
+                        numerical_error = f"root_heading_telemetry:{exc}"
+                        print(
+                            "matrix-sonic-runtime ERROR invalid root heading "
+                            f"telemetry: {exc}",
+                            flush=True,
+                        )
+                        break
                 instability_resets = int(snapshot.reset_count)
                 if args.fail_on_fall and bool(snapshot.fall_detected):
                     fall_detected = True
@@ -1724,6 +2676,7 @@ def main() -> int:
                     "backend": "gear_sonic_native",
                     "control_frames": control_frames,
                     "control_hz": args.control_hz,
+                    "control_source": args.control_source,
                     "elapsed_wall_s": round(now - started_wall, 3),
                     "model": str(model_path),
                     **model_attestation,
@@ -1785,6 +2738,19 @@ def main() -> int:
                     "startup_band_scale": round(float(snapshot.elastic_band_scale), 5),
                     "walking_commanded": walking,
                 }
+                if game_input is not None:
+                    status["game_input"] = game_input.telemetry(now_s=now)
+                    status["game_control_configuration"] = (
+                        _game_control_status_fields(args)
+                    )
+                    current_root_yaw = _root_yaw_rad(snapshot.qpos)
+                    assert initial_root_yaw_rad is not None
+                    assert heading_anchor_telemetry is not None
+                    status.update(heading_anchor_telemetry.status_fields())
+                    status["root_yaw_world_rad"] = round(current_root_yaw, 6)
+                    status["root_yaw_relative_rad"] = round(
+                        wrap_angle_rad(current_root_yaw - initial_root_yaw_rad), 6
+                    )
                 print(
                     f"matrix-sonic-runtime status={json.dumps(status, sort_keys=True)}",
                     flush=True,
@@ -1794,6 +2760,56 @@ def main() -> int:
                 last_render_count = render_count
                 last_physics_steps = physics_steps
                 next_print = now + max(args.print_every, 0.1)
+
+        # Drain packets already queued at the exact acceptance boundary.  The
+        # duration gate can otherwise break before observing a final focus-loss,
+        # EOF, or malformed packet.  dt=0 updates only input state; this command
+        # is never published, and emergency_stop() immediately follows.
+        game_input_boundary = None
+        if game_input is not None:
+            assert game_readiness is not None
+            assert initial_root_yaw_rad is not None
+            try:
+                boundary_measured_heading = wrap_angle_rad(
+                    _root_yaw_rad(snapshot.qpos) - initial_root_yaw_rad
+                )
+            except (InputProtocolError, ValueError) as exc:
+                unstable = True
+                termination_reason = "numerical_instability"
+                numerical_error = f"root_heading_at_boundary:{exc}"
+                game_input.core.invalidate_input("invalid_boundary_heading")
+            else:
+                # The duration gate runs before the next regular control frame.
+                # Refresh measured yaw from the latest physics snapshot so the
+                # boundary/emergency stop cannot retain a one-frame-old facing.
+                game_input.core.synchronize_heading(boundary_measured_heading)
+            boundary_now = time.perf_counter()
+            game_readiness.begin_frame(snapshot, game_input.core)
+            boundary_candidate = game_input.poll(now_s=boundary_now, dt_s=0.0)
+            game_input.last_command = game_readiness.apply(
+                boundary_candidate,
+                game_input.core,
+            )
+            # emergency_stop() intentionally overwrites the live command below,
+            # so sampling later would make every clean qualified run appear to
+            # have ended in safe-stop mode.
+            game_input_boundary = game_input.telemetry(now_s=boundary_now)
+
+        # Zero interactive motion before status aggregation or child teardown.
+        # In particular, a provider crash must not leave the last moving frame
+        # active while the runtime prepares its final report.
+        if game_input is not None and planner is not None:
+            if child_failure is not None:
+                child_name, child_code = child_failure
+                game_stop_reason = f"child_exit:{child_name}:{child_code}"
+            else:
+                game_stop_reason = f"runtime_stop:{termination_reason or 'stopping'}"
+            game_command = game_input.emergency_stop(
+                now_s=time.perf_counter(),
+                reason=game_stop_reason,
+            )
+            planner.send_game_command(game_command)
+            walking = False
 
         # One final poll followed by a non-reaping stop boundary closes the race
         # between the last loop poll and final status publication. Any native
@@ -1847,6 +2863,25 @@ def main() -> int:
             reset_count=instability_resets,
             max_resets=args.max_resets,
         )
+        if args.qualified_runtime and args.control_source == "game":
+            assert game_input is not None
+            assert game_input_boundary is not None
+            acceptance_failures.extend(
+                _game_input_acceptance_failures(
+                    accepted_connections=game_input.accepted_connections,
+                    packets_applied=game_input.packets_applied,
+                    moving_command_frames=game_input.moving_command_frames,
+                    protocol_errors=game_input.protocol_errors,
+                    rejected_packets=game_input.rejected_packets,
+                    peer_pid_mismatches=game_input.peer_pid_mismatches,
+                    connected_at_boundary=bool(game_input_boundary["connected"]),
+                    input_age_s=game_input_boundary["input_age_s"],
+                    maximum_boundary_age_s=(
+                        args.game_input_timeout + (1.0 / args.control_hz)
+                    ),
+                    safe_stop_at_boundary=bool(game_input_boundary["safe_stop"]),
+                )
+            )
         qualification = _qualification_state(
             max_seconds=args.max_seconds,
             termination_reason=termination_reason,
@@ -1871,6 +2906,7 @@ def main() -> int:
             "completed": completed,
             "control_frames": control_frames,
             "control_hz": args.control_hz,
+            "control_source": args.control_source,
             "elapsed_wall_s": round(elapsed_wall_s, 3),
             "failed_child_exit_code": failed_child_code,
             "failed_child_name": failed_child_name,
@@ -1941,6 +2977,25 @@ def main() -> int:
             "ue_pid": args.ue_pid,
             "walking_commanded": walking,
         }
+        if game_input is not None:
+            final_status["game_input"] = game_input.telemetry(now_s=finished_wall)
+            final_status["game_input_at_boundary"] = game_input_boundary
+            final_status["game_control_configuration"] = (
+                _game_control_status_fields(args)
+            )
+            assert initial_root_yaw_rad is not None
+            assert heading_anchor_telemetry is not None
+            final_status.update(heading_anchor_telemetry.status_fields())
+            try:
+                final_root_yaw = _root_yaw_rad(snapshot.qpos)
+            except ValueError:
+                final_status["root_yaw_world_rad"] = None
+                final_status["root_yaw_relative_rad"] = None
+            else:
+                final_status["root_yaw_world_rad"] = round(final_root_yaw, 6)
+                final_status["root_yaw_relative_rad"] = round(
+                    wrap_angle_rad(final_root_yaw - initial_root_yaw_rad), 6
+                )
         _atomic_json(args.status_file, final_status)
         print(
             "matrix-sonic-runtime stopped "
@@ -1969,6 +3024,9 @@ def main() -> int:
                     flush=True,
                 )
                 cleanup_errors.append(f"native deploy stop wait: {exc}")
+        error = _close_runtime_resource("game input", game_input)
+        if error is not None:
+            cleanup_errors.append(error)
         for name, resource in (
             ("native processes", processes),
             ("renderer", renderer),

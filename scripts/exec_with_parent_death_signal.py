@@ -19,6 +19,14 @@ TERM_GRACE_SECONDS = 2.0
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-parent", type=int, required=True)
+    parser.add_argument(
+        "--exec-command",
+        action="store_true",
+        help=(
+            "Replace the guardian with the command after arming PDEATHSIG. "
+            "Use only for a leaf process whose exact PID is security-relevant."
+        ),
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command[:1] == ["--"]:
@@ -71,11 +79,24 @@ def _terminate_process_group(_signum: int, _frame) -> None:
 
 def main() -> int:
     args = _parse_args()
-    _arm_parent_death_signal(signal.SIGTERM)
+    # A leaf exec has no guardian left to enforce a grace deadline. Use KILL
+    # for unexpected parent death so a provider stuck in Xlib or cleanup cannot
+    # survive while retaining the inherited host-lock fd. Normal supervised
+    # shutdown still reaches the process group with TERM before escalation.
+    _arm_parent_death_signal(
+        signal.SIGKILL if args.exec_command else signal.SIGTERM
+    )
     # PR_SET_PDEATHSIG has a fork-to-prctl race by definition. Checking the
     # expected parent closes it before any native command is spawned.
     if os.getppid() != args.expected_parent:
         return 125
+    if args.exec_command:
+        # exec preserves both the PID observed by the supervisor and the
+        # parent-death signal armed above.  The game-input adapter is a leaf
+        # process, so retaining a separate process-group reaper would only
+        # obscure the SO_PEERCRED identity that the runtime must authenticate.
+        os.execvp(args.command[0], args.command)
+        raise AssertionError("os.execvp returned unexpectedly")
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _terminate_process_group)
 

@@ -59,9 +59,11 @@ git -C "$MATRIX_SONIC_ROOT" switch --detach <locked-sonic-commit>
 git -C "$MATRIX_SONIC_ROOT" status --short
 ```
 
-Do not maintain machine-specific implementation branches. Heyuan, TRNA, and
-ZZA test the same commit. A feature branch is merged only after its required
-host gates have been recorded.
+Do not maintain machine-specific implementation branches. Heyuan is the default
+development and validation host. TRNA and ZZA remain backup hosts and are not
+updated unless the owner explicitly requests one; when requested, that host
+must test the same commit. A feature branch is merged only after its required
+Heyuan gates and any explicitly requested backup-host gates have been recorded.
 
 ## Runtime bundle layout
 
@@ -164,6 +166,14 @@ unavailable; verify its published checksum before bootstrap. Do not copy a sudo
 password or another host's credentials to satisfy this prerequisite.
 
 ## Launch
+
+For interactive camera-relative control, use `--control-source game` and follow
+the dedicated [game-control runbook](MATRIX_GAME_CONTROL_RUNBOOK.md) (or the
+[Chinese runbook](MATRIX_GAME_CONTROL_RUNBOOK_CN.md)). It separates fixed-frame
+functional checks from Heyuan `x11-mirror` calibration, specifies deadman and
+neutral-rearm gates, and records the current cooked-camera limitation. In
+particular, the current adapter must not be described as driving the visible UE
+camera with the right stick.
 
 Town10 main path:
 
@@ -273,22 +283,24 @@ ssh zza-ubuntu -t 'tmux attach -t matrix-zza-acceptance'
 
 ## Sync and delivery
 
-### Three-host collaboration contract
+### Primary-and-backup host collaboration contract
 
-Heyuan, TRNA, and ZZA are peers of one repository, not separate forks:
+Heyuan is the primary checkout. TRNA and ZZA are backup checkouts of the same
+repository, not separate forks:
 
-1. Create one short-lived feature branch on whichever host starts the change.
-2. Push the branch, then use `fetch`, `switch`, and `pull --ff-only` on the
-   other required hosts so every result names the same commit.
+1. Create one short-lived feature branch and do routine development on Heyuan.
+2. Push the branch for durable review. Do not fetch or switch TRNA or ZZA unless
+   the owner explicitly requests that backup; when requested, test the exact
+   same commit there.
 3. Keep host paths and display/NUMA defaults in `config/hosts/*.env`; keep local
    runtime locations in ignored `.matrix/local.env`.
 4. Synchronize private runtime bundles and release archives through bootstrap
    plus the tracked lock. Never synchronize an active Git worktree with rsync.
-5. Choose gates by impact: PICO/device changes require TRNA device evidence;
-   generic launcher/runtime changes require the affected host profiles; shared
-   physics or packaging changes require more than one host before merge.
+5. Heyuan supplies the default launcher/runtime gate. An additional TRNA or ZZA
+   gate is performed only under an explicit owner instruction; change type or
+   release size alone does not authorize synchronization.
 6. Merge through one PR only after source checks, artifact verification,
-   runtime acceptance, cleanup, and evidence links are recorded.
+   Heyuan runtime acceptance, cleanup, and evidence links are recorded.
 
 Before switching hosts:
 
@@ -297,7 +309,7 @@ git status --short
 git push -u origin HEAD
 ```
 
-On the other host:
+On another explicitly requested host:
 
 ```bash
 git fetch origin --prune
