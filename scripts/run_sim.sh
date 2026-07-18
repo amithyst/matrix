@@ -769,8 +769,21 @@ fi
 UE_COMMAND=(
     /usr/bin/env
     "LD_LIBRARY_PATH=$(ue_ld_library_path)"
+    # Force SDL's raw relative-motion path.  These hints make the behavior
+    # explicit across local Xorg and remote nxagent sessions: no warp
+    # emulation, viewport scaling, or system pointer acceleration is allowed
+    # to reshape a camera drag before UE receives it.
+    "SDL_MOUSE_RELATIVE_MODE_WARP=0"
+    "SDL_MOUSE_RELATIVE_SCALING=0"
     "SDL_MOUSE_RELATIVE_SPEED_SCALE=$UE_MOUSE_RELATIVE_SPEED_SCALE"
-    ./zsibot_mujoco_ue.sh -game "$MAPNAME" "-ExecCmds=$UE_EXEC_CMDS"
+    "SDL_MOUSE_RELATIVE_SYSTEM_SCALE=0"
+    ./zsibot_mujoco_ue.sh -game "$MAPNAME"
+    # The stock cooked package enables UE's legacy PlayerInput mouse
+    # smoothing.  Override it in the Input config hierarchy so a released
+    # drag has no interpolated tail; disabling FOV scaling also keeps one
+    # physical delta at one stable gain while zoom/FOV changes.
+    "-ini:Input:[/Script/Engine.InputSettings]:bEnableMouseSmoothing=False,[/Script/Engine.InputSettings]:bEnableFOVScaling=False"
+    "-ExecCmds=$UE_EXEC_CMDS"
 )
 [[ -n "$USE_OFFSCREEN" ]] && UE_COMMAND+=("$USE_OFFSCREEN")
 [[ -n "$USE_PIXELSTREAMER" ]] && UE_COMMAND+=("$USE_PIXELSTREAMER")

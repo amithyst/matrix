@@ -781,6 +781,18 @@ else:
                 "SDL_MOUSE_RELATIVE_SPEED_SCALE=0.400000",
                 ue_capture["command"],
             )
+            for direct_hint in (
+                "SDL_MOUSE_RELATIVE_MODE_WARP=0",
+                "SDL_MOUSE_RELATIVE_SCALING=0",
+                "SDL_MOUSE_RELATIVE_SYSTEM_SCALE=0",
+            ):
+                self.assertIn(direct_hint, ue_capture["command"])
+            self.assertIn(
+                "-ini:Input:[/Script/Engine.InputSettings]:"
+                "bEnableMouseSmoothing=False,[/Script/Engine.InputSettings]:"
+                "bEnableFOVScaling=False",
+                ue_capture["command"],
+            )
 
             with mock.patch.object(
                 sys,

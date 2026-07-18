@@ -87,6 +87,11 @@ startup. With `x11-mirror`, the same applied scale also changes the mirror gain,
 keeping their nominal scales aligned and reducing scale-only mismatch. It does
 not replace the round-trip black-box acceptance below. A missing or corrupt
 settings file safely falls back to Local 1.0x.
+The launcher also pins SDL to raw relative motion without warp emulation,
+viewport scaling, or system pointer acceleration, and disables UE
+`bEnableMouseSmoothing` and FOV sensitivity scaling. Camera rotation therefore
+uses the current frame's mouse delta directly and PlayerInput adds no tail after
+button release. This is independent of the speed scale, which changes gain only.
 Pointer recentering, window-edge effects, and absolute-coordinate jumps still
 require crosshair/MouseLock calibration; the speed scale deliberately does not
 reinterpret such jumps as valid movement.
