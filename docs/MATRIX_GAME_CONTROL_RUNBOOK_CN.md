@@ -97,6 +97,14 @@ test -S /tmp/.X11-unix/X1001
 `(zsibot|matrix|unreal)`。如果 cooked 窗口标题不同，用 `MATRIX_GAME_FOCUS_TITLE`
 精确配置；正式验收绝不能退回只看标题的焦点判断。
 
+当前河源桌面/tmux 的 `PATH` 中存在一个同名的 `~/.local/bin/env` 初始化脚本，它不是
+GNU `env`，会忽略后续启动参数。需要清理 Conda 污染时必须显式使用
+`/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH ...`，不能只写裸 `env`。
+
+当前锁定的 cooked 包实测不含 `/Game/Maps/ApartmentWorld`，因此 `--scene 21` 会在 UE
+日志中报缺包，不能作为可玩验收。该资源重新 cook 之前，河源交互/ESC 面板验收使用包内
+已确认存在的 `--scene 2`（`Town10World`）；物理侧仍由对应的 SONIC Town10 场景驱动。
+
 从新的 UE 进程及其默认跟随相机模式开始。cooked runtime 无法报告 provider 启动前
 发生的 V 切换。
 
@@ -108,9 +116,10 @@ test -S /tmp/.X11-unix/X1001
 先用固定 SONIC 相机 yaw 验证按键和安全行为；此时不假装控制坐标会跟随可见相机：
 
 ```bash
-bash scripts/run_matrix_sonic.sh \
+/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
+  bash scripts/run_matrix_sonic.sh \
   --profile heyuan \
-  --scene 21 \
+  --scene 2 \
   --control-source game \
   --game-input-source keyboard \
   --game-camera-yaw-source fixed \
@@ -161,9 +170,10 @@ wrap(sign × (initial_yaw + 累计鼠标横向像素 × sensitivity) + offset)
 先把画面相机放到可重复的基准姿态，再用保守默认值启动：
 
 ```bash
-bash scripts/run_matrix_sonic.sh \
+/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
+  bash scripts/run_matrix_sonic.sh \
   --profile heyuan \
-  --scene 21 \
+  --scene 2 \
   --control-source game \
   --game-input-source keyboard \
   --game-camera-yaw-source x11-mirror \
@@ -248,9 +258,10 @@ MEASURED_MOUSE_DEG_PER_PIXEL=0.12  # 替换为河源实测值
 MEASURED_CAMERA_YAW_SIGN=-1        # 替换为方向探针得到的 -1 或 1
 MEASURED_CAMERA_YAW_OFFSET_DEG=0   # 替换为标定后的 offset
 
-bash scripts/run_matrix_sonic.sh \
+/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
+  bash scripts/run_matrix_sonic.sh \
   --profile heyuan \
-  --scene 21 \
+  --scene 2 \
   --control-source game \
   --game-input-source keyboard \
   --game-camera-yaw-source x11-mirror \

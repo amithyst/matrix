@@ -1671,8 +1671,15 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         primary_verifier = primary.index(
             '"$PROJECT_ROOT/scripts/verify_matrix_sonic_runtime.py"'
         )
+        primary_bytecode_guard = primary.index(
+            "export PYTHONDONTWRITEBYTECODE=1"
+        )
+        primary_qualification_gate = primary.index(
+            'if [[ "$QUALIFICATION_REQUESTED" == "1" ]]'
+        )
         self.assertLess(primary_lock, primary_status_cleanup)
         self.assertLess(primary_status_cleanup, primary_verifier)
+        self.assertLess(primary_bytecode_guard, primary_qualification_gate)
         for launcher in (primary, overworld):
             self.assertIn("--require-git-sonic", launcher)
             self.assertIn("VERIFY_RUNTIME_ARGS+=(--fast)", launcher)

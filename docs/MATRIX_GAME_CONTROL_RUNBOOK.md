@@ -113,6 +113,17 @@ default. A different cooked-window title must be supplied through
 `MATRIX_GAME_FOCUS_TITLE`; title matching alone is not an acceptance-grade
 focus check.
 
+The current Heyuan desktop/tmux `PATH` contains a same-named
+`~/.local/bin/env` initialization script which is not GNU `env` and ignores the
+launcher arguments. When removing polluted Conda variables, call
+`/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH ...` explicitly rather than bare
+`env`.
+
+The currently locked cooked package does not contain
+`/Game/Maps/ApartmentWorld`; `--scene 21` therefore fails map loading and is not
+a playable acceptance target. Until that asset is recooked, use the packaged
+`--scene 2` (`Town10World`) for Heyuan interactive and ESC-panel acceptance.
+
 Start from a fresh UE process in its default follow-camera mode. The cooked
 runtime cannot report a V toggle made before the input provider starts.
 
@@ -126,9 +137,10 @@ Start with a fixed SONIC camera yaw. This proves input mapping and safety withou
 pretending to follow the visible camera:
 
 ```bash
-bash scripts/run_matrix_sonic.sh \
+/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
+  bash scripts/run_matrix_sonic.sh \
   --profile heyuan \
-  --scene 21 \
+  --scene 2 \
   --control-source game \
   --game-input-source keyboard \
   --game-camera-yaw-source fixed \
@@ -183,9 +195,10 @@ wrap(sign × (initial_yaw + accumulated_mouse_dx × sensitivity) + offset)
 Start from a repeatable visible camera pose and conservative defaults:
 
 ```bash
-bash scripts/run_matrix_sonic.sh \
+/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
+  bash scripts/run_matrix_sonic.sh \
   --profile heyuan \
-  --scene 21 \
+  --scene 2 \
   --control-source game \
   --game-input-source keyboard \
   --game-camera-yaw-source x11-mirror \
@@ -283,9 +296,10 @@ MEASURED_MOUSE_DEG_PER_PIXEL=0.12  # replace with the Heyuan measurement
 MEASURED_CAMERA_YAW_SIGN=-1        # replace with -1 or 1 from the sign probe
 MEASURED_CAMERA_YAW_OFFSET_DEG=0   # replace with the calibrated offset
 
-bash scripts/run_matrix_sonic.sh \
+/usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
+  bash scripts/run_matrix_sonic.sh \
   --profile heyuan \
-  --scene 21 \
+  --scene 2 \
   --control-source game \
   --game-input-source keyboard \
   --game-camera-yaw-source x11-mirror \

@@ -13,6 +13,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export MATRIX_PROJECT_ROOT="$PROJECT_ROOT"
+# The audit venv is a locked runtime artifact.  Interactive, unbounded runs
+# import the same packages as qualification runs, so they must not leave
+# unowned __pycache__ files that make the next preflight fail content closure.
+export PYTHONDONTWRITEBYTECODE=1
 ORIGINAL_ARGS=("$@")
 
 PROFILE="${MATRIX_PROFILE:-}"
@@ -302,9 +306,8 @@ if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
     export MATRIX_ROOT="$PROJECT_ROOT"
     export SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=0
     export MATRIX_SKIP_ENV_CHECK=0
-    # Ignore any historical source-tree __pycache__ and prevent this run from
-    # creating new bytecode beside the pinned SONIC sources.
-    export PYTHONDONTWRITEBYTECODE=1
+    # Redirect any historical source-tree __pycache__ away from the pinned
+    # SONIC sources.  Bytecode writes are already disabled for every launch.
     export PYTHONPYCACHEPREFIX="$(mktemp -d /tmp/matrix-qualified-pycache.XXXXXX)"
     if ! command -v git >/dev/null 2>&1 \
         || [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal)" ]]; then
