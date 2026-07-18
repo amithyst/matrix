@@ -209,6 +209,26 @@ else
 fi
 export MATRIX_SONIC_HOST_LOCK_FD=9
 
+# The host lock serializes every mutation of Saved/Paks.  Clear a verified
+# leftover from an interrupted generation before any runtime audit, then verify
+# the configured external bundle while the launcher still owns that lock.
+MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
+MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
+/usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_ue_overlay.py" \
+    purge-stale \
+    --contract "$MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT" \
+    --project-root "$PROJECT_ROOT"
+if [[ -n "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" ]]; then
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_ue_overlay.py" \
+        verify-bundle \
+        --contract "$MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT" \
+        --bundle "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE"
+    echo "[INFO] Verified Matrix centered-camera overlay bundle: " \
+        "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE"
+fi
+export MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT
+export MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE
+
 MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
 if [[ "$MATRIX_MOUSE_SETTINGS_FILE" != /* ]]; then
     echo "[ERROR] MATRIX_MOUSE_SETTINGS_FILE must be absolute" >&2

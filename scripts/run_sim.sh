@@ -19,6 +19,10 @@ MATRIX_DISABLE_MC="${MATRIX_DISABLE_MC:-0}"
 MATRIX_SONIC="${MATRIX_SONIC:-0}"
 MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
 MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
+MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
+MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
+CENTERED_CAMERA_OVERLAY_STEM="pakchunk99-MatrixCentered-Linux_P"
+MATRIX_GAME_CAMERA_DISTANCE_CM="${MATRIX_GAME_CAMERA_DISTANCE_CM:-150}"
 
 case "${MATRIX_GAME_CENTERED_CAMERA,,}" in
     1|true|yes|on)
@@ -178,11 +182,14 @@ UE_FAILURE_FILE=""
 UE_PID_FILE=""
 RUN_SIM_PARENT_PID="${MATRIX_SONIC_LAUNCHER_PID:-$PPID}"
 CLEANUP_STARTED=0
+CLEANUP_FAILED=0
 X_POINTER_ACCELERATION_RESTORE_NEEDED=0
 X_POINTER_ACCELERATION=""
 X_POINTER_THRESHOLD=""
 X_POINTER_DISPLAY=""
 X_POINTER_XSET_BIN=""
+CENTERED_CAMERA_OVERLAY_ENABLED=false
+CENTERED_CAMERA_OVERLAY_INSTALLED=0
 
 record_ue_supervisor_failure() {
     if [[ -z "${UE_FAILURE_FILE:-}" || -e "$UE_FAILURE_FILE" ]]; then
@@ -278,6 +285,132 @@ stop_supervised_ue() {
         record_ue_supervisor_failure
     fi
     UE_SUPERVISOR_PID=""
+}
+
+install_centered_camera_overlay() {
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_ue_overlay.py" \
+        install \
+        --contract "$MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT" \
+        --bundle "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" \
+        --project-root "$PROJECT_ROOT"
+    CENTERED_CAMERA_OVERLAY_INSTALLED=1
+}
+
+remove_centered_camera_overlay() {
+    if [[ "$CENTERED_CAMERA_OVERLAY_INSTALLED" != "1" ]]; then
+        return 0
+    fi
+    if /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_ue_overlay.py" \
+        remove \
+        --contract "$MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT" \
+        --project-root "$PROJECT_ROOT"; then
+        CENTERED_CAMERA_OVERLAY_INSTALLED=0
+        return 0
+    fi
+    echo "[ERROR] Failed to remove the verified centered-camera overlay" >&2
+    return 1
+}
+
+verify_centered_camera_overlay_mount() {
+    local ue_log="$1"
+    local start_offset="$2"
+    local timeout="${MATRIX_UE_OVERLAY_MOUNT_TIMEOUT_SECONDS:-5}"
+    if [[ ! "$timeout" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "[ERROR] MATRIX_UE_OVERLAY_MOUNT_TIMEOUT_SECONDS must be non-negative" >&2
+        return 1
+    fi
+    local attempts
+    attempts="$(/usr/bin/python3 -I - "$timeout" <<'PY'
+import math
+import sys
+
+timeout = float(sys.argv[1])
+if not math.isfinite(timeout):
+    raise SystemExit("mount timeout must be finite")
+print(max(1, math.ceil(timeout / 0.05) + 1))
+PY
+)" || return 1
+    local attempt
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        local mount_status
+        mount_status="$(/usr/bin/python3 -I - \
+            "$ue_log" "$start_offset" "$CENTERED_CAMERA_OVERLAY_STEM" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+offset = int(sys.argv[2])
+stem = sys.argv[3]
+if not path.is_file():
+    print("waiting")
+    raise SystemExit(0)
+size = path.stat().st_size
+if size < offset:
+    print("truncated")
+    raise SystemExit(0)
+with path.open("rb") as stream:
+    stream.seek(offset)
+    segment = stream.read().decode("utf-8", errors="replace")
+stem_lines = [line for line in segment.splitlines() if stem in line]
+if any("Failed" in line for line in stem_lines):
+    print("failed")
+    raise SystemExit(0)
+prefix = r"^\s*(?:\[[^\]\r\n]*\]\s*)*LogPakFile:\s*Display:\s*"
+found_pattern = re.compile(
+    prefix + r"Found Pak file (?P<path>.+?) attempting to mount\.?\s*$"
+)
+mounted_pattern = re.compile(
+    prefix + r"Mounted IoStore container (?P<path>.+?)\s*$"
+)
+
+def exact_basename(match, expected):
+    if match is None:
+        return False
+    raw = match.group("path").strip().strip("\"'")
+    return raw.replace("\\", "/").rsplit("/", 1)[-1] == expected
+
+found = any(
+    exact_basename(found_pattern.fullmatch(line), f"{stem}.pak")
+    for line in stem_lines
+)
+mounted = any(
+    exact_basename(mounted_pattern.fullmatch(line), f"{stem}.utoc")
+    for line in stem_lines
+)
+print("mounted" if found and mounted else "waiting")
+PY
+        )" || return 1
+        case "$mount_status" in
+            mounted)
+                echo "[INFO] Verified Matrix centered-camera IoStore mount:" \
+                    "$CENTERED_CAMERA_OVERLAY_STEM"
+                return 0
+                ;;
+            failed)
+                echo "[ERROR] UE reported Failed for the current centered-camera" \
+                    "overlay log segment: $ue_log" >&2
+                return 1
+                ;;
+            truncated)
+                echo "[ERROR] UE log was truncated after the centered-camera" \
+                    "startup boundary: $ue_log" >&2
+                return 1
+                ;;
+            waiting) ;;
+            *)
+                echo "[ERROR] Invalid centered-camera mount verifier status:" \
+                    "$mount_status" >&2
+                return 1
+                ;;
+        esac
+        if ((attempt + 1 < attempts)); then
+            sleep 0.05
+        fi
+    done
+    echo "[ERROR] UE log did not confirm Found and Mounted IoStore events for" \
+        "$CENTERED_CAMERA_OVERLAY_STEM: $ue_log" >&2
+    return 1
 }
 
 schedule_forced_cleanup() {
@@ -423,6 +556,11 @@ cleanup() {
     # PID list. Its control-pipe stop plus exact shell wait cannot target a
     # recycled UE or supervisor PID.
     stop_supervised_ue
+    # The cooked overlay must remain present for the whole UE lifetime.  Retire
+    # its active directory only after the exact supervised UE has stopped.
+    if ! remove_centered_camera_overlay; then
+        CLEANUP_FAILED=1
+    fi
 
     # 2. 兜底清理（仅限本项目）
     kill_known_processes TERM
@@ -467,6 +605,10 @@ cleanup() {
     # unavailable at the beginning of cleanup.
     restore_remote_pointer_acceleration || true
     echo "[INFO] ===== Cleanup finished ====="
+    if [[ "$CLEANUP_FAILED" == "1" ]]; then
+        echo "[ERROR] Matrix cleanup failed; refusing a successful exit" >&2
+        return 1
+    fi
 }
 
 handle_signal() {
@@ -717,7 +859,41 @@ esac
 if $MATRIX_SONIC_ENABLED \
     && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]] \
     && $GAME_CENTERED_CAMERA_ENABLED; then
-    if [[ -n "$MATRIX_GAME_CAMERA_VIEW_CLASS" ]]; then
+    if [[ "$ROBOTTYPE" == "custom" \
+        && -n "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" ]]; then
+        if [[ -n "$MATRIX_GAME_CAMERA_VIEW_CLASS" \
+            && "$MATRIX_GAME_CAMERA_VIEW_CLASS" != "Spectator_C" ]]; then
+            echo "[ERROR] The centered-camera overlay viewclass must be" \
+                "Spectator_C or unset; got $MATRIX_GAME_CAMERA_VIEW_CLASS" >&2
+            exit 1
+        fi
+        requested_camera_distance="$MATRIX_GAME_CAMERA_DISTANCE_CM"
+        if ! canonical_camera_distance="$(/usr/bin/python3 -I - \
+            "$requested_camera_distance" <<'PY'
+from decimal import Decimal, InvalidOperation
+import re
+import sys
+
+raw = sys.argv[1]
+if re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", raw) is None:
+    raise SystemExit("camera distance must be a plain non-negative decimal")
+try:
+    value = Decimal(raw)
+except InvalidOperation as exc:
+    raise SystemExit("camera distance is invalid") from exc
+if value < Decimal("80") or value > Decimal("500"):
+    raise SystemExit("camera distance must be within 80..500 cm")
+print(format(value.normalize(), "f"))
+PY
+        )"; then
+            echo "[ERROR] MATRIX_GAME_CAMERA_DISTANCE_CM must be a plain" \
+                "decimal in [80, 500]: $requested_camera_distance" >&2
+            exit 1
+        fi
+        MATRIX_GAME_CAMERA_DISTANCE_CM="$canonical_camera_distance"
+        CENTERED_CAMERA_OVERLAY_ENABLED=true
+        GAME_CAMERA_VIEW_CLASS="Spectator_C"
+    elif [[ -n "$MATRIX_GAME_CAMERA_VIEW_CLASS" ]]; then
         GAME_CAMERA_VIEW_CLASS="$MATRIX_GAME_CAMERA_VIEW_CLASS"
     else
         case "$ROBOTTYPE" in
@@ -738,8 +914,16 @@ if $MATRIX_SONIC_ENABLED \
     UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag False"
     UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag False"
     UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bDoCollisionTest True"
+    if $CENTERED_CAMERA_OVERLAY_ENABLED; then
+        UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent TargetArmLength ${MATRIX_GAME_CAMERA_DISTANCE_CM}"
+    fi
     UE_EXEC_CMDS="${UE_EXEC_CMDS},viewclass ${GAME_CAMERA_VIEW_CLASS}"
-    echo "[INFO] Native centered game-camera startup enabled: viewclass=$GAME_CAMERA_VIEW_CLASS"
+    if $CENTERED_CAMERA_OVERLAY_ENABLED; then
+        echo "[INFO] Persistent centered-camera overlay enabled:" \
+            "robot=MujocoSim_Custom_C viewclass=$GAME_CAMERA_VIEW_CLASS"
+    else
+        echo "[INFO] Native centered game-camera startup enabled: viewclass=$GAME_CAMERA_VIEW_CLASS"
+    fi
 elif $MATRIX_SONIC_ENABLED \
     && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
     echo "[INFO] Native centered game-camera startup disabled"
@@ -917,7 +1101,7 @@ if $ENABLE_MUJOCO && ! $MATRIX_SONIC_ENABLED; then
 fi
 
 cd ../../../UeSim/Linux
-echo "[INFO] Starting UE"
+echo "[INFO] Preparing UE launch"
 UE_MOUSE_RELATIVE_SPEED_SCALE="${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
 if [[ ! "$UE_MOUSE_RELATIVE_SPEED_SCALE" =~ ^(0\.[2-9][0-9]*|1(\.0+)?)$ ]]; then
     echo "[ERROR] MATRIX_MOUSE_APPLIED_SPEED_SCALE must be in [0.2, 1.0]" >&2
@@ -944,8 +1128,23 @@ UE_COMMAND=(
 )
 [[ -n "$USE_OFFSCREEN" ]] && UE_COMMAND+=("$USE_OFFSCREEN")
 [[ -n "$USE_PIXELSTREAMER" ]] && UE_COMMAND+=("$USE_PIXELSTREAMER")
+if $CENTERED_CAMERA_OVERLAY_ENABLED; then
+    install_centered_camera_overlay
+fi
 configure_remote_pointer_acceleration
-start_supervised_ue "$PWD/zsibot_mujoco_ue.log" "${UE_COMMAND[@]}"
+UE_LOG="$PWD/zsibot_mujoco_ue.log"
+UE_LOG_START_OFFSET=0
+if $CENTERED_CAMERA_OVERLAY_ENABLED; then
+    if [[ -f "$UE_LOG" ]]; then
+        UE_LOG_START_OFFSET="$(/usr/bin/stat -c '%s' -- "$UE_LOG")"
+    fi
+    if [[ ! "$UE_LOG_START_OFFSET" =~ ^[0-9]+$ ]]; then
+        echo "[ERROR] Could not record the UE log byte boundary: $UE_LOG" >&2
+        exit 1
+    fi
+fi
+echo "[INFO] Starting UE"
+start_supervised_ue "$UE_LOG" "${UE_COMMAND[@]}"
 
 UE_STARTUP_SECONDS="${MATRIX_UE_STARTUP_SECONDS:-7}"
 if [[ ! "$UE_STARTUP_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -953,6 +1152,9 @@ if [[ ! "$UE_STARTUP_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     exit 1
 fi
 sleep "$UE_STARTUP_SECONDS"
+if $CENTERED_CAMERA_OVERLAY_ENABLED; then
+    verify_centered_camera_overlay_mount "$UE_LOG" "$UE_LOG_START_OFFSET"
+fi
 
 if $MATRIX_SONIC_ENABLED; then
     MATRIX_SONIC_PYTHON="${MATRIX_SONIC_PYTHON:-python3}"

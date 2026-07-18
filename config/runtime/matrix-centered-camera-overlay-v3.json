@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "overlay_version": 3,
+  "overlay_id": "matrix-centered-camera-custom-v3",
+  "stem": "pakchunk99-MatrixCentered-Linux_P",
+  "runtime_directory": "src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/MatrixCenteredCameraActive",
+  "mode": "centered",
+  "scope": [
+    "MujocoSim_Custom",
+    "Spectator"
+  ],
+  "supported_class": "MujocoSim_Custom_C",
+  "files": [
+    {
+      "name": "pakchunk99-MatrixCentered-Linux_P.pak",
+      "size": 339,
+      "sha256": "b17dfaf284d60bef70d70dac05a32c74723afe689764628eb25cf8fdb9424487"
+    },
+    {
+      "name": "pakchunk99-MatrixCentered-Linux_P.utoc",
+      "size": 554,
+      "sha256": "6e95033e880fe2537e304317e2189c1ca5943f57acc3eb50ab439c26044afe9a"
+    },
+    {
+      "name": "pakchunk99-MatrixCentered-Linux_P.ucas",
+      "size": 34423,
+      "sha256": "f0fd22f538cb6d95c6e4e501c3aa5953247ba718a3e1cc4d218ce3f320c0c430"
+    }
+  ]
+}

@@ -24,6 +24,7 @@ if os.fspath(SCRIPTS) not in sys.path:
 
 CORE = importlib.import_module("matrix_game_control")
 PROVIDER = importlib.import_module("matrix_game_control_input")
+OVERLAY = importlib.import_module("matrix_ue_overlay")
 RUNTIME_SPEC = importlib.util.spec_from_file_location(
     "matrix_game_control_integration_runtime",
     SCRIPTS / "run_matrix_sonic.py",
@@ -366,6 +367,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "run_sim.sh",
             "matrix_mouse_settings.py",
             "matrix_restart_request.py",
+            "matrix_ue_overlay.py",
         ):
             shutil.copy2(SCRIPTS / name, scripts / name)
         self.write(
@@ -385,6 +387,10 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         lock = project / "config/runtime/matrix-sonic.lock.json"
         lock.parent.mkdir(parents=True)
         shutil.copy2(REPO_ROOT / "config/runtime/matrix-sonic.lock.json", lock)
+        shutil.copy2(
+            REPO_ROOT / "config/runtime/matrix-centered-camera-overlay-v3.json",
+            project / "config/runtime/matrix-centered-camera-overlay-v3.json",
+        )
         self.write(
             project / "config/config.json",
             json.dumps(
@@ -569,6 +575,21 @@ elif script == "prepare_sonic_physics_model.py":
 elif script == "supervise_matrix_ue.py":
     separator = args.index("--")
     ue_capture = {"command": args[separator + 1:]}
+    project_root = Path(
+        os.environ.get(
+            "MATRIX_PROJECT_ROOT", Path(os.environ["UE_CAPTURE_PATH"]).parent
+        )
+    )
+    overlay_active = (
+        project_root
+        / "src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/MatrixCenteredCameraActive"
+    )
+    ue_capture["overlay_active_at_start"] = overlay_active.is_dir()
+    ue_capture["overlay_inventory_at_start"] = (
+        sorted(path.name for path in overlay_active.iterdir())
+        if overlay_active.is_dir()
+        else []
+    )
     pointer_state = os.environ.get("XSET_STATE_FILE")
     if pointer_state:
         ue_capture["pointer_state_at_start"] = Path(pointer_state).read_text(
@@ -577,6 +598,23 @@ elif script == "supervise_matrix_ue.py":
     Path(os.environ["UE_CAPTURE_PATH"]).write_text(
         json.dumps(ue_capture), encoding="utf-8"
     )
+    overlay_log_mode = os.environ.get("FAKE_UE_OVERLAY_LOG", "")
+    if overlay_log_mode:
+        stem = "pakchunk99-MatrixCentered-Linux_P"
+        lines = "LogPakFile: Display: Found Pak file " + stem + ".pak attempting to mount\\n"
+        if overlay_log_mode == "failed":
+            lines += "LogPakFile: Error: Failed to mount " + stem + ".utoc\\n"
+        elif overlay_log_mode == "spoof":
+            lines = "NotLogPakFile: Display: Found Pak file " + stem + ".pak attempting to mount\\n"
+            lines += "NotLogPakFile: Display: Mounted IoStore container " + stem + ".utoc\\n"
+            lines += "LogPakFile: Display: Found Pak file " + stem + ".pak.bad attempting to mount\\n"
+            lines += "LogPakFile: Display: Mounted IoStore container " + stem + ".utoc.bad\\n"
+        else:
+            lines += "LogPakFile: Display: Mounted IoStore container " + stem + ".utoc\\n"
+        with Path(args[args.index("--log") + 1]).open(
+            "a", encoding="utf-8"
+        ) as log_stream:
+            log_stream.write(lines)
     pid_file = Path(args[args.index("--pid-file") + 1])
     pid_file.write_text(str(os.getpid()), encoding="utf-8")
     for line in sys.stdin:
@@ -1034,6 +1072,331 @@ else:
                 ue_capture["command"],
             )
             self.assertIn("using Local 1.00x", result.stderr)
+
+    def test_centered_overlay_is_mounted_for_custom_game_lifetime_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            bundle = project / "centered-bundle"
+            bundle.mkdir()
+            contents = {
+                f"{OVERLAY.STEM}.pak": b"fixture-pak\n",
+                f"{OVERLAY.STEM}.utoc": b"fixture-utoc\n",
+                f"{OVERLAY.STEM}.ucas": b"fixture-ucas\n",
+            }
+            for name, data in contents.items():
+                (bundle / name).write_bytes(data)
+            self.write(
+                project / "scripts/matrix_ue_overlay.py",
+                """#!/usr/bin/python3
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+command = sys.argv[1]
+args = sys.argv[2:]
+def option(name):
+    return Path(args[args.index(name) + 1])
+
+active_relative = Path(
+    "src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/MatrixCenteredCameraActive"
+)
+expected = {
+    "pakchunk99-MatrixCentered-Linux_P.pak",
+    "pakchunk99-MatrixCentered-Linux_P.utoc",
+    "pakchunk99-MatrixCentered-Linux_P.ucas",
+}
+payload = {"action": command, "version": 3}
+if command == "verify-bundle":
+    bundle = option("--bundle")
+    if {path.name for path in bundle.iterdir()} != expected:
+        raise SystemExit(2)
+    payload["bundle"] = str(bundle)
+elif command == "purge-stale":
+    active = option("--project-root") / active_relative
+    payload["purged"] = int(active.exists())
+    if active.exists():
+        shutil.rmtree(active)
+elif command == "install":
+    active = option("--project-root") / active_relative
+    shutil.copytree(option("--bundle"), active)
+    payload["active"] = str(active)
+elif command == "remove":
+    active = option("--project-root") / active_relative
+    if os.environ.get("FAKE_OVERLAY_REMOVE_FAIL") == "1":
+        print("[ERROR] injected overlay remove failure", file=sys.stderr)
+        raise SystemExit(2)
+    payload["removed"] = active.exists()
+    if active.exists():
+        shutil.rmtree(active)
+else:
+    raise SystemExit(2)
+print(json.dumps(payload, sort_keys=True))
+""",
+            )
+            active = project / OVERLAY.RUNTIME_DIRECTORY
+            active.mkdir(parents=True)
+            for name, data in contents.items():
+                (active / name).write_bytes(data)
+            self.assertTrue(active.is_dir())
+            ue_log = project / "src/UeSim/Linux/zsibot_mujoco_ue.log"
+            self.write(
+                ue_log,
+                "LogPakFile: Display: Found Pak file "
+                f"{OVERLAY.STEM}.pak attempting to mount\n"
+                "LogPakFile: Display: Mounted IoStore container "
+                f"{OVERLAY.STEM}.utoc\n"
+                f"LogPakFile: Error: Failed historical {OVERLAY.STEM}.utoc\n",
+            )
+
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_UE_OVERLAY_LOG": "1",
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE": os.fspath(bundle),
+                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
+                    fixture["stale_status"]
+                ),
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_OVERLAY_MOUNT_TIMEOUT_SECONDS": "0",
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            ue_capture = json.loads(
+                fixture["ue_capture"].read_text(encoding="utf-8")
+            )
+            self.assertTrue(ue_capture["overlay_active_at_start"])
+            self.assertEqual(
+                ue_capture["overlay_inventory_at_start"], sorted(contents)
+            )
+            exec_cmds = next(
+                argument
+                for argument in ue_capture["command"]
+                if argument.startswith("-ExecCmds=")
+            )
+            self.assertIn("viewclass Spectator_C", exec_cmds)
+            self.assertNotIn("viewclass MujocoSim_Custom_C", exec_cmds)
+            self.assertIn(
+                "set Engine.SpringArmComponent TargetArmLength 150", exec_cmds
+            )
+            self.assertFalse(active.exists())
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in bundle.iterdir()}, contents
+            )
+
+            purge_index = result.stdout.index('"action": "purge-stale"')
+            verify_index = result.stdout.index('"action": "verify-bundle"')
+            install_index = result.stdout.index('"action": "install"')
+            ue_index = result.stdout.index("[INFO] UE PID")
+            mounted_index = result.stdout.index(
+                "Verified Matrix centered-camera IoStore mount"
+            )
+            remove_index = result.stdout.index('"action": "remove"')
+            self.assertLess(purge_index, verify_index)
+            self.assertLess(verify_index, install_index)
+            self.assertLess(install_index, ue_index)
+            self.assertLess(ue_index, mounted_index)
+            self.assertLess(mounted_index, remove_index)
+
+            for invalid_distance in ("79", "501", "150,quit", "1e2"):
+                with self.subTest(invalid_distance=invalid_distance):
+                    fixture["ue_capture"].unlink(missing_ok=True)
+                    environment["MATRIX_GAME_CAMERA_DISTANCE_CM"] = invalid_distance
+                    environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                        project / f"launcher-distance-{invalid_distance}.lock"
+                    )
+                    rejected = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                            "--scene",
+                            "21",
+                            "--control-source",
+                            "game",
+                        ],
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        timeout=20.0,
+                        check=False,
+                    )
+                    self.assertEqual(rejected.returncode, 1)
+                    self.assertIn(
+                        "MATRIX_GAME_CAMERA_DISTANCE_CM must be a plain",
+                        rejected.stderr,
+                    )
+                    self.assertFalse(fixture["ue_capture"].exists())
+                    self.assertFalse(active.exists())
+
+            fixture["ue_capture"].unlink(missing_ok=True)
+            environment["MATRIX_GAME_CAMERA_DISTANCE_CM"] = "150"
+            environment["FAKE_UE_OVERLAY_LOG"] = "failed"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-current-log-failure.lock"
+            )
+            failed_mount = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(failed_mount.returncode, 1)
+            self.assertIn("UE reported Failed", failed_mount.stderr)
+            self.assertTrue(fixture["ue_capture"].exists())
+            self.assertFalse(active.exists())
+
+            fixture["ue_capture"].unlink()
+            environment["FAKE_UE_OVERLAY_LOG"] = "spoof"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-spoof-log.lock"
+            )
+            spoofed_mount = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(spoofed_mount.returncode, 1)
+            self.assertIn(
+                "did not confirm Found and Mounted IoStore",
+                spoofed_mount.stderr,
+            )
+            self.assertFalse(active.exists())
+
+            fixture["ue_capture"].unlink()
+            environment["FAKE_UE_OVERLAY_LOG"] = "1"
+            environment["FAKE_OVERLAY_REMOVE_FAIL"] = "1"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-remove-failure.lock"
+            )
+            failed_remove = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(failed_remove.returncode, 1)
+            self.assertIn("Matrix cleanup failed", failed_remove.stderr)
+            self.assertTrue(active.exists())
+
+            fixture["ue_capture"].unlink()
+            environment.pop("FAKE_OVERLAY_REMOVE_FAIL")
+            environment["FAKE_UE_OVERLAY_LOG"] = "1"
+            environment["MATRIX_GAME_CAMERA_VIEW_CLASS"] = "MujocoSim_Custom_C"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-overlay-viewclass.lock"
+            )
+            rejected_viewclass = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(rejected_viewclass.returncode, 1)
+            self.assertIn(
+                "overlay viewclass must be Spectator_C or unset",
+                rejected_viewclass.stderr,
+            )
+            self.assertFalse(fixture["ue_capture"].exists())
+            self.assertFalse(active.exists())
+
+    def test_launcher_source_preserves_overlay_audit_and_cleanup_order(self) -> None:
+        outer = (SCRIPTS / "run_matrix_sonic.sh").read_text(encoding="utf-8")
+        self.assertLess(
+            outer.index("export MATRIX_SONIC_HOST_LOCK_FD=9"),
+            outer.index("purge-stale"),
+        )
+        self.assertLess(
+            outer.index("purge-stale"),
+            outer.index("verify_matrix_sonic_runtime.py"),
+        )
+
+        inner = (SCRIPTS / "run_sim.sh").read_text(encoding="utf-8")
+        cleanup = inner[inner.index("cleanup() {") : inner.index("handle_signal() {")]
+        self.assertLess(
+            cleanup.index("stop_supervised_ue"),
+            cleanup.index("remove_centered_camera_overlay"),
+        )
+        launch = inner[inner.index("# 启动流程") :]
+        self.assertLess(
+            launch.index("install_centered_camera_overlay"),
+            launch.index("start_supervised_ue"),
+        )
+        self.assertLess(
+            launch.index("start_supervised_ue"),
+            launch.index("verify_centered_camera_overlay_mount"),
+        )
 
     def test_centered_camera_can_be_disabled_or_strictly_overridden(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

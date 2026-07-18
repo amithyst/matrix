@@ -22,7 +22,7 @@ Implemented behavior:
 - keyboard WASD uses hold-to-modify slow/walk/run profiles: Ctrl, no modifier,
   and Shift respectively; all remain native SONIC `SLOW_WALK`;
 - Q/E is excluded from locomotion yaw;
-- exact UE-PID focus loss, observed V/free-camera toggles, camera drag, stale
+- exact UE-PID focus loss, observed V safety-state toggles, camera drag, stale
   input, disconnect, and provider failure stop the robot;
 - native LowCmd must be fresh and the startup elastic band fully released
   before any movement frame can pass;
@@ -38,7 +38,8 @@ Not yet established in the cooked Matrix 0.1.2 runtime:
 - an API that makes the right stick rotate that visible camera;
 - verified coupling between a CARLA spectator and the camera shown to the
   operator;
-- authoritative UE free-camera/input-mode readback. V mirroring is best-effort.
+- authoritative UE free-camera/input-mode readback. V mirroring is best-effort;
+  centered-overlay v3 deliberately does not switch the visible camera on V.
 
 Therefore `fixed` is the safe default. `x11-mirror` is a calibration candidate,
 not an authoritative view transform. Full right-stick camera control must not
@@ -124,12 +125,50 @@ The currently locked cooked package does not contain
 a playable acceptance target. Until that asset is recooked, use the packaged
 `--scene 2` (`Town10World`) for Heyuan interactive and ESC-panel acceptance.
 
-Start from a fresh UE process in its default follow-camera mode. The cooked
-runtime cannot report a V toggle made before the input provider starts.
+Start from a fresh UE process in its default centred mode. The cooked runtime
+cannot report a V edge made before the input provider starts.
 
 Use the canonical launcher. Directly running `run_sim.sh` or
 `run_matrix_sonic.py` is only a debugging escape hatch and cannot produce
 qualified evidence.
+
+### Centered-overlay preflight and lifetime
+
+The Heyuan profile defaults `MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE` to
+`/home/kaijie/matrix-artifacts/matrix-centered-camera-custom-v1`. Before every
+launch, the host-locked top-level launcher purges only a previously verified
+stale active directory and verifies that bundle against
+`config/runtime/matrix-centered-camera-overlay-v3.json`. The bundle must be a
+real absolute directory containing exactly the three pinned
+`pakchunk99-MatrixCentered-Linux_P` files; symlinks, extra entries, path
+indirection, size differences, and SHA-256 differences fail closed.
+
+For SONIC game + centred + `custom`, `run_sim.sh` installs the verified files
+atomically immediately before UE, selects `Spectator_C`, and waits for both
+`LogPakFile: Found Pak file` and `LogPakFile: Mounted IoStore container` in the
+new log bytes after the launch boundary. A new stem line containing `Failed`
+fails immediately; historical log bytes cannot pass the gate. The active copy
+remains online for the whole UE process and is removed only after the exact
+supervised UE stops. A
+kill that prevents cleanup is handled by the next host-locked `purge-stale`.
+The launcher overrides the asset's 110 cm SpringArm with a 150 cm full-body
+default. `MATRIX_GAME_CAMERA_DISTANCE_CM` is fail-closed to plain decimals in
+80-500 cm; use 180 cm only when deliberately testing a wider view.
+Planner/PICO/external, non-SONIC, non-custom, or disabled-centred launches never
+install it. With no configured bundle, the existing native robot-viewclass
+fallback remains unchanged.
+
+V does not visually switch overlay v3 to free camera. It only toggles the
+input provider's best-effort mirrored safety state, so a V safety test still
+needs a second V press and neutral re-arm even though the view stays centred.
+For an explicit recovery launch without the Heyuan default, preserve an empty
+value while the profile loads:
+
+```bash
+MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE= \
+  bash scripts/run_matrix_sonic.sh --profile heyuan --scene 2 \
+    --control-source game
+```
 
 ## Stage 1: fixed-frame functional test
 
@@ -237,8 +276,9 @@ For the four-axis gate, align the calibrated SONIC yaw and check root delta:
 | -90° | -Y |
 
 Repeat the sequence after several clockwise/counter-clockwise rotations, after
-moving the pointer near each screen edge, and after entering and leaving V free
-camera. Any cumulative mismatch, jump after pointer warp, or automatic camera
+moving the pointer near each screen edge, and after two V presses that exercise
+the mirrored safety state (the v3 view itself remains centred). Any cumulative
+mismatch, jump after pointer warp, or automatic camera
 recenter invalidates `x11-mirror` as an acceptance source. Keep `fixed` as the
 default in that case.
 
@@ -270,7 +310,7 @@ Run every row with the robot already moving slowly:
 | Launch while W is held | `awaiting_neutral`; no motion until release and re-press |
 | Alt-Tab / focus another window | Immediate zero; `focus_lost`; neutral required after refocus |
 | Hold the configured mouse look button | Immediate zero during drag; neutral required afterward |
-| Press V after provider start | An observed edge gives immediate zero and `free_camera`; best-effort until UE mode readback exists |
+| Press V after provider start | An observed edge gives immediate zero and mirrored `free_camera`; overlay v3 does not visually switch |
 | Stop input packets | 0.15 s threshold; zero on the next 50 Hz tick (nominal worst case about 0.17 s plus scheduler jitter) |
 | Close the input socket | Zero on the next control poll; reconnect requires neutral |
 | Terminate the supervised provider | Zero/teardown; the whole launch must clean up its owned children |
@@ -324,8 +364,8 @@ MEASURED_CAMERA_YAW_OFFSET_DEG=0   # replace with the calibrated offset
 
 During the bounded window, exercise W/A/S/D, all three keyboard speed profiles,
 diagonals, a 180-degree reversal, Q/E, a camera drag/re-arm cycle, and one
-focus-loss/recovery cycle. For V, enter free-camera, verify the hard stop, press
-V again to exit, then complete neutral re-arm; a single toggle would correctly
+focus-loss/recovery cycle. For V, enter the mirrored safety state, verify the hard stop, press
+V again to clear it, then complete neutral re-arm; a single toggle would correctly
 leave the boundary in safe stop. End with sufficient commanded displacement to
 satisfy the locked profile.
 
@@ -408,7 +448,7 @@ described as complete right-stick camera control.
 ## Troubleshooting
 
 - **`awaiting_neutral` never clears:** focus Matrix, release WASD, center the
-  left stick, release the look button, and make sure V free camera is off.
+  left stick, release the look button, and make sure the mirrored V safety state is off.
 - **`focus_lost` while Matrix looks active:** inspect `focus.expected_ue_pid`,
   `focus.actual_pid`, and the X11 title in provider status; adjust
   `MATRIX_GAME_FOCUS_TITLE` only after the PID is correct.

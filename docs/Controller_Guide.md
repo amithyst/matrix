@@ -25,7 +25,7 @@ For setup, camera calibration, safety tests, and Heyuan acceptance, follow the
 | WASD without a speed modifier | Ordinary walk (0.20 m/s by default) |
 | Hold **Shift** + WASD | Run (0.30 m/s default maximum) |
 | Mouse drag | Native Matrix camera operation; the robot stops while the configured look button is held |
-| **V** | Mirror the native free-camera toggle; an observed press forces zero, but cooked UE provides no authoritative mode readback |
+| **V** | Best-effort safety mirror; an observed press forces zero. Centered-overlay v3 does not use V as a visual camera-mode switch |
 | **Q / E** | Reserved and ignored by SONIC locomotion; they do not rotate the robot |
 
 All four movement directions use orient-to-movement. The robot turns toward the
@@ -54,13 +54,49 @@ The default Matrix look button is the left mouse button. Releasing a camera
 drag does not immediately resume a movement key that remained held. Release all
 movement input once, then press it again; this is the neutral re-arm interlock.
 
-### Native robot-centred startup view
+### Persistent robot-centred cooked overlay and native fallback
 
-For `MATRIX_SONIC=1` with `--control-source game`, the launcher now defaults to
-the cooked package's native robot camera instead of leaving the initial view on
-the free `Spectator_C`. At UE startup it disables SpringArm camera lag and
-rotation lag, enables SpringArm collision, and runs `viewclass` for the actual
-rendered robot actor:
+The Heyuan profile configures the host-local bundle
+`/home/kaijie/matrix-artifacts/matrix-centered-camera-custom-v1`. Its tracked
+v3 contract is
+`config/runtime/matrix-centered-camera-overlay-v3.json`; the bundle directory
+name is historical and does not determine its version. The contract pins the
+three `pakchunk99-MatrixCentered-Linux_P` `.pak`/`.utoc`/`.ucas` files by exact
+size and SHA-256 and scopes them to `MujocoSim_Custom` plus `Spectator` for
+`MujocoSim_Custom_C`. The helper independently pins the same artifact tuple in
+code, so selecting a different contract file cannot authorize other bytes.
+
+The overlay is selected only for native SONIC, `--control-source game`, enabled
+centred mode, the `custom` robot, and a configured bundle. The top-level
+launcher owns the host lock, atomically purges a verified crash residue, and
+verifies the external bundle before the SONIC runtime audit. Immediately before
+UE starts, `run_sim.sh` atomically installs a private copy at:
+
+```text
+src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/MatrixCenteredCameraActive
+```
+
+UE then starts with `viewclass Spectator_C`. Overlay v3 continuously moves the
+Spectator pivot to the custom robot's `MainBody` position while preserving the
+Spectator rotation. It disables camera/rotation lag, keeps SpringArm collision,
+and clamps pitch to -75/+55 degrees. The asset default is 110 cm; the launcher
+overrides it to 150 cm so the full robot occupies about 60-63% of frame height.
+`MATRIX_GAME_CAMERA_DISTANCE_CM` accepts only plain decimal values in the
+inclusive 80-500 cm range; 180 cm is the suggested future wide view. Launch is
+fail-closed unless the current launch's new log segment reports both
+`LogPakFile: Found Pak file` and `LogPakFile: Mounted IoStore container` for the
+pinned stem; any new stem line containing `Failed` is rejected. Historical log
+lines cannot satisfy this gate. The active directory remains installed for the
+entire supervised UE lifetime and is atomically retired only after UE stops.
+Failure to remove it makes the launcher fail rather than reporting success.
+
+This is a persistent centred session mode, not a visual mode that V switches
+in and out of. V remains a best-effort locomotion safety observation, but v3
+keeps the visible camera centred; do not use V to assess free-camera visuals.
+
+Without a configured bundle, all existing modes retain the native fallback. In
+SONIC game mode the fallback disables SpringArm camera lag and rotation lag,
+enables SpringArm collision, and selects the rendered robot actor:
 
 | Matrix robot type | Cooked UE view class |
 |---|---|
@@ -71,30 +107,29 @@ rendered robot actor:
 The `xxg` mapping records the class present in the cooked asset; the current
 0.1.2 launcher still rejects robot type `xxg` before UE startup.
 
-The robot-centred view selection has been tested against the live Heyuan cooked
-runtime: a visible frame put the robot at the centre, the PlayerController view
-target read back as `MujocoSim_Custom_C`, and the live custom SpringArm read
-back `MainBody` as its parent, camera lag `False`, rotation lag `False`, and
-collision test `True`. This is a real cooked UE camera path, not the non-runtime
-Python camera contract.
-
-This result does **not** yet prove a moving-robot translation-follow acceptance,
-that every mouse drag is a true orbit about the robot, that pitch/wall/ground
-collision recovery matches a commercial third-person game, or that V has
-authoritative mode readback. Those still need black-box acceptance while the
-robot moves and beside obstacles. Do not call this a complete Genshin-style
-camera bridge.
+The native fallback was tested against the live Heyuan cooked runtime: its
+PlayerController target was `MujocoSim_Custom_C`, and the live custom SpringArm
+reported `MainBody` as parent, lag/rotation lag `False`, and collision test
+`True`. Overlay v3 has passed offline IoStore verification and exact Legacy/Zen
+round-trip checks. Moving-robot orbit, wall/ground collision recovery, and
+remote-desktop feel still require black-box acceptance; do not claim complete
+commercial-game camera parity from package verification alone.
 
 The startup behavior is reversible and narrowly gated:
 
-- set `MATRIX_GAME_CENTERED_CAMERA=0` to disable it;
-- set `MATRIX_GAME_CAMERA_VIEW_CLASS=AnotherRobot_C` to select a different
-  short Blueprint class. The value must be one token ending in `_C`; whitespace,
+- set `MATRIX_GAME_CENTERED_CAMERA=0` to disable centred selection and prevent
+  overlay installation;
+- inherit an explicitly empty `MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE` before
+  loading the Heyuan profile to disable the overlay and use native fallback;
+- without a bundle, set `MATRIX_GAME_CAMERA_VIEW_CLASS=AnotherRobot_C` to select
+  a different short Blueprint class. The value must be one token ending in `_C`; whitespace,
   commas, and console separators are rejected;
+- with the bundle configured, the view-class override must be unset or exactly
+  `Spectator_C`; every other value is rejected;
 - `MATRIX_UE_EXTRA_EXEC_CMDS` is appended last, so an operator can deliberately
   supersede the defaults.
 
-The three `set Engine.SpringArmComponent ...` commands are class-wide UE console
+The `set Engine.SpringArmComponent ...` commands are class-wide UE console
 operations. They are not scoped to the selected robot: assume every loaded
 SpringArmComponent can be affected. Use the disable switch if another scene
 depends on SpringArm lag, and validate any narrower replacement before adding
@@ -194,12 +229,12 @@ of the following occurs:
 - startup has not yet received a neutral frame;
 - native LowCmd is not fresh or the startup elastic band has not fully released;
 - the Matrix window loses focus;
-- the adapter observed native V/free-camera mode or the mouse look button is held;
+- the adapter observed its mirrored V safety state or the mouse look button is held;
 - input times out, becomes stale, disconnects, or is rejected;
 - the provider exits, its local socket closes, or an observed camera yaw is
   unavailable.
 
-After startup, focus loss, camera drag, free-camera toggling, timeout, or
+After startup, focus loss, camera drag, mirrored V-state toggling, timeout, or
 reconnection, release WASD and center the left stick. One focused neutral frame
 must be accepted before motion can resume. This prevents a held key or stick
 from causing an unexpected restart.
@@ -215,7 +250,8 @@ The 0.15 s timeout is evaluated on the next 50 Hz control tick (nominal worst
 case about 0.17 s plus scheduler jitter). It covers the input/provider chain;
 a freeze of the entire runtime process falls back to SONIC's own longer
 watchdog. V remains best-effort until a UE `SubscribeInputMode`-style bridge
-reports the actual free-camera state, including toggles before provider start.
+reports the actual free-camera state, including toggles before provider start;
+centered-overlay v3 intentionally keeps the visible view centred on V.
 
 ## Camera-yaw sources
 
@@ -258,6 +294,6 @@ Logitech Wireless Gamepad F710 is the upstream recommended controller.
 | Rotate Left / Right | **Q / E** |
 | Start | **Enter** |
 
-In the native path, **V** toggles free camera and holding the left mouse button
+In the legacy native path without centered-overlay v3, **V** toggles free camera and holding the left mouse button
 temporarily enters free-camera operation. In `game` mode, use the behavior and
 safety interlocks documented above.
