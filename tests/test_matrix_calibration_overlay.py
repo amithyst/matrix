@@ -57,6 +57,39 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertLess(hint[1], geometry.centre[1])
 
 
+class CursorShapeTest(unittest.TestCase):
+    @staticmethod
+    def pixels(rectangles):
+        return {
+            (x + dx, y + dy)
+            for x, y, width, height in rectangles
+            for dx in range(width)
+            for dy in range(height)
+        }
+
+    def test_xrectangle_uses_the_x11_short_ushort_layout(self) -> None:
+        self.assertEqual(MODULE.ctypes.sizeof(MODULE.XRectangle), 8)
+        self.assertEqual(MODULE.XRectangle.x.offset, 0)
+        self.assertEqual(MODULE.XRectangle.y.offset, 2)
+        self.assertEqual(MODULE.XRectangle.width.offset, 4)
+        self.assertEqual(MODULE.XRectangle.height.offset, 6)
+
+    def test_arrow_is_shaped_with_hotspot_at_window_origin(self) -> None:
+        shadow = self.pixels(MODULE._CURSOR_SHADOW_RECTANGLES)
+        foreground = self.pixels(MODULE._CURSOR_FOREGROUND_RECTANGLES)
+
+        self.assertIn((0, 0), shadow)
+        self.assertTrue(foreground)
+        self.assertLess(foreground, shadow)
+        self.assertLess(len(shadow), MODULE._CURSOR_WIDTH * MODULE._CURSOR_HEIGHT / 2)
+        self.assertTrue(
+            all(
+                0 <= x < MODULE._CURSOR_WIDTH and 0 <= y < MODULE._CURSOR_HEIGHT
+                for x, y in shadow
+            )
+        )
+
+
 class OverlayStateTest(unittest.TestCase):
     def test_state_is_visible_only_for_exact_versioned_true(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -144,7 +177,11 @@ class ParentDeathTest(unittest.TestCase):
                     stat = Path(f"/proc/{child_pid}/stat")
                     if not stat.exists():
                         break
-                    fields = stat.read_text(encoding="utf-8").split()
+                    try:
+                        fields = stat.read_text(encoding="utf-8").split()
+                    except OSError:
+                        # The process can disappear between exists() and read().
+                        break
                     if len(fields) > 2 and fields[2] == "Z":
                         break
                     time.sleep(0.02)
@@ -221,6 +258,20 @@ class X11IntegrationTest(unittest.TestCase):
                 values[labels[label]] = int(value.strip())
         if set(values) != {"X", "Y", "WIDTH", "HEIGHT"}:
             raise ValueError(f"incomplete client geometry: {output!r}")
+        return values
+
+    @classmethod
+    def pointer_location(
+        cls, environment: dict[str, str]
+    ) -> dict[str, int]:
+        output = cls.run_x11(environment, "xdotool", "getmouselocation", "--shell")
+        values: dict[str, int] = {}
+        for line in output.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in {"X", "Y", "WINDOW"}:
+                values[key] = int(value)
+        if set(values) != {"X", "Y", "WINDOW"}:
+            raise ValueError(f"incomplete pointer location: {output!r}")
         return values
 
     def test_click_through_overlay_follows_client_and_preserves_focus(self) -> None:
@@ -316,6 +367,8 @@ class X11IntegrationTest(unittest.TestCase):
                     "vertical-shadow",
                     "vertical",
                     "hint",
+                    "cursor-shadow",
+                    "cursor",
                 ):
                     window = self.wait_until(
                         lambda role=role: self.run_x11(
@@ -355,18 +408,36 @@ class X11IntegrationTest(unittest.TestCase):
 
                 centre_x = target_geometry["X"] + target_geometry["WIDTH"] // 2
                 centre_y = target_geometry["Y"] + target_geometry["HEIGHT"] // 2
+                expected_pointer = (centre_x + 113, centre_y + 71)
                 self.run_x11(
-                    environment, "xdotool", "mousemove", str(centre_x), str(centre_y)
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    str(expected_pointer[0]),
+                    str(expected_pointer[1]),
                 )
-                pointer = self.run_x11(
-                    environment, "xdotool", "getmouselocation", "--shell"
-                )
-                pointer_window = next(
-                    int(line.partition("=")[2])
-                    for line in pointer.splitlines()
-                    if line.startswith("WINDOW=")
-                )
-                self.assertNotIn(pointer_window, set(overlay_windows.values()))
+
+                def cursor_follows_hotspot():
+                    pointer = self.pointer_location(environment)
+                    cursor = self.geometry(environment, str(overlay_windows["cursor"]))
+                    shadow = self.geometry(
+                        environment, str(overlay_windows["cursor-shadow"])
+                    )
+                    expected = (pointer["X"], pointer["Y"])
+                    if (
+                        expected == expected_pointer
+                        and (cursor["X"], cursor["Y"]) == expected
+                        and (shadow["X"], shadow["Y"]) == expected
+                    ):
+                        return pointer
+                    return None
+
+                pointer = self.wait_until(cursor_follows_hotspot)
+                self.assertNotIn(pointer["WINDOW"], set(overlay_windows.values()))
+                focus_after_pointer = self.run_x11(
+                    environment, "xdotool", "getwindowfocus"
+                ).strip()
+                self.assertEqual(focus_after_pointer, focus_before)
 
                 self.run_x11(environment, "xdotool", "windowmove", target_window, "20", "30")
                 self.run_x11(environment, "xdotool", "windowsize", target_window, "700", "500")
@@ -388,11 +459,16 @@ class X11IntegrationTest(unittest.TestCase):
                 self.wait_until(moved_and_followed)
                 MODULE.atomic_json(state, {"version": 1, "active": False})
 
-                def is_unmapped():
-                    info = self.run_x11(environment, "xwininfo", "-id", horizontal)
-                    return "Map State: IsUnMapped" in info
+                def all_are_unmapped():
+                    return all(
+                        "Map State: IsUnMapped"
+                        in self.run_x11(
+                            environment, "xwininfo", "-id", str(window)
+                        )
+                        for window in overlay_windows.values()
+                    )
 
-                self.wait_until(is_unmapped)
+                self.wait_until(all_are_unmapped)
         finally:
             for process in (overlay, target):
                 if process is not None and process.poll() is None:

@@ -2,10 +2,11 @@
 """Show a supervised, click-through X11 calibration overlay above Matrix UE.
 
 The cooked Matrix build has no project sources with which to add a native UMG
-pause widget.  This process therefore renders four tiny crosshair bars and one
-hint window directly on X11.  Every overlay window is override-redirect and has
-an empty XFixes input shape: it neither takes keyboard focus nor receives mouse
-clicks.  The windows follow the mapped UE client carrying ``_NET_WM_PID``.
+pause widget.  This process therefore renders four tiny crosshair bars, one
+hint window, and a shaped visible proxy for UE's hidden cursor directly on X11.
+Every overlay window is override-redirect and has an empty XFixes input shape:
+it neither takes keyboard focus nor receives mouse clicks.  The windows follow
+the mapped UE client carrying ``_NET_WM_PID``.
 """
 
 from __future__ import annotations
@@ -26,8 +27,11 @@ from typing import Any, Callable
 
 _IS_VIEWABLE = 2
 _CW_OVERRIDE_REDIRECT = 1 << 9
+_SHAPE_BOUNDING = 0
 _SHAPE_INPUT = 2
 _PR_SET_PDEATHSIG = 1
+_CURSOR_WIDTH = 20
+_CURSOR_HEIGHT = 28
 
 
 class XWindowAttributes(ctypes.Structure):
@@ -89,6 +93,15 @@ class XColor(ctypes.Structure):
     ]
 
 
+class XRectangle(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_short),
+        ("y", ctypes.c_short),
+        ("width", ctypes.c_ushort),
+        ("height", ctypes.c_ushort),
+    ]
+
+
 @dataclass(frozen=True)
 class WindowGeometry:
     window: int
@@ -100,6 +113,47 @@ class WindowGeometry:
     @property
     def centre(self) -> tuple[int, int]:
         return (self.x + self.width // 2, self.y + self.height // 2)
+
+
+def polygon_scanline_rectangles(
+    vertices: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Rasterize a simple polygon into one-pixel-high XFixes rectangles."""
+
+    if len(vertices) < 3:
+        raise ValueError("a cursor polygon requires at least three vertices")
+    minimum_y = min(y for _x, y in vertices)
+    maximum_y = max(y for _x, y in vertices)
+    rectangles: list[tuple[int, int, int, int]] = []
+    for row in range(minimum_y, maximum_y):
+        scan_y = row + 0.5
+        intersections: list[float] = []
+        for index, (x1, y1) in enumerate(vertices):
+            x2, y2 = vertices[(index + 1) % len(vertices)]
+            if y1 == y2 or not (min(y1, y2) <= scan_y < max(y1, y2)):
+                continue
+            fraction = (scan_y - y1) / (y2 - y1)
+            intersections.append(x1 + fraction * (x2 - x1))
+        intersections.sort()
+        for index in range(0, len(intersections) - 1, 2):
+            left = math.floor(intersections[index])
+            right = math.ceil(intersections[index + 1])
+            if right > left:
+                rectangles.append((left, row, right - left, 1))
+    if not rectangles:
+        raise ValueError("cursor polygon rasterized to an empty region")
+    return tuple(rectangles)
+
+
+# A conventional north-west arrow.  Both layers share window origin (0, 0),
+# which is the real X11 pointer hotspot; the black outer tip remains visible at
+# that exact pixel and the white inset makes the proxy clear on light/dark maps.
+_CURSOR_SHADOW_RECTANGLES = polygon_scanline_rectangles(
+    ((0, 0), (0, 21), (5, 16), (10, 27), (15, 25), (10, 15), (19, 15))
+)
+_CURSOR_FOREGROUND_RECTANGLES = polygon_scanline_rectangles(
+    ((2, 4), (2, 16), (5, 13), (10, 23), (12, 22), (7, 12), (14, 12))
+)
 
 
 def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, int]]:
@@ -179,13 +233,15 @@ def arm_parent_death_signal(expected_parent_pid: int) -> None:
 class X11CalibrationOverlay:
     """Raw Xlib/XFixes overlay with no Python GUI-package dependency."""
 
-    _WINDOW_ORDER = (
+    _STATIC_WINDOW_ORDER = (
         "horizontal-shadow",
         "vertical-shadow",
         "horizontal",
         "vertical",
         "hint",
     )
+    _CURSOR_WINDOW_ORDER = ("cursor-shadow", "cursor")
+    _WINDOW_ORDER = _STATIC_WINDOW_ORDER + _CURSOR_WINDOW_ORDER
 
     def __init__(
         self,
@@ -233,6 +289,7 @@ class X11CalibrationOverlay:
         self._windows: dict[str, int] = {}
         self._hint_gc: int | None = None
         self._visible = False
+        self._cursor_visible = False
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
         self._target_window: int | None = None
         self._create_windows()
@@ -263,6 +320,20 @@ class X11CalibrationOverlay:
                     ctypes.POINTER(ctypes.c_ulong),
                     ctypes.POINTER(ctypes.c_ulong),
                     ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+                ],
+                ctypes.c_int,
+            ),
+            "XQueryPointer": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.POINTER(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_uint),
                 ],
                 ctypes.c_int,
             ),
@@ -449,6 +520,33 @@ class X11CalibrationOverlay:
         finally:
             self._xfixes.XFixesDestroyRegion(self._display, empty)
 
+    def _set_bounding_shape(
+        self,
+        window: int,
+        rectangles: tuple[tuple[int, int, int, int], ...],
+    ) -> None:
+        x_rectangles = (XRectangle * len(rectangles))(
+            *(XRectangle(x, y, width, height) for x, y, width, height in rectangles)
+        )
+        region = self._xfixes.XFixesCreateRegion(
+            self._display,
+            ctypes.cast(x_rectangles, ctypes.c_void_p),
+            len(rectangles),
+        )
+        if not region:
+            raise RuntimeError("cannot create shaped cursor XFixes region")
+        try:
+            self._xfixes.XFixesSetWindowShapeRegion(
+                self._display,
+                window,
+                _SHAPE_BOUNDING,
+                0,
+                0,
+                region,
+            )
+        finally:
+            self._xfixes.XFixesDestroyRegion(self._display, region)
+
     def _create_windows(self) -> None:
         black = int(self._x11.XBlackPixel(self._display, self._screen))
         white = int(self._x11.XWhitePixel(self._display, self._screen))
@@ -459,17 +557,24 @@ class X11CalibrationOverlay:
             "horizontal": accent,
             "vertical": accent,
             "hint": black,
+            "cursor-shadow": black,
+            "cursor": white,
         }
         try:
             for name in self._WINDOW_ORDER:
+                width, height = (
+                    (_CURSOR_WIDTH, _CURSOR_HEIGHT)
+                    if name in self._CURSOR_WINDOW_ORDER
+                    else (1, 1)
+                )
                 window = int(
                     self._x11.XCreateSimpleWindow(
                         self._display,
                         self._root,
                         -100,
                         -100,
-                        1,
-                        1,
+                        width,
+                        height,
                         0,
                         black,
                         colours[name],
@@ -484,6 +589,10 @@ class X11CalibrationOverlay:
                     f"Matrix Calibration {name}".encode("ascii"),
                 )
                 self._make_click_through(window)
+                if name == "cursor-shadow":
+                    self._set_bounding_shape(window, _CURSOR_SHADOW_RECTANGLES)
+                elif name == "cursor":
+                    self._set_bounding_shape(window, _CURSOR_FOREGROUND_RECTANGLES)
             hint = self._windows["hint"]
             gc = self._x11.XCreateGC(self._display, hint, 0, None)
             if not gc:
@@ -604,9 +713,31 @@ class X11CalibrationOverlay:
         self._target_window = selected.window
         return selected
 
-    def show(self, geometry: WindowGeometry) -> None:
+    def pointer_position(self) -> tuple[int, int] | None:
+        root_return = ctypes.c_ulong()
+        child_return = ctypes.c_ulong()
+        root_x = ctypes.c_int()
+        root_y = ctypes.c_int()
+        window_x = ctypes.c_int()
+        window_y = ctypes.c_int()
+        mask = ctypes.c_uint()
+        if not self._x11.XQueryPointer(
+            self._display,
+            self._root,
+            ctypes.byref(root_return),
+            ctypes.byref(child_return),
+            ctypes.byref(root_x),
+            ctypes.byref(root_y),
+            ctypes.byref(window_x),
+            ctypes.byref(window_y),
+            ctypes.byref(mask),
+        ):
+            return None
+        return (root_x.value, root_y.value)
+
+    def show(self, geometry: WindowGeometry, pointer: tuple[int, int]) -> None:
         layout = overlay_layout(geometry)
-        for name in self._WINDOW_ORDER:
+        for name in self._STATIC_WINDOW_ORDER:
             window = self._windows[name]
             x, y, width, height = layout[name]
             self._x11.XMoveResizeWindow(
@@ -628,17 +759,34 @@ class X11CalibrationOverlay:
             message,
             len(message),
         )
+        pointer_x, pointer_y = pointer
+        for name in self._CURSOR_WINDOW_ORDER:
+            window = self._windows[name]
+            self._x11.XMoveResizeWindow(
+                self._display,
+                window,
+                pointer_x,
+                pointer_y,
+                _CURSOR_WIDTH,
+                _CURSOR_HEIGHT,
+            )
+            if not self._cursor_visible:
+                self._x11.XMapRaised(self._display, window)
+            else:
+                self._x11.XRaiseWindow(self._display, window)
         self._x11.XFlush(self._display)
         self._last_layout = layout
         self._visible = True
+        self._cursor_visible = True
 
     def hide(self) -> None:
-        if not self._visible:
+        if not self._visible and not self._cursor_visible:
             return
         for window in self._windows.values():
             self._x11.XUnmapWindow(self._display, window)
         self._x11.XFlush(self._display)
         self._visible = False
+        self._cursor_visible = False
         self._last_layout = None
 
     def close(self) -> None:
@@ -721,10 +869,11 @@ def main() -> int:
                 break
             if read_active_state(args.state_file):
                 target = overlay.find_target()
-                if target is None:
+                pointer = overlay.pointer_position()
+                if target is None or pointer is None:
                     overlay.hide()
                 else:
-                    overlay.show(target)
+                    overlay.show(target, pointer)
             else:
                 overlay.hide()
             time.sleep(interval)
