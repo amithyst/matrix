@@ -149,6 +149,10 @@ def apply_calibration_interlock(
         return keyboard, gamepad
     return (
         KeyboardMouseSample(
+            # Preserve the physical level of V while unfocused so the core's
+            # edge detector cannot mistake a held key for a fresh press when
+            # calibration ends.  focused=False prevents it from toggling here.
+            v=keyboard.v,
             focused=False,
             focus_title=keyboard.focus_title,
             focus_pid=keyboard.focus_pid,

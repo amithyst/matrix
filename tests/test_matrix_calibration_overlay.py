@@ -310,6 +310,23 @@ class X11IntegrationTest(unittest.TestCase):
                         "^Matrix Calibration horizontal$",
                     ).splitlines()[0]
                 )
+                overlay_windows = {"horizontal": int(horizontal)}
+                for role in (
+                    "horizontal-shadow",
+                    "vertical-shadow",
+                    "vertical",
+                    "hint",
+                ):
+                    window = self.wait_until(
+                        lambda role=role: self.run_x11(
+                            environment,
+                            "xdotool",
+                            "search",
+                            "--name",
+                            f"^Matrix Calibration {role}$",
+                        ).splitlines()[0]
+                    )
+                    overlay_windows[role] = int(window)
                 # xdotool reports the outer origin for bordered test windows;
                 # the overlay intentionally follows X11 client coordinates.
                 target_geometry = self.client_geometry(environment, target_window)
@@ -349,7 +366,7 @@ class X11IntegrationTest(unittest.TestCase):
                     for line in pointer.splitlines()
                     if line.startswith("WINDOW=")
                 )
-                self.assertNotEqual(pointer_window, int(horizontal))
+                self.assertNotIn(pointer_window, set(overlay_windows.values()))
 
                 self.run_x11(environment, "xdotool", "windowmove", target_window, "20", "30")
                 self.run_x11(environment, "xdotool", "windowsize", target_window, "700", "500")

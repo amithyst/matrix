@@ -202,7 +202,9 @@ class CalibrationModeTest(unittest.TestCase):
         snapshot = self.snapshot(1, 10.0, neutral_keyboard, neutral_pad)
 
         self.assertFalse(snapshot.focused)
-        self.assertFalse(any(snapshot.keys.to_mapping().values()))
+        key_levels = snapshot.keys.to_mapping()
+        self.assertTrue(key_levels.pop("v"))
+        self.assertFalse(any(key_levels.values()))
         self.assertEqual(
             (snapshot.move_stick.right, snapshot.move_stick.forward), (0.0, 0.0)
         )
@@ -212,6 +214,58 @@ class CalibrationModeTest(unittest.TestCase):
         self.assertEqual(neutral_keyboard.focus_title, "Matrix")
         self.assertEqual(neutral_keyboard.focus_pid, 1234)
         self.assertFalse(neutral_pad.connected)
+
+    def test_held_v_across_calibration_does_not_create_a_mode_edge(self) -> None:
+        core = CORE.GameControlCore()
+
+        # V is already held on entry.  Every calibration packet is unfocused,
+        # but carries the real V level so the core keeps its edge memory true.
+        for sequence, timestamp in ((1, 10.0), (2, 10.01), (3, 10.02)):
+            keyboard, pad = MODULE.apply_calibration_interlock(
+                MODULE.KeyboardMouseSample(v=True, focused=True),
+                MODULE.GamepadSample(),
+                active=True,
+            )
+            core.accept_snapshot(
+                self.snapshot(sequence, timestamp, keyboard, pad),
+                received_at_s=timestamp,
+            )
+            self.assertFalse(core.free_camera)
+
+        # Exiting while V remains held must not look like a new focused edge.
+        core.accept_snapshot(
+            self.snapshot(
+                4,
+                10.03,
+                MODULE.KeyboardMouseSample(v=True, focused=True),
+            ),
+            received_at_s=10.03,
+        )
+        self.assertFalse(core.free_camera)
+
+        # A real release followed by a new press still toggles exactly once.
+        core.accept_snapshot(
+            self.snapshot(5, 10.04, MODULE.KeyboardMouseSample(focused=True)),
+            received_at_s=10.04,
+        )
+        core.accept_snapshot(
+            self.snapshot(
+                6,
+                10.05,
+                MODULE.KeyboardMouseSample(v=True, focused=True),
+            ),
+            received_at_s=10.05,
+        )
+        self.assertTrue(core.free_camera)
+        core.accept_snapshot(
+            self.snapshot(
+                7,
+                10.06,
+                MODULE.KeyboardMouseSample(v=True, focused=True),
+            ),
+            received_at_s=10.06,
+        )
+        self.assertTrue(core.free_camera)
 
     def test_second_escape_exits_after_ue_releases_focus_and_w_must_rearm(self) -> None:
         controller = MODULE.CalibrationModeController()
