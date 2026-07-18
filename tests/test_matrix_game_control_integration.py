@@ -410,18 +410,40 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             project / "src/robot_mc/build/export/config/xg-user-parameters.yaml",
             "motor_platform_type: 8\n",
         )
+        self.write(
+            project
+            / "src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml",
+            "motor_platform_type: 8\n",
+        )
+        self.write(
+            project
+            / "src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml",
+            "motor_platform_type: 8\n",
+        )
         self.write(project / "scene/scene.json", "{}\n")
         scene_xml = "<mujoco model=\"fixture\"/>\n"
-        self.write(
-            project
-            / "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_apart2.xml",
-            scene_xml,
-        )
-        self.write(
-            project
-            / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb/scene_terrain_apart2.xml",
-            scene_xml,
-        )
+        for robot_type in ("go2", "go2w", "xgb", "xgw", "zgws"):
+            self.write(
+                project
+                / "src/robot_mujoco/zsibot_robots"
+                / robot_type
+                / "scene_terrain_apart2.xml",
+                scene_xml,
+            )
+            self.write(
+                project
+                / "src/robot_mujoco/zsibot_robots"
+                / robot_type
+                / f"{robot_type}.xml",
+                '<mujoco><worldbody><body name="base_link" pos="0 0 0"/></worldbody></mujoco>\n',
+            )
+            self.write(
+                project
+                / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model"
+                / robot_type
+                / "scene_terrain_apart2.xml",
+                scene_xml,
+            )
         self.write(
             project / "src/UeSim/Linux/zsibot_mujoco_ue.sh",
             "#!/usr/bin/env bash\nexit 0\n",
@@ -706,6 +728,10 @@ else:
                 "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
                 "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
                 "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_EXTRA_EXEC_CMDS": (
+                    "set Engine.SpringArmComponent bEnableCameraLag True,"
+                    "viewclass OperatorCamera_C"
+                ),
                 "MATRIX_UE_STARTUP_SECONDS": "0",
                 "MATRIX_VERIFY_RUNTIME": "0",
                 "PATH": os.fspath(fixture["fake_bin"])
@@ -791,6 +817,16 @@ else:
                 "-ini:Input:[/Script/Engine.InputSettings]:"
                 "bEnableMouseSmoothing=False,[/Script/Engine.InputSettings]:"
                 "bEnableFOVScaling=False",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                "-ExecCmds=t.MaxFPS 30,"
+                "set Engine.SpringArmComponent bEnableCameraLag False,"
+                "set Engine.SpringArmComponent bEnableCameraRotationLag False,"
+                "set Engine.SpringArmComponent bDoCollisionTest True,"
+                "viewclass MujocoSim_Custom_C,"
+                "set Engine.SpringArmComponent bEnableCameraLag True,"
+                "viewclass OperatorCamera_C",
                 ue_capture["command"],
             )
 
@@ -900,6 +936,252 @@ else:
                 ue_capture["command"],
             )
             self.assertIn("using Local 1.00x", result.stderr)
+
+    def test_centered_camera_can_be_disabled_or_strictly_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_GAME_CENTERED_CAMERA": "off",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            command = [
+                "/bin/bash",
+                os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                "--scene",
+                "21",
+                "--control-source",
+                "game",
+            ]
+            disabled = subprocess.run(
+                command,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                disabled.returncode,
+                0,
+                msg=f"stdout:\n{disabled.stdout}\nstderr:\n{disabled.stderr}",
+            )
+            disabled_ue = json.loads(
+                fixture["ue_capture"].read_text(encoding="utf-8")
+            )["command"]
+            self.assertIn("-ExecCmds=t.MaxFPS 30", disabled_ue)
+            self.assertFalse(any("SpringArmComponent" in arg for arg in disabled_ue))
+            self.assertFalse(any("viewclass" in arg for arg in disabled_ue))
+
+            environment["MATRIX_GAME_CENTERED_CAMERA"] = "yes"
+            environment["MATRIX_GAME_CAMERA_VIEW_CLASS"] = "MyRobotView_C"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-overridden.lock"
+            )
+            overridden = subprocess.run(
+                command,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                overridden.returncode,
+                0,
+                msg=f"stdout:\n{overridden.stdout}\nstderr:\n{overridden.stderr}",
+            )
+            overridden_ue = json.loads(
+                fixture["ue_capture"].read_text(encoding="utf-8")
+            )["command"]
+            exec_cmds = next(
+                arg for arg in overridden_ue if arg.startswith("-ExecCmds=")
+            )
+            self.assertTrue(exec_cmds.endswith(",viewclass MyRobotView_C"))
+            self.assertNotIn("viewclass MujocoSim_Custom_C", exec_cmds)
+
+            planner_command = [*command]
+            planner_command[-1] = "planner"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-planner.lock"
+            )
+            planner = subprocess.run(
+                planner_command,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                planner.returncode,
+                0,
+                msg=f"stdout:\n{planner.stdout}\nstderr:\n{planner.stderr}",
+            )
+            planner_ue = json.loads(
+                fixture["ue_capture"].read_text(encoding="utf-8")
+            )["command"]
+            self.assertFalse(any("SpringArmComponent" in arg for arg in planner_ue))
+            self.assertFalse(any("viewclass" in arg for arg in planner_ue))
+
+    def test_centered_camera_rejects_invalid_boolean_and_command_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            command = [
+                "/bin/bash",
+                os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                "--scene",
+                "21",
+                "--control-source",
+                "game",
+            ]
+            environment["MATRIX_GAME_CENTERED_CAMERA"] = "sometimes"
+            bad_boolean = subprocess.run(
+                command,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(bad_boolean.returncode, 1)
+            self.assertIn(
+                "MATRIX_GAME_CENTERED_CAMERA must be a boolean",
+                bad_boolean.stderr,
+            )
+
+            environment["MATRIX_GAME_CENTERED_CAMERA"] = "true"
+            environment["MATRIX_GAME_CAMERA_VIEW_CLASS"] = (
+                "MujocoSim_Custom_C,quit"
+            )
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-injection.lock"
+            )
+            injection = subprocess.run(
+                command,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(injection.returncode, 1)
+            self.assertIn(
+                "MATRIX_GAME_CAMERA_VIEW_CLASS must be a short Blueprint class",
+                injection.stderr,
+            )
+            self.assertFalse(fixture["ue_capture"].exists())
+
+    def test_builtin_robot_types_select_their_native_camera_actor(self) -> None:
+        expected_classes = {
+            "go2": "MujoCoSim_go2_C",
+            "go2w": "MujoCoSim_go2w_C",
+            "xgb": "MujoCoSim_Xgb_C",
+            "xgw": "MujoCoSim_Xgw_C",
+            "zgws": "MujoCoSim_Zgws_C",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_DISABLE_MC": "1",
+                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
+                    project / "outputs/game-input.json"
+                ),
+                "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC": "1",
+                "MATRIX_SONIC_CONTROL_SOURCE": "game",
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UNITREE_SDK2_ROOT": os.fspath(
+                    fixture["sonic"] / "gear_sonic_deploy/thirdparty/unitree_sdk2"
+                ),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            for robot_type, expected_class in expected_classes.items():
+                with self.subTest(robot_type=robot_type):
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(project / "scripts/run_sim.sh"),
+                            robot_type,
+                            "21",
+                            "0",
+                            "0",
+                            "1",
+                        ],
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        timeout=20.0,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    ue_command = json.loads(
+                        fixture["ue_capture"].read_text(encoding="utf-8")
+                    )["command"]
+                    exec_cmds = next(
+                        arg
+                        for arg in ue_command
+                        if arg.startswith("-ExecCmds=")
+                    )
+                    self.assertTrue(
+                        exec_cmds.endswith(f",viewclass {expected_class}"),
+                        exec_cmds,
+                    )
 
     def test_private_request_restarts_whole_runtime_after_clean_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

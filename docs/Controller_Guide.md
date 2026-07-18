@@ -54,6 +54,53 @@ The default Matrix look button is the left mouse button. Releasing a camera
 drag does not immediately resume a movement key that remained held. Release all
 movement input once, then press it again; this is the neutral re-arm interlock.
 
+### Native robot-centred startup view
+
+For `MATRIX_SONIC=1` with `--control-source game`, the launcher now defaults to
+the cooked package's native robot camera instead of leaving the initial view on
+the free `Spectator_C`. At UE startup it disables SpringArm camera lag and
+rotation lag, enables SpringArm collision, and runs `viewclass` for the actual
+rendered robot actor:
+
+| Matrix robot type | Cooked UE view class |
+|---|---|
+| `custom` (the SONIC G1 launch path) | `MujocoSim_Custom_C` |
+| `go2` / `go2w` | `MujoCoSim_go2_C` / `MujoCoSim_go2w_C` |
+| `xgb` / `xgw` / `xxg` / `zgws` | `MujoCoSim_Xgb_C` / `MujoCoSim_Xgw_C` / `MujoCoSim_Xxg_C` / `MujoCoSim_Zgws_C` |
+
+The `xxg` mapping records the class present in the cooked asset; the current
+0.1.2 launcher still rejects robot type `xxg` before UE startup.
+
+The robot-centred view selection has been tested against the live Heyuan cooked
+runtime: a visible frame put the robot at the centre, the PlayerController view
+target read back as `MujocoSim_Custom_C`, and the live custom SpringArm read
+back `MainBody` as its parent, camera lag `False`, rotation lag `False`, and
+collision test `True`. This is a real cooked UE camera path, not the non-runtime
+Python camera contract.
+
+This result does **not** yet prove a moving-robot translation-follow acceptance,
+that every mouse drag is a true orbit about the robot, that pitch/wall/ground
+collision recovery matches a commercial third-person game, or that V has
+authoritative mode readback. Those still need black-box acceptance while the
+robot moves and beside obstacles. Do not call this a complete Genshin-style
+camera bridge.
+
+The startup behavior is reversible and narrowly gated:
+
+- set `MATRIX_GAME_CENTERED_CAMERA=0` to disable it;
+- set `MATRIX_GAME_CAMERA_VIEW_CLASS=AnotherRobot_C` to select a different
+  short Blueprint class. The value must be one token ending in `_C`; whitespace,
+  commas, and console separators are rejected;
+- `MATRIX_UE_EXTRA_EXEC_CMDS` is appended last, so an operator can deliberately
+  supersede the defaults.
+
+The three `set Engine.SpringArmComponent ...` commands are class-wide UE console
+operations. They are not scoped to the selected robot: assume every loaded
+SpringArmComponent can be affected. Use the disable switch if another scene
+depends on SpringArm lag, and validate any narrower replacement before adding
+it through `MATRIX_UE_EXTRA_EXEC_CMDS`. Planner, PICO, external, and non-SONIC
+launches do not receive these defaults.
+
 ### ESC local/remote mouse settings
 
 In `game` mode, **ESC** immediately hard-zeros locomotion and shows the centre

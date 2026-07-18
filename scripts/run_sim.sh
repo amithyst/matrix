@@ -17,6 +17,33 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 MATRIX_DISABLE_MC="${MATRIX_DISABLE_MC:-0}"
 MATRIX_SONIC="${MATRIX_SONIC:-0}"
+MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
+MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
+
+case "${MATRIX_GAME_CENTERED_CAMERA,,}" in
+    1|true|yes|on)
+        GAME_CENTERED_CAMERA_ENABLED=true
+        ;;
+    0|false|no|off)
+        GAME_CENTERED_CAMERA_ENABLED=false
+        ;;
+    *)
+        echo "[ERROR] MATRIX_GAME_CENTERED_CAMERA must be a boolean:" \
+            "$MATRIX_GAME_CENTERED_CAMERA" >&2
+        exit 1
+        ;;
+esac
+
+# viewclass accepts a short reflected class name.  Keep this override to one
+# Blueprint-generated class token: whitespace or console separators here would
+# turn a data override into an additional UE console command.
+if [[ -n "$MATRIX_GAME_CAMERA_VIEW_CLASS" \
+    && ! "$MATRIX_GAME_CAMERA_VIEW_CLASS" \
+        =~ ^[A-Za-z_][A-Za-z0-9_]{0,126}_C$ ]]; then
+    echo "[ERROR] MATRIX_GAME_CAMERA_VIEW_CLASS must be a short Blueprint" \
+        "class ending in _C: $MATRIX_GAME_CAMERA_VIEW_CLASS" >&2
+    exit 1
+fi
 
 SIM_LAUNCHER_ROOT="${SIM_LAUNCHER_ROOT:-$PROJECT_ROOT}"
 CUSTOM_WRAPPER="$SIM_LAUNCHER_ROOT/scripts/run_custom_urdf.sh"
@@ -382,9 +409,6 @@ if [[ ! "$UE_MAX_FPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     exit 1
 fi
 UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS"
-if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},${MATRIX_UE_EXTRA_EXEC_CMDS}"
-fi
 
 #######################################
 # 场景配置
@@ -593,6 +617,49 @@ case "${MATRIX_SONIC,,}" in
         exit 1
         ;;
 esac
+
+# The stock cooked package already contains a camera-bearing SpringArm on each
+# robot Blueprint.  In interactive SONIC game mode, select the real rendered
+# robot as the UE view target and make that native arm direct/collision-aware.
+# These are startup console commands, not the Python camera-bridge contract.
+# `set Engine.SpringArmComponent` intentionally affects every live spring arm;
+# an operator can append a narrower/newer command via MATRIX_UE_EXTRA_EXEC_CMDS.
+if $MATRIX_SONIC_ENABLED \
+    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]] \
+    && $GAME_CENTERED_CAMERA_ENABLED; then
+    if [[ -n "$MATRIX_GAME_CAMERA_VIEW_CLASS" ]]; then
+        GAME_CAMERA_VIEW_CLASS="$MATRIX_GAME_CAMERA_VIEW_CLASS"
+    else
+        case "$ROBOTTYPE" in
+            custom) GAME_CAMERA_VIEW_CLASS="MujocoSim_Custom_C" ;;
+            go2) GAME_CAMERA_VIEW_CLASS="MujoCoSim_go2_C" ;;
+            go2w) GAME_CAMERA_VIEW_CLASS="MujoCoSim_go2w_C" ;;
+            xgb) GAME_CAMERA_VIEW_CLASS="MujoCoSim_Xgb_C" ;;
+            xgw) GAME_CAMERA_VIEW_CLASS="MujoCoSim_Xgw_C" ;;
+            xxg) GAME_CAMERA_VIEW_CLASS="MujoCoSim_Xxg_C" ;;
+            zgws) GAME_CAMERA_VIEW_CLASS="MujoCoSim_Zgws_C" ;;
+            *)
+                echo "[ERROR] No native game-camera view class is mapped for" \
+                    "robot type: $ROBOTTYPE" >&2
+                exit 1
+                ;;
+        esac
+    fi
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag False"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag False"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bDoCollisionTest True"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},viewclass ${GAME_CAMERA_VIEW_CLASS}"
+    echo "[INFO] Native centered game-camera startup enabled: viewclass=$GAME_CAMERA_VIEW_CLASS"
+elif $MATRIX_SONIC_ENABLED \
+    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+    echo "[INFO] Native centered game-camera startup disabled"
+fi
+
+# Keep operator commands last by contract.  They can deliberately override a
+# default set/viewclass command without editing the launcher.
+if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},${MATRIX_UE_EXTRA_EXEC_CMDS}"
+fi
 
 if $MATRIX_SONIC_ENABLED \
     && [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]] \
