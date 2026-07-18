@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,40 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 os.sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+
+class CalibrationOverlaySupervisorTest(unittest.TestCase):
+    def test_isolated_overlay_explicitly_disables_bytecode_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=":123",
+                expected_ue_pid=41,
+                script=script,
+                python="/locked/venv/bin/python",
+                startup_timeout_s=0.1,
+            )
+
+            class ReadyProcess:
+                def poll(self):
+                    supervisor.ready_file.write_text(
+                        json.dumps({"ready": True}), encoding="utf-8"
+                    )
+                    return None
+
+            with mock.patch.object(
+                MODULE.subprocess, "Popen", return_value=ReadyProcess()
+            ) as popen:
+                supervisor.start()
+
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                command[:4],
+                ["/locked/venv/bin/python", "-B", "-I", "-u"],
+            )
 
 
 class SourceArbitrationTest(unittest.TestCase):

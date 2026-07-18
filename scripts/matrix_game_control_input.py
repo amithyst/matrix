@@ -1342,6 +1342,12 @@ class CalibrationOverlaySupervisor:
         )
         command = [
             self.python,
+            # -I ignores PYTHON* environment variables, including the
+            # launcher's PYTHONDONTWRITEBYTECODE guard.  Keep isolation, but
+            # make the no-bytecode contract an interpreter option so the
+            # overlay cannot contaminate the locked runtime venv and block a
+            # subsequent F9 generation.
+            "-B",
             "-I",
             "-u",
             os.fspath(self.script),
