@@ -71,6 +71,7 @@ To keep this README concise, detailed guides have been organized into the `docs/
 - [📦 Chunk Packages Guide](docs/CHUNK_PACKAGES_GUIDE.md) - Modular package deployment & offline install
 - [🎮 Controller Guide](docs/Controller_Guide.md) - Native and camera-relative game-control mappings
 - [Matrix Camera-Relative Control Runbook](docs/MATRIX_GAME_CONTROL_RUNBOOK.md) - Heyuan calibration, deadman tests, and cooked-camera limits
+- [Third-Person Camera Bridge Contract](docs/MATRIX_THIRD_PERSON_CAMERA_BRIDGE_CN.md) - Non-runtime legacy/relative-lock/orbit reference and UE integration gate
 - [🛠️ Scripts Guide](docs/Scripts_Guide.md) - Detailed CLI scripts usage
 
 **Simulation & Customization**
