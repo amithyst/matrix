@@ -245,13 +245,21 @@ default in that case.
 If remote-desktop dragging is too fast, do not tune system `xinput`
 acceleration. UE/SDL consumes raw relative motion, so a pointer curve may alter
 only the X11 absolute coordinates and make the visible camera diverge further
-from `x11-mirror`. Press ESC, click Remote, choose 0.2x–1.0x with the large
+from `x11-mirror`. For SONIC `game` + Remote, the launcher itself snapshots the
+current X pointer curve, uses `xset m 1/1 0` only for the lifetime of the run,
+and restores it during cleanup; leave the desktop setting at the user's normal
+value. Press ESC, click Remote, choose 0.2x–1.0x with the large
 -/+ controls, and click `Return to Game & Apply` (or press Enter). The panel
 waits for the neutral safety gate and reloads the complete runtime; F9 remains
 the keyboard fallback. After restart,
 verify that `CURRENT APPLIED (SDL)` is the intended value, then repeat the
 four-axis and multi-turn tests. F10/F12 remain external MouseLock bindings, not
 Matrix settings-page actions.
+
+Remote 0.4x is the native SDL/UE multiplier. With the example base mirror gain
+of 0.12 deg/px it makes the reported `x11-mirror` value 0.048 deg/px, but that
+number is only nominal arithmetic over X11 root-pointer pixels, not a measured
+visible-camera sensitivity.
 
 ## Stage 3: safety and recovery matrix
 

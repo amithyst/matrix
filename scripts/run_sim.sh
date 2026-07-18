@@ -178,6 +178,11 @@ UE_FAILURE_FILE=""
 UE_PID_FILE=""
 RUN_SIM_PARENT_PID="${MATRIX_SONIC_LAUNCHER_PID:-$PPID}"
 CLEANUP_STARTED=0
+X_POINTER_ACCELERATION_RESTORE_NEEDED=0
+X_POINTER_ACCELERATION=""
+X_POINTER_THRESHOLD=""
+X_POINTER_DISPLAY=""
+X_POINTER_XSET_BIN=""
 
 record_ue_supervisor_failure() {
     if [[ -z "${UE_FAILURE_FILE:-}" || -e "$UE_FAILURE_FILE" ]]; then
@@ -316,6 +321,87 @@ stop_parent_watchdog() {
     fi
 }
 
+restore_remote_pointer_acceleration() {
+    if [[ "${X_POINTER_ACCELERATION_RESTORE_NEEDED:-0}" != "1" ]]; then
+        return 0
+    fi
+
+    # Keep the restore armed when the X server is temporarily unavailable so a
+    # later cleanup attempt can retry it.  Pointer control belongs to the X
+    # display, not to UE, so use the exact display and xset binary recorded at
+    # setup time.
+    if DISPLAY="$X_POINTER_DISPLAY" "$X_POINTER_XSET_BIN" m \
+        "$X_POINTER_ACCELERATION" "$X_POINTER_THRESHOLD" \
+        >/dev/null 2>&1; then
+        echo "[INFO] Restored X pointer acceleration: " \
+            "$X_POINTER_ACCELERATION threshold $X_POINTER_THRESHOLD"
+        X_POINTER_ACCELERATION_RESTORE_NEEDED=0
+        return 0
+    fi
+
+    echo "[WARN] Could not restore X pointer acceleration on" \
+        "DISPLAY=$X_POINTER_DISPLAY; restore it manually with:" \
+        "xset m $X_POINTER_ACCELERATION $X_POINTER_THRESHOLD" >&2
+    return 1
+}
+
+configure_remote_pointer_acceleration() {
+    # This is deliberately narrower than the SDL raw-relative hints below.
+    # It linearizes the X11 pointer stream used by the Remote settings panel
+    # and x11-mirror only for interactive SONIC game launches.
+    if ! $MATRIX_SONIC_ENABLED \
+        || [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]] \
+        || [[ "${MATRIX_MOUSE_APPLIED_PROFILE:-local}" != "remote" ]]; then
+        return 0
+    fi
+
+    if [[ -z "${DISPLAY:-}" ]]; then
+        echo "[WARN] Remote mouse profile could not linearize X pointer" \
+            "acceleration because DISPLAY is unset; continuing" >&2
+        return 0
+    fi
+
+    local xset_bin
+    xset_bin="$(type -P xset || true)"
+    if [[ -z "$xset_bin" ]]; then
+        echo "[WARN] Remote mouse profile could not linearize X pointer" \
+            "acceleration because xset is unavailable; continuing" >&2
+        return 0
+    fi
+
+    local pointer_query
+    if ! pointer_query="$(DISPLAY="$DISPLAY" LC_ALL=C "$xset_bin" q 2>/dev/null)"; then
+        echo "[WARN] Remote mouse profile could not read X pointer" \
+            "acceleration on DISPLAY=$DISPLAY; continuing" >&2
+        return 0
+    fi
+    if [[ ! "$pointer_query" =~ acceleration:[[:space:]]*([0-9]+/[0-9]+)[[:space:]]+threshold:[[:space:]]*([0-9]+) ]]; then
+        echo "[WARN] Remote mouse profile could not parse X pointer" \
+            "acceleration on DISPLAY=$DISPLAY; continuing" >&2
+        return 0
+    fi
+
+    X_POINTER_ACCELERATION="${BASH_REMATCH[1]}"
+    X_POINTER_THRESHOLD="${BASH_REMATCH[2]}"
+    X_POINTER_DISPLAY="$DISPLAY"
+    X_POINTER_XSET_BIN="$xset_bin"
+    # Arm restoration before changing the X server.  Even an unusual xset
+    # implementation that changes state and then exits nonzero is covered.
+    X_POINTER_ACCELERATION_RESTORE_NEEDED=1
+    if DISPLAY="$X_POINTER_DISPLAY" "$X_POINTER_XSET_BIN" m 1/1 0 \
+        >/dev/null 2>&1; then
+        echo "[INFO] Remote mouse profile temporarily set X pointer" \
+            "acceleration to 1/1 threshold 0" \
+            "(saved $X_POINTER_ACCELERATION threshold $X_POINTER_THRESHOLD)"
+        return 0
+    fi
+
+    echo "[WARN] Remote mouse profile could not set X pointer acceleration" \
+        "on DISPLAY=$X_POINTER_DISPLAY; continuing" >&2
+    restore_remote_pointer_acceleration || true
+    return 0
+}
+
 cleanup() {
     if [[ "$CLEANUP_STARTED" == "1" ]]; then
         return
@@ -324,6 +410,7 @@ cleanup() {
     echo "[INFO] ===== Cleaning up processes ====="
 
     stop_parent_watchdog
+    restore_remote_pointer_acceleration || true
 
     # 1. 优雅关闭脚本启动的进程
     for pid in "${PIDS[@]:-}"; do
@@ -376,6 +463,9 @@ cleanup() {
         rm -rf -- "$UE_LIFECYCLE_DIR"
     fi
 
+    # Retry once after child teardown if the display was transiently
+    # unavailable at the beginning of cleanup.
+    restore_remote_pointer_acceleration || true
     echo "[INFO] ===== Cleanup finished ====="
 }
 
@@ -408,7 +498,7 @@ if [[ ! "$UE_MAX_FPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] MATRIX_UE_MAX_FPS must be a non-negative number: $UE_MAX_FPS" >&2
     exit 1
 fi
-UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS"
+UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS,r.MotionBlurQuality 0"
 
 #######################################
 # 场景配置
@@ -854,6 +944,7 @@ UE_COMMAND=(
 )
 [[ -n "$USE_OFFSCREEN" ]] && UE_COMMAND+=("$USE_OFFSCREEN")
 [[ -n "$USE_PIXELSTREAMER" ]] && UE_COMMAND+=("$USE_PIXELSTREAMER")
+configure_remote_pointer_acceleration
 start_supervised_ue "$PWD/zsibot_mujoco_ue.log" "${UE_COMMAND[@]}"
 
 UE_STARTUP_SECONDS="${MATRIX_UE_STARTUP_SECONDS:-7}"

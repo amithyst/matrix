@@ -479,6 +479,30 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             executable=True,
         )
         self.write(
+            fake_bin / "xset",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${XSET_FAIL_QUERY:-0}" == "1" && "${1:-}" == "q" ]]; then
+    exit 1
+fi
+printf '%s\\n' "$*" >> "${XSET_LOG:?}"
+case "${1:-}" in
+    q)
+        read -r acceleration threshold < "${XSET_STATE_FILE:?}"
+        printf 'Pointer Control:\\n  acceleration:  %s    threshold:  %s\\n' \
+            "$acceleration" "$threshold"
+        ;;
+    m)
+        printf '%s %s\\n' "${2:?}" "${3:?}" > "${XSET_STATE_FILE:?}"
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+""",
+            executable=True,
+        )
+        self.write(
             fake_bin / "cmp",
             """#!/usr/bin/env bash
 if [[ "${FAIL_CONFIG_RESTORE:-0}" == "1" ]]; then
@@ -544,8 +568,14 @@ elif script == "prepare_sonic_physics_model.py":
     shutil.copyfile(native, output / native.name)
 elif script == "supervise_matrix_ue.py":
     separator = args.index("--")
+    ue_capture = {"command": args[separator + 1:]}
+    pointer_state = os.environ.get("XSET_STATE_FILE")
+    if pointer_state:
+        ue_capture["pointer_state_at_start"] = Path(pointer_state).read_text(
+            encoding="utf-8"
+        ).strip()
     Path(os.environ["UE_CAPTURE_PATH"]).write_text(
-        json.dumps({"command": args[separator + 1:]}), encoding="utf-8"
+        json.dumps(ue_capture), encoding="utf-8"
     )
     pid_file = Path(args[args.index("--pid-file") + 1])
     pid_file.write_text(str(os.getpid()), encoding="utf-8")
@@ -707,14 +737,19 @@ else:
             runtime_dir = project / "runtime"
             runtime_dir.mkdir()
             mouse_settings = project / "home/.config/matrix/mouse-control.json"
+            xset_log = project / "xset.log"
+            xset_state = project / "xset.state"
             self.write(
                 mouse_settings,
                 json.dumps(
                     {"version": 1, "profile": "remote", "speed_scale": 0.4}
                 ),
             )
+            self.write(xset_log)
+            self.write(xset_state, "2/1 4\n")
             environment = {
                 "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "DISPLAY": ":fixture",
                 "HOME": os.fspath(project / "home"),
                 "LANG": "C.UTF-8",
                 "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
@@ -739,6 +774,8 @@ else:
                 + os.environ.get("PATH", "/usr/bin:/bin"),
                 "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
                 "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XSET_LOG": os.fspath(xset_log),
+                "XSET_STATE_FILE": os.fspath(xset_state),
                 "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
             }
             command = [
@@ -803,6 +840,12 @@ else:
             ue_capture = json.loads(
                 fixture["ue_capture"].read_text(encoding="utf-8")
             )
+            self.assertEqual(ue_capture["pointer_state_at_start"], "1/1 0")
+            self.assertEqual(xset_state.read_text(encoding="utf-8"), "2/1 4\n")
+            self.assertEqual(
+                xset_log.read_text(encoding="utf-8").splitlines(),
+                ["q", "m 1/1 0", "m 2/1 4"],
+            )
             self.assertIn(
                 "SDL_MOUSE_RELATIVE_SPEED_SCALE=0.400000",
                 ue_capture["command"],
@@ -820,7 +863,7 @@ else:
                 ue_capture["command"],
             )
             self.assertIn(
-                "-ExecCmds=t.MaxFPS 30,"
+                "-ExecCmds=t.MaxFPS 30,r.MotionBlurQuality 0,"
                 "set Engine.SpringArmComponent bEnableCameraLag False,"
                 "set Engine.SpringArmComponent bEnableCameraRotationLag False,"
                 "set Engine.SpringArmComponent bDoCollisionTest True,"
@@ -873,6 +916,61 @@ else:
             self.assertEqual(parsed.game_input_status_file, fixture["stale_status"])
             self.assertEqual(os.fspath(parsed.game_input_socket), capture["socket_env"])
             self.assertFalse(parsed.game_input_socket.parent.exists())
+
+            # X11 setup is an experience improvement, never a launch gate.
+            # A headless launch and an unreachable X server both continue with
+            # an explicit warning and without changing the recorded state.
+            xset_log.write_text("", encoding="utf-8")
+            xset_state.write_text("2/1 4\n", encoding="utf-8")
+            no_display_environment = dict(environment)
+            no_display_environment.pop("DISPLAY")
+            no_display_environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-no-display.lock"
+            )
+            no_display = subprocess.run(
+                command,
+                env=no_display_environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                no_display.returncode,
+                0,
+                msg=f"stdout:\n{no_display.stdout}\nstderr:\n{no_display.stderr}",
+            )
+            self.assertIn("because DISPLAY is unset; continuing", no_display.stderr)
+            self.assertEqual(xset_log.read_text(encoding="utf-8"), "")
+            self.assertEqual(xset_state.read_text(encoding="utf-8"), "2/1 4\n")
+
+            xset_log.write_text("", encoding="utf-8")
+            failed_query_environment = dict(environment)
+            failed_query_environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-xset-failure.lock"
+            )
+            failed_query_environment["XSET_FAIL_QUERY"] = "1"
+            failed_query = subprocess.run(
+                command,
+                env=failed_query_environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                failed_query.returncode,
+                0,
+                msg=(
+                    f"stdout:\n{failed_query.stdout}\n"
+                    f"stderr:\n{failed_query.stderr}"
+                ),
+            )
+            self.assertIn(
+                "could not read X pointer acceleration", failed_query.stderr
+            )
+            self.assertEqual(xset_log.read_text(encoding="utf-8"), "")
+            self.assertEqual(xset_state.read_text(encoding="utf-8"), "2/1 4\n")
 
     def test_corrupt_mouse_settings_fall_back_to_explicit_local_one_x(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -986,7 +1084,9 @@ else:
             disabled_ue = json.loads(
                 fixture["ue_capture"].read_text(encoding="utf-8")
             )["command"]
-            self.assertIn("-ExecCmds=t.MaxFPS 30", disabled_ue)
+            self.assertIn(
+                "-ExecCmds=t.MaxFPS 30,r.MotionBlurQuality 0", disabled_ue
+            )
             self.assertFalse(any("SpringArmComponent" in arg for arg in disabled_ue))
             self.assertFalse(any("viewclass" in arg for arg in disabled_ue))
 

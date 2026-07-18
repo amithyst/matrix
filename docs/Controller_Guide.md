@@ -130,15 +130,34 @@ F9 applies the same gate as a fallback. Do not restart UE alone, and keep all
 controls released during the reload.
 
 The visible UE camera receives `SDL_MOUSE_RELATIVE_SPEED_SCALE` at process
-startup. With `x11-mirror`, the same applied scale also changes the mirror gain,
-keeping their nominal scales aligned and reducing scale-only mismatch. It does
-not replace the round-trip black-box acceptance below. A missing or corrupt
-settings file safely falls back to Local 1.0x.
+startup. For example, the currently used Remote 0.4x setting is a native
+SDL/UE input multiplier; it is not an X pointer-acceleration value. With the
+default `x11-mirror` base of 0.12 degrees per pixel, status reports
+`0.12 x 0.4 = 0.048 deg/px`. That 0.048 value is only the mirror's nominal
+arithmetic gain over polled X11 root-pointer pixels. It is not a measured UE
+camera sensitivity and does not prove that the mirror and visible camera agree.
+The four-axis, multi-turn black-box acceptance below is still required. A
+missing or corrupt settings file safely falls back to Local 1.0x.
+
 The launcher also pins SDL to raw relative motion without warp emulation,
-viewport scaling, or system pointer acceleration, and disables UE
-`bEnableMouseSmoothing` and FOV sensitivity scaling. Camera rotation therefore
-uses the current frame's mouse delta directly and PlayerInput adds no tail after
-button release. This is independent of the speed scale, which changes gain only.
+viewport scaling, or SDL system-pointer scaling, disables UE
+`bEnableMouseSmoothing` and FOV sensitivity scaling, disables SpringArm lag in
+the robot-centred view, and adds `r.MotionBlurQuality 0`. The first settings
+remove input interpolation; the motion-blur command removes visual streaking.
+Neither command changes the selected gain.
+
+For an interactive SONIC `game` launch with the applied profile `Remote`,
+`run_sim.sh` additionally snapshots the current X display's acceleration and
+threshold, temporarily runs `xset m 1/1 0` before UE starts, and restores the
+exact pair at cleanup. This linearizes the absolute X11 stream used by the
+panel and `x11-mirror`; it does not replace SDL's raw-relative path and it does
+not modify MouseLock. A missing `DISPLAY`, missing `xset`, or X-server failure
+only produces a warning and does not block launch. Pointer control is global to
+that X display while Matrix is running. Normal exit and handled signals restore
+it, but an uncatchable `SIGKILL` or host crash cannot run cleanup; in that case
+restore the values printed by the warning/log with `xset m <accel> <threshold>`
+or restart the desktop session.
+
 Pointer recentering, window-edge effects, and absolute-coordinate jumps still
 require crosshair/MouseLock calibration; the speed scale deliberately does not
 reinterpret such jumps as valid movement.
