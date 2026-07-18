@@ -657,6 +657,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             game_camera_yaw_offset_deg=90.0,
             game_initial_camera_yaw_deg=5.0,
             game_mouse_sensitivity_deg=0.12,
+            game_applied_mouse_profile="remote",
+            game_applied_mouse_speed_scale=0.5,
             game_carla_host="127.0.0.2",
             game_carla_port=2100,
             gamepad_look_yaw_rate_deg_s=140.0,
@@ -690,6 +692,11 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["camera_yaw_sign"], -1)
         self.assertEqual(status["camera_yaw_offset_deg"], 90.0)
         self.assertEqual(status["mouse_sensitivity_deg_per_px"], 0.12)
+        self.assertEqual(status["visible_mouse_backend"], "sdl-relative-speed-scale")
+        self.assertEqual(status["applied_mouse_profile"], "remote")
+        self.assertEqual(status["applied_mouse_speed_scale"], 0.5)
+        self.assertEqual(status["mouse_sensitivity_base_deg_per_px"], 0.12)
+        self.assertEqual(status["mouse_sensitivity_effective_deg_per_px"], 0.06)
         self.assertEqual(status["carla_host"], "127.0.0.2")
         self.assertEqual(status["carla_port"], 2100)
         self.assertFalse(status["visible_follow_camera_verified"])
@@ -1648,6 +1655,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             look_button="left",
             initial_camera_yaw_deg=5.0,
             mouse_sensitivity_deg=0.12,
+            mouse_settings_file=Path("/home/user/.config/matrix/mouse-control.json"),
+            applied_mouse_profile="remote",
+            applied_mouse_speed_scale=0.5,
+            restart_request_file=Path("/run/user/1000/matrix/restart.json"),
+            restart_capability_file=Path("/run/user/1000/matrix/capability"),
+            restart_launcher_pid=4000,
             camera_yaw_sign=-1,
             camera_yaw_offset_deg=90.0,
             carla_host="127.0.0.2",
@@ -1683,6 +1696,19 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             command[command.index("--camera-yaw-offset-deg") + 1], "90.0"
         )
         self.assertEqual(command[command.index("--expected-ue-pid") + 1], "4242")
+        self.assertEqual(
+            command[command.index("--mouse-settings-file") + 1],
+            "/home/user/.config/matrix/mouse-control.json",
+        )
+        self.assertEqual(
+            command[command.index("--applied-mouse-profile") + 1], "remote"
+        )
+        self.assertEqual(
+            command[command.index("--applied-mouse-speed-scale") + 1], "0.5"
+        )
+        self.assertEqual(
+            command[command.index("--restart-launcher-pid") + 1], "4000"
+        )
         self.assertEqual(command[command.index("--carla-host") + 1], "127.0.0.2")
         self.assertEqual(command[command.index("--carla-port") + 1], "2100")
         self.assertEqual(

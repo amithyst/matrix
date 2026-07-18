@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ORIGINAL_ENVIRONMENT=()
+while IFS= read -r -d '' entry; do
+    ORIGINAL_ENVIRONMENT+=("$entry")
+done < "/proc/$$/environ"
+if ((BASH_VERSINFO[0] < 5 \
+    || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1))); then
+    echo "[ERROR] Matrix restart supervision requires Bash 5.1 or newer" >&2
+    exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -179,12 +188,49 @@ if ! command -v flock >/dev/null 2>&1; then
     exit 1
 fi
 MATRIX_SONIC_HOST_LOCK="${MATRIX_SONIC_HOST_LOCK:-/tmp/matrix-sonic-${UID}.lock}"
-exec 9>"$MATRIX_SONIC_HOST_LOCK"
-if ! flock -n 9; then
-    echo "[ERROR] Another Matrix SONIC launcher owns this host: $MATRIX_SONIC_HOST_LOCK" >&2
-    exit 1
+if [[ "${MATRIX_SONIC_RESTART_LOCK_FD:-}" == "9" ]]; then
+    inherited_target="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
+    expected_target="$(realpath -m "$MATRIX_SONIC_HOST_LOCK")"
+    if [[ "$inherited_target" != "$expected_target" ]] || ! flock -n 9; then
+        echo "[ERROR] Restart did not inherit the verified Matrix SONIC lock" >&2
+        exit 1
+    fi
+    unset MATRIX_SONIC_RESTART_LOCK_FD
+else
+    exec 9>"$MATRIX_SONIC_HOST_LOCK"
+    if ! flock -n 9; then
+        echo "[ERROR] Another Matrix SONIC launcher owns this host: $MATRIX_SONIC_HOST_LOCK" >&2
+        exit 1
+    fi
 fi
 export MATRIX_SONIC_HOST_LOCK_FD=9
+
+MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+if [[ "$MATRIX_MOUSE_SETTINGS_FILE" != /* ]]; then
+    echo "[ERROR] MATRIX_MOUSE_SETTINGS_FILE must be absolute" >&2
+    exit 2
+fi
+MATRIX_MOUSE_SETTINGS_FILE="$(realpath -m "$MATRIX_MOUSE_SETTINGS_FILE")"
+MOUSE_LAUNCH_FIELDS="$(
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_mouse_settings.py" \
+        launch-fields --file "$MATRIX_MOUSE_SETTINGS_FILE"
+)"
+IFS=$'\t' read -r MATRIX_MOUSE_APPLIED_PROFILE \
+    MATRIX_MOUSE_APPLIED_SPEED_SCALE MATRIX_MOUSE_SETTINGS_LOAD_STATUS \
+    <<<"$MOUSE_LAUNCH_FIELDS"
+if [[ "$MATRIX_MOUSE_APPLIED_PROFILE" != "local" \
+    && "$MATRIX_MOUSE_APPLIED_PROFILE" != "remote" ]] \
+    || [[ ! "$MATRIX_MOUSE_APPLIED_SPEED_SCALE" =~ ^(0\.[2-9][0-9]*|1\.0+)$ ]] \
+    || [[ "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "loaded" \
+        && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "missing" \
+        && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "invalid" ]]; then
+    echo "[ERROR] Invalid mouse-settings helper output" >&2
+    exit 2
+fi
+export MATRIX_MOUSE_SETTINGS_FILE MATRIX_MOUSE_APPLIED_PROFILE
+export MATRIX_MOUSE_APPLIED_SPEED_SCALE MATRIX_MOUSE_SETTINGS_LOAD_STATUS
+echo "[INFO] Mouse launch profile: $MATRIX_MOUSE_APPLIED_PROFILE " \
+    "scale=$MATRIX_MOUSE_APPLIED_SPEED_SCALE status=$MATRIX_MOUSE_SETTINGS_LOAD_STATUS"
 MATRIX_SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
 export MATRIX_SONIC_STATUS_FILE
 rm -f -- "$MATRIX_SONIC_STATUS_FILE"
@@ -546,12 +592,27 @@ export MATRIX_SONIC_STARTUP_BAND_FADE="$STARTUP_BAND_FADE"
 
 # Matrix's upstream launcher rewrites these tracked files. Restore the exact
 # pre-launch bytes so switching the same feature branch on two hosts stays clean.
-CONFIG_BACKUP="$(mktemp -d /tmp/matrix-sonic-config.XXXXXX)"
+CONFIG_BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/matrix-sonic-config.XXXXXX")"
 GAME_RUNTIME_DIR=""
-if [[ "$CONTROL_SOURCE" == "game" && -z "${MATRIX_GAME_INPUT_SOCKET:-}" ]]; then
+GENERATED_GAME_INPUT_SOCKET=0
+cleanup_prelaunch_temp() {
+    rm -rf -- "$CONFIG_BACKUP"
+    if [[ -n "$GAME_RUNTIME_DIR" ]]; then
+        rm -rf -- "$GAME_RUNTIME_DIR"
+    fi
+}
+trap cleanup_prelaunch_temp EXIT
+if [[ "$CONTROL_SOURCE" == "game" ]]; then
     GAME_RUNTIME_DIR="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}.XXXXXX")"
     chmod 700 "$GAME_RUNTIME_DIR"
-    export MATRIX_GAME_INPUT_SOCKET="$GAME_RUNTIME_DIR/input.sock"
+    if [[ -z "${MATRIX_GAME_INPUT_SOCKET:-}" ]]; then
+        export MATRIX_GAME_INPUT_SOCKET="$GAME_RUNTIME_DIR/input.sock"
+        GENERATED_GAME_INPUT_SOCKET=1
+    fi
+    export MATRIX_GAME_RESTART_REQUEST_FILE="$GAME_RUNTIME_DIR/restart-request.json"
+    export MATRIX_GAME_RESTART_CAPABILITY_FILE="$GAME_RUNTIME_DIR/restart-capability"
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_restart_request.py" \
+        create-capability --file "$MATRIX_GAME_RESTART_CAPABILITY_FILE"
 fi
 MUTABLE_FILES=(
     "config/config.json"
@@ -566,25 +627,70 @@ for relative in "${MUTABLE_FILES[@]}"; do
 done
 
 restore_tracked_config() {
+    if [[ "${TRACKED_CONFIG_RESTORED:-0}" == "1" ]]; then
+        return 0
+    fi
     local relative
+    local failed=0
+    local destination temporary_restore
     for relative in "${MUTABLE_FILES[@]}"; do
         if [[ -f "$CONFIG_BACKUP/$relative" ]]; then
-            cp -a "$CONFIG_BACKUP/$relative" "$PROJECT_ROOT/$relative"
+            destination="$PROJECT_ROOT/$relative"
+            temporary_restore="${destination}.matrix-restore.$$"
+            rm -f -- "$temporary_restore"
+            if ! cp -a "$CONFIG_BACKUP/$relative" "$temporary_restore"; then
+                echo "[ERROR] Failed to stage tracked config restore: $relative" >&2
+                rm -f -- "$temporary_restore"
+                failed=1
+                continue
+            fi
+            if ! mv -f -- "$temporary_restore" "$destination" \
+                || ! cmp -s -- "$CONFIG_BACKUP/$relative" "$destination"; then
+                echo "[ERROR] Failed to verify tracked config restore: $relative" >&2
+                rm -f -- "$temporary_restore"
+                failed=1
+            fi
         fi
     done
-    rm -rf "$CONFIG_BACKUP"
-    if [[ -n "$GAME_RUNTIME_DIR" ]]; then
-        rm -rf "$GAME_RUNTIME_DIR"
+    if [[ "$failed" != "0" ]]; then
+        echo "[ERROR] Preserving failed restore backup at $CONFIG_BACKUP" >&2
+        return 1
     fi
+    if [[ -n "$GAME_RUNTIME_DIR" ]]; then
+        if ! rm -rf -- "$GAME_RUNTIME_DIR"; then
+            echo "[ERROR] Failed to remove game runtime directory" >&2
+            return 1
+        fi
+    fi
+    if ! rm -rf -- "$CONFIG_BACKUP"; then
+        echo "[ERROR] Failed to remove tracked-config backup" >&2
+        return 1
+    fi
+    if [[ "$GENERATED_GAME_INPUT_SOCKET" == "1" ]]; then
+        unset MATRIX_GAME_INPUT_SOCKET
+    fi
+    unset MATRIX_GAME_RESTART_REQUEST_FILE MATRIX_GAME_RESTART_CAPABILITY_FILE
+    TRACKED_CONFIG_RESTORED=1
 }
 trap restore_tracked_config EXIT
 
 RUN_SIM_PID=""
 FORWARDED_SIGNAL_EXIT_CODE=0
+RESTART_REQUEST_VALID=0
+STOP_REQUESTED=0
+FORCED_STOP=0
+INTERNAL_RESTART_TIMEOUT=0
+RUN_SIM_STOP_TIMEOUT_SECONDS="${MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS:-25}"
+if [[ ! "$RUN_SIM_STOP_TIMEOUT_SECONDS" \
+    =~ ^([1-9][0-9]*(\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)$ ]]; then
+    echo "[ERROR] MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS must be positive" >&2
+    exit 2
+fi
 forward_signal() {
     local signal_name="$1"
     local exit_code="$2"
     FORWARDED_SIGNAL_EXIT_CODE="$exit_code"
+    STOP_REQUESTED=1
     if [[ -n "$RUN_SIM_PID" ]] && kill -0 "$RUN_SIM_PID" 2>/dev/null; then
         kill "-$signal_name" "$RUN_SIM_PID" 2>/dev/null || true
     fi
@@ -605,18 +711,152 @@ RUN_SIM_PID=$!
 if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
     kill -TERM "$RUN_SIM_PID" 2>/dev/null || true
 fi
-wait "$RUN_SIM_PID"
-exit_code=$?
-if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
-    deadline=$((SECONDS + 25))
-    while kill -0 "$RUN_SIM_PID" 2>/dev/null && ((SECONDS < deadline)); do
-        sleep 0.1
-    done
-    if kill -0 "$RUN_SIM_PID" 2>/dev/null; then
-        kill -KILL "$RUN_SIM_PID" 2>/dev/null || true
+RESTART_WATCHER_PID=""
+if [[ "$CONTROL_SOURCE" == "game" ]]; then
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_restart_request.py" \
+        watch \
+        --file "$MATRIX_GAME_RESTART_REQUEST_FILE" \
+        --launcher-pid "$$" \
+        --run-sim-pid "$RUN_SIM_PID" \
+        --provider-script "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+        --capability-file "$MATRIX_GAME_RESTART_CAPABILITY_FILE" \
+        --poll-seconds 0.2 9>&- &
+    RESTART_WATCHER_PID=$!
+fi
+exit_code=0
+RUN_SIM_COMPLETED=0
+STOP_TIMER_PID=""
+while [[ "$RUN_SIM_COMPLETED" == "0" ]]; do
+    if [[ "$STOP_REQUESTED" == "1" \
+        && -z "$STOP_TIMER_PID" \
+        && ( "$INTERNAL_RESTART_TIMEOUT" == "0" \
+            || "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ) ]]; then
+        sleep "$RUN_SIM_STOP_TIMEOUT_SECONDS" 9>&- &
+        STOP_TIMER_PID=$!
     fi
-    wait "$RUN_SIM_PID" 2>/dev/null || true
+    WAIT_PIDS=("$RUN_SIM_PID")
+    if [[ -n "$RESTART_WATCHER_PID" ]]; then
+        WAIT_PIDS+=("$RESTART_WATCHER_PID")
+    fi
+    if [[ -n "$STOP_TIMER_PID" ]]; then
+        WAIT_PIDS+=("$STOP_TIMER_PID")
+    fi
+    COMPLETED_PID=""
+    wait -n -p COMPLETED_PID "${WAIT_PIDS[@]}"
+    wait_status=$?
+    if [[ "${COMPLETED_PID:-}" == "$RUN_SIM_PID" ]]; then
+        exit_code="$wait_status"
+        RUN_SIM_COMPLETED=1
+        for helper_pid in "$RESTART_WATCHER_PID" "$STOP_TIMER_PID"; do
+            if [[ -n "$helper_pid" ]]; then
+                kill -TERM "$helper_pid" 2>/dev/null || true
+                wait "$helper_pid" 2>/dev/null || true
+            fi
+        done
+        break
+    fi
+    if [[ -n "$RESTART_WATCHER_PID" \
+        && "${COMPLETED_PID:-}" == "$RESTART_WATCHER_PID" ]]; then
+        RESTART_WATCHER_PID=""
+        if [[ "$wait_status" == "75" ]]; then
+            RESTART_REQUEST_VALID=1
+            STOP_REQUESTED=1
+            echo "[INFO] Validated full Matrix runtime restart request"
+            kill -TERM "$RUN_SIM_PID" 2>/dev/null || true
+        elif [[ "$wait_status" != "0" ]]; then
+            echo "[WARN] Restart watcher exited with code $wait_status; " \
+                "continuing without in-session restart" >&2
+        fi
+        continue
+    fi
+    if [[ -n "$STOP_TIMER_PID" \
+        && "${COMPLETED_PID:-}" == "$STOP_TIMER_PID" ]]; then
+        STOP_TIMER_PID=""
+        if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
+            && "$RESTART_REQUEST_VALID" == "1" ]]; then
+            # An in-session F9 request is not authority to orphan an old native
+            # process tree.  Cancel this restart and keep supervising the exact
+            # original child for as long as it needs.  A later real external
+            # signal can arm a fresh bounded forced-stop timer.
+            RESTART_REQUEST_VALID=0
+            INTERNAL_RESTART_TIMEOUT=1
+            echo "[ERROR] Internal Matrix restart timed out after " \
+                "${RUN_SIM_STOP_TIMEOUT_SECONDS}s; restart cancelled and " \
+                "continuing to supervise the original runtime" >&2
+            continue
+        fi
+        echo "[ERROR] run_sim did not finish external-signal cleanup within " \
+            "${RUN_SIM_STOP_TIMEOUT_SECONDS} seconds" >&2
+        kill -KILL "$RUN_SIM_PID" 2>/dev/null || true
+        wait "$RUN_SIM_PID" 2>/dev/null
+        exit_code=$?
+        RUN_SIM_COMPLETED=1
+        FORCED_STOP=1
+        RESTART_REQUEST_VALID=0
+        if [[ -n "$RESTART_WATCHER_PID" ]]; then
+            kill -TERM "$RESTART_WATCHER_PID" 2>/dev/null || true
+            wait "$RESTART_WATCHER_PID" 2>/dev/null || true
+            RESTART_WATCHER_PID=""
+        fi
+    fi
+done
+if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
     exit_code="$FORWARDED_SIGNAL_EXIT_CODE"
 fi
-set -e
+if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
+    && "$RESTART_REQUEST_VALID" == "1" \
+    && "$FORCED_STOP" == "0" \
+    && "$exit_code" == "143" ]]; then
+    if ! restore_tracked_config; then
+        RESTART_REQUEST_VALID=0
+        echo "[ERROR] Refusing restart after tracked-config restore failure" >&2
+    else
+        # Restoration can run external commands.  A stop signal received while
+        # waiting for one of them must still win over the already-authorized
+        # restart.  Once restoration is complete, remove its EXIT trap and use
+        # immediate-exit handlers for the commit-to-exec window: signals not
+        # already recorded by forward_signal then terminate instead of allowing
+        # one unwanted new generation.
+        trap - EXIT
+        trap 'exit 130' SIGINT
+        trap 'exit 143' SIGTERM
+        trap 'exit 129' SIGHUP
+        if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
+            RESTART_REQUEST_VALID=0
+            exit_code="$FORWARDED_SIGNAL_EXIT_CODE"
+            echo "[INFO] External stop cancelled the pending Matrix restart" >&2
+        else
+            exec /usr/bin/env -i \
+                "${ORIGINAL_ENVIRONMENT[@]}" \
+                MATRIX_SONIC_RESTART_LOCK_FD=9 \
+                "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${ORIGINAL_ARGS[@]}"
+            echo "[ERROR] Failed to exec restarted Matrix launcher" >&2
+            exit 1
+        fi
+    fi
+fi
+if [[ "$RESTART_REQUEST_VALID" == "1" ]]; then
+    echo "[ERROR] Aborting restart because run_sim did not exit cleanly" >&2
+fi
+# Run the normal-path restore explicitly while errexit is still disabled.  An
+# EXIT trap that returns non-zero under `set -e` replaces an explicit exit
+# status (for example, run_sim's expected 143 after a restart request).  Keep
+# the original non-zero runtime status, but surface a restore failure when the
+# runtime itself otherwise succeeded.
+if ! restore_tracked_config; then
+    if [[ "$exit_code" == "0" ]]; then
+        exit_code=1
+    fi
+fi
+trap - EXIT
+# The explicit restore above can itself be interrupted while waiting for cp,
+# mv, cmp, or directory cleanup.  Signals handled there must override the
+# runtime's earlier status.  Immediate handlers close the final check-to-exit
+# window without rerunning the already-completed restore.
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
+trap 'exit 129' SIGHUP
+if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
+    exit_code="$FORWARDED_SIGNAL_EXIT_CODE"
+fi
 exit "$exit_code"

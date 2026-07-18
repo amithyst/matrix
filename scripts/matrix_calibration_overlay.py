@@ -160,8 +160,8 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     """Return screen-space rectangles whose bars intersect the exact centre."""
 
     centre_x, centre_y = geometry.centre
-    hint_width = min(520, max(240, geometry.width - 32))
-    hint_height = 30
+    hint_width = min(900, max(240, geometry.width - 32))
+    hint_height = 70
     hint_x = centre_x - hint_width // 2
     hint_y = centre_y + 48
     if hint_y + hint_height > geometry.y + geometry.height:
@@ -187,6 +187,74 @@ def read_active_state(path: Path) -> bool:
         and value.get("version") == 1
         and value.get("active") is True
     )
+
+
+def read_overlay_state(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return None
+    return value
+
+
+def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
+    """Render only validated state supplied by the supervised provider."""
+
+    settings = state.get("mouse_settings")
+    settings = settings if isinstance(settings, dict) else {}
+    current = settings.get("current")
+    current = current if isinstance(current, dict) else {}
+    next_launch = settings.get("next_launch")
+    next_launch = next_launch if isinstance(next_launch, dict) else {}
+    restart = state.get("restart")
+    restart = restart if isinstance(restart, dict) else {}
+    mirror = state.get("mirror_sensitivity")
+    mirror = mirror if isinstance(mirror, dict) else {}
+
+    def profile(value: object) -> str:
+        return "Remote" if value == "remote" else "Local"
+
+    def finite(value: object, fallback: float) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return fallback
+        number = float(value)
+        return number if math.isfinite(number) else fallback
+
+    current_scale = finite(current.get("effective_scale"), 1.0)
+    next_scale = finite(next_launch.get("effective_scale"), 1.0)
+    pending = settings.get("pending_restart") is True
+    requested = restart.get("requested") is True
+    restart_available = restart.get("available") is True
+    persistence_error = settings.get("persistence_error")
+    line1 = (
+        f"CURRENT APPLIED (SDL): {profile(current.get('profile'))} "
+        f"{current_scale:.2f}x | "
+        f"NEXT LAUNCH: {profile(next_launch.get('profile'))} {next_scale:.2f}x | "
+        f"{'PENDING RESTART' if pending else 'CURRENT'}"
+    )
+    base = finite(mirror.get("base_deg_per_px"), 0.0)
+    effective = finite(mirror.get("effective_deg_per_px"), 0.0)
+    line2 = (
+        f"x11 mirror: base {base:.3f} -> effective {effective:.3f} deg/px | "
+        f"{'SAVE ERROR' if persistence_error else 'SAVED'}"
+    )
+    if requested:
+        action = "RESTART REQUESTED - keep controls released"
+    elif pending and restart_available and not persistence_error:
+        action = "F9: Apply & Restart"
+    else:
+        action = "F9: unavailable"
+    line3 = (
+        f"M: Local/Remote  -/+: next speed  {action} | "
+        "F10: center  F12: MouseLock  ESC: return"
+    )
+    encoded = tuple(
+        line.encode("ascii", errors="replace")
+        for line in (line1, line2, line3)
+    )
+    return (encoded[0], encoded[1], encoded[2])
 
 
 def atomic_json(path: Path, payload: dict[str, object]) -> None:
@@ -735,7 +803,12 @@ class X11CalibrationOverlay:
             return None
         return (root_x.value, root_y.value)
 
-    def show(self, geometry: WindowGeometry, pointer: tuple[int, int]) -> None:
+    def show(
+        self,
+        geometry: WindowGeometry,
+        pointer: tuple[int, int],
+        hint_lines: tuple[bytes, bytes, bytes],
+    ) -> None:
         layout = overlay_layout(geometry)
         for name in self._STATIC_WINDOW_ORDER:
             window = self._windows[name]
@@ -748,17 +821,17 @@ class X11CalibrationOverlay:
             else:
                 self._x11.XRaiseWindow(self._display, window)
         hint = self._windows["hint"]
-        message = b"Move cursor to +, press F10 to calibrate | ESC: return"
         self._x11.XClearWindow(self._display, hint)
-        self._x11.XDrawString(
-            self._display,
-            hint,
-            ctypes.c_void_p(self._hint_gc),
-            12,
-            20,
-            message,
-            len(message),
-        )
+        for index, message in enumerate(hint_lines):
+            self._x11.XDrawString(
+                self._display,
+                hint,
+                ctypes.c_void_p(self._hint_gc),
+                12,
+                18 + index * 21,
+                message,
+                len(message),
+            )
         pointer_x, pointer_y = pointer
         for name in self._CURSOR_WINDOW_ORDER:
             window = self._windows[name]
@@ -867,13 +940,14 @@ def main() -> int:
             if os.getppid() != args.expected_parent_pid:
                 exit_reason = "parent_exit"
                 break
-            if read_active_state(args.state_file):
+            state = read_overlay_state(args.state_file)
+            if state is not None and state.get("active") is True:
                 target = overlay.find_target()
                 pointer = overlay.pointer_position()
                 if target is None or pointer is None:
                     overlay.hide()
                 else:
-                    overlay.show(target, pointer)
+                    overlay.show(target, pointer, settings_hint_lines(state))
             else:
                 overlay.hide()
             time.sleep(interval)

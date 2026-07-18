@@ -104,6 +104,33 @@ class OverlayStateTest(unittest.TestCase):
             path.write_text(json.dumps({"version": 1, "active": True}))
             self.assertTrue(MODULE.read_active_state(path))
 
+    def test_settings_panel_distinguishes_current_next_and_pending(self) -> None:
+        lines = MODULE.settings_hint_lines(
+            {
+                "version": 1,
+                "active": True,
+                "mouse_settings": {
+                    "current": {"profile": "local", "effective_scale": 1.0},
+                    "next_launch": {
+                        "profile": "remote",
+                        "effective_scale": 0.5,
+                    },
+                    "pending_restart": True,
+                    "persistence_error": None,
+                },
+                "mirror_sensitivity": {
+                    "base_deg_per_px": 0.12,
+                    "effective_deg_per_px": 0.12,
+                },
+                "restart": {"available": True, "requested": False},
+            }
+        )
+        self.assertIn(b"CURRENT APPLIED (SDL): Local 1.00x", lines[0])
+        self.assertIn(b"NEXT LAUNCH: Remote 0.50x", lines[0])
+        self.assertIn(b"PENDING RESTART", lines[0])
+        self.assertIn(b"base 0.120 -> effective 0.120", lines[1])
+        self.assertIn(b"F9: Apply & Restart", lines[2])
+
 
 class TargetCacheTest(unittest.TestCase):
     def test_cached_live_pid_avoids_rewalking_the_x11_tree(self) -> None:

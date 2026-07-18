@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ SCRIPTS = REPO_ROOT / "scripts"
 if os.fspath(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, os.fspath(SCRIPTS))
 CORE = importlib.import_module("matrix_game_control")
+RESTART = importlib.import_module("matrix_restart_request")
 SCRIPT_PATH = SCRIPTS / "matrix_game_control_input.py"
 SPEC = importlib.util.spec_from_file_location("matrix_game_control_input", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -330,7 +332,161 @@ class CalibrationModeTest(unittest.TestCase):
         self.assertFalse(controller.active)
 
 
+class MouseSettingsAndRestartTest(unittest.TestCase):
+    def test_startup_requires_escape_and_f9_release_before_arming(self) -> None:
+        arming = MODULE.StartupShortcutArming()
+        self.assertFalse(arming.update(escape_pressed=True, restart_pressed=True))
+        self.assertFalse(arming.update(escape_pressed=False, restart_pressed=True))
+        self.assertTrue(arming.update(escape_pressed=False, restart_pressed=False))
+        self.assertTrue(arming.update(escape_pressed=True, restart_pressed=False))
+
+    def test_settings_edges_persist_only_next_launch_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config/mouse.json"
+            controller = MODULE.MouseSettingsController(
+                path=path,
+                desired=MODULE.MouseSettings(),
+                load_status="missing",
+                load_error=None,
+            )
+            applied = MODULE.AppliedMouseSettings(
+                profile="local", effective_scale=1.0
+            )
+            self.assertFalse(
+                controller.update(
+                    active=False,
+                    mode_pressed=True,
+                    slower_pressed=False,
+                    faster_pressed=False,
+                )
+            )
+            controller.update(
+                active=True,
+                mode_pressed=False,
+                slower_pressed=False,
+                faster_pressed=False,
+            )
+            self.assertTrue(
+                controller.update(
+                    active=True,
+                    mode_pressed=True,
+                    slower_pressed=False,
+                    faster_pressed=False,
+                )
+            )
+            self.assertTrue(controller.pending_restart(applied))
+            self.assertEqual(controller.desired.profile, "remote")
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"profile": "remote", "speed_scale": 0.5, "version": 1},
+            )
+
+            controller.update(
+                active=True,
+                mode_pressed=False,
+                slower_pressed=False,
+                faster_pressed=False,
+            )
+            self.assertTrue(
+                controller.update(
+                    active=True,
+                    mode_pressed=False,
+                    slower_pressed=True,
+                    faster_pressed=False,
+                )
+            )
+            self.assertEqual(controller.desired.effective_scale, 0.4)
+            # The current generation remains exactly the launch snapshot.
+            self.assertEqual(applied.effective_scale, 1.0)
+
+    def test_f9_requires_active_pending_saved_and_prior_neutral_send(self) -> None:
+        class Requester:
+            available = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self) -> bool:
+                self.calls += 1
+                return True
+
+        requester = Requester()
+        key = MODULE.ApplyRestartKey()
+        self.assertFalse(
+            key.update(
+                pressed=True,
+                calibration_active=True,
+                neutral_frame_ready=False,
+                pending_restart=True,
+                persistence_ok=True,
+                requester=requester,
+            )
+        )
+        # Holding F9 after the neutral frame cannot turn the rejected edge into
+        # a restart; the operator must release and make a fresh press.
+        self.assertFalse(
+            key.update(
+                pressed=True,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                pending_restart=True,
+                persistence_ok=True,
+                requester=requester,
+            )
+        )
+        key.update(
+            pressed=False,
+            calibration_active=True,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_ok=True,
+            requester=requester,
+        )
+        self.assertTrue(
+            key.update(
+                pressed=True,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                pending_restart=True,
+                persistence_ok=True,
+                requester=requester,
+            )
+        )
+        self.assertEqual(requester.calls, 1)
+
+    def test_requester_writes_once_without_signalling_or_exiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            capability = root / "capability"
+            request_file = root / "request.json"
+            RESTART.atomic_write_capability(capability)
+            requester = MODULE.RuntimeRestartRequester(
+                request_file=request_file,
+                capability_file=capability,
+                launcher_pid=os.getpid(),
+            )
+            self.assertTrue(requester.available)
+            self.assertTrue(requester.request())
+            self.assertTrue(request_file.is_file())
+            self.assertFalse(requester.available)
+            self.assertFalse(requester.request())
+
+
 class CameraYawTrackerTest(unittest.TestCase):
+    def test_applied_sdl_scale_also_scales_x11_mirror_gain(self) -> None:
+        base_deg_per_px = 0.12
+        applied_scale = 0.5
+        tracker = MODULE.CameraYawTracker(
+            0.0,
+            mouse_radians_per_pixel=math.radians(
+                base_deg_per_px * applied_scale
+            ),
+            gamepad_radians_per_second=0.0,
+        )
+        yaw = tracker.update(dt=0.02, mouse_dx=100.0, gamepad_look_yaw=0.0)
+        self.assertAlmostEqual(math.degrees(yaw), 6.0)
+
     def test_mouse_has_per_frame_priority_over_right_stick(self) -> None:
         tracker = MODULE.CameraYawTracker(
             0.0,

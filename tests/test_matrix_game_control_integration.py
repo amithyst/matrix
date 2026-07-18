@@ -361,7 +361,12 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
     def make_project(self, project: Path) -> dict[str, Path]:
         scripts = project / "scripts"
         scripts.mkdir(parents=True)
-        for name in ("run_matrix_sonic.sh", "run_sim.sh"):
+        for name in (
+            "run_matrix_sonic.sh",
+            "run_sim.sh",
+            "matrix_mouse_settings.py",
+            "matrix_restart_request.py",
+        ):
             shutil.copy2(SCRIPTS / name, scripts / name)
         self.write(
             scripts / "matrix_local_env.sh",
@@ -440,6 +445,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         custom_urdf = project / "fixture/g1.urdf"
         self.write(custom_urdf, '<robot name="g1"/>\n')
         capture = project / "capture.json"
+        ue_capture = project / "ue-capture.json"
         stale_status = project / "outputs/stale-game-input.json"
         self.write(stale_status, '{"stale": true}\n')
 
@@ -448,6 +454,23 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         self.write(
             fake_bin / "pkill",
             "#!/usr/bin/env bash\nexit 0\n",
+            executable=True,
+        )
+        self.write(
+            fake_bin / "cmp",
+            """#!/usr/bin/env bash
+if [[ "${FAIL_CONFIG_RESTORE:-0}" == "1" ]]; then
+    exit 1
+fi
+if [[ -n "${SIGNAL_LAUNCHER_DURING_RESTORE:-}" \
+    && -n "${SIGNAL_RESTORE_MARKER:-}" \
+    && ! -e "$SIGNAL_RESTORE_MARKER" ]]; then
+    mkdir "$SIGNAL_RESTORE_MARKER"
+    kill "-$SIGNAL_LAUNCHER_DURING_RESTORE" "$PPID"
+    sleep 0.2
+fi
+exec /usr/bin/cmp "$@"
+""",
             executable=True,
         )
         self.write(
@@ -481,7 +504,9 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sys
+import time
 
 script = Path(sys.argv[1]).name
 args = sys.argv[2:]
@@ -496,6 +521,10 @@ elif script == "prepare_sonic_physics_model.py":
     output.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(native, output / native.name)
 elif script == "supervise_matrix_ue.py":
+    separator = args.index("--")
+    Path(os.environ["UE_CAPTURE_PATH"]).write_text(
+        json.dumps({"command": args[separator + 1:]}), encoding="utf-8"
+    )
     pid_file = Path(args[args.index("--pid-file") + 1])
     pid_file.write_text(str(os.getpid()), encoding="utf-8")
     for line in sys.stdin:
@@ -516,6 +545,60 @@ elif script == "run_matrix_sonic.py":
     Path(os.environ["CAPTURE_PATH"]).write_text(
         json.dumps(capture), encoding="utf-8"
     )
+    generation_file = os.environ.get("GENERATION_FILE")
+    if generation_file:
+        generation_path = Path(generation_file)
+        generation = int(generation_path.read_text()) + 1 if generation_path.exists() else 1
+        generation_path.write_text(str(generation), encoding="utf-8")
+    marker_value = os.environ.get("TRIGGER_RESTART_MARKER")
+    if marker_value and not Path(marker_value).exists():
+        Path(marker_value).write_text("requested", encoding="utf-8")
+        provider = Path(args[args.index("--game-input-provider") + 1])
+        os.execv(
+            sys.argv[0],
+            [
+                sys.argv[0],
+                str(provider),
+                "--restart-request-file",
+                args[args.index("--game-restart-request-file") + 1],
+                "--restart-capability-file",
+                args[args.index("--game-restart-capability-file") + 1],
+                "--restart-launcher-pid",
+                args[args.index("--game-restart-launcher-pid") + 1],
+            ],
+        )
+elif script == "matrix_game_control_input.py":
+    request = Path(args[args.index("--restart-request-file") + 1])
+    capability = Path(args[args.index("--restart-capability-file") + 1])
+    launcher_pid = int(args[args.index("--restart-launcher-pid") + 1])
+    payload = {
+        "version": 1,
+        "action": "restart-whole-runtime",
+        "launcher_pid": launcher_pid,
+        "provider_pid": os.getpid(),
+        "nonce": capability.read_text(encoding="ascii").strip(),
+    }
+    temporary = request.with_name(f".{request.name}.{os.getpid()}")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, request)
+    def stop_provider(*_args):
+        delay = float(os.environ.get("FAKE_PROVIDER_TERM_DELAY_SECONDS", "0"))
+        if delay > 0.0:
+            time.sleep(delay)
+        marker = os.environ.get("FAKE_PROVIDER_TERM_MARKER")
+        if marker:
+            observed_path = os.environ.get("FAKE_PROVIDER_OBSERVE_PATH")
+            observed = (
+                Path(observed_path).read_text(encoding="utf-8")
+                if observed_path
+                else "term-complete"
+            )
+            Path(marker).write_text(observed, encoding="utf-8")
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop_provider)
+    while True:
+        time.sleep(0.1)
 else:
     raise SystemExit(f"unexpected fake runtime invocation: {script}")
 """,
@@ -523,6 +606,7 @@ else:
         )
         return {
             "capture": capture,
+            "ue_capture": ue_capture,
             "custom_urdf": custom_urdf,
             "fake_bin": fake_bin,
             "fake_python": fake_python,
@@ -600,6 +684,13 @@ else:
             fixture = self.make_project(project)
             runtime_dir = project / "runtime"
             runtime_dir.mkdir()
+            mouse_settings = project / "home/.config/matrix/mouse-control.json"
+            self.write(
+                mouse_settings,
+                json.dumps(
+                    {"version": 1, "profile": "remote", "speed_scale": 0.4}
+                ),
+            )
             environment = {
                 "CAPTURE_PATH": os.fspath(fixture["capture"]),
                 "HOME": os.fspath(project / "home"),
@@ -607,6 +698,7 @@ else:
                 "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
                     fixture["stale_status"]
                 ),
+                "MATRIX_MOUSE_SETTINGS_FILE": os.fspath(mouse_settings),
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
                 "MATRIX_SKIP_ENV_CHECK": "1",
                 # The fixture must not contend with a real Matrix runtime on
@@ -620,6 +712,7 @@ else:
                 + os.pathsep
                 + os.environ.get("PATH", "/usr/bin:/bin"),
                 "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
                 "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
             }
             command = [
@@ -681,6 +774,13 @@ else:
             self.assertEqual(capture["yaw_source_env"], "x11-mirror")
             self.assertEqual(capture["socket_parent_mode"], "0o700")
             self.assertFalse(capture["stale_status_existed"])
+            ue_capture = json.loads(
+                fixture["ue_capture"].read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "SDL_MOUSE_RELATIVE_SPEED_SCALE=0.400000",
+                ue_capture["command"],
+            )
 
             with mock.patch.object(
                 sys,
@@ -694,6 +794,12 @@ else:
             self.assertEqual(parsed.game_look_button, "right")
             self.assertEqual(parsed.game_initial_camera_yaw_deg, 12.5)
             self.assertEqual(parsed.game_mouse_sensitivity_deg, 0.25)
+            self.assertEqual(parsed.game_applied_mouse_profile, "remote")
+            self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.4)
+            self.assertEqual(parsed.game_mouse_settings_file, mouse_settings)
+            self.assertIsNotNone(parsed.game_restart_request_file)
+            self.assertIsNotNone(parsed.game_restart_capability_file)
+            self.assertGreater(parsed.game_restart_launcher_pid, 1)
             self.assertEqual(parsed.game_camera_yaw_sign, 1)
             self.assertEqual(parsed.game_camera_yaw_offset_deg, -90.0)
             self.assertEqual(parsed.game_carla_host, "127.0.0.2")
@@ -719,6 +825,403 @@ else:
             self.assertEqual(parsed.game_input_status_file, fixture["stale_status"])
             self.assertEqual(os.fspath(parsed.game_input_socket), capture["socket_env"])
             self.assertFalse(parsed.game_input_socket.parent.exists())
+
+    def test_corrupt_mouse_settings_fall_back_to_explicit_local_one_x(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            corrupt = project / "home/.config/matrix/mouse-control.json"
+            self.write(corrupt, "{")
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_MOUSE_SETTINGS_FILE": os.fspath(corrupt),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            capture = json.loads(fixture["capture"].read_text(encoding="utf-8"))
+            with mock.patch.object(
+                sys, "argv", ["run_matrix_sonic.py", *capture["argv"]]
+            ):
+                parsed = RUNTIME._parse_args()
+            self.assertEqual(parsed.game_applied_mouse_profile, "local")
+            self.assertEqual(parsed.game_applied_mouse_speed_scale, 1.0)
+            ue_capture = json.loads(
+                fixture["ue_capture"].read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "SDL_MOUSE_RELATIVE_SPEED_SCALE=1.000000",
+                ue_capture["command"],
+            )
+            self.assertIn("using Local 1.00x", result.stderr)
+
+    def test_private_request_restarts_whole_runtime_after_clean_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            marker = project / "restart-once.marker"
+            generations = project / "generations.txt"
+            mutable = [
+                project / "config/config.json",
+                project / "src/robot_mujoco/simulate/config.yaml",
+                project / "src/robot_mc/run_mc.sh",
+            ]
+            originals = {path: path.read_bytes() for path in mutable}
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TRIGGER_RESTART_MARKER": os.fspath(marker),
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
+            self.assertIn(
+                "Validated full Matrix runtime restart request", result.stdout
+            )
+            for path, expected in originals.items():
+                self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
+
+    def test_internal_restart_timeout_keeps_supervising_original_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            restart_marker = project / "restart-once.marker"
+            provider_term_marker = project / "provider-term-complete"
+            generations = project / "generations.txt"
+            mutable = [
+                project / "config/config.json",
+                project / "src/robot_mujoco/simulate/config.yaml",
+                project / "src/robot_mc/run_mc.sh",
+            ]
+            originals = {path: path.read_bytes() for path in mutable}
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_PROVIDER_TERM_DELAY_SECONDS": "0.6",
+                "FAKE_PROVIDER_TERM_MARKER": os.fspath(provider_term_marker),
+                "FAKE_PROVIDER_OBSERVE_PATH": os.fspath(mutable[1]),
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "0.05",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TMPDIR": os.fspath(temporary_dir),
+                "TRIGGER_RESTART_MARKER": os.fspath(restart_marker),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                143,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
+            observed_during_timeout = provider_term_marker.read_text(
+                encoding="utf-8"
+            )
+            self.assertNotEqual(
+                observed_during_timeout,
+                originals[mutable[1]].decode("utf-8"),
+            )
+            self.assertIn("scene_terrain_apart2.xml", observed_during_timeout)
+            self.assertEqual(result.stderr.count("restart timed out"), 1)
+            self.assertNotIn("external-signal cleanup", result.stderr)
+            for path, expected in originals.items():
+                self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
+
+    def test_restore_verification_failure_never_execs_next_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            marker = project / "restart-once.marker"
+            generations = project / "generations.txt"
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAIL_CONFIG_RESTORE": "1",
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TRIGGER_RESTART_MARKER": os.fspath(marker),
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                143,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
+            self.assertIn("Refusing restart", result.stderr)
+
+    def test_external_signal_during_restore_cancels_pending_restart(self) -> None:
+        for signal_name, expected_exit_code in (
+            ("INT", 130),
+            ("TERM", 143),
+            ("HUP", 129),
+        ):
+            with (
+                self.subTest(signal=signal_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                project = Path(temporary) / "matrix"
+                fixture = self.make_project(project)
+                runtime_dir = project / "runtime"
+                runtime_dir.mkdir()
+                temporary_dir = project / "tmp"
+                temporary_dir.mkdir()
+                restart_marker = project / "restart-once.marker"
+                signal_marker = project / "restore-signal-fired"
+                generations = project / "generations.txt"
+                mutable = [
+                    project / "config/config.json",
+                    project / "src/robot_mujoco/simulate/config.yaml",
+                    project / "src/robot_mc/run_mc.sh",
+                ]
+                originals = {path: path.read_bytes() for path in mutable}
+                environment = {
+                    "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                    "GENERATION_FILE": os.fspath(generations),
+                    "HOME": os.fspath(project / "home"),
+                    "LANG": "C.UTF-8",
+                    "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                    "MATRIX_SKIP_ENV_CHECK": "1",
+                    "MATRIX_SONIC_HOST_LOCK": os.fspath(
+                        project / "launcher.lock"
+                    ),
+                    "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                    "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                    "MATRIX_UE_STARTUP_SECONDS": "0",
+                    "MATRIX_VERIFY_RUNTIME": "0",
+                    "PATH": os.fspath(fixture["fake_bin"])
+                    + os.pathsep
+                    + os.environ.get("PATH", "/usr/bin:/bin"),
+                    "SIGNAL_LAUNCHER_DURING_RESTORE": signal_name,
+                    "SIGNAL_RESTORE_MARKER": os.fspath(signal_marker),
+                    "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                    "TMPDIR": os.fspath(temporary_dir),
+                    "TRIGGER_RESTART_MARKER": os.fspath(restart_marker),
+                    "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                    "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+                }
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                        "--scene",
+                        "21",
+                        "--control-source",
+                        "game",
+                    ],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    timeout=30.0,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    expected_exit_code,
+                    msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertEqual(generations.read_text(encoding="utf-8"), "1")
+                self.assertTrue(signal_marker.is_dir())
+                self.assertIn("External stop cancelled", result.stderr)
+                for path, expected in originals.items():
+                    self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
+
+    def test_external_signal_during_final_restore_overrides_runtime_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            signal_marker = project / "restore-signal-fired"
+            generations = project / "generations.txt"
+            mutable = [
+                project / "config/config.json",
+                project / "src/robot_mujoco/simulate/config.yaml",
+                project / "src/robot_mc/run_mc.sh",
+            ]
+            originals = {path: path.read_bytes() for path in mutable}
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIGNAL_LAUNCHER_DURING_RESTORE": "TERM",
+                "SIGNAL_RESTORE_MARKER": os.fspath(signal_marker),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                143,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
+            self.assertTrue(signal_marker.is_dir())
+            for path, expected in originals.items():
+                self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
 
 
 if __name__ == "__main__":

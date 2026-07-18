@@ -35,6 +35,22 @@ import tempfile
 import time
 from typing import Any, Callable, Protocol
 
+from matrix_mouse_settings import (
+    MAX_REMOTE_SPEED_SCALE,
+    MIN_REMOTE_SPEED_SCALE,
+    PROFILE_LOCAL,
+    PROFILE_REMOTE,
+    SPEED_SCALE_STEP,
+    MouseSettings,
+    atomic_save_settings,
+    default_settings_file,
+    load_settings,
+)
+from matrix_restart_request import (
+    RestartRequest,
+    atomic_write_request,
+    read_capability,
+)
 from matrix_game_control import (
     InputSnapshot,
     KeySnapshot,
@@ -78,6 +94,10 @@ class KeyboardMouseSample:
     ctrl: bool = False
     shift: bool = False
     escape: bool = False
+    mouse_mode: bool = False
+    mouse_speed_down: bool = False
+    mouse_speed_up: bool = False
+    apply_restart: bool = False
     mouse_dx: float = 0.0
     mouse_dy: float = 0.0
     camera_dragging: bool = False
@@ -135,6 +155,227 @@ class CalibrationModeController:
             toggled = True
         self._escape_was_down = escape_pressed
         return toggled
+
+
+class StartupShortcutArming:
+    """Require release of ESC/F9 once in every newly launched generation."""
+
+    def __init__(self) -> None:
+        self.armed = False
+
+    def update(self, *, escape_pressed: bool, restart_pressed: bool) -> bool:
+        if not self.armed and not escape_pressed and not restart_pressed:
+            self.armed = True
+        return self.armed
+
+
+@dataclass(frozen=True)
+class AppliedMouseSettings:
+    profile: str
+    effective_scale: float
+
+    def __post_init__(self) -> None:
+        if self.profile not in {PROFILE_LOCAL, PROFILE_REMOTE}:
+            raise ValueError(f"unsupported applied mouse profile: {self.profile}")
+        if (
+            isinstance(self.effective_scale, bool)
+            or not isinstance(self.effective_scale, (int, float))
+            or not math.isfinite(float(self.effective_scale))
+            or not MIN_REMOTE_SPEED_SCALE
+            <= float(self.effective_scale)
+            <= MAX_REMOTE_SPEED_SCALE
+        ):
+            raise ValueError("applied mouse scale must be finite and in [0.2, 1.0]")
+        if self.profile == PROFILE_LOCAL and not math.isclose(
+            float(self.effective_scale), 1.0
+        ):
+            raise ValueError("Local applied mouse profile must be 1.0x")
+        object.__setattr__(self, "effective_scale", float(self.effective_scale))
+
+
+class MouseSettingsController:
+    """Edit next-launch settings only while the ESC interlock is active."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        desired: MouseSettings,
+        load_status: str,
+        load_error: str | None,
+    ) -> None:
+        self.path = path
+        self.desired = desired
+        self.load_status = load_status
+        self.persistence_error = load_error
+        self.change_count = 0
+        self._mode_was_down = False
+        self._down_was_down = False
+        self._up_was_down = False
+
+    def update(
+        self,
+        *,
+        active: bool,
+        mode_pressed: bool,
+        slower_pressed: bool,
+        faster_pressed: bool,
+    ) -> bool:
+        mode_edge = mode_pressed and not self._mode_was_down
+        slower_edge = slower_pressed and not self._down_was_down
+        faster_edge = faster_pressed and not self._up_was_down
+        self._mode_was_down = mode_pressed
+        self._down_was_down = slower_pressed
+        self._up_was_down = faster_pressed
+        if not active:
+            return False
+
+        profile = self.desired.profile
+        speed_scale = self.desired.speed_scale
+        if mode_edge:
+            profile = PROFILE_REMOTE if profile == PROFILE_LOCAL else PROFILE_LOCAL
+        if profile == PROFILE_REMOTE:
+            if slower_edge and not faster_edge:
+                speed_scale -= SPEED_SCALE_STEP
+            elif faster_edge and not slower_edge:
+                speed_scale += SPEED_SCALE_STEP
+        speed_scale = round(
+            _clamp(speed_scale, MIN_REMOTE_SPEED_SCALE, MAX_REMOTE_SPEED_SCALE),
+            2,
+        )
+        replacement = MouseSettings(profile=profile, speed_scale=speed_scale)
+        if replacement == self.desired:
+            return False
+        self.desired = replacement
+        self.change_count += 1
+        try:
+            atomic_save_settings(self.path, replacement)
+            self.persistence_error = None
+            self.load_status = "saved"
+        except (OSError, ValueError) as exc:
+            self.persistence_error = str(exc)
+        return True
+
+    def pending_restart(self, applied: AppliedMouseSettings) -> bool:
+        return bool(
+            self.desired.profile != applied.profile
+            or not math.isclose(
+                self.desired.effective_scale,
+                applied.effective_scale,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+        )
+
+    def live_mapping(self, applied: AppliedMouseSettings) -> dict[str, object]:
+        return {
+            "settings_file": os.fspath(self.path),
+            "current": {
+                "profile": applied.profile,
+                "effective_scale": applied.effective_scale,
+            },
+            "next_launch": {
+                "profile": self.desired.profile,
+                "speed_scale": self.desired.speed_scale,
+                "effective_scale": self.desired.effective_scale,
+            },
+            "pending_restart": self.pending_restart(applied),
+            "load_status": self.load_status,
+            "persistence_error": self.persistence_error,
+            "change_count": self.change_count,
+        }
+
+
+class RuntimeRestartRequester:
+    """Write one private request polled by the top-level launcher."""
+
+    def __init__(
+        self,
+        *,
+        request_file: Path | None,
+        capability_file: Path | None,
+        launcher_pid: int | None,
+    ) -> None:
+        self.request_file = request_file
+        self.capability_file = capability_file
+        self.launcher_pid = launcher_pid
+        self.requested = False
+        self.error: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return bool(
+            self.request_file is not None
+            and self.request_file.is_absolute()
+            and self.request_file.parent.is_dir()
+            and self.capability_file is not None
+            and self.capability_file.is_absolute()
+            and self.capability_file.is_file()
+            and type(self.launcher_pid) is int
+            and self.launcher_pid > 1
+            and not self.requested
+        )
+
+    def request(self) -> bool:
+        if not self.available:
+            self.error = "whole-runtime restart channel is unavailable"
+            return False
+        assert self.request_file is not None
+        assert self.capability_file is not None
+        assert self.launcher_pid is not None
+        try:
+            nonce = read_capability(self.capability_file)
+            atomic_write_request(
+                self.request_file,
+                RestartRequest(
+                    launcher_pid=self.launcher_pid,
+                    provider_pid=os.getpid(),
+                    nonce=nonce,
+                ),
+            )
+            self.requested = True
+            self.error = None
+            return True
+        except (OSError, ValueError) as exc:
+            self.error = str(exc)
+            return False
+
+    def mapping(self) -> dict[str, object]:
+        return {
+            "available": self.available,
+            "requested": self.requested,
+            "error": self.error,
+        }
+
+
+class ApplyRestartKey:
+    """Accept only a fresh F9 edge while every safety precondition is true."""
+
+    def __init__(self) -> None:
+        self._was_down = False
+
+    def update(
+        self,
+        *,
+        pressed: bool,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        pending_restart: bool,
+        persistence_ok: bool,
+        requester: RuntimeRestartRequester,
+    ) -> bool:
+        edge = pressed and not self._was_down
+        self._was_down = pressed
+        if not (
+            edge
+            and calibration_active
+            and neutral_frame_ready
+            and pending_restart
+            and persistence_ok
+            and requester.available
+        ):
+            return False
+        return requester.request()
 
 
 def apply_calibration_interlock(
@@ -501,6 +742,10 @@ class X11KeyboardMouse:
         "shift_left": 0xFFE1,
         "shift_right": 0xFFE2,
         "escape": 0xFF1B,
+        "mouse_mode": 0x006D,
+        "mouse_speed_down": 0x002D,
+        "mouse_speed_up": 0x003D,
+        "apply_restart": 0xFFC6,
     }
 
     def __init__(
@@ -808,6 +1053,10 @@ class X11KeyboardMouse:
             shift=pressed.get("shift_left", False)
             or pressed.get("shift_right", False),
             escape=pressed.get("escape", False),
+            mouse_mode=pressed.get("mouse_mode", False),
+            mouse_speed_down=pressed.get("mouse_speed_down", False),
+            mouse_speed_up=pressed.get("mouse_speed_up", False),
+            apply_restart=pressed.get("apply_restart", False),
             mouse_dx=mouse_dx,
             mouse_dy=mouse_dy,
             camera_dragging=look_pressed and focused,
@@ -1078,7 +1327,7 @@ class CalibrationOverlaySupervisor:
         self.startup_timeout_s = startup_timeout_s
         self.process: subprocess.Popen[bytes] | None = None
 
-    def start(self) -> None:
+    def start(self, initial_state: dict[str, object] | None = None) -> None:
         if not self.script.is_file():
             raise RuntimeError(f"calibration overlay is missing: {self.script}")
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1087,7 +1336,10 @@ class CalibrationOverlaySupervisor:
                 stale.unlink()
             except FileNotFoundError:
                 pass
-        _atomic_json(self.state_file, {"version": 1, "active": False})
+        _atomic_json(
+            self.state_file,
+            {"active": False, **(initial_state or {}), "version": 1},
+        )
         command = [
             self.python,
             "-I",
@@ -1261,6 +1513,20 @@ def _parse_args() -> argparse.Namespace:
             "the launcher's private runtime directory"
         ),
     )
+    parser.add_argument(
+        "--mouse-settings-file",
+        type=Path,
+        default=default_settings_file(),
+    )
+    parser.add_argument(
+        "--applied-mouse-profile",
+        choices=(PROFILE_LOCAL, PROFILE_REMOTE),
+        default=PROFILE_LOCAL,
+    )
+    parser.add_argument("--applied-mouse-speed-scale", type=float, default=1.0)
+    parser.add_argument("--restart-request-file", type=Path)
+    parser.add_argument("--restart-capability-file", type=Path)
+    parser.add_argument("--restart-launcher-pid", type=int)
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print canonical packets; do not connect"
@@ -1323,11 +1589,52 @@ def _validate_args(args: argparse.Namespace) -> None:
                 "--calibration-state-file parent does not exist: "
                 f"{args.calibration_state_file.parent}"
             )
+    if not args.mouse_settings_file.is_absolute():
+        raise SystemExit("--mouse-settings-file must be absolute")
+    try:
+        AppliedMouseSettings(
+            profile=args.applied_mouse_profile,
+            effective_scale=args.applied_mouse_speed_scale,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    restart_values = (
+        args.restart_request_file,
+        args.restart_capability_file,
+        args.restart_launcher_pid,
+    )
+    if any(value is not None for value in restart_values) and not all(
+        value is not None for value in restart_values
+    ):
+        raise SystemExit("restart request file, capability, and launcher PID are all-or-none")
+    for name in ("restart_request_file", "restart_capability_file"):
+        path = getattr(args, name)
+        if path is not None and not path.is_absolute():
+            raise SystemExit(f"--{name.replace('_', '-')} must be absolute")
+    if args.restart_launcher_pid is not None and args.restart_launcher_pid <= 1:
+        raise SystemExit("--restart-launcher-pid must be greater than one")
 
 
 def main() -> int:
     args = _parse_args()
     _validate_args(args)
+    applied_mouse = AppliedMouseSettings(
+        profile=args.applied_mouse_profile,
+        effective_scale=args.applied_mouse_speed_scale,
+    )
+    loaded_mouse = load_settings(args.mouse_settings_file)
+    mouse_settings = MouseSettingsController(
+        path=args.mouse_settings_file,
+        desired=loaded_mouse.settings,
+        load_status=loaded_mouse.status,
+        load_error=loaded_mouse.error,
+    )
+    restart_requester = RuntimeRestartRequester(
+        request_file=args.restart_request_file,
+        capability_file=args.restart_capability_file,
+        launcher_pid=args.restart_launcher_pid,
+    )
+    apply_restart_key = ApplyRestartKey()
     try:
         input_source = effective_input_source(
             args.input_source, args.camera_yaw_source
@@ -1363,7 +1670,9 @@ def main() -> int:
     )
     tracker = CameraYawTracker(
         math.radians(args.initial_camera_yaw_deg),
-        mouse_radians_per_pixel=math.radians(args.mouse_sensitivity_deg),
+        mouse_radians_per_pixel=math.radians(
+            args.mouse_sensitivity_deg * applied_mouse.effective_scale
+        ),
         # Right-stick look is applied only by the CARLA driver below and comes
         # back as an absolute observed yaw.  The tracker never integrates an
         # unobserved gamepad angle.
@@ -1384,6 +1693,7 @@ def main() -> int:
         )
     publisher = None if args.dry_run else UnixSeqpacketPublisher(args.socket)
     calibration = CalibrationModeController()
+    shortcut_arming = StartupShortcutArming()
 
     running = True
 
@@ -1410,9 +1720,22 @@ def main() -> int:
     previous_gamepad_connected: bool | None = None
     next_overlay_heartbeat = started
     last_teleport_rejections = 0
+    calibration_neutral_frames = 0
     try:
         if overlay is not None:
-            overlay.start()
+            overlay.start(
+                {
+                    "mouse_settings": mouse_settings.live_mapping(applied_mouse),
+                    "restart": restart_requester.mapping(),
+                    "mirror_sensitivity": {
+                        "base_deg_per_px": args.mouse_sensitivity_deg,
+                        "effective_deg_per_px": (
+                            args.mouse_sensitivity_deg
+                            * applied_mouse.effective_scale
+                        ),
+                    },
+                }
+            )
         while running:
             now = time.monotonic()
             if args.max_seconds > 0.0 and now - started >= args.max_seconds:
@@ -1433,9 +1756,29 @@ def main() -> int:
             raw_keyboard = x11.poll()
             last_keyboard = raw_keyboard
             raw_pad = gamepad.poll(now)
-            calibration_toggled = calibration.update(
+            shortcuts_armed = shortcut_arming.update(
                 escape_pressed=raw_keyboard.escape,
+                restart_pressed=raw_keyboard.apply_restart,
+            )
+            calibration_toggled = calibration.update(
+                escape_pressed=raw_keyboard.escape if shortcuts_armed else False,
                 ue_focused=raw_keyboard.focused,
+            )
+            if calibration_toggled or not calibration.active:
+                calibration_neutral_frames = 0
+            mouse_settings_changed = mouse_settings.update(
+                active=calibration.active,
+                mode_pressed=raw_keyboard.mouse_mode,
+                slower_pressed=raw_keyboard.mouse_speed_down,
+                faster_pressed=raw_keyboard.mouse_speed_up,
+            )
+            restart_requested = apply_restart_key.update(
+                pressed=raw_keyboard.apply_restart,
+                calibration_active=calibration.active,
+                neutral_frame_ready=calibration_neutral_frames >= 1,
+                pending_restart=mouse_settings.pending_restart(applied_mouse),
+                persistence_ok=mouse_settings.persistence_error is None,
+                requester=restart_requester,
             )
             keyboard, pad = apply_calibration_interlock(
                 raw_keyboard,
@@ -1448,6 +1791,8 @@ def main() -> int:
                 overlay.ensure_running()
                 if (
                     calibration_toggled
+                    or mouse_settings_changed
+                    or restart_requested
                     or teleport_rejections != last_teleport_rejections
                     or now >= next_overlay_heartbeat
                 ):
@@ -1459,6 +1804,19 @@ def main() -> int:
                             "expected_ue_pid": args.expected_ue_pid,
                             "raw_ue_focused": raw_keyboard.focused,
                             "snapshot_forced_unfocused": calibration.active,
+                            "shortcuts_armed": shortcuts_armed,
+                            "neutral_frames": calibration_neutral_frames,
+                            "mouse_settings": mouse_settings.live_mapping(
+                                applied_mouse
+                            ),
+                            "restart": restart_requester.mapping(),
+                            "mirror_sensitivity": {
+                                "base_deg_per_px": args.mouse_sensitivity_deg,
+                                "effective_deg_per_px": (
+                                    args.mouse_sensitivity_deg
+                                    * applied_mouse.effective_scale
+                                ),
+                            },
                             "pointer": pointer_telemetry,
                         }
                     )
@@ -1515,11 +1873,16 @@ def main() -> int:
                 input_available=input_available,
             )
             last_snapshot = snapshot
+            neutral_delivered = False
             if publisher is None:
                 print(encode_input_packet(snapshot).decode("ascii"), flush=True)
                 sent_frames += 1
+                neutral_delivered = True
             elif publisher.send(snapshot, now=now):
                 sent_frames += 1
+                neutral_delivered = True
+            if calibration.active and neutral_delivered:
+                calibration_neutral_frames += 1
             sequence += 1
             sampled_frames += 1
         if exit_reason == "unknown":
@@ -1552,6 +1915,15 @@ def main() -> int:
                 "requested_input_source": args.input_source,
                 "effective_input_source": input_source,
                 "camera_yaw_source": args.camera_yaw_source,
+                "mouse_settings": mouse_settings.live_mapping(applied_mouse),
+                "mirror_sensitivity": {
+                    "base_deg_per_px": args.mouse_sensitivity_deg,
+                    "effective_deg_per_px": (
+                        args.mouse_sensitivity_deg
+                        * applied_mouse.effective_scale
+                    ),
+                },
+                "restart": restart_requester.mapping(),
                 "gamepad_camera": {
                     "driver": "carla-spectator"
                     if args.camera_yaw_source == "carla"

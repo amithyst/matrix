@@ -88,6 +88,18 @@ def _parse_args() -> argparse.Namespace:
         help="Initial provider/UE yaw before provider-to-SONIC sign and offset",
     )
     parser.add_argument("--game-mouse-sensitivity-deg", type=float, default=0.12)
+    parser.add_argument("--game-mouse-settings-file", type=Path)
+    parser.add_argument(
+        "--game-applied-mouse-profile",
+        choices=("local", "remote"),
+        default="local",
+    )
+    parser.add_argument(
+        "--game-applied-mouse-speed-scale", type=float, default=1.0
+    )
+    parser.add_argument("--game-restart-request-file", type=Path)
+    parser.add_argument("--game-restart-capability-file", type=Path)
+    parser.add_argument("--game-restart-launcher-pid", type=int)
     parser.add_argument(
         "--game-camera-yaw-sign", type=int, choices=(-1, 1), default=-1
     )
@@ -1243,6 +1255,10 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
     effective_input_source = args.game_input_source
     if source != "carla" and effective_input_source == "auto":
         effective_input_source = "keyboard"
+    applied_mouse_scale = args.game_applied_mouse_speed_scale
+    effective_mouse_sensitivity = (
+        args.game_mouse_sensitivity_deg * applied_mouse_scale
+    )
     return {
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
@@ -1267,7 +1283,13 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "camera_yaw_sign": args.game_camera_yaw_sign,
         "camera_yaw_offset_deg": args.game_camera_yaw_offset_deg,
         "initial_camera_yaw_deg": args.game_initial_camera_yaw_deg,
+        "visible_mouse_backend": "sdl-relative-speed-scale",
+        "applied_mouse_profile": args.game_applied_mouse_profile,
+        "applied_mouse_speed_scale": applied_mouse_scale,
+        # Historical field retained as the unscaled/base calibration value.
         "mouse_sensitivity_deg_per_px": args.game_mouse_sensitivity_deg,
+        "mouse_sensitivity_base_deg_per_px": args.game_mouse_sensitivity_deg,
+        "mouse_sensitivity_effective_deg_per_px": effective_mouse_sensitivity,
         "carla_host": args.game_carla_host,
         "carla_port": args.game_carla_port,
         "gamepad_look_yaw_rate_deg_s": args.gamepad_look_yaw_rate_deg_s,
@@ -1964,6 +1986,12 @@ class NativeProcessGroup:
         focus_title: str,
         expected_ue_pid: int,
         status_file: Path | None,
+        mouse_settings_file: Path | None = None,
+        applied_mouse_profile: str = "local",
+        applied_mouse_speed_scale: float = 1.0,
+        restart_request_file: Path | None = None,
+        restart_capability_file: Path | None = None,
+        restart_launcher_pid: int | None = None,
     ) -> int:
         command = [
             python,
@@ -1981,6 +2009,10 @@ class NativeProcessGroup:
             str(initial_camera_yaw_deg),
             "--mouse-sensitivity-deg",
             str(mouse_sensitivity_deg),
+            "--applied-mouse-profile",
+            applied_mouse_profile,
+            "--applied-mouse-speed-scale",
+            str(applied_mouse_speed_scale),
             "--camera-yaw-sign",
             str(camera_yaw_sign),
             "--camera-yaw-offset-deg",
@@ -2004,6 +2036,24 @@ class NativeProcessGroup:
             "--expected-ue-pid",
             str(expected_ue_pid),
         ]
+        if mouse_settings_file is not None:
+            command.extend(("--mouse-settings-file", str(mouse_settings_file)))
+        restart_values = (
+            restart_request_file,
+            restart_capability_file,
+            restart_launcher_pid,
+        )
+        if all(value is not None for value in restart_values):
+            command.extend(
+                (
+                    "--restart-request-file",
+                    str(restart_request_file),
+                    "--restart-capability-file",
+                    str(restart_capability_file),
+                    "--restart-launcher-pid",
+                    str(restart_launcher_pid),
+                )
+            )
         if status_file is not None:
             command.extend(("--status-file", str(status_file)))
         return self._start(
@@ -2236,6 +2286,42 @@ def main() -> int:
             raise SystemExit("--gamepad-look-deadzone must be in [0, 1)")
         if args.gamepad_look_min_pitch_deg >= args.gamepad_look_max_pitch_deg:
             raise SystemExit("gamepad camera pitch limits must be ordered")
+        if (
+            not math.isfinite(args.game_applied_mouse_speed_scale)
+            or not 0.2 <= args.game_applied_mouse_speed_scale <= 1.0
+        ):
+            raise SystemExit("--game-applied-mouse-speed-scale must be in [0.2, 1.0]")
+        if (
+            args.game_applied_mouse_profile == "local"
+            and args.game_applied_mouse_speed_scale != 1.0
+        ):
+            raise SystemExit("Local applied mouse profile must use 1.0x")
+        if (
+            args.game_mouse_settings_file is not None
+            and not args.game_mouse_settings_file.is_absolute()
+        ):
+            raise SystemExit("--game-mouse-settings-file must be absolute")
+        restart_values = (
+            args.game_restart_request_file,
+            args.game_restart_capability_file,
+            args.game_restart_launcher_pid,
+        )
+        if any(value is not None for value in restart_values) and not all(
+            value is not None for value in restart_values
+        ):
+            raise SystemExit("game restart request arguments are all-or-none")
+        for name in (
+            "game_restart_request_file",
+            "game_restart_capability_file",
+        ):
+            path = getattr(args, name)
+            if path is not None and not path.is_absolute():
+                raise SystemExit(f"--{name.replace('_', '-')} must be absolute")
+        if (
+            args.game_restart_launcher_pid is not None
+            and args.game_restart_launcher_pid <= 1
+        ):
+            raise SystemExit("--game-restart-launcher-pid must be greater than one")
         if not args.no_game_input_provider:
             if args.ue_pid is None:
                 raise SystemExit(
@@ -2433,6 +2519,16 @@ def main() -> int:
                         look_button=args.game_look_button,
                         initial_camera_yaw_deg=args.game_initial_camera_yaw_deg,
                         mouse_sensitivity_deg=args.game_mouse_sensitivity_deg,
+                        mouse_settings_file=args.game_mouse_settings_file,
+                        applied_mouse_profile=args.game_applied_mouse_profile,
+                        applied_mouse_speed_scale=(
+                            args.game_applied_mouse_speed_scale
+                        ),
+                        restart_request_file=args.game_restart_request_file,
+                        restart_capability_file=(
+                            args.game_restart_capability_file
+                        ),
+                        restart_launcher_pid=args.game_restart_launcher_pid,
                         camera_yaw_sign=args.game_camera_yaw_sign,
                         camera_yaw_offset_deg=args.game_camera_yaw_offset_deg,
                         carla_host=args.game_carla_host,

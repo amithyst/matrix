@@ -54,6 +54,36 @@ The default Matrix look button is the left mouse button. Releasing a camera
 drag does not immediately resume a movement key that remained held. Release all
 movement input once, then press it again; this is the neutral re-arm interlock.
 
+### ESC local/remote mouse settings
+
+In `game` mode, **ESC** immediately hard-zeros locomotion and shows the centre
+crosshair, a visible pointer, and the settings panel. The panel distinguishes
+the configuration applied to the current process from the next-launch value:
+
+| Key | Behavior |
+|---|---|
+| **M** | Toggle the next-launch profile between `Local` and `Remote` |
+| **- / +** | Adjust the Remote scale in 0.1 steps from 0.2x through 1.0x |
+| **F9** | After a successful save and while a change is pending, safely restart the complete Matrix/SONIC topology and apply it |
+| **F10 / F12** | Reserved for the external MouseLock center/toggle actions; Matrix does not intercept them |
+| **ESC** | Leave the panel; locomotion still requires a neutral re-arm |
+
+`Local` is always 1.0x; the default saved Remote preset is 0.5x. Changes are
+atomically persisted to `~/.config/matrix/mouse-control.json`, but they do not
+mutate the current UE process. F9 is accepted only after ESC/F9 have first been
+released, the panel is active, a safe neutral frame has been sent, and the
+setting was saved. The outer launcher then restarts the **whole** runtime; do
+not restart UE alone. Keep all controls released during the restart.
+
+The visible UE camera receives `SDL_MOUSE_RELATIVE_SPEED_SCALE` at process
+startup. With `x11-mirror`, the same applied scale also changes the mirror gain,
+keeping their nominal scales aligned and reducing scale-only mismatch. It does
+not replace the round-trip black-box acceptance below. A missing or corrupt
+settings file safely falls back to Local 1.0x.
+Pointer recentering, window-edge effects, and absolute-coordinate jumps still
+require crosshair/MouseLock calibration; the speed scale deliberately does not
+reinterpret such jumps as valid movement.
+
 ### Gamepad status
 
 The intended mapping is left stick for camera-relative movement and right stick

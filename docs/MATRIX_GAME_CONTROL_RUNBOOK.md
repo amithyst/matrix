@@ -229,6 +229,15 @@ camera. Any cumulative mismatch, jump after pointer warp, or automatic camera
 recenter invalidates `x11-mirror` as an acceptance source. Keep `fixed` as the
 default in that case.
 
+If remote-desktop dragging is too fast, do not tune system `xinput`
+acceleration. UE/SDL consumes raw relative motion, so a pointer curve may alter
+only the X11 absolute coordinates and make the visible camera diverge further
+from `x11-mirror`. Press ESC, select Remote with M, choose 0.2x–1.0x with -/+,
+and press F9 to apply it by restarting the complete runtime. After restart,
+verify that `CURRENT APPLIED (SDL)` is the intended value, then repeat the
+four-axis and multi-turn tests. F10/F12 remain external MouseLock bindings, not
+Matrix settings-page actions.
+
 ## Stage 3: safety and recovery matrix
 
 Run every row with the robot already moving slowly:

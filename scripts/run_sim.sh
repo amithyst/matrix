@@ -761,8 +761,15 @@ fi
 
 cd ../../../UeSim/Linux
 echo "[INFO] Starting UE"
+UE_MOUSE_RELATIVE_SPEED_SCALE="${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
+if [[ ! "$UE_MOUSE_RELATIVE_SPEED_SCALE" =~ ^(0\.[2-9][0-9]*|1(\.0+)?)$ ]]; then
+    echo "[ERROR] MATRIX_MOUSE_APPLIED_SPEED_SCALE must be in [0.2, 1.0]" >&2
+    exit 1
+fi
 UE_COMMAND=(
-    /usr/bin/env "LD_LIBRARY_PATH=$(ue_ld_library_path)"
+    /usr/bin/env
+    "LD_LIBRARY_PATH=$(ue_ld_library_path)"
+    "SDL_MOUSE_RELATIVE_SPEED_SCALE=$UE_MOUSE_RELATIVE_SPEED_SCALE"
     ./zsibot_mujoco_ue.sh -game "$MAPNAME" "-ExecCmds=$UE_EXEC_CMDS"
 )
 [[ -n "$USE_OFFSCREEN" ]] && UE_COMMAND+=("$USE_OFFSCREEN")
@@ -868,6 +875,9 @@ if $MATRIX_SONIC_ENABLED; then
         --game-look-button "${MATRIX_GAME_LOOK_BUTTON:-left}"
         --game-initial-camera-yaw-deg "${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
         --game-mouse-sensitivity-deg "${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
+        --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+        --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
+        --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
         --game-camera-yaw-offset-deg "${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
         --game-carla-host "${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
@@ -888,6 +898,15 @@ if $MATRIX_SONIC_ENABLED; then
         --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
+    if [[ -n "${MATRIX_GAME_RESTART_REQUEST_FILE:-}" \
+        && -n "${MATRIX_GAME_RESTART_CAPABILITY_FILE:-}" \
+        && -n "${MATRIX_SONIC_LAUNCHER_PID:-}" ]]; then
+        GAME_INPUT_ARGS+=(
+            --game-restart-request-file "$MATRIX_GAME_RESTART_REQUEST_FILE"
+            --game-restart-capability-file "$MATRIX_GAME_RESTART_CAPABILITY_FILE"
+            --game-restart-launcher-pid "$MATRIX_SONIC_LAUNCHER_PID"
+        )
+    fi
     GAME_NO_INPUT_PROVIDER_VALUE="${MATRIX_GAME_NO_INPUT_PROVIDER:-0}"
     case "${GAME_NO_INPUT_PROVIDER_VALUE,,}" in
         1|true|yes|on) GAME_INPUT_ARGS+=(--no-game-input-provider) ;;
