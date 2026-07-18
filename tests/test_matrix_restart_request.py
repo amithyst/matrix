@@ -111,6 +111,7 @@ class RestartRequestTest(unittest.TestCase):
             watcher = subprocess.Popen(
                 [
                     sys.executable,
+                    "-B",
                     "-I",
                     os.fspath(SCRIPT),
                     "watch",
