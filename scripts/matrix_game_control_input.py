@@ -143,7 +143,11 @@ def apply_calibration_interlock(
     *,
     active: bool,
 ) -> tuple[KeyboardMouseSample, GamepadSample]:
-    """Return fully neutral, unfocused physical inputs while calibrating."""
+    """Return locomotion-neutral, unfocused inputs while calibrating.
+
+    V keeps its physical level only to preserve the core's edge memory; an
+    unfocused snapshot cannot execute its mode toggle.
+    """
 
     if not active:
         return keyboard, gamepad
