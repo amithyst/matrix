@@ -593,6 +593,46 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(gate.timed_out)
         self.assertEqual(gate.status(now_s=3.1)["state"], "recovering_timeout")
 
+    def test_sonic_respawn_recovery_requests_one_fallback_at_timeout(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(
+            timeout_s=2.0,
+            mode="sonic-respawn",
+        )
+        fallen = self.snapshot(
+            fall_detected=True,
+            low_cmd_fresh=True,
+            elastic_band_scale=0.0,
+        )
+        fallen.qpos[2] = 0.15
+        fallen.qpos[4] = 1.0
+        self.assertEqual(gate.observe(fallen, now_s=1.0), "entered")
+        self.assertEqual(gate.observe(fallen, now_s=3.1), "respawn_due")
+        self.assertIsNone(gate.observe(fallen, now_s=3.2))
+        gate.confirm_respawn()
+        status = gate.status(now_s=3.2)
+        self.assertEqual(status["mode"], "sonic-respawn")
+        self.assertTrue(status["respawn_on_timeout"])
+        self.assertTrue(status["respawn_requested"])
+        self.assertEqual(status["respawns"], 1)
+
+    def test_recovery_respawn_snapshot_requires_exact_reset_contract(self) -> None:
+        before = self.snapshot(reset_count=0)
+        before.step_index = 10
+        after = self.snapshot(reset_count=1)
+        after.step_index = 10
+        after.qpos[2] = 0.8
+        after.last_reset_reason = MODULE._RECOVERY_RESPAWN_REASON
+        self.assertIsNone(
+            MODULE._recovery_respawn_validation_error(before, after)
+        )
+
+        after.last_reset_reason = "fall"
+        self.assertEqual(
+            MODULE._recovery_respawn_validation_error(before, after),
+            "respawn_reset_reason:'fall',expected="
+            f"{MODULE._RECOVERY_RESPAWN_REASON!r}",
+        )
+
     def test_sonic_fall_recovery_debounces_side_fall_above_native_height(self) -> None:
         gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
         side_fallen = self.snapshot(
@@ -706,6 +746,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             qualified_runtime=False,
         )
         MODULE._validate_game_fall_recovery(allowed)
+        respawn = SimpleNamespace(**vars(allowed))
+        respawn.game_fall_recovery = "sonic-respawn"
+        MODULE._validate_game_fall_recovery(respawn)
 
         invalid = (
             ("control", {"control_source": "planner"}),
