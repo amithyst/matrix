@@ -1203,12 +1203,18 @@ class _GameFallRecoveryGate:
 
     SONIC's public fall flag is session-sticky, so it cannot identify the end
     of one recovery or the beginning of a later fall.  The current fall level
-    therefore mirrors SONIC's own exact root-height condition (``z < 0.2``),
-    while the sticky flag remains the authoritative evidence that a fall was
-    observed.  Recovery never clears or rewrites that historical flag.
+    therefore mirrors SONIC's own exact root-height condition (``z < 0.2``).
+    Interactive game runs additionally debounce a low, strongly tilted base
+    pose because a stable side fall can remain above SONIC's height threshold
+    and never set the sticky flag.  This pose trigger is local to this gate;
+    recovery never clears or rewrites SONIC's historical fall flag, and the
+    qualification/fail-fast path continues to use that flag unchanged.
     """
 
     FALL_HEIGHT_M = 0.2
+    POSE_TRIGGER_HEIGHT_M = 0.45
+    POSE_TRIGGER_UP_Z = 0.5
+    POSE_TRIGGER_HOLD_S = 0.35
     UPRIGHT_HEIGHT_M = 0.65
     UPRIGHT_UP_Z = 0.85
     STABLE_HOLD_S = 1.0
@@ -1227,9 +1233,12 @@ class _GameFallRecoveryGate:
         self.episodes = 0
         self.recoveries = 0
         self.started_at_s: float | None = None
+        self.pose_candidate_since_s: float | None = None
         self.stable_since_s: float | None = None
         self.last_duration_s: float | None = None
         self.timed_out = False
+        self.pose_candidate = False
+        self.last_entry_source: str | None = None
         self.native_mode = SONIC_IDLE_MODE
         self.target_height = -1.0
 
@@ -1248,17 +1257,39 @@ class _GameFallRecoveryGate:
             raise ValueError("fall recovery root pose must be finite")
 
         self.current_fallen = root_z < self.FALL_HEIGHT_M
+        self.pose_candidate = (
+            root_z < self.POSE_TRIGGER_HEIGHT_M
+            and root_up_z < self.POSE_TRIGGER_UP_Z
+        )
+        if self.pose_candidate:
+            if self.pose_candidate_since_s is None:
+                self.pose_candidate_since_s = now
+            elif now < self.pose_candidate_since_s:
+                raise ValueError("fall recovery pose-candidate time regressed")
+        else:
+            self.pose_candidate_since_s = None
+
+        native_trigger = self.current_fallen and bool(
+            getattr(snapshot, "fall_detected", False)
+        )
+        pose_trigger = (
+            self.pose_candidate_since_s is not None
+            and now - self.pose_candidate_since_s >= self.POSE_TRIGGER_HOLD_S
+        )
         transition = None
         if (
             not self.recovering
-            and self.current_fallen
-            and bool(getattr(snapshot, "fall_detected", False))
+            and (native_trigger or pose_trigger)
         ):
             self.recovering = True
             self.episodes += 1
             self.started_at_s = now
+            self.pose_candidate_since_s = None
             self.stable_since_s = None
             self.timed_out = False
+            self.last_entry_source = (
+                "sonic_fall_detected" if native_trigger else "pose_debounce"
+            )
             transition = "entered"
 
         if not self.recovering:
@@ -1317,6 +1348,11 @@ class _GameFallRecoveryGate:
             if self.recovering and self.stable_since_s is not None
             else 0.0
         )
+        pose_candidate_elapsed_s = (
+            max(0.0, now - self.pose_candidate_since_s)
+            if self.pose_candidate_since_s is not None
+            else 0.0
+        )
         state = (
             "recovering_timeout"
             if self.recovering and self.timed_out
@@ -1331,6 +1367,9 @@ class _GameFallRecoveryGate:
             "native_mode": self.native_mode,
             "target_height": self.target_height,
             "current_fall_detected": self.current_fallen,
+            "pose_recovery_candidate": self.pose_candidate,
+            "pose_candidate_elapsed_s": round(pose_candidate_elapsed_s, 3),
+            "last_entry_source": self.last_entry_source,
             "episodes": self.episodes,
             "recoveries": self.recoveries,
             "active_elapsed_s": round(active_elapsed_s, 3),
@@ -1343,6 +1382,9 @@ class _GameFallRecoveryGate:
             "timeout_s": self.timeout_s,
             "timed_out": self.timed_out,
             "fall_height_m": self.FALL_HEIGHT_M,
+            "pose_trigger_height_m": self.POSE_TRIGGER_HEIGHT_M,
+            "pose_trigger_up_z": self.POSE_TRIGGER_UP_Z,
+            "pose_trigger_hold_s": self.POSE_TRIGGER_HOLD_S,
             "upright_height_m": self.UPRIGHT_HEIGHT_M,
             "upright_up_z": self.UPRIGHT_UP_Z,
             "stable_hold_s": self.STABLE_HOLD_S,
@@ -3095,7 +3137,9 @@ def main() -> int:
                         if recovery_transition == "entered":
                             print(
                                 "matrix-sonic-runtime fall recovery entered "
-                                f"episode={game_fall_recovery.episodes}",
+                                f"episode={game_fall_recovery.episodes} "
+                                "source="
+                                f"{game_fall_recovery.last_entry_source}",
                                 flush=True,
                             )
                         elif recovery_transition == "recovered":

@@ -540,6 +540,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(gate.recovering)
         self.assertTrue(gate.current_fallen)
         self.assertEqual(gate.episodes, 1)
+        self.assertEqual(gate.last_entry_source, "sonic_fall_detected")
         self.assertEqual(gate.native_mode, 5)
         self.assertEqual(gate.target_height, 0.4)
 
@@ -591,6 +592,110 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(gate.recovering)
         self.assertTrue(gate.timed_out)
         self.assertEqual(gate.status(now_s=3.1)["state"], "recovering_timeout")
+
+    def test_sonic_fall_recovery_debounces_side_fall_above_native_height(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        side_fallen = self.snapshot(
+            fall_detected=False,
+            low_cmd_fresh=True,
+            elastic_band_scale=0.0,
+        )
+        side_fallen.qpos[2] = 0.34
+        side_fallen.qpos[3] = 0.0
+        side_fallen.qpos[4] = 1.0
+
+        self.assertIsNone(gate.observe(side_fallen, now_s=1.0))
+        self.assertFalse(gate.current_fallen)
+        self.assertTrue(gate.pose_candidate)
+        self.assertFalse(gate.recovering)
+        self.assertIsNone(gate.observe(side_fallen, now_s=1.34))
+        self.assertEqual(gate.observe(side_fallen, now_s=1.36), "entered")
+        self.assertTrue(gate.recovering)
+        self.assertEqual(gate.last_entry_source, "pose_debounce")
+        status = gate.status(now_s=1.36)
+        self.assertEqual(status["last_entry_source"], "pose_debounce")
+        self.assertEqual(status["pose_trigger_height_m"], 0.45)
+        self.assertEqual(status["pose_trigger_up_z"], 0.5)
+        self.assertEqual(status["pose_trigger_hold_s"], 0.35)
+
+    def test_sonic_fall_recovery_pose_debounce_resets_when_pose_clears(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+
+        def pose(*, root_z: float, upright: bool) -> SimpleNamespace:
+            snapshot = self.snapshot(
+                fall_detected=False,
+                low_cmd_fresh=True,
+                elastic_band_scale=0.0,
+            )
+            snapshot.qpos[2] = root_z
+            snapshot.qpos[3] = 1.0 if upright else 0.0
+            snapshot.qpos[4] = 0.0 if upright else 1.0
+            return snapshot
+
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.0)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.70, upright=True), now_s=1.2)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.5)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.84)
+        )
+        self.assertEqual(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.86),
+            "entered",
+        )
+
+        upright_low = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        self.assertIsNone(
+            upright_low.observe(pose(root_z=0.40, upright=True), now_s=3.0)
+        )
+        self.assertIsNone(
+            upright_low.observe(pose(root_z=0.40, upright=True), now_s=4.0)
+        )
+        self.assertFalse(upright_low.pose_candidate)
+        self.assertFalse(upright_low.recovering)
+
+        high_side = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        self.assertIsNone(
+            high_side.observe(pose(root_z=0.45, upright=False), now_s=5.0)
+        )
+        self.assertIsNone(
+            high_side.observe(pose(root_z=0.45, upright=False), now_s=6.0)
+        )
+        self.assertFalse(high_side.pose_candidate)
+        self.assertFalse(high_side.recovering)
+
+    def test_sonic_fall_recovery_redebounces_later_side_fall(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=10.0)
+
+        def pose(*, root_z: float, upright: bool) -> SimpleNamespace:
+            snapshot = self.snapshot(
+                fall_detected=False,
+                low_cmd_fresh=True,
+                elastic_band_scale=0.0,
+            )
+            snapshot.qpos[2] = root_z
+            snapshot.qpos[3] = 1.0 if upright else 0.0
+            snapshot.qpos[4] = 0.0 if upright else 1.0
+            return snapshot
+
+        side = pose(root_z=0.34, upright=False)
+        upright = pose(root_z=0.72, upright=True)
+        self.assertIsNone(gate.observe(side, now_s=1.0))
+        self.assertEqual(gate.observe(side, now_s=1.36), "entered")
+        self.assertIsNone(gate.observe(upright, now_s=3.50))
+        self.assertEqual(gate.observe(upright, now_s=4.50), "recovered")
+        self.assertEqual(gate.recoveries, 1)
+
+        self.assertIsNone(gate.observe(side, now_s=5.0))
+        self.assertFalse(gate.recovering)
+        self.assertEqual(gate.observe(side, now_s=5.36), "entered")
+        self.assertEqual(gate.episodes, 2)
+        self.assertEqual(gate.last_entry_source, "pose_debounce")
 
     def test_sonic_fall_recovery_validation_is_interactive_only(self) -> None:
         allowed = SimpleNamespace(
