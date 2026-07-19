@@ -710,7 +710,11 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["expected_ue_pid"], 4242)
         self.assertEqual(
             status["camera_yaw_observation"],
-            "configured_pointer_delta_mirror",
+            "xinput2_raw_motion_mirror",
+        )
+        self.assertEqual(
+            status["camera_yaw_truth_scope"],
+            "xi2_raw_input_mirror_not_final_view",
         )
         self.assertEqual(
             status["native_gait"],
@@ -738,6 +742,16 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["applied_mouse_speed_scale"], 0.01)
         self.assertEqual(status["mouse_sensitivity_base_deg_per_px"], 0.12)
         self.assertEqual(status["mouse_sensitivity_effective_deg_per_px"], 0.0012)
+        self.assertEqual(
+            status["mouse_sensitivity_units"],
+            "degrees_per_xi2_raw_unit",
+        )
+        self.assertEqual(
+            status["mouse_sensitivity_base_deg_per_raw_unit"], 0.12
+        )
+        self.assertEqual(
+            status["mouse_sensitivity_effective_deg_per_raw_unit"], 0.0012
+        )
         self.assertEqual(status["carla_host"], "127.0.0.2")
         self.assertEqual(status["carla_port"], 2100)
         self.assertFalse(status["visible_follow_camera_verified"])

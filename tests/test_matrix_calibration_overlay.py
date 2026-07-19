@@ -214,8 +214,12 @@ class OverlayStateTest(unittest.TestCase):
                     "persistence_error": None,
                 },
                 "mirror_sensitivity": {
-                    "base_deg_per_px": 0.12,
-                    "effective_deg_per_px": 0.12,
+                    "units": "degrees_per_xi2_raw_unit",
+                    "base_deg_per_raw_unit": 0.12,
+                    "effective_deg_per_raw_unit": 0.12,
+                    # Conflicting legacy aliases prove the raw-unit fields win.
+                    "base_deg_per_px": 9.0,
+                    "effective_deg_per_px": 9.0,
                 },
                 "restart": {"available": True, "requested": False},
             }
@@ -224,6 +228,8 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn(b"NEXT LAUNCH: Remote 0.50x", lines[0])
         self.assertIn(b"PENDING RESTART", lines[0])
         self.assertIn(b"base 0.120 -> effective 0.120", lines[1])
+        self.assertIn(b"XI2 raw mirror", lines[1])
+        self.assertIn(b"deg/raw", lines[1])
         self.assertIn(b"Enter: RETURN TO GAME & APPLY", lines[2])
         self.assertIn(b"F9: fallback", lines[2])
         hint = b" | ".join(lines)

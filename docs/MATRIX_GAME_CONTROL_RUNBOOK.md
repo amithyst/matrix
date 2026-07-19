@@ -229,12 +229,16 @@ is expected and is why this stage is not camera-relative acceptance.
 
 ## Stage 2: X11 mirror calibration
 
-`x11-mirror` observes the same root-window mouse delta that the native UI is
-expected to consume. It does not query UE and does not move the camera itself.
-Its SONIC command yaw is:
+`x11-mirror` subscribes to XInput2 `XI_RawMotion`, which SDL relative mouse
+mode commonly uses; the launcher also requests SDL raw mode. It no longer derives yaw from
+50 Hz `XQueryPointer` absolute coordinates, so the current MouseLock's
+`pyautogui.moveTo`/XTEST absolute recenter cannot cancel the outward drag
+inside one sample. It still does not query UE's
+final rendered view, does not prove that the packaged UE build consumes the
+same deltas, and does not move the camera itself. Its SONIC command yaw is:
 
 ```text
-wrap(sign × (initial_yaw + accumulated_mouse_dx × sensitivity) + offset)
+wrap(sign × (initial_yaw + accumulated_XI2_raw_x × SDL_scale × sensitivity) + offset)
 ```
 
 Start from a repeatable visible camera pose and conservative defaults:
@@ -264,7 +268,7 @@ Calibrate in this order:
    all movement keys and the mouse, press W. If the movement frame changed in
    the opposite direction, flip `--game-camera-yaw-sign`.
 3. **Sensitivity:** make a visually measured 90-degree yaw rotation. Increase the
-   degrees-per-pixel value if the SONIC frame turns too little; decrease it if
+   degrees-per-XI2-raw-unit value if the SONIC frame turns too little; decrease it if
    the frame turns too far.
 
 Every drag is a safety stop. The correct sequence is: release WASD, drag the
@@ -284,14 +288,15 @@ For the four-axis gate, align the calibrated SONIC yaw and check root delta:
 Repeat the sequence after several clockwise/counter-clockwise rotations, after
 moving the pointer near each screen edge, and after two V presses that exercise
 the mirrored safety state (the v3 view itself remains centred). Any cumulative
-mismatch, jump after pointer warp, or automatic camera
+mismatch, divergence between raw input and UE processing, or automatic camera
 recenter invalidates `x11-mirror` as an acceptance source. Keep `fixed` as the
 default in that case.
 
-If remote-desktop dragging is too fast, do not tune system `xinput`
-acceleration. UE/SDL consumes raw relative motion, so a pointer curve may alter
-only the X11 absolute coordinates and make the visible camera diverge further
-from `x11-mirror`. For SONIC `game` + Remote, the launcher itself snapshots the
+If remote-desktop dragging is too fast, do not treat system `xinput`
+acceleration as a UE fix. The launcher requests SDL raw relative mode and
+`x11-mirror` reads XI2 raw motion; equal packaged-UE consumption still requires
+live qualification. A pointer curve may alter only the X11 absolute coordinates
+and make the visible camera diverge further from `x11-mirror`. For SONIC `game` + Remote, the launcher itself snapshots the
 current X pointer curve, uses `xset m 1/1 0` only for the lifetime of the run,
 and restores it during cleanup; leave the desktop setting at the user's normal
 value. Press ESC, click Remote, and use the large -/+ controls to traverse the
@@ -306,11 +311,12 @@ Matrix settings-page actions.
 
 Local is fixed at 1.0x. Remote 0.4x remains one of the presets and is the native
 SDL/UE multiplier. The same selected Remote multiplier feeds the visible SDL
-path and the nominal `x11-mirror` gain. With the example base mirror gain of
-0.12 deg/px, 0.4x makes the reported `x11-mirror` value 0.048 deg/px, but that
-number is only nominal arithmetic over X11 root-pointer pixels, not a measured
-visible-camera sensitivity. A missing, corrupt, or manually edited off-table
-settings file fails safe to Local 1.0x.
+path and the nominal `x11-mirror` raw gain. With a base mirror gain of
+0.12 deg/raw unit, 0.4x reports 0.048 deg/raw unit. This records the requested
+input configuration; it does not prove equal packaged-UE consumption or final
+rendered-camera yaw; status must retain
+`visible_follow_camera_verified=false`. A missing, corrupt, or manually edited
+off-table settings file fails safe to Local 1.0x.
 
 ## Stage 3: safety and recovery matrix
 
@@ -351,7 +357,7 @@ script and the same verified Python interpreter used by the runtime; interpreter
 overrides are diagnostic-only and rejected here.
 
 ```bash
-MEASURED_MOUSE_DEG_PER_PIXEL=0.12  # replace with the Heyuan measurement
+MEASURED_MOUSE_DEG_PER_RAW_UNIT=0.12  # replace with the Heyuan measurement
 MEASURED_CAMERA_YAW_SIGN=-1        # replace with -1 or 1 from the sign probe
 MEASURED_CAMERA_YAW_OFFSET_DEG=0   # replace with the calibrated offset
 
@@ -364,7 +370,7 @@ MEASURED_CAMERA_YAW_OFFSET_DEG=0   # replace with the calibrated offset
   --game-camera-yaw-source x11-mirror \
   --game-look-button left \
   --game-initial-yaw 0 \
-  --game-mouse-sensitivity "$MEASURED_MOUSE_DEG_PER_PIXEL" \
+  --game-mouse-sensitivity "$MEASURED_MOUSE_DEG_PER_RAW_UNIT" \
   --game-camera-yaw-sign "$MEASURED_CAMERA_YAW_SIGN" \
   --game-camera-yaw-offset "$MEASURED_CAMERA_YAW_OFFSET_DEG" \
   --game-max-speed 0.30 \

@@ -180,16 +180,18 @@ during the reload.
 The visible UE camera receives `SDL_MOUSE_RELATIVE_SPEED_SCALE` at process
 startup. For example, the currently used Remote 0.4x setting is a native
 SDL/UE input multiplier; it is not an X pointer-acceleration value. With the
-default `x11-mirror` base of 0.12 degrees per pixel, status reports
-`0.12 x 0.4 = 0.048 deg/px`. That 0.048 value is only the mirror's nominal
-arithmetic gain over polled X11 root-pointer pixels. It is not a measured UE
-camera sensitivity and does not prove that the mirror and visible camera agree.
+default `x11-mirror` base of 0.12 degrees per XI2 raw unit, status reports
+`0.12 x 0.4 = 0.048 deg/raw`. The mirror subscribes to `XI_RawMotion`, which
+SDL relative mouse mode commonly uses, and the launcher requests SDL raw mode.
+Live black-box evidence has not yet shown that the packaged UE build consumes
+those deltas one-for-one. This is not final rendered-camera yaw readback and
+does not prove that the mirror and visible camera agree.
 The four-axis, multi-turn black-box acceptance below is still required. A
 missing, corrupt, or manually edited off-table settings file safely falls back
 to Local 1.0x. On a valid Remote launch, the same selected multiplier is sent
 to the visible SDL/UE path and used for the nominal `x11-mirror` gain.
 
-The launcher also pins SDL to raw relative motion without warp emulation,
+The launcher also requests and configures SDL raw relative motion without warp emulation,
 viewport scaling, or SDL system-pointer scaling, disables UE
 `bEnableMouseSmoothing` and FOV sensitivity scaling, disables SpringArm lag in
 the robot-centred view, and adds `r.MotionBlurQuality 0`. The first settings
@@ -200,8 +202,8 @@ For an interactive SONIC `game` launch with the applied profile `Remote`,
 `run_sim.sh` additionally snapshots the current X display's acceleration and
 threshold, temporarily runs `xset m 1/1 0` before UE starts, and restores the
 exact pair at cleanup. This linearizes the absolute X11 stream used by the
-panel and `x11-mirror`; it does not replace SDL's raw-relative path and it does
-not modify MouseLock. A missing `DISPLAY`, missing `xset`, or X-server failure
+panel; the yaw mirror now uses XI2 raw motion. It does not modify MouseLock. A
+missing `DISPLAY`, missing `xset`, or X-server failure
 only produces a warning and does not block launch. Pointer control is global to
 that X display while Matrix is running. Normal exit and handled signals restore
 it, but an uncatchable `SIGKILL` or host crash cannot run cleanup; in that case
@@ -209,8 +211,10 @@ restore the values printed by the warning/log with `xset m <accel> <threshold>`
 or restart the desktop session.
 
 Pointer recentering, window-edge effects, and absolute-coordinate jumps still
-require crosshair/MouseLock calibration; the speed scale deliberately does not
-reinterpret such jumps as valid movement.
+require crosshair/MouseLock calibration for the visible remote session.
+The tested current MouseLock `pyautogui.moveTo`/XTEST absolute recenter is not
+accumulated as XI2 raw yaw motion. Other synthetic relative recenter paths are
+outside that claim.
 
 ### Gamepad status
 
@@ -274,7 +278,7 @@ centered-overlay v3 intentionally keeps the visible view centred on V.
 | Source | Use | Limitation |
 |---|---|---|
 | `fixed` | Safe axis and deadman testing | The command frame does not follow visible camera rotation |
-| `x11-mirror` | Heyuan calibration candidate | Integrates polled mouse deltas; press/release order inside one 20 ms sample is ambiguous, and it neither reads nor drives the actual UE camera. Pointer warps, window edges, and recentering can drift |
+| `x11-mirror` | Heyuan calibration candidate | Integrates ordered XI2 raw motion only while the configured raw button is held; absolute warps do not cancel the drag. It neither reads nor drives the final UE camera, so UE-side auto-rotation can still diverge |
 | `carla` | Writable spectator candidate with read-back | Right-stick yaw/pitch rotation is immediately read back; write/yaw failure stops. The Matrix 0.1.2 cooked package exposes no discovered CARLA server and has no visible-camera coupling proof |
 
 `fixed` is the default so an unverified camera estimate cannot silently steer

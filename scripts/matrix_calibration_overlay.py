@@ -463,8 +463,17 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         pending_restart=pending,
         restart_available=restart_available,
         restart_requested=requested,
-        base_mirror_gain=finite(mirror.get("base_deg_per_px"), 0.0),
-        effective_mirror_gain=finite(mirror.get("effective_deg_per_px"), 0.0),
+        base_mirror_gain=finite(
+            mirror.get("base_deg_per_raw_unit", mirror.get("base_deg_per_px")),
+            0.0,
+        ),
+        effective_mirror_gain=finite(
+            mirror.get(
+                "effective_deg_per_raw_unit",
+                mirror.get("effective_deg_per_px"),
+            ),
+            0.0,
+        ),
         status=status,
         error=error_value,
     )
@@ -481,8 +490,8 @@ def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
         f"{'PENDING RESTART' if model.pending_restart else 'CURRENT'}"
     )
     line2 = (
-        f"x11 mirror: base {model.base_mirror_gain:.3f} -> effective "
-        f"{model.effective_mirror_gain:.3f} deg/px | "
+        f"XI2 raw mirror: base {model.base_mirror_gain:.3f} -> effective "
+        f"{model.effective_mirror_gain:.3f} deg/raw | "
         "presets 0.01-0.10/0.01, 0.20-1.00/0.10 | "
         f"{'ERROR' if model.error else 'SAVED'}"
     )

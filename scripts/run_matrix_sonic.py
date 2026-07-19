@@ -1272,10 +1272,13 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
     source = args.game_camera_yaw_source
     if source == "fixed":
         yaw_observation = "constant_unobserved"
+        yaw_truth_scope = "configured_constant_not_final_view"
     elif source == "x11-mirror":
-        yaw_observation = "configured_pointer_delta_mirror"
+        yaw_observation = "xinput2_raw_motion_mirror"
+        yaw_truth_scope = "xi2_raw_input_mirror_not_final_view"
     else:
         yaw_observation = "carla_spectator_rpc_write_readback"
+        yaw_truth_scope = "carla_spectator_not_verified_final_view"
     effective_input_source = args.game_input_source
     if source != "carla" and effective_input_source == "auto":
         effective_input_source = "keyboard"
@@ -1310,6 +1313,7 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "focus_title_pattern": args.game_focus_title,
         "expected_ue_pid": args.ue_pid,
         "camera_yaw_observation": yaw_observation,
+        "camera_yaw_truth_scope": yaw_truth_scope,
         "camera_yaw_sign": args.game_camera_yaw_sign,
         "camera_yaw_offset_deg": args.game_camera_yaw_offset_deg,
         "initial_camera_yaw_deg": args.game_initial_camera_yaw_deg,
@@ -1320,6 +1324,13 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "mouse_sensitivity_deg_per_px": args.game_mouse_sensitivity_deg,
         "mouse_sensitivity_base_deg_per_px": args.game_mouse_sensitivity_deg,
         "mouse_sensitivity_effective_deg_per_px": effective_mouse_sensitivity,
+        "mouse_sensitivity_units": "degrees_per_xi2_raw_unit",
+        "mouse_sensitivity_base_deg_per_raw_unit": (
+            args.game_mouse_sensitivity_deg
+        ),
+        "mouse_sensitivity_effective_deg_per_raw_unit": (
+            effective_mouse_sensitivity
+        ),
         "carla_host": args.game_carla_host,
         "carla_port": args.game_carla_port,
         "gamepad_look_yaw_rate_deg_s": args.gamepad_look_yaw_rate_deg_s,

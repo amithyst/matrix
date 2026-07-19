@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import importlib
 import importlib.util
 import json
@@ -1264,7 +1265,553 @@ class CarlaSpectatorCameraTest(unittest.TestCase):
             )
 
 
+class XInput2RawMotionTest(unittest.TestCase):
+    @staticmethod
+    def raw(evtype, *, source=6, device=2, detail=0, dx=0.0, dy=0.0):
+        return MODULE.XInput2RawEvent(
+            evtype=evtype,
+            deviceid=device,
+            sourceid=source,
+            detail=detail,
+            dx=dx,
+            dy=dy,
+        )
+
+    def test_sparse_valuator_mask_decodes_packed_xy(self) -> None:
+        # Axes 0, 1, and 3 are present; packed values do not include axis 2.
+        self.assertEqual(
+            MODULE.decode_xinput2_xy(bytes((0b00001011,)), (4.5, -2.0, 99.0)),
+            (4.5, -2.0),
+        )
+        self.assertEqual(
+            MODULE.decode_xinput2_xy(bytes((0b00000010,)), (3.0,)),
+            (0.0, 3.0),
+        )
+        with self.assertRaisesRegex(RuntimeError, "count differs"):
+            MODULE.decode_xinput2_xy(bytes((0b00000011,)), (1.0,))
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            MODULE.decode_xinput2_xy(bytes((0b00000001,)), (math.nan,))
+
+    def test_raw_button_edges_attribute_only_held_motion(self) -> None:
+        accumulator = MODULE.XInput2DragAccumulator(look_button_detail=1)
+        self.assertEqual(
+            accumulator.update((), current_look_pressed=False),
+            (0.0, 0.0, False),
+        )
+        dx, dy, drag_observed = accumulator.update(
+            (
+                self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=2),
+                self.raw(MODULE._XI_RAW_MOTION, dx=9.0, dy=8.0),
+                self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+                self.raw(MODULE._XI_RAW_MOTION, dx=3.0, dy=-4.0),
+                self.raw(MODULE._XI_RAW_BUTTON_RELEASE, detail=1),
+                self.raw(MODULE._XI_RAW_MOTION, dx=100.0, dy=100.0),
+            ),
+            current_look_pressed=False,
+        )
+        self.assertEqual((dx, dy), (3.0, -4.0))
+        self.assertTrue(drag_observed)
+        self.assertEqual(accumulator.button_state_resyncs, 0)
+
+        fresh_first_press = MODULE.XInput2DragAccumulator(1)
+        self.assertEqual(
+            fresh_first_press.update(
+                (
+                    self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+                    self.raw(MODULE._XI_RAW_MOTION, dx=6.0),
+                    self.raw(MODULE._XI_RAW_BUTTON_RELEASE, detail=1),
+                ),
+                current_look_pressed=False,
+            ),
+            (6.0, 0.0, True),
+        )
+
+    def test_cross_source_drag_fails_closed(self) -> None:
+        accumulator = MODULE.XInput2DragAccumulator(look_button_detail=1)
+        accumulator.update((), current_look_pressed=False)
+        accumulator.update(
+            (self.raw(MODULE._XI_RAW_BUTTON_PRESS, source=6, detail=1),),
+            current_look_pressed=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "crossed input sources"):
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, source=4, dx=20.0),),
+                current_look_pressed=True,
+            )
+
+    def test_disarm_requires_release_then_fresh_same_source_press(self) -> None:
+        accumulator = MODULE.XInput2DragAccumulator(look_button_detail=1)
+        accumulator.update((), current_look_pressed=False)
+        self.assertEqual(
+            accumulator.update(
+                (
+                    self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+                    self.raw(MODULE._XI_RAW_MOTION, dx=2.0),
+                ),
+                current_look_pressed=True,
+            ),
+            (2.0, 0.0, True),
+        )
+        accumulator.disarm()
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, dx=30.0),),
+                current_look_pressed=True,
+            ),
+            (0.0, 0.0, False),
+        )
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_BUTTON_RELEASE, detail=1),),
+                current_look_pressed=False,
+            ),
+            (0.0, 0.0, False),
+        )
+        self.assertEqual(
+            accumulator.update(
+                (
+                    self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+                    self.raw(MODULE._XI_RAW_MOTION, dx=5.0),
+                ),
+                current_look_pressed=True,
+            ),
+            (5.0, 0.0, True),
+        )
+
+    def test_missed_release_discards_ambiguously_attributed_batch(self) -> None:
+        accumulator = MODULE.XInput2DragAccumulator(look_button_detail=1)
+        accumulator.update((), current_look_pressed=False)
+        accumulator.update(
+            (self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),),
+            current_look_pressed=True,
+        )
+
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, dx=30.0),),
+                current_look_pressed=False,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.button_state_resyncs, 1)
+
+    @staticmethod
+    def reader_for_events(events, *, enumerated_masters=(2,)):
+        pending_values = []
+        for _event in events:
+            pending_values.extend((1,))
+        pending_values.append(0)
+        pending = iter(pending_values)
+        event_iterator = iter(events)
+
+        class Pending:
+            @staticmethod
+            def XPending(_display) -> int:
+                return next(pending)
+
+            @staticmethod
+            def XFlush(_display) -> int:
+                return 1
+
+        reader = object.__new__(MODULE.XInput2RawMotion)
+        reader._x11 = Pending()
+        reader._display = 1
+        reader._read_event = lambda: next(event_iterator)
+        reader._accumulator = MODULE.XInput2DragAccumulator(1)
+        reader.events_consumed = 0
+        reader.raw_motion_events = 0
+        reader.hierarchy_events = 0
+        reader.foreign_master_events = 0
+        reader.master_device_changes = 0
+        reader._master_deviceid = 2
+        reader._single_master_pointer_deviceid = lambda: next(
+            reader._enumerated_masters
+        )
+        reader._enumerated_masters = iter(enumerated_masters)
+        return reader
+
+    def test_hierarchy_event_discards_complete_batch_and_rebinds(self) -> None:
+        reader = self.reader_for_events(
+            (
+                self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+                self.raw(MODULE._XI_RAW_MOTION, dx=40.0),
+                MODULE.XInput2RawEvent(MODULE._XI_HIERARCHY_CHANGED),
+            ),
+            enumerated_masters=(2,),
+        )
+
+        self.assertEqual(
+            reader.poll(current_look_pressed=True, focused=True),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(reader.hierarchy_events, 1)
+
+    def test_hierarchy_master_change_discards_batch_without_reselecting_old_id(
+        self,
+    ) -> None:
+        reader = self.reader_for_events(
+            (MODULE.XInput2RawEvent(MODULE._XI_HIERARCHY_CHANGED),),
+            enumerated_masters=(8,),
+        )
+
+        self.assertEqual(
+            reader.poll(current_look_pressed=False, focused=True),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(reader._master_deviceid, 8)
+        self.assertEqual(reader.master_device_changes, 1)
+
+    def test_raw_subscription_uses_all_master_devices_once(self) -> None:
+        reader = object.__new__(MODULE.XInput2RawMotion)
+        reader._raw_mask_buffer = object()
+        selections = []
+        reader._select_mask = lambda *, deviceid, buffer: selections.append(
+            (deviceid, buffer)
+        )
+
+        reader._subscribe_raw_masters()
+
+        self.assertEqual(
+            selections,
+            [(MODULE._XI_ALL_MASTER_DEVICES, reader._raw_mask_buffer)],
+        )
+
+    def test_unexpected_foreign_master_drops_batch_and_fails_closed(self) -> None:
+        reader = self.reader_for_events(
+            (
+                self.raw(MODULE._XI_RAW_MOTION, device=9, dx=1.0),
+                self.raw(MODULE._XI_RAW_MOTION, device=9, dx=2.0),
+            ),
+        )
+
+        self.assertEqual(
+            reader.poll(current_look_pressed=False, focused=True),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(reader.foreign_master_events, 2)
+
+    @staticmethod
+    def _device_query(*entries):
+        class FakeXi:
+            def __init__(self) -> None:
+                self.free_calls = 0
+                if entries:
+                    self.array = (MODULE._XIDeviceInfo * len(entries))(
+                        *(
+                            MODULE._XIDeviceInfo(
+                                deviceid=deviceid,
+                                name=name.encode(),
+                                use=use,
+                                attachment=attachment,
+                                enabled=enabled,
+                                num_classes=0,
+                                classes=None,
+                            )
+                            for deviceid, name, use, attachment, enabled in entries
+                        )
+                    )
+                    self.pointer = ctypes.cast(
+                        self.array, ctypes.POINTER(MODULE._XIDeviceInfo)
+                    )
+                else:
+                    self.pointer = ctypes.POINTER(MODULE._XIDeviceInfo)()
+
+            def XIQueryDevice(self, _display, selector, count_pointer):
+                if selector != MODULE._XI_ALL_MASTER_DEVICES:
+                    raise AssertionError(f"unexpected selector {selector}")
+                count_pointer._obj.value = len(entries)
+                return self.pointer
+
+            def XIFreeDeviceInfo(self, _devices) -> None:
+                self.free_calls += 1
+
+        return FakeXi()
+
+    def test_device_query_accepts_only_one_enabled_master_pointer(self) -> None:
+        xi = self._device_query(
+            (2, "Virtual core pointer", MODULE._XI_MASTER_POINTER, 3, 1),
+            (3, "Virtual core keyboard", 2, 2, 1),
+        )
+        reader = object.__new__(MODULE.XInput2RawMotion)
+        reader._display = 1
+        reader._xi = xi
+
+        self.assertEqual(reader._single_master_pointer_deviceid(), 2)
+        self.assertEqual(xi.free_calls, 1)
+
+    def test_device_query_rejects_zero_or_two_master_pointers(self) -> None:
+        for entries in (
+            (),
+            (
+                (2, "master-a", MODULE._XI_MASTER_POINTER, 3, 1),
+                (8, "master-b", MODULE._XI_MASTER_POINTER, 9, 1),
+            ),
+        ):
+            with self.subTest(master_count=len(entries)):
+                xi = self._device_query(*entries)
+                reader = object.__new__(MODULE.XInput2RawMotion)
+                reader._display = 1
+                reader._xi = xi
+                with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                    reader._single_master_pointer_deviceid()
+                self.assertEqual(xi.free_calls, int(bool(entries)))
+
+    def test_invalid_device_count_still_frees_nonnull_query_result(self) -> None:
+        xi = self._device_query(
+            (2, "master", MODULE._XI_MASTER_POINTER, 3, 1),
+        )
+        original_query = xi.XIQueryDevice
+
+        def invalid_count_query(display, selector, count_pointer):
+            devices = original_query(display, selector, count_pointer)
+            count_pointer._obj.value = 257
+            return devices
+
+        xi.XIQueryDevice = invalid_count_query
+        reader = object.__new__(MODULE.XInput2RawMotion)
+        reader._display = 1
+        reader._xi = xi
+
+        with self.assertRaisesRegex(RuntimeError, "invalid device count"):
+            reader._single_master_pointer_deviceid()
+        self.assertEqual(xi.free_calls, 1)
+
+    def test_hierarchy_with_ambiguous_master_topology_fails_closed(self) -> None:
+        reader = self.reader_for_events(
+            (MODULE.XInput2RawEvent(MODULE._XI_HIERARCHY_CHANGED),)
+        )
+        reader._single_master_pointer_deviceid = mock.Mock(
+            side_effect=RuntimeError("requires exactly one master pointer")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            reader.poll(current_look_pressed=False, focused=True)
+
+    def test_event_backlog_fails_closed_at_a_finite_bound(self) -> None:
+        class PendingForever:
+            @staticmethod
+            def XPending(_display) -> int:
+                return 1
+
+        reader = object.__new__(MODULE.XInput2RawMotion)
+        reader._x11 = PendingForever()
+        reader._display = 1
+        # Even unrelated GenericEvents must count toward the work bound.
+        reader._read_event = lambda: None
+        reader._accumulator = MODULE.XInput2DragAccumulator(1)
+        reader.events_consumed = 0
+        reader.raw_motion_events = 0
+        reader.hierarchy_events = 0
+        reader.foreign_master_events = 0
+        reader.master_device_changes = 0
+        reader._master_deviceid = 2
+
+        with self.assertRaisesRegex(RuntimeError, "backlog"):
+            reader.poll(current_look_pressed=True, focused=True)
+        self.assertEqual(
+            reader.events_consumed, MODULE._MAX_XI2_EVENTS_PER_POLL
+        )
+
+    def test_initialization_failure_closes_display_and_close_is_idempotent(self) -> None:
+        class FakeX11:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            @staticmethod
+            def XOpenDisplay(_name):
+                return 11
+
+            @staticmethod
+            def XQueryExtension(*_args):
+                return 1
+
+            @staticmethod
+            def XDefaultRootWindow(_display):
+                return 22
+
+            def XCloseDisplay(self, _display):
+                self.close_calls += 1
+                return 1
+
+        class FakeXi:
+            @staticmethod
+            def XIQueryVersion(*_args):
+                return 0
+
+            @staticmethod
+            def XIQueryDevice(_display, selector, count_pointer):
+                if selector != MODULE._XI_ALL_MASTER_DEVICES:
+                    raise AssertionError(f"unexpected selector {selector}")
+                count_pointer._obj.value = 0
+                return ctypes.POINTER(MODULE._XIDeviceInfo)()
+
+            @staticmethod
+            def XIFreeDeviceInfo(_devices):
+                raise AssertionError("null device array must not be freed")
+
+        x11 = FakeX11()
+        with mock.patch.object(
+            MODULE.XInput2RawMotion,
+            "_configure_signatures",
+            lambda _self: None,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exactly one"):
+                MODULE.XInput2RawMotion(
+                    display_name=":999",
+                    look_button="left",
+                    x11_library=x11,
+                    xi_library=FakeXi(),
+                )
+        self.assertEqual(x11.close_calls, 1)
+
+        reader = object.__new__(MODULE.XInput2RawMotion)
+        reader._x11 = x11
+        reader._display = 33
+        reader.close()
+        reader.close()
+        self.assertEqual(x11.close_calls, 2)
+
+
 class X11KeyboardMouseSafetyTest(unittest.TestCase):
+    @staticmethod
+    def _raw_backend(
+        *,
+        focus_results,
+        raw_deltas,
+        pointer_values=((10, 1 << 8), (20, 1 << 8)),
+        pressed_names=(),
+    ):
+        pointer_samples = iter(pointer_values)
+
+        class FakeX11:
+            @staticmethod
+            def XQueryKeymap(_display, _buffer) -> int:
+                return 1
+
+            @staticmethod
+            def XQueryPointer(*args) -> int:
+                x, button_mask = next(pointer_samples)
+                args[4]._obj.value = x
+                args[5]._obj.value = 0
+                args[8]._obj.value = button_mask
+                return 1
+
+        class FakeRaw:
+            telemetry = {"motion_source": "xi2-raw"}
+
+            def __init__(self) -> None:
+                self.deltas = iter(raw_deltas)
+                self.button_states = []
+
+            def poll(self, *, current_look_pressed, focused):
+                self.button_states.append((current_look_pressed, focused))
+                return next(self.deltas)
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 1
+        backend._root = 2
+        backend._keycodes = {
+            name: index
+            for index, name in enumerate(MODULE.X11KeyboardMouse._KEYSYMS, start=8)
+        }
+        pressed_codes = {
+            backend._keycodes[name] for name in pressed_names
+        }
+        backend._pressed = lambda _keymap, code: code in pressed_codes
+        backend._focus_pattern = None
+        backend._look_mask = 1 << 8
+        backend._previous_pointer = None
+        backend._previous_look_pressed = False
+        backend._maximum_mouse_delta = 200.0
+        backend._teleport_rejections = 0
+        backend._last_teleport_delta = None
+        backend._expected_ue_pid = 1234
+        backend._focus_identity = lambda: next(focus_results)
+        backend._raw_motion = FakeRaw()
+        return backend
+
+    def test_raw_focus_loss_discards_delta_without_replay(self) -> None:
+        backend = self._raw_backend(
+            focus_results=iter(
+                (
+                    (False, "Other", frozenset()),
+                    (True, "Matrix", frozenset({1234})),
+                )
+            ),
+            raw_deltas=((7.0, -3.0, True), (0.0, 0.0, False)),
+        )
+
+        unfocused = backend.poll()
+        refocused = backend.poll()
+
+        self.assertEqual((unfocused.mouse_dx, unfocused.mouse_dy), (0.0, 0.0))
+        self.assertEqual((refocused.mouse_dx, refocused.mouse_dy), (0.0, 0.0))
+        self.assertFalse(unfocused.focused)
+        self.assertTrue(refocused.focused)
+        self.assertEqual(
+            backend._raw_motion.button_states,
+            [(True, False), (True, True)],
+        )
+        self.assertEqual(
+            backend.pointer_telemetry["motion_source"], "xi2-raw"
+        )
+
+    def test_completed_raw_drag_interlocks_same_frame_w(self) -> None:
+        backend = self._raw_backend(
+            focus_results=iter(((True, "Matrix", frozenset({1234})),)),
+            raw_deltas=((12.0, 0.0, True),),
+            pointer_values=((10, 0),),
+            pressed_names=("w",),
+        )
+
+        sample = backend.poll()
+        self.assertTrue(sample.w)
+        self.assertTrue(sample.camera_dragging)
+        self.assertEqual(sample.mouse_dx, 12.0)
+        snapshot = MODULE.build_snapshot(
+            sequence=2,
+            timestamp_monotonic_s=1.01,
+            keyboard=sample,
+            gamepad=MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.1,
+            camera_available=True,
+        )
+        self.assertFalse(snapshot.focused)
+
+        core = CORE.GameControlCore()
+        core.accept_snapshot(
+            CORE.InputSnapshot(
+                sequence=1,
+                timestamp_monotonic_s=1.0,
+                focused=True,
+                camera_yaw_rad=0.0,
+                keys=CORE.KeySnapshot(
+                    False, False, False, False, False, False, False
+                ),
+                move_stick=CORE.MoveStickSnapshot(0.0, 0.0),
+            ),
+            received_at_s=1.0,
+        )
+        core.accept_snapshot(snapshot, received_at_s=1.01)
+        command = core.command(now_s=1.01, dt_s=0.01)
+        self.assertTrue(command.safe_stop)
+        self.assertEqual(command.reason, "focus_lost")
+        self.assertEqual(command.speed_mps, 0.0)
+
+    def test_completed_raw_click_without_motion_still_interlocks(self) -> None:
+        backend = self._raw_backend(
+            focus_results=iter(((True, "Matrix", frozenset({1234})),)),
+            raw_deltas=((0.0, 0.0, True),),
+            pointer_values=((10, 0),),
+        )
+
+        sample = backend.poll()
+
+        self.assertTrue(sample.camera_dragging)
+        self.assertEqual((sample.mouse_dx, sample.mouse_dy), (0.0, 0.0))
+
     def test_teleport_is_rejected_and_rebaselined_without_clamping(self) -> None:
         samples = iter(
             (

@@ -195,11 +195,14 @@ watch -n 0.5 'jq "{control_source, physics_step_hz, rtf, fall_detected, instabil
 
 ## 阶段二：X11 镜像标定
 
-`x11-mirror` 读取原生 UI 理应同时消费的 X11 根窗口鼠标位移。它不查询 UE，也不主动
-移动相机。最终送给 SONIC 的 yaw 为：
+`x11-mirror` 订阅 XInput2 `XI_RawMotion`；这是 SDL relative mouse mode 常用的输入层，
+launcher 也请求 SDL raw 模式，但 packaged UE 是否等量消费尚未通过 live 黑盒证明。
+它不再用 50 Hz `XQueryPointer` 绝对坐标差，因此 MouseLock
+把指针送回中心时，不会把一次拖动的出程和回程在同一采样周期内相消。它仍不查询 UE
+最终渲染相机，也不主动移动相机。最终送给 SONIC 的 yaw 为：
 
 ```text
-wrap(sign × (initial_yaw + 累计鼠标横向像素 × sensitivity) + offset)
+wrap(sign × (initial_yaw + 累计 XI2 raw X × SDL scale × sensitivity) + offset)
 ```
 
 先把画面相机放到可重复的基准姿态，再用保守默认值启动：
@@ -228,7 +231,7 @@ wrap(sign × (initial_yaw + 累计鼠标横向像素 × sensitivity) + offset)
 2. **sign：**把相机沿一个已知水平方向拖动；松开全部移动键和鼠标后再按 W。如果
    控制方向变化与画面相反，就翻转 `--game-camera-yaw-sign`；
 3. **sensitivity：**让画面相机完成可辨认的 90 度转动。SONIC 坐标转得不够就增大
-   每像素角度，转过头就减小。
+   每 XI2 raw unit 角度，转过头就减小。
 
 每次拖动都是一次安全停机。正确操作顺序是：松开 WASD → 拖动相机 → 松开鼠标 →
 给一帧回中输入 → 再按 W。若拖动期间一直按着 W，松开鼠标后也必须保持
@@ -244,12 +247,13 @@ wrap(sign × (initial_yaw + 累计鼠标横向像素 × sensitivity) + offset)
 | -90° | -Y |
 
 顺时针、逆时针连续绕转几圈后重复测试；把指针移到各个屏幕边缘后重复；按两次 V
-走完镜像安全状态后再重复（v3 可见画面仍保持居中）。只要出现累计偏差、光标 warp
-后突跳、或 UE 自动回正造成不一致，
+走完镜像安全状态后再重复（v3 可见画面仍保持居中）。只要出现累计偏差、raw 输入与
+UE 实际处理分叉、或 UE 自动回正造成不一致，
 `x11-mirror` 就不能作为验收相机源，此时继续保留 `fixed` 默认值。
 
-远程桌面拖动过快时，不要修改系统 `xinput` 加速度：UE/SDL 使用原始相对鼠标事件，系统
-指针曲线可能只改变 X11 绝对坐标，使可见相机和 `x11-mirror` 进一步分叉。
+远程桌面拖动过快时，不要把系统 `xinput` 加速度当成 UE 修复：launcher 请求 SDL raw
+relative mode，`x11-mirror` 读取 XI2 raw；packaged UE 是否等量消费仍须 live 验证。
+系统指针曲线可能只改变 X11 绝对坐标，使可见相机和 `x11-mirror` 进一步分叉。
 启动组合为 SONIC `game` + Remote 时，launcher 会自行保存当前指针曲线，只在本次运行
 期间执行 `xset m 1/1 0`，并在 cleanup 中恢复；桌面设置应保留用户平时的值。请按 ESC
 进入安全设置页，点击 Remote、用大号 -/+ 遍历 19 个精确档位：0.01x–0.10x 每次
@@ -260,9 +264,11 @@ wrap(sign × (initial_yaw + 累计鼠标横向像素 × sensitivity) + offset)
 多轮往返测试。F10/F12 仍属于外部 MouseLock，不是 Matrix 设置页的绑定。
 
 Local 固定为 1.0x。Remote 0.4x 仍是其中一个档位，也是 SDL/UE 原生倍率；同一个所选
-Remote 倍率会同时进入可见 SDL 路径与 `x11-mirror` 名义增益。示例基值 0.12 度/像素
-乘后，状态会显示 `x11-mirror = 0.048 度/像素`，但这只是 X11 根窗口像素上的名义
-算术值，不是可见相机的实测灵敏度。配置文件缺失、损坏或被手工改成非预设档位时，
+Remote 倍率会同时进入可见 SDL 路径与 `x11-mirror` raw 增益。示例基值
+0.12 度/raw unit 乘后，状态会显示 `x11-mirror = 0.048 度/raw unit`。XI2 raw 是 SDL
+相对鼠标模式常用的输入层，launcher 也请求 SDL raw 模式，但 packaged UE 是否等量消费
+仍未经过 live 黑盒证明；它不是最终渲染相机 yaw 的回读，状态必须保持
+`visible_follow_camera_verified=false`。配置文件缺失、损坏或被手工改成非预设档位时，
 系统会安全回退到 Local 1.0x。
 
 ## 阶段三：安全与恢复矩阵
@@ -300,7 +306,7 @@ Remote 倍率会同时进入可见 SDL 路径与 `x11-mirror` 名义增益。示
 runtime 同一个已验证 Python；解释器 override 只能调试，有界验收会拒绝。
 
 ```bash
-MEASURED_MOUSE_DEG_PER_PIXEL=0.12  # 替换为河源实测值
+MEASURED_MOUSE_DEG_PER_RAW_UNIT=0.12  # 替换为河源实测值
 MEASURED_CAMERA_YAW_SIGN=-1        # 替换为方向探针得到的 -1 或 1
 MEASURED_CAMERA_YAW_OFFSET_DEG=0   # 替换为标定后的 offset
 
@@ -313,7 +319,7 @@ MEASURED_CAMERA_YAW_OFFSET_DEG=0   # 替换为标定后的 offset
   --game-camera-yaw-source x11-mirror \
   --game-look-button left \
   --game-initial-yaw 0 \
-  --game-mouse-sensitivity "$MEASURED_MOUSE_DEG_PER_PIXEL" \
+  --game-mouse-sensitivity "$MEASURED_MOUSE_DEG_PER_RAW_UNIT" \
   --game-camera-yaw-sign "$MEASURED_CAMERA_YAW_SIGN" \
   --game-camera-yaw-offset "$MEASURED_CAMERA_YAW_OFFSET_DEG" \
   --game-max-speed 0.30 \

@@ -148,27 +148,29 @@ Legacy/Zen 精确 round trip。移动机器人 orbit、墙面/地面碰撞恢复
 
 真正影响可见 UE 相机的是启动时注入的 `SDL_MOUSE_RELATIVE_SPEED_SCALE`。例如目前使用
 的 Remote 0.4x 是 SDL/UE 原生输入倍率，不是 X 指针加速度。`x11-mirror` 的默认基值
-为 0.12 度/像素时，状态里会显示 `0.12 x 0.4 = 0.048 度/像素`；这个 0.048 只是在
-轮询到的 X11 根窗口像素上做出的名义算术增益，不是实测 UE 相机灵敏度，也不能证明
-镜像方向与可见画面已经一致。仍须完成下文的四方向、多轮往返黑盒验收。缺失或损坏的
+为 0.12 度/XI2 raw unit 时，状态里会显示 `0.12 x 0.4 = 0.048 度/raw`。镜像现在订阅
+SDL 相对鼠标模式通常使用的 `XI_RawMotion`，launcher 也请求 SDL raw 模式；但 packaged
+UE 是否等量消费这些增量尚未由 live 黑盒验证。它仍不是最终渲染相机 yaw 的回读，
+也不能证明镜像方向与可见画面已经一致。仍须完成下文的四方向、多轮往返黑盒验收。缺失或损坏的
 设置文件，以及手工写入非预设档位的配置，都会安全回退到 Local 1.0x。有效的 Remote
 启动会把同一个所选倍率同时交给可见 SDL/UE 输入路径和 `x11-mirror` 的名义增益。
 
-启动器同时固定使用 SDL raw relative motion，禁用 warp、窗口缩放和 SDL 系统指针
+启动器同时请求并配置 SDL raw relative motion，禁用 warp、窗口缩放和 SDL 系统指针
 缩放，通过 UE Input 配置关闭 `bEnableMouseSmoothing` 与 FOV 灵敏度缩放，在机器人
 居中视角中关闭 SpringArm lag，并加入 `r.MotionBlurQuality 0`。前几项消除输入插值，
 最后一项消除画面运动模糊造成的视觉拖尾；它们都不会改变所选倍率。
 
 当启动组合为 SONIC + `game` 且当前已应用 `Remote` 时，`run_sim.sh` 还会先记录当前
 X display 的 acceleration/threshold，在 UE 启动前临时执行 `xset m 1/1 0`，清理时再
-精确恢复原值。这只把设置页与 `x11-mirror` 使用的 X11 绝对指针流线性化，不替代 SDL
-raw-relative 路径，也不修改 MouseLock。没有 `DISPLAY`、找不到 `xset` 或 X server
+精确恢复原值。这只把设置页使用的 X11 绝对指针流线性化；yaw 镜像已经改用 XI2 raw
+motion，也不修改 MouseLock。没有 `DISPLAY`、找不到 `xset` 或 X server
 调用失败都只会告警，不阻止启动。指针参数在 Matrix 运行期间对该 X display 全局生效；
 正常退出和可处理信号会恢复，但 `SIGKILL` 或主机宕机无法执行 cleanup，此时需按日志
 记录手动执行 `xset m <原 acceleration> <原 threshold>`，或重启桌面会话。
 
 远程桌面若仍产生指针回中、窗口边缘或绝对坐标跳变，应先用十字和外部 MouseLock
-完成回中标定；速度倍率不会把这类跳变伪装成正常输入。
+完成可见会话的回中标定；已经实测的当前 MouseLock `pyautogui.moveTo`/XTEST absolute
+recenter 不会累计成 XI2 raw yaw。其他合成 relative recenter 不在这一结论范围内。
 
 ### 手柄当前状态
 
@@ -220,7 +222,7 @@ overlay v3 明确会在按 V 时继续保持可见画面居中。
 | 来源 | 用途 | 限制 |
 |---|---|---|
 | `fixed` | 安全验证方向键和 deadman | 可见相机旋转后，控制坐标系不会跟随 |
-| `x11-mirror` | 河源上的标定候选 | 只积分轮询到的鼠标位移；同一个 20 ms 采样区间内的按下/松开顺序无法区分，也不读取或驱动真实 UE 相机。光标 warp、窗口边缘和自动回正都可能造成漂移 |
+| `x11-mirror` | 河源上的标定候选 | 只在配置的 raw button 按下区间积分有序 XI2 raw motion；absolute warp 不会抵消拖动。它仍不读取或驱动最终 UE 相机，UE 自动回正仍可能造成分叉 |
 | `carla` | 可写且可回读的 spectator 候选 | 右摇杆写 yaw/pitch 旋转后立即回读；写入/yaw 回读失败直接停机。Matrix 0.1.2 cooked 包实际未发现 CARLA server，且没有可见相机耦合证明 |
 
 默认使用 `fixed`，避免未经验证的相机估计悄悄把机器人带向错误方向。只有在河源标定

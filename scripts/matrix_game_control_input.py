@@ -562,8 +562,11 @@ def effective_input_source(requested: str, camera_yaw_source: str) -> str:
     """Gate gamepad locomotion on an observed camera direction.
 
     With ``fixed`` or ``x11-mirror`` the adapter cannot observe any native UE
-    right-stick camera response.  Auto therefore degrades to keyboard-only,
-    while an explicit gamepad request fails instead of silently diverging.
+    right-stick camera response.  The XI2 mirror observes raw motion from an
+    input layer commonly used by SDL, but packaged-UE consumption has not been
+    verified and this is not a final rendered-camera readback.  Auto therefore
+    degrades to keyboard-only, while an explicit gamepad request fails instead
+    of silently diverging.
     """
     if requested not in {"auto", "keyboard", "gamepad"}:
         raise ValueError(f"unsupported input source: {requested}")
@@ -600,9 +603,10 @@ def gamepad_input_available(
 class CameraYawTracker:
     """Track a provider-frame yaw from calibrated local pointer motion.
 
-    This is only a mirror of the packaged UI: it is truthful when the same
-    pointer delta is consumed by UE and its sensitivity has been calibrated.
-    It does not itself rotate the visible camera.
+    This is only an input-side mirror of the packaged UI.  XI2 raw motion is a
+    common SDL relative-input source and the launcher requests that mode, but
+    this adapter cannot prove what the packaged UE build consumed.  It does
+    not itself rotate or read back the visible camera.
     """
 
     def __init__(
@@ -848,6 +852,547 @@ class CarlaSpectatorYawReader:
             return None
 
 
+_X11_GENERIC_EVENT = 35
+_XI_ALL_DEVICES = 0
+_XI_ALL_MASTER_DEVICES = 1
+_XI_MASTER_POINTER = 1
+_XI_HIERARCHY_CHANGED = 11
+_XI_RAW_BUTTON_PRESS = 15
+_XI_RAW_BUTTON_RELEASE = 16
+_XI_RAW_MOTION = 17
+_MAX_XI2_EVENTS_PER_POLL = 4096
+
+
+class _XGenericEventCookie(ctypes.Structure):
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("extension", ctypes.c_int),
+        ("evtype", ctypes.c_int),
+        ("cookie", ctypes.c_uint),
+        ("data", ctypes.c_void_p),
+    )
+
+
+class _XEvent(ctypes.Union):
+    # Xlib guarantees that XEvent is 24 longs on every supported ABI.
+    _fields_ = (("type", ctypes.c_int), ("pad", ctypes.c_long * 24))
+
+
+class _XIEventMask(ctypes.Structure):
+    _fields_ = (
+        ("deviceid", ctypes.c_int),
+        ("mask_len", ctypes.c_int),
+        ("mask", ctypes.POINTER(ctypes.c_ubyte)),
+    )
+
+
+class _XIDeviceInfo(ctypes.Structure):
+    # Public XInput2 ABI from XInput2.h.  ``classes`` is opaque here because
+    # master selection only needs the fixed fields which precede it.
+    _fields_ = (
+        ("deviceid", ctypes.c_int),
+        ("name", ctypes.c_char_p),
+        ("use", ctypes.c_int),
+        ("attachment", ctypes.c_int),
+        ("enabled", ctypes.c_int),
+        ("num_classes", ctypes.c_int),
+        ("classes", ctypes.c_void_p),
+    )
+
+
+class _XIValuatorState(ctypes.Structure):
+    _fields_ = (
+        ("mask_len", ctypes.c_int),
+        ("mask", ctypes.POINTER(ctypes.c_ubyte)),
+        ("values", ctypes.POINTER(ctypes.c_double)),
+    )
+
+
+class _XIRawEvent(ctypes.Structure):
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("extension", ctypes.c_int),
+        ("evtype", ctypes.c_int),
+        ("time", ctypes.c_ulong),
+        ("deviceid", ctypes.c_int),
+        ("sourceid", ctypes.c_int),
+        ("detail", ctypes.c_int),
+        ("flags", ctypes.c_int),
+        ("valuators", _XIValuatorState),
+        ("raw_values", ctypes.POINTER(ctypes.c_double)),
+    )
+
+
+@dataclass(frozen=True)
+class XInput2RawEvent:
+    evtype: int
+    deviceid: int = 0
+    sourceid: int = 0
+    detail: int = 0
+    dx: float = 0.0
+    dy: float = 0.0
+
+
+def decode_xinput2_xy(mask: bytes, values: tuple[float, ...]) -> tuple[float, float]:
+    """Decode XInput2's packed valuators, retaining only raw X/Y axes."""
+
+    if not isinstance(mask, bytes) or not mask:
+        raise RuntimeError("XI2 raw motion has an invalid valuator mask")
+    expected_values = sum(byte.bit_count() for byte in mask)
+    if expected_values != len(values):
+        raise RuntimeError("XI2 raw motion valuator mask/value count differs")
+    x = 0.0
+    y = 0.0
+    packed_index = 0
+    for axis in range(len(mask) * 8):
+        if not mask[axis >> 3] & (1 << (axis & 7)):
+            continue
+        value = float(values[packed_index])
+        packed_index += 1
+        if not math.isfinite(value):
+            raise RuntimeError("XI2 raw motion contains a non-finite valuator")
+        if axis == 0:
+            x = value
+        elif axis == 1:
+            y = value
+    return (x, y)
+
+
+class XInput2DragAccumulator:
+    """Attribute raw motion to one fresh, same-source look-button hold."""
+
+    def __init__(self, look_button_detail: int) -> None:
+        if look_button_detail not in {1, 2, 3}:
+            raise ValueError("XI2 look button detail must be 1, 2, or 3")
+        self._look_button_detail = look_button_detail
+        self._pressed_sourceid: int | None = None
+        self._requires_release = True
+        self.button_state_resyncs = 0
+
+    def disarm(self) -> None:
+        """Require a core-button release and a subsequent fresh raw press."""
+
+        self._pressed_sourceid = None
+        self._requires_release = True
+
+    def update(
+        self,
+        events: tuple[XInput2RawEvent, ...],
+        *,
+        current_look_pressed: bool,
+    ) -> tuple[float, float, bool]:
+        if type(current_look_pressed) is not bool:
+            raise ValueError("current XI2 look-button state must be boolean")
+        if self._requires_release:
+            # Startup, focus loss, and topology changes all lose a trustworthy
+            # per-source button boundary.  Never infer one from the master
+            # pointer mask.  A captured raw press is a fresh boundary; without
+            # one, first observe the combined core button released.
+            fresh_press_index = next(
+                (
+                    index
+                    for index, event in enumerate(events)
+                    if event.evtype == _XI_RAW_BUTTON_PRESS
+                    and event.detail == self._look_button_detail
+                ),
+                None,
+            )
+            if fresh_press_index is None:
+                if not current_look_pressed:
+                    self._requires_release = False
+                return (0.0, 0.0, False)
+            self._requires_release = False
+            events = events[fresh_press_index:]
+
+        dx = 0.0
+        dy = 0.0
+        drag_observed = self._pressed_sourceid is not None
+        for event in events:
+            if not isinstance(event, XInput2RawEvent):
+                raise TypeError("XI2 event must be XInput2RawEvent")
+            if event.evtype in {
+                _XI_RAW_BUTTON_PRESS,
+                _XI_RAW_BUTTON_RELEASE,
+                _XI_RAW_MOTION,
+            } and (event.deviceid <= 0 or event.sourceid <= 0):
+                raise RuntimeError("XI2 raw event has an invalid device identity")
+            if (
+                event.evtype == _XI_RAW_BUTTON_PRESS
+                and event.detail == self._look_button_detail
+            ):
+                if self._pressed_sourceid not in {None, event.sourceid}:
+                    raise RuntimeError("XI2 look button crossed input sources")
+                self._pressed_sourceid = event.sourceid
+                drag_observed = True
+            elif (
+                event.evtype == _XI_RAW_BUTTON_RELEASE
+                and event.detail == self._look_button_detail
+            ):
+                if self._pressed_sourceid not in {None, event.sourceid}:
+                    raise RuntimeError("XI2 look-button release crossed input sources")
+                if self._pressed_sourceid == event.sourceid:
+                    self._pressed_sourceid = None
+            elif event.evtype == _XI_RAW_MOTION and self._pressed_sourceid is not None:
+                if event.sourceid != self._pressed_sourceid:
+                    raise RuntimeError("XI2 drag motion crossed input sources")
+                if not math.isfinite(event.dx) or not math.isfinite(event.dy):
+                    raise RuntimeError("XI2 raw motion contains a non-finite delta")
+                dx += event.dx
+                dy += event.dy
+
+        if (self._pressed_sourceid is not None) != current_look_pressed:
+            self.button_state_resyncs += 1
+            self.disarm()
+            return (0.0, 0.0, True)
+        return (dx, dy, drag_observed)
+
+
+class XInput2RawMotion:
+    """Mirror XI_RawMotion commonly used by SDL relative mouse mode.
+
+    This is an input-side observation, not a readback of the final rendered
+    UE camera.  To avoid attributing one operator's movement to another
+    master pointer, capture is supported only while the X server exposes
+    exactly one master pointer.
+    """
+
+    _BUTTON_DETAIL = {"left": 1, "middle": 2, "right": 3}
+
+    def __init__(
+        self,
+        *,
+        display_name: str | None,
+        look_button: str,
+        x11_library: Any | None = None,
+        xi_library: Any | None = None,
+    ) -> None:
+        self._display: Any | None = None
+        if look_button not in self._BUTTON_DETAIL:
+            raise ValueError(f"unsupported XI2 look button: {look_button}")
+        if x11_library is None:
+            x11_name = ctypes.util.find_library("X11")
+            if not x11_name:
+                raise RuntimeError("libX11 was not found for XI2 raw motion")
+            x11_library = ctypes.CDLL(x11_name)
+        if xi_library is None:
+            xi_name = ctypes.util.find_library("Xi")
+            if not xi_name:
+                raise RuntimeError("libXi was not found for XI2 raw motion")
+            xi_library = ctypes.CDLL(xi_name)
+        self._x11 = x11_library
+        self._xi = xi_library
+        self._configure_signatures()
+        encoded_display = display_name.encode() if display_name else None
+        self._display = self._x11.XOpenDisplay(encoded_display)
+        if not self._display:
+            label = display_name or os.environ.get("DISPLAY", "<unset>")
+            raise RuntimeError(f"cannot open XI2 raw-motion display {label}")
+        try:
+            opcode = ctypes.c_int()
+            first_event = ctypes.c_int()
+            first_error = ctypes.c_int()
+            if not self._x11.XQueryExtension(
+                self._display,
+                b"XInputExtension",
+                ctypes.byref(opcode),
+                ctypes.byref(first_event),
+                ctypes.byref(first_error),
+            ):
+                raise RuntimeError("XInputExtension is unavailable")
+            major = ctypes.c_int(2)
+            minor = ctypes.c_int(0)
+            if self._xi.XIQueryVersion(
+                self._display, ctypes.byref(major), ctypes.byref(minor)
+            ) != 0 or (major.value, minor.value) < (2, 0):
+                raise RuntimeError("XInput2 2.0 or newer is required")
+            self._extension_opcode = opcode.value
+            self._negotiated_version = (major.value, minor.value)
+            self._root = int(self._x11.XDefaultRootWindow(self._display))
+            self._raw_mask_buffer = self._mask_buffer(
+                _XI_RAW_BUTTON_PRESS,
+                _XI_RAW_BUTTON_RELEASE,
+                _XI_RAW_MOTION,
+            )
+            self._hierarchy_mask_buffer = self._mask_buffer(
+                _XI_HIERARCHY_CHANGED
+            )
+            self._master_deviceid = self._single_master_pointer_deviceid()
+            self._subscribe_raw_masters()
+            self._subscribe_hierarchy()
+            self._x11.XFlush(self._display)
+        except Exception:
+            self.close()
+            raise
+        self._accumulator = XInput2DragAccumulator(
+            self._BUTTON_DETAIL[look_button]
+        )
+        self.events_consumed = 0
+        self.raw_motion_events = 0
+        self.hierarchy_events = 0
+        self.foreign_master_events = 0
+        self.master_device_changes = 0
+
+    @staticmethod
+    def _mask_buffer(*event_types: int) -> Any:
+        mask_length = (max(event_types) >> 3) + 1
+        buffer = (ctypes.c_ubyte * mask_length)()
+        for event_type in event_types:
+            buffer[event_type >> 3] |= 1 << (event_type & 7)
+        return buffer
+
+    def _select_mask(self, *, deviceid: int, buffer: Any) -> None:
+        mask = _XIEventMask(
+            deviceid=deviceid,
+            mask_len=len(buffer),
+            mask=ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)),
+        )
+        if self._xi.XISelectEvents(
+            self._display, self._root, ctypes.byref(mask), 1
+        ) != 0:
+            raise RuntimeError("XISelectEvents rejected raw-motion subscription")
+
+    def _single_master_pointer_deviceid(self) -> int:
+        count = ctypes.c_int()
+        devices = self._xi.XIQueryDevice(
+            self._display,
+            _XI_ALL_MASTER_DEVICES,
+            ctypes.byref(count),
+        )
+        try:
+            if count.value < 0 or count.value > 256:
+                raise RuntimeError("XIQueryDevice returned an invalid device count")
+            if count.value and not devices:
+                raise RuntimeError("XIQueryDevice omitted its device array")
+            masters = tuple(
+                devices[index]
+                for index in range(count.value)
+                if int(devices[index].use) == _XI_MASTER_POINTER
+            )
+            if len(masters) != 1:
+                raise RuntimeError(
+                    "XI2 raw capture requires exactly one master pointer"
+                )
+            master = masters[0]
+            if int(master.deviceid) <= 1 or not bool(master.enabled):
+                raise RuntimeError(
+                    "XI2 raw capture requires one enabled master pointer"
+                )
+            return int(master.deviceid)
+        finally:
+            if devices:
+                self._xi.XIFreeDeviceInfo(devices)
+
+    def _subscribe_raw_masters(self) -> None:
+        self._select_mask(
+            deviceid=_XI_ALL_MASTER_DEVICES,
+            buffer=self._raw_mask_buffer,
+        )
+
+    def _subscribe_hierarchy(self) -> None:
+        self._select_mask(
+            deviceid=_XI_ALL_DEVICES,
+            buffer=self._hierarchy_mask_buffer,
+        )
+
+    def _configure_signatures(self) -> None:
+        signatures = {
+            "XOpenDisplay": ([ctypes.c_char_p], ctypes.c_void_p),
+            "XDefaultRootWindow": ([ctypes.c_void_p], ctypes.c_ulong),
+            "XQueryExtension": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                ],
+                ctypes.c_int,
+            ),
+            "XPending": ([ctypes.c_void_p], ctypes.c_int),
+            "XNextEvent": (
+                [ctypes.c_void_p, ctypes.POINTER(_XEvent)],
+                ctypes.c_int,
+            ),
+            "XGetEventData": (
+                [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)],
+                ctypes.c_int,
+            ),
+            "XFreeEventData": (
+                [ctypes.c_void_p, ctypes.POINTER(_XGenericEventCookie)],
+                None,
+            ),
+            "XFlush": ([ctypes.c_void_p], ctypes.c_int),
+            "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
+        }
+        for name, (argtypes, restype) in signatures.items():
+            function = getattr(self._x11, name)
+            function.argtypes = argtypes
+            function.restype = restype
+        self._xi.XIQueryVersion.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        )
+        self._xi.XIQueryVersion.restype = ctypes.c_int
+        self._xi.XIQueryDevice.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+        )
+        self._xi.XIQueryDevice.restype = ctypes.POINTER(_XIDeviceInfo)
+        self._xi.XIFreeDeviceInfo.argtypes = (
+            ctypes.POINTER(_XIDeviceInfo),
+        )
+        self._xi.XIFreeDeviceInfo.restype = None
+        self._xi.XISelectEvents.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(_XIEventMask),
+            ctypes.c_int,
+        )
+        self._xi.XISelectEvents.restype = ctypes.c_int
+
+    @staticmethod
+    def _motion_event(raw: _XIRawEvent) -> XInput2RawEvent:
+        mask_length = int(raw.valuators.mask_len)
+        if not 1 <= mask_length <= 64 or not raw.valuators.mask:
+            raise RuntimeError("XI2 raw motion has an invalid valuator mask")
+        mask = bytes(raw.valuators.mask[index] for index in range(mask_length))
+        value_count = sum(byte.bit_count() for byte in mask)
+        if value_count and not raw.raw_values:
+            raise RuntimeError("XI2 raw motion omitted packed valuator values")
+        values = tuple(float(raw.raw_values[index]) for index in range(value_count))
+        dx, dy = decode_xinput2_xy(mask, values)
+        return XInput2RawEvent(
+            evtype=_XI_RAW_MOTION,
+            deviceid=int(raw.deviceid),
+            sourceid=int(raw.sourceid),
+            dx=dx,
+            dy=dy,
+        )
+
+    def _read_event(self) -> XInput2RawEvent | None:
+        event = _XEvent()
+        self._x11.XNextEvent(self._display, ctypes.byref(event))
+        cookie = ctypes.cast(
+            ctypes.byref(event), ctypes.POINTER(_XGenericEventCookie)
+        ).contents
+        if (
+            cookie.type != _X11_GENERIC_EVENT
+            or cookie.extension != self._extension_opcode
+            or cookie.evtype
+            not in {
+                _XI_HIERARCHY_CHANGED,
+                _XI_RAW_BUTTON_PRESS,
+                _XI_RAW_BUTTON_RELEASE,
+                _XI_RAW_MOTION,
+            }
+        ):
+            return None
+        if cookie.evtype == _XI_HIERARCHY_CHANGED:
+            return XInput2RawEvent(evtype=_XI_HIERARCHY_CHANGED)
+        if not self._x11.XGetEventData(self._display, ctypes.byref(cookie)):
+            raise RuntimeError("XGetEventData rejected an XI2 raw event")
+        try:
+            if not cookie.data:
+                raise RuntimeError("XI2 raw event omitted cookie data")
+            raw = ctypes.cast(
+                cookie.data, ctypes.POINTER(_XIRawEvent)
+            ).contents
+            if cookie.evtype == _XI_RAW_MOTION:
+                return self._motion_event(raw)
+            return XInput2RawEvent(
+                evtype=cookie.evtype,
+                deviceid=int(raw.deviceid),
+                sourceid=int(raw.sourceid),
+                detail=int(raw.detail),
+            )
+        finally:
+            self._x11.XFreeEventData(self._display, ctypes.byref(cookie))
+
+    def poll(
+        self,
+        *,
+        current_look_pressed: bool,
+        focused: bool,
+    ) -> tuple[float, float, bool]:
+        if type(focused) is not bool:
+            raise ValueError("XI2 focus state must be boolean")
+        topology_changed = False
+        events: list[XInput2RawEvent] = []
+        processed_this_poll = 0
+        while self._x11.XPending(self._display):
+            if processed_this_poll >= _MAX_XI2_EVENTS_PER_POLL:
+                raise RuntimeError("XI2 raw-motion backlog exceeded the safe limit")
+            event = self._read_event()
+            processed_this_poll += 1
+            self.events_consumed += 1
+            if event is not None:
+                events.append(event)
+                if event.evtype == _XI_RAW_MOTION:
+                    self.raw_motion_events += 1
+                elif event.evtype == _XI_HIERARCHY_CHANGED:
+                    self.hierarchy_events += 1
+        hierarchy_changed = any(
+            event.evtype == _XI_HIERARCHY_CHANGED for event in events
+        )
+        if hierarchy_changed:
+            observed_master = self._single_master_pointer_deviceid()
+            if observed_master != self._master_deviceid:
+                self.master_device_changes += 1
+                self._master_deviceid = observed_master
+                topology_changed = True
+        foreign_master_event_count = sum(
+            event.evtype
+            in {_XI_RAW_BUTTON_PRESS, _XI_RAW_BUTTON_RELEASE, _XI_RAW_MOTION}
+            and event.deviceid != self._master_deviceid
+            for event in events
+        )
+        foreign_master = foreign_master_event_count > 0
+        if foreign_master:
+            self.foreign_master_events += foreign_master_event_count
+        if topology_changed or hierarchy_changed or foreign_master or not focused:
+            # Topology/focus boundaries make per-source button attribution
+            # ambiguous.  Drop the complete batch and require release followed
+            # by a new raw press before any yaw delta can be accepted.
+            self._accumulator.disarm()
+            return (
+                0.0,
+                0.0,
+                bool(topology_changed or hierarchy_changed or foreign_master),
+            )
+        return self._accumulator.update(
+            tuple(events), current_look_pressed=current_look_pressed
+        )
+
+    @property
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "motion_source": "xi2-raw",
+            "negotiated_version": list(self._negotiated_version),
+            "events_consumed": self.events_consumed,
+            "raw_motion_events": self.raw_motion_events,
+            "hierarchy_events": self.hierarchy_events,
+            "master_deviceid": self._master_deviceid,
+            "master_pointer_policy": "exactly-one",
+            "master_device_changes": self.master_device_changes,
+            "foreign_master_events": self.foreign_master_events,
+            "button_state_resyncs": self._accumulator.button_state_resyncs,
+            "maximum_events_per_poll": _MAX_XI2_EVENTS_PER_POLL,
+        }
+
+    def close(self) -> None:
+        if self._display:
+            self._x11.XCloseDisplay(self._display)
+            self._display = None
+
+
 class X11KeyboardMouse:
     """Poll global keyboard/pointer state without grabbing it from Matrix UE."""
 
@@ -879,8 +1424,10 @@ class X11KeyboardMouse:
         focus_title_pattern: str | None,
         expected_ue_pid: int | None,
         look_button: str,
+        capture_raw_motion: bool = False,
         maximum_mouse_delta: float = 200.0,
         library: Any | None = None,
+        xi_library: Any | None = None,
     ) -> None:
         if library is None:
             library_name = ctypes.util.find_library("X11")
@@ -920,16 +1467,32 @@ class X11KeyboardMouse:
         self._maximum_mouse_delta = maximum_mouse_delta
         self._teleport_rejections = 0
         self._last_teleport_delta: tuple[int, int] | None = None
+        self._raw_motion: XInput2RawMotion | None = None
+        if capture_raw_motion:
+            try:
+                self._raw_motion = XInput2RawMotion(
+                    display_name=display_name,
+                    look_button=look_button,
+                    x11_library=self._x11,
+                    xi_library=xi_library,
+                )
+            except Exception:
+                self.close()
+                raise
 
     @property
     def pointer_telemetry(self) -> dict[str, object]:
-        return {
+        telemetry = {
             "teleport_rejections": self._teleport_rejections,
             "last_teleport_delta": list(self._last_teleport_delta)
             if self._last_teleport_delta is not None
             else None,
             "maximum_mouse_delta_px": self._maximum_mouse_delta,
         }
+        raw_motion = getattr(self, "_raw_motion", None)
+        if raw_motion is not None:
+            telemetry.update(raw_motion.telemetry)
+        return telemetry
 
     def _configure_signatures(self) -> None:
         signatures = {
@@ -1119,33 +1682,6 @@ class X11KeyboardMouse:
         )
         pointer = (root_x.value, root_y.value) if pointer_ok else None
         look_pressed = bool(pointer_ok and mask.value & self._look_mask)
-        mouse_dx = 0.0
-        mouse_dy = 0.0
-        # Attribute the interval to the state at its beginning.  On the release
-        # sample, movement since the preceding held sample was still consumed
-        # by UE before the button-up event and must not disappear from the yaw
-        # mirror. The first press remains a fresh baseline because pre-press
-        # pointer motion cannot be separated from drag motion by polling alone.
-        if self._previous_look_pressed and pointer is not None:
-            if self._previous_pointer is not None:
-                raw_dx = pointer[0] - self._previous_pointer[0]
-                raw_dy = pointer[1] - self._previous_pointer[1]
-                # Relative-mode UE windows commonly warp the server cursor to
-                # their centre.  Absolute-coordinate remote desktops can then
-                # reassert the client position, producing a teleport loop.
-                # Saturating that jump (the old behaviour) still injected as
-                # much as 200 px into the mirrored camera yaw.  Reject the
-                # whole discontinuity and use the new position as the next
-                # baseline instead; ordinary in-range motion is unchanged.
-                if max(abs(raw_dx), abs(raw_dy)) > self._maximum_mouse_delta:
-                    self._teleport_rejections += 1
-                    self._last_teleport_delta = (raw_dx, raw_dy)
-                else:
-                    mouse_dx = float(raw_dx)
-                    mouse_dy = float(raw_dy)
-        self._previous_pointer = pointer
-        self._previous_look_pressed = look_pressed
-
         has_application_focus, focus_title, focus_pids = self._focus_identity()
         focus_pid = (
             self._expected_ue_pid
@@ -1161,6 +1697,36 @@ class X11KeyboardMouse:
             )
         if self._expected_ue_pid is not None:
             focused = bool(focused and self._expected_ue_pid in focus_pids)
+
+        mouse_dx = 0.0
+        mouse_dy = 0.0
+        raw_drag_observed = False
+        raw_motion = getattr(self, "_raw_motion", None)
+        if raw_motion is not None:
+            # XI_RawMotion is commonly used by SDL relative mode, which the
+            # launcher requests.  Mirror it so the current MouseLock's
+            # absolute pyautogui/XTEST recenter cannot cancel the outward raw
+            # drag inside one 50 Hz XQueryPointer interval.  Packaged-UE
+            # consumption remains a separate live black-box qualification.
+            mouse_dx, mouse_dy, raw_drag_observed = raw_motion.poll(
+                current_look_pressed=look_pressed,
+                focused=focused,
+            )
+        # Legacy absolute polling remains available to fixed/CARLA modes, where
+        # its deltas never become a locomotion yaw source.
+        elif self._previous_look_pressed and pointer is not None:
+            if self._previous_pointer is not None:
+                raw_dx = pointer[0] - self._previous_pointer[0]
+                raw_dy = pointer[1] - self._previous_pointer[1]
+                if max(abs(raw_dx), abs(raw_dy)) > self._maximum_mouse_delta:
+                    self._teleport_rejections += 1
+                    self._last_teleport_delta = (raw_dx, raw_dy)
+                else:
+                    mouse_dx = float(raw_dx)
+                    mouse_dy = float(raw_dy)
+        self._previous_pointer = pointer
+        self._previous_look_pressed = look_pressed
+
         if not focused:
             mouse_dx = 0.0
             mouse_dy = 0.0
@@ -1184,13 +1750,17 @@ class X11KeyboardMouse:
             apply_return=pressed.get("apply_return", False),
             mouse_dx=mouse_dx,
             mouse_dy=mouse_dy,
-            camera_dragging=look_pressed and focused,
+            camera_dragging=focused and (look_pressed or raw_drag_observed),
             focused=focused,
             focus_title=focus_title,
             focus_pid=focus_pid,
         )
 
     def close(self) -> None:
+        raw_motion = getattr(self, "_raw_motion", None)
+        if raw_motion is not None:
+            raw_motion.close()
+            self._raw_motion = None
         if getattr(self, "_display", None):
             self._x11.XCloseDisplay(self._display)
             self._display = None
@@ -1675,7 +2245,8 @@ def _parse_args() -> argparse.Namespace:
         default="fixed",
         help=(
             "fixed is safe until runtime probing succeeds; x11-mirror requires "
-            "measured UE mouse sensitivity and does not drive the visible camera"
+            "XI2 raw motion plus measured UE sensitivity and does not read back "
+            "or drive the visible camera"
         ),
     )
     parser.add_argument(
@@ -1860,6 +2431,7 @@ def main() -> int:
             focus_title_pattern=focus_pattern,
             expected_ue_pid=args.expected_ue_pid,
             look_button=args.look_button,
+            capture_raw_motion=args.camera_yaw_source == "x11-mirror",
         )
     except (OSError, RuntimeError, re.error) as exc:
         raise SystemExit(f"Matrix game-control input cannot initialize X11: {exc}") from exc
@@ -1941,6 +2513,13 @@ def main() -> int:
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "mirror_sensitivity": {
+                        "units": "degrees_per_xi2_raw_unit",
+                        "base_deg_per_raw_unit": args.mouse_sensitivity_deg,
+                        "effective_deg_per_raw_unit": (
+                            args.mouse_sensitivity_deg
+                            * applied_mouse.effective_scale
+                        ),
+                        # Compatibility aliases for older overlay consumers.
                         "base_deg_per_px": args.mouse_sensitivity_deg,
                         "effective_deg_per_px": (
                             args.mouse_sensitivity_deg
@@ -2063,6 +2642,13 @@ def main() -> int:
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
                             "mirror_sensitivity": {
+                                "units": "degrees_per_xi2_raw_unit",
+                                "base_deg_per_raw_unit": args.mouse_sensitivity_deg,
+                                "effective_deg_per_raw_unit": (
+                                    args.mouse_sensitivity_deg
+                                    * applied_mouse.effective_scale
+                                ),
+                                # Compatibility aliases for older overlays.
                                 "base_deg_per_px": args.mouse_sensitivity_deg,
                                 "effective_deg_per_px": (
                                     args.mouse_sensitivity_deg
@@ -2169,6 +2755,13 @@ def main() -> int:
                 "camera_yaw_source": args.camera_yaw_source,
                 "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                 "mirror_sensitivity": {
+                    "units": "degrees_per_xi2_raw_unit",
+                    "base_deg_per_raw_unit": args.mouse_sensitivity_deg,
+                    "effective_deg_per_raw_unit": (
+                        args.mouse_sensitivity_deg
+                        * applied_mouse.effective_scale
+                    ),
+                    # Compatibility aliases for older status readers.
                     "base_deg_per_px": args.mouse_sensitivity_deg,
                     "effective_deg_per_px": (
                         args.mouse_sensitivity_deg
