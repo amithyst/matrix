@@ -435,6 +435,42 @@ class ProbeTest(unittest.TestCase):
         now[0] += 10_000_000_000
         self.assertTrue(paused.sample(4242).valid)
 
+    def test_stable_world_transition_requires_a_fresh_timestamp_advance(self) -> None:
+        memory = populated_memory()
+        probe, _memory, _identity = self.make_probe(memory)
+        self.assertEqual(
+            probe.sample(4242).error_code,
+            MODULE.ProbeError.CACHE_TIMESTAMP_NOT_READY,
+        )
+        memory.put(0x7080, camera_cache(timestamp=13.0))
+        self.assertTrue(probe.sample(4242).valid)
+
+        # Simulate the packaged startup world handing off to the requested
+        # map.  Every pointer in the new chain is stable across the sample, but
+        # its independent CameraCache timestamp starts from a lower value.
+        memory.put_pointer(0x1000, 0x2200)
+        memory.put_pointer(0x2210, 0x3200)
+        memory.put(0x3220, struct.pack("<Qii", 0x4200, 1, 2))
+        memory.put_pointer(0x4200, 0x5200)
+        memory.put_pointer(0x5230, 0x6200)
+        memory.put_pointer(0x6240, 0x7200)
+        memory.put(0x7280, camera_cache(timestamp=1.0))
+
+        first_new_world = probe.sample(4242)
+        self.assertEqual(
+            first_new_world.error_code,
+            MODULE.ProbeError.CACHE_TIMESTAMP_NOT_READY,
+        )
+        memory.put(0x7280, camera_cache(timestamp=1.25))
+        self.assertTrue(probe.sample(4242).valid)
+
+        # A regression within that same stable chain remains fail-closed.
+        memory.put(0x7280, camera_cache(timestamp=0.5))
+        self.assertEqual(
+            probe.sample(4242).error_code,
+            MODULE.ProbeError.CACHE_TIMESTAMP_REGRESSION,
+        )
+
     def test_short_custom_reader_is_a_memory_error(self) -> None:
         memory = populated_memory()
         memory.override(0x1000, 8, 1, b"short")

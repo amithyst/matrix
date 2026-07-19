@@ -769,14 +769,17 @@ class UECameraProbe:
         self.cache_startup_grace_ns = cache_startup_grace_ns
         self.cache_timestamp_epsilon_s = cache_timestamp_epsilon_s
         self._cache_progress: dict[int, _CacheProgress] = {}
+        self._cache_chains: dict[int, PointerChain] = {}
 
     def reset_identity(self, pid: int | None = None) -> None:
         if pid is None:
             self._identity_tokens.clear()
             self._cache_progress.clear()
+            self._cache_chains.clear()
         else:
             self._identity_tokens.pop(pid, None)
             self._cache_progress.pop(pid, None)
+            self._cache_chains.pop(pid, None)
 
     def reset_cache_progress(self, pid: int | None = None) -> None:
         """Authorize a known UE world restart or a paused-to-running transition."""
@@ -980,6 +983,21 @@ class UECameraProbe:
                 "UE CameraCachePrivate.Timestamp is still in startup grace",
             )
 
+    def _bind_cache_chain(self, pid: int, chain: PointerChain) -> None:
+        """Start a fresh timestamp proof after a stable UE world transition.
+
+        Packaged UE can expose a short-lived startup world before opening the
+        requested map.  A different, thrice-consistent object chain is an
+        observable lifetime boundary, not a timestamp regression in the old
+        CameraCache.  The new chain still starts fail-closed and must prove at
+        least one timestamp advance before any state becomes valid.
+        """
+
+        previous = self._cache_chains.get(pid)
+        if previous != chain:
+            self._cache_progress.pop(pid, None)
+            self._cache_chains[pid] = chain
+
     def sample(self, ue_pid: int) -> CameraProbeObservation:
         now = self._monotonic_ns()
         if isinstance(ue_pid, bool) or not isinstance(ue_pid, int) or ue_pid <= 0:
@@ -1014,6 +1032,7 @@ class UECameraProbe:
                 )
             timestamp, pitch, yaw, roll, x, y, z = self._decode_cache(second_cache)
             accepted_ns = self._monotonic_ns()
+            self._bind_cache_chain(ue_pid, third_chain)
             self._check_cache_progress(ue_pid, timestamp, accepted_ns)
             return CameraProbeObservation(
                 ue_pid=ue_pid,
