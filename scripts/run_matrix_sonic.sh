@@ -119,8 +119,8 @@ usage() {
         "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
         "  --game-max-speed MPS       Analog SLOW_WALK cap (default 0.30; max 0.80)" \
         "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
-        "  --game-fall-recovery MODE  auto, off, sonic, or sonic-respawn (auto uses the respawn fallback for games)" \
-        "  --game-fall-recovery-timeout SEC  Time before native recovery is timed out or respawned" \
+        "  --game-fall-recovery MODE  auto, off, or sonic (auto enables SONIC recovery for unbounded game runs)" \
+        "  --game-fall-recovery-timeout SEC  Mark recovery timed out after SEC while continuing IDLE" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -288,18 +288,18 @@ case "$GAME_FALL_RECOVERY" in
     auto)
         if [[ "$CONTROL_SOURCE" == "game" \
             && "$QUALIFICATION_REQUESTED" == "0" ]]; then
-            GAME_FALL_RECOVERY="sonic-respawn"
+            GAME_FALL_RECOVERY="sonic"
         else
             GAME_FALL_RECOVERY="off"
         fi
         ;;
-    off|sonic|sonic-respawn) ;;
+    off|sonic) ;;
     *)
-        echo "[ERROR] --game-fall-recovery must be auto, off, sonic, or sonic-respawn" >&2
+        echo "[ERROR] --game-fall-recovery must be auto, off, or sonic" >&2
         exit 2
         ;;
 esac
-if [[ "$GAME_FALL_RECOVERY" != "off" ]]; then
+if [[ "$GAME_FALL_RECOVERY" == "sonic" ]]; then
     if [[ "$CONTROL_SOURCE" != "game" ]]; then
         echo "[ERROR] SONIC fall recovery requires --control-source game" >&2
         exit 2
@@ -654,7 +654,7 @@ export MATRIX_SONIC_QUALIFICATION_PROFILE
 export MATRIX_SONIC_RUNTIME_LOCK_SHA256
 export MATRIX_SONIC_MATRIX_COMMIT
 export MATRIX_SONIC_VERIFICATION_RECEIPT
-if [[ "$GAME_FALL_RECOVERY" != "off" ]]; then
+if [[ "$GAME_FALL_RECOVERY" == "sonic" ]]; then
     export MATRIX_SONIC_FAIL_ON_FALL=0
 else
     export MATRIX_SONIC_FAIL_ON_FALL=1

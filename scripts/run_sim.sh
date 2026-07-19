@@ -1247,22 +1247,22 @@ if $MATRIX_SONIC_ENABLED; then
     esac
     case "${MATRIX_GAME_FALL_RECOVERY:-off}" in
         off|"") ;;
-        sonic|sonic-respawn)
+        sonic)
             if [[ "$SONIC_FAIL_ON_FALL_ENABLED" == "1" ]]; then
-                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=${MATRIX_GAME_FALL_RECOVERY} conflicts with MATRIX_SONIC_FAIL_ON_FALL" >&2
+                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=sonic conflicts with MATRIX_SONIC_FAIL_ON_FALL" >&2
                 exit 1
             fi
             if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
-                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=${MATRIX_GAME_FALL_RECOVERY} requires game control" >&2
+                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=sonic requires game control" >&2
                 exit 1
             fi
             SONIC_ACCEPTANCE_ARGS+=(
-                --game-fall-recovery "${MATRIX_GAME_FALL_RECOVERY}"
+                --game-fall-recovery sonic
                 --game-fall-recovery-timeout "${MATRIX_GAME_FALL_RECOVERY_TIMEOUT:-15.0}"
             )
             ;;
         *)
-            echo "[ERROR] MATRIX_GAME_FALL_RECOVERY must be off, sonic, or sonic-respawn" >&2
+            echo "[ERROR] MATRIX_GAME_FALL_RECOVERY must be off or sonic" >&2
             exit 1
             ;;
     esac
