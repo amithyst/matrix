@@ -71,10 +71,10 @@ feature branch 推送后先做一次 worktree 准备。Git worktree 不会自动
 里被忽略的 UE 安装包、`.venv-audit` 和 `.matrix/local.env`，因此必须 bootstrap：
 
 ```bash
-git -C /home/kaijie/matrix fetch origin feature/camera-relative-game-control
+git -C /home/kaijie/matrix fetch origin main
 git -C /home/kaijie/matrix worktree add --detach \
   /home/kaijie/worktrees/matrix-game-control-exp \
-  origin/feature/camera-relative-game-control
+  origin/main
 cd /home/kaijie/worktrees/matrix-game-control-exp
 MATRIX_SONIC_ROOT=/home/kaijie/worktrees/sonic-matrix-native-final \
   bash scripts/bootstrap_matrix_sonic.sh \

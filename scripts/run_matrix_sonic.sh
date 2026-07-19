@@ -105,7 +105,7 @@ usage() {
         "  --game-camera-yaw-source S x11-mirror, carla, or fixed (default: fixed)" \
         "  --game-look-button BUTTON  Camera drag button: left, middle, or right" \
         "  --game-initial-yaw DEG     Initial provider/UE camera yaw before sign and offset" \
-        "  --game-mouse-sensitivity DEG_PER_PX  Calibrated mirror scale (default: 0.12)" \
+        "  --game-mouse-sensitivity DEG_PER_RAW_UNIT  Calibrated XI2 raw mirror scale (default: 0.12)" \
         "  --game-camera-yaw-sign N   Provider-to-SONIC sign: -1 or 1" \
         "  --game-camera-yaw-offset DEG  Provider-to-SONIC zero-frame offset" \
         "  --game-carla-host HOST     Optional fail-closed CARLA spectator host" \

@@ -1299,8 +1299,14 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         ],
         "keyboard_walk_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE],
         "keyboard_run_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE],
-        "maximum_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE],
+        # Preserve the historical status contract: maximum_speed_mps is the
+        # configurable analog SLOW_WALK ceiling.  Keyboard tiers now have a
+        # separate native RUN target and must not silently change that field.
+        "maximum_speed_mps": args.game_max_speed,
         "analog_maximum_speed_mps": args.game_max_speed,
+        "keyboard_maximum_target_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
+            SONIC_RUN_MODE
+        ],
         "maximum_acceleration_mps2": args.game_max_acceleration,
         "maximum_deceleration_mps2": args.game_max_deceleration,
         "maximum_turn_rate_rad_s": args.game_max_turn_rate,

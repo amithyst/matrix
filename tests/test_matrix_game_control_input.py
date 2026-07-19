@@ -1780,7 +1780,13 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         )
         self.assertFalse(snapshot.focused)
 
-        core = CORE.GameControlCore()
+        core = CORE.GameControlCore(
+            CORE.ControlConfig(
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_step_s=1.0,
+            )
+        )
         core.accept_snapshot(
             CORE.InputSnapshot(
                 sequence=1,
@@ -1799,6 +1805,56 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         self.assertTrue(command.safe_stop)
         self.assertEqual(command.reason, "focus_lost")
         self.assertEqual(command.speed_mps, 0.0)
+        self.assertEqual(command.locomotion_mode, CORE.SONIC_IDLE_MODE)
+
+        def focused_snapshot(
+            sequence: int,
+            timestamp: float,
+            *,
+            w: bool = False,
+            ctrl: bool = False,
+            shift: bool = False,
+        ) -> CORE.InputSnapshot:
+            return MODULE.build_snapshot(
+                sequence=sequence,
+                timestamp_monotonic_s=timestamp,
+                keyboard=MODULE.KeyboardMouseSample(
+                    w=w,
+                    ctrl=ctrl,
+                    shift=shift,
+                    focused=True,
+                ),
+                gamepad=MODULE.GamepadSample(),
+                input_source="keyboard",
+                camera_yaw_rad=0.1,
+                camera_available=True,
+            )
+
+        held_w = focused_snapshot(3, 1.02, w=True)
+        core.accept_snapshot(held_w, received_at_s=1.02)
+        still_stopped = core.command(now_s=1.02, dt_s=1.0)
+        self.assertTrue(still_stopped.safe_stop)
+        self.assertEqual(still_stopped.reason, "awaiting_neutral")
+        self.assertEqual(still_stopped.locomotion_mode, CORE.SONIC_IDLE_MODE)
+
+        neutral = focused_snapshot(4, 1.03)
+        core.accept_snapshot(neutral, received_at_s=1.03)
+        neutral_command = core.command(now_s=1.03, dt_s=1.0)
+        self.assertFalse(neutral_command.safe_stop)
+        self.assertEqual(neutral_command.locomotion_mode, CORE.SONIC_IDLE_MODE)
+        for sequence, timestamp, modifiers, expected_mode, expected_speed in (
+            (5, 1.04, {"ctrl": True}, CORE.SONIC_SLOW_WALK_MODE, 0.10),
+            (6, 1.05, {}, CORE.SONIC_WALK_MODE, 0.80),
+            (7, 1.06, {"shift": True}, CORE.SONIC_RUN_MODE, 2.50),
+        ):
+            core.accept_snapshot(
+                focused_snapshot(sequence, timestamp, w=True, **modifiers),
+                received_at_s=timestamp,
+            )
+            resumed = core.command(now_s=timestamp, dt_s=1.0)
+            self.assertFalse(resumed.safe_stop)
+            self.assertEqual(resumed.locomotion_mode, expected_mode)
+            self.assertAlmostEqual(resumed.speed_mps, expected_speed)
 
     def test_completed_raw_click_without_motion_still_interlocks(self) -> None:
         backend = self._raw_backend(

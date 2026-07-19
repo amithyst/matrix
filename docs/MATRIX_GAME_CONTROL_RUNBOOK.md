@@ -87,10 +87,10 @@ required because Git worktrees do not carry ignored UE packages,
 `.venv-audit`, or `.matrix/local.env` from the main checkout:
 
 ```bash
-git -C /home/kaijie/matrix fetch origin feature/camera-relative-game-control
+git -C /home/kaijie/matrix fetch origin main
 git -C /home/kaijie/matrix worktree add --detach \
   /home/kaijie/worktrees/matrix-game-control-exp \
-  origin/feature/camera-relative-game-control
+  origin/main
 cd /home/kaijie/worktrees/matrix-game-control-exp
 MATRIX_SONIC_ROOT=/home/kaijie/worktrees/sonic-matrix-native-final \
   bash scripts/bootstrap_matrix_sonic.sh \
