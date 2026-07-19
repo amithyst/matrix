@@ -615,6 +615,13 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(stopped.facing[0], 1.0)
         self.assertAlmostEqual(stopped.facing[1], 0.0)
 
+        core.synchronize_heading(math.radians(35.0))
+        still_stopped = core.command(now_s=10.01, dt_s=0.01)
+        self.assertTrue(still_stopped.safe_stop)
+        self.assertAlmostEqual(core.heading_rad, 0.0)
+        self.assertAlmostEqual(still_stopped.facing[0], 1.0)
+        self.assertAlmostEqual(still_stopped.facing[1], 0.0)
+
     def test_active_gait_does_not_hold_minimum_speed_in_wrong_heading(self) -> None:
         core = armed_core(
             MODULE.ControlConfig(
@@ -712,6 +719,34 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(stopped.speed_mps, 0.0)
         self.assertAlmostEqual(stopped.facing[0], 1.0)
         self.assertAlmostEqual(stopped.facing[1], 0.0)
+
+        # Planner lookahead can keep the physical body rotating after key-up.
+        # IDLE must retain the one release-frame target instead of chasing that
+        # residual rotation and triggering a fresh native replan every frame.
+        core.synchronize_heading(math.radians(40.0))
+        core.accept_snapshot(
+            snapshot(sequence=3, timestamp=10.02), received_at_s=10.02
+        )
+        held = core.command(now_s=10.02, dt_s=0.02)
+        self.assertEqual(held.mode, "idle")
+        self.assertAlmostEqual(math.atan2(held.facing[1], held.facing[0]), 0.0)
+
+        # A new movement interval clears the stop latch.  Its next release can
+        # capture a new measured heading exactly once.
+        core.accept_snapshot(
+            snapshot(sequence=4, timestamp=10.03, pressed=("w",)),
+            received_at_s=10.03,
+        )
+        core.command(now_s=10.03, dt_s=0.02)
+        core.synchronize_heading(math.radians(25.0))
+        core.accept_snapshot(
+            snapshot(sequence=5, timestamp=10.04), received_at_s=10.04
+        )
+        relatched = core.command(now_s=10.04, dt_s=0.02)
+        self.assertAlmostEqual(
+            math.atan2(relatched.facing[1], relatched.facing[0]),
+            math.radians(25.0),
+        )
 
     def test_slow_walk_never_publishes_below_native_gait_minimum(self) -> None:
         core = armed_core(

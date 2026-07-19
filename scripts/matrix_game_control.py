@@ -507,6 +507,7 @@ class GameControlCore:
         self._turn_sign = 1.0
         self._requires_neutral_rearm = True
         self._invalid_reason: str | None = None
+        self._stopped_heading_latched = False
 
     @property
     def free_camera(self) -> bool:
@@ -540,6 +541,22 @@ class GameControlCore:
         self._gait_active = False
         self._requires_neutral_rearm = True
         self._invalid_reason = reason
+
+    def _latch_stopped_heading(self) -> None:
+        """Hold one physical heading for the complete stopped interval.
+
+        Native SONIC replans IDLE when ``facing`` changes.  Copying measured
+        yaw on every stopped frame therefore turns planner lookahead or
+        residual body rotation into a moving target and continuously approves
+        the drift.  Capture feedback only on entry, then keep that target
+        fixed until fresh movement intent is accepted.
+        """
+
+        if self._stopped_heading_latched:
+            return
+        if self._measured_heading_rad is not None:
+            self._command_heading_rad = self._measured_heading_rad
+        self._stopped_heading_latched = True
 
     def accept_snapshot(
         self, snapshot: InputSnapshot, *, received_at_s: float
@@ -610,8 +627,7 @@ class GameControlCore:
         # it here would let the robot keep turning after focus loss, EOF, or a
         # deadman timeout.  Absorb fresh runtime feedback so a safety stop holds
         # the body's current heading instead of completing a stale turn.
-        if self._measured_heading_rad is not None:
-            self._command_heading_rad = self._measured_heading_rad
+        self._latch_stopped_heading()
         facing = (
             math.cos(self._command_heading_rad),
             math.sin(self._command_heading_rad),
@@ -731,6 +747,7 @@ class GameControlCore:
         requested_locomotion_mode = SONIC_IDLE_MODE
 
         if input_magnitude > 1e-12:
+            self._stopped_heading_latched = False
             world_x, world_y = camera_relative_to_world(
                 right=local_right,
                 forward=local_forward,
@@ -806,8 +823,7 @@ class GameControlCore:
             # measured yaw as well instead of finishing a stale turn target.
             self._speed_mps = 0.0
             self._gait_active = False
-            if self._measured_heading_rad is not None:
-                self._command_heading_rad = self._measured_heading_rad
+            self._latch_stopped_heading()
         else:
             if not digital_movement:
                 # Switching from a keyboard run to an already-deflected stick
