@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import importlib
 import importlib.util
 import json
@@ -218,7 +219,20 @@ class SourceArbitrationTest(unittest.TestCase):
             MODULE.effective_input_source("auto", "x11-mirror"), "keyboard"
         )
         self.assertEqual(
+            MODULE.effective_input_source("auto", "x11-core-gated"), "keyboard"
+        )
+        self.assertEqual(
+            MODULE.effective_input_source("auto", "x11-absolute"), "keyboard"
+        )
+        self.assertEqual(
             MODULE.effective_input_source("gamepad", "carla"), "gamepad"
+        )
+        self.assertEqual(
+            MODULE.effective_input_source("auto", "ue-final-pov"), "auto"
+        )
+        self.assertEqual(
+            MODULE.effective_input_source("gamepad", "ue-final-pov"),
+            "gamepad",
         )
         with self.assertRaisesRegex(ValueError, "observed CARLA"):
             MODULE.effective_input_source("gamepad", "fixed")
@@ -316,6 +330,137 @@ class SnapshotTest(unittest.TestCase):
         )
         self.assertFalse(snapshot.focused)
         self.assertTrue(snapshot.keys.w)
+
+
+class UeFinalPovYawReaderTest(unittest.TestCase):
+    class State:
+        def __init__(self, yaw_deg: float) -> None:
+            self.yaw_deg = yaw_deg
+            self.pitch_deg = -12.0
+            self.roll_deg = 0.5
+            self.sequence = 7
+            self.monotonic_ns = 999_000_000
+            self.cache_timestamp_s = 42.0
+
+    class Reader:
+        def __init__(self, samples) -> None:
+            self.samples = iter(samples)
+            self.angles_changed = False
+            self.max_angle_delta_deg = 0.0
+            self.last_error = None
+            self.read_count = 0
+
+        def read(self):
+            self.read_count += 1
+            state, self.angles_changed, self.last_error = next(self.samples)
+            self.max_angle_delta_deg = 12.5 if self.angles_changed else 0.0
+            return state
+
+    def adapter(self, samples):
+        reader = self.Reader(samples)
+        adapter = MODULE.UeFinalPovYawReader(
+            Path("/run/user/1000/camera-state.bin"),
+            expected_ue_pid=4242,
+            reader=reader,
+        )
+        return adapter, reader
+
+    def test_missing_and_stale_state_fail_closed_then_recovery_is_observable(self) -> None:
+        adapter, reader = self.adapter(
+            (
+                (None, False, "missing_file"),
+                (None, False, "stale"),
+                (self.State(30.0), False, None),
+            )
+        )
+
+        missing = adapter.read(10.0)
+        stale = adapter.read(10.02)
+        recovered = adapter.read(10.04)
+
+        self.assertIsNone(missing.yaw_rad)
+        self.assertEqual(missing.error, "missing_file")
+        self.assertIsNone(stale.yaw_rad)
+        self.assertEqual(stale.error, "stale")
+        self.assertAlmostEqual(recovered.yaw_rad, math.radians(30.0))
+        self.assertFalse(recovered.angles_changed)
+        self.assertEqual(reader.read_count, 3)
+
+    def test_robot_follow_angle_change_does_not_impersonate_a_mouse_drag(self) -> None:
+        adapter, _reader = self.adapter(
+            (
+                (self.State(0.0), False, None),
+                # A centered camera can rotate as a consequence of robot
+                # motion, without an operator mouse-button boundary.
+                (self.State(0.0), True, None),
+                (self.State(0.0), False, None),
+                (self.State(0.0), False, None),
+                (self.State(0.0), False, None),
+            )
+        )
+        core = CORE.GameControlCore(
+            CORE.ControlConfig(
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+
+        def deliver(sequence: int, timestamp: float, *, w: bool):
+            observation = adapter.read(timestamp)
+            keyboard = MODULE.KeyboardMouseSample(
+                w=w,
+                focused=True,
+            )
+            snapshot = MODULE.build_snapshot(
+                sequence=sequence,
+                timestamp_monotonic_s=timestamp,
+                keyboard=keyboard,
+                gamepad=MODULE.GamepadSample(),
+                input_source="keyboard",
+                camera_yaw_rad=observation.yaw_rad or 0.0,
+                camera_available=observation.yaw_rad is not None,
+            )
+            core.accept_snapshot(snapshot, received_at_s=timestamp)
+            return core.command(now_s=timestamp, dt_s=1.0)
+
+        self.assertFalse(deliver(1, 1.00, w=False).safe_stop)
+        moving = deliver(2, 1.01, w=True)
+        self.assertFalse(moving.safe_stop)
+        self.assertEqual(moving.mode, "move")
+        observation = adapter.read(1.02)
+        self.assertFalse(observation.angles_changed)
+        self.assertEqual(observation.max_angle_delta_deg, 0.0)
+        self.assertFalse(deliver(4, 1.03, w=False).safe_stop)
+        self.assertFalse(deliver(5, 1.04, w=True).safe_stop)
+
+    def test_final_pov_yaw_uses_provider_sign_and_offset_transform(self) -> None:
+        adapter, _reader = self.adapter(((self.State(30.0), False, None),))
+        observation = adapter.read(1.0)
+        assert observation.yaw_rad is not None
+        sonic_yaw = MODULE.transform_camera_yaw(
+            observation.yaw_rad,
+            sign=-1,
+            offset_rad=math.radians(90.0),
+        )
+        self.assertAlmostEqual(sonic_yaw, math.radians(60.0))
+
+        telemetry = MODULE.ue_final_pov_telemetry(observation)
+        self.assertTrue(telemetry["available"])
+        self.assertEqual(telemetry["sequence"], 7)
+        self.assertEqual(telemetry["sample_age_ms"], 1.0)
+        self.assertAlmostEqual(telemetry["provider_yaw_deg"], 30.0)
+        self.assertEqual(telemetry["pitch_deg"], -12.0)
+        self.assertEqual(telemetry["cache_timestamp_s"], 42.0)
+
+    def test_final_pov_uses_xi2_only_for_drag_boundaries(self) -> None:
+        self.assertTrue(MODULE.captures_xi2_drag_boundaries("ue-final-pov"))
+        self.assertTrue(MODULE.captures_xi2_drag_boundaries("x11-mirror"))
+        self.assertTrue(MODULE.captures_xi2_drag_boundaries("x11-core-gated"))
+        self.assertFalse(MODULE.captures_xi2_drag_boundaries("x11-absolute"))
+        self.assertFalse(MODULE.captures_xi2_drag_boundaries("fixed"))
+        self.assertFalse(MODULE.captures_xi2_drag_boundaries("carla"))
 
 
 class CalibrationModeTest(unittest.TestCase):
@@ -1139,6 +1284,47 @@ class CameraYawTrackerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sign"):
             MODULE.transform_camera_yaw(0.0, sign=0, offset_rad=0.0)
 
+    def test_source_specific_sensitivity_and_yaw_telemetry(self) -> None:
+        core = MODULE.mirror_sensitivity_mapping(
+            "x11-core-gated",
+            base_deg_per_unit=0.12,
+            effective_deg_per_unit=0.0024,
+        )
+        absolute = MODULE.mirror_sensitivity_mapping(
+            "x11-absolute",
+            base_deg_per_unit=0.12,
+            effective_deg_per_unit=0.0024,
+        )
+        self.assertEqual(core["units"], "degrees_per_xi2_raw_unit")
+        self.assertEqual(absolute["units"], "degrees_per_x11_root_pixel")
+        self.assertEqual(core["effective_deg_per_unit"], 0.0024)
+        yaw = MODULE.camera_yaw_telemetry(
+            "x11-core-gated",
+            provider_yaw_rad=math.pi / 2.0,
+            sonic_yaw_rad=-math.pi / 2.0,
+        )
+        self.assertAlmostEqual(yaw["provider_yaw_deg"], 90.0)
+        self.assertAlmostEqual(yaw["sonic_yaw_deg"], -90.0)
+        claim = MODULE.camera_source_claim("x11-core-gated")
+        self.assertEqual(
+            claim["button_gate_truth_scope"],
+            "xquerypointer_core_button_level_sampled_not_event_ordered",
+        )
+        self.assertTrue(claim["experimental"])
+        self.assertFalse(claim["legacy"])
+        self.assertFalse(claim["visible_follow_camera_verified"])
+        final_pov = MODULE.camera_source_claim("ue-final-pov")
+        self.assertEqual(
+            final_pov["camera_yaw_truth_scope"],
+            "player_camera_manager_final_pov",
+        )
+        self.assertTrue(final_pov["experimental"])
+        self.assertFalse(final_pov["visible_follow_camera_verified"])
+        self.assertEqual(
+            final_pov["button_gate_truth_scope"],
+            "xquerypointer_core_level_or_xi2_raw_button_edges",
+        )
+
 
 class CarlaSpectatorCameraTest(unittest.TestCase):
     class Rotation:
@@ -1395,6 +1581,173 @@ class XInput2RawMotionTest(unittest.TestCase):
         )
         self.assertEqual(accumulator.button_state_resyncs, 1)
 
+    def test_core_gate_accepts_only_stable_held_intervals(self) -> None:
+        accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
+        self.assertEqual(
+            accumulator.update((), current_look_pressed=False),
+            (0.0, 0.0, False),
+        )
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, dx=9.0),),
+                current_look_pressed=True,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.last_drop_reason, "core_press_boundary")
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, dx=4.0, dy=-2.0),),
+                current_look_pressed=True,
+            ),
+            (4.0, -2.0, True),
+        )
+        self.assertIsNone(accumulator.last_drop_reason)
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, dx=6.0),),
+                current_look_pressed=False,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.last_drop_reason, "core_release_boundary")
+        self.assertEqual(accumulator.ambiguous_raw_motion_events, 2)
+        self.assertEqual(accumulator.ambiguous_raw_dx_total, 15.0)
+
+    def test_core_gate_quick_drag_is_interlocked_but_never_integrated(self) -> None:
+        accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
+        accumulator.update((), current_look_pressed=False)
+        result = accumulator.update(
+            (
+                self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+                self.raw(MODULE._XI_RAW_MOTION, dx=30.0),
+                self.raw(MODULE._XI_RAW_BUTTON_RELEASE, detail=1),
+            ),
+            current_look_pressed=False,
+        )
+        self.assertEqual(result, (0.0, 0.0, True))
+        self.assertEqual(
+            accumulator.last_drop_reason, "quick_press_drag_release"
+        )
+        self.assertEqual(accumulator.ambiguous_raw_motion_events, 1)
+
+    def test_core_gate_disarm_requires_release_then_fresh_level_edge(self) -> None:
+        accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, dx=20.0),),
+                current_look_pressed=True,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.last_drop_reason, "awaiting_core_release")
+        self.assertEqual(
+            accumulator.update((), current_look_pressed=False),
+            (0.0, 0.0, False),
+        )
+        self.assertEqual(
+            accumulator.update((), current_look_pressed=True),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, dx=5.0),),
+                current_look_pressed=True,
+            ),
+            (5.0, 0.0, True),
+        )
+
+    def test_core_gate_binds_one_slave_and_rearms_on_source_change(self) -> None:
+        accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
+        accumulator.update((), current_look_pressed=False)
+        accumulator.update(
+            (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=1.0),),
+            current_look_pressed=True,
+        )
+        self.assertEqual(accumulator.bound_sourceid, 6)
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=2.0),),
+                current_look_pressed=True,
+            ),
+            (2.0, 0.0, True),
+        )
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, source=7, dx=30.0),),
+                current_look_pressed=True,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.last_drop_reason, "slave_source_changed")
+        self.assertIsNone(accumulator.bound_sourceid)
+        self.assertEqual(accumulator.source_bindings, 1)
+        self.assertEqual(accumulator.source_rejections, 1)
+
+    def test_core_gate_rejects_multiple_slaves_in_one_batch(self) -> None:
+        accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
+        accumulator.update((), current_look_pressed=False)
+        self.assertEqual(
+            accumulator.update(
+                (
+                    self.raw(MODULE._XI_RAW_MOTION, source=6, dx=2.0),
+                    self.raw(MODULE._XI_RAW_MOTION, source=7, dx=3.0),
+                ),
+                current_look_pressed=True,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.last_drop_reason, "multiple_slave_sources")
+        self.assertEqual(accumulator.source_rejections, 1)
+
+    def test_core_gate_delayed_raw_edges_drop_batch_but_keep_hold_binding(self) -> None:
+        accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
+        accumulator.update((), current_look_pressed=False)
+        accumulator.update(
+            (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=1.0),),
+            current_look_pressed=True,
+        )
+        self.assertEqual(
+            accumulator.update(
+                (
+                    self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+                    self.raw(MODULE._XI_RAW_MOTION, dx=8.0),
+                ),
+                current_look_pressed=True,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(
+            accumulator.last_drop_reason,
+            "raw_button_edge_inside_stable_core_hold",
+        )
+        self.assertEqual(accumulator.bound_sourceid, 6)
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=3.0),),
+                current_look_pressed=True,
+            ),
+            (3.0, 0.0, True),
+        )
+        self.assertEqual(
+            accumulator.update(
+                (
+                    self.raw(MODULE._XI_RAW_BUTTON_RELEASE, detail=1),
+                    self.raw(MODULE._XI_RAW_MOTION, dx=9.0),
+                ),
+                current_look_pressed=True,
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.bound_sourceid, 6)
+        self.assertEqual(
+            accumulator.update(
+                (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=4.0),),
+                current_look_pressed=True,
+            ),
+            (4.0, 0.0, True),
+        )
+
     @staticmethod
     def reader_for_events(events, *, enumerated_masters=(2,)):
         pending_values = []
@@ -1429,6 +1782,184 @@ class XInput2RawMotionTest(unittest.TestCase):
         )
         reader._enumerated_masters = iter(enumerated_masters)
         return reader
+
+    @staticmethod
+    def batched_reader(*, button_gate="xi2-events"):
+        class Pending:
+            def __init__(self) -> None:
+                self.events = []
+
+            def XPending(self, _display) -> int:
+                return int(bool(self.events))
+
+            @staticmethod
+            def XFlush(_display) -> int:
+                return 1
+
+        pending = Pending()
+        reader = object.__new__(MODULE.XInput2RawMotion)
+        reader._x11 = pending
+        reader._display = 1
+        reader._read_event = lambda: pending.events.pop(0)
+        reader._button_gate = button_gate
+        accumulator_type = (
+            MODULE.XInput2CoreGatedAccumulator
+            if button_gate == "x11-core-level"
+            else MODULE.XInput2DragAccumulator
+        )
+        reader._accumulator = accumulator_type(1)
+        reader.events_consumed = 0
+        reader.raw_motion_events = 0
+        reader.hierarchy_events = 0
+        reader.foreign_master_events = 0
+        reader.master_device_changes = 0
+        reader._master_deviceid = 2
+        reader._negotiated_version = (2, 0)
+        reader._single_master_pointer_deviceid = lambda: 2
+
+        def load(*events) -> None:
+            if pending.events:
+                raise AssertionError("previous XI2 batch was not drained")
+            pending.events.extend(events)
+
+        reader.load = load
+        return reader
+
+    def test_xi2_event_gate_poll_behavior_is_preserved_with_telemetry(self) -> None:
+        reader = self.batched_reader()
+        self.assertEqual(
+            reader.poll(current_look_pressed=False, focused=True),
+            (0.0, 0.0, False),
+        )
+        reader.load(
+            self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1),
+            self.raw(MODULE._XI_RAW_MOTION, dx=3.0),
+        )
+        self.assertEqual(
+            reader.poll(current_look_pressed=True, focused=True),
+            (3.0, 0.0, True),
+        )
+        reader.load(
+            self.raw(MODULE._XI_RAW_MOTION, dx=2.0),
+            self.raw(MODULE._XI_RAW_BUTTON_RELEASE, detail=1),
+        )
+        self.assertEqual(
+            reader.poll(current_look_pressed=False, focused=True),
+            (2.0, 0.0, True),
+        )
+        telemetry = reader.telemetry
+        self.assertEqual(telemetry["button_gate"], "xi2-events")
+        self.assertEqual(telemetry["accepted_dx_total"], 5.0)
+        self.assertEqual(telemetry["dropped_motion_events"], 0)
+        self.assertEqual(telemetry["button_state_resyncs"], 0)
+
+    def test_core_gated_poll_counts_accepted_and_boundary_drops(self) -> None:
+        reader = self.batched_reader(button_gate="x11-core-level")
+        reader.poll(current_look_pressed=False, focused=True)
+        reader.load(self.raw(MODULE._XI_RAW_MOTION, source=6, dx=10.0))
+        self.assertEqual(
+            reader.poll(current_look_pressed=True, focused=True),
+            (0.0, 0.0, True),
+        )
+        reader.load(self.raw(MODULE._XI_RAW_MOTION, source=6, dx=4.0))
+        self.assertEqual(
+            reader.poll(current_look_pressed=True, focused=True),
+            (4.0, 0.0, True),
+        )
+        reader.load(self.raw(MODULE._XI_RAW_MOTION, source=6, dx=6.0))
+        self.assertEqual(
+            reader.poll(current_look_pressed=False, focused=True),
+            (0.0, 0.0, True),
+        )
+        telemetry = reader.telemetry
+        self.assertEqual(telemetry["button_gate"], "x11-core-level")
+        self.assertEqual(telemetry["accepted_dx_total"], 4.0)
+        self.assertEqual(telemetry["dropped_motion_events"], 2)
+        self.assertEqual(telemetry["dropped_dx_total"], 16.0)
+        self.assertEqual(telemetry["source_bindings"], 1)
+        self.assertEqual(
+            telemetry["drop_reason_counts"],
+            {"core_press_boundary": 1, "core_release_boundary": 1},
+        )
+
+    def test_poll_resync_and_focus_drop_include_motion_totals(self) -> None:
+        reader = self.batched_reader()
+        reader.poll(current_look_pressed=False, focused=True)
+        reader.load(self.raw(MODULE._XI_RAW_BUTTON_PRESS, detail=1))
+        reader.poll(current_look_pressed=True, focused=True)
+        reader.load(self.raw(MODULE._XI_RAW_MOTION, dx=30.0, dy=-2.0))
+        self.assertEqual(
+            reader.poll(current_look_pressed=False, focused=True),
+            (0.0, 0.0, True),
+        )
+        reader.load(self.raw(MODULE._XI_RAW_MOTION, dx=7.0, dy=1.0))
+        reader.poll(current_look_pressed=True, focused=False)
+        telemetry = reader.telemetry
+        self.assertEqual(telemetry["dropped_motion_events"], 2)
+        self.assertEqual(telemetry["dropped_dx_total"], 37.0)
+        self.assertEqual(telemetry["dropped_dy_total"], -1.0)
+        self.assertEqual(
+            telemetry["drop_reason_counts"],
+            {"xi2_button_state_resync": 1, "focus_or_pointer_invalid": 1},
+        )
+
+    def test_core_gated_drag_requires_neutral_before_camera_relative_w(self) -> None:
+        accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
+        tracker = MODULE.CameraYawTracker(
+            0.0,
+            mouse_radians_per_pixel=math.pi / 2.0,
+            gamepad_radians_per_second=0.0,
+        )
+        core = CORE.GameControlCore(
+            CORE.ControlConfig(
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+
+        def deliver(sequence, timestamp, *, w=False, dragging=False):
+            snapshot = MODULE.build_snapshot(
+                sequence=sequence,
+                timestamp_monotonic_s=timestamp,
+                keyboard=MODULE.KeyboardMouseSample(
+                    w=w,
+                    camera_dragging=dragging,
+                    focused=True,
+                ),
+                gamepad=MODULE.GamepadSample(),
+                input_source="keyboard",
+                camera_yaw_rad=tracker.yaw,
+                camera_available=True,
+            )
+            core.accept_snapshot(snapshot, received_at_s=timestamp)
+            return core.command(now_s=timestamp, dt_s=1.0)
+
+        accumulator.update((), current_look_pressed=False)
+        self.assertFalse(deliver(1, 1.00).safe_stop)
+        _, _, press_drag = accumulator.update(
+            (), current_look_pressed=True
+        )
+        self.assertTrue(deliver(2, 1.01, dragging=press_drag).safe_stop)
+        dx, _, held_drag = accumulator.update(
+            (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=1.0),),
+            current_look_pressed=True,
+        )
+        tracker.update(dt=0.02, mouse_dx=dx, gamepad_look_yaw=0.0)
+        self.assertTrue(deliver(3, 1.02, w=True, dragging=held_drag).safe_stop)
+        _, _, release_drag = accumulator.update(
+            (), current_look_pressed=False
+        )
+        self.assertTrue(deliver(4, 1.03, w=True, dragging=release_drag).safe_stop)
+        awaiting = deliver(5, 1.04, w=True)
+        self.assertTrue(awaiting.safe_stop)
+        self.assertEqual(awaiting.reason, "awaiting_neutral")
+        self.assertFalse(deliver(6, 1.05).safe_stop)
+        resumed = deliver(7, 1.06, w=True)
+        self.assertFalse(resumed.safe_stop)
+        self.assertAlmostEqual(resumed.movement[0], 0.0, places=7)
+        self.assertAlmostEqual(resumed.movement[1], 1.0, places=7)
 
     def test_hierarchy_event_discards_complete_batch_and_rebinds(self) -> None:
         reader = self.reader_for_events(
@@ -1673,6 +2204,126 @@ class XInput2RawMotionTest(unittest.TestCase):
 
 
 class X11KeyboardMouseSafetyTest(unittest.TestCase):
+    class AsyncFocusX11:
+        """Deliver one queued X error only when the backend calls XSync."""
+
+        def __init__(self, *, error_code=MODULE._X11_BAD_WINDOW, resource=77):
+            self.error_code = error_code
+            self.resource = resource
+            self.handler = 0
+            self.pending = False
+            self.sync_calls = 0
+            self.delivered = 0
+
+        def XSync(self, display, _discard) -> int:
+            self.sync_calls += 1
+            if self.pending:
+                self.pending = False
+                event = MODULE._XErrorEvent(
+                    type=0,
+                    display=display,
+                    resourceid=self.resource,
+                    serial=1,
+                    error_code=self.error_code,
+                    request_code=20,
+                    minor_code=0,
+                )
+                if not self.handler:
+                    raise AssertionError("queued X error had no installed handler")
+                MODULE._X11_ERROR_HANDLER(self.handler)(
+                    display, ctypes.byref(event)
+                )
+                self.delivered += 1
+            return 1
+
+        def XSetErrorHandler(self, handler):
+            previous = self.handler
+            self.handler = MODULE.X11KeyboardMouse._pointer_value(handler)
+            return previous or None
+
+        @staticmethod
+        def XGetInputFocus(_display, focus, _revert) -> int:
+            focus._obj.value = 77
+            return 1
+
+        def XFetchName(self, _display, _window, _name) -> int:
+            self.pending = True
+            return 0
+
+        @staticmethod
+        def XGetWindowProperty(*args) -> int:
+            args[8]._obj.value = 0
+            args[9]._obj.value = 0
+            return 0
+
+        @staticmethod
+        def XQueryTree(*_args) -> int:
+            return 0
+
+        @staticmethod
+        def XFree(_value) -> int:
+            return 1
+
+    @staticmethod
+    def _focus_backend(x11):
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = x11
+        backend._display = 11
+        backend._root = 2
+        backend._pid_atom = 9
+        backend._active_focus_error_scope = None
+        backend._previous_x_error_handler = None
+        backend._x_error_handler_callback = MODULE._X11_ERROR_HANDLER(
+            backend._handle_x_error
+        )
+        return backend
+
+    def test_async_badwindow_in_tracked_focus_chain_fails_closed(self) -> None:
+        x11 = self.AsyncFocusX11()
+        backend = self._focus_backend(x11)
+
+        focus = backend._focus_identity()
+
+        self.assertEqual(focus, (False, None, frozenset()))
+        self.assertEqual(x11.delivered, 1)
+        self.assertEqual(x11.sync_calls, 2)
+        self.assertEqual(x11.handler, 0)
+        self.assertEqual(backend._focus_badwindow_recoveries, 1)
+        self.assertEqual(backend._last_focus_badwindow_resource, 77)
+
+    def test_non_badwindow_focus_error_is_not_swallowed(self) -> None:
+        x11 = self.AsyncFocusX11(error_code=2)
+        backend = self._focus_backend(x11)
+
+        with self.assertRaisesRegex(RuntimeError, "unexpected X11 error"):
+            backend._focus_identity()
+
+        self.assertEqual(x11.delivered, 1)
+        self.assertEqual(x11.handler, 0)
+
+    def test_focus_scope_restores_previous_handler_on_body_exception(self) -> None:
+        x11 = self.AsyncFocusX11()
+        x11.handler = 1234
+        backend = self._focus_backend(x11)
+
+        with self.assertRaisesRegex(ValueError, "body failed"):
+            with backend._focus_window_error_scope():
+                raise ValueError("body failed")
+
+        self.assertEqual(x11.handler, 1234)
+        self.assertIsNone(backend._active_focus_error_scope)
+        self.assertIsNone(backend._previous_x_error_handler)
+
+    def test_untracked_badwindow_is_not_misclassified_as_focus_race(self) -> None:
+        x11 = self.AsyncFocusX11(resource=88)
+        backend = self._focus_backend(x11)
+
+        with self.assertRaisesRegex(RuntimeError, "resource=88"):
+            backend._focus_identity()
+
+        self.assertEqual(x11.delivered, 1)
+        self.assertEqual(x11.handler, 0)
+
     @staticmethod
     def _raw_backend(
         *,
@@ -1871,6 +2522,7 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
     def test_teleport_is_rejected_and_rebaselined_without_clamping(self) -> None:
         samples = iter(
             (
+                (0, 0),
                 (0, 1 << 8),
                 (200, 1 << 8),
                 (401, 1 << 8),
@@ -1907,29 +2559,35 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         backend._maximum_mouse_delta = 200.0
         backend._teleport_rejections = 0
         backend._last_teleport_delta = None
+        backend._raw_motion = None
+        backend._absolute_motion = MODULE.X11AbsoluteDragAccumulator(200.0)
         backend._expected_ue_pid = 1234
         backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
 
         baseline = backend.poll()
+        pressed = backend.poll()
         exact_boundary = backend.poll()
         teleport = backend.poll()
         after_rebaseline = backend.poll()
 
         self.assertEqual(baseline.mouse_dx, 0.0)
+        self.assertEqual(pressed.mouse_dx, 0.0)
         self.assertEqual(exact_boundary.mouse_dx, 200.0)
         self.assertEqual(teleport.mouse_dx, 0.0)
         self.assertEqual(after_rebaseline.mouse_dx, 5.0)
-        self.assertEqual(
-            backend.pointer_telemetry,
-            {
-                "teleport_rejections": 1,
-                "last_teleport_delta": [201, 0],
-                "maximum_mouse_delta_px": 200.0,
-            },
-        )
+        telemetry = backend.pointer_telemetry
+        self.assertEqual(telemetry["motion_source"], "x11-absolute-root-delta")
+        self.assertEqual(telemetry["teleport_rejections"], 1)
+        self.assertEqual(telemetry["last_teleport_delta"], [201, 0])
+        self.assertEqual(telemetry["accepted_dx_total"], 205.0)
+        self.assertEqual(telemetry["drop_reason_counts"], {"teleport_rejected": 1})
+        self.assertEqual(telemetry["dropped_motion_events"], 1)
+        self.assertEqual(telemetry["dropped_dx_total"], 201.0)
+        self.assertEqual(telemetry["focus_badwindow_recoveries"], 0)
+        self.assertIsNone(telemetry["last_focus_badwindow_resource"])
 
     def test_release_sample_keeps_final_held_drag_delta(self) -> None:
-        samples = iter(((0, 1 << 8), (10, 1 << 8), (30, 0)))
+        samples = iter(((0, 0), (0, 1 << 8), (10, 1 << 8), (30, 0)))
 
         class FakeX11:
             @staticmethod
@@ -1958,19 +2616,77 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         backend._previous_pointer = None
         backend._previous_look_pressed = False
         backend._maximum_mouse_delta = 200.0
+        backend._teleport_rejections = 0
+        backend._last_teleport_delta = None
+        backend._raw_motion = None
+        backend._absolute_motion = MODULE.X11AbsoluteDragAccumulator(200.0)
         backend._expected_ue_pid = 1234
         backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
 
+        baseline = backend.poll()
         pressed = backend.poll()
         held = backend.poll()
         released = backend.poll()
 
+        self.assertEqual(baseline.mouse_dx, 0.0)
         self.assertEqual(pressed.mouse_dx, 0.0)
         self.assertEqual(held.mouse_dx, 10.0)
         self.assertEqual(released.mouse_dx, 20.0)
         self.assertTrue(pressed.camera_dragging)
         self.assertTrue(held.camera_dragging)
-        self.assertFalse(released.camera_dragging)
+        self.assertTrue(released.camera_dragging)
+
+    def test_absolute_focus_loss_requires_release_and_fresh_press(self) -> None:
+        accumulator = MODULE.X11AbsoluteDragAccumulator(200.0)
+        self.assertEqual(
+            accumulator.update(
+                pointer=(0, 0), current_look_pressed=False, focused=True
+            ),
+            (0.0, 0.0, False),
+        )
+        accumulator.update(
+            pointer=(0, 0), current_look_pressed=True, focused=True
+        )
+        self.assertEqual(
+            accumulator.update(
+                pointer=(10, 0), current_look_pressed=True, focused=True
+            ),
+            (10.0, 0.0, True),
+        )
+        self.assertEqual(
+            accumulator.update(
+                pointer=(20, 0), current_look_pressed=True, focused=False
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(
+            accumulator.update(
+                pointer=(30, 0), current_look_pressed=True, focused=True
+            ),
+            (0.0, 0.0, True),
+        )
+        self.assertEqual(
+            accumulator.update(
+                pointer=(30, 0), current_look_pressed=False, focused=True
+            ),
+            (0.0, 0.0, False),
+        )
+        accumulator.update(
+            pointer=(30, 0), current_look_pressed=True, focused=True
+        )
+        self.assertEqual(
+            accumulator.update(
+                pointer=(35, 0), current_look_pressed=True, focused=True
+            ),
+            (5.0, 0.0, True),
+        )
+        self.assertEqual(accumulator.accepted_dx_total, 15.0)
+        self.assertEqual(
+            accumulator.drop_reason_counts,
+            {"focus_lost": 1, "awaiting_release_before_fresh_press": 1},
+        )
+        self.assertEqual(accumulator.dropped_motion_events, 1)
+        self.assertEqual(accumulator.dropped_dx_total, 10.0)
 
     def test_left_or_right_modifier_keys_are_collapsed(self) -> None:
         class FakeX11:
@@ -2097,6 +2813,117 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         sample = backend.poll()
         self.assertIsNone(sample.focus_title)
         self.assertTrue(sample.focused)
+
+
+@unittest.skipUnless(
+    os.environ.get("MATRIX_RUN_X11_BADWINDOW_INTEGRATION") == "1",
+    "set MATRIX_RUN_X11_BADWINDOW_INTEGRATION=1 under Xvfb",
+)
+class X11BadWindowIntegrationTest(unittest.TestCase):
+    def test_destroyed_focused_window_does_not_exit_provider(self) -> None:
+        library_name = ctypes.util.find_library("X11")
+        if not library_name or not os.environ.get("DISPLAY"):
+            self.skipTest("an X11 display and libX11 are required")
+        x11 = ctypes.CDLL(library_name)
+        signatures = {
+            "XOpenDisplay": ([ctypes.c_char_p], ctypes.c_void_p),
+            "XDefaultRootWindow": ([ctypes.c_void_p], ctypes.c_ulong),
+            "XCreateSimpleWindow": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_ulong,
+                    ctypes.c_ulong,
+                ],
+                ctypes.c_ulong,
+            ),
+            "XMapWindow": (
+                [ctypes.c_void_p, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
+            "XSetInputFocus": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_ulong,
+                ],
+                ctypes.c_int,
+            ),
+            "XDestroyWindow": (
+                [ctypes.c_void_p, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
+            "XSync": (
+                [ctypes.c_void_p, ctypes.c_int],
+                ctypes.c_int,
+            ),
+            "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
+        }
+        for name, (argtypes, restype) in signatures.items():
+            function = getattr(x11, name)
+            function.argtypes = argtypes
+            function.restype = restype
+
+        creator = x11.XOpenDisplay(None)
+        self.assertTrue(creator)
+        backend = None
+        window = 0
+        try:
+            root = x11.XDefaultRootWindow(creator)
+            window = int(
+                x11.XCreateSimpleWindow(
+                    creator, root, 0, 0, 100, 100, 0, 0, 0
+                )
+            )
+            self.assertGreater(window, 1)
+            x11.XMapWindow(creator, window)
+            x11.XSync(creator, 0)
+            # RevertToParent=2, CurrentTime=0.
+            x11.XSetInputFocus(creator, window, 2, 0)
+            x11.XSync(creator, 0)
+
+            backend = MODULE.X11KeyboardMouse(
+                display_name=os.environ["DISPLAY"],
+                focus_title_pattern=None,
+                expected_ue_pid=None,
+                look_button="left",
+            )
+            original_fetch_name = backend._fetch_name
+            destroyed = False
+
+            def destroy_then_query(focused_window: int):
+                nonlocal destroyed
+                if not destroyed:
+                    self.assertEqual(focused_window, window)
+                    x11.XDestroyWindow(creator, window)
+                    x11.XSync(creator, 0)
+                    destroyed = True
+                return original_fetch_name(focused_window)
+
+            backend._fetch_name = destroy_then_query
+
+            self.assertEqual(
+                backend._focus_identity(),
+                (False, None, frozenset()),
+            )
+            self.assertTrue(destroyed)
+            self.assertEqual(
+                backend.pointer_telemetry["focus_badwindow_recoveries"], 1
+            )
+            self.assertEqual(
+                backend.pointer_telemetry["last_focus_badwindow_resource"],
+                window,
+            )
+        finally:
+            if backend is not None:
+                backend.close()
+            x11.XCloseDisplay(creator)
 
 
 class FrameWaitTest(unittest.TestCase):
@@ -2276,6 +3103,56 @@ class UnixSeqpacketPublisherTest(unittest.TestCase):
         self.assertFalse(publisher.send(self.snapshot(), now=10.0))
         self.assertFalse(publisher.connected)
         self.assertEqual(calls, ["send", "close"])
+
+
+class CameraYawSourceCliTest(unittest.TestCase):
+    def test_provider_parser_keeps_three_x11_sources_distinct(self) -> None:
+        for source in ("x11-mirror", "x11-core-gated", "x11-absolute"):
+            with self.subTest(source=source), mock.patch.object(
+                os.sys,
+                "argv",
+                ["matrix_game_control_input.py", "--camera-yaw-source", source],
+            ):
+                args = MODULE._parse_args()
+                self.assertEqual(args.camera_yaw_source, source)
+
+    def test_provider_parser_accepts_final_pov_state_file(self) -> None:
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                "--camera-yaw-source",
+                "ue-final-pov",
+                "--ue-camera-state-file",
+                "/run/user/1000/camera-state.bin",
+                "--expected-ue-pid",
+                "4242",
+                "--dry-run",
+            ],
+        ):
+            args = MODULE._parse_args()
+        MODULE._validate_args(args)
+        self.assertEqual(args.camera_yaw_source, "ue-final-pov")
+        self.assertEqual(
+            args.ue_camera_state_file,
+            Path("/run/user/1000/camera-state.bin"),
+        )
+
+    def test_final_pov_requires_state_file_and_exact_pid(self) -> None:
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                "--camera-yaw-source",
+                "ue-final-pov",
+                "--dry-run",
+            ],
+        ):
+            args = MODULE._parse_args()
+        with self.assertRaisesRegex(SystemExit, "expected-ue-pid"):
+            MODULE._validate_args(args)
 
 
 if __name__ == "__main__":

@@ -374,6 +374,20 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn('--expected-parent-pid "$$"', run_sim)
         self.assertIn("RUN_SIM_PARENT_PID", run_sim)
         self.assertIn("handle_signal 143", run_sim)
+        for source in ("x11-core-gated", "x11-absolute", "ue-final-pov"):
+            self.assertIn(
+                f'"${{MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}}" == "{source}"',
+                run_sim,
+            )
+            self.assertIn(f'"$GAME_CAMERA_YAW_SOURCE" == "{source}"', text)
+        self.assertIn(
+            "Qualified game control rejects experimental camera yaw sources",
+            run_sim,
+        )
+        self.assertIn(
+            "Bounded game-control qualification rejects experimental camera yaw sources",
+            text,
+        )
 
         self.assertIn("forward_signal TERM 143", text)
         self.assertIn("FORWARDED_SIGNAL_EXIT_CODE", text)

@@ -96,8 +96,20 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--game-camera-yaw-source",
-        choices=("x11-mirror", "carla", "fixed"),
+        choices=(
+            "x11-mirror",
+            "x11-core-gated",
+            "x11-absolute",
+            "ue-final-pov",
+            "carla",
+            "fixed",
+        ),
         default="fixed",
+    )
+    parser.add_argument(
+        "--game-ue-camera-state-file",
+        type=Path,
+        help="Supervised fresh PlayerCameraManager final-POV state",
     )
     parser.add_argument(
         "--game-look-button", choices=("left", "middle", "right"), default="left"
@@ -898,12 +910,21 @@ def _validate_qualified_game_control(args: argparse.Namespace) -> None:
         raise SystemExit(
             "qualified game control rejects an unobserved fixed camera yaw"
         )
+    if args.game_camera_yaw_source in {
+        "x11-core-gated",
+        "x11-absolute",
+        "ue-final-pov",
+    }:
+        raise SystemExit(
+            "qualified game control rejects experimental camera yaw sources"
+        )
     if (
-        args.game_camera_yaw_source == "x11-mirror"
+        args.game_camera_yaw_source
+        in {"x11-mirror", "x11-core-gated", "x11-absolute"}
         and args.game_mouse_sensitivity_deg <= 0.0
     ):
         raise SystemExit(
-            "qualified x11-mirror control requires positive mouse sensitivity"
+            "qualified X11 camera control requires positive mouse sensitivity"
         )
     expected_provider = (_SCRIPT_DIR / "matrix_game_control_input.py").resolve()
     try:
@@ -1266,25 +1287,84 @@ def _game_input_acceptance_failures(
     return failures
 
 
-def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
+def _effective_game_camera_yaw_offset_deg(
+    *,
+    source: str,
+    configured_offset_deg: float,
+    initial_root_yaw_rad: float | None,
+) -> float:
+    """Map absolute provider yaw into SONIC's initial-root-relative frame."""
+
+    configured = float(configured_offset_deg)
+    if not math.isfinite(configured):
+        raise ValueError("configured camera yaw offset must be finite")
+    if source != "ue-final-pov":
+        return configured
+    if initial_root_yaw_rad is None or not math.isfinite(initial_root_yaw_rad):
+        raise ValueError("UE final-POV yaw requires a finite initial root yaw")
+    return configured - math.degrees(initial_root_yaw_rad)
+
+
+def _game_control_status_fields(
+    args: argparse.Namespace,
+    *,
+    applied_camera_yaw_offset_deg: float | None = None,
+    initial_root_yaw_rad: float | None = None,
+) -> dict[str, object]:
     """Return the immutable input/camera claim carried by every status frame."""
 
     source = args.game_camera_yaw_source
     if source == "fixed":
         yaw_observation = "constant_unobserved"
         yaw_truth_scope = "configured_constant_not_final_view"
+        button_gate_truth_scope = "no_button_gate"
     elif source == "x11-mirror":
         yaw_observation = "xinput2_raw_motion_mirror"
         yaw_truth_scope = "xi2_raw_input_mirror_not_final_view"
+        button_gate_truth_scope = "xi2_raw_button_edges_same_slave_source"
+    elif source == "x11-core-gated":
+        yaw_observation = "xinput2_raw_motion_core_button_level_gate"
+        yaw_truth_scope = "xi2_raw_motion_core_button_gate_not_final_view"
+        button_gate_truth_scope = (
+            "xquerypointer_core_button_level_sampled_not_event_ordered"
+        )
+    elif source == "x11-absolute":
+        yaw_observation = "xquerypointer_root_absolute_delta"
+        yaw_truth_scope = "x11_absolute_pointer_delta_mirror_not_final_view"
+        button_gate_truth_scope = "xquerypointer_core_level_sampled_at_50hz"
+    elif source == "ue-final-pov":
+        yaw_observation = "ue_player_camera_manager_final_pov_state"
+        yaw_truth_scope = "player_camera_manager_final_pov"
+        button_gate_truth_scope = (
+            "xquerypointer_core_level_or_xi2_raw_button_edges"
+        )
     else:
         yaw_observation = "carla_spectator_rpc_write_readback"
         yaw_truth_scope = "carla_spectator_not_verified_final_view"
+        button_gate_truth_scope = "not_applicable_carla_rpc"
     effective_input_source = args.game_input_source
-    if source != "carla" and effective_input_source == "auto":
+    if (
+        source not in {"carla", "ue-final-pov"}
+        and effective_input_source == "auto"
+    ):
         effective_input_source = "keyboard"
     applied_mouse_scale = args.game_applied_mouse_speed_scale
     effective_mouse_sensitivity = (
         args.game_mouse_sensitivity_deg * applied_mouse_scale
+    )
+    if source in {"x11-mirror", "x11-core-gated"}:
+        sensitivity_units = "degrees_per_xi2_raw_unit"
+    elif source == "x11-absolute":
+        sensitivity_units = "degrees_per_x11_root_pixel"
+    elif source == "ue-final-pov":
+        sensitivity_units = "absolute_degrees_from_player_camera_manager_final_pov"
+    else:
+        sensitivity_units = "degrees_per_unobserved_input_unit"
+    configured_camera_yaw_offset_deg = args.game_camera_yaw_offset_deg
+    effective_camera_yaw_offset_deg = (
+        configured_camera_yaw_offset_deg
+        if applied_camera_yaw_offset_deg is None
+        else applied_camera_yaw_offset_deg
     )
     return {
         "input_protocol": PROTOCOL_NAME,
@@ -1320,8 +1400,20 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "expected_ue_pid": args.ue_pid,
         "camera_yaw_observation": yaw_observation,
         "camera_yaw_truth_scope": yaw_truth_scope,
+        "button_gate_truth_scope": button_gate_truth_scope,
+        "legacy": source == "x11-absolute",
+        "experimental": source
+        in {"x11-core-gated", "x11-absolute", "ue-final-pov"},
+        "ue_camera_state_file": os.fspath(args.game_ue_camera_state_file)
+        if getattr(args, "game_ue_camera_state_file", None) is not None
+        else None,
         "camera_yaw_sign": args.game_camera_yaw_sign,
-        "camera_yaw_offset_deg": args.game_camera_yaw_offset_deg,
+        "camera_yaw_offset_deg": effective_camera_yaw_offset_deg,
+        "camera_yaw_offset_configured_deg": configured_camera_yaw_offset_deg,
+        "camera_yaw_initial_root_compensation_deg": (
+            effective_camera_yaw_offset_deg - configured_camera_yaw_offset_deg
+        ),
+        "initial_root_yaw_rad_for_camera": initial_root_yaw_rad,
         "initial_camera_yaw_deg": args.game_initial_camera_yaw_deg,
         "visible_mouse_backend": "sdl-relative-speed-scale",
         "applied_mouse_profile": args.game_applied_mouse_profile,
@@ -1330,7 +1422,11 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "mouse_sensitivity_deg_per_px": args.game_mouse_sensitivity_deg,
         "mouse_sensitivity_base_deg_per_px": args.game_mouse_sensitivity_deg,
         "mouse_sensitivity_effective_deg_per_px": effective_mouse_sensitivity,
-        "mouse_sensitivity_units": "degrees_per_xi2_raw_unit",
+        "mouse_sensitivity_units": sensitivity_units,
+        "mouse_sensitivity_base_deg_per_unit": args.game_mouse_sensitivity_deg,
+        "mouse_sensitivity_effective_deg_per_unit": (
+            effective_mouse_sensitivity
+        ),
         "mouse_sensitivity_base_deg_per_raw_unit": (
             args.game_mouse_sensitivity_deg
         ),
@@ -1345,10 +1441,9 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "gamepad_look_min_pitch_deg": args.gamepad_look_min_pitch_deg,
         "gamepad_look_max_pitch_deg": args.gamepad_look_max_pitch_deg,
         "carla_write_readback_tolerance_deg": 0.5,
-        # Neither pointer integration nor a CARLA spectator transform proves
-        # that the cooked Matrix follow camera rendered the same direction.
-        # Qualified status therefore names its scope instead of over-claiming
-        # a visual camera-relative acceptance result.
+        # Pointer integration and CARLA do not prove the cooked final view.
+        # ue-final-pov names PlayerCameraManager's final POV, but remains
+        # experimental until live visual/cardinal acceptance succeeds.
         "qualification_scope": "runtime_input_and_motion_path_only",
         "visible_follow_camera_verified": False,
         "external_visual_evidence_required": True,
@@ -2068,6 +2163,7 @@ class NativeProcessGroup:
         focus_title: str,
         expected_ue_pid: int,
         status_file: Path | None,
+        ue_camera_state_file: Path | None = None,
         mouse_settings_file: Path | None = None,
         applied_mouse_profile: str = "local",
         applied_mouse_speed_scale: float = 1.0,
@@ -2120,6 +2216,8 @@ class NativeProcessGroup:
         ]
         if mouse_settings_file is not None:
             command.extend(("--mouse-settings-file", str(mouse_settings_file)))
+        if ue_camera_state_file is not None:
+            command.extend(("--ue-camera-state-file", str(ue_camera_state_file)))
         restart_values = (
             restart_request_file,
             restart_capability_file,
@@ -2386,6 +2484,13 @@ def main() -> int:
             and not args.game_mouse_settings_file.is_absolute()
         ):
             raise SystemExit("--game-mouse-settings-file must be absolute")
+        if args.game_camera_yaw_source == "ue-final-pov":
+            if args.game_ue_camera_state_file is None:
+                raise SystemExit(
+                    "--game-ue-camera-state-file is required for ue-final-pov"
+                )
+            if not args.game_ue_camera_state_file.is_absolute():
+                raise SystemExit("--game-ue-camera-state-file must be absolute")
         restart_values = (
             args.game_restart_request_file,
             args.game_restart_capability_file,
@@ -2540,6 +2645,20 @@ def main() -> int:
             )
         except ValueError as exc:
             raise SystemExit(f"invalid native SONIC initial root heading: {exc}") from exc
+        applied_game_camera_yaw_offset_deg = float(
+            getattr(args, "game_camera_yaw_offset_deg", 0.0)
+        )
+        try:
+            if args.control_source == "game":
+                applied_game_camera_yaw_offset_deg = (
+                    _effective_game_camera_yaw_offset_deg(
+                        source=args.game_camera_yaw_source,
+                        configured_offset_deg=args.game_camera_yaw_offset_deg,
+                        initial_root_yaw_rad=initial_root_yaw_rad,
+                    )
+                )
+        except ValueError as exc:
+            raise SystemExit(f"invalid game camera yaw frame: {exc}") from exc
         renderer = (
             None
             if args.no_render_sync
@@ -2615,7 +2734,9 @@ def main() -> int:
                         ),
                         restart_launcher_pid=args.game_restart_launcher_pid,
                         camera_yaw_sign=args.game_camera_yaw_sign,
-                        camera_yaw_offset_deg=args.game_camera_yaw_offset_deg,
+                        camera_yaw_offset_deg=(
+                            applied_game_camera_yaw_offset_deg
+                        ),
                         carla_host=args.game_carla_host,
                         carla_port=args.game_carla_port,
                         gamepad_look_yaw_rate_deg_s=(
@@ -2634,6 +2755,7 @@ def main() -> int:
                         focus_title=args.game_focus_title,
                         expected_ue_pid=args.ue_pid,
                         status_file=args.game_input_status_file,
+                        ue_camera_state_file=args.game_ue_camera_state_file,
                     )
                     game_input.bind_expected_peer_pid(provider_pid)
         elif running and args.control_source == "pico":
@@ -2922,7 +3044,13 @@ def main() -> int:
                 if game_input is not None:
                     status["game_input"] = game_input.telemetry(now_s=now)
                     status["game_control_configuration"] = (
-                        _game_control_status_fields(args)
+                        _game_control_status_fields(
+                            args,
+                            applied_camera_yaw_offset_deg=(
+                                applied_game_camera_yaw_offset_deg
+                            ),
+                            initial_root_yaw_rad=initial_root_yaw_rad,
+                        )
                     )
                     current_root_yaw = _root_yaw_rad(snapshot.qpos)
                     assert initial_root_yaw_rad is not None
@@ -3162,7 +3290,13 @@ def main() -> int:
             final_status["game_input"] = game_input.telemetry(now_s=finished_wall)
             final_status["game_input_at_boundary"] = game_input_boundary
             final_status["game_control_configuration"] = (
-                _game_control_status_fields(args)
+                _game_control_status_fields(
+                    args,
+                    applied_camera_yaw_offset_deg=(
+                        applied_game_camera_yaw_offset_deg
+                    ),
+                    initial_root_yaw_rad=initial_root_yaw_rad,
+                )
             )
             assert initial_root_yaw_rad is not None
             assert heading_anchor_telemetry is not None

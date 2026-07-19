@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "binary": {
+    "sha256": "155aeb0dd43e154839a2ec7795f83aecfb461f84fe72cdf9f5f4cd8e9158d022",
+    "gnu_build_id": "056e17b8675b1006",
+    "elf_type": "ET_EXEC"
+  },
+  "byte_order": "little",
+  "pointer_size": 8,
+  "player_index": 0,
+  "addresses": {
+    "gworld": 328333824,
+    "gworld_storage": "proxy",
+    "gworld_proxy_world_offset": 0
+  },
+  "offsets": {
+    "uworld_owning_game_instance": 480,
+    "game_instance_local_players": 56,
+    "tarray_data": 0,
+    "tarray_num": 8,
+    "tarray_max": 12,
+    "local_player_player_controller": 48,
+    "player_controller_camera_manager": 904,
+    "camera_manager_camera_cache": 5104,
+    "camera_cache_timestamp": 0,
+    "camera_cache_pov": 16,
+    "pov_location": 0,
+    "pov_rotation": 24
+  },
+  "sizes": {
+    "camera_cache": 2080,
+    "tarray": 16
+  },
+  "formats": {
+    "pointer": "uint64",
+    "pointer_representation": "raw_virtual_address",
+    "tarray_count": "int32",
+    "cache_timestamp": "float32",
+    "location": "float64x3",
+    "rotation": "float64x3"
+  },
+  "limits": {
+    "min_pointer": 65536,
+    "max_pointer": 140737488355327,
+    "max_local_players": 8,
+    "max_abs_location": 1000000000.0,
+    "max_abs_angle_degrees": 3600.0,
+    "max_cache_timestamp": 1000000000.0
+  }
+}
