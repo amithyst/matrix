@@ -608,6 +608,29 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 parsed = MODULE._parse_args()
                 self.assertEqual(parsed.game_camera_yaw_source, source)
 
+    def test_parse_args_exposes_final_pov_state_file(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--game-camera-yaw-source",
+                "ue-final-pov",
+                "--game-ue-camera-state-file",
+                "/run/user/1000/camera-state.bin",
+            ],
+        ):
+            parsed = MODULE._parse_args()
+        self.assertEqual(parsed.game_camera_yaw_source, "ue-final-pov")
+        self.assertEqual(
+            parsed.game_ue_camera_state_file,
+            Path("/run/user/1000/camera-state.bin"),
+        )
+
     def test_qualified_acceptance_rejects_weaker_lock_gates(self) -> None:
         lock = json.loads(
             (REPO_ROOT / "config/runtime/matrix-sonic.lock.json").read_text(
@@ -687,7 +710,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         zero_sensitivity.game_mouse_sensitivity_deg = 0.0
         with self.assertRaisesRegex(SystemExit, "positive mouse sensitivity"):
             MODULE._validate_qualified_game_control(zero_sensitivity)
-        for source in ("x11-core-gated", "x11-absolute"):
+        for source in ("x11-core-gated", "x11-absolute", "ue-final-pov"):
             with self.subTest(source=source):
                 candidate = SimpleNamespace(**vars(valid))
                 candidate.game_camera_yaw_source = source
@@ -834,6 +857,28 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             absolute_status["mouse_sensitivity_effective_deg_per_unit"],
             0.0012,
+        )
+
+        final_pov_args = SimpleNamespace(**vars(args))
+        final_pov_args.game_camera_yaw_source = "ue-final-pov"
+        final_pov_args.game_ue_camera_state_file = Path(
+            "/run/user/1000/camera-state.bin"
+        )
+        final_pov_status = MODULE._game_control_status_fields(final_pov_args)
+        self.assertEqual(final_pov_status["input_source_effective"], "auto")
+        self.assertEqual(
+            final_pov_status["camera_yaw_observation"],
+            "ue_player_camera_manager_final_pov_state",
+        )
+        self.assertEqual(
+            final_pov_status["camera_yaw_truth_scope"],
+            "player_camera_manager_final_pov",
+        )
+        self.assertTrue(final_pov_status["experimental"])
+        self.assertFalse(final_pov_status["visible_follow_camera_verified"])
+        self.assertEqual(
+            final_pov_status["ue_camera_state_file"],
+            "/run/user/1000/camera-state.bin",
         )
 
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
@@ -1020,6 +1065,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertNotIn('kill -0 "$ue_pid"', run_sim)
         self.assertNotIn('PIDS+=("$UE_PID")', run_sim)
         self.assertNotIn("UE_EXPECTED_STOP_FILE", run_sim)
+        self.assertIn('--camera-state-file "$UE_CAMERA_STATE_FILE"', run_sim)
+        self.assertIn('--camera-layout "$MATRIX_UE_CAMERA_LAYOUT"', run_sim)
+        self.assertIn('--game-ue-camera-state-file "$UE_CAMERA_STATE_FILE"', run_sim)
+        self.assertNotIn("--camera-executable", run_sim)
         self.assertIn("os.WNOWAIT", supervisor)
         self.assertIn("start_new_session=True", supervisor)
         self.assertIn("signal.SIGKILL", supervisor)
@@ -1868,6 +1917,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             command[command.index("--camera-yaw-offset-deg") + 1], "90.0"
         )
         self.assertEqual(command[command.index("--expected-ue-pid") + 1], "4242")
+        self.assertNotIn("--ue-camera-state-file", command)
         self.assertEqual(
             command[command.index("--mouse-settings-file") + 1],
             "/home/user/.config/matrix/mouse-control.json",
@@ -1903,6 +1953,47 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "50.0",
         )
         self.assertEqual(popen.call_args.kwargs["cwd"], Path("/matrix"))
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_native_process_group_forwards_final_pov_state_file(self, popen) -> None:
+        process = mock.Mock()
+        process.pid = 4243
+        popen.return_value = process
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        group.start_game_input(
+            "/runtime/python",
+            Path("/matrix/scripts/matrix_game_control_input.py"),
+            input_socket=Path("/run/user/1000/matrix-game.sock"),
+            input_source="keyboard",
+            camera_yaw_source="ue-final-pov",
+            ue_camera_state_file=Path("/run/user/1000/camera-state.bin"),
+            look_button="left",
+            initial_camera_yaw_deg=0.0,
+            mouse_sensitivity_deg=0.12,
+            camera_yaw_sign=-1,
+            camera_yaw_offset_deg=0.0,
+            carla_host="127.0.0.1",
+            carla_port=2000,
+            gamepad_look_yaw_rate_deg_s=120.0,
+            gamepad_look_pitch_rate_deg_s=90.0,
+            gamepad_look_deadzone=0.12,
+            gamepad_look_min_pitch_deg=-80.0,
+            gamepad_look_max_pitch_deg=60.0,
+            focus_title="matrix",
+            expected_ue_pid=4242,
+            status_file=None,
+        )
+
+        guarded = popen.call_args.args[0]
+        command = guarded[guarded.index("--") + 1 :]
+        self.assertEqual(
+            command[command.index("--camera-yaw-source") + 1],
+            "ue-final-pov",
+        )
+        self.assertEqual(
+            command[command.index("--ue-camera-state-file") + 1],
+            "/run/user/1000/camera-state.bin",
+        )
 
     def test_process_group_prepends_sonic_to_existing_pythonpath(self) -> None:
         group = MODULE.NativeProcessGroup(

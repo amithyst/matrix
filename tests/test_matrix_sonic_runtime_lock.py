@@ -374,7 +374,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn('--expected-parent-pid "$$"', run_sim)
         self.assertIn("RUN_SIM_PARENT_PID", run_sim)
         self.assertIn("handle_signal 143", run_sim)
-        for source in ("x11-core-gated", "x11-absolute"):
+        for source in ("x11-core-gated", "x11-absolute", "ue-final-pov"):
             self.assertIn(
                 f'"${{MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}}" == "{source}"',
                 run_sim,

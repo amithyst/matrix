@@ -8,8 +8,8 @@ that native wire.  Complete input snapshots instead travel over a local Linux
 control core.
 
 The default backend polls X11 with ``libX11`` and Linux ``/dev/input/js*``
-directly, so no pygame, evdev, or Python Xlib package is required.  A CARLA
-spectator yaw reader is optional and imported only when explicitly selected.
+directly, so no pygame, evdev, or Python Xlib package is required.  CARLA and
+the supervised UE final-POV reader are imported only when explicitly selected.
 """
 
 from __future__ import annotations
@@ -601,7 +601,8 @@ def effective_input_source(requested: str, camera_yaw_source: str) -> str:
     right-stick camera response.  The mirrors observe input-side motion, but
     packaged-UE consumption has not been verified and none is a final rendered
     camera readback.  Auto therefore degrades to keyboard-only, while an
-    explicit gamepad request fails instead of silently diverging.
+    explicit gamepad request fails instead of silently diverging.  CARLA and
+    ``ue-final-pov`` provide an observed yaw and retain the requested source.
     """
     if requested not in {"auto", "keyboard", "gamepad"}:
         raise ValueError(f"unsupported input source: {requested}")
@@ -610,14 +611,39 @@ def effective_input_source(requested: str, camera_yaw_source: str) -> str:
         "x11-mirror",
         "x11-core-gated",
         "x11-absolute",
+        "ue-final-pov",
         "carla",
     }:
         raise ValueError(f"unsupported camera yaw source: {camera_yaw_source}")
-    if camera_yaw_source == "carla":
+    if camera_yaw_source in {"carla", "ue-final-pov"}:
         return requested
     if requested == "gamepad":
-        raise ValueError("gamepad input requires an observed CARLA camera yaw")
+        raise ValueError(
+            "gamepad input requires an observed CARLA or UE final-POV camera yaw"
+        )
     return "keyboard" if requested == "auto" else requested
+
+
+def captures_xi2_drag_boundaries(camera_yaw_source: str) -> bool:
+    """Whether XI2 must observe native look-button boundaries for a source."""
+
+    if camera_yaw_source not in {
+        "fixed",
+        "x11-mirror",
+        "x11-core-gated",
+        "x11-absolute",
+        "ue-final-pov",
+        "carla",
+    }:
+        raise ValueError(f"unsupported camera yaw source: {camera_yaw_source}")
+    # ue-final-pov gets yaw from UE memory, but still needs XI2's raw
+    # press/motion/release edges to distinguish operator look input from
+    # automatic robot-follow camera rotation.
+    return camera_yaw_source in {
+        "x11-mirror",
+        "x11-core-gated",
+        "ue-final-pov",
+    }
 
 
 def gamepad_input_available(
@@ -714,6 +740,8 @@ def mirror_sensitivity_mapping(
         units = "degrees_per_xi2_raw_unit"
     elif camera_yaw_source == "x11-absolute":
         units = "degrees_per_x11_root_pixel"
+    elif camera_yaw_source == "ue-final-pov":
+        units = "absolute_degrees_from_player_camera_manager_final_pov"
     else:
         units = "degrees_per_unobserved_input_unit"
     return {
@@ -772,6 +800,11 @@ def camera_source_claim(source: str) -> dict[str, object]:
             "x11_absolute_pointer_delta_mirror_not_final_view",
             "xquerypointer_core_level_sampled_at_50hz",
         ),
+        "ue-final-pov": (
+            "ue_player_camera_manager_final_pov_state",
+            "player_camera_manager_final_pov",
+            "not_applicable_final_pov_observer",
+        ),
         "carla": (
             "carla_spectator_rpc_write_readback",
             "carla_spectator_not_verified_final_view",
@@ -788,7 +821,10 @@ def camera_source_claim(source: str) -> dict[str, object]:
         "camera_yaw_truth_scope": truth_scope,
         "button_gate_truth_scope": button_scope,
         "legacy": source == "x11-absolute",
-        "experimental": source in {"x11-core-gated", "x11-absolute"},
+        "experimental": source
+        in {"x11-core-gated", "x11-absolute", "ue-final-pov"},
+        # The source names UE's final PlayerCameraManager POV, but live visual
+        # and cardinal-direction acceptance remains outstanding.
         "visible_follow_camera_verified": False,
     }
 
@@ -805,6 +841,150 @@ def initial_sequence(clock: Callable[[], int] = time.monotonic_ns) -> int:
 
 class CameraYawReader(Protocol):
     def read(self, now: float) -> float | None: ...
+
+
+@dataclass(frozen=True)
+class UeFinalPovObservation:
+    """One fail-closed final-POV observation used by the input loop.
+
+    ``angles_changed`` is diagnostic only.  A centered third-person camera can
+    rotate with the robot even when the operator is not touching the mouse, so
+    final-POV motion alone is not evidence of an active drag.  The X11/XI2
+    button-boundary observer owns the locomotion interlock.
+    """
+
+    yaw_rad: float | None
+    error: str | None
+    angles_changed: bool = False
+    max_angle_delta_deg: float = 0.0
+    sequence: int | None = None
+    sample_age_ms: float | None = None
+    pitch_deg: float | None = None
+    roll_deg: float | None = None
+    cache_timestamp_s: float | None = None
+
+
+def ue_final_pov_telemetry(
+    observation: UeFinalPovObservation | None,
+) -> dict[str, object]:
+    """Expose live probe health without feeding diagnostics back into control."""
+
+    if observation is None:
+        return {
+            "available": False,
+            "error": "not_sampled",
+            "sequence": None,
+            "sample_age_ms": None,
+            "provider_yaw_deg": None,
+            "pitch_deg": None,
+            "roll_deg": None,
+            "cache_timestamp_s": None,
+            "angles_changed": False,
+            "max_angle_delta_deg": 0.0,
+        }
+    return {
+        "available": observation.yaw_rad is not None,
+        "error": observation.error,
+        "sequence": observation.sequence,
+        "sample_age_ms": observation.sample_age_ms,
+        "provider_yaw_deg": (
+            math.degrees(observation.yaw_rad)
+            if observation.yaw_rad is not None
+            else None
+        ),
+        "pitch_deg": observation.pitch_deg,
+        "roll_deg": observation.roll_deg,
+        "cache_timestamp_s": observation.cache_timestamp_s,
+        "angles_changed": observation.angles_changed,
+        "max_angle_delta_deg": observation.max_angle_delta_deg,
+    }
+
+
+class UeFinalPovYawReader:
+    """Adapt the supervised UE final-POV state into a safe yaw observation.
+
+    ``CameraStateReader`` owns file integrity, freshness, sequence and exact UE
+    PID validation.  This adapter deliberately does not infer mouse-button
+    state from camera motion: robot-follow rotation changes the final POV too.
+    Missing/stale state still fails closed through ``camera_available=False``;
+    actual press/drag/release boundaries are observed independently by XI2.
+    """
+
+    def __init__(
+        self,
+        state_file: Path,
+        *,
+        expected_ue_pid: int,
+        reader: Any | None = None,
+    ) -> None:
+        if reader is None:
+            module = importlib.import_module("matrix_ue_camera_probe")
+            reader = module.CameraStateReader(
+                state_file,
+                expected_ue_pid=expected_ue_pid,
+            )
+        self._reader = reader
+
+    @property
+    def last_error(self) -> str | None:
+        value = getattr(self._reader, "last_error", None)
+        return value if isinstance(value, str) else None
+
+    def read(self, now: float) -> UeFinalPovObservation:
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("final-POV read time must be finite and non-negative")
+        state = self._reader.read(now_monotonic_ns=int(now * 1_000_000_000))
+        if state is None:
+            return UeFinalPovObservation(
+                yaw_rad=None,
+                error=self.last_error,
+            )
+        yaw_deg = float(state.yaw_deg)
+        if not math.isfinite(yaw_deg):
+            return UeFinalPovObservation(
+                yaw_rad=None,
+                error="non_finite_yaw",
+            )
+        max_angle_delta_deg = float(
+            getattr(self._reader, "max_angle_delta_deg", 0.0)
+        )
+        if not math.isfinite(max_angle_delta_deg) or max_angle_delta_deg < 0.0:
+            max_angle_delta_deg = 0.0
+        state_monotonic_ns = getattr(state, "monotonic_ns", None)
+        sample_age_ms: float | None = None
+        now_ns = int(now * 1_000_000_000)
+        if (
+            isinstance(state_monotonic_ns, int)
+            and not isinstance(state_monotonic_ns, bool)
+            and 0 < state_monotonic_ns <= now_ns
+        ):
+            sample_age_ms = (now_ns - state_monotonic_ns) / 1_000_000.0
+
+        def finite_optional(name: str) -> float | None:
+            value = getattr(state, name, None)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            result = float(value)
+            return result if math.isfinite(result) else None
+
+        sequence = getattr(state, "sequence", None)
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence <= 0
+        ):
+            sequence = None
+        return UeFinalPovObservation(
+            yaw_rad=math.radians(yaw_deg),
+            error=None,
+            angles_changed=bool(getattr(self._reader, "angles_changed", False)),
+            max_angle_delta_deg=max_angle_delta_deg,
+            sequence=sequence,
+            sample_age_ms=sample_age_ms,
+            pitch_deg=finite_optional("pitch_deg"),
+            roll_deg=finite_optional("roll_deg"),
+            cache_timestamp_s=finite_optional("cache_timestamp_s"),
+        )
 
 
 class CarlaSpectatorYawReader:
@@ -3021,6 +3201,7 @@ def _parse_args() -> argparse.Namespace:
             "x11-mirror",
             "x11-core-gated",
             "x11-absolute",
+            "ue-final-pov",
             "carla",
             "fixed",
         ),
@@ -3029,8 +3210,14 @@ def _parse_args() -> argparse.Namespace:
             "fixed is safe until runtime probing succeeds; x11-mirror requires "
             "XI2 raw button edges; x11-core-gated experimentally gates XI2 raw "
             "motion with the X11 core button; x11-absolute mirrors root-pointer "
-            "deltas; none reads back or drives the visible camera"
+            "deltas; ue-final-pov reads the supervised PlayerCameraManager "
+            "final POV; the X11 sources do not read back the visible camera"
         ),
+    )
+    parser.add_argument(
+        "--ue-camera-state-file",
+        type=Path,
+        help="Supervised fresh PlayerCameraManager final-POV state",
     )
     parser.add_argument(
         "--initial-camera-yaw-deg",
@@ -3146,6 +3333,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--expected-ue-pid must be greater than 1")
     if args.expected_ue_pid is None and not args.dry_run:
         raise SystemExit("--expected-ue-pid is required outside --dry-run")
+    if args.camera_yaw_source == "ue-final-pov":
+        if args.expected_ue_pid is None:
+            raise SystemExit("--expected-ue-pid is required for ue-final-pov")
+        if args.ue_camera_state_file is None:
+            raise SystemExit("--ue-camera-state-file is required for ue-final-pov")
+        if not args.ue_camera_state_file.is_absolute():
+            raise SystemExit("--ue-camera-state-file must be absolute")
     if args.calibration_state_file is not None:
         if not args.calibration_state_file.is_absolute():
             raise SystemExit("--calibration-state-file must be an absolute path")
@@ -3214,8 +3408,9 @@ def main() -> int:
             focus_title_pattern=focus_pattern,
             expected_ue_pid=args.expected_ue_pid,
             look_button=args.look_button,
-            capture_raw_motion=args.camera_yaw_source
-            in {"x11-mirror", "x11-core-gated"},
+            capture_raw_motion=captures_xi2_drag_boundaries(
+                args.camera_yaw_source
+            ),
             capture_absolute_motion=args.camera_yaw_source == "x11-absolute",
             raw_button_gate=(
                 "x11-core-level"
@@ -3265,6 +3460,19 @@ def main() -> int:
             minimum_pitch_rad=math.radians(args.gamepad_look_min_pitch_deg),
             maximum_pitch_rad=math.radians(args.gamepad_look_max_pitch_deg),
         )
+    ue_final_pov_reader: UeFinalPovYawReader | None = None
+    if args.camera_yaw_source == "ue-final-pov":
+        assert args.ue_camera_state_file is not None
+        assert args.expected_ue_pid is not None
+        try:
+            ue_final_pov_reader = UeFinalPovYawReader(
+                args.ue_camera_state_file,
+                expected_ue_pid=args.expected_ue_pid,
+            )
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            raise SystemExit(
+                f"Matrix game-control input cannot initialize UE final-POV reader: {exc}"
+            ) from exc
     publisher = None if args.dry_run else UnixSeqpacketPublisher(args.socket)
     calibration = CalibrationModeController()
     shortcut_arming = StartupShortcutArming()
@@ -3295,6 +3503,7 @@ def main() -> int:
     next_overlay_heartbeat = started
     last_teleport_rejections = 0
     calibration_neutral_frames = 0
+    final_pov_observation: UeFinalPovObservation | None = None
     provider_yaw = tracker.yaw
     camera_yaw = transform_camera_yaw(
         provider_yaw,
@@ -3325,6 +3534,7 @@ def main() -> int:
                         provider_yaw_rad=provider_yaw,
                         sonic_yaw_rad=camera_yaw,
                     ),
+                    "ue_final_pov": ue_final_pov_telemetry(None),
                 }
             )
         while running:
@@ -3437,7 +3647,17 @@ def main() -> int:
                 if carla_reader is not None
                 else None
             )
-            camera_available = args.camera_yaw_source != "carla" or observed_yaw is not None
+            final_pov_observation = (
+                ue_final_pov_reader.read(now)
+                if ue_final_pov_reader is not None
+                else None
+            )
+            if final_pov_observation is not None:
+                observed_yaw = final_pov_observation.yaw_rad
+            camera_available = (
+                args.camera_yaw_source not in {"carla", "ue-final-pov"}
+                or observed_yaw is not None
+            )
             provider_yaw = tracker.update(
                 dt=dt,
                 mouse_dx=(
@@ -3490,6 +3710,9 @@ def main() -> int:
                                 args.camera_yaw_source,
                                 provider_yaw_rad=provider_yaw,
                                 sonic_yaw_rad=camera_yaw,
+                            ),
+                            "ue_final_pov": ue_final_pov_telemetry(
+                                final_pov_observation
                             ),
                             "pointer": pointer_telemetry,
                         }
@@ -3555,6 +3778,9 @@ def main() -> int:
                     args.camera_yaw_source,
                     provider_yaw_rad=provider_yaw,
                     sonic_yaw_rad=camera_yaw,
+                ),
+                "ue_final_pov": ue_final_pov_telemetry(
+                    final_pov_observation
                 ),
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),

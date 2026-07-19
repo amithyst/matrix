@@ -100,10 +100,16 @@ def _parse_args() -> argparse.Namespace:
             "x11-mirror",
             "x11-core-gated",
             "x11-absolute",
+            "ue-final-pov",
             "carla",
             "fixed",
         ),
         default="fixed",
+    )
+    parser.add_argument(
+        "--game-ue-camera-state-file",
+        type=Path,
+        help="Supervised fresh PlayerCameraManager final-POV state",
     )
     parser.add_argument(
         "--game-look-button", choices=("left", "middle", "right"), default="left"
@@ -904,7 +910,11 @@ def _validate_qualified_game_control(args: argparse.Namespace) -> None:
         raise SystemExit(
             "qualified game control rejects an unobserved fixed camera yaw"
         )
-    if args.game_camera_yaw_source in {"x11-core-gated", "x11-absolute"}:
+    if args.game_camera_yaw_source in {
+        "x11-core-gated",
+        "x11-absolute",
+        "ue-final-pov",
+    }:
         raise SystemExit(
             "qualified game control rejects experimental camera yaw sources"
         )
@@ -1299,12 +1309,19 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         yaw_observation = "xquerypointer_root_absolute_delta"
         yaw_truth_scope = "x11_absolute_pointer_delta_mirror_not_final_view"
         button_gate_truth_scope = "xquerypointer_core_level_sampled_at_50hz"
+    elif source == "ue-final-pov":
+        yaw_observation = "ue_player_camera_manager_final_pov_state"
+        yaw_truth_scope = "player_camera_manager_final_pov"
+        button_gate_truth_scope = "not_applicable_final_pov_observer"
     else:
         yaw_observation = "carla_spectator_rpc_write_readback"
         yaw_truth_scope = "carla_spectator_not_verified_final_view"
         button_gate_truth_scope = "not_applicable_carla_rpc"
     effective_input_source = args.game_input_source
-    if source != "carla" and effective_input_source == "auto":
+    if (
+        source not in {"carla", "ue-final-pov"}
+        and effective_input_source == "auto"
+    ):
         effective_input_source = "keyboard"
     applied_mouse_scale = args.game_applied_mouse_speed_scale
     effective_mouse_sensitivity = (
@@ -1314,6 +1331,8 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         sensitivity_units = "degrees_per_xi2_raw_unit"
     elif source == "x11-absolute":
         sensitivity_units = "degrees_per_x11_root_pixel"
+    elif source == "ue-final-pov":
+        sensitivity_units = "absolute_degrees_from_player_camera_manager_final_pov"
     else:
         sensitivity_units = "degrees_per_unobserved_input_unit"
     return {
@@ -1352,7 +1371,11 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "camera_yaw_truth_scope": yaw_truth_scope,
         "button_gate_truth_scope": button_gate_truth_scope,
         "legacy": source == "x11-absolute",
-        "experimental": source in {"x11-core-gated", "x11-absolute"},
+        "experimental": source
+        in {"x11-core-gated", "x11-absolute", "ue-final-pov"},
+        "ue_camera_state_file": os.fspath(args.game_ue_camera_state_file)
+        if getattr(args, "game_ue_camera_state_file", None) is not None
+        else None,
         "camera_yaw_sign": args.game_camera_yaw_sign,
         "camera_yaw_offset_deg": args.game_camera_yaw_offset_deg,
         "initial_camera_yaw_deg": args.game_initial_camera_yaw_deg,
@@ -1382,10 +1405,9 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "gamepad_look_min_pitch_deg": args.gamepad_look_min_pitch_deg,
         "gamepad_look_max_pitch_deg": args.gamepad_look_max_pitch_deg,
         "carla_write_readback_tolerance_deg": 0.5,
-        # Neither pointer integration nor a CARLA spectator transform proves
-        # that the cooked Matrix follow camera rendered the same direction.
-        # Qualified status therefore names its scope instead of over-claiming
-        # a visual camera-relative acceptance result.
+        # Pointer integration and CARLA do not prove the cooked final view.
+        # ue-final-pov names PlayerCameraManager's final POV, but remains
+        # experimental until live visual/cardinal acceptance succeeds.
         "qualification_scope": "runtime_input_and_motion_path_only",
         "visible_follow_camera_verified": False,
         "external_visual_evidence_required": True,
@@ -2105,6 +2127,7 @@ class NativeProcessGroup:
         focus_title: str,
         expected_ue_pid: int,
         status_file: Path | None,
+        ue_camera_state_file: Path | None = None,
         mouse_settings_file: Path | None = None,
         applied_mouse_profile: str = "local",
         applied_mouse_speed_scale: float = 1.0,
@@ -2157,6 +2180,8 @@ class NativeProcessGroup:
         ]
         if mouse_settings_file is not None:
             command.extend(("--mouse-settings-file", str(mouse_settings_file)))
+        if ue_camera_state_file is not None:
+            command.extend(("--ue-camera-state-file", str(ue_camera_state_file)))
         restart_values = (
             restart_request_file,
             restart_capability_file,
@@ -2423,6 +2448,13 @@ def main() -> int:
             and not args.game_mouse_settings_file.is_absolute()
         ):
             raise SystemExit("--game-mouse-settings-file must be absolute")
+        if args.game_camera_yaw_source == "ue-final-pov":
+            if args.game_ue_camera_state_file is None:
+                raise SystemExit(
+                    "--game-ue-camera-state-file is required for ue-final-pov"
+                )
+            if not args.game_ue_camera_state_file.is_absolute():
+                raise SystemExit("--game-ue-camera-state-file must be absolute")
         restart_values = (
             args.game_restart_request_file,
             args.game_restart_capability_file,
@@ -2671,6 +2703,7 @@ def main() -> int:
                         focus_title=args.game_focus_title,
                         expected_ue_pid=args.ue_pid,
                         status_file=args.game_input_status_file,
+                        ue_camera_state_file=args.game_ue_camera_state_file,
                     )
                     game_input.bind_expected_peer_pid(provider_pid)
         elif running and args.control_source == "pico":

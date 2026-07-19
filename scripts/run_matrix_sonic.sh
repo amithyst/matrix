@@ -102,7 +102,7 @@ usage() {
         "  --name NAME                Custom robot cache name (default: g1_29dof)" \
         "  --control-source SOURCE    planner, game, pico, or external (default: planner)" \
         "  --game-input-source SOURCE auto, keyboard, or gamepad (default: auto)" \
-        "  --game-camera-yaw-source S x11-mirror, x11-core-gated, x11-absolute, carla, or fixed" \
+        "  --game-camera-yaw-source S ue-final-pov, x11-mirror, x11-core-gated, x11-absolute, carla, or fixed" \
         "  --game-look-button BUTTON  Camera drag button: left, middle, or right" \
         "  --game-initial-yaw DEG     Initial provider/UE camera yaw before sign and offset" \
         "  --game-mouse-sensitivity DEG_PER_UNIT  Calibrated selected X11 mirror scale (default: 0.12)" \
@@ -298,7 +298,8 @@ if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
             exit 2
         fi
         if [[ "$GAME_CAMERA_YAW_SOURCE" == "x11-core-gated" \
-            || "$GAME_CAMERA_YAW_SOURCE" == "x11-absolute" ]]; then
+            || "$GAME_CAMERA_YAW_SOURCE" == "x11-absolute" \
+            || "$GAME_CAMERA_YAW_SOURCE" == "ue-final-pov" ]]; then
             echo "[ERROR] Bounded game-control qualification rejects experimental camera yaw sources" >&2
             exit 2
         fi

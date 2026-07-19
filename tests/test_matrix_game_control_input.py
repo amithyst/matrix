@@ -227,6 +227,13 @@ class SourceArbitrationTest(unittest.TestCase):
         self.assertEqual(
             MODULE.effective_input_source("gamepad", "carla"), "gamepad"
         )
+        self.assertEqual(
+            MODULE.effective_input_source("auto", "ue-final-pov"), "auto"
+        )
+        self.assertEqual(
+            MODULE.effective_input_source("gamepad", "ue-final-pov"),
+            "gamepad",
+        )
         with self.assertRaisesRegex(ValueError, "observed CARLA"):
             MODULE.effective_input_source("gamepad", "fixed")
 
@@ -323,6 +330,140 @@ class SnapshotTest(unittest.TestCase):
         )
         self.assertFalse(snapshot.focused)
         self.assertTrue(snapshot.keys.w)
+
+
+class UeFinalPovYawReaderTest(unittest.TestCase):
+    class State:
+        def __init__(self, yaw_deg: float) -> None:
+            self.yaw_deg = yaw_deg
+            self.pitch_deg = -12.0
+            self.roll_deg = 0.5
+            self.sequence = 7
+            self.monotonic_ns = 999_000_000
+            self.cache_timestamp_s = 42.0
+
+    class Reader:
+        def __init__(self, samples) -> None:
+            self.samples = iter(samples)
+            self.angles_changed = False
+            self.max_angle_delta_deg = 0.0
+            self.last_error = None
+            self.read_times = []
+
+        def read(self, *, now_monotonic_ns: int):
+            self.read_times.append(now_monotonic_ns)
+            state, self.angles_changed, self.last_error = next(self.samples)
+            self.max_angle_delta_deg = 12.5 if self.angles_changed else 0.0
+            return state
+
+    def adapter(self, samples):
+        reader = self.Reader(samples)
+        adapter = MODULE.UeFinalPovYawReader(
+            Path("/run/user/1000/camera-state.bin"),
+            expected_ue_pid=4242,
+            reader=reader,
+        )
+        return adapter, reader
+
+    def test_missing_and_stale_state_fail_closed_then_recovery_is_observable(self) -> None:
+        adapter, reader = self.adapter(
+            (
+                (None, False, "missing_file"),
+                (None, False, "stale"),
+                (self.State(30.0), False, None),
+            )
+        )
+
+        missing = adapter.read(10.0)
+        stale = adapter.read(10.02)
+        recovered = adapter.read(10.04)
+
+        self.assertIsNone(missing.yaw_rad)
+        self.assertEqual(missing.error, "missing_file")
+        self.assertIsNone(stale.yaw_rad)
+        self.assertEqual(stale.error, "stale")
+        self.assertAlmostEqual(recovered.yaw_rad, math.radians(30.0))
+        self.assertFalse(recovered.angles_changed)
+        self.assertEqual(
+            reader.read_times,
+            [10_000_000_000, 10_020_000_000, 10_040_000_000],
+        )
+
+    def test_robot_follow_angle_change_does_not_impersonate_a_mouse_drag(self) -> None:
+        adapter, _reader = self.adapter(
+            (
+                (self.State(0.0), False, None),
+                # A centered camera can rotate as a consequence of robot
+                # motion, without an operator mouse-button boundary.
+                (self.State(0.0), True, None),
+                (self.State(0.0), False, None),
+                (self.State(0.0), False, None),
+                (self.State(0.0), False, None),
+            )
+        )
+        core = CORE.GameControlCore(
+            CORE.ControlConfig(
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+
+        def deliver(sequence: int, timestamp: float, *, w: bool):
+            observation = adapter.read(timestamp)
+            keyboard = MODULE.KeyboardMouseSample(
+                w=w,
+                focused=True,
+            )
+            snapshot = MODULE.build_snapshot(
+                sequence=sequence,
+                timestamp_monotonic_s=timestamp,
+                keyboard=keyboard,
+                gamepad=MODULE.GamepadSample(),
+                input_source="keyboard",
+                camera_yaw_rad=observation.yaw_rad or 0.0,
+                camera_available=observation.yaw_rad is not None,
+            )
+            core.accept_snapshot(snapshot, received_at_s=timestamp)
+            return core.command(now_s=timestamp, dt_s=1.0)
+
+        self.assertFalse(deliver(1, 1.00, w=False).safe_stop)
+        moving = deliver(2, 1.01, w=True)
+        self.assertFalse(moving.safe_stop)
+        self.assertEqual(moving.mode, "move")
+        observation = adapter.read(1.02)
+        self.assertFalse(observation.angles_changed)
+        self.assertEqual(observation.max_angle_delta_deg, 0.0)
+        self.assertFalse(deliver(4, 1.03, w=False).safe_stop)
+        self.assertFalse(deliver(5, 1.04, w=True).safe_stop)
+
+    def test_final_pov_yaw_uses_provider_sign_and_offset_transform(self) -> None:
+        adapter, _reader = self.adapter(((self.State(30.0), False, None),))
+        observation = adapter.read(1.0)
+        assert observation.yaw_rad is not None
+        sonic_yaw = MODULE.transform_camera_yaw(
+            observation.yaw_rad,
+            sign=-1,
+            offset_rad=math.radians(90.0),
+        )
+        self.assertAlmostEqual(sonic_yaw, math.radians(60.0))
+
+        telemetry = MODULE.ue_final_pov_telemetry(observation)
+        self.assertTrue(telemetry["available"])
+        self.assertEqual(telemetry["sequence"], 7)
+        self.assertEqual(telemetry["sample_age_ms"], 1.0)
+        self.assertAlmostEqual(telemetry["provider_yaw_deg"], 30.0)
+        self.assertEqual(telemetry["pitch_deg"], -12.0)
+        self.assertEqual(telemetry["cache_timestamp_s"], 42.0)
+
+    def test_final_pov_uses_xi2_only_for_drag_boundaries(self) -> None:
+        self.assertTrue(MODULE.captures_xi2_drag_boundaries("ue-final-pov"))
+        self.assertTrue(MODULE.captures_xi2_drag_boundaries("x11-mirror"))
+        self.assertTrue(MODULE.captures_xi2_drag_boundaries("x11-core-gated"))
+        self.assertFalse(MODULE.captures_xi2_drag_boundaries("x11-absolute"))
+        self.assertFalse(MODULE.captures_xi2_drag_boundaries("fixed"))
+        self.assertFalse(MODULE.captures_xi2_drag_boundaries("carla"))
 
 
 class CalibrationModeTest(unittest.TestCase):
@@ -1175,6 +1316,13 @@ class CameraYawTrackerTest(unittest.TestCase):
         self.assertTrue(claim["experimental"])
         self.assertFalse(claim["legacy"])
         self.assertFalse(claim["visible_follow_camera_verified"])
+        final_pov = MODULE.camera_source_claim("ue-final-pov")
+        self.assertEqual(
+            final_pov["camera_yaw_truth_scope"],
+            "player_camera_manager_final_pov",
+        )
+        self.assertTrue(final_pov["experimental"])
+        self.assertFalse(final_pov["visible_follow_camera_verified"])
 
 
 class CarlaSpectatorCameraTest(unittest.TestCase):
@@ -2966,6 +3114,44 @@ class CameraYawSourceCliTest(unittest.TestCase):
             ):
                 args = MODULE._parse_args()
                 self.assertEqual(args.camera_yaw_source, source)
+
+    def test_provider_parser_accepts_final_pov_state_file(self) -> None:
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                "--camera-yaw-source",
+                "ue-final-pov",
+                "--ue-camera-state-file",
+                "/run/user/1000/camera-state.bin",
+                "--expected-ue-pid",
+                "4242",
+                "--dry-run",
+            ],
+        ):
+            args = MODULE._parse_args()
+        MODULE._validate_args(args)
+        self.assertEqual(args.camera_yaw_source, "ue-final-pov")
+        self.assertEqual(
+            args.ue_camera_state_file,
+            Path("/run/user/1000/camera-state.bin"),
+        )
+
+    def test_final_pov_requires_state_file_and_exact_pid(self) -> None:
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                "--camera-yaw-source",
+                "ue-final-pov",
+                "--dry-run",
+            ],
+        ):
+            args = MODULE._parse_args()
+        with self.assertRaisesRegex(SystemExit, "expected-ue-pid"):
+            MODULE._validate_args(args)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
 MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
 MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
+MATRIX_UE_CAMERA_LAYOUT="${MATRIX_UE_CAMERA_LAYOUT:-$PROJECT_ROOT/config/runtime/matrix-ue-camera-layout-v1.json}"
 CENTERED_CAMERA_OVERLAY_STEM="pakchunk99-MatrixCentered-Linux_P"
 MATRIX_GAME_CAMERA_DISTANCE_CM="${MATRIX_GAME_CAMERA_DISTANCE_CM:-150}"
 
@@ -180,6 +181,7 @@ UE_CONTROL_FD=""
 UE_LIFECYCLE_DIR=""
 UE_FAILURE_FILE=""
 UE_PID_FILE=""
+UE_CAMERA_STATE_FILE=""
 RUN_SIM_PARENT_PID="${MATRIX_SONIC_LAUNCHER_PID:-$PPID}"
 CLEANUP_STARTED=0
 CLEANUP_FAILED=0
@@ -221,6 +223,18 @@ start_supervised_ue() {
     UE_LIFECYCLE_DIR="$(mktemp -d "$PROJECT_ROOT/outputs/.matrix-ue-lifecycle.XXXXXX")"
     UE_FAILURE_FILE="$UE_LIFECYCLE_DIR/failure.json"
     UE_PID_FILE="$UE_LIFECYCLE_DIR/ue.pid"
+    local -a camera_probe_args=()
+    if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
+        if [[ ! -f "$MATRIX_UE_CAMERA_LAYOUT" ]]; then
+            echo "[ERROR] UE final-POV layout is missing: $MATRIX_UE_CAMERA_LAYOUT" >&2
+            return 1
+        fi
+        UE_CAMERA_STATE_FILE="$UE_LIFECYCLE_DIR/camera-state.bin"
+        camera_probe_args=(
+            --camera-state-file "$UE_CAMERA_STATE_FILE"
+            --camera-layout "$MATRIX_UE_CAMERA_LAYOUT"
+        )
+    fi
     local supervisor_python="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
     coproc MATRIX_UE_SUPERVISOR {
         exec "$supervisor_python" "$PROJECT_ROOT/scripts/supervise_matrix_ue.py" \
@@ -228,6 +242,7 @@ start_supervised_ue() {
             --failure-file "$UE_FAILURE_FILE" \
             --log "$ue_log" \
             --expected-parent-pid "$$" \
+            "${camera_probe_args[@]}" \
             -- "${ue_command[@]}"
     }
     UE_SUPERVISOR_PID="$MATRIX_UE_SUPERVISOR_PID"
@@ -943,7 +958,8 @@ if $MATRIX_SONIC_ENABLED \
         exit 1
     fi
     if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "x11-core-gated" \
-        || "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "x11-absolute" ]]; then
+        || "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "x11-absolute" \
+        || "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
         echo "[ERROR] Qualified game control rejects experimental camera yaw sources" >&2
         exit 1
     fi
@@ -1279,6 +1295,15 @@ if $MATRIX_SONIC_ENABLED; then
         --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
+    if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
+        if [[ -z "$UE_CAMERA_STATE_FILE" ]]; then
+            echo "[ERROR] UE final-POV state file was not initialized" >&2
+            exit 1
+        fi
+        GAME_INPUT_ARGS+=(
+            --game-ue-camera-state-file "$UE_CAMERA_STATE_FILE"
+        )
+    fi
     if [[ -n "${MATRIX_GAME_RESTART_REQUEST_FILE:-}" \
         && -n "${MATRIX_GAME_RESTART_CAPABILITY_FILE:-}" \
         && -n "${MATRIX_SONIC_LAUNCHER_PID:-}" ]]; then

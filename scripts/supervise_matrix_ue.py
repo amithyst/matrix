@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from functools import partial
+import importlib
 import json
 import os
 from pathlib import Path
@@ -14,13 +15,184 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from exec_with_parent_death_signal import _arm_parent_death_signal
 
 
 UNKNOWN_EXIT_CODE = 255
 SPAWN_FAILURE_EXIT_CODE = 127
+CAMERA_SAMPLE_INTERVAL_SECONDS = 0.02
+CAMERA_BIND_TIMEOUT_SECONDS = 15.0
+
+
+class _CameraProbeRuntime:
+    """Own one final-POV probe and its single-writer state file.
+
+    Probe and state failures are control-data failures, not permission to kill
+    UE.  Every service call therefore either writes the sampled final POV or a
+    fresh invalid record and returns to the supervisor loop.
+    """
+
+    def __init__(
+        self,
+        module: Any,
+        probe: Any | None,
+        writer: Any,
+        *,
+        initialization_error: str | None = None,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        self._module = module
+        self._probe = probe
+        self._writer = writer
+        self._monotonic_ns = monotonic_ns
+        self.bound = False
+        self.closed = False
+        self.initialization_error = initialization_error
+        self._last_diagnostic: str | None = None
+        if initialization_error is not None:
+            self._diagnose(initialization_error)
+
+    @classmethod
+    def open(cls, state_file: Path, layout_file: Path) -> "_CameraProbeRuntime":
+        module = importlib.import_module("matrix_ue_camera_probe")
+        writer = module.CameraStateWriter(state_file)
+        try:
+            layout = module.load_layout(layout_file)
+            probe = module.UECameraProbe(layout)
+        except Exception as exc:
+            return cls(
+                module,
+                None,
+                writer,
+                initialization_error=(
+                    f"probe_initialization_failed:{type(exc).__name__}:{exc}"
+                ),
+            )
+        return cls(module, probe, writer)
+
+    @property
+    def probe_ready(self) -> bool:
+        return self._probe is not None
+
+    def _diagnose(self, message: str) -> None:
+        if message == self._last_diagnostic:
+            return
+        self._last_diagnostic = message
+        try:
+            print(
+                f"matrix-ue-supervisor CAMERA {message}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
+
+    def _invalid_observation(self, pid: int, error_code: Any) -> Any:
+        return self._module.CameraProbeObservation(
+            ue_pid=pid,
+            monotonic_ns=max(1, int(self._monotonic_ns())),
+            valid=False,
+            error_code=error_code,
+        )
+
+    def _write(self, observation: Any) -> bool:
+        if self.closed:
+            return False
+        try:
+            self._writer.write(observation)
+        except Exception as exc:
+            self._diagnose(f"state_write_failed:{type(exc).__name__}:{exc}")
+            return False
+        return True
+
+    def invalidate(self, pid: int, *, identity: bool = False) -> bool:
+        error_code = (
+            self._module.ProbeError.IDENTITY_MISMATCH
+            if identity
+            else self._module.ProbeError.INTERNAL
+        )
+        return self._write(self._invalid_observation(pid, error_code))
+
+    def try_bind(self, pid: int) -> bool:
+        if self.bound:
+            return True
+        if self._probe is None:
+            self.invalidate(pid)
+            return False
+        try:
+            duration_ns = self._probe.bind(pid)
+        except Exception as exc:
+            # The direct child initially executes env/bash before the UE script
+            # execs the packaged binary under the same PID.  Identity mismatch
+            # is therefore retried by the bounded supervisor startup state.
+            self._diagnose(f"bind_pending:{type(exc).__name__}:{exc}")
+            self.invalidate(pid, identity=True)
+            return False
+        self.bound = True
+        self._last_diagnostic = None
+        if isinstance(duration_ns, int) and duration_ns >= 0:
+            self._diagnose(f"bound:identity_verification_ns={duration_ns}")
+        else:
+            self._diagnose("bound")
+        return True
+
+    def sample(self, pid: int) -> bool:
+        if self._probe is None:
+            return self.invalidate(pid)
+        if not self.bound:
+            return self.invalidate(pid, identity=True)
+        try:
+            observation = self._probe.sample(pid)
+        except Exception as exc:
+            self._diagnose(f"sample_failed:{type(exc).__name__}:{exc}")
+            observation = self._invalid_observation(
+                pid, self._module.ProbeError.INTERNAL
+            )
+        written = self._write(observation)
+        if not written and bool(getattr(observation, "valid", False)):
+            # If publishing a valid sample itself failed, make one immediate
+            # best-effort attempt to replace it with an explicit invalid state.
+            return self.invalidate(pid)
+        return written
+
+    def service_failed(self, pid: int, exc: Exception) -> None:
+        self._diagnose(f"service_failed:{type(exc).__name__}:{exc}")
+        self.invalidate(pid)
+
+    def close(self, pid: int | None) -> None:
+        if self.closed:
+            return
+        if pid is not None and pid > 0:
+            self.invalidate(pid)
+        try:
+            self._writer.close()
+        except Exception as exc:
+            self._diagnose(f"state_close_failed:{type(exc).__name__}:{exc}")
+        self.closed = True
+
+
+def _service_camera_probe(
+    runtime: _CameraProbeRuntime,
+    *,
+    ue_pid: int,
+    now: float,
+    bind_deadline: float,
+) -> None:
+    """Run one 50 Hz probe action without coupling failures to UE lifetime."""
+
+    if not runtime.probe_ready:
+        runtime.invalidate(ue_pid)
+    elif runtime.bound:
+        runtime.sample(ue_pid)
+    elif now < bind_deadline:
+        if runtime.try_bind(ue_pid):
+            # The first post-bind sample may still be NOT_READY while UE proves
+            # CameraCachePrivate.Timestamp is advancing.
+            runtime.sample(ue_pid)
+    else:
+        runtime.invalidate(ue_pid, identity=True)
 
 
 def _normalized_returncode(returncode: int) -> int:
@@ -111,6 +283,8 @@ def _control_event(stream: BinaryIO, timeout: float) -> str | None:
 
 def supervise(args: argparse.Namespace) -> int:
     stop_requested = False
+    camera_runtime: _CameraProbeRuntime | None = None
+    process: subprocess.Popen[bytes] | None = None
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop_requested
@@ -132,6 +306,27 @@ def supervise(args: argparse.Namespace) -> int:
         return SPAWN_FAILURE_EXIT_CODE
 
     try:
+        if args.camera_state_file is not None:
+            assert args.camera_layout is not None
+            try:
+                camera_runtime = _CameraProbeRuntime.open(
+                    args.camera_state_file,
+                    args.camera_layout,
+                )
+            except Exception as exc:
+                try:
+                    print(
+                        "matrix-ue-supervisor ERROR initializing final-POV probe: "
+                        f"{exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                # Camera observation is fail-closed data, not UE lifecycle
+                # authority.  A missing helper/writer leaves the state absent
+                # and the provider stopped, while UE still starts normally.
+                camera_runtime = None
         try:
             supervisor_pid = os.getpid()
             process = subprocess.Popen(
@@ -154,9 +349,15 @@ def supervise(args: argparse.Namespace) -> int:
             return SPAWN_FAILURE_EXIT_CODE
 
         _atomic_text(args.pid_file, f"{process.pid}\n")
+        next_camera_sample = time.monotonic()
+        camera_bind_deadline = (
+            next_camera_sample + CAMERA_BIND_TIMEOUT_SECONDS
+        )
         while True:
             returncode = _peek_returncode(process)
             if returncode is not None:
+                if camera_runtime is not None:
+                    camera_runtime.close(process.pid)
                 _publish_failure(args.failure_file, returncode)
                 final_code = _reap_process_group(
                     process,
@@ -168,7 +369,29 @@ def supervise(args: argparse.Namespace) -> int:
                     stop_requested = event in {"stop", "eof"}
                 return _normalized_returncode(final_code)
 
-            control_event = _control_event(sys.stdin.buffer, 0.02)
+            now = time.monotonic()
+            if camera_runtime is not None and now >= next_camera_sample:
+                try:
+                    _service_camera_probe(
+                        camera_runtime,
+                        ue_pid=process.pid,
+                        now=now,
+                        bind_deadline=camera_bind_deadline,
+                    )
+                except Exception as exc:
+                    # A defensive outer boundary keeps any adapter defect from
+                    # changing UE ownership/lifetime semantics.
+                    camera_runtime.service_failed(process.pid, exc)
+                next_camera_sample = (
+                    time.monotonic() + CAMERA_SAMPLE_INTERVAL_SECONDS
+                )
+            control_timeout = 0.02
+            if camera_runtime is not None:
+                control_timeout = min(
+                    control_timeout,
+                    max(0.0, next_camera_sample - time.monotonic()),
+                )
+            control_event = _control_event(sys.stdin.buffer, control_timeout)
             if (
                 control_event == "eof"
                 and not stop_requested
@@ -176,6 +399,8 @@ def supervise(args: argparse.Namespace) -> int:
             ):
                 # Losing the control writer while the launcher is still alive is
                 # a supervisor failure, not an authorized clean shutdown.
+                if camera_runtime is not None:
+                    camera_runtime.close(process.pid)
                 _publish_failure(args.failure_file, UNKNOWN_EXIT_CODE)
                 _reap_process_group(
                     process,
@@ -188,6 +413,8 @@ def supervise(args: argparse.Namespace) -> int:
                 # before this boundary is an unexpected exit, even exit code 0.
                 returncode = _peek_returncode(process)
                 if returncode is not None:
+                    if camera_runtime is not None:
+                        camera_runtime.close(process.pid)
                     _publish_failure(args.failure_file, returncode)
                     final_code = _reap_process_group(
                         process,
@@ -195,6 +422,8 @@ def supervise(args: argparse.Namespace) -> int:
                         term_grace_seconds=0.2,
                     )
                     return _normalized_returncode(final_code)
+                if camera_runtime is not None:
+                    camera_runtime.close(process.pid)
                 _reap_process_group(
                     process,
                     returncode=None,
@@ -202,6 +431,8 @@ def supervise(args: argparse.Namespace) -> int:
                 )
                 return 0
     finally:
+        if camera_runtime is not None:
+            camera_runtime.close(process.pid if process is not None else None)
         log_stream.close()
 
 
@@ -212,6 +443,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--expected-parent-pid", type=int, required=True)
     parser.add_argument("--term-grace-seconds", type=float, default=3.0)
+    parser.add_argument(
+        "--camera-state-file",
+        type=Path,
+        help="Private final-POV state file written for this UE lifetime",
+    )
+    parser.add_argument(
+        "--camera-layout",
+        type=Path,
+        help="Build-pinned PlayerCameraManager memory layout",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command[:1] == ["--"]:
@@ -222,6 +463,15 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--expected-parent-pid must identify the launcher")
     if args.term_grace_seconds < 0.0:
         parser.error("--term-grace-seconds must be non-negative")
+    camera_values = (args.camera_state_file, args.camera_layout)
+    if any(value is not None for value in camera_values) and not all(
+        value is not None for value in camera_values
+    ):
+        parser.error("--camera-state-file and --camera-layout are all-or-none")
+    for name in ("camera_state_file", "camera_layout"):
+        path = getattr(args, name)
+        if path is not None and not path.is_absolute():
+            parser.error(f"--{name.replace('_', '-')} must be absolute")
     return args
 
 

@@ -779,7 +779,7 @@ else:
                 "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             }
-            for source in ("x11-core-gated", "x11-absolute"):
+            for source in ("x11-core-gated", "x11-absolute", "ue-final-pov"):
                 with self.subTest(source=source):
                     result = subprocess.run(
                         [
