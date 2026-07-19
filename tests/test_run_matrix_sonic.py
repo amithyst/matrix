@@ -621,6 +621,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         after = self.snapshot(reset_count=1)
         after.step_index = 10
         after.qpos[2] = 0.8
+        after.qpos[3] = 1.0
         after.last_reset_reason = MODULE._RECOVERY_RESPAWN_REASON
         self.assertIsNone(
             MODULE._recovery_respawn_validation_error(before, after)
@@ -632,6 +633,48 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "respawn_reset_reason:'fall',expected="
             f"{MODULE._RECOVERY_RESPAWN_REASON!r}",
         )
+
+        after.last_reset_reason = MODULE._RECOVERY_RESPAWN_REASON
+        after.qpos[3] = 0.0
+        self.assertEqual(
+            MODULE._recovery_respawn_validation_error(before, after),
+            "respawn_root_quaternion_norm:0.0",
+        )
+
+    def test_recovery_respawn_restores_validated_initial_mujoco_state(self) -> None:
+        initial = self.snapshot()
+        initial.qpos[2] = 0.8
+        initial.qpos[3] = 1.0
+        initial.qvel[0] = 0.25
+        initial.ctrl[0] = -0.5
+        initial.applied_torque[0] = 0.75
+        data = SimpleNamespace(
+            qpos=[0.0] * 36,
+            qvel=[0.0] * 35,
+            ctrl=[0.0] * 29,
+        )
+        model = object()
+        sim_env = SimpleNamespace(
+            mj_data=data,
+            mj_model=model,
+            torques=[0.0] * 29,
+            fall=True,
+        )
+        simulator = SimpleNamespace(sim_env=sim_env)
+        mujoco_module = SimpleNamespace(mj_forward=mock.Mock())
+
+        MODULE._restore_recovery_respawn_state(
+            simulator,
+            initial,
+            mujoco_module=mujoco_module,
+        )
+
+        self.assertEqual(data.qpos, initial.qpos)
+        self.assertEqual(data.qvel, initial.qvel)
+        self.assertEqual(data.ctrl, initial.ctrl)
+        self.assertEqual(sim_env.torques, initial.applied_torque)
+        self.assertFalse(sim_env.fall)
+        mujoco_module.mj_forward.assert_called_once_with(model, data)
 
     def test_sonic_fall_recovery_debounces_side_fall_above_native_height(self) -> None:
         gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)

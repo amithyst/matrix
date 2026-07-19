@@ -1429,6 +1429,44 @@ class _GameFallRecoveryGate:
 _RECOVERY_RESPAWN_REASON = "game_fall_recovery_respawn"
 
 
+def _restore_recovery_respawn_state(
+    simulator: Any,
+    initial_snapshot: Any,
+    *,
+    mujoco_module: Any,
+) -> None:
+    """Restore the validated initial pose after SONIC's bare ``mj_resetData``.
+
+    The current SONIC custom model has a zero free-root quaternion in qpos0.
+    Its public reset API therefore needs the already-validated startup state
+    copied back before the next elastic-band/physics step.
+    """
+
+    try:
+        sim_env = simulator.sim_env
+        data = sim_env.mj_data
+        model = sim_env.mj_model
+        fields = (
+            ("qpos", data.qpos, initial_snapshot.qpos),
+            ("qvel", data.qvel, initial_snapshot.qvel),
+            ("ctrl", data.ctrl, initial_snapshot.ctrl),
+        )
+    except AttributeError as exc:
+        raise ValueError("simulator does not expose the SONIC MuJoCo state") from exc
+    for name, destination, source in fields:
+        if len(destination) != len(source):
+            raise ValueError(
+                f"respawn {name} dimension changed: {len(destination)} != {len(source)}"
+            )
+        destination[:] = source
+    if hasattr(sim_env, "torques"):
+        if len(sim_env.torques) != len(initial_snapshot.applied_torque):
+            raise ValueError("respawn applied-torque dimension changed")
+        sim_env.torques[:] = initial_snapshot.applied_torque
+    sim_env.fall = False
+    mujoco_module.mj_forward(model, data)
+
+
 def _recovery_respawn_validation_error(before: Any, after: Any) -> str | None:
     """Validate the one intentional MuJoCo reset used by interactive respawn."""
 
@@ -1451,6 +1489,10 @@ def _recovery_respawn_validation_error(before: Any, after: Any) -> str | None:
             "respawn_reset_reason:"
             f"{after.last_reset_reason!r},expected={_RECOVERY_RESPAWN_REASON!r}"
         )
+    root_quaternion = [float(value) for value in after.qpos[3:7]]
+    quaternion_norm = math.sqrt(sum(value * value for value in root_quaternion))
+    if not math.isclose(quaternion_norm, 1.0, rel_tol=0.0, abs_tol=1e-5):
+        return f"respawn_root_quaternion_norm:{quaternion_norm}"
     root_z = float(after.qpos[2])
     root_up_z = _root_up_z(after.qpos)
     if (
@@ -2971,6 +3013,7 @@ def main() -> int:
                 f"invalid native SONIC initial snapshot: {initial_snapshot_error}"
             )
         qpos = snapshot.qpos
+        initial_respawn_snapshot = snapshot
 
         physics_hz = float(args.physics_hz)
         substeps_float = physics_hz / args.control_hz
@@ -3223,6 +3266,27 @@ def main() -> int:
                         elif recovery_transition == "respawn_due":
                             before_respawn = snapshot
                             simulator.reset(reason=_RECOVERY_RESPAWN_REASON)
+                            try:
+                                import mujoco as mujoco_module
+
+                                _restore_recovery_respawn_state(
+                                    simulator,
+                                    initial_respawn_snapshot,
+                                    mujoco_module=mujoco_module,
+                                )
+                            except (ImportError, ValueError) as exc:
+                                unstable = True
+                                running = False
+                                termination_reason = "numerical_instability"
+                                numerical_error = (
+                                    f"fall_recovery_respawn_restore:{exc}"
+                                )
+                                print(
+                                    "matrix-sonic-runtime ERROR failed to "
+                                    f"restore fall recovery respawn: {exc}",
+                                    flush=True,
+                                )
+                                break
                             respawn_snapshot = simulator.get_state_snapshot()
                             respawn_error = _recovery_respawn_validation_error(
                                 before_respawn,
