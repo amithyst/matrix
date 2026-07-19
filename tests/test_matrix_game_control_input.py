@@ -383,19 +383,18 @@ class UeFinalPovYawReaderTest(unittest.TestCase):
         self.assertIsNone(stale.yaw_rad)
         self.assertEqual(stale.error, "stale")
         self.assertAlmostEqual(recovered.yaw_rad, math.radians(30.0))
-        self.assertTrue(recovered.camera_dragging)
         self.assertFalse(recovered.angles_changed)
         self.assertEqual(
             reader.read_times,
             [10_000_000_000, 10_020_000_000, 10_040_000_000],
         )
 
-    def test_final_pov_angle_change_stops_and_requires_neutral(self) -> None:
+    def test_robot_follow_angle_change_does_not_impersonate_a_mouse_drag(self) -> None:
         adapter, _reader = self.adapter(
             (
                 (self.State(0.0), False, None),
-                # NoMachine can hide the held-button level, but the final POV
-                # still records the camera movement.
+                # A centered camera can rotate as a consequence of robot
+                # motion, without an operator mouse-button boundary.
                 (self.State(0.0), True, None),
                 (self.State(0.0), False, None),
                 (self.State(0.0), False, None),
@@ -416,7 +415,6 @@ class UeFinalPovYawReaderTest(unittest.TestCase):
             keyboard = MODULE.KeyboardMouseSample(
                 w=w,
                 focused=True,
-                camera_dragging=observation.camera_dragging,
             )
             snapshot = MODULE.build_snapshot(
                 sequence=sequence,
@@ -431,10 +429,12 @@ class UeFinalPovYawReaderTest(unittest.TestCase):
             return core.command(now_s=timestamp, dt_s=1.0)
 
         self.assertFalse(deliver(1, 1.00, w=False).safe_stop)
-        self.assertTrue(deliver(2, 1.01, w=True).safe_stop)
-        awaiting = deliver(3, 1.02, w=True)
-        self.assertTrue(awaiting.safe_stop)
-        self.assertEqual(awaiting.reason, "awaiting_neutral")
+        moving = deliver(2, 1.01, w=True)
+        self.assertFalse(moving.safe_stop)
+        self.assertEqual(moving.mode, "move")
+        observation = adapter.read(1.02)
+        self.assertFalse(observation.angles_changed)
+        self.assertEqual(observation.max_angle_delta_deg, 0.0)
         self.assertFalse(deliver(4, 1.03, w=False).safe_stop)
         self.assertFalse(deliver(5, 1.04, w=True).safe_stop)
 
@@ -451,14 +451,13 @@ class UeFinalPovYawReaderTest(unittest.TestCase):
 
         telemetry = MODULE.ue_final_pov_telemetry(observation)
         self.assertTrue(telemetry["available"])
-        self.assertFalse(telemetry["camera_dragging"])
         self.assertEqual(telemetry["sequence"], 7)
         self.assertEqual(telemetry["sample_age_ms"], 1.0)
         self.assertAlmostEqual(telemetry["provider_yaw_deg"], 30.0)
         self.assertEqual(telemetry["pitch_deg"], -12.0)
         self.assertEqual(telemetry["cache_timestamp_s"], 42.0)
 
-    def test_final_pov_retains_xi2_as_a_complementary_drag_signal(self) -> None:
+    def test_final_pov_uses_xi2_only_for_drag_boundaries(self) -> None:
         self.assertTrue(MODULE.captures_xi2_drag_boundaries("ue-final-pov"))
         self.assertTrue(MODULE.captures_xi2_drag_boundaries("x11-mirror"))
         self.assertTrue(MODULE.captures_xi2_drag_boundaries("x11-core-gated"))
