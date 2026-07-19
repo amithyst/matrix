@@ -244,11 +244,17 @@ IFS=$'\t' read -r MATRIX_MOUSE_APPLIED_PROFILE \
     <<<"$MOUSE_LAUNCH_FIELDS"
 if [[ "$MATRIX_MOUSE_APPLIED_PROFILE" != "local" \
     && "$MATRIX_MOUSE_APPLIED_PROFILE" != "remote" ]] \
-    || [[ ! "$MATRIX_MOUSE_APPLIED_SPEED_SCALE" =~ ^(0\.[2-9][0-9]*|1\.0+)$ ]] \
     || [[ "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "loaded" \
         && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "missing" \
         && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "invalid" ]]; then
     echo "[ERROR] Invalid mouse-settings helper output" >&2
+    exit 2
+fi
+if ! MATRIX_MOUSE_APPLIED_SPEED_SCALE="$(
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_mouse_settings.py" \
+        canonical-scale --value "$MATRIX_MOUSE_APPLIED_SPEED_SCALE"
+)"; then
+    echo "[ERROR] Invalid mouse speed preset from settings helper" >&2
     exit 2
 fi
 export MATRIX_MOUSE_SETTINGS_FILE MATRIX_MOUSE_APPLIED_PROFILE

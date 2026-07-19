@@ -36,15 +36,14 @@ import time
 from typing import Any, Callable, Protocol
 
 from matrix_mouse_settings import (
-    MAX_REMOTE_SPEED_SCALE,
-    MIN_REMOTE_SPEED_SCALE,
     PROFILE_LOCAL,
     PROFILE_REMOTE,
-    SPEED_SCALE_STEP,
     MouseSettings,
     atomic_save_settings,
+    canonical_remote_speed_scale,
     default_settings_file,
     load_settings,
+    step_remote_speed_scale,
 )
 from matrix_restart_request import (
     RestartRequest,
@@ -187,20 +186,13 @@ class AppliedMouseSettings:
     def __post_init__(self) -> None:
         if self.profile not in {PROFILE_LOCAL, PROFILE_REMOTE}:
             raise ValueError(f"unsupported applied mouse profile: {self.profile}")
-        if (
-            isinstance(self.effective_scale, bool)
-            or not isinstance(self.effective_scale, (int, float))
-            or not math.isfinite(float(self.effective_scale))
-            or not MIN_REMOTE_SPEED_SCALE
-            <= float(self.effective_scale)
-            <= MAX_REMOTE_SPEED_SCALE
-        ):
-            raise ValueError("applied mouse scale must be finite and in [0.2, 1.0]")
-        if self.profile == PROFILE_LOCAL and not math.isclose(
-            float(self.effective_scale), 1.0
-        ):
+        try:
+            canonical = canonical_remote_speed_scale(self.effective_scale)
+        except ValueError as exc:
+            raise ValueError(f"invalid applied mouse scale: {exc}") from exc
+        if self.profile == PROFILE_LOCAL and canonical != 1.0:
             raise ValueError("Local applied mouse profile must be 1.0x")
-        object.__setattr__(self, "effective_scale", float(self.effective_scale))
+        object.__setattr__(self, "effective_scale", canonical)
 
 
 class MouseSettingsController:
@@ -259,13 +251,9 @@ class MouseSettingsController:
             profile = PROFILE_REMOTE if profile == PROFILE_LOCAL else PROFILE_LOCAL
         if profile == PROFILE_REMOTE:
             if slower_edge and not faster_edge:
-                speed_scale -= SPEED_SCALE_STEP
+                speed_scale = step_remote_speed_scale(speed_scale, -1)
             elif faster_edge and not slower_edge:
-                speed_scale += SPEED_SCALE_STEP
-        speed_scale = round(
-            _clamp(speed_scale, MIN_REMOTE_SPEED_SCALE, MAX_REMOTE_SPEED_SCALE),
-            2,
-        )
+                speed_scale = step_remote_speed_scale(speed_scale, 1)
         return self._replace(MouseSettings(profile=profile, speed_scale=speed_scale))
 
     def apply_panel_action(self, action: str, *, active: bool) -> bool:
@@ -280,15 +268,11 @@ class MouseSettingsController:
         elif action == "profile_remote":
             profile = PROFILE_REMOTE
         elif action == "speed_down" and profile == PROFILE_REMOTE:
-            speed_scale -= SPEED_SCALE_STEP
+            speed_scale = step_remote_speed_scale(speed_scale, -1)
         elif action == "speed_up" and profile == PROFILE_REMOTE:
-            speed_scale += SPEED_SCALE_STEP
+            speed_scale = step_remote_speed_scale(speed_scale, 1)
         else:
             return False
-        speed_scale = round(
-            _clamp(speed_scale, MIN_REMOTE_SPEED_SCALE, MAX_REMOTE_SPEED_SCALE),
-            2,
-        )
         return self._replace(
             MouseSettings(profile=profile, speed_scale=speed_scale)
         )

@@ -558,6 +558,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(clock[0], 1.00025)
         self.assertAlmostEqual(deadline, 1.005)
 
+    def test_parse_args_accepts_low_preset_and_rejects_off_table_scale(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--game-applied-mouse-speed-scale",
+                "0.01",
+            ],
+        ):
+            parsed = MODULE._parse_args()
+        self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.01)
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--game-applied-mouse-speed-scale",
+                "0.15",
+            ],
+        ), self.assertRaises(SystemExit):
+            MODULE._parse_args()
+
     def test_qualified_acceptance_rejects_weaker_lock_gates(self) -> None:
         lock = json.loads(
             (REPO_ROOT / "config/runtime/matrix-sonic.lock.json").read_text(
@@ -658,7 +690,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             game_initial_camera_yaw_deg=5.0,
             game_mouse_sensitivity_deg=0.12,
             game_applied_mouse_profile="remote",
-            game_applied_mouse_speed_scale=0.5,
+            game_applied_mouse_speed_scale=0.01,
             game_carla_host="127.0.0.2",
             game_carla_port=2100,
             gamepad_look_yaw_rate_deg_s=140.0,
@@ -694,9 +726,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["mouse_sensitivity_deg_per_px"], 0.12)
         self.assertEqual(status["visible_mouse_backend"], "sdl-relative-speed-scale")
         self.assertEqual(status["applied_mouse_profile"], "remote")
-        self.assertEqual(status["applied_mouse_speed_scale"], 0.5)
+        self.assertEqual(status["applied_mouse_speed_scale"], 0.01)
         self.assertEqual(status["mouse_sensitivity_base_deg_per_px"], 0.12)
-        self.assertEqual(status["mouse_sensitivity_effective_deg_per_px"], 0.06)
+        self.assertEqual(status["mouse_sensitivity_effective_deg_per_px"], 0.0012)
         self.assertEqual(status["carla_host"], "127.0.0.2")
         self.assertEqual(status["carla_port"], 2100)
         self.assertFalse(status["visible_follow_camera_verified"])

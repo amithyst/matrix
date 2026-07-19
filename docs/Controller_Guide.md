@@ -148,21 +148,25 @@ configuration applied to the current process from the next-launch value:
 | Key | Behavior |
 |---|---|
 | **M** | Toggle the next-launch profile between `Local` and `Remote` |
-| **- / +** | Adjust the Remote scale in 0.1 steps from 0.2x through 1.0x |
-| **Mouse** | Click `Local`/`Remote`, `-`/`+`, or the large `Return to Game & Apply` button |
+| **- / +** | Traverse the Remote presets: 0.01x–0.10x in 0.01 steps, then 0.20x–1.00x in 0.10 steps |
+| **Mouse** | Click `Local`/`Remote`, the same preset-table `-`/`+`, or the large `Return to Game & Apply` button |
 | **Enter** | Keyboard equivalent of `Return to Game & Apply`; returns directly when nothing changed |
 | **F9** | Keyboard fallback: safely restart the complete Matrix/SONIC topology when a saved change is pending |
 | **F10 / F12** | Reserved for the external MouseLock center/toggle actions; Matrix does not intercept them |
 | **ESC** | Leave the panel; locomotion still requires a neutral re-arm |
 
-`Local` is always 1.0x; the default saved Remote preset is 0.5x. Changes are
-atomically persisted to `~/.config/matrix/mouse-control.json`, but they do not
-mutate the current UE process. Apply/Enter waits for a successfully delivered
-neutral frame, then asks the existing private restart channel to reload the
-**whole** runtime. The old generation remains in the safe panel and displays
-reload progress; a save/request failure leaves the panel open with an error.
-F9 applies the same gate as a fallback. Do not restart UE alone, and keep all
-controls released during the reload.
+`Local` is always 1.0x; the default saved Remote preset is 0.5x. Remote has 19
+exact presets: 0.01x through 0.10x in 0.01 increments, followed directly by
+0.20x through 1.00x in 0.10 increments (`0.10 +` becomes `0.20`, and
+`0.20 -` becomes `0.10`). Keyboard and panel clicks traverse this same table,
+including the existing 0.40x preset. Changes are atomically persisted to
+`~/.config/matrix/mouse-control.json`, but they do not mutate the current UE
+process. Apply/Enter waits for a successfully delivered neutral frame, then
+asks the existing private restart channel to reload the **whole** runtime. The
+old generation remains in the safe panel and displays reload progress; a
+save/request failure leaves the panel open with an error. F9 applies the same
+gate as a fallback. Do not restart UE alone, and keep all controls released
+during the reload.
 
 The visible UE camera receives `SDL_MOUSE_RELATIVE_SPEED_SCALE` at process
 startup. For example, the currently used Remote 0.4x setting is a native
@@ -172,7 +176,9 @@ default `x11-mirror` base of 0.12 degrees per pixel, status reports
 arithmetic gain over polled X11 root-pointer pixels. It is not a measured UE
 camera sensitivity and does not prove that the mirror and visible camera agree.
 The four-axis, multi-turn black-box acceptance below is still required. A
-missing or corrupt settings file safely falls back to Local 1.0x.
+missing, corrupt, or manually edited off-table settings file safely falls back
+to Local 1.0x. On a valid Remote launch, the same selected multiplier is sent
+to the visible SDL/UE path and used for the nominal `x11-mirror` gain.
 
 The launcher also pins SDL to raw relative motion without warp emulation,
 viewport scaling, or SDL system-pointer scaling, disables UE

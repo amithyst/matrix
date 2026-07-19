@@ -780,7 +780,7 @@ else:
             self.write(
                 mouse_settings,
                 json.dumps(
-                    {"version": 1, "profile": "remote", "speed_scale": 0.4}
+                    {"version": 1, "profile": "remote", "speed_scale": 0.01}
                 ),
             )
             self.write(xset_log)
@@ -885,7 +885,7 @@ else:
                 ["q", "m 1/1 0", "m 2/1 4"],
             )
             self.assertIn(
-                "SDL_MOUSE_RELATIVE_SPEED_SCALE=0.400000",
+                "SDL_MOUSE_RELATIVE_SPEED_SCALE=0.010000",
                 ue_capture["command"],
             )
             for direct_hint in (
@@ -924,7 +924,7 @@ else:
             self.assertEqual(parsed.game_initial_camera_yaw_deg, 12.5)
             self.assertEqual(parsed.game_mouse_sensitivity_deg, 0.25)
             self.assertEqual(parsed.game_applied_mouse_profile, "remote")
-            self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.4)
+            self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.01)
             self.assertEqual(parsed.game_mouse_settings_file, mouse_settings)
             self.assertIsNotNone(parsed.game_restart_request_file)
             self.assertIsNotNone(parsed.game_restart_capability_file)

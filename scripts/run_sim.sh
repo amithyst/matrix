@@ -1103,8 +1103,11 @@ fi
 cd ../../../UeSim/Linux
 echo "[INFO] Preparing UE launch"
 UE_MOUSE_RELATIVE_SPEED_SCALE="${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
-if [[ ! "$UE_MOUSE_RELATIVE_SPEED_SCALE" =~ ^(0\.[2-9][0-9]*|1(\.0+)?)$ ]]; then
-    echo "[ERROR] MATRIX_MOUSE_APPLIED_SPEED_SCALE must be in [0.2, 1.0]" >&2
+if ! UE_MOUSE_RELATIVE_SPEED_SCALE="$(
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_mouse_settings.py" \
+        canonical-scale --value "$UE_MOUSE_RELATIVE_SPEED_SCALE"
+)"; then
+    echo "[ERROR] MATRIX_MOUSE_APPLIED_SPEED_SCALE must use a supported preset" >&2
     exit 1
 fi
 UE_COMMAND=(

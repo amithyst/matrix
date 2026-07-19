@@ -21,9 +21,55 @@ import tempfile
 PROFILE_LOCAL = "local"
 PROFILE_REMOTE = "remote"
 DEFAULT_REMOTE_SPEED_SCALE = 0.5
-MIN_REMOTE_SPEED_SCALE = 0.2
-MAX_REMOTE_SPEED_SCALE = 1.0
-SPEED_SCALE_STEP = 0.1
+REMOTE_SPEED_SCALE_STEPS = tuple(
+    percent / 100.0
+    for percent in (*range(1, 11), *range(20, 101, 10))
+)
+MIN_REMOTE_SPEED_SCALE = REMOTE_SPEED_SCALE_STEPS[0]
+MAX_REMOTE_SPEED_SCALE = REMOTE_SPEED_SCALE_STEPS[-1]
+REMOTE_SPEED_SCALE_DESCRIPTION = (
+    "0.01-0.10 in 0.01 steps, then 0.20-1.00 in 0.10 steps"
+)
+
+
+def canonical_remote_speed_scale(value: object) -> float:
+    """Return one stable preset value, rejecting ranges and float drift."""
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(
+            "remote mouse speed scale must be finite and use a preset: "
+            f"{REMOTE_SPEED_SCALE_DESCRIPTION}"
+        )
+    number = float(value)
+    for preset in REMOTE_SPEED_SCALE_STEPS:
+        if math.isclose(number, preset, rel_tol=0.0, abs_tol=1e-9):
+            return preset
+    raise ValueError(
+        "remote mouse speed scale must use a preset: "
+        f"{REMOTE_SPEED_SCALE_DESCRIPTION}"
+    )
+
+
+def step_remote_speed_scale(value: object, direction: int) -> float:
+    """Move to one adjacent preset, clamping at the two endpoints."""
+
+    if (
+        isinstance(direction, bool)
+        or not isinstance(direction, int)
+        or direction not in {-1, 1}
+    ):
+        raise ValueError("remote mouse speed direction must be -1 or 1")
+    canonical = canonical_remote_speed_scale(value)
+    index = REMOTE_SPEED_SCALE_STEPS.index(canonical)
+    next_index = max(
+        0,
+        min(len(REMOTE_SPEED_SCALE_STEPS) - 1, index + direction),
+    )
+    return REMOTE_SPEED_SCALE_STEPS[next_index]
 
 
 @dataclass(frozen=True)
@@ -34,16 +80,11 @@ class MouseSettings:
     def __post_init__(self) -> None:
         if self.profile not in {PROFILE_LOCAL, PROFILE_REMOTE}:
             raise ValueError(f"unsupported mouse profile: {self.profile!r}")
-        if (
-            isinstance(self.speed_scale, bool)
-            or not isinstance(self.speed_scale, (int, float))
-            or not math.isfinite(float(self.speed_scale))
-            or not MIN_REMOTE_SPEED_SCALE
-            <= float(self.speed_scale)
-            <= MAX_REMOTE_SPEED_SCALE
-        ):
-            raise ValueError("mouse speed scale must be finite and in [0.2, 1.0]")
-        object.__setattr__(self, "speed_scale", float(self.speed_scale))
+        object.__setattr__(
+            self,
+            "speed_scale",
+            canonical_remote_speed_scale(self.speed_scale),
+        )
 
     @property
     def effective_scale(self) -> float:
@@ -148,11 +189,22 @@ def _launch_fields(path: Path) -> int:
     return 0
 
 
+def _canonical_scale(value: float) -> int:
+    try:
+        canonical = canonical_remote_speed_scale(value)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"{canonical:.6f}")
+    return 0
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     launch = subparsers.add_parser("launch-fields")
     launch.add_argument("--file", type=Path, required=True)
+    canonical = subparsers.add_parser("canonical-scale")
+    canonical.add_argument("--value", type=float, required=True)
     return parser.parse_args()
 
 
@@ -160,6 +212,8 @@ def main() -> int:
     args = _parse_args()
     if args.command == "launch-fields":
         return _launch_fields(args.file)
+    if args.command == "canonical-scale":
+        return _canonical_scale(args.value)
     raise AssertionError(f"unhandled command: {args.command}")
 
 

@@ -288,18 +288,23 @@ only the X11 absolute coordinates and make the visible camera diverge further
 from `x11-mirror`. For SONIC `game` + Remote, the launcher itself snapshots the
 current X pointer curve, uses `xset m 1/1 0` only for the lifetime of the run,
 and restores it during cleanup; leave the desktop setting at the user's normal
-value. Press ESC, click Remote, choose 0.2x–1.0x with the large
--/+ controls, and click `Return to Game & Apply` (or press Enter). The panel
-waits for the neutral safety gate and reloads the complete runtime; F9 remains
-the keyboard fallback. After restart,
+value. Press ESC, click Remote, and use the large -/+ controls to traverse the
+19 exact presets: 0.01x–0.10x in 0.01 steps, then 0.20x–1.00x in 0.10 steps.
+The 0.10x and 0.20x presets are adjacent, and keyboard -/+ traverses the same
+table as panel clicks. Click `Return to Game & Apply` (or press Enter). The
+panel waits for the neutral safety gate and reloads the complete runtime; F9
+remains the keyboard fallback. After restart,
 verify that `CURRENT APPLIED (SDL)` is the intended value, then repeat the
 four-axis and multi-turn tests. F10/F12 remain external MouseLock bindings, not
 Matrix settings-page actions.
 
-Remote 0.4x is the native SDL/UE multiplier. With the example base mirror gain
-of 0.12 deg/px it makes the reported `x11-mirror` value 0.048 deg/px, but that
+Local is fixed at 1.0x. Remote 0.4x remains one of the presets and is the native
+SDL/UE multiplier. The same selected Remote multiplier feeds the visible SDL
+path and the nominal `x11-mirror` gain. With the example base mirror gain of
+0.12 deg/px, 0.4x makes the reported `x11-mirror` value 0.048 deg/px, but that
 number is only nominal arithmetic over X11 root-pointer pixels, not a measured
-visible-camera sensitivity.
+visible-camera sensitivity. A missing, corrupt, or manually edited off-table
+settings file fails safe to Local 1.0x.
 
 ## Stage 3: safety and recovery matrix
 

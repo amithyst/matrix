@@ -19,6 +19,42 @@ SPEC.loader.exec_module(MODULE)
 
 
 class MouseSettingsFileTest(unittest.TestCase):
+    def test_remote_presets_are_exactly_the_nineteen_discrete_values(self) -> None:
+        expected = tuple(value / 100 for value in range(1, 11)) + tuple(
+            value / 10 for value in range(2, 11)
+        )
+        self.assertEqual(len(expected), 19)
+        self.assertEqual(MODULE.REMOTE_SPEED_SCALE_STEPS, expected)
+        self.assertEqual(expected[9:11], (0.10, 0.20))
+
+    def test_canonical_scale_accepts_presets_and_rejects_untrusted_values(self) -> None:
+        for value in (0.01, 0.10, 0.20, 0.40, 1.00):
+            with self.subTest(accepted=value):
+                self.assertEqual(MODULE.canonical_remote_speed_scale(value), value)
+
+        for value in (0.00, 0.11, 0.15, 1.01, True, float("nan")):
+            with self.subTest(rejected=value), self.assertRaises(ValueError):
+                MODULE.canonical_remote_speed_scale(value)
+
+    def test_discrete_stepper_traverses_without_drift_and_clamps_endpoints(self) -> None:
+        expected = MODULE.REMOTE_SPEED_SCALE_STEPS
+        forward = [expected[0]]
+        while forward[-1] != expected[-1]:
+            forward.append(MODULE.step_remote_speed_scale(forward[-1], 1))
+        self.assertEqual(tuple(forward), expected)
+        self.assertEqual(MODULE.step_remote_speed_scale(expected[-1], 1), 1.0)
+
+        backward = [expected[-1]]
+        while backward[-1] != expected[0]:
+            backward.append(MODULE.step_remote_speed_scale(backward[-1], -1))
+        self.assertEqual(tuple(backward), tuple(reversed(expected)))
+        self.assertEqual(MODULE.step_remote_speed_scale(expected[0], -1), 0.01)
+        self.assertEqual(MODULE.step_remote_speed_scale(0.10, 1), 0.20)
+        self.assertEqual(MODULE.step_remote_speed_scale(0.20, -1), 0.10)
+        for direction in (0, True, 1.0):
+            with self.subTest(direction=direction), self.assertRaises(ValueError):
+                MODULE.step_remote_speed_scale(0.10, direction)
+
     def test_missing_and_corrupt_files_fall_back_to_local_one_x(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "mouse.json"
@@ -44,6 +80,17 @@ class MouseSettingsFileTest(unittest.TestCase):
             self.assertEqual(out_of_range.status, "invalid")
             self.assertEqual(out_of_range.settings.effective_scale, 1.0)
 
+            path.write_text(
+                json.dumps(
+                    {"version": 1, "profile": "remote", "speed_scale": 0.15}
+                ),
+                encoding="utf-8",
+            )
+            off_table = MODULE.load_settings(path)
+            self.assertEqual(off_table.status, "invalid")
+            self.assertEqual(off_table.settings.profile, "local")
+            self.assertEqual(off_table.settings.effective_scale, 1.0)
+
     def test_remote_file_is_atomic_private_and_strictly_versioned(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "nested/mouse.json"
@@ -64,6 +111,17 @@ class MouseSettingsFileTest(unittest.TestCase):
         settings = MODULE.MouseSettings(profile="local", speed_scale=0.3)
         self.assertEqual(settings.speed_scale, 0.3)
         self.assertEqual(settings.effective_scale, 1.0)
+
+    def test_low_remote_preset_round_trips_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "nested/mouse.json"
+            settings = MODULE.MouseSettings(profile="remote", speed_scale=0.01)
+            MODULE.atomic_save_settings(path, settings)
+
+            loaded = MODULE.load_settings(path)
+            self.assertEqual(loaded.status, "loaded")
+            self.assertEqual(loaded.settings, settings)
+            self.assertEqual(loaded.settings.effective_scale, 0.01)
 
 
 if __name__ == "__main__":

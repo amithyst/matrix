@@ -22,9 +22,20 @@ import os
 from pathlib import Path
 import signal
 import socket
+import sys
 import tempfile
 import time
 from typing import Any, Callable
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from matrix_mouse_settings import (
+    MAX_REMOTE_SPEED_SCALE,
+    MIN_REMOTE_SPEED_SCALE,
+    canonical_remote_speed_scale,
+)
 
 
 _IS_VIEWABLE = 2
@@ -371,13 +382,13 @@ class SettingsPanelModel:
             return bool(
                 not controls_disabled
                 and self.next_profile == "Remote"
-                and self.next_scale > 0.2
+                and self.next_scale > MIN_REMOTE_SPEED_SCALE
             )
         if action == "speed_up":
             return bool(
                 not controls_disabled
                 and self.next_profile == "Remote"
-                and self.next_scale < 1.0
+                and self.next_scale < MAX_REMOTE_SPEED_SCALE
             )
         if action == "apply_return":
             return bool(
@@ -412,8 +423,14 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         number = float(value)
         return number if math.isfinite(number) else fallback
 
-    current_scale = max(0.2, min(1.0, finite(current.get("effective_scale"), 1.0)))
-    next_scale = max(0.2, min(1.0, finite(next_launch.get("effective_scale"), 1.0)))
+    def preset(value: object) -> float:
+        try:
+            return canonical_remote_speed_scale(value)
+        except ValueError:
+            return 1.0
+
+    current_scale = preset(current.get("effective_scale"))
+    next_scale = preset(next_launch.get("effective_scale"))
     pending = settings.get("pending_restart") is True
     requested = restart.get("requested") is True
     restart_available = restart.get("available") is True
@@ -466,6 +483,7 @@ def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
     line2 = (
         f"x11 mirror: base {model.base_mirror_gain:.3f} -> effective "
         f"{model.effective_mirror_gain:.3f} deg/px | "
+        "presets 0.01-0.10/0.01, 0.20-1.00/0.10 | "
         f"{'ERROR' if model.error else 'SAVED'}"
     )
     line3 = (
@@ -1397,6 +1415,13 @@ class X11CalibrationOverlay:
             y=status_y,
             colour=status_colour,
         )
+        if not compact:
+            self._draw_text(
+                "Fine: 0.01-0.10 by 0.01 | Coarse: 0.20-1.00 by 0.10",
+                x=32,
+                y=status_y + 22,
+                colour=self._colours["muted"],
+            )
         apply_disabled = not model.action_enabled("apply_return")
         apply_fill = self._colours[
             "disabled"

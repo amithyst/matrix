@@ -35,6 +35,15 @@ from matrix_game_control import (
     UnixSeqpacketInputServer,
     wrap_angle_rad,
 )
+from matrix_mouse_settings import canonical_remote_speed_scale
+
+
+def _remote_speed_scale_argument(value: str) -> float:
+    try:
+        numeric = float(value)
+        return canonical_remote_speed_scale(numeric)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _parse_args() -> argparse.Namespace:
@@ -95,7 +104,9 @@ def _parse_args() -> argparse.Namespace:
         default="local",
     )
     parser.add_argument(
-        "--game-applied-mouse-speed-scale", type=float, default=1.0
+        "--game-applied-mouse-speed-scale",
+        type=_remote_speed_scale_argument,
+        default=1.0,
     )
     parser.add_argument("--game-restart-request-file", type=Path)
     parser.add_argument("--game-restart-capability-file", type=Path)
@@ -2286,11 +2297,14 @@ def main() -> int:
             raise SystemExit("--gamepad-look-deadzone must be in [0, 1)")
         if args.gamepad_look_min_pitch_deg >= args.gamepad_look_max_pitch_deg:
             raise SystemExit("gamepad camera pitch limits must be ordered")
-        if (
-            not math.isfinite(args.game_applied_mouse_speed_scale)
-            or not 0.2 <= args.game_applied_mouse_speed_scale <= 1.0
-        ):
-            raise SystemExit("--game-applied-mouse-speed-scale must be in [0.2, 1.0]")
+        try:
+            args.game_applied_mouse_speed_scale = canonical_remote_speed_scale(
+                args.game_applied_mouse_speed_scale
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                f"--game-applied-mouse-speed-scale is invalid: {exc}"
+            ) from exc
         if (
             args.game_applied_mouse_profile == "local"
             and args.game_applied_mouse_speed_scale != 1.0

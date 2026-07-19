@@ -586,6 +586,23 @@ class CalibrationModeTest(unittest.TestCase):
 
 
 class MouseSettingsAndRestartTest(unittest.TestCase):
+    def test_applied_remote_scale_is_discrete_but_local_remains_one_x(self) -> None:
+        remote = MODULE.AppliedMouseSettings(
+            profile="remote", effective_scale=0.01
+        )
+        self.assertEqual(remote.effective_scale, 0.01)
+        local = MODULE.AppliedMouseSettings(profile="local", effective_scale=1.0)
+        self.assertEqual(local.effective_scale, 1.0)
+
+        for value in (0.0, 0.11, 0.15, 1.01, True, float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                MODULE.AppliedMouseSettings(
+                    profile="remote", effective_scale=value
+                )
+
+        with self.assertRaises(ValueError):
+            MODULE.AppliedMouseSettings(profile="local", effective_scale=0.40)
+
     def test_startup_requires_escape_and_f9_release_before_arming(self) -> None:
         arming = MODULE.StartupShortcutArming()
         self.assertFalse(arming.update(escape_pressed=True, restart_pressed=True))
@@ -675,6 +692,58 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             )
             self.assertEqual(controller.desired.profile, "local")
             self.assertFalse(controller.apply_panel_action("speed_down", active=True))
+
+    def test_keyboard_and_panel_steps_traverse_the_same_discrete_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initial = MODULE.MouseSettings(profile="remote", speed_scale=0.01)
+            keyboard = MODULE.MouseSettingsController(
+                path=root / "keyboard.json",
+                desired=initial,
+                load_status="loaded",
+                load_error=None,
+            )
+            panel = MODULE.MouseSettingsController(
+                path=root / "panel.json",
+                desired=initial,
+                load_status="loaded",
+                load_error=None,
+            )
+
+            def keyboard_step(*, slower: bool = False, faster: bool = False) -> bool:
+                keyboard.update(
+                    active=True,
+                    mode_pressed=False,
+                    slower_pressed=False,
+                    faster_pressed=False,
+                )
+                return keyboard.update(
+                    active=True,
+                    mode_pressed=False,
+                    slower_pressed=slower,
+                    faster_pressed=faster,
+                )
+
+            expected = tuple(value / 100 for value in range(1, 11)) + tuple(
+                value / 10 for value in range(2, 11)
+            )
+            self.assertEqual(keyboard.desired.speed_scale, expected[0])
+            self.assertEqual(panel.desired.speed_scale, expected[0])
+            for scale in expected[1:]:
+                self.assertTrue(keyboard_step(faster=True))
+                self.assertTrue(panel.apply_panel_action("speed_up", active=True))
+                self.assertEqual(keyboard.desired.speed_scale, scale)
+                self.assertEqual(panel.desired.speed_scale, scale)
+            self.assertFalse(keyboard_step(faster=True))
+            self.assertFalse(panel.apply_panel_action("speed_up", active=True))
+
+            for scale in reversed(expected[:-1]):
+                self.assertTrue(keyboard_step(slower=True))
+                self.assertTrue(panel.apply_panel_action("speed_down", active=True))
+                self.assertEqual(keyboard.desired.speed_scale, scale)
+                self.assertEqual(panel.desired.speed_scale, scale)
+            self.assertFalse(keyboard_step(slower=True))
+            self.assertFalse(panel.apply_panel_action("speed_down", active=True))
 
     @staticmethod
     def requester(*, available: bool = True, succeeds: bool = True):
@@ -1021,7 +1090,7 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
 class CameraYawTrackerTest(unittest.TestCase):
     def test_applied_sdl_scale_also_scales_x11_mirror_gain(self) -> None:
         base_deg_per_px = 0.12
-        applied_scale = 0.5
+        applied_scale = 0.01
         tracker = MODULE.CameraYawTracker(
             0.0,
             mouse_radians_per_pixel=math.radians(
@@ -1030,7 +1099,7 @@ class CameraYawTrackerTest(unittest.TestCase):
             gamepad_radians_per_second=0.0,
         )
         yaw = tracker.update(dt=0.02, mouse_dx=100.0, gamepad_look_yaw=0.0)
-        self.assertAlmostEqual(math.degrees(yaw), 6.0)
+        self.assertAlmostEqual(math.degrees(yaw), 0.12)
 
     def test_mouse_has_per_frame_priority_over_right_stick(self) -> None:
         tracker = MODULE.CameraYawTracker(

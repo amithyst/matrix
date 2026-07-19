@@ -16,7 +16,10 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = REPO_ROOT / "scripts/matrix_calibration_overlay.py"
+SCRIPTS = REPO_ROOT / "scripts"
+if os.fspath(SCRIPTS) not in sys.path:
+    sys.path.insert(0, os.fspath(SCRIPTS))
+SCRIPT = SCRIPTS / "matrix_calibration_overlay.py"
 SPEC = importlib.util.spec_from_file_location("matrix_calibration_overlay", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -223,6 +226,9 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn(b"base 0.120 -> effective 0.120", lines[1])
         self.assertIn(b"Enter: RETURN TO GAME & APPLY", lines[2])
         self.assertIn(b"F9: fallback", lines[2])
+        hint = b" | ".join(lines)
+        self.assertIn(b"0.01-0.10", hint)
+        self.assertIn(b"0.20-1.00", hint)
 
     def test_panel_model_surfaces_restart_progress_and_errors(self) -> None:
         restarting = MODULE.settings_panel_model(
@@ -269,12 +275,93 @@ class OverlayStateTest(unittest.TestCase):
                 }
             )
 
-        minimum = model(0.2)
+        minimum = model(0.01)
         self.assertFalse(minimum.action_enabled("speed_down"))
         self.assertTrue(minimum.action_enabled("speed_up"))
+        self.assertEqual(minimum.next_scale, 0.01)
         maximum = model(1.0)
         self.assertTrue(maximum.action_enabled("speed_down"))
         self.assertFalse(maximum.action_enabled("speed_up"))
+
+    def test_off_table_untrusted_scale_fails_safe_to_local_one_x(self) -> None:
+        model = MODULE.settings_panel_model(
+            {
+                "mouse_settings": {
+                    "current": {
+                        "profile": "remote",
+                        "effective_scale": 0.15,
+                    },
+                    "next_launch": {
+                        "profile": "remote",
+                        "effective_scale": 0.11,
+                    },
+                },
+                "restart": {"available": True, "requested": False},
+            }
+        )
+        self.assertEqual(model.current_scale, 1.0)
+        self.assertEqual(model.next_scale, 1.0)
+
+    def test_low_remote_scale_is_rendered_with_discrete_step_hint(self) -> None:
+        geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
+        layout = MODULE.overlay_layout(geometry)
+        model = MODULE.settings_panel_model(
+            {
+                "mouse_settings": {
+                    "current": {
+                        "profile": "remote",
+                        "effective_scale": 0.01,
+                    },
+                    "next_launch": {
+                        "profile": "remote",
+                        "effective_scale": 0.01,
+                    },
+                },
+                "restart": {"available": True, "requested": False},
+            }
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._windows = {"panel": 2}
+        overlay._panel_gc = 3
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "selected",
+                    "button",
+                    "disabled",
+                    "pending",
+                    "error",
+                    "apply",
+                ),
+                10,
+            )
+        }
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+
+        overlay._draw_panel(layout, model)
+
+        labels = [call.args[0] for call in overlay._draw_text.call_args_list]
+        self.assertIn("0.01x", labels)
+        combined = " | ".join(labels)
+        self.assertIn("0.01-0.10", combined)
+        self.assertIn("0.20-1.00", combined)
+
+        overlay._draw_text.reset_mock()
+        compact_layout = MODULE.overlay_layout(
+            MODULE.WindowGeometry(1, 0, 0, 480, 360)
+        )
+        overlay._draw_panel(compact_layout, model)
+        compact_labels = [
+            call.args[0] for call in overlay._draw_text.call_args_list
+        ]
+        self.assertNotIn("0.01-0.10", " | ".join(compact_labels))
+        self.assertNotIn("0.20-1.00", " | ".join(compact_labels))
 
     def test_font_fallbacks_match_heyuan_xlsfonts_probe(self) -> None:
         self.assertEqual(MODULE._LARGE_FONT_CANDIDATES[0], b"12x24")
