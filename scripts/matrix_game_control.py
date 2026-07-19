@@ -322,11 +322,76 @@ def _move_toward(current: float, target: float, maximum_delta: float) -> float:
     return max(target, current - maximum_delta)
 
 
+SONIC_IDLE_MODE = 0
+SONIC_SLOW_WALK_MODE = 1
+SONIC_WALK_MODE = 2
+SONIC_RUN_MODE = 3
+SONIC_GAIT_NAMES = {
+    SONIC_IDLE_MODE: "IDLE",
+    SONIC_SLOW_WALK_MODE: "SLOW_WALK",
+    SONIC_WALK_MODE: "WALK",
+    SONIC_RUN_MODE: "RUN",
+}
+SONIC_GAIT_SPEED_RANGES_MPS = {
+    SONIC_SLOW_WALK_MODE: (0.10, 0.80),
+    SONIC_WALK_MODE: (0.80, 2.50),
+    SONIC_RUN_MODE: (2.50, 7.50),
+}
+KEYBOARD_GAIT_TARGETS_MPS = {
+    SONIC_SLOW_WALK_MODE: 0.10,
+    SONIC_WALK_MODE: 0.80,
+    SONIC_RUN_MODE: 2.50,
+}
+DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
+
+
+def native_locomotion_mode_for_speed(
+    speed_mps: float, *, requested_mode: int
+) -> int:
+    """Select a native gait whose documented speed interval contains speed.
+
+    Acceleration crosses SONIC's contiguous SLOW_WALK/WALK/RUN boundaries in
+    order.  At an exact shared boundary, the requested keyboard tier breaks
+    the tie: 0.80 m/s is WALK only for a walk/run request, and 2.50 m/s is RUN
+    only for a run request.  Downshifts therefore enter the slower gait as soon
+    as that gait can represent the current speed without publishing an invalid
+    mode/speed pair.
+    """
+
+    speed = _finite_number(speed_mps, name="speed_mps", nonnegative=True)
+    if type(requested_mode) is not int or requested_mode not in {
+        SONIC_SLOW_WALK_MODE,
+        SONIC_WALK_MODE,
+        SONIC_RUN_MODE,
+    }:
+        raise ValueError("requested_mode must be native SLOW_WALK, WALK, or RUN")
+    if speed == 0.0:
+        return SONIC_IDLE_MODE
+    run_min, run_max = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_RUN_MODE]
+    walk_min, walk_max = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_WALK_MODE]
+    slow_min, slow_max = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE]
+    if speed < slow_min:
+        raise ValueError("positive speed is below native SLOW_WALK minimum")
+    if speed > run_max:
+        raise ValueError("speed exceeds native RUN maximum")
+    if speed > walk_max or (
+        requested_mode == SONIC_RUN_MODE and speed >= run_min
+    ):
+        return SONIC_RUN_MODE
+    if speed > slow_max or (
+        requested_mode >= SONIC_WALK_MODE and speed >= walk_min
+    ):
+        return SONIC_WALK_MODE
+    return SONIC_SLOW_WALK_MODE
+
+
 @dataclass(frozen=True)
 class ControlConfig:
     """Tuning and safety limits for :class:`GameControlCore`."""
 
-    max_speed_mps: float = 0.30
+    # This is the analog cap; keyboard targets are the fixed native gait
+    # boundaries in KEYBOARD_GAIT_TARGETS_MPS.
+    max_speed_mps: float = DEFAULT_ANALOG_MAX_SPEED_MPS
     max_acceleration_mps2: float = 1.20
     max_deceleration_mps2: float = 2.40
     max_turn_rate_rad_s: float = 2.50
@@ -371,13 +436,21 @@ class ControlConfig:
         )
         if deadzone >= 1.0:
             raise ValueError("stick_deadzone must be less than 1")
+        slow_walk_max = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][1]
+        if self.max_speed_mps > slow_walk_max:
+            raise ValueError(
+                "max_speed_mps cannot exceed native SLOW_WALK maximum 0.80"
+            )
+        slow_walk_min = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][0]
         if not (
             self.gait_stop_speed_mps < self.min_gait_speed_mps
             and self.min_gait_speed_mps == self.gait_start_speed_mps
+            and self.min_gait_speed_mps == slow_walk_min
             and self.gait_start_speed_mps <= self.max_speed_mps
         ):
             raise ValueError(
-                "gait speeds must satisfy stop < minimum == start <= maximum"
+                "gait speeds must satisfy stop < minimum == start == native "
+                "SLOW_WALK minimum <= maximum"
             )
         if not (
             self.gait_start_heading_error_rad
@@ -406,6 +479,7 @@ class RobotMotionCommand:
     movement: tuple[float, float, float]
     facing: tuple[float, float, float]
     speed_mps: float
+    locomotion_mode: int
     mode: str
     safe_stop: bool
     reason: str | None
@@ -548,6 +622,7 @@ class GameControlCore:
             movement=(0.0, 0.0, 0.0),
             facing=facing,
             speed_mps=0.0,
+            locomotion_mode=SONIC_IDLE_MODE,
             mode="deadman" if deadman else "free_camera",
             safe_stop=True,
             reason=reason,
@@ -596,15 +671,16 @@ class GameControlCore:
             deadzone=self.config.stick_deadzone,
         )
 
-    def _requested_speed(self, input_magnitude: float) -> float:
-        """Map digital tiers or analog stick travel onto native SLOW_WALK.
+    def _requested_locomotion(self, input_magnitude: float) -> tuple[float, int]:
+        """Map keyboard tiers or analog travel onto a speed and native gait.
 
         Keyboard movement follows the usual third-person convention: Ctrl is
         held for a precise slow walk, unmodified WASD is ordinary walking, and
-        Shift is held to run.  All three remain speed targets inside SONIC's
-        native SLOW_WALK manifold.  Ctrl wins a Ctrl+Shift conflict so an
-        accidental overlap can only reduce speed.  Gamepad magnitude remains
-        continuous and is never quantized into these keyboard tiers.
+        Shift is held to run. These map to SONIC modes 1, 2, and 3 at the lower
+        boundary of each native speed interval. Ctrl wins a Ctrl+Shift conflict
+        so an accidental overlap can only reduce speed. Gamepad magnitude stays
+        continuous in native SLOW_WALK and is never quantized into keyboard
+        tiers.
         """
 
         assert self._snapshot is not None
@@ -612,19 +688,23 @@ class GameControlCore:
         digital_movement = any((keys.w, keys.a, keys.s, keys.d))
         if digital_movement:
             if keys.ctrl:
-                return self.config.min_gait_speed_mps
+                requested_mode = SONIC_SLOW_WALK_MODE
+                return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
             if keys.shift:
-                return self.config.max_speed_mps
-            return (
-                self.config.min_gait_speed_mps + self.config.max_speed_mps
-            ) / 2.0
+                requested_mode = SONIC_RUN_MODE
+                return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
+            requested_mode = SONIC_WALK_MODE
+            return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
         # Treat the deadzone-remapped stick magnitude like a native analog
         # gait command: the first non-zero intent starts at SONIC's minimum
         # feasible gait, then the rest of the stick travel spans the full
         # remaining speed range.
-        return self.config.min_gait_speed_mps + (
-            self.config.max_speed_mps - self.config.min_gait_speed_mps
-        ) * input_magnitude
+        return (
+            self.config.min_gait_speed_mps
+            + (self.config.max_speed_mps - self.config.min_gait_speed_mps)
+            * input_magnitude,
+            SONIC_SLOW_WALK_MODE,
+        )
 
     def command(self, *, now_s: float, dt_s: float) -> RobotMotionCommand:
         """Advance smoothing by ``dt_s`` and return the current robot command."""
@@ -644,8 +724,11 @@ class GameControlCore:
         assert self._snapshot is not None
         local_right, local_forward = self._local_movement()
         input_magnitude = min(1.0, math.hypot(local_right, local_forward))
+        keys = self._snapshot.keys
+        digital_movement = any((keys.w, keys.a, keys.s, keys.d))
         alignment = 0.0
         requested_speed = 0.0
+        requested_locomotion_mode = SONIC_IDLE_MODE
 
         if input_magnitude > 1e-12:
             world_x, world_y = camera_relative_to_world(
@@ -693,28 +776,77 @@ class GameControlCore:
                 # both frames; otherwise movement/facing would be published in
                 # a direction that the alignment gate did not actually check.
                 alignment = min(command_alignment, measured_alignment)
-            # Digital WASD uses Ctrl/walk/Shift speed tiers.  Analog stick
-            # travel stays continuous; ``max(minimum, maximum * magnitude)``
-            # would flatten roughly the first third of a 0.30 m/s stick into a
-            # single 0.10 m/s speed and make gentle control feel digital.
-            requested_speed = self._requested_speed(input_magnitude)
+            # Digital WASD requests native SLOW_WALK/WALK/RUN. Analog stick
+            # travel stays continuous within SLOW_WALK; ``max(minimum,
+            # maximum * magnitude)`` would flatten roughly the first third of
+            # a 0.30 m/s stick into one speed and make gentle control digital.
+            requested_speed, requested_locomotion_mode = (
+                self._requested_locomotion(input_magnitude)
+            )
             target_speed = requested_speed * alignment
+            if (
+                digital_movement
+                and alignment
+                >= math.cos(self.config.gait_start_heading_error_rad)
+            ):
+                # Keyboard targets sit exactly on native gait boundaries.
+                # Cosine attenuation at a harmless residual heading error
+                # would otherwise make WALK/RUN mathematically unreachable.
+                # The 15-degree translation gate already supplies the intended
+                # turn-before-move behavior, so preserve the exact tier target
+                # once the body is inside that gate.
+                target_speed = requested_speed
         else:
             target_speed = 0.0
 
-        rate = (
-            self.config.max_acceleration_mps2
-            if target_speed > self._speed_mps
-            else self.config.max_deceleration_mps2
-        )
-        self._speed_mps = _move_toward(self._speed_mps, target_speed, rate * dt)
+        if input_magnitude <= 1e-12:
+            # Releasing every movement direction is the keyboard's only IDLE
+            # request. Do not let a multi-second RUN deceleration keep moving
+            # after key-up. Facing remains active in native IDLE, so absorb
+            # measured yaw as well instead of finishing a stale turn target.
+            self._speed_mps = 0.0
+            self._gait_active = False
+            if self._measured_heading_rad is not None:
+                self._command_heading_rad = self._measured_heading_rad
+        else:
+            if not digital_movement:
+                # Switching from a keyboard run to an already-deflected stick
+                # must not retain a higher-gait deceleration tail under an
+                # analog command. The configured SLOW_WALK cap is an output
+                # invariant (0.30 m/s by default, configurable up to 0.80).
+                self._speed_mps = min(
+                    self._speed_mps, self.config.max_speed_mps
+                )
+            rate = (
+                self.config.max_acceleration_mps2
+                if target_speed > self._speed_mps
+                else self.config.max_deceleration_mps2
+            )
+            self._speed_mps = _move_toward(
+                self._speed_mps, target_speed, rate * dt
+            )
+            if math.isclose(
+                self._speed_mps, target_speed, rel_tol=0.0, abs_tol=1e-12
+            ):
+                # Keep shared 0.80/2.50 boundaries exact, then apply strict
+                # native interval validation rather than accepting an
+                # out-of-range speed through a broad control epsilon.
+                self._speed_mps = target_speed
+            for boundary in (
+                SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][1],
+                SONIC_GAIT_SPEED_RANGES_MPS[SONIC_WALK_MODE][1],
+            ):
+                if math.isclose(
+                    self._speed_mps, boundary, rel_tol=0.0, abs_tol=1e-12
+                ):
+                    self._speed_mps = boundary
+                    break
         if self._speed_mps < self.config.speed_epsilon_mps:
             self._speed_mps = 0.0
 
-        # SONIC's native SLOW_WALK manifold starts at 0.10 m/s.  Keep distinct
-        # start/stop thresholds around that floor so measured-heading noise
-        # cannot switch native motion modes every control frame.  A deliberate
-        # input release still follows the internal deceleration ramp to zero.
+        # Native locomotion starts at SLOW_WALK's 0.10 m/s floor. Keep distinct
+        # start/stop thresholds so measured-heading noise cannot chatter between
+        # IDLE and locomotion. A deliberate direction release is IDLE above.
         if (
             input_magnitude > 1e-12
             and self._gait_active
@@ -754,6 +886,14 @@ class GameControlCore:
             if self._gait_active
             else 0.0
         )
+        locomotion_mode = (
+            native_locomotion_mode_for_speed(
+                output_speed,
+                requested_mode=requested_locomotion_mode,
+            )
+            if output_speed > 0.0
+            else SONIC_IDLE_MODE
+        )
 
         direction = (
             math.cos(self._command_heading_rad),
@@ -766,6 +906,7 @@ class GameControlCore:
             movement=direction if moving else (0.0, 0.0, 0.0),
             facing=direction,
             speed_mps=output_speed,
+            locomotion_mode=locomotion_mode,
             mode="move" if moving else "idle",
             safe_stop=False,
             reason=None,

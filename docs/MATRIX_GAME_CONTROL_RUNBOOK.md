@@ -19,8 +19,8 @@ Implemented behavior:
   and S;
 - diagonals are normalized, with speed, acceleration, deceleration, and turn
   rate limited;
-- keyboard WASD uses hold-to-modify slow/walk/run profiles: Ctrl, no modifier,
-  and Shift respectively; all remain native SONIC `SLOW_WALK`;
+- keyboard WASD selects native slow/walk/run modes: Ctrl, no modifier, and
+  Shift map to SONIC modes 1, 2, and 3 respectively;
 - Q/E is excluded from locomotion yaw;
 - exact UE-PID focus loss, observed V safety-state toggles, camera drag, stale
   input, disconnect, and provider failure stop the robot;
@@ -52,24 +52,29 @@ be claimed from this implementation.
 | Input sampling | 50 Hz |
 | Local input protocol | strict `matrix-game-input/v2` (`ctrl` and `shift` are required fields) |
 | SONIC control | 50 Hz; native physics remains 200 Hz |
-| Maximum speed | 0.30 m/s |
-| Keyboard speed profiles | Ctrl slow 0.10; unmodified walk 0.20; Shift run 0.30 m/s; Ctrl wins a conflict |
-| Native gait | `SLOW_WALK`; 0.10 m/s floor with start/stop hysteresis |
+| Maximum keyboard target | 2.50 m/s (`RUN` lower boundary) |
+| Analog maximum | 0.30 m/s default; configurable up to 0.80 m/s, kept inside `SLOW_WALK` |
+| Keyboard gait profiles | Ctrl mode 1 / 0.10; unmodified mode 2 / 0.80; Shift mode 3 / 2.50 m/s; Ctrl wins a conflict |
+| Native gait intervals | mode 1: 0.10-0.80; mode 2: 0.80-2.50; mode 3: 2.50-7.50 m/s |
 | Acceleration / deceleration | 1.20 / 2.40 m/s² |
 | Maximum heading rate | 2.50 rad/s |
 | Translation heading gate | start within 15 degrees; stop beyond 30 degrees |
 | Left-stick radial deadzone | 0.15 |
 | Input timeout | 0.15 s |
 | Maximum snapshot age | 0.15 s |
-| Safe stop | Immediate zero command, without smoothing |
+| Direction release / safe stop | Immediate mode 0 and zero command, without smoothing |
 | Re-arm | One focused neutral frame before movement |
 
-Do not increase the timeout or speed during the first Heyuan calibration. Keep the
-startup elastic band enabled and keep `--fail-on-fall`/zero-reset acceptance
-gates at their launcher defaults. The internal ramp is bounded, but native
-gait entry/exit has a 0.10 m/s floor step. The hidden intent ramp runs before
-entry and published acceleration is limited again after that first native floor
-frame; record physical start/stop distance.
+Do not increase the timeout or the 0.30 m/s analog cap during the first Heyuan
+calibration. Keep the startup elastic band enabled and keep
+`--fail-on-fall`/zero-reset acceptance gates at their launcher defaults. The
+keyboard target is deliberately higher because it selects native `WALK`/`RUN`.
+The bounded ramp publishes mode 1 until 0.80 m/s, mode 2 from 0.80 to 2.50 m/s,
+and mode 3 only at 2.50 m/s. Record physical gait-transition distance.
+The CLI permits an analog cap up to native `SLOW_WALK`'s 0.80 m/s ceiling, but
+the tracked Heyuan/default value remains 0.30 m/s. Switching from keyboard to
+an already-deflected stick clamps that frame to the configured analog cap and
+returns to mode 1.
 
 ## Preflight on Heyuan
 
@@ -210,13 +215,14 @@ At fixed SONIC yaw zero, verify the normalized physics directions:
 Also verify:
 
 1. W+A and W+D are not faster than W.
-2. Ctrl+W, W, and Shift+W settle at 0.10, 0.20, and 0.30 m/s respectively;
-   holding Ctrl+Shift uses the safer 0.10 m/s profile, and modifier transitions
-   obey acceleration/deceleration limits.
+2. Ctrl+W, W, and Shift+W settle at native modes/speeds 1/0.10, 2/0.80,
+   and 3/2.50 m/s respectively; holding Ctrl+Shift uses 1/0.10. During a
+   transition, every intermediate mode/speed pair stays in its native interval.
 3. A, D, and S rotate the robot toward movement; a reversal turns before it
    develops full translation speed.
 4. Q and E alone do not move the root or change the game-control heading.
-5. Releasing movement decelerates normally, while a safety event hard-stops.
+5. Releasing every movement direction, losing focus, or timing out publishes
+   mode 0 immediately; Ctrl/Shift without a direction remains mode 0.
 
 The visible camera may not align with this table in `fixed` mode. That mismatch
 is expected and is why this stage is not camera-relative acceptance.

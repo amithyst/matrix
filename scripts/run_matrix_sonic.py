@@ -29,8 +29,15 @@ from matrix_game_control import (
     GameControlCore,
     InputProtocolError,
     InputRejectedError,
+    KEYBOARD_GAIT_TARGETS_MPS,
     PROTOCOL_NAME,
     RobotMotionCommand,
+    SONIC_GAIT_NAMES,
+    SONIC_GAIT_SPEED_RANGES_MPS,
+    SONIC_IDLE_MODE,
+    SONIC_RUN_MODE,
+    SONIC_SLOW_WALK_MODE,
+    SONIC_WALK_MODE,
     UnixInputConnection,
     UnixSeqpacketInputServer,
     wrap_angle_rad,
@@ -63,7 +70,12 @@ def _parse_args() -> argparse.Namespace:
         / f"matrix-game-control-{os.getuid()}-{os.getpid()}.sock",
         help="User-local Unix socket for camera-relative input snapshots",
     )
-    parser.add_argument("--game-max-speed", type=float, default=0.30)
+    parser.add_argument(
+        "--game-max-speed",
+        type=float,
+        default=0.30,
+        help="Analog SLOW_WALK cap (default 0.30, maximum 0.80); keyboard targets are fixed",
+    )
     parser.add_argument("--game-max-acceleration", type=float, default=1.20)
     parser.add_argument("--game-max-deceleration", type=float, default=2.40)
     parser.add_argument("--game-max-turn-rate", type=float, default=2.50)
@@ -1122,6 +1134,7 @@ class _GameSonicReadinessGate:
             movement=(0.0, 0.0, 0.0),
             facing=stopped.facing,
             speed_mps=0.0,
+            locomotion_mode=SONIC_IDLE_MODE,
             mode="deadman",
             safe_stop=True,
             reason="sonic_not_ready",
@@ -1274,11 +1287,17 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
         "input_source_effective": effective_input_source,
-        "native_gait": "SLOW_WALK",
-        "keyboard_slow_speed_mps": 0.10,
-        "keyboard_walk_speed_mps": round((0.10 + args.game_max_speed) / 2.0, 6),
-        "keyboard_run_speed_mps": args.game_max_speed,
-        "maximum_speed_mps": args.game_max_speed,
+        "native_gait": "IDLE/SLOW_WALK/WALK/RUN selected by movement tier",
+        "native_gait_modes": {
+            SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
+        },
+        "keyboard_slow_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
+            SONIC_SLOW_WALK_MODE
+        ],
+        "keyboard_walk_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE],
+        "keyboard_run_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE],
+        "maximum_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE],
+        "analog_maximum_speed_mps": args.game_max_speed,
         "maximum_acceleration_mps2": args.game_max_acceleration,
         "maximum_deceleration_mps2": args.game_max_deceleration,
         "maximum_turn_rate_rad_s": args.game_max_turn_rate,
@@ -1608,11 +1627,13 @@ class NativePlannerClient:
         speed_value = float(speed)
         if not math.isfinite(speed_value) or speed_value < 0.0:
             raise ValueError("speed must be non-negative and finite")
-        if type(locomotion_mode) is not int or not 1 <= locomotion_mode <= 26:
-            raise ValueError("locomotion_mode must be a native SONIC motion in [1, 26]")
         moving = speed_value > 1e-6 and math.hypot(
             movement_values[0], movement_values[1]
         ) > 1e-6
+        if type(locomotion_mode) is not int or not 0 <= locomotion_mode <= 26:
+            raise ValueError("locomotion_mode must be a native SONIC motion in [0, 26]")
+        if moving and locomotion_mode == SONIC_IDLE_MODE:
+            raise ValueError("moving planner command cannot use native IDLE")
         self._socket.send(
             self._build_command_message(
                 start=start,
@@ -1634,15 +1655,40 @@ class NativePlannerClient:
     def send_game_command(self, command: RobotMotionCommand) -> None:
         if not isinstance(command, RobotMotionCommand):
             raise TypeError("command must be a RobotMotionCommand")
-        if command.speed_mps > 0.8:
-            raise ValueError("game command exceeds native SLOW_WALK maximum 0.8 m/s")
+        if command.locomotion_mode not in {
+            SONIC_IDLE_MODE,
+            SONIC_SLOW_WALK_MODE,
+            SONIC_WALK_MODE,
+            SONIC_RUN_MODE,
+        }:
+            raise ValueError("game command must use native IDLE/SLOW_WALK/WALK/RUN")
+        has_speed = command.speed_mps > 1e-6
+        has_direction = math.hypot(
+            command.movement[0], command.movement[1]
+        ) > 1e-6
+        if has_speed != has_direction:
+            raise ValueError("game command speed and movement must become active together")
+        moving = has_speed and has_direction
+        if not moving:
+            if command.locomotion_mode != SONIC_IDLE_MODE:
+                raise ValueError("stationary game command must use native IDLE")
+        else:
+            if command.locomotion_mode == SONIC_IDLE_MODE:
+                raise ValueError("moving game command cannot use native IDLE")
+            minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[
+                command.locomotion_mode
+            ]
+            if not minimum <= command.speed_mps <= maximum:
+                gait_name = SONIC_GAIT_NAMES[command.locomotion_mode]
+                raise ValueError(
+                    f"game command speed is outside native {gait_name} "
+                    f"range {minimum:.1f}-{maximum:.1f} m/s"
+                )
         self.send_direction(
             movement=command.movement,
             facing=command.facing,
             speed=command.speed_mps,
-            # Interactive control is capped at 0.30 m/s.  Native SONIC mode 1
-            # is SLOW_WALK (0.1-0.8 m/s); mode 2 starts at 0.8 m/s.
-            locomotion_mode=1,
+            locomotion_mode=command.locomotion_mode,
         )
 
     def close(self) -> None:
@@ -1842,6 +1888,14 @@ class GameInputRuntime:
             ),
             "last_error": self.last_error,
             "mode": command.mode if command is not None else "deadman",
+            "locomotion_mode": (
+                command.locomotion_mode if command is not None else SONIC_IDLE_MODE
+            ),
+            "locomotion_mode_name": (
+                SONIC_GAIT_NAMES.get(command.locomotion_mode, "UNKNOWN")
+                if command is not None
+                else SONIC_GAIT_NAMES[SONIC_IDLE_MODE]
+            ),
             "moving_command_frames": self.moving_command_frames,
             "packets_applied": self.packets_applied,
             "packets_received": self.packets_received,
@@ -2252,6 +2306,8 @@ def main() -> int:
         raise SystemExit("--ue-pid must identify a live UE process")
     game_config = None
     if args.control_source == "game":
+        if args.game_max_speed > 0.8:
+            raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
         try:
             game_config = ControlConfig(
                 max_speed_mps=args.game_max_speed,
@@ -2265,8 +2321,6 @@ def main() -> int:
             )
         except (InputProtocolError, ValueError) as exc:
             raise SystemExit(f"invalid game control configuration: {exc}") from exc
-        if args.game_max_speed > 0.8:
-            raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
         if not args.game_input_socket.is_absolute():
             raise SystemExit("--game-input-socket must be an absolute path")
         if not args.game_input_socket.parent.is_dir():

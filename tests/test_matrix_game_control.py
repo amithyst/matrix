@@ -51,7 +51,7 @@ def snapshot(
 
 def immediate_config(**overrides):
     values = {
-        "max_speed_mps": 2.0,
+        "max_speed_mps": 0.3,
         "max_acceleration_mps2": 1000.0,
         "max_deceleration_mps2": 1000.0,
         "max_turn_rate_rad_s": 1000.0,
@@ -181,6 +181,19 @@ class MovementMathTest(unittest.TestCase):
         )
         self.assertAlmostEqual(math.hypot(right, forward), 1.0)
 
+    def test_native_gait_boundary_ties_follow_requested_tier(self) -> None:
+        select = MODULE.native_locomotion_mode_for_speed
+        self.assertEqual(select(0.10, requested_mode=1), 1)
+        self.assertEqual(select(0.80, requested_mode=1), 1)
+        self.assertEqual(select(0.79995, requested_mode=2), 1)
+        self.assertEqual(select(0.80, requested_mode=2), 2)
+        self.assertEqual(select(2.49, requested_mode=3), 2)
+        self.assertEqual(select(2.49995, requested_mode=3), 2)
+        self.assertEqual(select(2.50, requested_mode=2), 2)
+        self.assertEqual(select(2.50, requested_mode=3), 3)
+        with self.assertRaisesRegex(ValueError, "below native SLOW_WALK"):
+            select(0.05, requested_mode=1)
+
 
 class GameControlCoreTest(unittest.TestCase):
     def test_library_defaults_match_safe_runtime_profile(self) -> None:
@@ -200,6 +213,15 @@ class GameControlCoreTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "must not overlap"):
             MODULE.ControlConfig(gait_stop_speed_mps=0.099)
+        with self.assertRaisesRegex(ValueError, "native SLOW_WALK minimum"):
+            MODULE.ControlConfig(
+                min_gait_speed_mps=0.05,
+                gait_start_speed_mps=0.05,
+                gait_stop_speed_mps=0.04,
+            )
+        self.assertEqual(MODULE.ControlConfig(max_speed_mps=0.8).max_speed_mps, 0.8)
+        with self.assertRaisesRegex(ValueError, "SLOW_WALK maximum"):
+            MODULE.ControlConfig(max_speed_mps=0.81)
 
     def test_w_follows_camera_and_orients_to_movement(self) -> None:
         core = armed_core(immediate_config())
@@ -213,9 +235,11 @@ class GameControlCoreTest(unittest.TestCase):
         )
         first = core.command(now_s=10.0, dt_s=0.1)
         self.assertAlmostEqual(first.speed_mps, 0.10)
+        self.assertEqual(first.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
         command = core.command(now_s=10.0, dt_s=0.1)
         self.assertEqual(command.mode, "move")
-        self.assertAlmostEqual(command.speed_mps, 2.0)
+        self.assertAlmostEqual(command.speed_mps, 2.5)
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_RUN_MODE)
         self.assertAlmostEqual(command.movement[0], 0.0, places=7)
         self.assertAlmostEqual(command.movement[1], 1.0, places=7)
         self.assertEqual(command.movement, command.facing)
@@ -248,23 +272,93 @@ class GameControlCoreTest(unittest.TestCase):
             diagonal_command.movement[1], -math.sqrt(0.5), places=7
         )
 
-    def test_keyboard_uses_hold_to_walk_and_run_speed_tiers(self) -> None:
+    def test_keyboard_uses_native_hold_to_walk_and_run_gaits(self) -> None:
         config = immediate_config(max_speed_mps=0.3)
 
-        def speed_for(modifiers: tuple[str, ...]) -> float:
+        def command_for(modifiers: tuple[str, ...]):
             core = armed_core(config)
             core.accept_snapshot(
                 snapshot(pressed=("w",), speed_modifiers=modifiers),
                 received_at_s=10.0,
             )
             core.command(now_s=10.0, dt_s=0.1)
-            return core.command(now_s=10.0, dt_s=0.1).speed_mps
+            return core.command(now_s=10.0, dt_s=0.1)
 
-        self.assertAlmostEqual(speed_for(("ctrl",)), 0.10)
-        self.assertAlmostEqual(speed_for(()), 0.20)
-        self.assertAlmostEqual(speed_for(("shift",)), 0.30)
+        slow = command_for(("ctrl",))
+        walk = command_for(())
+        run = command_for(("shift",))
+        self.assertEqual((slow.locomotion_mode, slow.speed_mps), (1, 0.10))
+        self.assertEqual((walk.locomotion_mode, walk.speed_mps), (2, 0.80))
+        self.assertEqual((run.locomotion_mode, run.speed_mps), (3, 2.50))
         # The slower modifier wins an accidental overlap.
-        self.assertAlmostEqual(speed_for(("ctrl", "shift")), 0.10)
+        conflict = command_for(("ctrl", "shift"))
+        self.assertEqual((conflict.locomotion_mode, conflict.speed_mps), (1, 0.10))
+
+    def test_modifiers_without_direction_are_native_idle(self) -> None:
+        for modifiers in (("ctrl",), ("shift",), ("ctrl", "shift")):
+            core = armed_core(immediate_config(max_speed_mps=0.3))
+            core.accept_snapshot(
+                snapshot(speed_modifiers=modifiers), received_at_s=10.0
+            )
+            command = core.command(now_s=10.0, dt_s=0.1)
+            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+            self.assertEqual(command.speed_mps, 0.0)
+            self.assertEqual(command.mode, "idle")
+
+    def test_native_gait_boundaries_follow_acceleration_and_downshift(self) -> None:
+        core = armed_core(
+            MODULE.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=1.0,
+                max_deceleration_mps2=1.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=2.0,
+            )
+        )
+        core.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            received_at_s=10.0,
+        )
+        entered = core.command(now_s=10.0, dt_s=0.1)
+        walking = core.command(now_s=10.0, dt_s=0.7)
+        running = core.command(now_s=10.0, dt_s=1.7)
+        self.assertEqual((entered.locomotion_mode, entered.speed_mps), (1, 0.1))
+        self.assertEqual(walking.locomotion_mode, 2)
+        self.assertAlmostEqual(walking.speed_mps, 0.8)
+        self.assertEqual(running.locomotion_mode, 3)
+        self.assertAlmostEqual(running.speed_mps, 2.5)
+
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.01,
+                pressed=("w",),
+                speed_modifiers=("ctrl",),
+            ),
+            received_at_s=10.01,
+        )
+        downshifted = core.command(now_s=10.01, dt_s=1.0)
+        precise = core.command(now_s=10.01, dt_s=1.0)
+        self.assertEqual(downshifted.locomotion_mode, 2)
+        self.assertAlmostEqual(downshifted.speed_mps, 1.5)
+        self.assertEqual(precise.locomotion_mode, 1)
+        self.assertAlmostEqual(precise.speed_mps, 0.5)
+
+    def test_small_measured_heading_error_still_reaches_keyboard_native_gaits(self) -> None:
+        for modifiers, expected_mode, expected_speed in (
+            ((), MODULE.SONIC_WALK_MODE, 0.8),
+            (("shift",), MODULE.SONIC_RUN_MODE, 2.5),
+        ):
+            core = armed_core(immediate_config(max_speed_mps=0.3))
+            core.synchronize_heading(math.radians(5.0))
+            core.accept_snapshot(
+                snapshot(pressed=("w",), speed_modifiers=modifiers),
+                received_at_s=10.0,
+            )
+            core.command(now_s=10.0, dt_s=0.1)
+            settled = core.command(now_s=10.0, dt_s=0.1)
+            self.assertEqual(settled.locomotion_mode, expected_mode)
+            self.assertAlmostEqual(settled.speed_mps, expected_speed)
 
     def test_keyboard_modifiers_do_not_quantize_gamepad_speed(self) -> None:
         core = armed_core(immediate_config(max_speed_mps=0.3))
@@ -280,6 +374,32 @@ class GameControlCoreTest(unittest.TestCase):
         moving = core.command(now_s=10.0, dt_s=0.1)
 
         self.assertAlmostEqual(moving.speed_mps, 0.20)
+
+    def test_analog_full_stick_respects_configured_slow_walk_cap(self) -> None:
+        core = armed_core(immediate_config(max_speed_mps=0.8))
+        core.accept_snapshot(snapshot(stick=(0.0, 1.0)), received_at_s=10.0)
+        core.command(now_s=10.0, dt_s=0.1)
+        moving = core.command(now_s=10.0, dt_s=0.1)
+        self.assertEqual(moving.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertAlmostEqual(moving.speed_mps, 0.8)
+
+    def test_keyboard_run_to_analog_clamps_to_configured_cap_immediately(self) -> None:
+        core = armed_core(immediate_config(max_speed_mps=0.3))
+        core.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        running = core.command(now_s=10.0, dt_s=0.1)
+        self.assertEqual((running.locomotion_mode, running.speed_mps), (3, 2.5))
+
+        core.accept_snapshot(
+            snapshot(sequence=2, timestamp=10.01, stick=(0.0, 1.0)),
+            received_at_s=10.01,
+        )
+        analog = core.command(now_s=10.01, dt_s=0.02)
+        self.assertEqual(analog.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertAlmostEqual(analog.speed_mps, 0.3)
 
     def test_keyboard_tier_changes_keep_acceleration_limits(self) -> None:
         core = armed_core(
@@ -352,8 +472,8 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(first.speed_mps, 0.10)
         command = core.command(now_s=10.0, dt_s=0.1)
         # (0.6 - 0.2) / (1 - 0.2) = 0.5 input.  Analog travel spans the
-        # interval from the 0.10 m/s native floor to the 2.0 m/s maximum.
-        self.assertAlmostEqual(command.speed_mps, 0.10 + (2.0 - 0.10) * 0.5)
+        # interval from the 0.10 m/s native floor to the 0.30 m/s default cap.
+        self.assertAlmostEqual(command.speed_mps, 0.20)
         self.assertAlmostEqual(command.movement[0], 1.0)
         self.assertAlmostEqual(command.movement[1], 0.0)
 
@@ -381,7 +501,7 @@ class GameControlCoreTest(unittest.TestCase):
 
     def test_turn_and_acceleration_are_rate_limited(self) -> None:
         config = MODULE.ControlConfig(
-            max_speed_mps=2.0,
+            max_speed_mps=0.3,
             max_acceleration_mps2=1.0,
             max_deceleration_mps2=2.0,
             max_turn_rate_rad_s=1.0,
@@ -543,7 +663,7 @@ class GameControlCoreTest(unittest.TestCase):
             all(later > earlier for earlier, later in zip(headings, headings[1:]))
         )
 
-    def test_release_decelerates_to_zero_within_default_150ms_window(self) -> None:
+    def test_direction_release_hard_idles_in_one_frame(self) -> None:
         core = armed_core()
         core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
         moving = core.command(now_s=10.0, dt_s=0.1)
@@ -552,7 +672,46 @@ class GameControlCoreTest(unittest.TestCase):
         core.accept_snapshot(snapshot(sequence=2, timestamp=10.1), received_at_s=10.1)
         stopping = core.command(now_s=10.1, dt_s=0.1)
         self.assertEqual(stopping.speed_mps, 0.0)
+        self.assertEqual(stopping.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(stopping.mode, "idle")
+
+    def test_run_key_release_requests_idle_in_one_control_frame(self) -> None:
+        core = armed_core(immediate_config(max_speed_mps=0.3))
+        core.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        running = core.command(now_s=10.0, dt_s=0.1)
+        self.assertEqual((running.locomotion_mode, running.speed_mps), (3, 2.5))
+
+        core.accept_snapshot(snapshot(sequence=2, timestamp=10.01), received_at_s=10.01)
+        stopped = core.command(now_s=10.01, dt_s=0.02)
+        self.assertEqual(stopped.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(stopped.speed_mps, 0.0)
+        self.assertEqual(stopped.mode, "idle")
+
+    def test_mid_turn_direction_release_holds_measured_heading(self) -> None:
+        core = armed_core(
+            MODULE.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=1.0,
+                max_deceleration_mps2=1.0,
+                max_turn_rate_rad_s=1.0,
+                max_step_s=0.1,
+            )
+        )
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(snapshot(pressed=("s",)), received_at_s=10.0)
+        turning = core.command(now_s=10.0, dt_s=0.1)
+        self.assertGreater(abs(math.atan2(turning.facing[1], turning.facing[0])), 0.0)
+
+        core.accept_snapshot(snapshot(sequence=2, timestamp=10.01), received_at_s=10.01)
+        stopped = core.command(now_s=10.01, dt_s=0.02)
+        self.assertEqual(stopped.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(stopped.speed_mps, 0.0)
+        self.assertAlmostEqual(stopped.facing[0], 1.0)
+        self.assertAlmostEqual(stopped.facing[1], 0.0)
 
     def test_slow_walk_never_publishes_below_native_gait_minimum(self) -> None:
         core = armed_core(
@@ -737,6 +896,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertTrue(command.safe_stop)
         self.assertEqual(command.reason, "free_camera")
         self.assertEqual(command.speed_mps, 0.0)
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
 
         # Holding V does not repeatedly toggle.
         core.accept_snapshot(
@@ -764,6 +924,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(command.mode, "deadman")
         self.assertEqual(command.reason, "focus_lost")
         self.assertEqual(command.speed_mps, 0.0)
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
 
         core.accept_snapshot(
             snapshot(sequence=3, timestamp=10.02, focused=True, pressed=("w",)),
@@ -804,6 +965,7 @@ class GameControlCoreTest(unittest.TestCase):
         command = core.command(now_s=10.17, dt_s=0.01)
         self.assertEqual(command.reason, "input_timeout")
         self.assertEqual(command.speed_mps, 0.0)
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
 
         core.accept_snapshot(
             snapshot(sequence=4, timestamp=10.171, pressed=("w",)),

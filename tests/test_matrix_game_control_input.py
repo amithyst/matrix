@@ -1400,11 +1400,20 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         backend._expected_ue_pid = 1234
         backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
 
-        sample = backend.poll()
+        left_ctrl_right_shift = backend.poll()
+        pressed_codes.clear()
+        pressed_codes.update(
+            {
+                backend._keycodes["ctrl_right"],
+                backend._keycodes["shift_left"],
+            }
+        )
+        right_ctrl_left_shift = backend.poll()
 
-        self.assertTrue(sample.ctrl)
-        self.assertTrue(sample.shift)
-        self.assertTrue(sample.focused)
+        for sample in (left_ctrl_right_shift, right_ctrl_left_shift):
+            self.assertTrue(sample.ctrl)
+            self.assertTrue(sample.shift)
+            self.assertTrue(sample.focused)
 
     def test_pointer_query_failure_disarms_even_when_matrix_has_focus(self) -> None:
         class FakeX11:

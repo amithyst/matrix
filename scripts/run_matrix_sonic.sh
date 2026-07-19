@@ -115,7 +115,7 @@ usage() {
         "  --gamepad-look-deadzone VALUE    Radial right-stick deadzone" \
         "  --gamepad-look-min-pitch DEG     Spectator pitch lower limit" \
         "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
-        "  --game-max-speed MPS       Maximum interactive speed (default: 0.30)" \
+        "  --game-max-speed MPS       Analog SLOW_WALK cap (default 0.30; max 0.80)" \
         "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \

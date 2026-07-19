@@ -712,10 +712,19 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             status["camera_yaw_observation"],
             "configured_pointer_delta_mirror",
         )
-        self.assertEqual(status["native_gait"], "SLOW_WALK")
+        self.assertEqual(
+            status["native_gait"],
+            "IDLE/SLOW_WALK/WALK/RUN selected by movement tier",
+        )
+        self.assertEqual(
+            status["native_gait_modes"],
+            {"IDLE": 0, "SLOW_WALK": 1, "WALK": 2, "RUN": 3},
+        )
         self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
-        self.assertEqual(status["keyboard_walk_speed_mps"], 0.20)
-        self.assertEqual(status["keyboard_run_speed_mps"], 0.30)
+        self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
+        self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
+        self.assertEqual(status["maximum_speed_mps"], 2.50)
+        self.assertEqual(status["analog_maximum_speed_mps"], 0.30)
         self.assertEqual(status["maximum_acceleration_mps2"], 1.20)
         self.assertEqual(status["maximum_deceleration_mps2"], 2.40)
         self.assertEqual(status["maximum_turn_rate_rad_s"], 2.50)
@@ -1470,6 +1479,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 movement=(0.0, 1.0, 0.0),
                 facing=(0.0, 1.0, 0.0),
                 speed_mps=0.3,
+                locomotion_mode=MODULE.SONIC_SLOW_WALK_MODE,
                 mode="move",
                 safe_stop=False,
                 reason=None,
@@ -1480,35 +1490,76 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[1]["facing"], [0.0, 1.0, 0.0])
         self.assertEqual(planners[1]["speed"], 0.3)
 
-        client.send_game_command(
-            MODULE.RobotMotionCommand(
-                sequence=10,
-                movement=(0.0, 0.0, 0.0),
-                facing=(0.0, 1.0, 0.0),
-                speed_mps=0.0,
-                mode="deadman",
-                safe_stop=True,
-                reason="sonic_not_ready",
-            )
-        )
-        self.assertTrue(commands[2]["start"])
-        self.assertFalse(commands[2]["stop"])
-        self.assertEqual(planners[2]["mode"], 0)
-        self.assertEqual(planners[2]["movement"], [0.0, 0.0, 0.0])
-        self.assertEqual(planners[2]["speed"], -1.0)
-
-        with self.assertRaisesRegex(ValueError, "SLOW_WALK"):
+        for sequence, native_mode, speed in (
+            (10, MODULE.SONIC_WALK_MODE, 0.8),
+            (11, MODULE.SONIC_RUN_MODE, 2.5),
+        ):
             client.send_game_command(
                 MODULE.RobotMotionCommand(
-                    sequence=11,
-                    movement=(1.0, 0.0, 0.0),
-                    facing=(1.0, 0.0, 0.0),
-                    speed_mps=0.81,
+                    sequence=sequence,
+                    movement=(0.0, 1.0, 0.0),
+                    facing=(0.0, 1.0, 0.0),
+                    speed_mps=speed,
+                    locomotion_mode=native_mode,
                     mode="move",
                     safe_stop=False,
                     reason=None,
                 )
             )
+            self.assertEqual(planners[-1]["mode"], native_mode)
+            self.assertEqual(planners[-1]["speed"], speed)
+
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=12,
+                movement=(0.0, 0.0, 0.0),
+                facing=(0.0, 1.0, 0.0),
+                speed_mps=0.0,
+                locomotion_mode=MODULE.SONIC_IDLE_MODE,
+                mode="deadman",
+                safe_stop=True,
+                reason="sonic_not_ready",
+            )
+        )
+        self.assertTrue(commands[4]["start"])
+        self.assertFalse(commands[4]["stop"])
+        self.assertEqual(planners[4]["mode"], 0)
+        self.assertEqual(planners[4]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[4]["speed"], -1.0)
+
+        with self.assertRaisesRegex(ValueError, "SLOW_WALK"):
+            client.send_game_command(
+                MODULE.RobotMotionCommand(
+                    sequence=13,
+                    movement=(1.0, 0.0, 0.0),
+                    facing=(1.0, 0.0, 0.0),
+                    speed_mps=0.81,
+                    locomotion_mode=MODULE.SONIC_SLOW_WALK_MODE,
+                    mode="move",
+                    safe_stop=False,
+                    reason=None,
+                )
+            )
+
+        for sequence, native_mode, speed, gait_name in (
+            (14, MODULE.SONIC_WALK_MODE, 0.79995, "WALK"),
+            (15, MODULE.SONIC_RUN_MODE, 2.49995, "RUN"),
+        ):
+            with self.subTest(native_mode=native_mode), self.assertRaisesRegex(
+                ValueError, gait_name
+            ):
+                client.send_game_command(
+                    MODULE.RobotMotionCommand(
+                        sequence=sequence,
+                        movement=(1.0, 0.0, 0.0),
+                        facing=(1.0, 0.0, 0.0),
+                        speed_mps=speed,
+                        locomotion_mode=native_mode,
+                        mode="move",
+                        safe_stop=False,
+                        reason=None,
+                    )
+                )
 
         with mock.patch.object(MODULE.time, "sleep") as sleep:
             client.close()

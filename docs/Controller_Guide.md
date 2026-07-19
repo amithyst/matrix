@@ -21,12 +21,15 @@ For setup, camera calibration, safety tests, and Heyuan acceptance, follow the
 | **W / S** | Move toward / away from the camera's horizontal forward direction |
 | **A / D** | Move left / right in the camera's horizontal frame |
 | **W+A**, **W+D**, etc. | Diagonal movement at the same maximum speed as a cardinal direction |
-| Hold **Ctrl** + WASD | Precise slow walk (0.10 m/s with the default speed cap) |
-| WASD without a speed modifier | Ordinary walk (0.20 m/s by default) |
-| Hold **Shift** + WASD | Run (0.30 m/s default maximum) |
+| Hold **Ctrl** + WASD | Native mode 1 `SLOW_WALK`, 0.10 m/s target |
+| WASD without a speed modifier | Native mode 2 `WALK`, 0.80 m/s target |
+| Hold **Shift** + WASD | Native mode 3 `RUN`, 2.50 m/s target |
 | Mouse drag | Native Matrix camera operation; the robot stops while the configured look button is held |
 | **V** | Best-effort safety mirror; an observed press forces zero. Centered-overlay v3 does not use V as a visual camera-mode switch |
 | **Q / E** | Reserved and ignored by SONIC locomotion; they do not rotate the robot |
+
+Left and right Ctrl are equivalent, as are left and right Shift. If any Ctrl
+and any Shift are held together, Ctrl's slower profile wins.
 
 All four movement directions use orient-to-movement. The robot turns toward the
 requested world direction and reduces translation while a large turn is still
@@ -38,16 +41,22 @@ within 15 degrees of the requested direction. Once moving, a wider 30-degree
 stop edge prevents noise from chattering the gait while still stopping a
 materially misaligned body.
 
-All three keyboard speed profiles stay in native SONIC `SLOW_WALK`; “run” is an
-operator speed profile, not a switch to another SONIC gait. Ctrl selects the
-0.10 m/s native floor, unmodified WASD selects the midpoint between that floor
-and the configured maximum, and Shift selects the configured maximum. Ctrl wins
-if both modifiers are held. Q/E is not reused. Acceleration limits apply when a
-modifier changes while moving. Native gait entry/exit necessarily has a
-0.10 m/s floor step; after entry, the published ramp again follows the configured
-limit. Above the radial deadzone, left-stick travel
-still maps continuously from 0.10 m/s to the configured maximum instead of
-being quantized into the keyboard tiers. Measure actual start/stop distance on
+The keyboard tiers select SONIC's native locomotion modes, not three aliases of
+`SLOW_WALK`: Ctrl selects mode 1 at 0.10 m/s, unmodified WASD selects mode 2 at
+0.80 m/s, and Shift selects mode 3 at 2.50 m/s. These targets are the lower
+boundaries of SONIC's documented 0.10-0.80, 0.80-2.50, and 2.50-7.50 m/s gait
+intervals. Ctrl wins if both modifiers are held. Q/E is not reused.
+
+Acceleration and modifier downshifts remain rate limited. The published native
+mode follows the current ramp, so an upshift reaches mode 2 only at 0.80 m/s
+and mode 3 only at 2.50 m/s; a downshift crosses the same boundaries in reverse.
+Every published mode/speed pair therefore stays inside a native gait interval.
+Releasing all movement directions immediately requests mode 0 `IDLE`; modifier
+keys alone never move the robot. Above the radial deadzone, left-stick travel
+still maps continuously from 0.10 m/s to the separately configured analog
+maximum (0.30 m/s by default, configurable up to the native 0.80 m/s ceiling)
+and remains `SLOW_WALK`. Switching from a keyboard gait to the stick clamps the
+same output frame to that configured cap. Measure actual gait transitions on
 Heyuan.
 
 The default Matrix look button is the left mouse button. Releasing a camera
@@ -226,11 +235,12 @@ runtime camera bridge has passed the runbook's black-box acceptance checks.
 
 ### Safety behavior
 
-Game input is sampled at 50 Hz. Keyboard slow/walk/run defaults are
-0.10/0.20/0.30 m/s in native `SLOW_WALK`; gamepad speed remains continuous in
-the same range. The input timeout threshold and maximum snapshot age are
-0.15 s. The SONIC command is hard-zeroed, without a deceleration tail, when any
-of the following occurs:
+Game input is sampled at 50 Hz. Keyboard slow/walk/run targets are native modes
+1/2/3 at 0.10/0.80/2.50 m/s; gamepad speed remains continuous in native
+`SLOW_WALK` up to its separate configured cap (0.30 m/s by default, at most
+0.80 m/s). The input timeout threshold and maximum snapshot age are 0.15 s.
+Releasing all directions or any condition below hard-zeroes the SONIC command
+without a deceleration tail:
 
 - startup has not yet received a neutral frame;
 - native LowCmd is not fresh or the startup elastic band has not fully released;

@@ -158,10 +158,9 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
                 planner.send_game_command(moving)
                 runtime.record_published_command(moving)
 
-                self.assertEqual(planner_frames[-1]["mode"], 1)
-                # Unmodified keyboard WASD is the ordinary-walk midpoint
-                # between SONIC's 0.10 m/s floor and the 0.30 m/s run cap.
-                self.assertAlmostEqual(planner_frames[-1]["speed"], 0.2)
+                self.assertEqual(planner_frames[-1]["mode"], 2)
+                # Unmodified keyboard WASD reaches native WALK's lower bound.
+                self.assertAlmostEqual(planner_frames[-1]["speed"], 0.8)
                 self.assertAlmostEqual(
                     planner_frames[-1]["movement"][0], 0.0, places=7
                 )
@@ -172,9 +171,10 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
                     planner_frames[-1]["movement"],
                     planner_frames[-1]["facing"],
                 )
-                self.assertEqual(
-                    runtime.telemetry(now_s=10.011)["moving_command_frames"], 1
-                )
+                telemetry = runtime.telemetry(now_s=10.011)
+                self.assertEqual(telemetry["moving_command_frames"], 1)
+                self.assertEqual(telemetry["locomotion_mode"], 2)
+                self.assertEqual(telemetry["locomotion_mode_name"], "WALK")
 
                 publisher.close()
                 stopped = runtime.poll(now_s=10.012, dt_s=0.001)
