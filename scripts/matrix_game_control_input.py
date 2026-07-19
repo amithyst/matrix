@@ -561,16 +561,21 @@ def select_physical_inputs(
 def effective_input_source(requested: str, camera_yaw_source: str) -> str:
     """Gate gamepad locomotion on an observed camera direction.
 
-    With ``fixed`` or ``x11-mirror`` the adapter cannot observe any native UE
-    right-stick camera response.  The XI2 mirror observes raw motion from an
-    input layer commonly used by SDL, but packaged-UE consumption has not been
-    verified and this is not a final rendered-camera readback.  Auto therefore
-    degrades to keyboard-only, while an explicit gamepad request fails instead
-    of silently diverging.
+    With ``fixed`` or any X11 mirror the adapter cannot observe native UE
+    right-stick camera response.  The mirrors observe input-side motion, but
+    packaged-UE consumption has not been verified and none is a final rendered
+    camera readback.  Auto therefore degrades to keyboard-only, while an
+    explicit gamepad request fails instead of silently diverging.
     """
     if requested not in {"auto", "keyboard", "gamepad"}:
         raise ValueError(f"unsupported input source: {requested}")
-    if camera_yaw_source not in {"fixed", "x11-mirror", "carla"}:
+    if camera_yaw_source not in {
+        "fixed",
+        "x11-mirror",
+        "x11-core-gated",
+        "x11-absolute",
+        "carla",
+    }:
         raise ValueError(f"unsupported camera yaw source: {camera_yaw_source}")
     if camera_yaw_source == "carla":
         return requested
@@ -659,6 +664,97 @@ def transform_camera_yaw(
     if not math.isfinite(provider_yaw_rad) or not math.isfinite(offset_rad):
         raise ValueError("camera yaw and offset must be finite")
     return wrap_angle_rad(sign * provider_yaw_rad + offset_rad)
+
+
+def mirror_sensitivity_mapping(
+    camera_yaw_source: str,
+    *,
+    base_deg_per_unit: float,
+    effective_deg_per_unit: float,
+) -> dict[str, object]:
+    """Describe one source's gain without changing the applied value."""
+
+    if camera_yaw_source in {"x11-mirror", "x11-core-gated"}:
+        units = "degrees_per_xi2_raw_unit"
+    elif camera_yaw_source == "x11-absolute":
+        units = "degrees_per_x11_root_pixel"
+    else:
+        units = "degrees_per_unobserved_input_unit"
+    return {
+        "source": camera_yaw_source,
+        "units": units,
+        "base_deg_per_unit": base_deg_per_unit,
+        "effective_deg_per_unit": effective_deg_per_unit,
+        # Compatibility aliases retained for existing overlay/status readers.
+        "base_deg_per_raw_unit": base_deg_per_unit,
+        "effective_deg_per_raw_unit": effective_deg_per_unit,
+        "base_deg_per_px": base_deg_per_unit,
+        "effective_deg_per_px": effective_deg_per_unit,
+    }
+
+
+def camera_yaw_telemetry(
+    source: str,
+    *,
+    provider_yaw_rad: float,
+    sonic_yaw_rad: float,
+) -> dict[str, object]:
+    """Expose provider and transformed yaw without participating in control."""
+
+    if not math.isfinite(provider_yaw_rad) or not math.isfinite(sonic_yaw_rad):
+        raise ValueError("telemetry camera yaw must be finite")
+    return {
+        "source": source,
+        "provider_yaw_rad": provider_yaw_rad,
+        "provider_yaw_deg": math.degrees(provider_yaw_rad),
+        "sonic_yaw_rad": sonic_yaw_rad,
+        "sonic_yaw_deg": math.degrees(sonic_yaw_rad),
+    }
+
+
+def camera_source_claim(source: str) -> dict[str, object]:
+    """Name an input-side camera claim without implying final-view truth."""
+
+    claims = {
+        "fixed": (
+            "constant_unobserved",
+            "configured_constant_not_final_view",
+            "no_button_gate",
+        ),
+        "x11-mirror": (
+            "xinput2_raw_motion_mirror",
+            "xi2_raw_input_mirror_not_final_view",
+            "xi2_raw_button_edges_same_slave_source",
+        ),
+        "x11-core-gated": (
+            "xinput2_raw_motion_core_button_level_gate",
+            "xi2_raw_motion_core_button_gate_not_final_view",
+            "xquerypointer_core_button_level_sampled_not_event_ordered",
+        ),
+        "x11-absolute": (
+            "xquerypointer_root_absolute_delta",
+            "x11_absolute_pointer_delta_mirror_not_final_view",
+            "xquerypointer_core_level_sampled_at_50hz",
+        ),
+        "carla": (
+            "carla_spectator_rpc_write_readback",
+            "carla_spectator_not_verified_final_view",
+            "not_applicable_carla_rpc",
+        ),
+    }
+    try:
+        observation, truth_scope, button_scope = claims[source]
+    except KeyError as exc:
+        raise ValueError(f"unsupported camera yaw source: {source}") from exc
+    return {
+        "camera_yaw_source": source,
+        "camera_yaw_observation": observation,
+        "camera_yaw_truth_scope": truth_scope,
+        "button_gate_truth_scope": button_scope,
+        "legacy": source == "x11-absolute",
+        "experimental": source in {"x11-core-gated", "x11-absolute"},
+        "visible_follow_camera_verified": False,
+    }
 
 
 def initial_sequence(clock: Callable[[], int] = time.monotonic_ns) -> int:
@@ -974,6 +1070,7 @@ class XInput2DragAccumulator:
         self._pressed_sourceid: int | None = None
         self._requires_release = True
         self.button_state_resyncs = 0
+        self.last_drop_reason: str | None = None
 
     def disarm(self) -> None:
         """Require a core-button release and a subsequent fresh raw press."""
@@ -989,6 +1086,7 @@ class XInput2DragAccumulator:
     ) -> tuple[float, float, bool]:
         if type(current_look_pressed) is not bool:
             raise ValueError("current XI2 look-button state must be boolean")
+        self.last_drop_reason = None
         if self._requires_release:
             # Startup, focus loss, and topology changes all lose a trustworthy
             # per-source button boundary.  Never infer one from the master
@@ -1006,6 +1104,8 @@ class XInput2DragAccumulator:
             if fresh_press_index is None:
                 if not current_look_pressed:
                     self._requires_release = False
+                elif any(event.evtype == _XI_RAW_MOTION for event in events):
+                    self.last_drop_reason = "awaiting_xi2_release_or_fresh_press"
                 return (0.0, 0.0, False)
             self._requires_release = False
             events = events[fresh_press_index:]
@@ -1048,9 +1148,173 @@ class XInput2DragAccumulator:
 
         if (self._pressed_sourceid is not None) != current_look_pressed:
             self.button_state_resyncs += 1
+            self.last_drop_reason = "xi2_button_state_resync"
             self.disarm()
             return (0.0, 0.0, True)
         return (dx, dy, drag_observed)
+
+
+class XInput2CoreGatedAccumulator:
+    """Gate XI2 raw deltas with stable XQueryPointer core-button levels.
+
+    Only a poll interval whose previous and current core levels are both held
+    may contribute yaw.  Press/release boundary batches are deliberately
+    dropped and still report a drag interlock.  This experimental attribution
+    loses at most the boundary portions of a drag, but it never treats raw
+    motion observed while the core button is released as camera yaw.
+    """
+
+    def __init__(self, look_button_detail: int) -> None:
+        if look_button_detail not in {1, 2, 3}:
+            raise ValueError("XI2 look button detail must be 1, 2, or 3")
+        self._look_button_detail = look_button_detail
+        self._previous_core_pressed = False
+        self._requires_release = True
+        self._bound_sourceid: int | None = None
+        self.button_state_resyncs = 0
+        self.last_drop_reason: str | None = None
+        self.drop_reason_counts: dict[str, int] = {}
+        self.ambiguous_raw_motion_events = 0
+        self.ambiguous_raw_dx_total = 0.0
+        self.ambiguous_raw_dy_total = 0.0
+        self.source_bindings = 0
+        self.source_rejections = 0
+
+    def disarm(self) -> None:
+        self._previous_core_pressed = False
+        self._requires_release = True
+        self._bound_sourceid = None
+
+    @property
+    def bound_sourceid(self) -> int | None:
+        return self._bound_sourceid
+
+    def _bind_or_reject(
+        self,
+        sourceids: set[int],
+        motion_events: tuple[XInput2RawEvent, ...],
+    ) -> bool:
+        """Bind one slave source for a fresh hold; reject any source change."""
+
+        if len(sourceids) > 1:
+            self.source_rejections += 1
+            self._drop("multiple_slave_sources", motion_events)
+            self.disarm()
+            return False
+        if not sourceids:
+            return True
+        sourceid = next(iter(sourceids))
+        if self._bound_sourceid is None:
+            self._bound_sourceid = sourceid
+            self.source_bindings += 1
+            return True
+        if sourceid != self._bound_sourceid:
+            self.source_rejections += 1
+            self._drop("slave_source_changed", motion_events)
+            self.disarm()
+            return False
+        return True
+
+    def _drop(
+        self,
+        reason: str,
+        motion_events: tuple[XInput2RawEvent, ...],
+    ) -> None:
+        self.last_drop_reason = reason
+        self.drop_reason_counts[reason] = self.drop_reason_counts.get(reason, 0) + 1
+        self.ambiguous_raw_motion_events += len(motion_events)
+        self.ambiguous_raw_dx_total += sum(event.dx for event in motion_events)
+        self.ambiguous_raw_dy_total += sum(event.dy for event in motion_events)
+
+    def update(
+        self,
+        events: tuple[XInput2RawEvent, ...],
+        *,
+        current_look_pressed: bool,
+    ) -> tuple[float, float, bool]:
+        if type(current_look_pressed) is not bool:
+            raise ValueError("current core look-button state must be boolean")
+        self.last_drop_reason = None
+        for event in events:
+            if not isinstance(event, XInput2RawEvent):
+                raise TypeError("XI2 event must be XInput2RawEvent")
+            if event.evtype in {
+                _XI_RAW_BUTTON_PRESS,
+                _XI_RAW_BUTTON_RELEASE,
+                _XI_RAW_MOTION,
+            } and (event.deviceid <= 0 or event.sourceid <= 0):
+                raise RuntimeError("XI2 raw event has an invalid device identity")
+            if event.evtype == _XI_RAW_MOTION and (
+                not math.isfinite(event.dx) or not math.isfinite(event.dy)
+            ):
+                raise RuntimeError("XI2 raw motion contains a non-finite delta")
+
+        motion_events = tuple(
+            event for event in events if event.evtype == _XI_RAW_MOTION
+        )
+        look_edges = tuple(
+            event
+            for event in events
+            if event.evtype in {_XI_RAW_BUTTON_PRESS, _XI_RAW_BUTTON_RELEASE}
+            and event.detail == self._look_button_detail
+        )
+        raw_dx = sum(event.dx for event in motion_events)
+        raw_dy = sum(event.dy for event in motion_events)
+        batch_sourceids = {
+            event.sourceid for event in (*motion_events, *look_edges)
+        }
+
+        if self._requires_release:
+            if current_look_pressed:
+                if motion_events or look_edges:
+                    self._drop("awaiting_core_release", motion_events)
+                return (0.0, 0.0, True)
+            self._requires_release = False
+            self._previous_core_pressed = False
+            if look_edges:
+                self._drop("quick_drag_while_rearming", motion_events)
+                return (0.0, 0.0, True)
+            if motion_events:
+                self._drop("core_released", motion_events)
+            return (0.0, 0.0, False)
+
+        previous_pressed = self._previous_core_pressed
+        self._previous_core_pressed = current_look_pressed
+        if previous_pressed and current_look_pressed:
+            if look_edges:
+                if not self._bind_or_reject(batch_sourceids, motion_events):
+                    return (0.0, 0.0, True)
+                self._drop("raw_button_edge_inside_stable_core_hold", motion_events)
+                return (0.0, 0.0, True)
+            if not self._bind_or_reject(batch_sourceids, motion_events):
+                return (0.0, 0.0, True)
+            return (raw_dx, raw_dy, True)
+        if not previous_pressed and current_look_pressed:
+            if not self._bind_or_reject(batch_sourceids, motion_events):
+                return (0.0, 0.0, True)
+            if motion_events:
+                self._drop("core_press_boundary", motion_events)
+            return (0.0, 0.0, True)
+        if previous_pressed and not current_look_pressed:
+            if (
+                self._bound_sourceid is not None
+                and batch_sourceids
+                and batch_sourceids != {self._bound_sourceid}
+            ):
+                self.source_rejections += 1
+                self._drop("slave_source_changed_on_release", motion_events)
+                self.disarm()
+                return (0.0, 0.0, True)
+            if motion_events:
+                self._drop("core_release_boundary", motion_events)
+            self._bound_sourceid = None
+            return (0.0, 0.0, True)
+        if look_edges:
+            self._drop("quick_press_drag_release", motion_events)
+            return (0.0, 0.0, True)
+        if motion_events:
+            self._drop("core_released", motion_events)
+        return (0.0, 0.0, False)
 
 
 class XInput2RawMotion:
@@ -1069,12 +1333,15 @@ class XInput2RawMotion:
         *,
         display_name: str | None,
         look_button: str,
+        button_gate: str = "xi2-events",
         x11_library: Any | None = None,
         xi_library: Any | None = None,
     ) -> None:
         self._display: Any | None = None
         if look_button not in self._BUTTON_DETAIL:
             raise ValueError(f"unsupported XI2 look button: {look_button}")
+        if button_gate not in {"xi2-events", "x11-core-level"}:
+            raise ValueError(f"unsupported XI2 button gate: {button_gate}")
         if x11_library is None:
             x11_name = ctypes.util.find_library("X11")
             if not x11_name:
@@ -1129,14 +1396,95 @@ class XInput2RawMotion:
         except Exception:
             self.close()
             raise
-        self._accumulator = XInput2DragAccumulator(
-            self._BUTTON_DETAIL[look_button]
+        self._button_gate = button_gate
+        accumulator_type = (
+            XInput2CoreGatedAccumulator
+            if button_gate == "x11-core-level"
+            else XInput2DragAccumulator
         )
+        self._accumulator = accumulator_type(self._BUTTON_DETAIL[look_button])
         self.events_consumed = 0
         self.raw_motion_events = 0
         self.hierarchy_events = 0
         self.foreign_master_events = 0
         self.master_device_changes = 0
+        self.accepted_dx_total = 0.0
+        self.accepted_dy_total = 0.0
+        self.last_accepted_dx = 0.0
+        self.last_accepted_dy = 0.0
+        self.drag_batches = 0
+        self.accepted_drag_batches = 0
+        self.dropped_batches = 0
+        self.dropped_motion_events = 0
+        self.dropped_dx_total = 0.0
+        self.dropped_dy_total = 0.0
+        self.drop_reason_counts: dict[str, int] = {}
+        self.last_drop_reasons: tuple[str, ...] = ()
+
+    def _ensure_telemetry_counters(self) -> None:
+        """Initialize counters for legacy unit-test fakes made via __new__."""
+
+        defaults: dict[str, object] = {
+            "accepted_dx_total": 0.0,
+            "accepted_dy_total": 0.0,
+            "last_accepted_dx": 0.0,
+            "last_accepted_dy": 0.0,
+            "drag_batches": 0,
+            "accepted_drag_batches": 0,
+            "dropped_batches": 0,
+            "dropped_motion_events": 0,
+            "dropped_dx_total": 0.0,
+            "dropped_dy_total": 0.0,
+            "drop_reason_counts": {},
+            "last_drop_reasons": (),
+            "_button_gate": "xi2-events",
+        }
+        for name, value in defaults.items():
+            if not hasattr(self, name):
+                setattr(self, name, value.copy() if isinstance(value, dict) else value)
+
+    def _record_drop(
+        self,
+        *reasons: str,
+        motion_events: tuple[XInput2RawEvent, ...] = (),
+    ) -> None:
+        self._ensure_telemetry_counters()
+        unique_reasons = tuple(dict.fromkeys(reason for reason in reasons if reason))
+        if not unique_reasons:
+            return
+        self.dropped_batches += 1
+        self.dropped_motion_events += len(motion_events)
+        self.dropped_dx_total += sum(event.dx for event in motion_events)
+        self.dropped_dy_total += sum(event.dy for event in motion_events)
+        self.last_drop_reasons = unique_reasons
+        for reason in unique_reasons:
+            self.drop_reason_counts[reason] = self.drop_reason_counts.get(reason, 0) + 1
+
+    def _record_result(
+        self,
+        dx: float,
+        dy: float,
+        drag_observed: bool,
+        *,
+        motion_events: tuple[XInput2RawEvent, ...],
+    ) -> None:
+        self._ensure_telemetry_counters()
+        accumulator_reason = getattr(self._accumulator, "last_drop_reason", None)
+        if drag_observed:
+            self.drag_batches += 1
+        if accumulator_reason is not None:
+            self._record_drop(
+                accumulator_reason,
+                motion_events=motion_events,
+            )
+            return
+        self.last_drop_reasons = ()
+        if drag_observed:
+            self.accepted_drag_batches += 1
+            self.accepted_dx_total += dx
+            self.accepted_dy_total += dy
+            self.last_accepted_dx = dx
+            self.last_accepted_dy = dy
 
     @staticmethod
     def _mask_buffer(*event_types: int) -> Any:
@@ -1324,6 +1672,7 @@ class XInput2RawMotion:
     ) -> tuple[float, float, bool]:
         if type(focused) is not bool:
             raise ValueError("XI2 focus state must be boolean")
+        self._ensure_telemetry_counters()
         topology_changed = False
         events: list[XInput2RawEvent] = []
         processed_this_poll = 0
@@ -1362,19 +1711,71 @@ class XInput2RawMotion:
             # ambiguous.  Drop the complete batch and require release followed
             # by a new raw press before any yaw delta can be accepted.
             self._accumulator.disarm()
+            reasons = []
+            if not focused:
+                reasons.append("focus_or_pointer_invalid")
+            if hierarchy_changed:
+                reasons.append("hierarchy_changed")
+            if topology_changed:
+                reasons.append("master_device_changed")
+            if foreign_master:
+                reasons.append("foreign_master_event")
+            if events or current_look_pressed or reasons[1:]:
+                self._record_drop(
+                    *reasons,
+                    motion_events=tuple(
+                        event
+                        for event in events
+                        if event.evtype == _XI_RAW_MOTION
+                    ),
+                )
+            raw_look_edge = any(
+                event.evtype in {_XI_RAW_BUTTON_PRESS, _XI_RAW_BUTTON_RELEASE}
+                and event.detail
+                == getattr(self._accumulator, "_look_button_detail", 0)
+                for event in events
+            )
+            if self._button_gate == "x11-core-level":
+                drag_observed = bool(
+                    current_look_pressed
+                    or raw_look_edge
+                    or topology_changed
+                    or hierarchy_changed
+                    or foreign_master
+                )
+            else:
+                # Preserve the existing x11-mirror interlock semantics.
+                drag_observed = bool(
+                    topology_changed or hierarchy_changed or foreign_master
+                )
+            if drag_observed:
+                self.drag_batches += 1
             return (
                 0.0,
                 0.0,
-                bool(topology_changed or hierarchy_changed or foreign_master),
+                drag_observed,
             )
-        return self._accumulator.update(
+        result = self._accumulator.update(
             tuple(events), current_look_pressed=current_look_pressed
         )
+        self._record_result(
+            *result,
+            motion_events=tuple(
+                event for event in events if event.evtype == _XI_RAW_MOTION
+            ),
+        )
+        return result
 
     @property
     def telemetry(self) -> dict[str, object]:
+        self._ensure_telemetry_counters()
         return {
-            "motion_source": "xi2-raw",
+            "motion_source": (
+                "xi2-raw-x11-core-gated"
+                if self._button_gate == "x11-core-level"
+                else "xi2-raw"
+            ),
+            "button_gate": self._button_gate,
             "negotiated_version": list(self._negotiated_version),
             "events_consumed": self.events_consumed,
             "raw_motion_events": self.raw_motion_events,
@@ -1384,6 +1785,36 @@ class XInput2RawMotion:
             "master_device_changes": self.master_device_changes,
             "foreign_master_events": self.foreign_master_events,
             "button_state_resyncs": self._accumulator.button_state_resyncs,
+            "accepted_dx_total": self.accepted_dx_total,
+            "accepted_dy_total": self.accepted_dy_total,
+            "last_accepted_dx": self.last_accepted_dx,
+            "last_accepted_dy": self.last_accepted_dy,
+            "drag_batches": self.drag_batches,
+            "accepted_drag_batches": self.accepted_drag_batches,
+            "dropped_batches": self.dropped_batches,
+            "dropped_motion_events": self.dropped_motion_events,
+            "dropped_dx_total": self.dropped_dx_total,
+            "dropped_dy_total": self.dropped_dy_total,
+            "drop_reason_counts": dict(self.drop_reason_counts),
+            "last_drop_reasons": list(self.last_drop_reasons),
+            "ambiguous_raw_motion_events": getattr(
+                self._accumulator, "ambiguous_raw_motion_events", 0
+            ),
+            "ambiguous_raw_dx_total": getattr(
+                self._accumulator, "ambiguous_raw_dx_total", 0.0
+            ),
+            "ambiguous_raw_dy_total": getattr(
+                self._accumulator, "ambiguous_raw_dy_total", 0.0
+            ),
+            "bound_sourceid": getattr(
+                self._accumulator, "bound_sourceid", None
+            ),
+            "source_bindings": getattr(
+                self._accumulator, "source_bindings", 0
+            ),
+            "source_rejections": getattr(
+                self._accumulator, "source_rejections", 0
+            ),
             "maximum_events_per_poll": _MAX_XI2_EVENTS_PER_POLL,
         }
 
@@ -1391,6 +1822,179 @@ class XInput2RawMotion:
         if self._display:
             self._x11.XCloseDisplay(self._display)
             self._display = None
+
+
+class X11AbsoluteDragAccumulator:
+    """Mirror held-drag root-pointer deltas with fail-closed boundaries."""
+
+    def __init__(self, maximum_mouse_delta: float) -> None:
+        if (
+            not math.isfinite(maximum_mouse_delta)
+            or maximum_mouse_delta <= 0.0
+        ):
+            raise ValueError("maximum absolute mouse delta must be positive and finite")
+        self._maximum_mouse_delta = float(maximum_mouse_delta)
+        self._previous_pointer: tuple[int, int] | None = None
+        self._previous_look_pressed = False
+        self._requires_release = True
+        self.teleport_rejections = 0
+        self.last_teleport_delta: tuple[int, int] | None = None
+        self.accepted_dx_total = 0.0
+        self.accepted_dy_total = 0.0
+        self.last_accepted_dx = 0.0
+        self.last_accepted_dy = 0.0
+        self.drag_batches = 0
+        self.accepted_drag_batches = 0
+        self.dropped_batches = 0
+        self.dropped_motion_events = 0
+        self.dropped_dx_total = 0.0
+        self.dropped_dy_total = 0.0
+        self.drop_reason_counts: dict[str, int] = {}
+        self.last_drop_reasons: tuple[str, ...] = ()
+
+    def _drop(
+        self,
+        reason: str,
+        *,
+        dropped_dx: float = 0.0,
+        dropped_dy: float = 0.0,
+        motion_event: bool = False,
+    ) -> None:
+        self.dropped_batches += 1
+        if motion_event:
+            self.dropped_motion_events += 1
+            self.dropped_dx_total += dropped_dx
+            self.dropped_dy_total += dropped_dy
+        self.drop_reason_counts[reason] = self.drop_reason_counts.get(reason, 0) + 1
+        self.last_drop_reasons = (reason,)
+
+    def disarm(self) -> None:
+        self._previous_pointer = None
+        self._previous_look_pressed = False
+        self._requires_release = True
+
+    def update(
+        self,
+        *,
+        pointer: tuple[int, int] | None,
+        current_look_pressed: bool,
+        focused: bool,
+    ) -> tuple[float, float, bool]:
+        if type(current_look_pressed) is not bool or type(focused) is not bool:
+            raise ValueError("absolute pointer button/focus states must be boolean")
+        if pointer is not None and (
+            len(pointer) != 2
+            or any(type(coordinate) is not int for coordinate in pointer)
+        ):
+            raise ValueError("absolute pointer must be an integer root coordinate")
+        self.last_drop_reasons = ()
+
+        if pointer is None or not focused:
+            drag_observed = bool(
+                current_look_pressed or self._previous_look_pressed
+            )
+            if drag_observed:
+                self.drag_batches += 1
+                dropped_dx = 0.0
+                dropped_dy = 0.0
+                motion_event = False
+                if pointer is not None and self._previous_pointer is not None:
+                    dropped_dx = float(pointer[0] - self._previous_pointer[0])
+                    dropped_dy = float(pointer[1] - self._previous_pointer[1])
+                    motion_event = True
+                self._drop(
+                    "pointer_unavailable" if pointer is None else "focus_lost",
+                    dropped_dx=dropped_dx,
+                    dropped_dy=dropped_dy,
+                    motion_event=motion_event,
+                )
+            self.disarm()
+            return (0.0, 0.0, drag_observed)
+
+        if self._requires_release:
+            previous_pointer = self._previous_pointer
+            self._previous_pointer = pointer
+            self._previous_look_pressed = False
+            if current_look_pressed:
+                self.drag_batches += 1
+                dropped_dx = 0.0
+                dropped_dy = 0.0
+                motion_event = previous_pointer is not None
+                if previous_pointer is not None:
+                    dropped_dx = float(pointer[0] - previous_pointer[0])
+                    dropped_dy = float(pointer[1] - previous_pointer[1])
+                self._drop(
+                    "awaiting_release_before_fresh_press",
+                    dropped_dx=dropped_dx,
+                    dropped_dy=dropped_dy,
+                    motion_event=motion_event,
+                )
+                return (0.0, 0.0, True)
+            self._requires_release = False
+            return (0.0, 0.0, False)
+
+        previous_pointer = self._previous_pointer
+        previous_pressed = self._previous_look_pressed
+        self._previous_pointer = pointer
+        self._previous_look_pressed = current_look_pressed
+
+        if not previous_pressed and current_look_pressed:
+            self.drag_batches += 1
+            return (0.0, 0.0, True)
+        if not previous_pressed:
+            return (0.0, 0.0, False)
+
+        # Attribute the complete interval to its held state at the beginning.
+        # This deliberately preserves the final delta sampled on release, and
+        # the returned drag flag hard-stops movement for that release frame.
+        self.drag_batches += 1
+        if previous_pointer is None:
+            self._drop("missing_previous_pointer")
+            return (0.0, 0.0, True)
+        raw_dx = pointer[0] - previous_pointer[0]
+        raw_dy = pointer[1] - previous_pointer[1]
+        if max(abs(raw_dx), abs(raw_dy)) > self._maximum_mouse_delta:
+            self.teleport_rejections += 1
+            self.last_teleport_delta = (raw_dx, raw_dy)
+            self._drop(
+                "teleport_rejected",
+                dropped_dx=float(raw_dx),
+                dropped_dy=float(raw_dy),
+                motion_event=True,
+            )
+            return (0.0, 0.0, True)
+        dx = float(raw_dx)
+        dy = float(raw_dy)
+        self.accepted_drag_batches += 1
+        self.accepted_dx_total += dx
+        self.accepted_dy_total += dy
+        self.last_accepted_dx = dx
+        self.last_accepted_dy = dy
+        return (dx, dy, True)
+
+    @property
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "motion_source": "x11-absolute-root-delta",
+            "button_gate": "xquerypointer-core-level",
+            "teleport_rejections": self.teleport_rejections,
+            "last_teleport_delta": list(self.last_teleport_delta)
+            if self.last_teleport_delta is not None
+            else None,
+            "maximum_mouse_delta_px": self._maximum_mouse_delta,
+            "accepted_dx_total": self.accepted_dx_total,
+            "accepted_dy_total": self.accepted_dy_total,
+            "last_accepted_dx": self.last_accepted_dx,
+            "last_accepted_dy": self.last_accepted_dy,
+            "drag_batches": self.drag_batches,
+            "accepted_drag_batches": self.accepted_drag_batches,
+            "dropped_batches": self.dropped_batches,
+            "dropped_motion_events": self.dropped_motion_events,
+            "dropped_dx_total": self.dropped_dx_total,
+            "dropped_dy_total": self.dropped_dy_total,
+            "drop_reason_counts": dict(self.drop_reason_counts),
+            "last_drop_reasons": list(self.last_drop_reasons),
+        }
 
 
 class X11KeyboardMouse:
@@ -1425,10 +2029,14 @@ class X11KeyboardMouse:
         expected_ue_pid: int | None,
         look_button: str,
         capture_raw_motion: bool = False,
+        capture_absolute_motion: bool = False,
+        raw_button_gate: str = "xi2-events",
         maximum_mouse_delta: float = 200.0,
         library: Any | None = None,
         xi_library: Any | None = None,
     ) -> None:
+        if capture_raw_motion and capture_absolute_motion:
+            raise ValueError("raw and absolute mouse capture are mutually exclusive")
         if library is None:
             library_name = ctypes.util.find_library("X11")
             if not library_name:
@@ -1467,12 +2075,18 @@ class X11KeyboardMouse:
         self._maximum_mouse_delta = maximum_mouse_delta
         self._teleport_rejections = 0
         self._last_teleport_delta: tuple[int, int] | None = None
+        self._absolute_motion: X11AbsoluteDragAccumulator | None = (
+            X11AbsoluteDragAccumulator(maximum_mouse_delta)
+            if capture_absolute_motion
+            else None
+        )
         self._raw_motion: XInput2RawMotion | None = None
         if capture_raw_motion:
             try:
                 self._raw_motion = XInput2RawMotion(
                     display_name=display_name,
                     look_button=look_button,
+                    button_gate=raw_button_gate,
                     x11_library=self._x11,
                     xi_library=xi_library,
                 )
@@ -1492,6 +2106,9 @@ class X11KeyboardMouse:
         raw_motion = getattr(self, "_raw_motion", None)
         if raw_motion is not None:
             telemetry.update(raw_motion.telemetry)
+        absolute_motion = getattr(self, "_absolute_motion", None)
+        if absolute_motion is not None:
+            telemetry.update(absolute_motion.telemetry)
         return telemetry
 
     def _configure_signatures(self) -> None:
@@ -1701,6 +2318,7 @@ class X11KeyboardMouse:
         mouse_dx = 0.0
         mouse_dy = 0.0
         raw_drag_observed = False
+        absolute_drag_observed = False
         raw_motion = getattr(self, "_raw_motion", None)
         if raw_motion is not None:
             # XI_RawMotion is commonly used by SDL relative mode, which the
@@ -1712,18 +2330,18 @@ class X11KeyboardMouse:
                 current_look_pressed=look_pressed,
                 focused=focused,
             )
-        # Legacy absolute polling remains available to fixed/CARLA modes, where
-        # its deltas never become a locomotion yaw source.
-        elif self._previous_look_pressed and pointer is not None:
-            if self._previous_pointer is not None:
-                raw_dx = pointer[0] - self._previous_pointer[0]
-                raw_dy = pointer[1] - self._previous_pointer[1]
-                if max(abs(raw_dx), abs(raw_dy)) > self._maximum_mouse_delta:
-                    self._teleport_rejections += 1
-                    self._last_teleport_delta = (raw_dx, raw_dy)
-                else:
-                    mouse_dx = float(raw_dx)
-                    mouse_dy = float(raw_dy)
+        else:
+            absolute_motion = getattr(self, "_absolute_motion", None)
+            if absolute_motion is not None:
+                (
+                    mouse_dx,
+                    mouse_dy,
+                    absolute_drag_observed,
+                ) = absolute_motion.update(
+                    pointer=pointer,
+                    current_look_pressed=look_pressed,
+                    focused=focused,
+                )
         self._previous_pointer = pointer
         self._previous_look_pressed = look_pressed
 
@@ -1750,7 +2368,8 @@ class X11KeyboardMouse:
             apply_return=pressed.get("apply_return", False),
             mouse_dx=mouse_dx,
             mouse_dy=mouse_dy,
-            camera_dragging=focused and (look_pressed or raw_drag_observed),
+            camera_dragging=focused
+            and (look_pressed or raw_drag_observed or absolute_drag_observed),
             focused=focused,
             focus_title=focus_title,
             focus_pid=focus_pid,
@@ -2232,7 +2851,7 @@ def _parse_args() -> argparse.Namespace:
         "--look-button",
         choices=("left", "middle", "right"),
         default="left",
-        help="Native Matrix documents left-drag; only used by x11-mirror",
+        help="Native Matrix documents left-drag; used by X11 yaw sources",
     )
     parser.add_argument("--gamepad", default=None, help="Linux js device; auto if omitted")
     parser.add_argument("--gamepad-left-x-axis", type=int, default=0)
@@ -2241,12 +2860,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gamepad-right-y-axis", type=int, default=4)
     parser.add_argument(
         "--camera-yaw-source",
-        choices=("x11-mirror", "carla", "fixed"),
+        choices=(
+            "x11-mirror",
+            "x11-core-gated",
+            "x11-absolute",
+            "carla",
+            "fixed",
+        ),
         default="fixed",
         help=(
             "fixed is safe until runtime probing succeeds; x11-mirror requires "
-            "XI2 raw motion plus measured UE sensitivity and does not read back "
-            "or drive the visible camera"
+            "XI2 raw button edges; x11-core-gated experimentally gates XI2 raw "
+            "motion with the X11 core button; x11-absolute mirrors root-pointer "
+            "deltas; none reads back or drives the visible camera"
         ),
     )
     parser.add_argument(
@@ -2431,7 +3057,14 @@ def main() -> int:
             focus_title_pattern=focus_pattern,
             expected_ue_pid=args.expected_ue_pid,
             look_button=args.look_button,
-            capture_raw_motion=args.camera_yaw_source == "x11-mirror",
+            capture_raw_motion=args.camera_yaw_source
+            in {"x11-mirror", "x11-core-gated"},
+            capture_absolute_motion=args.camera_yaw_source == "x11-absolute",
+            raw_button_gate=(
+                "x11-core-level"
+                if args.camera_yaw_source == "x11-core-gated"
+                else "xi2-events"
+            ),
         )
     except (OSError, RuntimeError, re.error) as exc:
         raise SystemExit(f"Matrix game-control input cannot initialize X11: {exc}") from exc
@@ -2505,27 +3138,36 @@ def main() -> int:
     next_overlay_heartbeat = started
     last_teleport_rejections = 0
     calibration_neutral_frames = 0
+    provider_yaw = tracker.yaw
+    camera_yaw = transform_camera_yaw(
+        provider_yaw,
+        sign=args.camera_yaw_sign,
+        offset_rad=math.radians(args.camera_yaw_offset_deg),
+    )
+    effective_mouse_sensitivity = (
+        args.mouse_sensitivity_deg * applied_mouse.effective_scale
+    )
+    sensitivity_telemetry = mirror_sensitivity_mapping(
+        args.camera_yaw_source,
+        base_deg_per_unit=args.mouse_sensitivity_deg,
+        effective_deg_per_unit=effective_mouse_sensitivity,
+    )
+    source_claim = camera_source_claim(args.camera_yaw_source)
     try:
         if overlay is not None:
             overlay.start(
                 {
+                    **source_claim,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
-                    "mirror_sensitivity": {
-                        "units": "degrees_per_xi2_raw_unit",
-                        "base_deg_per_raw_unit": args.mouse_sensitivity_deg,
-                        "effective_deg_per_raw_unit": (
-                            args.mouse_sensitivity_deg
-                            * applied_mouse.effective_scale
-                        ),
-                        # Compatibility aliases for older overlay consumers.
-                        "base_deg_per_px": args.mouse_sensitivity_deg,
-                        "effective_deg_per_px": (
-                            args.mouse_sensitivity_deg
-                            * applied_mouse.effective_scale
-                        ),
-                    },
+                    "mirror_sensitivity": sensitivity_telemetry,
+                    "pointer": x11.pointer_telemetry,
+                    "camera_yaw": camera_yaw_telemetry(
+                        args.camera_yaw_source,
+                        provider_yaw_rad=provider_yaw,
+                        sonic_yaw_rad=camera_yaw,
+                    ),
                 }
             )
         while running:
@@ -2615,51 +3257,6 @@ def main() -> int:
             )
             pointer_telemetry = x11.pointer_telemetry
             teleport_rejections = int(pointer_telemetry["teleport_rejections"])
-            if overlay is not None:
-                overlay.ensure_running()
-                if (
-                    calibration_toggled
-                    or left_calibration
-                    or bool(panel_actions)
-                    or mouse_settings_changed
-                    or restart_requested
-                    or teleport_rejections != last_teleport_rejections
-                    or now >= next_overlay_heartbeat
-                ):
-                    overlay.publish(
-                        {
-                            "active": calibration.active,
-                            "toggle_count": calibration.toggle_count,
-                            "updated_monotonic_s": now,
-                            "expected_ue_pid": args.expected_ue_pid,
-                            "raw_ue_focused": raw_keyboard.focused,
-                            "snapshot_forced_unfocused": calibration_interlock_active,
-                            "shortcuts_armed": shortcuts_armed,
-                            "neutral_frames": calibration_neutral_frames,
-                            "mouse_settings": mouse_settings.live_mapping(
-                                applied_mouse
-                            ),
-                            "restart": restart_requester.mapping(),
-                            "apply_return": apply_return.mapping(),
-                            "mirror_sensitivity": {
-                                "units": "degrees_per_xi2_raw_unit",
-                                "base_deg_per_raw_unit": args.mouse_sensitivity_deg,
-                                "effective_deg_per_raw_unit": (
-                                    args.mouse_sensitivity_deg
-                                    * applied_mouse.effective_scale
-                                ),
-                                # Compatibility aliases for older overlays.
-                                "base_deg_per_px": args.mouse_sensitivity_deg,
-                                "effective_deg_per_px": (
-                                    args.mouse_sensitivity_deg
-                                    * applied_mouse.effective_scale
-                                ),
-                            },
-                            "pointer": pointer_telemetry,
-                        }
-                    )
-                    next_overlay_heartbeat = now + 1.0
-            last_teleport_rejections = teleport_rejections
             input_available = gamepad_input_available(
                 input_source,
                 connected=pad.connected,
@@ -2688,7 +3285,8 @@ def main() -> int:
                 dt=dt,
                 mouse_dx=(
                     keyboard.mouse_dx
-                    if args.camera_yaw_source == "x11-mirror"
+                    if args.camera_yaw_source
+                    in {"x11-mirror", "x11-core-gated", "x11-absolute"}
                     and args.input_source != "gamepad"
                     else 0.0
                 ),
@@ -2700,6 +3298,47 @@ def main() -> int:
                 sign=args.camera_yaw_sign,
                 offset_rad=math.radians(args.camera_yaw_offset_deg),
             )
+            # Publish input counters and the yaw produced from that exact same
+            # poll.  Telemetry stays downstream of every safety decision and
+            # never feeds the tracker or snapshot interlocks.
+            if overlay is not None:
+                overlay.ensure_running()
+                if (
+                    calibration_toggled
+                    or left_calibration
+                    or bool(panel_actions)
+                    or mouse_settings_changed
+                    or restart_requested
+                    or teleport_rejections != last_teleport_rejections
+                    or now >= next_overlay_heartbeat
+                ):
+                    overlay.publish(
+                        {
+                            **source_claim,
+                            "active": calibration.active,
+                            "toggle_count": calibration.toggle_count,
+                            "updated_monotonic_s": now,
+                            "expected_ue_pid": args.expected_ue_pid,
+                            "raw_ue_focused": raw_keyboard.focused,
+                            "snapshot_forced_unfocused": calibration_interlock_active,
+                            "shortcuts_armed": shortcuts_armed,
+                            "neutral_frames": calibration_neutral_frames,
+                            "mouse_settings": mouse_settings.live_mapping(
+                                applied_mouse
+                            ),
+                            "restart": restart_requester.mapping(),
+                            "apply_return": apply_return.mapping(),
+                            "mirror_sensitivity": sensitivity_telemetry,
+                            "camera_yaw": camera_yaw_telemetry(
+                                args.camera_yaw_source,
+                                provider_yaw_rad=provider_yaw,
+                                sonic_yaw_rad=camera_yaw,
+                            ),
+                            "pointer": pointer_telemetry,
+                        }
+                    )
+                    next_overlay_heartbeat = now + 1.0
+            last_teleport_rejections = teleport_rejections
             snapshot = build_snapshot(
                 sequence=sequence,
                 timestamp_monotonic_s=now,
@@ -2745,6 +3384,7 @@ def main() -> int:
         _atomic_json(
             args.status_file,
             {
+                **source_claim,
                 "completed": return_code == 0,
                 "exit_reason": exit_reason,
                 "sampled_frames": sampled_frames,
@@ -2752,22 +3392,13 @@ def main() -> int:
                 "socket": os.fspath(args.socket),
                 "requested_input_source": args.input_source,
                 "effective_input_source": input_source,
-                "camera_yaw_source": args.camera_yaw_source,
                 "mouse_settings": mouse_settings.live_mapping(applied_mouse),
-                "mirror_sensitivity": {
-                    "units": "degrees_per_xi2_raw_unit",
-                    "base_deg_per_raw_unit": args.mouse_sensitivity_deg,
-                    "effective_deg_per_raw_unit": (
-                        args.mouse_sensitivity_deg
-                        * applied_mouse.effective_scale
-                    ),
-                    # Compatibility aliases for older status readers.
-                    "base_deg_per_px": args.mouse_sensitivity_deg,
-                    "effective_deg_per_px": (
-                        args.mouse_sensitivity_deg
-                        * applied_mouse.effective_scale
-                    ),
-                },
+                "mirror_sensitivity": sensitivity_telemetry,
+                "camera_yaw": camera_yaw_telemetry(
+                    args.camera_yaw_source,
+                    provider_yaw_rad=provider_yaw,
+                    sonic_yaw_rad=camera_yaw,
+                ),
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),
                 "gamepad_camera": {

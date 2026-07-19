@@ -942,6 +942,11 @@ if $MATRIX_SONIC_ENABLED \
         echo "[ERROR] Qualified game control rejects a fixed camera yaw source" >&2
         exit 1
     fi
+    if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "x11-core-gated" \
+        || "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "x11-absolute" ]]; then
+        echo "[ERROR] Qualified game control rejects experimental camera yaw sources" >&2
+        exit 1
+    fi
     if [[ -n "${MATRIX_GAME_INPUT_PYTHON:-}" \
         && "${MATRIX_GAME_INPUT_PYTHON}" != "${MATRIX_SONIC_PYTHON:-}" ]]; then
         echo "[ERROR] Qualified game control requires MATRIX_GAME_INPUT_PYTHON to match the verified runtime Python" >&2

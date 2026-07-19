@@ -96,7 +96,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--game-camera-yaw-source",
-        choices=("x11-mirror", "carla", "fixed"),
+        choices=(
+            "x11-mirror",
+            "x11-core-gated",
+            "x11-absolute",
+            "carla",
+            "fixed",
+        ),
         default="fixed",
     )
     parser.add_argument(
@@ -898,12 +904,17 @@ def _validate_qualified_game_control(args: argparse.Namespace) -> None:
         raise SystemExit(
             "qualified game control rejects an unobserved fixed camera yaw"
         )
+    if args.game_camera_yaw_source in {"x11-core-gated", "x11-absolute"}:
+        raise SystemExit(
+            "qualified game control rejects experimental camera yaw sources"
+        )
     if (
-        args.game_camera_yaw_source == "x11-mirror"
+        args.game_camera_yaw_source
+        in {"x11-mirror", "x11-core-gated", "x11-absolute"}
         and args.game_mouse_sensitivity_deg <= 0.0
     ):
         raise SystemExit(
-            "qualified x11-mirror control requires positive mouse sensitivity"
+            "qualified X11 camera control requires positive mouse sensitivity"
         )
     expected_provider = (_SCRIPT_DIR / "matrix_game_control_input.py").resolve()
     try:
@@ -1273,12 +1284,25 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
     if source == "fixed":
         yaw_observation = "constant_unobserved"
         yaw_truth_scope = "configured_constant_not_final_view"
+        button_gate_truth_scope = "no_button_gate"
     elif source == "x11-mirror":
         yaw_observation = "xinput2_raw_motion_mirror"
         yaw_truth_scope = "xi2_raw_input_mirror_not_final_view"
+        button_gate_truth_scope = "xi2_raw_button_edges_same_slave_source"
+    elif source == "x11-core-gated":
+        yaw_observation = "xinput2_raw_motion_core_button_level_gate"
+        yaw_truth_scope = "xi2_raw_motion_core_button_gate_not_final_view"
+        button_gate_truth_scope = (
+            "xquerypointer_core_button_level_sampled_not_event_ordered"
+        )
+    elif source == "x11-absolute":
+        yaw_observation = "xquerypointer_root_absolute_delta"
+        yaw_truth_scope = "x11_absolute_pointer_delta_mirror_not_final_view"
+        button_gate_truth_scope = "xquerypointer_core_level_sampled_at_50hz"
     else:
         yaw_observation = "carla_spectator_rpc_write_readback"
         yaw_truth_scope = "carla_spectator_not_verified_final_view"
+        button_gate_truth_scope = "not_applicable_carla_rpc"
     effective_input_source = args.game_input_source
     if source != "carla" and effective_input_source == "auto":
         effective_input_source = "keyboard"
@@ -1286,6 +1310,12 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
     effective_mouse_sensitivity = (
         args.game_mouse_sensitivity_deg * applied_mouse_scale
     )
+    if source in {"x11-mirror", "x11-core-gated"}:
+        sensitivity_units = "degrees_per_xi2_raw_unit"
+    elif source == "x11-absolute":
+        sensitivity_units = "degrees_per_x11_root_pixel"
+    else:
+        sensitivity_units = "degrees_per_unobserved_input_unit"
     return {
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
@@ -1320,6 +1350,9 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "expected_ue_pid": args.ue_pid,
         "camera_yaw_observation": yaw_observation,
         "camera_yaw_truth_scope": yaw_truth_scope,
+        "button_gate_truth_scope": button_gate_truth_scope,
+        "legacy": source == "x11-absolute",
+        "experimental": source in {"x11-core-gated", "x11-absolute"},
         "camera_yaw_sign": args.game_camera_yaw_sign,
         "camera_yaw_offset_deg": args.game_camera_yaw_offset_deg,
         "initial_camera_yaw_deg": args.game_initial_camera_yaw_deg,
@@ -1330,7 +1363,11 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         "mouse_sensitivity_deg_per_px": args.game_mouse_sensitivity_deg,
         "mouse_sensitivity_base_deg_per_px": args.game_mouse_sensitivity_deg,
         "mouse_sensitivity_effective_deg_per_px": effective_mouse_sensitivity,
-        "mouse_sensitivity_units": "degrees_per_xi2_raw_unit",
+        "mouse_sensitivity_units": sensitivity_units,
+        "mouse_sensitivity_base_deg_per_unit": args.game_mouse_sensitivity_deg,
+        "mouse_sensitivity_effective_deg_per_unit": (
+            effective_mouse_sensitivity
+        ),
         "mouse_sensitivity_base_deg_per_raw_unit": (
             args.game_mouse_sensitivity_deg
         ),

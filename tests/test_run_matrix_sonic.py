@@ -590,6 +590,24 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         ), self.assertRaises(SystemExit):
             MODULE._parse_args()
 
+    def test_parse_args_exposes_all_explicit_x11_camera_sources(self) -> None:
+        for source in ("x11-mirror", "x11-core-gated", "x11-absolute"):
+            with self.subTest(source=source), mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "run_matrix_sonic.py",
+                    "--model",
+                    os.fspath(SCRIPT_PATH),
+                    "--sonic-root",
+                    "/tmp",
+                    "--game-camera-yaw-source",
+                    source,
+                ],
+            ):
+                parsed = MODULE._parse_args()
+                self.assertEqual(parsed.game_camera_yaw_source, source)
+
     def test_qualified_acceptance_rejects_weaker_lock_gates(self) -> None:
         lock = json.loads(
             (REPO_ROOT / "config/runtime/matrix-sonic.lock.json").read_text(
@@ -669,6 +687,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         zero_sensitivity.game_mouse_sensitivity_deg = 0.0
         with self.assertRaisesRegex(SystemExit, "positive mouse sensitivity"):
             MODULE._validate_qualified_game_control(zero_sensitivity)
+        for source in ("x11-core-gated", "x11-absolute"):
+            with self.subTest(source=source):
+                candidate = SimpleNamespace(**vars(valid))
+                candidate.game_camera_yaw_source = source
+                with self.assertRaisesRegex(
+                    SystemExit, "experimental camera yaw sources"
+                ):
+                    MODULE._validate_qualified_game_control(candidate)
 
     def test_game_control_status_records_camera_claim_and_calibration(self) -> None:
         args = SimpleNamespace(
@@ -760,6 +786,54 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             status["qualification_scope"],
             "runtime_input_and_motion_path_only",
+        )
+
+        core_args = SimpleNamespace(**vars(args))
+        core_args.game_camera_yaw_source = "x11-core-gated"
+        core_status = MODULE._game_control_status_fields(core_args)
+        self.assertEqual(
+            core_status["camera_yaw_observation"],
+            "xinput2_raw_motion_core_button_level_gate",
+        )
+        self.assertEqual(
+            core_status["camera_yaw_truth_scope"],
+            "xi2_raw_motion_core_button_gate_not_final_view",
+        )
+        self.assertEqual(
+            core_status["button_gate_truth_scope"],
+            "xquerypointer_core_button_level_sampled_not_event_ordered",
+        )
+        self.assertTrue(core_status["experimental"])
+        self.assertFalse(core_status["legacy"])
+        self.assertEqual(
+            core_status["mouse_sensitivity_units"],
+            "degrees_per_xi2_raw_unit",
+        )
+
+        absolute_args = SimpleNamespace(**vars(args))
+        absolute_args.game_camera_yaw_source = "x11-absolute"
+        absolute_status = MODULE._game_control_status_fields(absolute_args)
+        self.assertEqual(
+            absolute_status["camera_yaw_observation"],
+            "xquerypointer_root_absolute_delta",
+        )
+        self.assertEqual(
+            absolute_status["camera_yaw_truth_scope"],
+            "x11_absolute_pointer_delta_mirror_not_final_view",
+        )
+        self.assertEqual(
+            absolute_status["button_gate_truth_scope"],
+            "xquerypointer_core_level_sampled_at_50hz",
+        )
+        self.assertTrue(absolute_status["experimental"])
+        self.assertTrue(absolute_status["legacy"])
+        self.assertEqual(
+            absolute_status["mouse_sensitivity_units"],
+            "degrees_per_x11_root_pixel",
+        )
+        self.assertEqual(
+            absolute_status["mouse_sensitivity_effective_deg_per_unit"],
+            0.0012,
         )
 
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:

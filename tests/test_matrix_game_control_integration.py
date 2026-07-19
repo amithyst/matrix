@@ -768,6 +768,44 @@ else:
                 interpreter_result.stderr,
             )
 
+    def test_bounded_launcher_rejects_experimental_camera_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            self.make_project(project)
+            self.write(project / "config/hosts/test.env", "\n")
+            environment = {
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            }
+            for source in ("x11-core-gated", "x11-absolute"):
+                with self.subTest(source=source):
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                            "--profile",
+                            "test",
+                            "--control-source",
+                            "game",
+                            "--game-camera-yaw-source",
+                            source,
+                            "--max-seconds",
+                            "1",
+                        ],
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        timeout=20.0,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(
+                        "rejects experimental camera yaw sources",
+                        result.stderr,
+                    )
+
     def test_real_launcher_and_run_sim_forward_all_game_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"

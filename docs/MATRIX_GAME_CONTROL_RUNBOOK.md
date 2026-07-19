@@ -229,6 +229,15 @@ is expected and is why this stage is not camera-relative acceptance.
 
 ## Stage 2: X11 mirror calibration
 
+Three explicitly named input-side sources are available. None is a final UE
+view readback, and none replaces the safe `fixed` default:
+
+| Source | Motion | Button attribution | Intended use |
+|---|---|---|---|
+| `x11-mirror` | XI2 raw | XI2 raw press/release, same source | Existing behavior; keep as regression baseline |
+| `x11-core-gated` | XI2 raw | stable held XQueryPointer core level | Preferred experimental Heyuan/NoMachine A/B |
+| `x11-absolute` | XQueryPointer root delta | held core level at 50 Hz | Legacy be3b634-style diagnostic fallback |
+
 `x11-mirror` subscribes to XInput2 `XI_RawMotion`, which SDL relative mouse
 mode commonly uses; the launcher also requests SDL raw mode. It no longer derives yaw from
 50 Hz `XQueryPointer` absolute coordinates, so the current MouseLock's
@@ -240,6 +249,26 @@ same deltas, and does not move the camera itself. Its SONIC command yaw is:
 ```text
 wrap(sign × (initial_yaw + accumulated_XI2_raw_x × SDL_scale × sensitivity) + offset)
 ```
+
+`x11-core-gated` keeps the same raw motion but accepts it only when the core
+look-button level was held both before and after a provider poll. Press and
+release boundary deltas are dropped; both boundary frames still hard-stop the
+robot. Startup, focus/pointer loss, hierarchy changes, and foreign-master
+events disarm it until a released poll followed by a fresh press. A fast
+press-drag-release completed between polls never contributes yaw; if XI2 saw
+the raw button edges, it still produces a one-frame drag interlock and an
+explicit drop reason. This source is experimental and has truth scope
+`xi2_raw_motion_core_button_gate_not_final_view`.
+
+`x11-absolute` reproduces the old root-coordinate idea with stricter safety:
+it retains the final held interval on the release sample, rejects and
+rebaselines the complete interval above 200 px instead of clamping, and uses
+the same release/fresh-press rearm. Its units are degrees per X11 root pixel
+and its truth scope is
+`x11_absolute_pointer_delta_mirror_not_final_view`. A complete drag between
+two 50 Hz polls is invisible, and a 10 ms MouseLock outward/recenter cycle can
+cancel before the 20 ms provider poll, so this is a diagnostic A/B source, not
+an acceptance claim.
 
 Start from a repeatable visible camera pose and conservative defaults:
 
@@ -259,6 +288,18 @@ Start from a repeatable visible camera pose and conservative defaults:
   --game-max-speed 0.30 \
   --game-input-timeout 0.15
 ```
+
+For the primary Heyuan A/B, change only the source to
+`x11-core-gated`; for the legacy fallback, change only it to
+`x11-absolute`. The selected Remote multiplier is applied exactly once to the
+source gain. At Remote 0.02x, a base 0.12 degree/unit becomes 0.0024
+degree/unit, so a nominal 90-degree absolute-mirror turn would require 37,500
+accepted root pixels; compare 1.0x and 0.02x rather than assuming visible UE
+motion consumed the same amount.
+
+Both experimental sources are intentionally rejected by bounded/qualified
+acceptance. Use them only for supervised interactive A/B until visual evidence
+promotes a source contract; `x11-absolute` remains diagnostic-only.
 
 Calibrate in this order:
 
@@ -438,7 +479,7 @@ low-level escape hatch is useful diagnostics, but not qualified evidence.
 
 ## Gamepad and future camera bridge gate
 
-For `fixed` and `x11-mirror`, `auto` intentionally becomes keyboard-only and
+For `fixed` and all three X11 sources, `auto` intentionally becomes keyboard-only and
 explicit `--game-input-source gamepad` fails. This is a safety result, not a
 setup error. Do not work around it by feeding right-stick values into the yaw
 integrator while the visible camera remains unchanged.
@@ -474,8 +515,8 @@ described as complete right-stick camera control.
 - **Error grows after repeated drags:** recalibrate sensitivity; if pointer
   warp/recenter causes discontinuities, reject `x11-mirror` rather than hiding
   the drift.
-- **Explicit gamepad is rejected:** always expected for `fixed` and
-  `x11-mirror`. Selecting `carla` admits the spectator RPC candidate only after
+- **Explicit gamepad is rejected:** always expected for `fixed` and every X11
+  source. Selecting `carla` admits the spectator RPC candidate only after
   write/read-back succeeds; that still does not verify the visible follow
   camera.
 - **Input provider exits:** inspect `outputs/matrix_game_control_input.json` and
