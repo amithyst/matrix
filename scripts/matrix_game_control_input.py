@@ -15,6 +15,7 @@ spectator yaw reader is optional and imported only when explicitly selected.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 import ctypes.util
 from dataclasses import dataclass
@@ -32,8 +33,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 from matrix_mouse_settings import (
     PROFILE_LOCAL,
@@ -75,6 +77,40 @@ _JS_EVENT_BUTTON = 0x01
 _JS_EVENT_AXIS = 0x02
 _JS_EVENT_INIT = 0x80
 DEFAULT_CARLA_WRITE_READBACK_TOLERANCE_RAD = math.radians(0.5)
+
+
+_X11_BAD_WINDOW = 3
+_X11_ERROR_HANDLER_LOCK = threading.RLock()
+
+
+class _XErrorEvent(ctypes.Structure):
+    """Public ``XErrorEvent`` layout from Xlib.h."""
+
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("resourceid", ctypes.c_ulong),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+    )
+
+
+_X11_ERROR_HANDLER = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.POINTER(_XErrorEvent),
+)
+
+
+@dataclass
+class _X11FocusErrorScope:
+    """Errors and window IDs owned by one synchronous focus-chain query."""
+
+    windows: set[int]
+    stale_window: int | None = None
+    unexpected_error: tuple[int, int, int, int] | None = None
 
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -2080,6 +2116,16 @@ class X11KeyboardMouse:
             if capture_absolute_motion
             else None
         )
+        self._focus_badwindow_recoveries = 0
+        self._last_focus_badwindow_resource: int | None = None
+        self._active_focus_error_scope: _X11FocusErrorScope | None = None
+        self._previous_x_error_handler: int | None = None
+        # XSetErrorHandler stores this process-global function pointer.  Keep
+        # the ctypes callback alive for the complete backend lifetime even
+        # though it is installed only inside a short, XSync-bounded scope.
+        self._x_error_handler_callback = _X11_ERROR_HANDLER(
+            self._handle_x_error
+        )
         self._raw_motion: XInput2RawMotion | None = None
         if capture_raw_motion:
             try:
@@ -2102,6 +2148,12 @@ class X11KeyboardMouse:
             if self._last_teleport_delta is not None
             else None,
             "maximum_mouse_delta_px": self._maximum_mouse_delta,
+            "focus_badwindow_recoveries": getattr(
+                self, "_focus_badwindow_recoveries", 0
+            ),
+            "last_focus_badwindow_resource": getattr(
+                self, "_last_focus_badwindow_resource", None
+            ),
         }
         raw_motion = getattr(self, "_raw_motion", None)
         if raw_motion is not None:
@@ -2171,6 +2223,14 @@ class X11KeyboardMouse:
                 ],
                 ctypes.c_int,
             ),
+            "XSync": (
+                [ctypes.c_void_p, ctypes.c_int],
+                ctypes.c_int,
+            ),
+            # The callback type itself remains process-global in Xlib.  Use a
+            # void pointer at the ABI boundary so the previous handler can be
+            # restored verbatim, including Xlib's null/default sentinel.
+            "XSetErrorHandler": ([ctypes.c_void_p], ctypes.c_void_p),
             "XFree": ([ctypes.c_void_p], ctypes.c_int),
             "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
         }
@@ -2187,6 +2247,91 @@ class X11KeyboardMouse:
     @staticmethod
     def _pressed(keymap: bytes, keycode: int) -> bool:
         return bool(keymap[keycode >> 3] & (1 << (keycode & 7)))
+
+    @staticmethod
+    def _pointer_value(value: object) -> int:
+        if isinstance(value, ctypes.c_void_p):
+            return int(value.value or 0)
+        return int(value or 0)
+
+    def _handle_x_error(
+        self,
+        display: int | None,
+        event_pointer: ctypes.POINTER(_XErrorEvent),
+    ) -> int:
+        """Suppress only a tracked focus window disappearing mid-query."""
+
+        scope = self._active_focus_error_scope
+        if scope is None or not event_pointer:
+            return 0
+        event = event_pointer.contents
+        resource = int(event.resourceid)
+        if (
+            self._pointer_value(display) == self._pointer_value(self._display)
+            and int(event.error_code) == _X11_BAD_WINDOW
+            and resource in scope.windows
+        ):
+            scope.stale_window = resource
+            return 0
+
+        previous = self._previous_x_error_handler
+        if previous:
+            return int(
+                _X11_ERROR_HANDLER(previous)(display, event_pointer)
+            )
+        # A null previous handler means Xlib's default handler.  A ctypes
+        # callback cannot raise across the C boundary, so retain the complete
+        # identity and surface it immediately after the trailing XSync.
+        scope.unexpected_error = (
+            int(event.error_code),
+            int(event.request_code),
+            int(event.minor_code),
+            resource,
+        )
+        return 0
+
+    @contextmanager
+    def _focus_window_error_scope(self) -> Iterator[_X11FocusErrorScope]:
+        """Bound asynchronous BadWindow handling to one focus-chain read.
+
+        Xlib error handlers are process-global while protocol errors are
+        asynchronous.  The leading XSync drains older requests under the
+        caller's handler; the trailing XSync delivers only errors generated by
+        this scope before the exact previous handler is restored.
+        """
+
+        with _X11_ERROR_HANDLER_LOCK:
+            if self._active_focus_error_scope is not None:
+                raise RuntimeError("nested X11 focus error scope")
+            self._x11.XSync(self._display, 0)
+            scope = _X11FocusErrorScope(windows=set())
+            self._active_focus_error_scope = scope
+            callback = ctypes.cast(
+                self._x_error_handler_callback, ctypes.c_void_p
+            )
+            previous_raw = self._x11.XSetErrorHandler(callback)
+            previous = self._pointer_value(previous_raw)
+            self._previous_x_error_handler = previous or None
+            try:
+                yield scope
+            finally:
+                try:
+                    self._x11.XSync(self._display, 0)
+                finally:
+                    self._x11.XSetErrorHandler(
+                        ctypes.c_void_p(previous) if previous else None
+                    )
+                    self._active_focus_error_scope = None
+                    self._previous_x_error_handler = None
+            if scope.unexpected_error is not None:
+                error_code, request_code, minor_code, resource = (
+                    scope.unexpected_error
+                )
+                raise RuntimeError(
+                    "unexpected X11 error during focus query: "
+                    f"code={error_code} request={request_code} "
+                    f"minor={minor_code} resource={resource}"
+                )
 
     def _fetch_name(self, window: int) -> str | None:
         name = ctypes.c_char_p()
@@ -2250,28 +2395,40 @@ class X11KeyboardMouse:
     def _focus_identity(self) -> tuple[bool, str | None, frozenset[int]]:
         """Read validity, title, and PIDs from one X11 focus ancestry chain."""
 
-        focus = ctypes.c_ulong()
-        revert = ctypes.c_int()
-        if not self._x11.XGetInputFocus(
-            self._display, ctypes.byref(focus), ctypes.byref(revert)
-        ):
+        result: tuple[bool, str | None, frozenset[int]] = (
+            False,
+            None,
+            frozenset(),
+        )
+        with self._focus_window_error_scope() as error_scope:
+            focus = ctypes.c_ulong()
+            revert = ctypes.c_int()
+            if self._x11.XGetInputFocus(
+                self._display, ctypes.byref(focus), ctypes.byref(revert)
+            ):
+                window = int(focus.value)
+                if window > 1:  # X11 None and PointerRoot sentinels
+                    title = None
+                    process_ids: set[int] = set()
+                    for _ in range(12):
+                        error_scope.windows.add(window)
+                        if title is None:
+                            title = self._fetch_name(window)
+                        candidate_pid = self._window_pid(window)
+                        if candidate_pid is not None:
+                            process_ids.add(candidate_pid)
+                        parent = self._parent(window)
+                        if parent is None or parent == self._root:
+                            break
+                        window = parent
+                    result = (True, title, frozenset(process_ids))
+        if error_scope.stale_window is not None:
+            self._focus_badwindow_recoveries = (
+                getattr(self, "_focus_badwindow_recoveries", 0) + 1
+            )
+            self._last_focus_badwindow_resource = error_scope.stale_window
             return (False, None, frozenset())
-        window = int(focus.value)
-        if window <= 1:  # X11 None and PointerRoot sentinels
-            return (False, None, frozenset())
-        title = None
-        process_ids: set[int] = set()
-        for _ in range(12):
-            if title is None:
-                title = self._fetch_name(window)
-            candidate_pid = self._window_pid(window)
-            if candidate_pid is not None:
-                process_ids.add(candidate_pid)
-            parent = self._parent(window)
-            if parent is None or parent == self._root:
-                break
-            window = parent
-        return (True, title, frozenset(process_ids))
+        return result
 
     def poll(self) -> KeyboardMouseSample:
         key_buffer = ctypes.create_string_buffer(32)
