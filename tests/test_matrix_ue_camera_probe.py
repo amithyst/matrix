@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -479,6 +480,49 @@ class ProbeTest(unittest.TestCase):
 
 
 class StateFileTest(unittest.TestCase):
+    def test_live_validation_clock_is_sampled_after_locked_pread(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "camera.state"
+            with MODULE.CameraStateWriter(path) as writer:
+                writer.write(observation(monotonic_ns=1_000_000_010))
+
+            order = []
+            original_pread = MODULE._pread_state
+
+            def ordered_pread(fd):
+                order.append("pread")
+                return original_pread(fd)
+
+            def validation_clock():
+                order.append("clock")
+                return 1_000_000_020
+
+            reader = MODULE.CameraStateReader(
+                path,
+                expected_ue_pid=4242,
+                monotonic_ns=validation_clock,
+            )
+            with mock.patch.object(MODULE, "_pread_state", side_effect=ordered_pread):
+                state = reader.read()
+
+            self.assertIsNotNone(state)
+            self.assertEqual(order, ["pread", "clock"])
+            self.assertIsNone(reader.last_error)
+
+    def test_live_validation_still_rejects_a_truly_future_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "camera.state"
+            with MODULE.CameraStateWriter(path) as writer:
+                writer.write(observation(monotonic_ns=2_000_000_020))
+            reader = MODULE.CameraStateReader(
+                path,
+                expected_ue_pid=4242,
+                monotonic_ns=lambda: 2_000_000_010,
+            )
+
+            self.assertIsNone(reader.read())
+            self.assertEqual(reader.last_error, "future")
+
     def test_locked_writer_and_reader_enforce_pid_freshness_and_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "camera.state"

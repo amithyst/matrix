@@ -933,7 +933,10 @@ class UeFinalPovYawReader:
     def read(self, now: float) -> UeFinalPovObservation:
         if not math.isfinite(now) or now < 0.0:
             raise ValueError("final-POV read time must be finite and non-negative")
-        state = self._reader.read(now_monotonic_ns=int(now * 1_000_000_000))
+        # CameraStateReader owns the read/clock linearization point.  Passing
+        # this input frame's earlier timestamp creates a TOCTOU race when the
+        # supervisor publishes a valid state between the X11 poll and pread.
+        state = self._reader.read()
         if state is None:
             return UeFinalPovObservation(
                 yaw_rad=None,

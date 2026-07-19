@@ -1389,8 +1389,15 @@ class CameraStateReader:
         self.max_angle_delta_deg = 0.0
 
     def read(self, now_monotonic_ns: int | None = None) -> CameraProbeState | None:
-        now = self._monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
-        if isinstance(now, bool) or not isinstance(now, int) or now <= 0:
+        # A caller-supplied timestamp is reserved for deterministic tests.  In
+        # production, sample the validation clock only after the record has
+        # been read while the shared lock is still held.  Sampling before
+        # ``pread`` lets a writer publish a newer, perfectly valid record in
+        # between and makes that record appear to come from the future.
+        now = now_monotonic_ns
+        if now is not None and (
+            isinstance(now, bool) or not isinstance(now, int) or now <= 0
+        ):
             self._fail("invalid_now")
             return None
         flags = os.O_RDONLY | os.O_CLOEXEC
@@ -1409,6 +1416,11 @@ class CameraStateReader:
             _bounded_flock(fd, fcntl.LOCK_SH, self.lock_timeout_ns)
             locked = True
             raw = _pread_state(fd)
+            if now is None:
+                now = self._monotonic_ns()
+                if isinstance(now, bool) or not isinstance(now, int) or now <= 0:
+                    self._fail("invalid_now")
+                    return None
         except _StateLockTimeout:
             self._fail("busy")
             return None
@@ -1432,6 +1444,7 @@ class CameraStateReader:
         if not state.valid or state.error_code != ProbeError.NONE:
             self._fail(f"probe_error_{int(state.error_code)}")
             return None
+        assert now is not None
         if state.monotonic_ns > now:
             self._fail("future")
             return None

@@ -348,10 +348,10 @@ class UeFinalPovYawReaderTest(unittest.TestCase):
             self.angles_changed = False
             self.max_angle_delta_deg = 0.0
             self.last_error = None
-            self.read_times = []
+            self.read_count = 0
 
-        def read(self, *, now_monotonic_ns: int):
-            self.read_times.append(now_monotonic_ns)
+        def read(self):
+            self.read_count += 1
             state, self.angles_changed, self.last_error = next(self.samples)
             self.max_angle_delta_deg = 12.5 if self.angles_changed else 0.0
             return state
@@ -384,10 +384,7 @@ class UeFinalPovYawReaderTest(unittest.TestCase):
         self.assertEqual(stale.error, "stale")
         self.assertAlmostEqual(recovered.yaw_rad, math.radians(30.0))
         self.assertFalse(recovered.angles_changed)
-        self.assertEqual(
-            reader.read_times,
-            [10_000_000_000, 10_020_000_000, 10_040_000_000],
-        )
+        self.assertEqual(reader.read_count, 3)
 
     def test_robot_follow_angle_change_does_not_impersonate_a_mouse_drag(self) -> None:
         adapter, _reader = self.adapter(
