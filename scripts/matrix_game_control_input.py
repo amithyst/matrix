@@ -18,7 +18,7 @@ import argparse
 from contextlib import contextmanager
 import ctypes
 import ctypes.util
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import glob
 import importlib
@@ -847,14 +847,16 @@ class CameraYawReader(Protocol):
 class UeFinalPovObservation:
     """One fail-closed final-POV observation used by the input loop.
 
-    ``angles_changed`` is diagnostic only.  A centered third-person camera can
-    rotate with the robot even when the operator is not touching the mouse, so
-    final-POV motion alone is not evidence of an active drag.  The X11/XI2
-    button-boundary observer owns the locomotion interlock.
+    The final POV is also the only reliable drag signal under NoMachine when a
+    complete outward move and MouseLock recenter happen between two X11 polls.
+    Live qualification showed that the centered camera yaw stays fixed while
+    the robot turns, so a fresh POV angle change safely complements XI2/core
+    button evidence and interlocks locomotion for that frame.
     """
 
     yaw_rad: float | None
     error: str | None
+    camera_dragging: bool = False
     angles_changed: bool = False
     max_angle_delta_deg: float = 0.0
     sequence: int | None = None
@@ -879,6 +881,7 @@ def ue_final_pov_telemetry(
             "pitch_deg": None,
             "roll_deg": None,
             "cache_timestamp_s": None,
+            "camera_dragging": False,
             "angles_changed": False,
             "max_angle_delta_deg": 0.0,
         }
@@ -895,6 +898,7 @@ def ue_final_pov_telemetry(
         "pitch_deg": observation.pitch_deg,
         "roll_deg": observation.roll_deg,
         "cache_timestamp_s": observation.cache_timestamp_s,
+        "camera_dragging": observation.camera_dragging,
         "angles_changed": observation.angles_changed,
         "max_angle_delta_deg": observation.max_angle_delta_deg,
     }
@@ -904,10 +908,10 @@ class UeFinalPovYawReader:
     """Adapt the supervised UE final-POV state into a safe yaw observation.
 
     ``CameraStateReader`` owns file integrity, freshness, sequence and exact UE
-    PID validation.  This adapter deliberately does not infer mouse-button
-    state from camera motion: robot-follow rotation changes the final POV too.
-    Missing/stale state still fails closed through ``camera_available=False``;
-    actual press/drag/release boundaries are observed independently by XI2.
+    PID validation.  Missing/stale state fails closed through
+    ``camera_available=False``.  A valid angle change or the first recovered
+    sample is an interlock frame; XI2/core button state remains an independent
+    complementary signal.
     """
 
     def __init__(
@@ -924,6 +928,7 @@ class UeFinalPovYawReader:
                 expected_ue_pid=expected_ue_pid,
             )
         self._reader = reader
+        self._unavailable_since_valid = False
 
     @property
     def last_error(self) -> str | None:
@@ -935,12 +940,14 @@ class UeFinalPovYawReader:
             raise ValueError("final-POV read time must be finite and non-negative")
         state = self._reader.read(now_monotonic_ns=int(now * 1_000_000_000))
         if state is None:
+            self._unavailable_since_valid = True
             return UeFinalPovObservation(
                 yaw_rad=None,
                 error=self.last_error,
             )
         yaw_deg = float(state.yaw_deg)
         if not math.isfinite(yaw_deg):
+            self._unavailable_since_valid = True
             return UeFinalPovObservation(
                 yaw_rad=None,
                 error="non_finite_yaw",
@@ -974,10 +981,14 @@ class UeFinalPovYawReader:
             or sequence <= 0
         ):
             sequence = None
+        angles_changed = bool(getattr(self._reader, "angles_changed", False))
+        camera_dragging = angles_changed or self._unavailable_since_valid
+        self._unavailable_since_valid = False
         return UeFinalPovObservation(
             yaw_rad=math.radians(yaw_deg),
             error=None,
-            angles_changed=bool(getattr(self._reader, "angles_changed", False)),
+            camera_dragging=camera_dragging,
+            angles_changed=angles_changed,
             max_angle_delta_deg=max_angle_delta_deg,
             sequence=sequence,
             sample_age_ms=sample_age_ms,
@@ -3654,6 +3665,8 @@ def main() -> int:
             )
             if final_pov_observation is not None:
                 observed_yaw = final_pov_observation.yaw_rad
+                if final_pov_observation.camera_dragging:
+                    keyboard = replace(keyboard, camera_dragging=True)
             camera_available = (
                 args.camera_yaw_source not in {"carla", "ue-final-pov"}
                 or observed_yaw is not None
