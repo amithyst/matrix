@@ -84,6 +84,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
     parser.add_argument("--game-max-future-skew", type=float, default=0.05)
     parser.add_argument(
+        "--game-fall-recovery",
+        choices=("off", "sonic"),
+        default="off",
+        help=(
+            "Interactive fall behavior: 'sonic' keeps the runtime alive and "
+            "holds native IDLE while SONIC's policy recovers"
+        ),
+    )
+    parser.add_argument(
+        "--game-fall-recovery-timeout",
+        type=float,
+        default=15.0,
+        help="Seconds before an active SONIC recovery is marked timed out",
+    )
+    parser.add_argument(
         "--game-input-provider",
         type=Path,
         default=_SCRIPT_DIR / "matrix_game_control_input.py",
@@ -897,6 +912,27 @@ def _validate_qualified_acceptance(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_game_fall_recovery(args: argparse.Namespace) -> None:
+    """Keep SONIC self-recovery isolated to explicit interactive game runs."""
+
+    mode = getattr(args, "game_fall_recovery", "off")
+    if mode == "off":
+        return
+    if mode != "sonic":
+        raise SystemExit(f"unsupported game fall recovery mode: {mode}")
+    if args.control_source != "game":
+        raise SystemExit("SONIC fall recovery requires --control-source game")
+    if bool(args.fail_on_fall):
+        raise SystemExit("SONIC fall recovery conflicts with --fail-on-fall")
+    if bool(args.qualified_runtime):
+        raise SystemExit("qualified runtime requires fail-fast fall handling")
+    timeout = float(getattr(args, "game_fall_recovery_timeout", 15.0))
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise SystemExit(
+            "--game-fall-recovery-timeout must be positive and finite"
+        )
+
+
 def _validate_qualified_game_control(args: argparse.Namespace) -> None:
     """Reject game-control qualification paths that bypass real camera input."""
 
@@ -1162,6 +1198,160 @@ class _GameSonicReadinessGate:
         )
 
 
+class _GameFallRecoveryGate:
+    """Keep interactive control neutral while SONIC recovers its own policy.
+
+    SONIC's public fall flag is session-sticky, so it cannot identify the end
+    of one recovery or the beginning of a later fall.  The current fall level
+    therefore mirrors SONIC's own exact root-height condition (``z < 0.2``),
+    while the sticky flag remains the authoritative evidence that a fall was
+    observed.  Recovery never clears or rewrites that historical flag.
+    """
+
+    FALL_HEIGHT_M = 0.2
+    UPRIGHT_HEIGHT_M = 0.65
+    UPRIGHT_UP_Z = 0.85
+    STABLE_HOLD_S = 1.0
+    KNEEL_TWO_LEGS_MODE = 5
+    KNEEL_HEIGHT_M = 0.4
+    KNEEL_STAGE_S = 2.0
+    RETRY_PERIOD_S = 6.0
+
+    def __init__(self, *, timeout_s: float = 15.0) -> None:
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("fall recovery timeout must be positive and finite")
+        self.timeout_s = timeout
+        self.recovering = False
+        self.current_fallen = False
+        self.episodes = 0
+        self.recoveries = 0
+        self.started_at_s: float | None = None
+        self.stable_since_s: float | None = None
+        self.last_duration_s: float | None = None
+        self.timed_out = False
+        self.native_mode = SONIC_IDLE_MODE
+        self.target_height = -1.0
+
+    def observe(self, snapshot: Any, *, now_s: float) -> str | None:
+        """Observe one control-frame snapshot and return a transition name."""
+
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("fall recovery time must be non-negative and finite")
+        try:
+            root_z = float(snapshot.qpos[2])
+            root_up_z = _root_up_z(snapshot.qpos)
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError("fall recovery requires a valid root pose") from exc
+        if not math.isfinite(root_z) or not math.isfinite(root_up_z):
+            raise ValueError("fall recovery root pose must be finite")
+
+        self.current_fallen = root_z < self.FALL_HEIGHT_M
+        transition = None
+        if (
+            not self.recovering
+            and self.current_fallen
+            and bool(getattr(snapshot, "fall_detected", False))
+        ):
+            self.recovering = True
+            self.episodes += 1
+            self.started_at_s = now
+            self.stable_since_s = None
+            self.timed_out = False
+            transition = "entered"
+
+        if not self.recovering:
+            return transition
+
+        assert self.started_at_s is not None
+        if now < self.started_at_s:
+            raise ValueError("fall recovery time regressed")
+        episode_elapsed_s = now - self.started_at_s
+        retry_phase_s = episode_elapsed_s % self.RETRY_PERIOD_S
+        if retry_phase_s < self.KNEEL_STAGE_S:
+            self.native_mode = self.KNEEL_TWO_LEGS_MODE
+            self.target_height = self.KNEEL_HEIGHT_M
+        else:
+            self.native_mode = SONIC_IDLE_MODE
+            self.target_height = -1.0
+        ready = _GameSonicReadinessGate.snapshot_ready(snapshot)
+        upright = (
+            not self.current_fallen
+            and root_z >= self.UPRIGHT_HEIGHT_M
+            and root_up_z >= self.UPRIGHT_UP_Z
+            and ready
+            and self.native_mode == SONIC_IDLE_MODE
+        )
+        if upright:
+            if self.stable_since_s is None:
+                self.stable_since_s = now
+            elif now < self.stable_since_s:
+                raise ValueError("fall recovery stable time regressed")
+            if now - self.stable_since_s >= self.STABLE_HOLD_S:
+                self.last_duration_s = now - self.started_at_s
+                self.recovering = False
+                self.recoveries += 1
+                self.started_at_s = None
+                self.stable_since_s = None
+                self.timed_out = False
+                self.native_mode = SONIC_IDLE_MODE
+                self.target_height = -1.0
+                return "recovered"
+        else:
+            self.stable_since_s = None
+
+        if now - self.started_at_s >= self.timeout_s:
+            self.timed_out = True
+        return transition
+
+    def status(self, *, now_s: float) -> dict[str, object]:
+        now = float(now_s)
+        active_elapsed_s = (
+            max(0.0, now - self.started_at_s)
+            if self.recovering and self.started_at_s is not None
+            else 0.0
+        )
+        stable_elapsed_s = (
+            max(0.0, now - self.stable_since_s)
+            if self.recovering and self.stable_since_s is not None
+            else 0.0
+        )
+        state = (
+            "recovering_timeout"
+            if self.recovering and self.timed_out
+            else "recovering"
+            if self.recovering
+            else "monitoring"
+        )
+        return {
+            "mode": "sonic",
+            "state": state,
+            "policy_command": "KNEEL_TWO_LEGS_TO_IDLE",
+            "native_mode": self.native_mode,
+            "target_height": self.target_height,
+            "current_fall_detected": self.current_fallen,
+            "episodes": self.episodes,
+            "recoveries": self.recoveries,
+            "active_elapsed_s": round(active_elapsed_s, 3),
+            "stable_elapsed_s": round(stable_elapsed_s, 3),
+            "last_duration_s": (
+                round(self.last_duration_s, 3)
+                if self.last_duration_s is not None
+                else None
+            ),
+            "timeout_s": self.timeout_s,
+            "timed_out": self.timed_out,
+            "fall_height_m": self.FALL_HEIGHT_M,
+            "upright_height_m": self.UPRIGHT_HEIGHT_M,
+            "upright_up_z": self.UPRIGHT_UP_Z,
+            "stable_hold_s": self.STABLE_HOLD_S,
+            "kneel_stage_s": self.KNEEL_STAGE_S,
+            "retry_period_s": self.RETRY_PERIOD_S,
+            "recovered_requires_neutral": True,
+        }
+
+
 def _pace_absolute_deadline(deadline_s: float, period_s: float) -> float:
     """Wait for one absolute tick and return the following tick deadline.
 
@@ -1392,6 +1582,10 @@ def _game_control_status_fields(
         "maximum_turn_rate_rad_s": args.game_max_turn_rate,
         "stick_deadzone": args.game_stick_deadzone,
         "input_timeout_s": args.game_input_timeout,
+        "fall_recovery_mode": getattr(args, "game_fall_recovery", "off"),
+        "fall_recovery_timeout_s": getattr(
+            args, "game_fall_recovery_timeout", 15.0
+        ),
         "maximum_snapshot_age_s": args.game_max_snapshot_age,
         "maximum_future_skew_s": args.game_max_future_skew,
         "camera_yaw_source": source,
@@ -1801,6 +1995,46 @@ class NativePlannerClient:
             facing=command.facing,
             speed=command.speed_mps,
             locomotion_mode=command.locomotion_mode,
+        )
+
+    def send_recovery_posture(
+        self,
+        *,
+        locomotion_mode: int,
+        height: float,
+        facing: tuple[float, float, float],
+    ) -> None:
+        """Send the native kneel/stand sequence used by SONIC's gamepad path."""
+
+        if locomotion_mode not in {0, 5}:
+            raise ValueError("fall recovery only permits native IDLE or KNEEL_TWO_LEGS")
+        facing_values = [float(value) for value in facing]
+        if len(facing_values) != 3 or not all(
+            math.isfinite(value) for value in facing_values
+        ):
+            raise ValueError("fall recovery facing must contain three finite values")
+        height_value = float(height)
+        if locomotion_mode == 0:
+            if height_value != -1.0:
+                raise ValueError("native IDLE recovery must use default height -1")
+        elif not 0.2 <= height_value <= 0.8:
+            raise ValueError("native KNEEL_TWO_LEGS height must be in [0.2, 0.8]")
+        self._socket.send(
+            self._build_command_message(
+                start=True,
+                stop=False,
+                planner=True,
+                delta_heading=None,
+            )
+        )
+        self._socket.send(
+            self._build_planner_message(
+                mode=locomotion_mode,
+                movement=[0.0, 0.0, 0.0],
+                facing=facing_values,
+                speed=-1.0,
+                height=height_value,
+            )
         )
 
     def close(self) -> None:
@@ -2552,6 +2786,7 @@ def main() -> int:
         )
     ):
         raise SystemExit("qualification metadata requires --qualified-runtime")
+    _validate_game_fall_recovery(args)
     qualification_receipt = _validate_qualification_receipt(args)
     _validate_qualified_acceptance(args)
     _validate_qualified_game_control(args)
@@ -2595,6 +2830,7 @@ def main() -> int:
     planner = None
     game_input = None
     game_readiness = None
+    game_fall_recovery = None
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -2707,6 +2943,10 @@ def main() -> int:
                     GameControlCore(game_config),
                 )
                 game_readiness = _GameSonicReadinessGate(snapshot)
+                if getattr(args, "game_fall_recovery", "off") == "sonic":
+                    game_fall_recovery = _GameFallRecoveryGate(
+                        timeout_s=args.game_fall_recovery_timeout
+                    )
                 try:
                     game_input.open()
                 except OSError as exc:
@@ -2834,6 +3074,40 @@ def main() -> int:
                 if game_input is not None:
                     assert initial_root_yaw_rad is not None
                     assert game_readiness is not None
+                    recovery_transition = None
+                    if game_fall_recovery is not None:
+                        try:
+                            recovery_transition = game_fall_recovery.observe(
+                                snapshot,
+                                now_s=frame_wall,
+                            )
+                        except ValueError as exc:
+                            unstable = True
+                            running = False
+                            termination_reason = "numerical_instability"
+                            numerical_error = f"fall_recovery:{exc}"
+                            print(
+                                "matrix-sonic-runtime ERROR invalid fall "
+                                f"recovery state: {exc}",
+                                flush=True,
+                            )
+                            break
+                        if recovery_transition == "entered":
+                            print(
+                                "matrix-sonic-runtime fall recovery entered "
+                                f"episode={game_fall_recovery.episodes}",
+                                flush=True,
+                            )
+                        elif recovery_transition == "recovered":
+                            game_input.core.invalidate_input(
+                                "fall_recovered_awaiting_neutral"
+                            )
+                            print(
+                                "matrix-sonic-runtime fall recovery completed "
+                                f"episode={game_fall_recovery.episodes} "
+                                f"duration_s={game_fall_recovery.last_duration_s:.3f}",
+                                flush=True,
+                            )
                     try:
                         measured_heading = wrap_angle_rad(
                             _root_yaw_rad(snapshot.qpos) - initial_root_yaw_rad
@@ -2855,14 +3129,34 @@ def main() -> int:
                         now_s=frame_wall,
                         dt_s=1.0 / args.control_hz,
                     )
-                    game_command = game_readiness.apply(
+                    ready_game_command = game_readiness.apply(
                         candidate_game_command,
                         game_input.core,
                     )
+                    if (
+                        game_fall_recovery is not None
+                        and game_fall_recovery.recovering
+                    ):
+                        game_command = game_input.emergency_stop(
+                            now_s=frame_wall,
+                            reason="fall_recovery",
+                        )
+                    else:
+                        game_command = ready_game_command
                     # Telemetry must describe the command actually published,
                     # not the pre-readiness candidate returned by the core.
                     game_input.last_command = game_command
-                    planner.send_game_command(game_command)
+                    if (
+                        game_fall_recovery is not None
+                        and game_fall_recovery.recovering
+                    ):
+                        planner.send_recovery_posture(
+                            locomotion_mode=game_fall_recovery.native_mode,
+                            height=game_fall_recovery.target_height,
+                            facing=game_command.facing,
+                        )
+                    else:
+                        planner.send_game_command(game_command)
                     game_input.record_published_command(game_command)
                     walking = game_command.mode == "move"
                 else:
@@ -3060,6 +3354,12 @@ def main() -> int:
                     status["root_yaw_relative_rad"] = round(
                         wrap_angle_rad(current_root_yaw - initial_root_yaw_rad), 6
                     )
+                    if game_fall_recovery is not None:
+                        recovery_status = game_fall_recovery.status(now_s=now)
+                        status["game_fall_recovery"] = recovery_status
+                        status["current_fall_detected"] = recovery_status[
+                            "current_fall_detected"
+                        ]
                 print(
                     f"matrix-sonic-runtime status={json.dumps(status, sort_keys=True)}",
                     flush=True,
@@ -3311,6 +3611,12 @@ def main() -> int:
                 final_status["root_yaw_relative_rad"] = round(
                     wrap_angle_rad(final_root_yaw - initial_root_yaw_rad), 6
                 )
+            if game_fall_recovery is not None:
+                recovery_status = game_fall_recovery.status(now_s=finished_wall)
+                final_status["game_fall_recovery"] = recovery_status
+                final_status["current_fall_detected"] = recovery_status[
+                    "current_fall_detected"
+                ]
         _atomic_json(args.status_file, final_status)
         print(
             "matrix-sonic-runtime stopped "

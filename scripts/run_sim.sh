@@ -1233,11 +1233,36 @@ if $MATRIX_SONIC_ENABLED; then
             ;;
     esac
     SONIC_ACCEPTANCE_ARGS=()
+    SONIC_FAIL_ON_FALL_ENABLED=0
     case "${MATRIX_SONIC_FAIL_ON_FALL:-1}" in
-        1|true|yes|on) SONIC_ACCEPTANCE_ARGS+=(--fail-on-fall) ;;
+        1|true|yes|on)
+            SONIC_FAIL_ON_FALL_ENABLED=1
+            SONIC_ACCEPTANCE_ARGS+=(--fail-on-fall)
+            ;;
         0|false|no|off|"") ;;
         *)
             echo "[ERROR] MATRIX_SONIC_FAIL_ON_FALL must be a boolean" >&2
+            exit 1
+            ;;
+    esac
+    case "${MATRIX_GAME_FALL_RECOVERY:-off}" in
+        off|"") ;;
+        sonic)
+            if [[ "$SONIC_FAIL_ON_FALL_ENABLED" == "1" ]]; then
+                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=sonic conflicts with MATRIX_SONIC_FAIL_ON_FALL" >&2
+                exit 1
+            fi
+            if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
+                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=sonic requires game control" >&2
+                exit 1
+            fi
+            SONIC_ACCEPTANCE_ARGS+=(
+                --game-fall-recovery sonic
+                --game-fall-recovery-timeout "${MATRIX_GAME_FALL_RECOVERY_TIMEOUT:-15.0}"
+            )
+            ;;
+        *)
+            echo "[ERROR] MATRIX_GAME_FALL_RECOVERY must be off or sonic" >&2
             exit 1
             ;;
     esac

@@ -67,6 +67,8 @@ GAMEPAD_LOOK_MIN_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG:--80.0}"
 GAMEPAD_LOOK_MAX_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG:-60.0}"
 GAME_MAX_SPEED="${MATRIX_GAME_MAX_SPEED:-0.30}"
 GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
+GAME_FALL_RECOVERY="${MATRIX_GAME_FALL_RECOVERY:-auto}"
+GAME_FALL_RECOVERY_TIMEOUT="${MATRIX_GAME_FALL_RECOVERY_TIMEOUT:-15.0}"
 WALK_AFTER="-1"
 VX="0.30"
 VY="0.0"
@@ -117,6 +119,8 @@ usage() {
         "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
         "  --game-max-speed MPS       Analog SLOW_WALK cap (default 0.30; max 0.80)" \
         "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
+        "  --game-fall-recovery MODE  auto, off, or sonic (auto enables SONIC recovery for unbounded game runs)" \
+        "  --game-fall-recovery-timeout SEC  Mark recovery timed out after SEC while continuing IDLE" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -157,6 +161,8 @@ while [[ $# -gt 0 ]]; do
         --gamepad-look-max-pitch) GAMEPAD_LOOK_MAX_PITCH_DEG="$2"; shift 2 ;;
         --game-max-speed) GAME_MAX_SPEED="$2"; shift 2 ;;
         --game-input-timeout) GAME_INPUT_TIMEOUT="$2"; shift 2 ;;
+        --game-fall-recovery) GAME_FALL_RECOVERY="$2"; shift 2 ;;
+        --game-fall-recovery-timeout) GAME_FALL_RECOVERY_TIMEOUT="$2"; shift 2 ;;
         --walk-after) WALK_AFTER="$2"; shift 2 ;;
         --vx) VX="$2"; shift 2 ;;
         --vy) VY="$2"; shift 2 ;;
@@ -278,6 +284,32 @@ PY
 )"; then
     exit 2
 fi
+case "$GAME_FALL_RECOVERY" in
+    auto)
+        if [[ "$CONTROL_SOURCE" == "game" \
+            && "$QUALIFICATION_REQUESTED" == "0" ]]; then
+            GAME_FALL_RECOVERY="sonic"
+        else
+            GAME_FALL_RECOVERY="off"
+        fi
+        ;;
+    off|sonic) ;;
+    *)
+        echo "[ERROR] --game-fall-recovery must be auto, off, or sonic" >&2
+        exit 2
+        ;;
+esac
+if [[ "$GAME_FALL_RECOVERY" == "sonic" ]]; then
+    if [[ "$CONTROL_SOURCE" != "game" ]]; then
+        echo "[ERROR] SONIC fall recovery requires --control-source game" >&2
+        exit 2
+    fi
+    if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
+        echo "[ERROR] Bounded qualification requires fail-fast fall handling" >&2
+        exit 2
+    fi
+fi
+echo "[INFO] Fall policy: $GAME_FALL_RECOVERY timeout=${GAME_FALL_RECOVERY_TIMEOUT}s"
 MATRIX_SONIC_QUALIFIED_RUNTIME=0
 MATRIX_SONIC_QUALIFICATION_PROFILE=""
 MATRIX_SONIC_RUNTIME_LOCK_SHA256=""
@@ -600,6 +632,8 @@ export MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG="$GAMEPAD_LOOK_MIN_PITCH_DEG"
 export MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG="$GAMEPAD_LOOK_MAX_PITCH_DEG"
 export MATRIX_GAME_MAX_SPEED="$GAME_MAX_SPEED"
 export MATRIX_GAME_INPUT_TIMEOUT="$GAME_INPUT_TIMEOUT"
+export MATRIX_GAME_FALL_RECOVERY="$GAME_FALL_RECOVERY"
+export MATRIX_GAME_FALL_RECOVERY_TIMEOUT="$GAME_FALL_RECOVERY_TIMEOUT"
 export MATRIX_GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
 if [[ "$CONTROL_SOURCE" == "game" ]]; then
     rm -f -- "$MATRIX_GAME_INPUT_STATUS_FILE"
@@ -620,7 +654,11 @@ export MATRIX_SONIC_QUALIFICATION_PROFILE
 export MATRIX_SONIC_RUNTIME_LOCK_SHA256
 export MATRIX_SONIC_MATRIX_COMMIT
 export MATRIX_SONIC_VERIFICATION_RECEIPT
-export MATRIX_SONIC_FAIL_ON_FALL=1
+if [[ "$GAME_FALL_RECOVERY" == "sonic" ]]; then
+    export MATRIX_SONIC_FAIL_ON_FALL=0
+else
+    export MATRIX_SONIC_FAIL_ON_FALL=1
+fi
 export MATRIX_SONIC_STARTUP_BAND="$STARTUP_BAND"
 export MATRIX_SONIC_STARTUP_BAND_HOLD="$STARTUP_BAND_HOLD"
 export MATRIX_SONIC_STARTUP_BAND_FADE="$STARTUP_BAND_FADE"

@@ -519,6 +519,103 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     f"snapshot_invalid_elastic_band_scale:{invalid!r}",
                 )
 
+    def test_sonic_fall_recovery_holds_idle_until_stably_upright(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+
+        def pose(*, root_z: float, upright: bool) -> SimpleNamespace:
+            snapshot = self.snapshot(
+                fall_detected=True,
+                low_cmd_fresh=True,
+                elastic_band_scale=0.0,
+            )
+            snapshot.qpos[2] = root_z
+            snapshot.qpos[3] = 1.0 if upright else 0.0
+            snapshot.qpos[4] = 0.0 if upright else 1.0
+            return snapshot
+
+        self.assertEqual(
+            gate.observe(pose(root_z=0.19, upright=False), now_s=10.0),
+            "entered",
+        )
+        self.assertTrue(gate.recovering)
+        self.assertTrue(gate.current_fallen)
+        self.assertEqual(gate.episodes, 1)
+        self.assertEqual(gate.native_mode, 5)
+        self.assertEqual(gate.target_height, 0.4)
+
+        # Height alone is insufficient: the base must also be upright and the
+        # native readiness contract must stay healthy for a continuous second.
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=False), now_s=10.5)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=11.0)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=11.99)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=12.0)
+        )
+        self.assertEqual(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=13.0),
+            "recovered",
+        )
+        self.assertFalse(gate.recovering)
+        self.assertEqual(gate.recoveries, 1)
+        self.assertAlmostEqual(gate.last_duration_s, 3.0)
+        status = gate.status(now_s=13.0)
+        self.assertEqual(status["state"], "monitoring")
+        self.assertEqual(status["policy_command"], "KNEEL_TWO_LEGS_TO_IDLE")
+        self.assertTrue(status["recovered_requires_neutral"])
+
+        # SONIC's historical fall flag remains sticky. A later current-height
+        # fall must still start a distinct recovery episode.
+        self.assertEqual(
+            gate.observe(pose(root_z=0.18, upright=False), now_s=14.0),
+            "entered",
+        )
+        self.assertEqual(gate.episodes, 2)
+
+    def test_sonic_fall_recovery_timeout_is_telemetry_not_runtime_exit(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=2.0)
+        fallen = self.snapshot(
+            fall_detected=True,
+            low_cmd_fresh=True,
+            elastic_band_scale=0.0,
+        )
+        fallen.qpos[2] = 0.15
+        fallen.qpos[4] = 1.0
+        self.assertEqual(gate.observe(fallen, now_s=1.0), "entered")
+        self.assertIsNone(gate.observe(fallen, now_s=3.1))
+        self.assertTrue(gate.recovering)
+        self.assertTrue(gate.timed_out)
+        self.assertEqual(gate.status(now_s=3.1)["state"], "recovering_timeout")
+
+    def test_sonic_fall_recovery_validation_is_interactive_only(self) -> None:
+        allowed = SimpleNamespace(
+            game_fall_recovery="sonic",
+            game_fall_recovery_timeout=15.0,
+            control_source="game",
+            fail_on_fall=False,
+            qualified_runtime=False,
+        )
+        MODULE._validate_game_fall_recovery(allowed)
+
+        invalid = (
+            ("control", {"control_source": "planner"}),
+            ("conflicts", {"fail_on_fall": True}),
+            ("qualified", {"qualified_runtime": True}),
+            ("positive", {"game_fall_recovery_timeout": 0.0}),
+        )
+        for expected, changes in invalid:
+            values = vars(allowed).copy()
+            values.update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                SystemExit, expected
+            ):
+                MODULE._validate_game_fall_recovery(SimpleNamespace(**values))
+
     def test_absolute_physics_pacing_compensates_sleep_overshoot(self) -> None:
         with mock.patch.object(
             MODULE.time, "perf_counter", side_effect=[9.996, 10.00025]
@@ -1700,6 +1797,31 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[4]["mode"], 0)
         self.assertEqual(planners[4]["movement"], [0.0, 0.0, 0.0])
         self.assertEqual(planners[4]["speed"], -1.0)
+
+        client.send_recovery_posture(
+            locomotion_mode=5,
+            height=0.4,
+            facing=(0.0, 1.0, 0.0),
+        )
+        self.assertEqual(planners[5]["mode"], 5)
+        self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[5]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[5]["speed"], -1.0)
+        self.assertEqual(planners[5]["height"], 0.4)
+
+        client.send_recovery_posture(
+            locomotion_mode=0,
+            height=-1.0,
+            facing=(1.0, 0.0, 0.0),
+        )
+        self.assertEqual(planners[6]["mode"], 0)
+        self.assertEqual(planners[6]["height"], -1.0)
+        with self.assertRaisesRegex(ValueError, "IDLE or KNEEL"):
+            client.send_recovery_posture(
+                locomotion_mode=7,
+                height=0.4,
+                facing=(1.0, 0.0, 0.0),
+            )
 
         with self.assertRaisesRegex(ValueError, "SLOW_WALK"):
             client.send_game_command(
