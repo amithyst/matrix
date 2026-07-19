@@ -1287,7 +1287,30 @@ def _game_input_acceptance_failures(
     return failures
 
 
-def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
+def _effective_game_camera_yaw_offset_deg(
+    *,
+    source: str,
+    configured_offset_deg: float,
+    initial_root_yaw_rad: float | None,
+) -> float:
+    """Map absolute provider yaw into SONIC's initial-root-relative frame."""
+
+    configured = float(configured_offset_deg)
+    if not math.isfinite(configured):
+        raise ValueError("configured camera yaw offset must be finite")
+    if source != "ue-final-pov":
+        return configured
+    if initial_root_yaw_rad is None or not math.isfinite(initial_root_yaw_rad):
+        raise ValueError("UE final-POV yaw requires a finite initial root yaw")
+    return configured - math.degrees(initial_root_yaw_rad)
+
+
+def _game_control_status_fields(
+    args: argparse.Namespace,
+    *,
+    applied_camera_yaw_offset_deg: float | None = None,
+    initial_root_yaw_rad: float | None = None,
+) -> dict[str, object]:
     """Return the immutable input/camera claim carried by every status frame."""
 
     source = args.game_camera_yaw_source
@@ -1312,7 +1335,9 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
     elif source == "ue-final-pov":
         yaw_observation = "ue_player_camera_manager_final_pov_state"
         yaw_truth_scope = "player_camera_manager_final_pov"
-        button_gate_truth_scope = "not_applicable_final_pov_observer"
+        button_gate_truth_scope = (
+            "xquerypointer_core_level_or_xi2_raw_button_edges"
+        )
     else:
         yaw_observation = "carla_spectator_rpc_write_readback"
         yaw_truth_scope = "carla_spectator_not_verified_final_view"
@@ -1335,6 +1360,12 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         sensitivity_units = "absolute_degrees_from_player_camera_manager_final_pov"
     else:
         sensitivity_units = "degrees_per_unobserved_input_unit"
+    configured_camera_yaw_offset_deg = args.game_camera_yaw_offset_deg
+    effective_camera_yaw_offset_deg = (
+        configured_camera_yaw_offset_deg
+        if applied_camera_yaw_offset_deg is None
+        else applied_camera_yaw_offset_deg
+    )
     return {
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
@@ -1377,7 +1408,12 @@ def _game_control_status_fields(args: argparse.Namespace) -> dict[str, object]:
         if getattr(args, "game_ue_camera_state_file", None) is not None
         else None,
         "camera_yaw_sign": args.game_camera_yaw_sign,
-        "camera_yaw_offset_deg": args.game_camera_yaw_offset_deg,
+        "camera_yaw_offset_deg": effective_camera_yaw_offset_deg,
+        "camera_yaw_offset_configured_deg": configured_camera_yaw_offset_deg,
+        "camera_yaw_initial_root_compensation_deg": (
+            effective_camera_yaw_offset_deg - configured_camera_yaw_offset_deg
+        ),
+        "initial_root_yaw_rad_for_camera": initial_root_yaw_rad,
         "initial_camera_yaw_deg": args.game_initial_camera_yaw_deg,
         "visible_mouse_backend": "sdl-relative-speed-scale",
         "applied_mouse_profile": args.game_applied_mouse_profile,
@@ -2609,6 +2645,20 @@ def main() -> int:
             )
         except ValueError as exc:
             raise SystemExit(f"invalid native SONIC initial root heading: {exc}") from exc
+        applied_game_camera_yaw_offset_deg = float(
+            getattr(args, "game_camera_yaw_offset_deg", 0.0)
+        )
+        try:
+            if args.control_source == "game":
+                applied_game_camera_yaw_offset_deg = (
+                    _effective_game_camera_yaw_offset_deg(
+                        source=args.game_camera_yaw_source,
+                        configured_offset_deg=args.game_camera_yaw_offset_deg,
+                        initial_root_yaw_rad=initial_root_yaw_rad,
+                    )
+                )
+        except ValueError as exc:
+            raise SystemExit(f"invalid game camera yaw frame: {exc}") from exc
         renderer = (
             None
             if args.no_render_sync
@@ -2684,7 +2734,9 @@ def main() -> int:
                         ),
                         restart_launcher_pid=args.game_restart_launcher_pid,
                         camera_yaw_sign=args.game_camera_yaw_sign,
-                        camera_yaw_offset_deg=args.game_camera_yaw_offset_deg,
+                        camera_yaw_offset_deg=(
+                            applied_game_camera_yaw_offset_deg
+                        ),
                         carla_host=args.game_carla_host,
                         carla_port=args.game_carla_port,
                         gamepad_look_yaw_rate_deg_s=(
@@ -2992,7 +3044,13 @@ def main() -> int:
                 if game_input is not None:
                     status["game_input"] = game_input.telemetry(now_s=now)
                     status["game_control_configuration"] = (
-                        _game_control_status_fields(args)
+                        _game_control_status_fields(
+                            args,
+                            applied_camera_yaw_offset_deg=(
+                                applied_game_camera_yaw_offset_deg
+                            ),
+                            initial_root_yaw_rad=initial_root_yaw_rad,
+                        )
                     )
                     current_root_yaw = _root_yaw_rad(snapshot.qpos)
                     assert initial_root_yaw_rad is not None
@@ -3232,7 +3290,13 @@ def main() -> int:
             final_status["game_input"] = game_input.telemetry(now_s=finished_wall)
             final_status["game_input_at_boundary"] = game_input_boundary
             final_status["game_control_configuration"] = (
-                _game_control_status_fields(args)
+                _game_control_status_fields(
+                    args,
+                    applied_camera_yaw_offset_deg=(
+                        applied_game_camera_yaw_offset_deg
+                    ),
+                    initial_root_yaw_rad=initial_root_yaw_rad,
+                )
             )
             assert initial_root_yaw_rad is not None
             assert heading_anchor_telemetry is not None

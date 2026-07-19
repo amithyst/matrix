@@ -803,7 +803,7 @@ def camera_source_claim(source: str) -> dict[str, object]:
         "ue-final-pov": (
             "ue_player_camera_manager_final_pov_state",
             "player_camera_manager_final_pov",
-            "not_applicable_final_pov_observer",
+            "xquerypointer_core_level_or_xi2_raw_button_edges",
         ),
         "carla": (
             "carla_spectator_rpc_write_readback",

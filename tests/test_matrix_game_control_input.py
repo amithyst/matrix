@@ -1323,6 +1323,10 @@ class CameraYawTrackerTest(unittest.TestCase):
         )
         self.assertTrue(final_pov["experimental"])
         self.assertFalse(final_pov["visible_follow_camera_verified"])
+        self.assertEqual(
+            final_pov["button_gate_truth_scope"],
+            "xquerypointer_core_level_or_xi2_raw_button_edges",
+        )
 
 
 class CarlaSpectatorCameraTest(unittest.TestCase):

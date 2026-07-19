@@ -874,11 +874,47 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             final_pov_status["camera_yaw_truth_scope"],
             "player_camera_manager_final_pov",
         )
+        self.assertEqual(
+            final_pov_status["button_gate_truth_scope"],
+            "xquerypointer_core_level_or_xi2_raw_button_edges",
+        )
         self.assertTrue(final_pov_status["experimental"])
         self.assertFalse(final_pov_status["visible_follow_camera_verified"])
         self.assertEqual(
             final_pov_status["ue_camera_state_file"],
             "/run/user/1000/camera-state.bin",
+        )
+
+        applied_offset = MODULE._effective_game_camera_yaw_offset_deg(
+            source="ue-final-pov",
+            configured_offset_deg=90.0,
+            initial_root_yaw_rad=math.pi / 2.0,
+        )
+        self.assertAlmostEqual(applied_offset, 0.0)
+        compensated_status = MODULE._game_control_status_fields(
+            final_pov_args,
+            applied_camera_yaw_offset_deg=applied_offset,
+            initial_root_yaw_rad=math.pi / 2.0,
+        )
+        self.assertAlmostEqual(compensated_status["camera_yaw_offset_deg"], 0.0)
+        self.assertEqual(
+            compensated_status["camera_yaw_offset_configured_deg"], 90.0
+        )
+        self.assertAlmostEqual(
+            compensated_status["camera_yaw_initial_root_compensation_deg"],
+            -90.0,
+        )
+        self.assertAlmostEqual(
+            compensated_status["initial_root_yaw_rad_for_camera"],
+            math.pi / 2.0,
+        )
+        self.assertEqual(
+            MODULE._effective_game_camera_yaw_offset_deg(
+                source="x11-mirror",
+                configured_offset_deg=90.0,
+                initial_root_yaw_rad=math.pi / 2.0,
+            ),
+            90.0,
         )
 
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
