@@ -12,12 +12,13 @@
 
 ## G1 材质
 
-通用导入流水线 V15 会识别标准 G1，并使用可追溯的 `aue_g1_v1` 三层材质：黑色
-软胶、深灰结构件和暖白外壳。颜色、粗糙度、金属度、部件匹配规则及 Matrix UE
-当前只渲染 RGBA 的边界均记录在 `docs/G1_FINAL_MATERIALS_CN.md`。旧 V14 缓存会
-自动重建；材质转换不改变 collision、质量、惯量、关节或 SONIC 控制。
+通用导入流水线 V18 会识别标准 G1，并默认使用 `matrix_g1_v2` 高对比材质：黑色
+软胶、石墨结构件、冷白外壳和 Matrix 蓝点缀。颜色、粗糙度、金属度、部件匹配
+规则及 Matrix UE 当前只渲染 RGBA 的边界均记录在
+`docs/G1_FINAL_MATERIALS_CN.md`。旧 V17 缓存会自动重建；材质转换不改变
+collision 的几何/接触属性、质量、惯量、关节或 SONIC 控制。
 
-TRNA 验收结果位于
+历史 `aue_g1_v1` 的 TRNA V15 验收结果仍保存在
 `research/urban_v1/results/trna_aue_g1_material_v15_20260716.json`：36 个来源
 visual 覆盖 41 个实际视觉 geom，黑色 12、深灰 6、暖白 23、未匹配 0；Town10
 录制为 1920x1080、30 FPS、10 秒，SONIC 物理约 200 Hz、RTF 约 1.0，无跌倒或

@@ -43,15 +43,20 @@ class="visual" /></body></body></worldbody></mujoco>"""
 
 PROFILE_LINKS = (
     "pelvis",
+    "pelvis_contour_link",
     "left_hip_pitch_link",
     "right_hip_pitch_link",
+    "left_hip_yaw_link",
     "left_ankle_roll_link",
     "right_ankle_roll_link",
+    "left_knee_link",
     "torso_link",
     "head_link",
     "logo_link",
     "left_shoulder_pitch_link",
     "right_shoulder_pitch_link",
+    "left_shoulder_roll_link",
+    "left_elbow_link",
     "left_wrist_roll_link",
 )
 
@@ -73,7 +78,9 @@ def _profile_mjcf() -> str:
     )
     bodies = "".join(
         f"""<body name="{name}"><geom name="{name}_visual" type="mesh"
-        mesh="{name}" class="visual" /></body>"""
+        mesh="{name}" class="visual" /><geom name="{name}_collision"
+        type="mesh" mesh="{name}" class="collision" contype="1"
+        conaffinity="1" density="12" /></body>"""
         for name in PROFILE_LINKS
     )
     return (
@@ -142,7 +149,7 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
 
             self.assertEqual(mjcf.read_bytes(), first)
 
-    def test_applies_aue_g1_surface_profile_by_link_semantics(self) -> None:
+    def test_applies_matrix_g1_surface_profile_by_link_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             urdf = root / "g1_29dof.urdf"
@@ -152,35 +159,56 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
 
             summary = MODULE.apply_urdf_visual_materials(urdf, mjcf)
 
-            self.assertEqual(summary.profile_id, "aue_g1_v1")
-            self.assertEqual(summary.source_styles, 3)
+            self.assertEqual(summary.profile_id, "matrix_g1_v2")
+            self.assertEqual(summary.source_styles, 4)
             self.assertEqual(summary.styled_geoms, len(PROFILE_LINKS))
+            self.assertEqual(summary.styled_collision_geoms, len(PROFILE_LINKS))
             self.assertEqual(summary.unmatched_visual_geoms, 0)
             parsed = ET.parse(mjcf).getroot()
             materials = {
                 material.get("name"): material
                 for material in parsed.find("asset").findall("material")
             }
-            geom_by_body = {
-                body.get("name"): body.find("geom") for body in parsed.iter("body")
+            body_by_name = {
+                body.get("name"): body for body in parsed.iter("body")
             }
 
             expected = {
-                "pelvis": ("0.035 0.035 0.035 1", "0.62"),
-                "left_ankle_roll_link": ("0.035 0.035 0.035 1", "0.62"),
-                "left_wrist_roll_link": ("0.035 0.035 0.035 1", "0.62"),
-                "left_hip_pitch_link": ("0.16 0.16 0.16 1", "0.58"),
-                "head_link": ("0.16 0.16 0.16 1", "0.58"),
-                "torso_link": ("0.72 0.72 0.68 1", "0.52"),
+                "pelvis": ("0.018 0.024 0.035 1", "0.62"),
+                "left_ankle_roll_link": ("0.018 0.024 0.035 1", "0.62"),
+                "left_wrist_roll_link": ("0.018 0.024 0.035 1", "0.62"),
+                "left_hip_pitch_link": ("0.055 0.075 0.11 1", "0.58"),
+                "head_link": ("0.055 0.075 0.11 1", "0.58"),
+                "torso_link": ("0.9 0.94 1 1", "0.48"),
+                "pelvis_contour_link": ("0.015 0.2 0.95 1", "0.42"),
+                "left_hip_yaw_link": ("0.015 0.2 0.95 1", "0.42"),
+                "left_knee_link": ("0.015 0.2 0.95 1", "0.42"),
+                "logo_link": ("0.015 0.2 0.95 1", "0.42"),
+                "left_shoulder_roll_link": ("0.015 0.2 0.95 1", "0.42"),
+                "left_elbow_link": ("0.015 0.2 0.95 1", "0.42"),
             }
             for body_name, (rgba, roughness) in expected.items():
-                geom = geom_by_body[body_name]
+                body = body_by_name[body_name]
+                geom = body.find("geom")
                 self.assertIsNotNone(geom)
                 self.assertEqual(geom.get("rgba"), rgba)
                 material = materials[geom.get("material")]
                 self.assertEqual(material.get("rgba"), rgba)
                 self.assertEqual(material.get("roughness"), roughness)
-                self.assertEqual(material.get("metallic"), "0")
+                self.assertEqual(
+                    material.get("metallic"),
+                    "0.08" if rgba == "0.015 0.2 0.95 1" else "0",
+                )
+                collision = next(
+                    geom
+                    for geom in body.findall("geom")
+                    if geom.get("name") == f"{body_name}_collision"
+                )
+                self.assertEqual(collision.get("rgba"), rgba)
+                self.assertEqual(collision.get("material"), geom.get("material"))
+                self.assertEqual(collision.get("contype"), "1")
+                self.assertEqual(collision.get("conaffinity"), "1")
+                self.assertEqual(collision.get("density"), "12")
 
     def test_explicit_urdf_profile_disables_g1_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -201,6 +229,17 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
             self.assertTrue(
                 all(geom.get("rgba") == "0.7 0.7 0.7 1" for geom in visual_geoms)
             )
+
+    def test_default_profile_and_launcher_pipeline_contract(self) -> None:
+        self.assertEqual(MODULE.DEFAULT_PROFILE_PATH.name, "matrix_g1_v2.json")
+        launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("PIPELINE_VERSION=18", launcher)
+        self.assertIn(
+            '"$SCRIPT_DIR/apply_urdf_visual_materials.py"',
+            launcher,
+        )
 
     def test_rejects_out_of_range_color(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

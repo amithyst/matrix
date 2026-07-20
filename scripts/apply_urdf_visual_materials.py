@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 DEFAULT_RGBA = "0.75294 0.75294 0.75294 1"
 GENERATED_PREFIX = "urdf_visual_"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PROFILE_PATH = REPO_ROOT / "config" / "materials" / "aue_g1_v1.json"
+DEFAULT_PROFILE_PATH = REPO_ROOT / "config" / "materials" / "matrix_g1_v2.json"
 AUTO_PROFILE = "auto"
 URDF_PROFILE = "urdf"
 
@@ -43,6 +43,7 @@ class MaterialSummary:
     source_visuals: int
     source_styles: int
     styled_geoms: int
+    styled_collision_geoms: int
     unmatched_visual_geoms: int
     generated_materials: int
 
@@ -393,22 +394,32 @@ def apply_urdf_visual_materials(
     styles = set(by_link_mesh.values())
     generated_materials = _ensure_materials(asset, styles)
     styled_geoms = 0
+    styled_collision_geoms = 0
     unmatched_visual_geoms = 0
     for body in root.iter("body"):
         link_name = body.get("name", "")
         for geom in body.findall("geom"):
-            if not _is_visual_mesh(geom):
+            if geom.get("type") != "mesh":
                 continue
+            is_visual = _is_visual_mesh(geom)
             mesh_name = geom.get("mesh", "")
             style = by_link_mesh.get((link_name, mesh_name))
             if style is None:
                 style = by_unique_mesh.get(mesh_name)
             if style is None:
-                unmatched_visual_geoms += 1
+                if is_visual:
+                    unmatched_visual_geoms += 1
                 continue
             geom.set("material", style.material_name)
             geom.set("rgba", style.rgba)
-            styled_geoms += 1
+            if is_visual:
+                styled_geoms += 1
+            else:
+                # Matrix UE 0.1.2 renders the duplicate mesh collision geoms.
+                # Give them the same appearance as their visual counterpart so
+                # the default white collision material cannot hide the color.
+                # Contact attributes remain byte-for-byte untouched.
+                styled_collision_geoms += 1
 
     _write_atomic(tree, mjcf_path)
     return MaterialSummary(
@@ -420,6 +431,7 @@ def apply_urdf_visual_materials(
         source_visuals=source_visuals,
         source_styles=len(styles),
         styled_geoms=styled_geoms,
+        styled_collision_geoms=styled_collision_geoms,
         unmatched_visual_geoms=unmatched_visual_geoms,
         generated_materials=generated_materials,
     )

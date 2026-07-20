@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "profile_id": "matrix_g1_v2",
+  "description": "High-contrast Matrix G1 appearance for the released RGBA-only UE custom-robot bridge.",
+  "provenance": {
+    "base_profile": "config/materials/aue_g1_v1.json",
+    "design_revision": "matrix-g1-high-contrast-20260720",
+    "reason": "The released Matrix UE bridge renders only flat FLinearColor values, so the achromatic AUE reference surfaces collapse to a visually uniform gray robot in Town10."
+  },
+  "matcher": {
+    "required_links": [
+      "pelvis",
+      "left_hip_pitch_link",
+      "right_hip_pitch_link",
+      "left_ankle_roll_link",
+      "right_ankle_roll_link",
+      "torso_link",
+      "head_link",
+      "left_shoulder_pitch_link",
+      "right_shoulder_pitch_link"
+    ]
+  },
+  "materials": {
+    "black_soft": {
+      "rgba": [0.018, 0.024, 0.035, 1.0],
+      "roughness": 0.62,
+      "metallic": 0.0
+    },
+    "graphite_structure": {
+      "rgba": [0.055, 0.075, 0.11, 1.0],
+      "roughness": 0.58,
+      "metallic": 0.0
+    },
+    "cool_white_shell": {
+      "rgba": [0.9, 0.94, 1.0, 1.0],
+      "roughness": 0.48,
+      "metallic": 0.0
+    },
+    "matrix_blue_accent": {
+      "rgba": [0.015, 0.2, 0.95, 1.0],
+      "roughness": 0.42,
+      "metallic": 0.08
+    }
+  },
+  "rules": [
+    {
+      "material": "matrix_blue_accent",
+      "tokens": [
+        "pelvis_contour",
+        "logo",
+        "hip_yaw",
+        "shoulder_roll",
+        "elbow",
+        "knee"
+      ]
+    },
+    {
+      "material": "black_soft",
+      "tokens": [
+        "pelvis",
+        "ankle",
+        "wrist",
+        "rubber_hand",
+        "hand_",
+        "thumb",
+        "index",
+        "middle",
+        "ring",
+        "little"
+      ]
+    },
+    {
+      "material": "graphite_structure",
+      "tokens": ["head", "hip_pitch", "waist_yaw", "waist_roll"]
+    }
+  ],
+  "default_material": "cool_white_shell",
+  "renderer_contract": {
+    "mujoco_3_3": ["rgba", "roughness", "metallic"],
+    "matrix_ue_0_1_2": ["rgba"],
+    "textures": false,
+    "texture_reason": "The canonical STL visual meshes have no UV coordinates and the released Matrix UE bridge exposes only FLinearColor."
+  }
+}
