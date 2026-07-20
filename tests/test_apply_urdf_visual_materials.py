@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -229,6 +230,29 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
             self.assertTrue(
                 all(geom.get("rgba") == "0.7 0.7 0.7 1" for geom in visual_geoms)
             )
+
+    def test_ue_material_bridge_palette_matches_g1_profile(self) -> None:
+        profile = MODULE._load_profile(MODULE.DEFAULT_PROFILE_PATH)
+        materials = profile["materials"]
+        self.assertIsInstance(materials, dict)
+        expected_rgb = {
+            tuple(float(value) for value in material["rgba"][:3])
+            for material in materials.values()
+        }
+        bridge = (
+            REPO_ROOT / "src" / "ue_shims" / "matrix_ue_material_fix.c"
+        ).read_text(encoding="utf-8")
+        observed_rgb = {
+            tuple(float(value) for value in match)
+            for match in re.findall(
+                r"\{([0-9.]+)f, ([0-9.]+)f, ([0-9.]+)f\}", bridge
+            )
+        }
+
+        self.assertEqual(observed_rgb, expected_rgb)
+        self.assertIn("if (material_index == -1)", bridge)
+        self.assertIn("mapped G1 material profile ", bridge)
+        self.assertIn("section to slot 0\\n", bridge)
 
     def test_default_profile_and_launcher_pipeline_contract(self) -> None:
         self.assertEqual(MODULE.DEFAULT_PROFILE_PATH.name, "matrix_g1_v2.json")
