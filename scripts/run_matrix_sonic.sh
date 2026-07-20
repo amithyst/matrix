@@ -68,6 +68,9 @@ GAMEPAD_LOOK_MIN_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG:--80.0}"
 GAMEPAD_LOOK_MAX_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG:-60.0}"
 GAME_MAX_SPEED="${MATRIX_GAME_MAX_SPEED:-0.30}"
 GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
+GAME_WORLD_PERSISTENCE="${MATRIX_GAME_WORLD_PERSISTENCE:-auto}"
+GAME_AUTO_RESPAWN="${MATRIX_GAME_AUTO_RESPAWN:-auto}"
+GAME_WORLD_CHECKPOINT_SECONDS="${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
 WALK_AFTER="-1"
 VX="0.30"
 VY="0.0"
@@ -119,6 +122,9 @@ usage() {
         "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
         "  --game-max-speed MPS       Analog SLOW_WALK cap (default 0.30; max 0.80)" \
         "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
+        "  --game-world-persistence MODE  auto, on, or off (default: auto)" \
+        "  --game-auto-respawn MODE   auto, on, or off; cold-reloads after a fall" \
+        "  --game-world-checkpoint-seconds SEC  Durable last-exit interval (default: 0.75)" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -160,6 +166,9 @@ while [[ $# -gt 0 ]]; do
         --gamepad-look-max-pitch) GAMEPAD_LOOK_MAX_PITCH_DEG="$2"; shift 2 ;;
         --game-max-speed) GAME_MAX_SPEED="$2"; shift 2 ;;
         --game-input-timeout) GAME_INPUT_TIMEOUT="$2"; shift 2 ;;
+        --game-world-persistence) GAME_WORLD_PERSISTENCE="$2"; shift 2 ;;
+        --game-auto-respawn) GAME_AUTO_RESPAWN="$2"; shift 2 ;;
+        --game-world-checkpoint-seconds) GAME_WORLD_CHECKPOINT_SECONDS="$2"; shift 2 ;;
         --walk-after) WALK_AFTER="$2"; shift 2 ;;
         --vx) VX="$2"; shift 2 ;;
         --vy) VY="$2"; shift 2 ;;
@@ -285,6 +294,69 @@ PY
 )"; then
     exit 2
 fi
+case "${GAME_WORLD_PERSISTENCE,,}" in
+    auto)
+        if [[ "$CONTROL_SOURCE" == "game" \
+            && "$QUALIFICATION_REQUESTED" == "0" ]]; then
+            GAME_WORLD_PERSISTENCE=1
+        else
+            GAME_WORLD_PERSISTENCE=0
+        fi
+        ;;
+    1|true|yes|on) GAME_WORLD_PERSISTENCE=1 ;;
+    0|false|no|off) GAME_WORLD_PERSISTENCE=0 ;;
+    *)
+        echo "[ERROR] --game-world-persistence must be auto, on, or off" >&2
+        exit 2
+        ;;
+esac
+case "${GAME_AUTO_RESPAWN,,}" in
+    auto)
+        if [[ "$CONTROL_SOURCE" == "game" \
+            && "$QUALIFICATION_REQUESTED" == "0" \
+            && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
+            GAME_AUTO_RESPAWN=1
+        else
+            GAME_AUTO_RESPAWN=0
+        fi
+        ;;
+    1|true|yes|on) GAME_AUTO_RESPAWN=1 ;;
+    0|false|no|off) GAME_AUTO_RESPAWN=0 ;;
+    *)
+        echo "[ERROR] --game-auto-respawn must be auto, on, or off" >&2
+        exit 2
+        ;;
+esac
+if [[ "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
+    if [[ "$CONTROL_SOURCE" != "game" ]]; then
+        echo "[ERROR] Persistent world state requires --control-source game" >&2
+        exit 2
+    fi
+    if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
+        echo "[ERROR] Bounded qualification rejects persistent world state" >&2
+        exit 2
+    fi
+fi
+if [[ "$GAME_AUTO_RESPAWN" == "1" \
+    && "$GAME_WORLD_PERSISTENCE" != "1" ]]; then
+    echo "[ERROR] Auto respawn requires persistent world state" >&2
+    exit 2
+fi
+if ! /usr/bin/python3 -I - "$GAME_WORLD_CHECKPOINT_SECONDS" <<'PY'
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("checkpoint interval is not numeric") from exc
+if not math.isfinite(value) or not 0.1 <= value <= 60.0:
+    raise SystemExit("checkpoint interval must be in [0.1, 60]")
+PY
+then
+    echo "[ERROR] Invalid --game-world-checkpoint-seconds" >&2
+    exit 2
+fi
+export MATRIX_PROFILE="${PROFILE:-local}"
 MATRIX_SONIC_QUALIFIED_RUNTIME=0
 MATRIX_SONIC_QUALIFICATION_PROFILE=""
 MATRIX_SONIC_RUNTIME_LOCK_SHA256=""
@@ -412,10 +484,19 @@ for required in \
         exit 1
     fi
 done
-if [[ "$CONTROL_SOURCE" == "game" \
-    && ! -f "$PROJECT_ROOT/scripts/matrix_game_control_input.py" ]]; then
-    echo "[ERROR] Matrix game-control input provider is missing: $PROJECT_ROOT/scripts/matrix_game_control_input.py" >&2
-    exit 1
+if [[ "$CONTROL_SOURCE" == "game" ]]; then
+    for required in \
+        "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+        "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
+        "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
+        "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+        "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
+        "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
+        if [[ ! -f "$required" ]]; then
+            echo "[ERROR] Matrix game-control dependency is missing: $required" >&2
+            exit 1
+        fi
+    done
 fi
 
 require_qualified_path() {
@@ -607,6 +688,9 @@ export MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG="$GAMEPAD_LOOK_MIN_PITCH_DEG"
 export MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG="$GAMEPAD_LOOK_MAX_PITCH_DEG"
 export MATRIX_GAME_MAX_SPEED="$GAME_MAX_SPEED"
 export MATRIX_GAME_INPUT_TIMEOUT="$GAME_INPUT_TIMEOUT"
+export MATRIX_GAME_WORLD_PERSISTENCE="$GAME_WORLD_PERSISTENCE"
+export MATRIX_GAME_AUTO_RESPAWN="$GAME_AUTO_RESPAWN"
+export MATRIX_GAME_WORLD_CHECKPOINT_SECONDS="$GAME_WORLD_CHECKPOINT_SECONDS"
 export MATRIX_GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
 if [[ "$CONTROL_SOURCE" == "game" ]]; then
     rm -f -- "$MATRIX_GAME_INPUT_STATUS_FILE"
@@ -627,7 +711,11 @@ export MATRIX_SONIC_QUALIFICATION_PROFILE
 export MATRIX_SONIC_RUNTIME_LOCK_SHA256
 export MATRIX_SONIC_MATRIX_COMMIT
 export MATRIX_SONIC_VERIFICATION_RECEIPT
-export MATRIX_SONIC_FAIL_ON_FALL=1
+if [[ "$GAME_AUTO_RESPAWN" == "1" ]]; then
+    export MATRIX_SONIC_FAIL_ON_FALL=0
+else
+    export MATRIX_SONIC_FAIL_ON_FALL=1
+fi
 export MATRIX_SONIC_STARTUP_BAND="$STARTUP_BAND"
 export MATRIX_SONIC_STARTUP_BAND_HOLD="$STARTUP_BAND_HOLD"
 export MATRIX_SONIC_STARTUP_BAND_FADE="$STARTUP_BAND_FADE"
@@ -719,6 +807,7 @@ trap restore_tracked_config EXIT
 RUN_SIM_PID=""
 FORWARDED_SIGNAL_EXIT_CODE=0
 RESTART_REQUEST_VALID=0
+RESTART_EXPECTED_EXIT_CODE=143
 STOP_REQUESTED=0
 FORCED_STOP=0
 INTERNAL_RESTART_TIMEOUT=0
@@ -846,9 +935,123 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
     exit_code="$FORWARDED_SIGNAL_EXIT_CODE"
 fi
 if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
+    && "$FORCED_STOP" == "0" \
+    && "$exit_code" == "75" \
+    && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
+    if /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if not path.is_file() or path.is_symlink():
+    raise SystemExit(1)
+try:
+    status = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(status, dict):
+    raise SystemExit(1)
+internal = status.get("internal_restart")
+world = status.get("game_world_state")
+if not isinstance(internal, dict) or internal.get("requested") is not True:
+    raise SystemExit(1)
+reason = internal.get("reason")
+if reason not in {"game_fall_respawn", "game_teleport"}:
+    raise SystemExit(1)
+if status.get("termination_reason") != reason:
+    raise SystemExit(1)
+if "termination_signal" not in status or status["termination_signal"] is not None:
+    raise SystemExit(1)
+for field in ("failed_child_name", "failed_child_exit_code"):
+    if field not in status or status[field] is not None:
+        raise SystemExit(1)
+if not isinstance(world, dict) or world.get("has_last_exit") is not True:
+    raise SystemExit(1)
+if world.get("last_error") is not None:
+    raise SystemExit(1)
+if reason == "game_fall_respawn" and status.get("game_auto_respawn") is not True:
+    raise SystemExit(1)
+PY
+    then
+        INTERNAL_RESTART_NOW="$(date +%s)"
+        INTERNAL_RESTART_WINDOW="${MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH:-$INTERNAL_RESTART_NOW}"
+        INTERNAL_RESTART_COUNT="${MATRIX_GAME_INTERNAL_RESTART_COUNT:-0}"
+        INTERNAL_RESTART_MAX="${MATRIX_GAME_INTERNAL_RESTART_MAX_PER_MINUTE:-6}"
+        if [[ ! "$INTERNAL_RESTART_WINDOW" =~ ^[0-9]+$ \
+            || ! "$INTERNAL_RESTART_COUNT" =~ ^[0-9]+$ \
+            || ! "$INTERNAL_RESTART_MAX" =~ ^[1-9][0-9]*$ ]]; then
+            echo "[ERROR] Invalid Matrix internal-restart guard state" >&2
+        else
+            if ((INTERNAL_RESTART_NOW - INTERNAL_RESTART_WINDOW >= 60)); then
+                INTERNAL_RESTART_WINDOW="$INTERNAL_RESTART_NOW"
+                INTERNAL_RESTART_COUNT=0
+            fi
+            INTERNAL_RESTART_COUNT=$((INTERNAL_RESTART_COUNT + 1))
+            if ((INTERNAL_RESTART_COUNT <= INTERNAL_RESTART_MAX)); then
+                RESTART_REQUEST_VALID=1
+                RESTART_EXPECTED_EXIT_CODE=75
+                echo "[INFO] Validated Matrix world reload " \
+                    "count=${INTERNAL_RESTART_COUNT}/${INTERNAL_RESTART_MAX}"
+            else
+                echo "[ERROR] Matrix world reload rate limit exceeded; " \
+                    "leaving the runtime stopped" >&2
+            fi
+        fi
+    else
+        echo "[ERROR] Refusing unverified Matrix world reload request" >&2
+    fi
+fi
+if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
+    && "$FORCED_STOP" == "0" \
+    && "$RESTART_REQUEST_VALID" == "1" \
+    && "$RESTART_EXPECTED_EXIT_CODE" == "143" \
+    && "$exit_code" == "143" \
+    && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
+    if /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+import json
+from pathlib import Path
+import signal
+import sys
+
+path = Path(sys.argv[1])
+if not path.is_file() or path.is_symlink():
+    raise SystemExit(1)
+try:
+    status = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(status, dict):
+    raise SystemExit(1)
+if status.get("termination_reason") != "signal":
+    raise SystemExit(1)
+if status.get("termination_signal") != signal.SIGTERM:
+    raise SystemExit(1)
+for field in ("failed_child_name", "failed_child_exit_code"):
+    if field not in status or status[field] is not None:
+        raise SystemExit(1)
+internal = status.get("internal_restart")
+if not isinstance(internal, dict):
+    raise SystemExit(1)
+if internal.get("requested") is not False or internal.get("reason") is not None:
+    raise SystemExit(1)
+world = status.get("game_world_state")
+if not isinstance(world, dict) or world.get("has_last_exit") is not True:
+    raise SystemExit(1)
+if world.get("last_error") is not None:
+    raise SystemExit(1)
+PY
+    then
+        echo "[INFO] Verified final Matrix world checkpoint for requested restart"
+    else
+        RESTART_REQUEST_VALID=0
+        echo "[ERROR] Refusing Matrix restart without a verified final world checkpoint" >&2
+    fi
+fi
+if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
     && "$RESTART_REQUEST_VALID" == "1" \
     && "$FORCED_STOP" == "0" \
-    && "$exit_code" == "143" ]]; then
+    && "$exit_code" == "$RESTART_EXPECTED_EXIT_CODE" ]]; then
     if ! restore_tracked_config; then
         RESTART_REQUEST_VALID=0
         echo "[ERROR] Refusing restart after tracked-config restore failure" >&2
@@ -871,6 +1074,8 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
             exec /usr/bin/env -i \
                 "${ORIGINAL_ENVIRONMENT[@]}" \
                 MATRIX_SONIC_RESTART_LOCK_FD=9 \
+                MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH="${INTERNAL_RESTART_WINDOW:-0}" \
+                MATRIX_GAME_INTERNAL_RESTART_COUNT="${INTERNAL_RESTART_COUNT:-0}" \
                 "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${ORIGINAL_ARGS[@]}"
             echo "[ERROR] Failed to exec restarted Matrix launcher" >&2
             exit 1

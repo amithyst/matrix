@@ -1310,6 +1310,29 @@ if $MATRIX_SONIC_ENABLED; then
     MATRIX_UNITREE_SDK2_ROOT="${MATRIX_UNITREE_SDK2_ROOT:-}"
     MATRIX_SONIC_CANONICAL_MODEL="${MATRIX_SONIC_CANONICAL_MODEL:-$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml}"
     MATRIX_SONIC_CANONICAL_MESHES="${MATRIX_SONIC_CANONICAL_MESHES:-$MATRIX_SONIC_ROOT/gear_sonic/data/robot_model/model_data/g1/meshes}"
+    GAME_WORLD_PERSISTENCE_ENABLED=0
+    case "${MATRIX_GAME_WORLD_PERSISTENCE:-0}" in
+        1|true|yes|on) GAME_WORLD_PERSISTENCE_ENABLED=1 ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_GAME_WORLD_PERSISTENCE must be a boolean" >&2
+            exit 1
+            ;;
+    esac
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+        for required in \
+            "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+            "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
+            "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
+            "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+            "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
+            "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
+            if [[ ! -f "$required" ]]; then
+                echo "[ERROR] Matrix game-control dependency is missing: $required" >&2
+                exit 1
+            fi
+        done
+    fi
     for required in \
         "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         "$PROJECT_ROOT/scripts/matrix_game_control.py" \
@@ -1324,22 +1347,95 @@ if $MATRIX_SONIC_ENABLED; then
             exit 1
         fi
     done
-    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" \
-        && ! -f "$PROJECT_ROOT/scripts/matrix_game_control_input.py" ]]; then
-        echo "[ERROR] Matrix game-control input provider is missing: $PROJECT_ROOT/scripts/matrix_game_control_input.py" >&2
-        exit 1
-    fi
     if [[ ! -d "$MATRIX_SONIC_CANONICAL_MESHES" ]]; then
         echo "[ERROR] Canonical SONIC G1 meshes are missing: $MATRIX_SONIC_CANONICAL_MESHES" >&2
         exit 1
     fi
     mkdir -p "$PROJECT_ROOT/outputs/logs"
+    NATIVE_SONIC_SCENE="$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/xgb/$SCENE"
+    SONIC_SPAWN_ARGS=()
+    SONIC_WORLD_ARGS=()
+    if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
+        if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
+            echo "[ERROR] Persistent Matrix world state requires game control" >&2
+            exit 1
+        fi
+        GAME_WORLD_ID="${MATRIX_GAME_WORLD_ID:-${CUSTOM_NAME}:${SCENE%.xml}}"
+        GAME_WORLD_REVISION="$(
+            "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+                revision \
+                --world-id "$GAME_WORLD_ID" \
+                --native-scene "$NATIVE_SONIC_SCENE" \
+                --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
+                --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES"
+        )"
+        GAME_WORLD_STATE_FILE="${MATRIX_GAME_WORLD_STATE_FILE:-}"
+        if [[ -z "$GAME_WORLD_STATE_FILE" ]]; then
+            GAME_WORLD_STATE_FILE="$(
+                "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+                    default-path \
+                    --profile "${MATRIX_PROFILE:-local}" \
+                    --world-id "$GAME_WORLD_ID"
+            )"
+        fi
+        if [[ "$GAME_WORLD_STATE_FILE" != /* ]]; then
+            echo "[ERROR] MATRIX_GAME_WORLD_STATE_FILE must be absolute" >&2
+            exit 1
+        fi
+        if ! GAME_WORLD_START_OUTPUT="$(
+            "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+                resolve-start \
+                --file "$GAME_WORLD_STATE_FILE" \
+                --world-id "$GAME_WORLD_ID" \
+                --world-revision "$GAME_WORLD_REVISION"
+        )"; then
+            echo "[ERROR] Could not resolve the Matrix world resume pose" >&2
+            exit 1
+        fi
+        mapfile -t GAME_WORLD_START_LINES <<<"$GAME_WORLD_START_OUTPUT"
+        if [[ "${GAME_WORLD_START_LINES[0]:-}" == "pose" ]]; then
+            if [[ "${#GAME_WORLD_START_LINES[@]}" != "7" ]]; then
+                echo "[ERROR] Invalid Matrix world-state pose response" >&2
+                exit 1
+            fi
+            SONIC_SPAWN_ARGS=(
+                --spawn-x "${GAME_WORLD_START_LINES[1]}"
+                --spawn-y "${GAME_WORLD_START_LINES[2]}"
+                --spawn-z "${GAME_WORLD_START_LINES[3]}"
+                --spawn-yaw "${GAME_WORLD_START_LINES[4]}"
+            )
+            echo "[INFO] Matrix resume pose: ${GAME_WORLD_START_LINES[5]} " \
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]}"
+        elif [[ "${GAME_WORLD_START_LINES[0]:-}" == "none" \
+            && "${#GAME_WORLD_START_LINES[@]}" == "2" ]]; then
+            echo "[INFO] Matrix resume pose: map default " \
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]}"
+        else
+            echo "[ERROR] Invalid Matrix world-state helper response" >&2
+            exit 1
+        fi
+        SONIC_WORLD_ARGS=(
+            --game-world-id "$GAME_WORLD_ID"
+            --game-world-revision "$GAME_WORLD_REVISION"
+            --game-world-state-file "$GAME_WORLD_STATE_FILE"
+            --game-world-checkpoint-seconds "${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
+        )
+        case "${MATRIX_GAME_AUTO_RESPAWN:-0}" in
+            1|true|yes|on) SONIC_WORLD_ARGS+=(--game-auto-respawn) ;;
+            0|false|no|off|"") ;;
+            *)
+                echo "[ERROR] MATRIX_GAME_AUTO_RESPAWN must be a boolean" >&2
+                exit 1
+                ;;
+        esac
+    fi
     SONIC_PHYSICS_DIR="${MATRIX_SONIC_PHYSICS_DIR:-$PROJECT_ROOT/outputs/runtime/matrix_sonic/$CUSTOM_NAME/${SCENE%.xml}}"
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
         --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
         --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES" \
-        --native-scene "$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/xgb/$SCENE" \
-        --output-dir "$SONIC_PHYSICS_DIR"
+        --native-scene "$NATIVE_SONIC_SCENE" \
+        --output-dir "$SONIC_PHYSICS_DIR" \
+        "${SONIC_SPAWN_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
     GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
@@ -1471,6 +1567,7 @@ if $MATRIX_SONIC_ENABLED; then
         --startup-band-hold "${MATRIX_SONIC_STARTUP_BAND_HOLD:-4}" \
         --startup-band-fade "${MATRIX_SONIC_STARTUP_BAND_FADE:-3}" \
         "${GAME_INPUT_ARGS[@]}" \
+        "${SONIC_WORLD_ARGS[@]}" \
         --status-file "$SONIC_STATUS_FILE" \
         > "$PROJECT_ROOT/outputs/logs/matrix_sonic_runtime.log" 2>&1 &
     SONIC_PID=$!
@@ -1552,7 +1649,12 @@ PY
         then
             echo "[ERROR] Failed to merge the UE lifecycle failure into status" >&2
         fi
-        if [[ "$SONIC_EXIT_CODE" == "0" ]]; then
+        # Exit 75 is authority only for a clean, status-verified world reload.
+        # A UE failure observed at this late boundary must invalidate it just as
+        # it invalidates an otherwise-successful zero exit; otherwise the outer
+        # launcher can mistake a concurrent UE crash for an authorized teleport
+        # or fall respawn.
+        if [[ "$SONIC_EXIT_CODE" == "0" || "$SONIC_EXIT_CODE" == "75" ]]; then
             SONIC_EXIT_CODE=2
         fi
     fi

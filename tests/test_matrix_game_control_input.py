@@ -19,6 +19,7 @@ SCRIPTS = REPO_ROOT / "scripts"
 if os.fspath(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, os.fspath(SCRIPTS))
 CORE = importlib.import_module("matrix_game_control")
+MC_COMMANDS = importlib.import_module("matrix_mc_commands")
 RESTART = importlib.import_module("matrix_restart_request")
 SCRIPT_PATH = SCRIPTS / "matrix_game_control_input.py"
 SPEC = importlib.util.spec_from_file_location("matrix_game_control_input", SCRIPT_PATH)
@@ -87,12 +88,14 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "version": 1,
                     "session": supervisor._action_session,
                     "sequence": 1,
+                    "kind": "action",
                     "action": "profile_remote",
                 },
                 {
                     "version": 1,
                     "session": supervisor._action_session,
                     "sequence": 2,
+                    "kind": "action",
                     "action": "speed_down",
                 },
             )
@@ -100,10 +103,13 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 for packet in packets:
                     sender.send(json.dumps(packet).encode("ascii"))
                 self.assertEqual(
-                    supervisor.drain_actions(),
-                    ("profile_remote", "speed_down"),
+                    supervisor.drain_intents(),
+                    (
+                        MODULE.OverlayIntent(kind="action", action="profile_remote"),
+                        MODULE.OverlayIntent(kind="action", action="speed_down"),
+                    ),
                 )
-                self.assertEqual(supervisor.drain_actions(), ())
+                self.assertEqual(supervisor.drain_intents(), ())
             finally:
                 sender.close()
                 receiver.close()
@@ -134,15 +140,19 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 "version": 1,
                 "session": supervisor._action_session,
                 "sequence": 1,
+                "kind": "action",
                 "action": "profile_remote",
             }
             try:
                 sender.send(json.dumps(packet).encode("ascii"))
-                actions = supervisor.drain_actions()
-                self.assertEqual(actions, ("profile_remote",))
-                for action in actions:
+                intents = supervisor.drain_intents()
+                self.assertEqual(
+                    intents,
+                    (MODULE.OverlayIntent(kind="action", action="profile_remote"),),
+                )
+                for intent in intents:
                     self.assertTrue(
-                        controller.apply_panel_action(action, active=True)
+                        controller.apply_panel_action(intent.action, active=True)
                     )
                 self.assertEqual(
                     json.loads(settings_file.read_text(encoding="utf-8")),
@@ -160,11 +170,18 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
             script = root / "matrix_calibration_overlay.py"
             script.write_text("", encoding="utf-8")
             for packet in (
-                {"version": 1, "session": "wrong", "sequence": 1, "action": "speed_up"},
+                {
+                    "version": 1,
+                    "session": "wrong",
+                    "sequence": 1,
+                    "kind": "action",
+                    "action": "speed_up",
+                },
                 {
                     "version": 1,
                     "session": "placeholder",
                     "sequence": 1,
+                    "kind": "action",
                     "action": "restart_directly",
                 },
             ):
@@ -183,12 +200,679 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 supervisor._action_socket = receiver
                 try:
                     sender.send(json.dumps(packet).encode("ascii"))
-                    with self.assertRaisesRegex(RuntimeError, "identity"):
-                        supervisor.drain_actions()
+                    with self.assertRaisesRegex(RuntimeError, "identity|action intent"):
+                        supervisor.drain_intents()
                 finally:
                     sender.close()
                     receiver.close()
                     supervisor._action_socket = None
+
+    def test_private_intent_socket_accepts_strict_command_edit_and_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            packets = (
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 1,
+                    "kind": "command_edit",
+                    "active": True,
+                },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 2,
+                    "kind": "command_submit",
+                    "command": "/tp @s ~1 ~ ~",
+                },
+            )
+            try:
+                for packet in packets:
+                    sender.send(json.dumps(packet).encode("utf-8"))
+                self.assertEqual(
+                    supervisor.drain_intents(),
+                    (
+                        MODULE.OverlayIntent(kind="command_edit", active=True),
+                        MODULE.OverlayIntent(
+                            kind="command_submit", command="/tp @s ~1 ~ ~"
+                        ),
+                    ),
+                )
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
+    def test_private_intent_socket_rejects_schema_smuggling_and_oversize(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            invalid_packets = (
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "kind": "command_edit",
+                    "active": 1,
+                },
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "kind": "command_submit",
+                    "command": "/tp @s 1 2 3",
+                    "action": "apply_return",
+                },
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "kind": "command_submit",
+                    "command": "x" * (MC_COMMANDS.MAX_COMMAND_CHARS + 1),
+                },
+            )
+            for packet in invalid_packets:
+                supervisor = MODULE.CalibrationOverlaySupervisor(
+                    state_file=root / "state.json",
+                    display_name=None,
+                    expected_ue_pid=41,
+                    script=script,
+                )
+                packet["session"] = supervisor._action_session
+                receiver, sender = socket.socketpair(
+                    socket.AF_UNIX, socket.SOCK_SEQPACKET
+                )
+                receiver.setblocking(False)
+                supervisor._action_socket = receiver
+                try:
+                    sender.send(json.dumps(packet).encode("utf-8"))
+                    with self.assertRaisesRegex(RuntimeError, "intent"):
+                        supervisor.drain_intents()
+                finally:
+                    sender.close()
+                    receiver.close()
+                    supervisor._action_socket = None
+
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            try:
+                sender.send(b"x" * (supervisor._MAX_INTENT_PACKET_BYTES + 1))
+                with self.assertRaisesRegex(RuntimeError, "oversized"):
+                    supervisor.drain_intents()
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
+
+@unittest.skipUnless(
+    hasattr(socket, "SOCK_SEQPACKET"), "Unix SOCK_SEQPACKET is required"
+)
+class GameCommandClientTest(unittest.TestCase):
+    def make_client(self):
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(provider.detach())
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+        return client, runtime
+
+    @staticmethod
+    def enable_editor(client) -> None:
+        assert client.set_editing(
+            True, panel_active=True, restart_requested=False
+        )
+
+    def test_unavailable_channel_cannot_enter_editor_or_capture_escape(self) -> None:
+        client = MODULE.GameCommandClient(None)
+        self.addCleanup(client.close)
+        self.assertFalse(
+            client.set_editing(True, panel_active=True, restart_requested=False)
+        )
+        self.assertFalse(client.editing)
+        self.assertTrue(
+            client.panel_escape_pressed(True, editor_owned_this_frame=True)
+        )
+        self.assertFalse(client.panel_escape_pressed(False))
+
+    def test_command_channel_rejects_a_unix_stream_socket(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        descriptor = provider.detach()
+        self.addCleanup(runtime.close)
+        with self.assertRaisesRegex(ValueError, "SOCK_SEQPACKET"):
+            MODULE.GameCommandClient(descriptor)
+
+    def test_raw_text_is_parsed_to_typed_ast_and_response_is_surfaced(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+
+        self.assertTrue(
+            client.submit(
+                "/tp @s ~1 2 ~-3",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        payload = runtime.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+        self.assertNotIn(b"/tp", payload)
+        request = MC_COMMANDS.decode_command_request(payload)
+        self.assertIsInstance(request.command, MC_COMMANDS.TeleportCoordinates)
+        self.assertEqual(request.sequence, 1)
+        self.assertTrue(client.in_flight)
+
+        response = MC_COMMANDS.GameCommandResponse(
+            session=request.session,
+            sequence=request.sequence,
+            request_id=request.request_id,
+            ok=True,
+            code="OK_TELEPORT_RESTART",
+            message="Teleport saved",
+            restart_required=True,
+            data={"position": [1.0, 2.0, 3.0]},
+        )
+        runtime.send(MC_COMMANDS.encode_command_response(response))
+        self.assertTrue(client.poll())
+        self.assertFalse(client.in_flight)
+        self.assertEqual(
+            client.mapping(),
+            {
+                "available": True,
+                "editing": True,
+                "in_flight": False,
+                "status": "restarting",
+                "request_id": request.request_id,
+                "sequence": 1,
+                "result_revision": 2,
+                "ok": True,
+                "code": "OK_TELEPORT_RESTART",
+                "message": "Teleport saved",
+                "warning": None,
+                "restart_required": True,
+                "outcome_unknown": False,
+                "data": {"position": [1.0, 2.0, 3.0]},
+            },
+        )
+
+    def test_only_one_request_is_in_flight_and_restart_response_is_terminal(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        arguments = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+        }
+        self.assertTrue(client.submit("/tp @s 1 2 3", **arguments))
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+
+        self.assertFalse(client.submit("/tp @s 4 5 6", **arguments))
+        for _ in range(5):
+            self.assertFalse(client.poll())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_RESTART",
+                    message="saved",
+                    restart_required=True,
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertTrue(client.restart_required)
+        self.assertFalse(client.submit("/tp @s 4 5 6", **arguments))
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+    def test_submit_requires_panel_neutral_editor_and_no_restart(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        cases = (
+            (
+                {
+                    "calibration_active": False,
+                    "neutral_frame_ready": True,
+                    "restart_requested": False,
+                },
+                "E_NOT_PAUSED",
+            ),
+            (
+                {
+                    "calibration_active": True,
+                    "neutral_frame_ready": False,
+                    "restart_requested": False,
+                },
+                "E_NEUTRAL_REQUIRED",
+            ),
+            (
+                {
+                    "calibration_active": True,
+                    "neutral_frame_ready": True,
+                    "restart_requested": True,
+                },
+                "E_RESTART_PENDING",
+            ),
+        )
+        for arguments, code in cases:
+            with self.subTest(code=code):
+                self.assertFalse(client.submit("/tp @s 1 2 3", **arguments))
+                self.assertEqual(client.code, code)
+                with self.assertRaises(BlockingIOError):
+                    runtime.recv(4096)
+
+        self.assertTrue(
+            client.set_editing(False, panel_active=True, restart_requested=False)
+        )
+        self.assertFalse(
+            client.submit(
+                "/tp @s 1 2 3",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertEqual(client.code, "E_COMMAND_EDIT_REQUIRED")
+
+    def test_parser_error_and_summom_warning_stay_provider_side(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        arguments = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+        }
+        self.assertFalse(client.submit("/tp @s 1 2", **arguments))
+        self.assertEqual(client.code, "E_COORD_ARITY")
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        self.assertTrue(
+            client.submit(
+                '/summom matrix:teleport_point ~ ~ ~ {Tags:["XX"]}',
+                **arguments,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertIsInstance(request.command, MC_COMMANDS.SummonTeleportPoint)
+        self.assertIn("/summon", client.warning or "")
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_SUMMONED",
+                    message="Summoned teleport point",
+                )
+            )
+        )
+        client.poll()
+        self.assertIn("/summon", client.warning or "")
+
+    def test_repeated_identical_parse_error_has_a_new_result_revision(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        arguments = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+        }
+        revisions = []
+        for _ in range(2):
+            self.assertFalse(client.submit("/tp @s 1 2", **arguments))
+            mapping = client.mapping()
+            self.assertEqual(mapping["code"], "E_COORD_ARITY")
+            self.assertEqual(
+                mapping["message"],
+                "tp @s requires three coordinates or one selector",
+            )
+            revisions.append(mapping["result_revision"])
+            with self.assertRaises(BlockingIOError):
+                runtime.recv(4096)
+        self.assertEqual(revisions, [1, 2])
+
+    def test_wrong_response_identity_preserves_unknown_outcome_without_retry(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        self.assertTrue(
+            client.submit(
+                "/tp @s 1 2 3",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session="f" * 32,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=False,
+                    code="E_TEST_RESPONSE",
+                    message="wrong session",
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertFalse(client.available)
+        self.assertFalse(client.in_flight)
+        self.assertIsNone(client.ok)
+        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
+        self.assertEqual(client.last_request_id, request.request_id)
+        self.assertTrue(client.mapping()["outcome_unknown"])
+        self.assertIn("do not retry blindly", client.message or "")
+        self.assertIn("identity", client.message or "")
+        self.assertFalse(
+            client.submit(
+                "/tp @s 4 5 6",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
+        self.assertEqual(client.last_request_id, request.request_id)
+        self.assertTrue(
+            client.set_editing(False, panel_active=True, restart_requested=False)
+        )
+        self.assertFalse(client.editing)
+        self.assertFalse(client.panel_escape_pressed(True))
+        self.assertFalse(client.panel_closed())
+
+    def test_eof_after_send_is_unknown_but_unsolicited_response_is_protocol_error(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        self.assertTrue(
+            client.submit(
+                '/summon matrix:teleport_point ~ ~ ~ {Tags:["maybe"]}',
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.close()
+        self.assertTrue(client.poll())
+        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
+        self.assertEqual(client.last_request_id, request.request_id)
+
+        unsolicited, peer = self.make_client()
+        peer.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session="a" * 32,
+                    sequence=1,
+                    request_id="cmd-" + "b" * 32,
+                    ok=False,
+                    code="E_TEST_RESPONSE",
+                    message="unsolicited",
+                )
+            )
+        )
+        self.assertTrue(unsolicited.poll())
+        self.assertEqual(unsolicited.code, "E_COMMAND_PROTOCOL")
+        self.assertIsNone(unsolicited.last_request_id)
+
+    def test_shutdown_marks_an_unacknowledged_request_outcome_unknown(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        self.assertTrue(
+            client.submit(
+                '/summon matrix:teleport_point ~ ~ ~ {Tags:["maybe"]}',
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+
+        # Production cleanup can be entered by SIGTERM before the provider's
+        # next frame observes EOF from the runtime.  close() is therefore the
+        # final authority for resolving an in-flight request safely.
+        client.close()
+
+        self.assertFalse(client.available)
+        self.assertFalse(client.in_flight)
+        self.assertTrue(client.outcome_unknown)
+        self.assertIsNone(client.ok)
+        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
+        self.assertEqual(client.last_request_id, request.request_id)
+        self.assertIn("do not retry blindly", client.message or "")
+
+    def test_shutdown_drains_a_buffered_response_before_closing(self) -> None:
+        client, runtime = self.make_client()
+        self.enable_editor(client)
+        self.assertTrue(
+            client.submit(
+                "/tp @s 1 2 3",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_RESTART",
+                    message="saved",
+                    restart_required=True,
+                )
+            )
+        )
+
+        client.close()
+
+        self.assertFalse(client.available)
+        self.assertFalse(client.in_flight)
+        self.assertFalse(client.outcome_unknown)
+        self.assertIs(client.ok, True)
+        self.assertEqual(client.status, "restarting")
+        self.assertEqual(client.code, "OK_TELEPORT_RESTART")
+        self.assertEqual(client.last_request_id, request.request_id)
+
+    def test_first_escape_exits_editor_only_after_release_and_pending_blocks_exit(self) -> None:
+        client, runtime = self.make_client()
+        # Even a begin/end pair drained inside one provider frame owns Escape.
+        self.assertFalse(
+            client.panel_escape_pressed(True, editor_owned_this_frame=True)
+        )
+        self.assertFalse(client.panel_escape_pressed(False))
+        self.assertTrue(client.panel_escape_pressed(True))
+        self.assertFalse(client.panel_escape_pressed(False))
+        self.enable_editor(client)
+
+        self.assertFalse(client.panel_escape_pressed(True))
+        self.assertTrue(
+            client.set_editing(False, panel_active=True, restart_requested=False)
+        )
+        self.assertFalse(client.panel_escape_pressed(True))
+        self.assertFalse(client.panel_escape_pressed(False))
+        self.assertTrue(client.panel_escape_pressed(True))
+        self.assertFalse(client.panel_escape_pressed(False))
+
+        self.enable_editor(client)
+        self.assertTrue(
+            client.submit(
+                "/tp @s 1 2 3",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertTrue(
+            client.set_editing(False, panel_active=True, restart_requested=False)
+        )
+        self.assertFalse(client.editing)
+        self.assertFalse(client.panel_escape_pressed(True))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_RESTART",
+                    message="saved",
+                    restart_required=True,
+                )
+            )
+        )
+        client.poll()
+        # The restart response is terminal for this provider generation.  No
+        # Escape or edit intent may reopen/close controls while the runtime is
+        # transitioning to its new cold-start generation.
+        self.assertFalse(client.panel_escape_pressed(True))
+        self.assertFalse(client.panel_escape_pressed(False))
+        self.assertFalse(client.panel_escape_pressed(True))
+        self.assertFalse(
+            client.set_editing(True, panel_active=True, restart_requested=False)
+        )
+        self.assertFalse(client.editing)
+        self.assertFalse(client.panel_escape_pressed(True))
+        self.assertFalse(client.panel_escape_pressed(False))
+        self.assertFalse(client.panel_escape_pressed(True))
+
+    def test_editor_consumes_global_settings_enter_and_f9_levels_until_release(self) -> None:
+        client, _runtime = self.make_client()
+        self.assertTrue(
+            client.set_editing(True, panel_active=True, restart_requested=False)
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = MODULE.MouseSettingsController(
+                path=Path(temporary) / "mouse.json",
+                desired=MODULE.MouseSettings(),
+                load_status="missing",
+                load_error=None,
+            )
+            # Poll the physical levels while inactive so a held key cannot turn
+            # into a fresh M/-/+ edge when editing ends.
+            self.assertFalse(
+                settings.update(
+                    active=not client.editing,
+                    mode_pressed=True,
+                    slower_pressed=True,
+                    faster_pressed=True,
+                )
+            )
+            client.set_editing(False, panel_active=True, restart_requested=False)
+            self.assertFalse(
+                settings.update(
+                    active=True,
+                    mode_pressed=True,
+                    slower_pressed=True,
+                    faster_pressed=True,
+                )
+            )
+            settings.update(
+                active=True,
+                mode_pressed=False,
+                slower_pressed=False,
+                faster_pressed=False,
+            )
+            self.assertTrue(
+                settings.update(
+                    active=True,
+                    mode_pressed=True,
+                    slower_pressed=False,
+                    faster_pressed=False,
+                )
+            )
+
+        class Requester:
+            available = True
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self) -> bool:
+                self.calls += 1
+                return True
+
+        requester = Requester()
+        key = MODULE.ApplyRestartKey()
+        key.update(
+            pressed=True,
+            calibration_active=False,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_ok=True,
+            requester=requester,
+        )
+        key.update(
+            pressed=True,
+            calibration_active=True,
+            neutral_frame_ready=True,
+            pending_restart=True,
+            persistence_ok=True,
+            requester=requester,
+        )
+        self.assertEqual(requester.calls, 0)
+
+        calibration = MODULE.CalibrationModeController()
+        calibration.active = True
+        apply_return = MODULE.ApplyReturnController()
+        restart = mock.Mock(available=False, requested=False)
+        apply_return.update(
+            enter_pressed=True,
+            clicked=False,
+            ue_focused=False,
+            panel_was_active=True,
+            calibration=calibration,
+            neutral_frame_ready=True,
+            pending_restart=False,
+            persistence_error=None,
+            requester=restart,
+        )
+        self.assertEqual(
+            apply_return.update(
+                enter_pressed=True,
+                clicked=False,
+                ue_focused=True,
+                panel_was_active=True,
+                calibration=calibration,
+                neutral_frame_ready=True,
+                pending_restart=False,
+                persistence_error=None,
+                requester=restart,
+            ),
+            (False, False),
+        )
+        self.assertTrue(calibration.active)
 
 
 class SourceArbitrationTest(unittest.TestCase):
@@ -3106,6 +3790,45 @@ class UnixSeqpacketPublisherTest(unittest.TestCase):
 
 
 class CameraYawSourceCliTest(unittest.TestCase):
+    def test_provider_parser_accepts_an_open_game_command_fd(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        try:
+            with mock.patch.object(
+                os.sys,
+                "argv",
+                [
+                    "matrix_game_control_input.py",
+                    "--game-command-fd",
+                    str(provider.fileno()),
+                    "--dry-run",
+                ],
+            ):
+                args = MODULE._parse_args()
+            MODULE._validate_args(args)
+            self.assertEqual(args.game_command_fd, provider.fileno())
+        finally:
+            provider.close()
+            runtime.close()
+
+    def test_provider_validation_rejects_a_closed_game_command_fd(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        descriptor = provider.fileno()
+        provider.close()
+        self.addCleanup(runtime.close)
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                "--game-command-fd",
+                str(descriptor),
+                "--dry-run",
+            ],
+        ):
+            args = MODULE._parse_args()
+        with self.assertRaisesRegex(SystemExit, "not open"):
+            MODULE._validate_args(args)
+
     def test_provider_parser_keeps_three_x11_sources_distinct(self) -> None:
         for source in ("x11-mirror", "x11-core-gated", "x11-absolute"):
             with self.subTest(source=source), mock.patch.object(

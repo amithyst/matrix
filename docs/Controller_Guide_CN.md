@@ -146,6 +146,60 @@ Legacy/Zen 精确 round trip。移动机器人 orbit、墙面/地面碰撞恢复
 会停留在安全页面并显示加载状态；保存或请求失败时仍留在页面并显示错误。F9 复用同一
 安全门槛作为兜底。不要单独重启 UE，重启期间保持所有控制输入松开。
 
+#### ESC 命令行、续玩与传送
+
+非限时的 SONIC `game` 启动现在默认开启本机世界存档和摔倒冷重生。命令入口只在 ESC
+面板内开放；正常游戏画面、终端和 UE 控制台都不是这套命令的入口。命令框编辑期间，
+`M`、`-`、`+`、`Enter` 和 `F9` 不会误触鼠标设置快捷键；隐藏面板、provider 退出或父
+进程退出都会释放键盘抓取。runtime 只有在机器人已经处于安全归零且非移动帧时才执行
+请求。原始文本在受监督 provider 中解析成严格的 typed AST，物理进程不会把文本交给
+shell、UE `ExecCmds`、`eval` 或子进程。
+
+目前支持四种操作形式（命令名、实体类型、selector 字段和值均区分大小写）：
+
+```text
+/summon matrix:teleport_point ~ ~ ~ {Tags:["XX"]}
+/summom matrix:teleport_point ~ ~ ~ {Tags:["XX"]}
+/tp @s 1 2 0.8
+/tp @s @e[type=matrix:teleport_point,tag=XX,limit=1,sort=nearest]
+```
+
+- `/summon` 在指定位置保存一个逻辑传送点；它不会在 UE 里生成可见 Actor。`~` 表示相对
+  当前机器人 root，`~1.5` 表示在对应轴增加 1.5 m。精确拼写错误 `summom` 为兼容别名，
+  会执行并提示标准写法；其他近似拼写直接拒绝。
+- `/tp @s x y z` 保存目标位置；未指定 yaw，因此沿用提交命令时的机器人 yaw。
+- selector 形式只选择当前场景中含该 tag 的逻辑传送点；当前严格要求
+  `type=matrix:teleport_point`、`limit=1`、`sort=nearest`。selector 字段顺序可以调整。
+- 使用 `{Tags:["home"]}` 可设置固定 `home` 回退点。启动仍优先恢复 `last_exit`；需要主动
+  回家时执行 selector 的 `tag=home` 传送。
+
+Matrix 世界坐标为右手系，单位米：X 向前、Y 向左、Z 向上。传送不会在线修改 MuJoCo
+`qpos`，也不会调用 SONIC 的不完整 reset。成功的 `/tp` 先原子保存目标并返回结果，再由
+最外层 launcher 冷重启完整 Matrix/UE/SONIC 运行链；新一代以 canonical 站姿、零速度和
+新的策略历史在目标 root pose 初始化。`/summon` 只改存档，不触发重启。命令客户端同一
+时刻只允许一个在途请求；完整送出后，只有 session、sequence 和 request id 全部匹配的
+响应才能结束该请求，等待期间不会超时自动重试。如果响应通道断开或响应校验失败，面板
+会保留 request id 并显示 `E_COMMAND_OUTCOME_UNKNOWN`，继续保持安全暂停。此时命令可能
+已经落盘，不能盲目重输；应完整重启 Matrix，再检查恢复位置或传送点存档。
+
+世界状态默认位于 `$XDG_STATE_HOME/matrix/<profile>/`，未设置时使用
+`~/.local/state/matrix/<profile>/`。它按**本机 + profile + 场景**隔离，并绑定物理场景
+revision，不会自动同步到河源/TRNA/ZZA 之间。运行中默认每 0.75 s 持久化一次安全语义
+pose，正常退出还会强制写一次；因此断电或 `SIGKILL` 最多回退到最近一次成功 checkpoint。
+安全 checkpoint 要求 root Z 至少 0.55 m、root-up Z 至少 0.85、垂直速度不超过
+0.35 m/s，且 roll/pitch 角速度各不超过 0.75 rad/s；水平行走速度不参与这项门禁。
+物理 revision 同时覆盖 canonical model、canonical meshes、native scene/资产和 prepare
+pipeline 版本，但不包含主机绝对路径或本次 spawn override。启动顺序固定为
+`last_exit → home → 地图默认点`。F9/应用设置只在最终 checkpoint 已可靠写盘并由外层
+launcher 验证后才会启动下一代；写盘失败时保持停止，不会拿旧位置继续重启。
+
+SONIC 报告摔倒后，runtime 先发布 emergency stop，再保留摔倒位置的 X/Y，并使用最近
+一次安全直立 checkpoint 的 Z/yaw 生成恢复 pose，随后走同一条完整冷重启链。这不是物理
+起身动画。如果从未有过安全直立 pose，系统不会猜测高度；连续内部重启还受每分钟最多
+6 次的防循环门限制。带 `--max-seconds` 的 bounded qualification 会自动关闭世界存档和
+自动重生，显式强开会在启动前被拒绝；这保证资格验收继续使用跌倒即失败、零 reset 的
+原门禁。交互调试可用 `--game-world-persistence off` 显式关闭续玩。
+
 真正影响可见 UE 相机的是启动时注入的 `SDL_MOUSE_RELATIVE_SPEED_SCALE`。例如目前使用
 的 Remote 0.4x 是 SDL/UE 原生输入倍率，不是 X 指针加速度。`x11-mirror` 的默认基值
 为 0.12 度/XI2 raw unit 时，状态里会显示 `0.12 x 0.4 = 0.048 度/raw`。镜像现在订阅

@@ -69,6 +69,8 @@ class OverlayLayoutTest(unittest.TestCase):
         )
         layout = MODULE.overlay_layout(geometry)
         panel = layout["panel"]
+        self.assertGreaterEqual(layout["command_result"][3], 14)
+        self.assertGreaterEqual(layout["command_input"][3], 22)
         self.assertGreaterEqual(panel[2], 800)
         self.assertGreaterEqual(panel[3], 560)
         self.assertEqual(
@@ -89,6 +91,7 @@ class OverlayLayoutTest(unittest.TestCase):
             "speed_down",
             "speed_value",
             "speed_up",
+            "command_input",
             "apply_return",
         ):
             self.assertFalse(
@@ -130,6 +133,7 @@ class OverlayLayoutTest(unittest.TestCase):
             "speed_down",
             "speed_value",
             "speed_up",
+            "command_input",
             "apply_return",
         ):
             self.assertFalse(
@@ -139,6 +143,20 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertFalse(MODULE.overlay_supported(tiny))
         with self.assertRaisesRegex(ValueError, "too small"):
             MODULE.overlay_layout(tiny)
+
+    def test_command_input_is_a_separate_hit_target_below_crosshair(self) -> None:
+        geometry = MODULE.WindowGeometry(1, 0, 0, 480, 360)
+        layout = MODULE.overlay_layout(geometry)
+        command_input = layout["command_input"]
+        point = (
+            command_input[0] + command_input[2] // 2,
+            command_input[1] + command_input[3] // 2,
+        )
+        self.assertEqual(MODULE.panel_action_at(layout, *point), "command_input")
+        self.assertFalse(self.intersects(command_input, layout["crosshair_safe"]))
+        self.assertGreaterEqual(layout["command_result"][3], 14)
+        self.assertFalse(self.intersects(layout["title"], layout["profile_local"]))
+        self.assertFalse(self.intersects(layout["title"], layout["profile_remote"]))
 
     def test_root_coordinate_hit_test_handles_offset_remote_desktop_client(self) -> None:
         geometry = MODULE.WindowGeometry(1, -640, 120, 1600, 900)
@@ -168,6 +186,11 @@ class CursorShapeTest(unittest.TestCase):
         self.assertEqual(MODULE.XRectangle.y.offset, 2)
         self.assertEqual(MODULE.XRectangle.width.offset, 4)
         self.assertEqual(MODULE.XRectangle.height.offset, 6)
+        self.assertEqual(
+            MODULE.ctypes.sizeof(MODULE.XKeyEvent),
+            MODULE.ctypes.sizeof(MODULE.XButtonEvent),
+        )
+        self.assertEqual(MODULE.XKeyEvent.keycode.offset, MODULE.XButtonEvent.button.offset)
 
     def test_arrow_is_shaped_with_hotspot_at_window_origin(self) -> None:
         shadow = self.pixels(MODULE._CURSOR_SHADOW_RECTANGLES)
@@ -230,8 +253,9 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn(b"base 0.120 -> effective 0.120", lines[1])
         self.assertIn(b"XI2 raw mirror", lines[1])
         self.assertIn(b"deg/raw", lines[1])
-        self.assertIn(b"Enter: RETURN TO GAME & APPLY", lines[2])
-        self.assertIn(b"F9: fallback", lines[2])
+        self.assertIn(b"RETURN TO GAME & APPLY", lines[2])
+        self.assertIn(b"Enter runs", lines[2])
+        self.assertIn(b"ESC leaves editor first", lines[2])
         hint = b" | ".join(lines)
         self.assertIn(b"0.01-0.10", hint)
         self.assertIn(b"0.20-1.00", hint)
@@ -266,6 +290,38 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(unavailable.apply_label, "APPLY UNAVAILABLE")
         self.assertIn("unavailable", unavailable.error)
         self.assertFalse(unavailable.action_enabled("apply_return"))
+
+    def test_command_state_is_strict_and_alias_warning_is_ascii_readable(self) -> None:
+        status = MODULE.command_console_status(
+            {
+                "command_console": {
+                    "available": True,
+                    "editing": 1,
+                    "in_flight": False,
+                    "status": "success",
+                    "sequence": 4,
+                    "result_revision": 7,
+                    "ok": True,
+                    "warning": "已兼容执行；标准命令是 /summon",
+                }
+            }
+        )
+        self.assertTrue(status.available)
+        self.assertFalse(status.provider_editing)
+        self.assertEqual(status.result_revision, 7)
+        self.assertEqual(status.warning, "Accepted /summom alias; standard command is /summon")
+        malformed = MODULE.command_console_status(
+            {
+                "command_console": {
+                    "status": {},
+                    "sequence": True,
+                    "result_revision": True,
+                }
+            }
+        )
+        self.assertEqual(malformed.status, "unavailable")
+        self.assertIsNone(malformed.sequence)
+        self.assertEqual(malformed.result_revision, 0)
 
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):
@@ -343,10 +399,13 @@ class OverlayStateTest(unittest.TestCase):
                     "pending",
                     "error",
                     "apply",
+                    "outline",
                 ),
                 10,
             )
         }
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._last_command_status = MODULE.command_console_status({})
         overlay._draw_text = mock.Mock()
         overlay._draw_button = mock.Mock()
 
@@ -388,12 +447,313 @@ class PointerActionPublisherTest(unittest.TestCase):
             second = json.loads(receiver.recv(1024).decode("ascii"))
             self.assertEqual(first["session"], "known-session")
             self.assertEqual((first["sequence"], second["sequence"]), (1, 2))
+            self.assertEqual(first["kind"], "action")
             self.assertEqual(second["action"], "speed_down")
             with self.assertRaisesRegex(ValueError, "unsupported"):
                 publisher.publish("restart_directly")
         finally:
             publisher.close()
             receiver.close()
+
+    def test_command_intents_have_disjoint_strict_shapes(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_command_edit(True)
+            publisher.publish_command_submit("/tp @s ~ ~ ~")
+            publisher.publish_command_edit(False)
+            packets = [
+                json.loads(receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES).decode("ascii"))
+                for _ in range(3)
+            ]
+            self.assertEqual(
+                set(packets[0]),
+                {"version", "session", "sequence", "kind", "active"},
+            )
+            self.assertEqual(packets[0]["kind"], "command_edit")
+            self.assertIs(packets[0]["active"], True)
+            self.assertEqual(
+                set(packets[1]),
+                {"version", "session", "sequence", "kind", "command"},
+            )
+            self.assertEqual(packets[1]["kind"], "command_submit")
+            self.assertEqual(packets[1]["command"], "/tp @s ~ ~ ~")
+            self.assertEqual([packet["sequence"] for packet in packets], [1, 2, 3])
+            with self.assertRaisesRegex(ValueError, "printable ASCII"):
+                publisher.publish_command_submit("/tp @s 1 2 3\n")
+            with self.assertRaisesRegex(ValueError, "printable ASCII"):
+                publisher.publish_command_submit("x" * (MODULE.MAX_COMMAND_CHARS + 1))
+            with self.assertRaisesRegex(ValueError, "boolean"):
+                publisher.publish_command_edit(1)
+        finally:
+            publisher.close()
+            receiver.close()
+
+
+class CommandLineEditorTest(unittest.TestCase):
+    @staticmethod
+    def status(**overrides):
+        values = {
+            "available": True,
+            "provider_editing": False,
+            "in_flight": False,
+            "status": "idle",
+            "request_id": None,
+            "sequence": None,
+            "result_revision": 0,
+            "ok": None,
+            "code": None,
+            "message": None,
+            "warning": None,
+            "restart_required": False,
+            "outcome_unknown": False,
+        }
+        values.update(overrides)
+        return MODULE.CommandConsoleStatus(**values)
+
+    @staticmethod
+    def key(editor, keysym=0, printable="", status=None):
+        return editor.handle_key(
+            keysym=keysym,
+            printable=printable,
+            status=status or CommandLineEditorTest.status(),
+        )
+
+    def test_bounded_ascii_cursor_and_delete_editing(self) -> None:
+        editor = MODULE.CommandLineEditor()
+        self.assertTrue(editor.begin())
+        self.key(editor, printable="abcd")
+        self.key(editor, MODULE._XK_LEFT)
+        self.key(editor, MODULE._XK_LEFT)
+        self.key(editor, MODULE._XK_BACK_SPACE)
+        self.assertEqual((editor.text, editor.cursor), ("acd", 1))
+        self.key(editor, MODULE._XK_DELETE)
+        self.assertEqual((editor.text, editor.cursor), ("ad", 1))
+        self.key(editor, MODULE._XK_HOME)
+        self.key(editor, printable="/")
+        self.key(editor, MODULE._XK_END)
+        self.key(editor, printable=" " + "x" * 600)
+        self.assertEqual(len(editor.text), MODULE.MAX_COMMAND_CHARS)
+        before = editor.text
+        self.key(editor, printable="é")
+        self.assertEqual(editor.text, before)
+
+    def test_history_pending_single_submit_and_escape_gate(self) -> None:
+        editor = MODULE.CommandLineEditor()
+        idle = self.status()
+        editor.begin()
+        self.key(editor, printable="/tp @s 1 2 3")
+        submitted = self.key(editor, MODULE._XK_RETURN, status=idle)
+        self.assertEqual(submitted.command, "/tp @s 1 2 3")
+        self.assertTrue(editor.pending)
+        self.assertEqual(editor.history, ["/tp @s 1 2 3"])
+        self.assertIsNone(self.key(editor, MODULE._XK_RETURN).action)
+        self.assertIsNone(self.key(editor, MODULE._XK_ESCAPE).action)
+        self.assertTrue(editor.editing)
+
+        success = self.status(
+            status="success",
+            request_id="cmd-" + "1" * 32,
+            sequence=1,
+            result_revision=1,
+            ok=True,
+            code="OK_TELEPORT",
+            message="done",
+        )
+        self.assertTrue(editor.reconcile(success))
+        self.assertFalse(editor.pending)
+        ended = self.key(editor, MODULE._XK_ESCAPE, status=success)
+        self.assertEqual(ended.action, "end")
+        self.assertFalse(editor.editing)
+
+        editor.begin()
+        self.key(editor, printable="draft")
+        self.key(editor, MODULE._XK_UP)
+        self.assertEqual(editor.text, "/tp @s 1 2 3")
+        self.key(editor, MODULE._XK_DOWN)
+        self.assertEqual(editor.text, "draft")
+
+    def test_repeated_identical_error_uses_result_revision_to_clear_pending(self) -> None:
+        prior = self.status(
+            status="error",
+            result_revision=4,
+            ok=False,
+            code="E_COMMAND_UNKNOWN",
+            message="supported commands are /summon and /tp",
+        )
+        editor = MODULE.CommandLineEditor()
+        editor.begin()
+        self.key(editor, printable="bad")
+        self.assertEqual(
+            self.key(editor, MODULE._XK_RETURN, status=prior).action,
+            "submit",
+        )
+        repeated = self.status(
+            status="error",
+            result_revision=5,
+            ok=False,
+            code=prior.code,
+            message=prior.message,
+        )
+        self.assertTrue(editor.reconcile(repeated))
+        self.assertFalse(editor.pending)
+
+
+class KeyboardGrabLifecycleTest(unittest.TestCase):
+    @staticmethod
+    def overlay(*, visible=True, grab_result=MODULE._GRAB_SUCCESS):
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._x11.XGrabKeyboard.return_value = grab_result
+        overlay._display = 1
+        overlay._windows = {"panel": 2}
+        overlay._visible = visible
+        overlay._cursor_visible = False
+        overlay._keyboard_grabbed = False
+        overlay._deferred_ungrab_keycode = None
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._last_command_status = CommandLineEditorTest.status()
+        overlay._last_layout = None
+        overlay._last_geometry = None
+        overlay._last_panel_model = None
+        overlay._last_command_revision = -1
+        overlay._last_pointer = None
+        overlay._last_raise_s = None
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        return overlay
+
+    def test_grab_exists_only_during_visible_edit_and_hide_releases(self) -> None:
+        publisher = mock.Mock()
+        overlay = self.overlay()
+        self.assertTrue(overlay._begin_command_editing(publisher))
+        self.assertTrue(overlay._keyboard_grabbed)
+        publisher.publish_command_edit.assert_called_once_with(True)
+        overlay._deferred_ungrab_keycode = 42
+        overlay.hide(publisher)
+        self.assertFalse(overlay._keyboard_grabbed)
+        self.assertIsNone(overlay._deferred_ungrab_keycode)
+        self.assertFalse(overlay._command_editor.editing)
+        publisher.publish_command_edit.assert_has_calls([mock.call(True), mock.call(False)])
+        overlay._x11.XUngrabKeyboard.assert_called_once_with(1, MODULE._CURRENT_TIME)
+
+        hidden = self.overlay(visible=False)
+        with self.assertRaisesRegex(RuntimeError, "hidden"):
+            hidden._grab_keyboard()
+        hidden._x11.XGrabKeyboard.assert_not_called()
+
+    def test_failed_begin_and_close_both_fail_safe_to_ungrabbed(self) -> None:
+        publisher = mock.Mock()
+        failed = self.overlay(grab_result=1)
+        with self.assertRaisesRegex(RuntimeError, "X11 status 1"):
+            failed._begin_command_editing(publisher)
+        self.assertFalse(failed._keyboard_grabbed)
+        self.assertFalse(failed._command_editor.editing)
+        publisher.publish_command_edit.assert_not_called()
+
+        closing = self.overlay()
+        closing._keyboard_grabbed = True
+        closing._deferred_ungrab_keycode = 42
+        closing._command_editor.begin()
+        closing._panel_gc = None
+        closing._body_font = None
+        closing._large_font = None
+        closing.close()
+        self.assertFalse(closing._keyboard_grabbed)
+        self.assertIsNone(closing._deferred_ungrab_keycode)
+        calls = closing._x11.method_calls
+        self.assertLess(
+            calls.index(mock.call.XUngrabKeyboard(1, MODULE._CURRENT_TIME)),
+            calls.index(mock.call.XCloseDisplay(1)),
+        )
+
+    def test_escape_keeps_grab_until_physical_release(self) -> None:
+        overlay = self.overlay()
+        overlay._deferred_ungrab_keycode = None
+        overlay._command_editor.begin()
+        overlay._keyboard_grabbed = True
+        overlay._lookup_key = lambda _event: (MODULE._XK_ESCAPE, "")
+        publisher = mock.Mock()
+        event = MODULE.XKeyEvent()
+        event.keycode = 42
+
+        self.assertEqual(overlay._handle_key_press(event, publisher), 1)
+        publisher.publish_command_edit.assert_called_once_with(False)
+        self.assertTrue(overlay._keyboard_grabbed)
+        self.assertEqual(overlay._deferred_ungrab_keycode, 42)
+
+        overlay._release_key_is_still_down = mock.Mock(return_value=True)
+        overlay._handle_key_release(event)
+        self.assertTrue(overlay._keyboard_grabbed)
+        overlay._release_key_is_still_down.return_value = False
+        overlay._handle_key_release(event)
+        self.assertFalse(overlay._keyboard_grabbed)
+        self.assertIsNone(overlay._deferred_ungrab_keycode)
+
+    def test_deferred_escape_release_blocks_click_reentry(self) -> None:
+        overlay = self.overlay()
+        publisher = mock.Mock()
+        self.assertTrue(overlay._begin_command_editing(publisher))
+        overlay._lookup_key = lambda _event: (MODULE._XK_ESCAPE, "")
+        event = MODULE.XKeyEvent()
+        event.keycode = 42
+        self.assertEqual(overlay._handle_key_press(event, publisher), 1)
+        self.assertFalse(overlay._command_editor.editing)
+        self.assertTrue(overlay._keyboard_grabbed)
+        self.assertEqual(overlay._deferred_ungrab_keycode, 42)
+
+        # Pointer input remains live during a keyboard grab.  A click on the
+        # command field must not create editing=true on top of the old grab.
+        self.assertFalse(overlay._begin_command_editing(publisher))
+        self.assertFalse(overlay._command_editor.editing)
+        self.assertEqual(
+            publisher.publish_command_edit.call_args_list,
+            [mock.call(True), mock.call(False)],
+        )
+
+        overlay._release_key_is_still_down = mock.Mock(return_value=False)
+        overlay._handle_key_release(event)
+        self.assertFalse(overlay._keyboard_grabbed)
+        self.assertIsNone(overlay._deferred_ungrab_keycode)
+        self.assertTrue(overlay._begin_command_editing(publisher))
+        self.assertTrue(overlay._command_editor.editing)
+        self.assertTrue(overlay._keyboard_grabbed)
+        self.assertEqual(
+            publisher.publish_command_edit.call_args_list,
+            [mock.call(True), mock.call(False), mock.call(True)],
+        )
+
+    def test_pending_or_restart_provider_state_blocks_click_reentry(self) -> None:
+        publisher = mock.Mock()
+        blocked_states = (
+            CommandLineEditorTest.status(in_flight=True, status="pending"),
+            CommandLineEditorTest.status(status="pending"),
+            CommandLineEditorTest.status(
+                status="restarting", restart_required=True
+            ),
+            CommandLineEditorTest.status(
+                status="error",
+                code="E_COMMAND_OUTCOME_UNKNOWN",
+                outcome_unknown=True,
+            ),
+        )
+        for status in blocked_states:
+            with self.subTest(status=status.status, in_flight=status.in_flight):
+                overlay = self.overlay()
+                overlay._last_command_status = status
+                self.assertFalse(overlay._begin_command_editing(publisher))
+                self.assertFalse(overlay._command_editor.editing)
+                self.assertFalse(overlay._keyboard_grabbed)
+        publisher.publish_command_edit.assert_not_called()
+        publisher.reset_mock()
+
+        ready = self.overlay()
+        ready._last_command_status = CommandLineEditorTest.status(status="success")
+        self.assertTrue(ready._begin_command_editing(publisher))
+        publisher.publish_command_edit.assert_called_once_with(True)
 
 
 class OverlayRenderCacheTest(unittest.TestCase):
@@ -411,6 +771,12 @@ class OverlayRenderCacheTest(unittest.TestCase):
                 "pending_restart": scale != 0.5,
             },
             "restart": {"available": True, "requested": False},
+            "command_console": {
+                "available": True,
+                "editing": False,
+                "in_flight": False,
+                "status": "idle",
+            },
         }
 
     def make_overlay(self):
@@ -426,10 +792,14 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay._last_layout = None
         overlay._last_geometry = None
         overlay._last_panel_model = None
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._last_command_status = MODULE.command_console_status({})
+        overlay._last_command_revision = -1
         overlay._last_pointer = None
         overlay._last_raise_s = None
         overlay._pressed_action = None
         overlay._pressed_window = None
+        overlay._keyboard_grabbed = False
         overlay._draw_panel = mock.Mock()
         return overlay
 
@@ -676,6 +1046,8 @@ class X11IntegrationTest(unittest.TestCase):
                     "800x600+100+80",
                     "-event",
                     "button",
+                    "-event",
+                    "keyboard",
                 ],
                 env=environment,
                 stdout=subprocess.PIPE,
@@ -728,6 +1100,21 @@ class X11IntegrationTest(unittest.TestCase):
                             "pending_restart": False,
                         },
                         "restart": {"available": True, "requested": False},
+                        "command_console": {
+                            "available": True,
+                            "editing": False,
+                            "in_flight": False,
+                            "status": "idle",
+                            "request_id": None,
+                            "sequence": 0,
+                            "result_revision": 0,
+                            "ok": None,
+                            "code": None,
+                            "message": None,
+                            "warning": None,
+                            "restart_required": False,
+                            "data": None,
+                        },
                     },
                 )
                 action_receiver, action_sender = socket.socketpair(
@@ -856,7 +1243,11 @@ class X11IntegrationTest(unittest.TestCase):
 
                 def pointer_action():
                     try:
-                        return json.loads(action_receiver.recv(1024).decode("ascii"))
+                        return json.loads(
+                            action_receiver.recv(
+                                MODULE._MAX_INTENT_PACKET_BYTES
+                            ).decode("ascii")
+                        )
                     except BlockingIOError:
                         return None
 
@@ -873,7 +1264,105 @@ class X11IntegrationTest(unittest.TestCase):
                 def assert_no_pointer_action() -> None:
                     assert action_receiver is not None
                     with self.assertRaises(BlockingIOError):
-                        action_receiver.recv(1024)
+                        action_receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES)
+
+                # Clicking the command line is the only keyboard-grab entry.
+                # Focus remains on UE, but all typed keys are delivered to the
+                # overlay until its first Escape ends editing.
+                read_target_events()
+                target_events.clear()
+                command_input = layout["command_input"]
+                command_point = (
+                    command_input[0] + command_input[2] // 2,
+                    command_input[1] + command_input[3] // 2,
+                )
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(command_point[0]),
+                    str(command_point[1]),
+                    "click",
+                    "1",
+                )
+                begin_edit = self.wait_until(pointer_action)
+                self.assertEqual(begin_edit["kind"], "command_edit")
+                self.assertIs(begin_edit["active"], True)
+                self.assertEqual(
+                    self.run_x11(environment, "xdotool", "getwindowfocus").strip(),
+                    focus_before,
+                )
+
+                command_text = "/tp @s 1 2 3"
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "type",
+                    "--delay",
+                    "1",
+                    command_text,
+                )
+                self.run_x11(environment, "xdotool", "key", "Return")
+                submitted = self.wait_until(pointer_action)
+                self.assertEqual(submitted["kind"], "command_submit")
+                self.assertEqual(submitted["command"], command_text)
+                time.sleep(0.08)
+                self.assertNotIn(b"KeyPress event", read_target_events())
+
+                # The local pending latch suppresses key-repeat/second submit
+                # and Escape until a distinct terminal provider result appears.
+                self.run_x11(environment, "xdotool", "key", "Return")
+                self.run_x11(environment, "xdotool", "key", "Escape")
+                time.sleep(0.08)
+                assert_no_pointer_action()
+                terminal = json.loads(state.read_text(encoding="utf-8"))
+                terminal["command_console"] = {
+                    "available": True,
+                    "editing": True,
+                    "in_flight": False,
+                    "status": "success",
+                    "request_id": "cmd-" + "1" * 32,
+                    "sequence": 1,
+                    "result_revision": 1,
+                    "ok": True,
+                    "code": "OK_SUMMONED",
+                    "message": "Command completed",
+                    "warning": "已兼容执行；标准命令是 /summon",
+                    "restart_required": False,
+                    "data": None,
+                }
+                MODULE.atomic_json(state, terminal)
+                time.sleep(0.12)
+                self.run_x11(environment, "xdotool", "keydown", "Escape")
+                end_edit = self.wait_until(pointer_action)
+                self.assertEqual(end_edit["kind"], "command_edit")
+                self.assertIs(end_edit["active"], False)
+
+                # Pointer input remains live during the deferred Escape grab.
+                # Clicking the command field before keyup must not re-enter;
+                # otherwise the old release would ungrab a new editor session.
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(command_point[0]),
+                    str(command_point[1]),
+                    "click",
+                    "1",
+                )
+                time.sleep(0.08)
+                assert_no_pointer_action()
+                self.run_x11(environment, "xdotool", "keyup", "Escape")
+                time.sleep(0.08)
+
+                # Active keyboard grabs do not change X focus.  Once editing
+                # ends, the next key reaches the still-focused target again.
+                read_target_events()
+                target_events.clear()
+                self.run_x11(environment, "xdotool", "key", "m")
+                self.wait_until(lambda: b"KeyPress event" in read_target_events())
 
                 # A non-button part of the visible panel consumes the click but
                 # emits no provider action and never reaches the UE target.
