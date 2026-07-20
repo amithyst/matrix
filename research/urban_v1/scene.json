@@ -13,7 +13,15 @@
   },
   "physics_source": {
     "mujoco_scene": "scene_terrain_t10.xml",
-    "environment_geom_count": 869,
+    "native_environment_geom_count": 869,
+    "environment_geom_count": 865,
+    "scene_transform": "town10-open-boundary-v1",
+    "removed_environment_geoms": [
+      "ps_Cube",
+      "ps_Cube2",
+      "ps_Cube3",
+      "ps_Cube4"
+    ],
     "dynamic_environment_body_count": 0,
     "robot_physics": "canonical SONIC G1 29-DOF model"
   },

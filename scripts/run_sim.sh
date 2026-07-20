@@ -1334,12 +1334,20 @@ if $MATRIX_SONIC_ENABLED; then
         exit 1
     fi
     mkdir -p "$PROJECT_ROOT/outputs/logs"
+    SONIC_SCENE_TRANSFORM_ARGS=()
+    if [[ "$SCENE" == "scene_terrain_t10.xml" ]]; then
+        SONIC_SCENE_TRANSFORM_ARGS+=(
+            --scene-transform town10-open-boundary-v1
+        )
+        echo "[INFO] Town10 perimeter collision walls removed in derived physics scene"
+    fi
     SONIC_PHYSICS_DIR="${MATRIX_SONIC_PHYSICS_DIR:-$PROJECT_ROOT/outputs/runtime/matrix_sonic/$CUSTOM_NAME/${SCENE%.xml}}"
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
         --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
         --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES" \
         --native-scene "$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/xgb/$SCENE" \
-        --output-dir "$SONIC_PHYSICS_DIR"
+        --output-dir "$SONIC_PHYSICS_DIR" \
+        "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
     GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"

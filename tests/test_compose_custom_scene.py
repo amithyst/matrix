@@ -48,6 +48,46 @@ class ComposeCustomSceneTest(unittest.TestCase):
             self.assertEqual((custom / "height.png").read_bytes(), b"height")
             self.assertEqual(len(copied), 2)
 
+    def test_removes_only_exact_requested_geoms_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            native = root / "xgb"
+            native.mkdir()
+            source = native / "scene.xml"
+            source.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<geom name="floor" type="plane" />
+<geom name="perimeter" type="box" size="5 0.1 1" />
+<geom name="building" type="box" size="1 1 1" />
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+            output = root / "custom" / "scene.xml"
+
+            MODULE.compose_custom_scene(
+                source, output, remove_geoms=("perimeter",)
+            )
+            names = [
+                geom.get("name")
+                for geom in ET.parse(output).getroot().iter("geom")
+            ]
+            self.assertEqual(names, ["floor", "building"])
+
+            with self.assertRaisesRegex(
+                MODULE.SceneCompositionError, "missing requested geoms"
+            ):
+                MODULE.compose_custom_scene(
+                    source, root / "missing.xml", remove_geoms=("missing",)
+                )
+            with self.assertRaisesRegex(
+                MODULE.SceneCompositionError, "must not contain duplicates"
+            ):
+                MODULE.compose_custom_scene(
+                    source,
+                    root / "duplicate.xml",
+                    remove_geoms=("perimeter", "perimeter"),
+                )
+
     def test_rejects_asset_collision_with_custom_robot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

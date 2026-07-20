@@ -82,6 +82,42 @@ def _copy_scene_assets(
     return copied
 
 
+def _remove_named_geoms(
+    root: ET.Element, *, remove_geoms: tuple[str, ...]
+) -> tuple[str, ...]:
+    if not remove_geoms:
+        return ()
+    if any(not name for name in remove_geoms):
+        raise SceneCompositionError("removed geom names must be non-empty")
+    if len(set(remove_geoms)) != len(remove_geoms):
+        raise SceneCompositionError("removed geom names must not contain duplicates")
+
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise SceneCompositionError("native scene has no worldbody")
+    requested = set(remove_geoms)
+    removed: set[str] = set()
+    for parent in worldbody.iter():
+        for child in list(parent):
+            if child.tag != "geom" or child.get("name") not in requested:
+                continue
+            name = child.get("name")
+            assert name is not None
+            if name in removed:
+                raise SceneCompositionError(
+                    f"native scene contains duplicate requested geom: {name}"
+                )
+            parent.remove(child)
+            removed.add(name)
+
+    missing = [name for name in remove_geoms if name not in removed]
+    if missing:
+        raise SceneCompositionError(
+            f"native scene is missing requested geoms: {', '.join(missing)}"
+        )
+    return tuple(name for name in remove_geoms if name in removed)
+
+
 def compose_custom_scene(
     source_scene: Path,
     output_scene: Path,
@@ -89,6 +125,7 @@ def compose_custom_scene(
     robot_include: str = "current.xml",
     source_asset_root: Path | None = None,
     target_asset_root: Path | None = None,
+    remove_geoms: tuple[str, ...] = (),
 ) -> list[Path]:
     source_scene = source_scene.resolve()
     output_scene = output_scene.resolve()
@@ -115,6 +152,12 @@ def compose_custom_scene(
             f"native scene must have exactly one top-level robot include, got {len(includes)}"
         )
     includes[0].set("file", robot_include)
+    removed = _remove_named_geoms(root, remove_geoms=remove_geoms)
+    if removed:
+        root.insert(
+            0,
+            ET.Comment(f" removed environment geoms: {','.join(removed)} "),
+        )
     root.set("model", f"custom::{source_scene.stem}")
     root.insert(
         0,
@@ -162,6 +205,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--robot-include", default="current.xml")
     parser.add_argument("--source-asset-root", type=Path)
     parser.add_argument("--target-asset-root", type=Path)
+    parser.add_argument("--remove-geom", action="append", default=[])
     return parser.parse_args()
 
 
@@ -174,6 +218,7 @@ def main() -> int:
             robot_include=args.robot_include,
             source_asset_root=args.source_asset_root,
             target_asset_root=args.target_asset_root,
+            remove_geoms=tuple(args.remove_geom),
         )
     except SceneCompositionError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc

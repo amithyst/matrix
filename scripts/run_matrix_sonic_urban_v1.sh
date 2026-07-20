@@ -11,7 +11,8 @@ for argument in "$@"; do
 done
 
 echo "[INFO] urban-v1 visual map: Matrix native Town10World (scene 2)"
-echo "[INFO] urban-v1 physics: 869 static native environment geoms plus SONIC G1"
+echo "[INFO] urban-v1 physics: 865 static environment geoms plus SONIC G1"
+echo "[INFO] urban-v1 open boundary: removed 4 perimeter walls; infinite floor retained"
 echo "[WARN] Native people and vehicles are UE presentation assets, not dynamic MuJoCo actors."
 
 exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 2 "$@"

@@ -20,7 +20,40 @@ if str(SCRIPT_DIR) not in sys.path:
 from compose_custom_scene import compose_custom_scene  # noqa: E402
 
 
-PIPELINE_VERSION = 3
+PIPELINE_VERSION = 4
+SCENE_TRANSFORM_NONE = "none"
+TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
+TOWN10_SOURCE_SCENE_SHA256 = (
+    "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
+)
+TOWN10_PERIMETER_WALL_NAMES = (
+    "ps_Cube",
+    "ps_Cube2",
+    "ps_Cube3",
+    "ps_Cube4",
+)
+TOWN10_PERIMETER_WALL_CONTRACT = {
+    "ps_Cube": {
+        "size": (125.0, 0.05, 1.5),
+        "pos": (0.9, 72.6, 1.5),
+        "quat": (1.0, 0.0, 0.0, 0.0),
+    },
+    "ps_Cube2": {
+        "size": (125.0, 0.05, 1.5),
+        "pos": (0.9, -125.7, 1.5),
+        "quat": (1.0, 0.0, 0.0, 0.0),
+    },
+    "ps_Cube3": {
+        "size": (125.0, 0.05, 1.5),
+        "pos": (104.4, -21.6, 1.5),
+        "quat": (0.707107, 0.0, 0.0, -0.707107),
+    },
+    "ps_Cube4": {
+        "size": (125.0, 0.05, 1.5),
+        "pos": (-109.0, -21.6, 1.5),
+        "quat": (0.707107, 0.0, 0.0, -0.707107),
+    },
+}
 G1_BODY_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -96,6 +129,111 @@ def _bundle_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _float_vector(
+    element: ET.Element, attribute: str, *, length: int, default: str | None = None
+) -> tuple[float, ...]:
+    raw = element.get(attribute, default)
+    if raw is None:
+        raise SonicPhysicsModelError(
+            f"geom {element.get('name')!r} is missing {attribute}"
+        )
+    try:
+        values = tuple(float(value) for value in raw.split())
+    except ValueError as exc:
+        raise SonicPhysicsModelError(
+            f"geom {element.get('name')!r} has invalid {attribute}: {raw!r}"
+        ) from exc
+    if len(values) != length or not all(math.isfinite(value) for value in values):
+        raise SonicPhysicsModelError(
+            f"geom {element.get('name')!r} has invalid {attribute}: {raw!r}"
+        )
+    return values
+
+
+def _vectors_equal(
+    actual: tuple[float, ...], expected: tuple[float, ...]
+) -> bool:
+    return len(actual) == len(expected) and all(
+        math.isclose(left, right, rel_tol=0.0, abs_tol=1e-9)
+        for left, right in zip(actual, expected)
+    )
+
+
+def _scene_transform_removals(
+    native_scene: Path, scene_transform: str | None
+) -> tuple[str, tuple[str, ...]]:
+    transform = scene_transform or SCENE_TRANSFORM_NONE
+    if transform == SCENE_TRANSFORM_NONE:
+        return transform, ()
+    if transform != TOWN10_OPEN_BOUNDARY_TRANSFORM:
+        raise SonicPhysicsModelError(f"unsupported scene transform: {transform}")
+    if native_scene.name != "scene_terrain_t10.xml":
+        raise SonicPhysicsModelError(
+            f"{transform} requires scene_terrain_t10.xml, got {native_scene.name}"
+        )
+    actual_sha256 = _file_sha256(native_scene)
+    if actual_sha256 != TOWN10_SOURCE_SCENE_SHA256:
+        raise SonicPhysicsModelError(
+            f"{transform} source SHA drift: expected={TOWN10_SOURCE_SCENE_SHA256} "
+            f"actual={actual_sha256}"
+        )
+    try:
+        root = ET.parse(native_scene).getroot()
+    except ET.ParseError as exc:
+        raise SonicPhysicsModelError(
+            f"invalid Matrix native scene {native_scene}: {exc}"
+        ) from exc
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise SonicPhysicsModelError("Town10 native scene has no worldbody")
+    geoms_by_name: dict[str, list[ET.Element]] = {}
+    for geom in worldbody.iter("geom"):
+        name = geom.get("name")
+        if name:
+            geoms_by_name.setdefault(name, []).append(geom)
+
+    floors = geoms_by_name.get("floor", [])
+    if len(floors) != 1:
+        raise SonicPhysicsModelError("Town10 must retain exactly one floor geom")
+    floor = floors[0]
+    if (
+        floor.get("type") != "plane"
+        or not _vectors_equal(
+            _float_vector(floor, "size", length=3), (0.0, 0.0, 0.01)
+        )
+        or floor.get("contype", "1") != "1"
+        or floor.get("conaffinity", "1") != "1"
+    ):
+        raise SonicPhysicsModelError("Town10 floor collision contract drifted")
+
+    for name in TOWN10_PERIMETER_WALL_NAMES:
+        matches = geoms_by_name.get(name, [])
+        if len(matches) != 1:
+            raise SonicPhysicsModelError(
+                f"Town10 perimeter geom {name} count drifted: {len(matches)}"
+            )
+        geom = matches[0]
+        expected = TOWN10_PERIMETER_WALL_CONTRACT[name]
+        if (
+            geom.get("type") != "box"
+            or not _vectors_equal(
+                _float_vector(geom, "size", length=3), expected["size"]
+            )
+            or not _vectors_equal(
+                _float_vector(geom, "pos", length=3), expected["pos"]
+            )
+            or not _vectors_equal(
+                _float_vector(geom, "quat", length=4), expected["quat"]
+            )
+            or geom.get("contype", "1") != "1"
+            or geom.get("conaffinity", "1") != "1"
+        ):
+            raise SonicPhysicsModelError(
+                f"Town10 perimeter geom {name} collision contract drifted"
+            )
+    return transform, TOWN10_PERIMETER_WALL_NAMES
+
+
 def _native_scene_asset_inventory(native_scene: Path) -> list[dict[str, object]]:
     """Resolve every native scene file input, including assets/../ siblings."""
     try:
@@ -147,6 +285,8 @@ def _source_contract(
     body_joint_names: tuple[str, ...],
     spawn_xyz: tuple[float, float, float] | None,
     spawn_yaw: float | None,
+    scene_transform: str,
+    removed_environment_geoms: tuple[str, ...],
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
     return {
@@ -165,6 +305,8 @@ def _source_contract(
         "body_joint_names": list(body_joint_names),
         "spawn_xyz": list(spawn_xyz) if spawn_xyz is not None else None,
         "spawn_yaw_rad": spawn_yaw,
+        "scene_transform": scene_transform,
+        "removed_environment_geoms": list(removed_environment_geoms),
     }
 
 
@@ -305,6 +447,7 @@ def prepare_sonic_physics_model(
     body_joint_names: tuple[str, ...] = G1_BODY_JOINT_NAMES,
     spawn_xyz: tuple[float, float, float] | None = None,
     spawn_yaw: float | None = None,
+    scene_transform: str | None = None,
 ) -> Path:
     canonical_model = canonical_model.resolve()
     canonical_meshes = canonical_meshes.resolve()
@@ -331,6 +474,9 @@ def prepare_sonic_physics_model(
         else None
     )
     normalized_spawn_yaw = float(spawn_yaw) if spawn_yaw is not None else None
+    normalized_scene_transform, removed_environment_geoms = (
+        _scene_transform_removals(native_scene, scene_transform)
+    )
 
     contract = _source_contract(
         canonical_model,
@@ -339,6 +485,8 @@ def prepare_sonic_physics_model(
         body_joint_names=body_joint_names,
         spawn_xyz=normalized_spawn_xyz,
         spawn_yaw=normalized_spawn_yaw,
+        scene_transform=normalized_scene_transform,
+        removed_environment_geoms=removed_environment_geoms,
     )
     manifest_path = output_dir / "manifest.json"
     scene_path = output_dir / native_scene.name
@@ -392,6 +540,7 @@ def prepare_sonic_physics_model(
             robot_include="robot.xml",
             source_asset_root=native_scene.parent / "assets",
             target_asset_root=temporary_dir / "meshes",
+            remove_geoms=removed_environment_geoms,
         )
         contract["body_joint_names"] = list(body_joint_names)
         contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")
@@ -423,6 +572,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--spawn-y", type=float)
     parser.add_argument("--spawn-z", type=float)
     parser.add_argument("--spawn-yaw", type=float)
+    parser.add_argument(
+        "--scene-transform",
+        choices=(SCENE_TRANSFORM_NONE, TOWN10_OPEN_BOUNDARY_TRANSFORM),
+        default=SCENE_TRANSFORM_NONE,
+    )
     return parser.parse_args()
 
 
@@ -446,6 +600,7 @@ def main() -> int:
             args.output_dir,
             spawn_xyz=spawn_xyz,
             spawn_yaw=args.spawn_yaw,
+            scene_transform=args.scene_transform,
         )
     except SonicPhysicsModelError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc
