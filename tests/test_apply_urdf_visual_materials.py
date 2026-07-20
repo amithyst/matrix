@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
-import re
 import sys
 import tempfile
 import unittest
@@ -160,7 +160,7 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
 
             summary = MODULE.apply_urdf_visual_materials(urdf, mjcf)
 
-            self.assertEqual(summary.profile_id, "matrix_g1_v2")
+            self.assertEqual(summary.profile_id, "matrix_g1_stock_v1")
             self.assertEqual(summary.source_styles, 4)
             self.assertEqual(summary.styled_geoms, len(PROFILE_LINKS))
             self.assertEqual(summary.styled_collision_geoms, len(PROFILE_LINKS))
@@ -181,12 +181,12 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
                 "left_hip_pitch_link": ("0.055 0.075 0.11 1", "0.58"),
                 "head_link": ("0.055 0.075 0.11 1", "0.58"),
                 "torso_link": ("0.9 0.94 1 1", "0.48"),
-                "pelvis_contour_link": ("0.015 0.2 0.95 1", "0.42"),
-                "left_hip_yaw_link": ("0.015 0.2 0.95 1", "0.42"),
-                "left_knee_link": ("0.015 0.2 0.95 1", "0.42"),
-                "logo_link": ("0.015 0.2 0.95 1", "0.42"),
-                "left_shoulder_roll_link": ("0.015 0.2 0.95 1", "0.42"),
-                "left_elbow_link": ("0.015 0.2 0.95 1", "0.42"),
+                "pelvis_contour_link": ("0.42 0.42 0.42 1", "0.38"),
+                "left_hip_yaw_link": ("0.42 0.42 0.42 1", "0.38"),
+                "left_knee_link": ("0.42 0.42 0.42 1", "0.38"),
+                "logo_link": ("0.42 0.42 0.42 1", "0.38"),
+                "left_shoulder_roll_link": ("0.42 0.42 0.42 1", "0.38"),
+                "left_elbow_link": ("0.42 0.42 0.42 1", "0.38"),
             }
             for body_name, (rgba, roughness) in expected.items():
                 body = body_by_name[body_name]
@@ -198,7 +198,7 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
                 self.assertEqual(material.get("roughness"), roughness)
                 self.assertEqual(
                     material.get("metallic"),
-                    "0.08" if rgba == "0.015 0.2 0.95 1" else "0",
+                    "0.35" if rgba == "0.42 0.42 0.42 1" else "0",
                 )
                 collision = next(
                     geom
@@ -210,6 +210,54 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
                 self.assertEqual(collision.get("contype"), "1")
                 self.assertEqual(collision.get("conaffinity"), "1")
                 self.assertEqual(collision.get("density"), "12")
+
+    def test_matrix_blue_skin_remains_selectable(self) -> None:
+        selection = MODULE.resolve_g1_skin("matrix-blue")
+        self.assertEqual(selection.profile_id, "matrix_g1_v2")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            urdf = root / "g1_29dof.urdf"
+            mjcf = root / "g1_29dof.xml"
+            urdf.write_text(_profile_urdf(), encoding="utf-8")
+            mjcf.write_text(_profile_mjcf(), encoding="utf-8")
+
+            summary = MODULE.apply_urdf_visual_materials(
+                urdf,
+                mjcf,
+                profile_path=selection.profile_path,
+            )
+
+            self.assertEqual(summary.profile_id, "matrix_g1_v2")
+            body = next(
+                item
+                for item in ET.parse(mjcf).getroot().iter("body")
+                if item.get("name") == "left_knee_link"
+            )
+            self.assertEqual(body.find("geom").get("rgba"), "0.015 0.2 0.95 1")
+
+    def test_ue_scope_tag_marks_only_registered_g1_materials(self) -> None:
+        selection = MODULE.resolve_g1_skin()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            urdf = root / "g1_29dof.urdf"
+            mjcf = root / "g1_29dof.xml"
+            urdf.write_text(_profile_urdf(), encoding="utf-8")
+            mjcf.write_text(_profile_mjcf(), encoding="utf-8")
+
+            MODULE.apply_urdf_visual_materials(
+                urdf,
+                mjcf,
+                profile_path=selection.profile_path,
+                profile_scope_alpha=selection.ue_scope_alpha,
+            )
+
+            tagged = [
+                geom.get("rgba")
+                for geom in ET.parse(mjcf).getroot().iter("geom")
+            ]
+            self.assertTrue(
+                all(value.endswith(" 0.99609375") for value in tagged)
+            )
 
     def test_explicit_urdf_profile_disables_g1_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -231,38 +279,126 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
                 all(geom.get("rgba") == "0.7 0.7 0.7 1" for geom in visual_geoms)
             )
 
-    def test_ue_material_bridge_palette_matches_g1_profile(self) -> None:
-        profile = MODULE._load_profile(MODULE.DEFAULT_PROFILE_PATH)
-        materials = profile["materials"]
-        self.assertIsInstance(materials, dict)
-        expected_rgb = {
-            tuple(float(value) for value in material["rgba"][:3])
-            for material in materials.values()
-        }
+    def test_skin_registry_is_extensible_and_defaults_to_stock(self) -> None:
+        stock = MODULE.resolve_g1_skin()
+        blue = MODULE.resolve_g1_skin("matrix-blue")
+        self.assertEqual(stock.skin_id, "unitree-stock")
+        self.assertEqual(stock.profile_path, MODULE.DEFAULT_PROFILE_PATH)
+        self.assertEqual(stock.ue_colors[-1], (0.42, 0.42, 0.42))
+        self.assertEqual(blue.ue_colors[-1], (0.015, 0.2, 0.95))
+        self.assertEqual(
+            MODULE.resolve_g1_skin_for_profile("matrix_g1_v2").skin_id,
+            "matrix-blue",
+        )
+        with self.assertRaisesRegex(
+            MODULE.VisualMaterialError,
+            "not requested profile",
+        ):
+            MODULE._resolve_requested_skin(
+                "unitree-stock",
+                "matrix_g1_v2",
+                MODULE.DEFAULT_SKIN_REGISTRY_PATH,
+            )
+        with self.assertRaisesRegex(MODULE.VisualMaterialError, "available skins"):
+            MODULE.resolve_g1_skin("gold")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            profile = MODULE._load_profile(MODULE.DEFAULT_PROFILE_PATH)
+            profile["profile_id"] = "matrix_g1_gold_v1"
+            profile["materials"]["silver_gray_accent"]["rgba"] = [
+                0.75,
+                0.45,
+                0.05,
+                1.0,
+            ]
+            (root / "gold.json").write_text(
+                json.dumps(profile),
+                encoding="utf-8",
+            )
+            registry = {
+                "schema_version": 1,
+                "robot_id": "unitree_g1",
+                "default_skin": "gold",
+                "ue_scope_alpha": 0.99609375,
+                "skins": {
+                    "gold": {
+                        "label": "黄金",
+                        "profile": "gold.json",
+                    }
+                },
+            }
+            registry_path = root / "g1_skins.json"
+            registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+            gold = MODULE.resolve_g1_skin(registry_path=registry_path)
+
+            self.assertEqual(gold.skin_id, "gold")
+            self.assertEqual(gold.profile_id, "matrix_g1_gold_v1")
+            self.assertIn("0.75,0.45,0.05", gold.ue_palette)
+            self.assertEqual(gold.ue_scope_alpha, 0.99609375)
+
+            registry["ue_scope_alpha"] = 0.99999
+            registry_path.write_text(json.dumps(registry), encoding="utf-8")
+            with self.assertRaisesRegex(
+                MODULE.VisualMaterialError,
+                "0.999",
+            ):
+                MODULE.resolve_g1_skin(registry_path=registry_path)
+
+    def test_ue_material_bridge_consumes_selected_skin_palette(self) -> None:
         bridge = (
             REPO_ROOT / "src" / "ue_shims" / "matrix_ue_material_fix.c"
         ).read_text(encoding="utf-8")
-        observed_rgb = {
-            tuple(float(value) for value in match)
-            for match in re.findall(
-                r"\{([0-9.]+)f, ([0-9.]+)f, ([0-9.]+)f\}", bridge
-            )
-        }
 
-        self.assertEqual(observed_rgb, expected_rgb)
+        self.assertIn('getenv("MATRIX_G1_SKIN")', bridge)
+        self.assertIn('getenv("MATRIX_G1_MATERIAL_PALETTE")', bridge)
+        self.assertIn('getenv("MATRIX_G1_MATERIAL_SCOPE_ALPHA")', bridge)
+        self.assertIn("MAX_G1_PROFILE_COLORS = 16", bridge)
+        self.assertIn("g1_profile_colors", bridge)
+        self.assertIn("component_matches(color.alpha, g1_scope_alpha)", bridge)
+        self.assertIn("color.alpha = 1.0f", bridge)
         self.assertIn("if (material_index == -1)", bridge)
         self.assertIn("mapped G1 material profile ", bridge)
         self.assertIn("section to slot 0\\n", bridge)
 
     def test_default_profile_and_launcher_pipeline_contract(self) -> None:
-        self.assertEqual(MODULE.DEFAULT_PROFILE_PATH.name, "matrix_g1_v2.json")
+        self.assertEqual(
+            MODULE.DEFAULT_PROFILE_PATH.name,
+            "matrix_g1_stock_v1.json",
+        )
         launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn("PIPELINE_VERSION=18", launcher)
+        self.assertIn("--describe-skin", launcher)
+        self.assertIn("--ue-scope-tag", launcher)
+        self.assertIn(
+            'MATRIX_G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE"',
+            launcher,
+        )
+        self.assertIn(
+            'MATRIX_G1_MATERIAL_SCOPE_ALPHA="$G1_MATERIAL_SCOPE_ALPHA"',
+            launcher,
+        )
         self.assertIn(
             '"$SCRIPT_DIR/apply_urdf_visual_materials.py"',
             launcher,
+        )
+        outer = (REPO_ROOT / "scripts" / "run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--skin ID", outer)
+        self.assertIn('export MATRIX_G1_SKIN="$G1_SKIN"', outer)
+        inner = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertLess(
+            inner.index(
+                "unset MATRIX_G1_MATERIAL_PALETTE "
+                "MATRIX_G1_MATERIAL_SCOPE_ALPHA"
+            ),
+            inner.index("# 基础"),
         )
 
     def test_rejects_out_of_range_color(self) -> None:

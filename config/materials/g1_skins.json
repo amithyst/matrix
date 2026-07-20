@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "robot_id": "unitree_g1",
+  "default_skin": "unitree-stock",
+  "ue_scope_alpha": 0.99609375,
+  "skins": {
+    "unitree-stock": {
+      "label": "原厂银灰",
+      "profile": "matrix_g1_stock_v1.json",
+      "description": "Stock-inspired black, white, graphite, and Town10-compensated silver-gray appearance."
+    },
+    "matrix-blue": {
+      "label": "Matrix 冰蓝",
+      "profile": "matrix_g1_v2.json",
+      "description": "The previously validated high-contrast blue, black, and white Matrix appearance."
+    }
+  }
+}

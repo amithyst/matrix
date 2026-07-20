@@ -13,6 +13,8 @@ MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
 PIPELINE_VERSION=18
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
+G1_MATERIAL_PALETTE=""
+G1_MATERIAL_SCOPE_ALPHA=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_LAUNCHER_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -68,6 +70,38 @@ run_env_check() {
 }
 
 run_env_check
+
+resolve_g1_skin() {
+    local selection skin_id skin_label profile_id palette scope_alpha
+    if ! selection="$(
+        "$MATRIX_PYTHON" "$SCRIPT_DIR/apply_urdf_visual_materials.py" \
+            --describe-skin
+    )"; then
+        echo "[ERROR] Failed to resolve the configured G1 skin" >&2
+        return 1
+    fi
+    skin_id="$(jq -er '.skin_id' <<<"$selection")"
+    skin_label="$(jq -er '.label' <<<"$selection")"
+    profile_id="$(jq -er '.profile_id' <<<"$selection")"
+    palette="$(jq -er '.ue_palette' <<<"$selection")"
+    scope_alpha="$(jq -er '.ue_scope_alpha' <<<"$selection")"
+    if [[ -z "$skin_id" || -z "$profile_id" || -z "$palette" \
+        || -z "$scope_alpha" ]]; then
+        echo "[ERROR] G1 skin resolver returned an incomplete contract" >&2
+        return 1
+    fi
+    export MATRIX_G1_SKIN="$skin_id"
+    G1_MATERIAL_PALETTE="$palette"
+    G1_MATERIAL_SCOPE_ALPHA="$scope_alpha"
+    if [[ "${MATRIX_CUSTOM_MATERIAL_PROFILE:-auto}" == "urdf" ]]; then
+        echo "[INFO] G1 registered skin disabled by profile=urdf; " \
+            "UE scope repair is disabled"
+    else
+        echo "[INFO] G1 skin: $skin_id ($skin_label), profile=$profile_id"
+    fi
+}
+
+resolve_g1_skin
 
 MODEL_DIR="$MATRIX_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model"
 UE_CUSTOM_ROOT="$MODEL_DIR/custom"
@@ -748,9 +782,16 @@ sync_runtime_layout() {
         restore_urdf_fixed_links "$cache_urdf" "$active_xml"
         echo "[INFO] restoring generic runtime layout in: $active_xml"
         restore_generic_runtime_layout "$active_xml" "$cache_urdf"
-        "$MATRIX_PYTHON" "$SCRIPT_DIR/apply_urdf_visual_materials.py" \
-            --urdf "$cache_urdf" \
+        local -a material_arguments=(
+            --urdf "$cache_urdf"
             --mjcf "$active_xml"
+            --skin "$MATRIX_G1_SKIN"
+        )
+        if [[ "$active_root" == "$UE_CUSTOM_ROOT" ]]; then
+            material_arguments+=(--ue-scope-tag)
+        fi
+        "$MATRIX_PYTHON" "$SCRIPT_DIR/apply_urdf_visual_materials.py" \
+            "${material_arguments[@]}"
     fi
 
     write_scene_template "$active_scene_xml"
@@ -2114,4 +2155,8 @@ echo "[INFO] handing off to run_sim.sh with custom URDF: $CUSTOM_URDF_RELATIVE"
 # The second run_sim.sh invocation does not need the original URDF path anymore.
 # Passing it through can make the broad `pkill -f robot_mujoco` cleanup match this
 # launcher command line when the source path itself contains `/robot_mujoco/`.
-SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=1 exec "$RUN_SIM_SH" "custom" "$SCENE_ID" "$OFFSCREEN" "$PIXELSTREAM" "$MUJOCORUNNING" "" "$CUSTOM_NAME"
+MATRIX_G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE" \
+MATRIX_G1_MATERIAL_SCOPE_ALPHA="$G1_MATERIAL_SCOPE_ALPHA" \
+SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=1 \
+    exec "$RUN_SIM_SH" "custom" "$SCENE_ID" "$OFFSCREEN" "$PIXELSTREAM" \
+        "$MUJOCORUNNING" "" "$CUSTOM_NAME"

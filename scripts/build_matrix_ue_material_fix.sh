@@ -13,7 +13,9 @@ usage() {
 Usage: scripts/build_matrix_ue_material_fix.sh [--output ABSOLUTE_PATH]
 
 Build the guarded Matrix 0.1.2 UE material bridge used through
-MATRIX_UE_MATERIAL_FIX_PRELOAD.  The build refuses unknown UE executables.
+MATRIX_UE_MATERIAL_FIX_PRELOAD.  Launch through run_matrix_sonic.sh so the
+registered G1 skin palette and scope tag are supplied.  The build refuses
+unknown UE executables.
 EOF
 }
 
@@ -92,4 +94,5 @@ mv -f -- "$temporary" "$OUTPUT"
 trap - EXIT
 
 echo "[PASS] built Matrix UE material fix: $OUTPUT"
-echo "[INFO] enable only for UE with MATRIX_UE_MATERIAL_FIX_PRELOAD=$OUTPUT"
+echo "[INFO] use run_matrix_sonic.sh with MATRIX_UE_MATERIAL_FIX_PRELOAD=$OUTPUT"
+echo "[INFO] the launcher supplies the selected registered G1 skin contract"

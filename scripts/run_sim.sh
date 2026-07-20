@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT="${MATRIX_G1_MATERIAL_PALETTE:-}"
+MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT="${MATRIX_G1_MATERIAL_SCOPE_ALPHA:-}"
+unset MATRIX_G1_MATERIAL_PALETTE MATRIX_G1_MATERIAL_SCOPE_ALPHA
+
 #######################################
 # 基础
 #######################################
@@ -1187,7 +1191,26 @@ UE_COMMAND=(
 )
 UE_MATERIAL_FIX_PRELOAD="${MATRIX_UE_MATERIAL_FIX_PRELOAD:-}"
 UE_MATERIAL_FIX_BINARY=""
+UE_G1_SKIN="${MATRIX_G1_SKIN:-}"
+UE_G1_MATERIAL_PALETTE="$MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT"
+UE_G1_MATERIAL_SCOPE_ALPHA="$MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT"
+UE_G1_PALETTE_PATTERN='^[-0-9eE+.,;]+$'
+UE_G1_COMPONENT_PATTERN='^[-0-9eE+.]+$'
 if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
+    if [[ ! "$UE_G1_SKIN" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]; then
+        echo "[ERROR] MATRIX_G1_SKIN must name a registered skin" >&2
+        exit 1
+    fi
+    if [[ -z "$UE_G1_MATERIAL_PALETTE" \
+        || ! "$UE_G1_MATERIAL_PALETTE" =~ $UE_G1_PALETTE_PATTERN ]]; then
+        echo "[ERROR] MATRIX_G1_MATERIAL_PALETTE is missing or malformed" >&2
+        exit 1
+    fi
+    if [[ -z "$UE_G1_MATERIAL_SCOPE_ALPHA" \
+        || ! "$UE_G1_MATERIAL_SCOPE_ALPHA" =~ $UE_G1_COMPONENT_PATTERN ]]; then
+        echo "[ERROR] MATRIX_G1_MATERIAL_SCOPE_ALPHA is missing or malformed" >&2
+        exit 1
+    fi
     if [[ "$UE_MATERIAL_FIX_PRELOAD" != /* ]]; then
         echo "[ERROR] MATRIX_UE_MATERIAL_FIX_PRELOAD must be absolute" >&2
         exit 1
@@ -1198,7 +1221,12 @@ if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
         exit 1
     fi
     UE_MATERIAL_FIX_PRELOAD="$(realpath -- "$UE_MATERIAL_FIX_PRELOAD")"
-    UE_COMMAND+=("LD_PRELOAD=$UE_MATERIAL_FIX_PRELOAD")
+    UE_COMMAND+=(
+        "LD_PRELOAD=$UE_MATERIAL_FIX_PRELOAD"
+        "MATRIX_G1_SKIN=$UE_G1_SKIN"
+        "MATRIX_G1_MATERIAL_PALETTE=$UE_G1_MATERIAL_PALETTE"
+        "MATRIX_G1_MATERIAL_SCOPE_ALPHA=$UE_G1_MATERIAL_SCOPE_ALPHA"
+    )
     for candidate in \
         "$PWD/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue-Linux-Shipping" \
         "$PWD/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue-Linux-Development" \
@@ -1214,6 +1242,7 @@ if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
         exit 1
     fi
     echo "[INFO] Matrix UE material fix enabled: $UE_MATERIAL_FIX_PRELOAD"
+    echo "[INFO] Matrix UE material skin: $UE_G1_SKIN"
 fi
 UE_COMMAND+=(
     # Force SDL's raw relative-motion path.  These hints make the behavior

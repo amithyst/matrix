@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <link.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +54,9 @@ typedef void (*SetMeshColorFn)(
 enum {
     HOOK_PROLOGUE_SIZE = 12,
     TRAMPOLINE_SIZE = 4 + HOOK_PROLOGUE_SIZE + 5,
+    MAX_G1_PROFILE_COLORS = 16,
+    MAX_G1_PALETTE_LENGTH = 1024,
+    MAX_G1_SKIN_ID_LENGTH = 48,
 };
 
 static const uintptr_t SET_MESH_COLOR_ADDRESS = UINT64_C(0x1077c580);
@@ -105,6 +109,10 @@ static SetMeshColorFn original_set_mesh_color;
 static AddMaterialFn original_add_material;
 static unsigned int substituted_material_count;
 static unsigned int repaired_section_count;
+static float g1_profile_colors[MAX_G1_PROFILE_COLORS][3];
+static size_t g1_profile_color_count;
+static char g1_skin_id[MAX_G1_SKIN_ID_LENGTH + 1];
+static float g1_scope_alpha;
 
 typedef struct MainImageRange {
     uintptr_t address;
@@ -143,6 +151,108 @@ static void fail_closed(const char *reason)
         write_message(message);
     }
     _exit(86);
+}
+
+static int is_valid_skin_id(const char *value)
+{
+    size_t length = value != NULL ? strlen(value) : 0U;
+    if (length == 0U || length > MAX_G1_SKIN_ID_LENGTH) {
+        return 0;
+    }
+    for (size_t index = 0; index < length; ++index) {
+        unsigned char character = (unsigned char)value[index];
+        if ((character < 'a' || character > 'z')
+            && (character < '0' || character > '9')
+            && (index == 0U || character != '-')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static float parse_palette_component(const char **cursor)
+{
+    if ((**cursor < '0' || **cursor > '9') && **cursor != '.') {
+        fail_closed("G1 material palette contains an invalid component");
+    }
+    errno = 0;
+    char *end = NULL;
+    float value = strtof(*cursor, &end);
+    if (end == *cursor || errno == ERANGE || !isfinite(value)
+        || value < 0.0f || value > 1.0f) {
+        fail_closed("G1 material palette component is outside [0, 1]");
+    }
+    *cursor = end;
+    return value;
+}
+
+static void load_g1_material_palette(void)
+{
+    const char *configured_skin = getenv("MATRIX_G1_SKIN");
+    const char *palette = getenv("MATRIX_G1_MATERIAL_PALETTE");
+    const char *scope_alpha = getenv("MATRIX_G1_MATERIAL_SCOPE_ALPHA");
+    if (!is_valid_skin_id(configured_skin)) {
+        fail_closed("MATRIX_G1_SKIN is missing or invalid");
+    }
+    if (palette == NULL || palette[0] == '\0'
+        || strlen(palette) > MAX_G1_PALETTE_LENGTH) {
+        fail_closed("MATRIX_G1_MATERIAL_PALETTE is missing or too long");
+    }
+    memcpy(g1_skin_id, configured_skin, strlen(configured_skin) + 1U);
+    if (scope_alpha == NULL || scope_alpha[0] == '\0') {
+        fail_closed("MATRIX_G1_MATERIAL_SCOPE_ALPHA is missing");
+    }
+    const char *scope_cursor = scope_alpha;
+    g1_scope_alpha = parse_palette_component(&scope_cursor);
+    if (*scope_cursor != '\0' || g1_scope_alpha <= 0.0f
+        || g1_scope_alpha > 0.999f) {
+        fail_closed("G1 material scope alpha must be inside (0, 0.999]");
+    }
+
+    const char *cursor = palette;
+    while (*cursor != '\0') {
+        if (g1_profile_color_count >= MAX_G1_PROFILE_COLORS) {
+            fail_closed("G1 material palette contains too many colors");
+        }
+        for (size_t channel = 0; channel < 3U; ++channel) {
+            g1_profile_colors[g1_profile_color_count][channel] =
+                parse_palette_component(&cursor);
+            if (channel < 2U) {
+                if (*cursor != ',') {
+                    fail_closed("G1 material palette must use r,g,b triples");
+                }
+                ++cursor;
+            }
+        }
+        ++g1_profile_color_count;
+        if (*cursor == '\0') {
+            break;
+        }
+        if (*cursor != ';' || cursor[1] == '\0') {
+            fail_closed("G1 material palette must separate colors with ';'");
+        }
+        ++cursor;
+    }
+    if (g1_profile_color_count == 0U) {
+        fail_closed("G1 material palette contains no colors");
+    }
+    if (unsetenv("MATRIX_G1_MATERIAL_PALETTE") != 0
+        || unsetenv("MATRIX_G1_MATERIAL_SCOPE_ALPHA") != 0
+        || unsetenv("MATRIX_G1_SKIN") != 0) {
+        fail_closed("could not clear the selected G1 skin environment");
+    }
+
+    char message[192];
+    int length = snprintf(
+        message,
+        sizeof(message),
+        "matrix-ue-material-fix: loaded skin %s palette (%zu colors)\n",
+        g1_skin_id,
+        g1_profile_color_count
+    );
+    if (length > 0) {
+        write_message(message);
+    }
 }
 
 static int find_main_image_range(
@@ -343,19 +453,11 @@ static int component_matches(float actual, float expected)
 
 static int is_g1_material_profile_color(MatrixLinearColor color)
 {
-    static const float profile_colors[][3] = {
-        {0.018f, 0.024f, 0.035f},
-        {0.055f, 0.075f, 0.110f},
-        {0.900f, 0.940f, 1.000f},
-        {0.015f, 0.200f, 0.950f},
-    };
-    for (size_t index = 0;
-         index < sizeof(profile_colors) / sizeof(profile_colors[0]);
-         ++index) {
-        if (component_matches(color.red, profile_colors[index][0])
-            && component_matches(color.green, profile_colors[index][1])
-            && component_matches(color.blue, profile_colors[index][2])
-            && component_matches(color.alpha, 1.0f)) {
+    for (size_t index = 0; index < g1_profile_color_count; ++index) {
+        if (component_matches(color.red, g1_profile_colors[index][0])
+            && component_matches(color.green, g1_profile_colors[index][1])
+            && component_matches(color.blue, g1_profile_colors[index][2])
+            && component_matches(color.alpha, g1_scope_alpha)) {
             return 1;
         }
     }
@@ -427,6 +529,7 @@ static void matrix_set_mesh_color_hook(
 {
     if (component != NULL && is_g1_material_profile_color(color)) {
         repair_first_runtime_section_material(component);
+        color.alpha = 1.0f;
     }
 
     original_set_mesh_color(renderer, component, color);
@@ -444,6 +547,7 @@ __attribute__((constructor)) static void install_matrix_material_fix(void)
     if (!main_image_has_expected_build_id()) {
         fail_closed("main executable Build ID is not Matrix 0.1.2");
     }
+    load_g1_material_palette();
     if (!main_image_contains(
             SET_MESH_COLOR_ADDRESS,
             0x80,

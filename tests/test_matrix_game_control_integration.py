@@ -852,6 +852,11 @@ else:
                 ),
                 "MATRIX_MOUSE_SETTINGS_FILE": os.fspath(mouse_settings),
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_G1_MATERIAL_PALETTE": (
+                    "0.018,0.024,0.035;0.055,0.075,0.11;"
+                    "0.9,0.94,1;0.015,0.2,0.95"
+                ),
+                "MATRIX_G1_MATERIAL_SCOPE_ALPHA": "0.99609375",
                 "MATRIX_SKIP_ENV_CHECK": "1",
                 # The fixture must not contend with a real Matrix runtime on
                 # the host that happens to execute this integration test.
@@ -879,6 +884,8 @@ else:
                 os.fspath(project / "scripts/run_matrix_sonic.sh"),
                 "--scene",
                 "21",
+                "--skin",
+                "matrix-blue",
                 "--control-source",
                 "game",
                 "--game-input-source",
@@ -948,6 +955,20 @@ else:
             )
             self.assertIn(
                 f"LD_PRELOAD={material_fix.resolve()}",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                "MATRIX_G1_SKIN=matrix-blue",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                "MATRIX_G1_MATERIAL_PALETTE="
+                "0.018,0.024,0.035;0.055,0.075,0.11;"
+                "0.9,0.94,1;0.015,0.2,0.95",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                "MATRIX_G1_MATERIAL_SCOPE_ALPHA=0.99609375",
                 ue_capture["command"],
             )
             for direct_hint in (
@@ -1306,6 +1327,12 @@ print(json.dumps(payload, sort_keys=True))
             environment["MATRIX_UE_MATERIAL_FIX_PRELOAD"] = os.fspath(
                 material_fix
             )
+            environment["MATRIX_G1_SKIN"] = "unitree-stock"
+            environment["MATRIX_G1_MATERIAL_PALETTE"] = (
+                "0.018,0.024,0.035;0.055,0.075,0.11;"
+                "0.9,0.94,1;0.42,0.42,0.42"
+            )
+            environment["MATRIX_G1_MATERIAL_SCOPE_ALPHA"] = "0.99609375"
             environment["FAKE_UE_MATERIAL_FIX_LOG"] = "missing"
             environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
                 project / "launcher-missing-material-marker.lock"
@@ -1332,6 +1359,9 @@ print(json.dumps(payload, sort_keys=True))
             )
             self.assertFalse(active.exists())
             environment.pop("MATRIX_UE_MATERIAL_FIX_PRELOAD")
+            environment.pop("MATRIX_G1_SKIN")
+            environment.pop("MATRIX_G1_MATERIAL_PALETTE")
+            environment.pop("MATRIX_G1_MATERIAL_SCOPE_ALPHA")
             environment.pop("FAKE_UE_MATERIAL_FIX_LOG")
 
             for invalid_distance in ("79", "501", "150,quit", "1e2"):
