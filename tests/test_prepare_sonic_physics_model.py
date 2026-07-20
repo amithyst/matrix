@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 
@@ -134,6 +135,90 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
                 spawn_yaw=math.pi / 2.0,
             )
             self.assertEqual((output / "height.png").read_bytes(), b"height")
+
+    def test_town10_open_boundary_removes_four_walls_and_retains_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            canonical = root / "canonical.xml"
+            meshes = root / "canonical_meshes"
+            native = root / "xgb"
+            output = root / "output"
+            meshes.mkdir()
+            (native / "assets").mkdir(parents=True)
+            canonical.write_text(
+                """<mujoco><worldbody><body name="pelvis">
+<freejoint name="floating" /><joint name="joint_a" />
+</body></worldbody><actuator><motor name="a" joint="joint_a" />
+</actuator></mujoco>""",
+                encoding="utf-8",
+            )
+            scene = native / "scene_terrain_t10.xml"
+            scene.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<geom name="floor" size="0 0 0.01" type="plane" />
+<geom name="ps_Cube" type="box" size="125.0 0.05 1.5" pos="0.9 72.6 1.5" quat="1 0 0 0" />
+<geom name="ps_Cube2" type="box" size="125.0 0.05 1.5" pos="0.9 -125.7 1.5" quat="1 0 0 0" />
+<geom name="ps_Cube3" type="box" size="125.0 0.05 1.5" pos="104.4 -21.6 1.5" quat="0.707107 0 0 -0.707107" />
+<geom name="ps_Cube4" type="box" size="125.0 0.05 1.5" pos="-109.0 -21.6 1.5" quat="0.707107 0 0 -0.707107" />
+<geom name="building" type="box" size="1 1 1" />
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+            source_sha256 = MODULE._file_sha256(scene)
+            with mock.patch.object(
+                MODULE, "TOWN10_SOURCE_SCENE_SHA256", source_sha256
+            ):
+                output_scene = MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    output,
+                    body_joint_names=("joint_a",),
+                    scene_transform=MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
+                )
+
+            names = [
+                geom.get("name")
+                for geom in ET.parse(output_scene).getroot().iter("geom")
+            ]
+            self.assertIn("floor", names)
+            self.assertIn("building", names)
+            for wall in MODULE.TOWN10_PERIMETER_WALL_NAMES:
+                self.assertNotIn(wall, names)
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["pipeline_version"], 4)
+            self.assertEqual(
+                manifest["scene_transform"],
+                MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
+            )
+            self.assertEqual(
+                manifest["removed_environment_geoms"],
+                list(MODULE.TOWN10_PERIMETER_WALL_NAMES),
+            )
+
+            drifted = scene.read_text(encoding="utf-8").replace(
+                'name="ps_Cube4" type="box" size="125.0 0.05 1.5"',
+                'name="ps_Cube4" type="box" size="124.0 0.05 1.5"',
+            )
+            scene.write_text(drifted, encoding="utf-8")
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "TOWN10_SOURCE_SCENE_SHA256",
+                    MODULE._file_sha256(scene),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SonicPhysicsModelError, "collision contract drifted"
+                ),
+            ):
+                MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    root / "drifted-output",
+                    body_joint_names=("joint_a",),
+                    scene_transform=MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
+                )
 
 
 if __name__ == "__main__":

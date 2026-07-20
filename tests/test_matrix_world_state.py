@@ -624,6 +624,63 @@ class WorldStateStoreTest(unittest.TestCase):
                     revision(model_b, meshes_b, scene_b),
                 )
 
+    def test_revision_records_scene_transform_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            meshes = root / "canonical-meshes"
+            native = root / "native"
+            meshes.mkdir()
+            native.mkdir()
+            model = root / "canonical.xml"
+            scene = native / "scene_terrain_t10.xml"
+            model.write_text("<mujoco model='robot'/>", encoding="utf-8")
+            (meshes / "body.stl").write_bytes(b"canonical mesh")
+            scene.write_text(
+                """<mujoco><worldbody>
+<geom name="floor" size="0 0 0.01" type="plane" />
+<geom name="ps_Cube" type="box" size="125.0 0.05 1.5" pos="0.9 72.6 1.5" quat="1 0 0 0" />
+<geom name="ps_Cube2" type="box" size="125.0 0.05 1.5" pos="0.9 -125.7 1.5" quat="1 0 0 0" />
+<geom name="ps_Cube3" type="box" size="125.0 0.05 1.5" pos="104.4 -21.6 1.5" quat="0.707107 0 0 -0.707107" />
+<geom name="ps_Cube4" type="box" size="125.0 0.05 1.5" pos="-109.0 -21.6 1.5" quat="0.707107 0 0 -0.707107" />
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                PHYSICS,
+                "TOWN10_SOURCE_SCENE_SHA256",
+                PHYSICS._file_sha256(scene),
+            ):
+                default_revision = MODULE.world_revision_for_files(
+                    world_id="g1:town10",
+                    native_scene=scene,
+                    canonical_model=model,
+                    canonical_meshes=meshes,
+                )
+                transformed_revision = MODULE.world_revision_for_files(
+                    world_id="g1:town10",
+                    native_scene=scene,
+                    canonical_model=model,
+                    canonical_meshes=meshes,
+                    scene_transform=PHYSICS.TOWN10_OPEN_BOUNDARY_TRANSFORM,
+                )
+                payload = PHYSICS.physics_revision_payload(
+                    model,
+                    meshes,
+                    scene,
+                    scene_transform=PHYSICS.TOWN10_OPEN_BOUNDARY_TRANSFORM,
+                )
+
+            self.assertNotEqual(default_revision, transformed_revision)
+            self.assertEqual(
+                payload["scene_transform"],
+                PHYSICS.TOWN10_OPEN_BOUNDARY_TRANSFORM,
+            )
+            self.assertEqual(
+                payload["removed_environment_geoms"],
+                list(PHYSICS.TOWN10_PERIMETER_WALL_NAMES),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

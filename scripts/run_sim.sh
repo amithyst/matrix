@@ -1355,6 +1355,13 @@ if $MATRIX_SONIC_ENABLED; then
     NATIVE_SONIC_SCENE="$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/xgb/$SCENE"
     SONIC_SPAWN_ARGS=()
     SONIC_WORLD_ARGS=()
+    SONIC_SCENE_TRANSFORM_ARGS=()
+    if [[ "$SCENE" == "scene_terrain_t10.xml" ]]; then
+        SONIC_SCENE_TRANSFORM_ARGS+=(
+            --scene-transform town10-open-boundary-v1
+        )
+        echo "[INFO] Town10 perimeter collision walls removed in derived physics scene"
+    fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
             echo "[ERROR] Persistent Matrix world state requires game control" >&2
@@ -1367,7 +1374,8 @@ if $MATRIX_SONIC_ENABLED; then
                 --world-id "$GAME_WORLD_ID" \
                 --native-scene "$NATIVE_SONIC_SCENE" \
                 --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
-                --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES"
+                --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES" \
+                "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
         )"
         GAME_WORLD_STATE_FILE="${MATRIX_GAME_WORLD_STATE_FILE:-}"
         if [[ -z "$GAME_WORLD_STATE_FILE" ]]; then
@@ -1435,7 +1443,8 @@ if $MATRIX_SONIC_ENABLED; then
         --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES" \
         --native-scene "$NATIVE_SONIC_SCENE" \
         --output-dir "$SONIC_PHYSICS_DIR" \
-        "${SONIC_SPAWN_ARGS[@]}"
+        "${SONIC_SPAWN_ARGS[@]}" \
+        "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
     GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"

@@ -28,7 +28,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from prepare_sonic_physics_model import (
+    SCENE_TRANSFORM_NONE,
     SonicPhysicsModelError,
+    TOWN10_OPEN_BOUNDARY_TRANSFORM,
     physics_revision_payload,
 )
 
@@ -819,6 +821,7 @@ def world_revision_for_files(
     native_scene: Path,
     canonical_model: Path,
     canonical_meshes: Path,
+    scene_transform: str | None = None,
 ) -> str:
     """Bind a save slot to physics inputs without including its spawn override."""
 
@@ -835,6 +838,7 @@ def world_revision_for_files(
             canonical_model,
             canonical_meshes,
             native_scene,
+            scene_transform=scene_transform,
         )
     except (OSError, SonicPhysicsModelError) as exc:
         raise WorldStateError(f"cannot build physics source contract: {exc}") from exc
@@ -861,6 +865,11 @@ def _parse_cli_args() -> argparse.Namespace:
     revision.add_argument("--native-scene", type=Path, required=True)
     revision.add_argument("--canonical-model", type=Path, required=True)
     revision.add_argument("--canonical-meshes", type=Path, required=True)
+    revision.add_argument(
+        "--scene-transform",
+        choices=(SCENE_TRANSFORM_NONE, TOWN10_OPEN_BOUNDARY_TRANSFORM),
+        default=SCENE_TRANSFORM_NONE,
+    )
 
     default_path = subparsers.add_parser("default-path")
     default_path.add_argument("--profile", required=True)
@@ -883,6 +892,7 @@ def main() -> int:
                     native_scene=args.native_scene,
                     canonical_model=args.canonical_model,
                     canonical_meshes=args.canonical_meshes,
+                    scene_transform=args.scene_transform,
                 )
             )
             return 0

@@ -37,8 +37,15 @@ class UrbanV1ContractTest(unittest.TestCase):
         self.assertEqual(visual["release_sha256"], town10["release_package"]["sha256"])
         self.assertEqual(physics["mujoco_scene"], town10["mujoco_scene"])
         self.assertEqual(
-            physics["environment_geom_count"],
+            physics["native_environment_geom_count"],
             town10["physics_proxy"]["geom_count"],
+        )
+        self.assertEqual(physics["native_environment_geom_count"], 869)
+        self.assertEqual(physics["environment_geom_count"], 865)
+        self.assertEqual(physics["scene_transform"], "town10-open-boundary-v1")
+        self.assertEqual(
+            physics["removed_environment_geoms"],
+            ["ps_Cube", "ps_Cube2", "ps_Cube3", "ps_Cube4"],
         )
         self.assertEqual(
             physics["dynamic_environment_body_count"],
@@ -52,6 +59,11 @@ class UrbanV1ContractTest(unittest.TestCase):
         self.assertIn('run_matrix_sonic.sh" --scene 2', launcher)
         self.assertIn('argument" == "--scene"', launcher)
         self.assertIn("people and vehicles are UE presentation assets", launcher)
+        run_sim = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('if [[ "$SCENE" == "scene_terrain_t10.xml" ]]', run_sim)
+        self.assertIn("--scene-transform town10-open-boundary-v1", run_sim)
 
 
 if __name__ == "__main__":

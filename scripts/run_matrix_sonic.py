@@ -845,6 +845,9 @@ def _validate_qualified_model(
     spawn_xyz_value = manifest.get("spawn_xyz")
     spawn_xyz = tuple(spawn_xyz_value) if spawn_xyz_value is not None else None
     spawn_yaw = manifest.get("spawn_yaw_rad")
+    scene_transform = manifest.get("scene_transform")
+    if not isinstance(scene_transform, str):
+        raise SystemExit("qualified physics model has no scene transform contract")
     with tempfile.TemporaryDirectory(prefix="matrix-sonic-model-recheck.") as temporary:
         temporary_root = Path(temporary)
         if args.scenario_layout_sha256 is not None:
@@ -862,7 +865,20 @@ def _validate_qualified_model(
             expected_output,
             spawn_xyz=spawn_xyz,
             spawn_yaw=spawn_yaw,
+            scene_transform=scene_transform,
         )
+        expected_manifest = _regular_json(
+            expected_output / "manifest.json", "reproduced physics model manifest"
+        )
+        for field in (
+            "pipeline_version",
+            "scene_transform",
+            "removed_environment_geoms",
+        ):
+            if manifest.get(field) != expected_manifest.get(field):
+                raise SystemExit(
+                    f"qualified physics model {field} contract is stale"
+                )
         actual_robot = model_path.parent / "robot.xml"
         actual_meshes = model_path.parent / "meshes"
         if not actual_robot.is_file() or actual_robot.is_symlink() or not actual_meshes.is_dir():
