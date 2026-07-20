@@ -168,6 +168,54 @@ def _source_contract(
     }
 
 
+def physics_revision_payload(
+    canonical_model: Path,
+    canonical_meshes: Path,
+    native_scene: Path,
+    *,
+    body_joint_names: tuple[str, ...] = G1_BODY_JOINT_NAMES,
+) -> dict[str, object]:
+    """Return the location-independent source contract for save isolation.
+
+    The preparation manifest intentionally records absolute provenance paths and
+    the selected spawn override.  Neither belongs in a persistent-world
+    revision: identical physics assets copied to another host must select the
+    same save slot, while changing a resume pose must not invalidate that slot.
+    Keep the content-bearing fields sourced from :func:`_source_contract` so
+    preparation and persistence cannot silently drift apart.
+    """
+
+    contract = _source_contract(
+        canonical_model,
+        canonical_meshes,
+        native_scene,
+        body_joint_names=body_joint_names,
+        spawn_xyz=None,
+        spawn_yaw=None,
+    )
+    native_scene_assets = []
+    for asset in contract["native_scene_assets"]:
+        if not isinstance(asset, dict):
+            raise SonicPhysicsModelError("native scene asset contract is invalid")
+        native_scene_assets.append(
+            {
+                "relative_path": asset["relative_path"],
+                "size": asset["size"],
+                "sha256": asset["sha256"],
+            }
+        )
+    return {
+        "schema": "matrix-sonic-physics-source/v1",
+        "pipeline_version": contract["pipeline_version"],
+        "canonical_model_sha256": contract["canonical_model_sha256"],
+        "canonical_meshes_sha256": contract["canonical_meshes_sha256"],
+        "native_scene_sha256": contract["native_scene_sha256"],
+        "native_assets_sha256": contract["native_assets_sha256"],
+        "native_scene_assets": native_scene_assets,
+        "body_joint_names": contract["body_joint_names"],
+    }
+
+
 def _strip_non_body_joints(
     canonical_model: Path,
     output_model: Path,

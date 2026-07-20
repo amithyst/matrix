@@ -42,7 +42,32 @@ from matrix_game_control import (
     UnixSeqpacketInputServer,
     wrap_angle_rad,
 )
+from matrix_mc_commands import (
+    CommandExecutionError,
+    CommandProtocolError,
+    GameCommandRequest,
+    GameCommandResponse,
+    MAX_COMMAND_PACKET_BYTES,
+    decode_command_request,
+    encode_command_response,
+    execute_command,
+)
 from matrix_mouse_settings import canonical_remote_speed_scale
+from matrix_world_state import (
+    WorldPose,
+    WorldStateError,
+    WorldStateStore,
+)
+
+
+_GAME_INTERNAL_RESTART_EXIT_CODE = 75
+_GAME_INTERNAL_RESTART_REASONS = frozenset(
+    {"game_fall_respawn", "game_teleport"}
+)
+_WORLD_SAFE_MIN_ROOT_Z = 0.55
+_WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
+_WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
+_WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
 
 
 def _remote_speed_scale_argument(value: str) -> float:
@@ -153,6 +178,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-focus-title", default=r"(zsibot|matrix|unreal)")
     parser.add_argument("--game-input-status-file", type=Path)
     parser.add_argument("--no-game-input-provider", action="store_true")
+    parser.add_argument("--game-world-id")
+    parser.add_argument("--game-world-revision")
+    parser.add_argument("--game-world-state-file", type=Path)
+    parser.add_argument(
+        "--game-world-checkpoint-seconds",
+        type=float,
+        default=0.75,
+        help="Durable last-exit checkpoint interval for interactive game runs",
+    )
+    parser.add_argument(
+        "--game-auto-respawn",
+        action="store_true",
+        help="On fall, save an upright resume pose and request a cold full-runtime reload",
+    )
     parser.add_argument(
         "--pico-python",
         default=None,
@@ -965,6 +1004,122 @@ def _root_yaw_rad(qpos) -> float:
     sine = 2.0 * ((w * z) + (x * y))
     cosine = 1.0 - (2.0 * ((y * y) + (z * z)))
     return math.atan2(sine, cosine)
+
+
+def _snapshot_world_pose(snapshot: Any) -> WorldPose:
+    try:
+        qpos = snapshot.qpos
+        return WorldPose(
+            float(qpos[0]),
+            float(qpos[1]),
+            float(qpos[2]),
+            _root_yaw_rad(qpos),
+        )
+    except (AttributeError, IndexError, TypeError, ValueError, WorldStateError) as exc:
+        raise WorldStateError(f"snapshot does not contain a valid root pose: {exc}") from exc
+
+
+def _snapshot_world_upright(snapshot: Any) -> bool:
+    try:
+        qvel = snapshot.qvel
+        vertical_speed = float(qvel[2])
+        roll_rate = float(qvel[3])
+        pitch_rate = float(qvel[4])
+        return bool(
+            not bool(snapshot.fall_detected)
+            and float(snapshot.qpos[2]) >= _WORLD_SAFE_MIN_ROOT_Z
+            and _root_up_z(snapshot.qpos) >= _WORLD_SAFE_MIN_ROOT_UP_Z
+            and math.isfinite(vertical_speed)
+            and abs(vertical_speed) <= _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S
+            and math.isfinite(roll_rate)
+            and abs(roll_rate) <= _WORLD_SAFE_MAX_TILT_RATE_RAD_S
+            and math.isfinite(pitch_rate)
+            and abs(pitch_rate) <= _WORLD_SAFE_MAX_TILT_RATE_RAD_S
+        )
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+
+
+class _GameWorldStateRuntime:
+    """Checkpoint semantic root poses without serializing dynamic MuJoCo state."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        world_id: str,
+        world_revision: str,
+        checkpoint_seconds: float,
+    ) -> None:
+        interval = float(checkpoint_seconds)
+        if not math.isfinite(interval) or not 0.1 <= interval <= 60.0:
+            raise WorldStateError(
+                "game world checkpoint interval must be finite and in [0.1, 60]"
+            )
+        self.store = WorldStateStore(
+            path,
+            world_id=world_id,
+            world_revision=world_revision,
+        )
+        self.state = self.store.load()
+        self.checkpoint_seconds = interval
+        self.next_checkpoint_s = 0.0
+        self.checkpoint_count = 0
+        self.last_error: str | None = self.store.load_error
+        self.last_checkpoint_monotonic_s: float | None = None
+
+    def checkpoint(
+        self,
+        snapshot: Any,
+        *,
+        now_s: float,
+        force: bool = False,
+        required: bool = False,
+    ) -> bool:
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise WorldStateError("checkpoint monotonic time is invalid")
+        if not force and now < self.next_checkpoint_s:
+            return False
+        try:
+            pose = _snapshot_world_pose(snapshot)
+            state = self.state.checkpoint(
+                pose,
+                upright=_snapshot_world_upright(snapshot),
+            )
+            self.store.save(state)
+        except WorldStateError as exc:
+            self.last_error = str(exc)
+            self.next_checkpoint_s = now + self.checkpoint_seconds
+            if required:
+                raise
+            return False
+        self.state = state
+        self.checkpoint_count += 1
+        self.last_error = None
+        self.last_checkpoint_monotonic_s = now
+        self.next_checkpoint_s = now + self.checkpoint_seconds
+        return True
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "path": str(self.store.path),
+            "world_id": self.store.world_id,
+            "world_revision": self.store.world_revision,
+            "load_status": self.store.load_status,
+            "load_error": self.store.load_error,
+            "checkpoint_count": self.checkpoint_count,
+            "checkpoint_seconds": self.checkpoint_seconds,
+            "last_checkpoint_monotonic_s": self.last_checkpoint_monotonic_s,
+            "last_error": self.last_error,
+            "resume_source": self.state.resume_source,
+            "has_last_exit": self.state.last_exit is not None,
+            "has_home": self.state.home is not None,
+            "teleport_point_count": len(self.state.teleport_points),
+            "frame": "matrix_mj_world",
+            "units": "m",
+        }
 
 
 class _HeadingAnchorTelemetry:
@@ -2037,6 +2192,192 @@ class GameInputRuntime:
         self.server.close()
 
 
+class GameCommandRuntime:
+    """Execute typed ESC-panel commands over one inherited private socketpair."""
+
+    def __init__(self, connection: socket.socket, world: _GameWorldStateRuntime) -> None:
+        self.connection = connection
+        self.connection.setblocking(False)
+        self.world = world
+        self.session: str | None = None
+        self.last_sequence = 0
+        self.request_ids: set[str] = set()
+        self.requests_received = 0
+        self.commands_executed = 0
+        self.protocol_errors = 0
+        self.rejected_commands = 0
+        self.response_errors = 0
+        self.restart_requested = False
+        self.last_response: dict[str, object] | None = None
+
+    def _send(self, response: GameCommandResponse) -> None:
+        payload = encode_command_response(response)
+        try:
+            sent = self.connection.send(payload)
+        except (BlockingIOError, OSError) as exc:
+            self.response_errors += 1
+            raise RuntimeError(f"cannot send game command response: {exc}") from exc
+        if sent != len(payload):
+            self.response_errors += 1
+            raise RuntimeError(
+                f"partial game command response: sent {sent}/{len(payload)}"
+            )
+        self.last_response = response.to_mapping()
+
+    @staticmethod
+    def _response(
+        request: GameCommandRequest,
+        *,
+        ok: bool,
+        code: str,
+        message: str,
+        restart_required: bool = False,
+        data: dict[str, object] | None = None,
+    ) -> GameCommandResponse:
+        return GameCommandResponse(
+            session=request.session,
+            sequence=request.sequence,
+            request_id=request.request_id,
+            ok=ok,
+            code=code,
+            message=message,
+            restart_required=restart_required,
+            data=data,
+        )
+
+    def _validate_identity(self, request: GameCommandRequest) -> str | None:
+        if self.session is None:
+            self.session = request.session
+        elif request.session != self.session:
+            return "command session changed"
+        if request.sequence <= self.last_sequence:
+            return "command sequence did not increase"
+        self.last_sequence = request.sequence
+        if request.request_id in self.request_ids:
+            return "command request_id was already used"
+        self.request_ids.add(request.request_id)
+        if len(self.request_ids) > 256:
+            # Sequences already prevent replay; keep only a bounded diagnostic set.
+            self.request_ids = {request.request_id}
+        return None
+
+    def poll(self, *, current_pose: WorldPose, command_allowed: bool) -> bool:
+        if self.restart_requested:
+            return True
+        for _ in range(16):
+            try:
+                payload = self.connection.recv(MAX_COMMAND_PACKET_BYTES + 1)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                raise RuntimeError(f"game command channel failed: {exc}") from exc
+            if not payload:
+                raise EOFError("game command provider closed its channel")
+            self.requests_received += 1
+            try:
+                request = decode_command_request(payload)
+            except CommandProtocolError as exc:
+                self.protocol_errors += 1
+                # A packet without a valid request identity cannot receive a
+                # trustworthy correlated response.  Keeping the channel alive
+                # would leave the provider's single in-flight request pending
+                # forever and would also permit traffic after protocol drift.
+                # Escalate through the supervised runtime boundary instead; its
+                # cleanup closes the socket and lets the provider report the
+                # already-sent command as outcome-unknown without retrying it.
+                raise RuntimeError(
+                    f"invalid game command request: {exc}"
+                ) from exc
+            identity_error = self._validate_identity(request)
+            if identity_error is not None:
+                self.protocol_errors += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_PROTOCOL_IDENTITY",
+                        message=identity_error,
+                    )
+                )
+                continue
+            if not command_allowed:
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_NOT_PAUSED",
+                        message="Open ESC and wait for a neutral frame before commands",
+                    )
+                )
+                continue
+            try:
+                effect = execute_command(
+                    request.command,
+                    state=self.world.state,
+                    current_pose=current_pose,
+                    now_unix_ns=time.time_ns(),
+                )
+                self.world.store.save(effect.state)
+            except CommandExecutionError as exc:
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code=exc.code,
+                        message=exc.message,
+                    )
+                )
+                continue
+            except WorldStateError as exc:
+                self.rejected_commands += 1
+                self.world.last_error = str(exc)
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_STATE_PERSIST",
+                        message="Could not persist the command result",
+                    )
+                )
+                continue
+            self.world.state = effect.state
+            self.world.last_error = None
+            self.commands_executed += 1
+            self._send(
+                self._response(
+                    request,
+                    ok=True,
+                    code=effect.code,
+                    message=effect.message,
+                    restart_required=effect.restart_required,
+                    data=dict(effect.data),
+                )
+            )
+            if effect.restart_required:
+                self.restart_requested = True
+                return True
+        return False
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "session_bound": self.session is not None,
+            "last_sequence": self.last_sequence,
+            "requests_received": self.requests_received,
+            "commands_executed": self.commands_executed,
+            "protocol_errors": self.protocol_errors,
+            "rejected_commands": self.rejected_commands,
+            "response_errors": self.response_errors,
+            "restart_requested": self.restart_requested,
+            "last_response": self.last_response,
+        }
+
+    def close(self) -> None:
+        self.connection.close()
+
+
 def _peek_child_returncode(process: subprocess.Popen[bytes]) -> int | None:
     """Observe a direct child without releasing its PID/process-group identity."""
 
@@ -2106,6 +2447,7 @@ class NativeProcessGroup:
         cwd: Path,
         *,
         exec_command: bool = False,
+        extra_pass_fds: tuple[int, ...] = (),
     ) -> int:
         guarded_command = [
             sys.executable,
@@ -2116,11 +2458,14 @@ class NativeProcessGroup:
         if exec_command:
             guarded_command.append("--exec-command")
         guarded_command.extend(("--", *command))
+        pass_fds = tuple(dict.fromkeys((*self.pass_fds, *extra_pass_fds)))
+        for descriptor in pass_fds:
+            os.fstat(descriptor)
         process = subprocess.Popen(
             guarded_command,
             cwd=cwd,
             env=self.env,
-            pass_fds=self.pass_fds,
+            pass_fds=pass_fds,
             start_new_session=True,
         )
         self.children.append((name, process))
@@ -2170,6 +2515,7 @@ class NativeProcessGroup:
         restart_request_file: Path | None = None,
         restart_capability_file: Path | None = None,
         restart_launcher_pid: int | None = None,
+        command_fd: int | None = None,
     ) -> int:
         command = [
             python,
@@ -2236,11 +2582,19 @@ class NativeProcessGroup:
             )
         if status_file is not None:
             command.extend(("--status-file", str(status_file)))
+        extra_pass_fds: tuple[int, ...] = ()
+        if command_fd is not None:
+            if isinstance(command_fd, bool) or not isinstance(command_fd, int):
+                raise ValueError("game command fd must be an integer")
+            os.fstat(command_fd)
+            command.extend(("--game-command-fd", str(command_fd)))
+            extra_pass_fds = (command_fd,)
         return self._start(
             "game-input",
             command,
             script.parent.parent,
             exec_command=True,
+            extra_pass_fds=extra_pass_fds,
         )
 
     def start_deploy(self, *, interface: str, zmq_port: int) -> None:
@@ -2395,6 +2749,18 @@ def _record_cleanup_failure(path: Path | None, errors: list[str]) -> None:
 
 def main() -> int:
     args = _parse_args()
+    # Several focused tests and downstream embedders construct the historical
+    # argparse namespace directly.  New optional gameplay fields must remain
+    # absent-safe for those callers.
+    for name, default in (
+        ("game_world_id", None),
+        ("game_world_revision", None),
+        ("game_world_state_file", None),
+        ("game_world_checkpoint_seconds", 0.75),
+        ("game_auto_respawn", False),
+    ):
+        if not hasattr(args, name):
+            setattr(args, name, default)
     args.verification_receipt_sha256 = None
     _arm_supervisor_parent_death(args.expected_parent_pid)
     run_id = uuid.uuid4().hex
@@ -2526,6 +2892,45 @@ def main() -> int:
                     "game input provider Python is missing: "
                     f"{args.game_input_provider_python}"
                 )
+    world_values = (
+        args.game_world_id,
+        args.game_world_revision,
+        args.game_world_state_file,
+    )
+    if any(value is not None for value in world_values) and not all(
+        value is not None for value in world_values
+    ):
+        raise SystemExit("game world-state arguments are all-or-none")
+    if all(value is not None for value in world_values):
+        if args.control_source != "game":
+            raise SystemExit("game world-state persistence requires game control")
+        assert args.game_world_state_file is not None
+        if not args.game_world_state_file.is_absolute():
+            raise SystemExit("--game-world-state-file must be absolute")
+        try:
+            WorldStateStore(
+                args.game_world_state_file,
+                world_id=args.game_world_id,
+                world_revision=args.game_world_revision,
+            )
+        except WorldStateError as exc:
+            raise SystemExit(f"invalid game world-state configuration: {exc}") from exc
+        if (
+            not math.isfinite(args.game_world_checkpoint_seconds)
+            or not 0.1 <= args.game_world_checkpoint_seconds <= 60.0
+        ):
+            raise SystemExit(
+                "--game-world-checkpoint-seconds must be in [0.1, 60]"
+            )
+        if args.qualified_runtime or args.max_seconds > 0.0:
+            raise SystemExit(
+                "bounded qualification rejects persistent game world state"
+            )
+    if args.game_auto_respawn:
+        if not all(value is not None for value in world_values):
+            raise SystemExit("--game-auto-respawn requires game world-state persistence")
+        if args.fail_on_fall:
+            raise SystemExit("--game-auto-respawn conflicts with --fail-on-fall")
     sha256_pattern = r"[0-9a-f]{64}"
     if args.qualified_runtime:
         if not args.qualification_profile:
@@ -2595,6 +3000,9 @@ def main() -> int:
     planner = None
     game_input = None
     game_readiness = None
+    game_world = None
+    game_commands = None
+    game_command_child_socket = None
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -2603,13 +3011,18 @@ def main() -> int:
     termination_signal: int | None = None
     child_failure: tuple[str, int] | None = None
     numerical_error: str | None = None
+    world_checkpoint_failed = False
+    proposed_exit_code = 2
+    final_status: dict[str, Any] | None = None
+    termination_boundary_previous_mask: set[signal.Signals] | None = None
+    termination_boundary_safe = False
 
     def request_stop(signum, _frame) -> None:
         nonlocal running, termination_reason, termination_signal
         running = False
+        termination_signal = int(signum)
         if termination_reason is None:
             termination_reason = "signal"
-            termination_signal = int(signum)
 
     try:
         # Install handlers before any child is started. Everything after the
@@ -2625,6 +3038,23 @@ def main() -> int:
             raise SystemExit(
                 f"invalid native SONIC initial snapshot: {initial_snapshot_error}"
             )
+        if args.game_world_state_file is not None:
+            try:
+                game_world = _GameWorldStateRuntime(
+                    path=args.game_world_state_file,
+                    world_id=args.game_world_id,
+                    world_revision=args.game_world_revision,
+                    checkpoint_seconds=args.game_world_checkpoint_seconds,
+                )
+                if _snapshot_world_upright(snapshot):
+                    game_world.checkpoint(
+                        snapshot,
+                        now_s=time.perf_counter(),
+                        force=True,
+                        required=bool(args.game_auto_respawn),
+                    )
+            except WorldStateError as exc:
+                raise SystemExit(f"cannot initialize game world state: {exc}") from exc
         qpos = snapshot.qpos
 
         physics_hz = float(args.physics_hz)
@@ -2707,6 +3137,12 @@ def main() -> int:
                     GameControlCore(game_config),
                 )
                 game_readiness = _GameSonicReadinessGate(snapshot)
+                if game_world is not None and not args.no_game_input_provider:
+                    command_parent, game_command_child_socket = socket.socketpair(
+                        socket.AF_UNIX,
+                        socket.SOCK_SEQPACKET,
+                    )
+                    game_commands = GameCommandRuntime(command_parent, game_world)
                 try:
                     game_input.open()
                 except OSError as exc:
@@ -2756,7 +3192,15 @@ def main() -> int:
                         expected_ue_pid=args.ue_pid,
                         status_file=args.game_input_status_file,
                         ue_camera_state_file=args.game_ue_camera_state_file,
+                        command_fd=(
+                            game_command_child_socket.fileno()
+                            if game_command_child_socket is not None
+                            else None
+                        ),
                     )
+                    if game_command_child_socket is not None:
+                        game_command_child_socket.close()
+                        game_command_child_socket = None
                     game_input.bind_expected_peer_pid(provider_pid)
         elif running and args.control_source == "pico":
             processes.start_pico(
@@ -2865,6 +3309,39 @@ def main() -> int:
                     planner.send_game_command(game_command)
                     game_input.record_published_command(game_command)
                     walking = game_command.mode == "move"
+                    if game_commands is not None:
+                        command_allowed = bool(
+                            game_command.safe_stop
+                            and game_command.speed_mps == 0.0
+                            and game_command.mode != "move"
+                        )
+                        try:
+                            command_restart = game_commands.poll(
+                                current_pose=_snapshot_world_pose(snapshot),
+                                command_allowed=command_allowed,
+                            )
+                        except (EOFError, RuntimeError, WorldStateError) as exc:
+                            game_input.core.invalidate_input(
+                                "game_command_channel_error"
+                            )
+                            running = False
+                            termination_reason = "game_command_channel_error"
+                            numerical_error = str(exc)
+                            print(
+                                "matrix-sonic-runtime ERROR game command "
+                                f"channel failed: {exc}",
+                                flush=True,
+                            )
+                        else:
+                            if command_restart:
+                                game_command = game_input.emergency_stop(
+                                    now_s=time.perf_counter(),
+                                    reason="teleport_reload",
+                                )
+                                planner.send_game_command(game_command)
+                                walking = False
+                                running = False
+                                termination_reason = "game_teleport"
                 else:
                     planner.send_velocity(
                         args.vx if walking else 0.0,
@@ -2915,11 +3392,47 @@ def main() -> int:
                         )
                         break
                 instability_resets = int(snapshot.reset_count)
-                if args.fail_on_fall and bool(snapshot.fall_detected):
+                if bool(snapshot.fall_detected):
                     fall_detected = True
-                    running = False
-                    termination_reason = "fall_detected"
-                    break
+                    if args.game_auto_respawn:
+                        assert game_world is not None
+                        assert game_input is not None
+                        assert planner is not None
+                        game_command = game_input.emergency_stop(
+                            now_s=time.perf_counter(),
+                            reason="fall_respawn_reload",
+                        )
+                        planner.send_game_command(game_command)
+                        walking = False
+                        try:
+                            game_world.checkpoint(
+                                snapshot,
+                                now_s=time.perf_counter(),
+                                force=True,
+                                required=True,
+                            )
+                        except WorldStateError as exc:
+                            running = False
+                            termination_reason = "world_state_error"
+                            numerical_error = f"fall_checkpoint:{exc}"
+                            print(
+                                "matrix-sonic-runtime ERROR cannot save fall "
+                                f"respawn checkpoint: {exc}",
+                                flush=True,
+                            )
+                            break
+                        running = False
+                        termination_reason = "game_fall_respawn"
+                        print(
+                            "matrix-sonic-runtime fall detected; saved an "
+                            "upright cold-respawn checkpoint",
+                            flush=True,
+                        )
+                        break
+                    if args.fail_on_fall:
+                        running = False
+                        termination_reason = "fall_detected"
+                        break
                 if instability_resets > args.max_resets:
                     running = False
                     termination_reason = "reset_detected"
@@ -2936,6 +3449,8 @@ def main() -> int:
             active_lowcmd = bool(snapshot.low_cmd_fresh)
             low_cmd_age_s = snapshot.low_cmd_age_s
             freshness_sample_wall = time.perf_counter()
+            if game_world is not None:
+                game_world.checkpoint(snapshot, now_s=freshness_sample_wall)
             if active_lowcmd:
                 if active_started_wall is None:
                     active_started_wall = freshness_sample_wall
@@ -3060,6 +3575,11 @@ def main() -> int:
                     status["root_yaw_relative_rad"] = round(
                         wrap_angle_rad(current_root_yaw - initial_root_yaw_rad), 6
                     )
+                if game_world is not None:
+                    status["game_world_state"] = game_world.telemetry()
+                    status["game_auto_respawn"] = bool(args.game_auto_respawn)
+                if game_commands is not None:
+                    status["game_commands"] = game_commands.telemetry()
                 print(
                     f"matrix-sonic-runtime status={json.dumps(status, sort_keys=True)}",
                     flush=True,
@@ -3120,6 +3640,26 @@ def main() -> int:
             planner.send_game_command(game_command)
             walking = False
 
+        if (
+            game_world is not None
+            and termination_reason not in _GAME_INTERNAL_RESTART_REASONS
+        ):
+            try:
+                game_world.checkpoint(
+                    snapshot,
+                    now_s=time.perf_counter(),
+                    force=True,
+                    required=True,
+                )
+            except WorldStateError as exc:
+                world_checkpoint_failed = True
+                numerical_error = f"final_checkpoint:{exc}"
+                print(
+                    "matrix-sonic-runtime ERROR cannot save final game-world "
+                    f"checkpoint: {exc}",
+                    flush=True,
+                )
+
         # One final poll followed by a non-reaping stop boundary closes the race
         # between the last loop poll and final status publication. Any native
         # exit observed before this boundary is a failure, including exit 0.
@@ -3172,6 +3712,8 @@ def main() -> int:
             reset_count=instability_resets,
             max_resets=args.max_resets,
         )
+        if world_checkpoint_failed:
+            acceptance_failures.append("world_state_checkpoint_failed")
         if args.qualified_runtime and args.control_source == "game":
             assert game_input is not None
             assert game_input_boundary is not None
@@ -3311,6 +3853,22 @@ def main() -> int:
                 final_status["root_yaw_relative_rad"] = round(
                     wrap_angle_rad(final_root_yaw - initial_root_yaw_rad), 6
                 )
+        internal_restart_requested = bool(
+            termination_reason in _GAME_INTERNAL_RESTART_REASONS
+            and termination_signal is None
+            and child_failure is None
+            and not unstable
+            and not world_checkpoint_failed
+        )
+        final_status["internal_restart"] = {
+            "requested": internal_restart_requested,
+            "reason": termination_reason if internal_restart_requested else None,
+        }
+        final_status["game_auto_respawn"] = bool(args.game_auto_respawn)
+        if game_world is not None:
+            final_status["game_world_state"] = game_world.telemetry()
+        if game_commands is not None:
+            final_status["game_commands"] = game_commands.telemetry()
         _atomic_json(args.status_file, final_status)
         print(
             "matrix-sonic-runtime stopped "
@@ -3320,9 +3878,16 @@ def main() -> int:
             f"failures={acceptance_failures}",
             flush=True,
         )
-        if passed or (not qualification_attempted and interrupted and not acceptance_failures):
-            return 0
-        return 2
+        if internal_restart_requested:
+            proposed_exit_code = _GAME_INTERNAL_RESTART_EXIT_CODE
+        elif passed or (
+            not qualification_attempted
+            and interrupted
+            and not acceptance_failures
+        ):
+            proposed_exit_code = 0
+        else:
+            proposed_exit_code = 2
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_errors = []
@@ -3342,6 +3907,14 @@ def main() -> int:
         error = _close_runtime_resource("game input", game_input)
         if error is not None:
             cleanup_errors.append(error)
+        error = _close_runtime_resource("game commands", game_commands)
+        if error is not None:
+            cleanup_errors.append(error)
+        error = _close_runtime_resource(
+            "game command child socket", game_command_child_socket
+        )
+        if error is not None:
+            cleanup_errors.append(error)
         for name, resource in (
             ("native processes", processes),
             ("renderer", renderer),
@@ -3350,6 +3923,23 @@ def main() -> int:
             error = _close_runtime_resource(name, resource)
             if error is not None:
                 cleanup_errors.append(error)
+        if (
+            not active_exception
+            and not cleanup_errors
+            and proposed_exit_code == _GAME_INTERNAL_RESTART_EXIT_CODE
+        ):
+            try:
+                termination_boundary_previous_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    {signal.SIGINT, signal.SIGTERM},
+                )
+                termination_boundary_safe = True
+            except (AttributeError, OSError, ValueError) as exc:
+                print(
+                    "matrix-sonic-runtime ERROR cannot close the internal "
+                    f"restart signal boundary: {exc}",
+                    flush=True,
+                )
         for signum, previous_handler in previous_signal_handlers.items():
             try:
                 signal.signal(signum, previous_handler)
@@ -3363,11 +3953,62 @@ def main() -> int:
                     f"signal handler {signum}: {exc}"
                 )
         if cleanup_errors:
+            if termination_boundary_previous_mask is not None:
+                signal.pthread_sigmask(
+                    signal.SIG_SETMASK,
+                    termination_boundary_previous_mask,
+                )
             _record_cleanup_failure(args.status_file, cleanup_errors)
             if not active_exception:
                 raise RuntimeError(
                     "native cleanup failed: " + "; ".join(cleanup_errors)
                 )
+
+    try:
+        if termination_boundary_previous_mask is not None:
+            try:
+                pending_termination_signals = signal.sigpending().intersection(
+                    {signal.SIGINT, signal.SIGTERM}
+                )
+            except (AttributeError, OSError, ValueError) as exc:
+                termination_boundary_safe = False
+                print(
+                    "matrix-sonic-runtime ERROR cannot inspect pending "
+                    f"termination signals: {exc}",
+                    flush=True,
+                )
+            else:
+                if pending_termination_signals:
+                    termination_signal = int(
+                        min(pending_termination_signals, key=int)
+                    )
+
+        status_changed = False
+        if (
+            final_status is not None
+            and final_status.get("termination_signal") != termination_signal
+        ):
+            final_status["termination_signal"] = termination_signal
+            status_changed = True
+        if proposed_exit_code == _GAME_INTERNAL_RESTART_EXIT_CODE and (
+            termination_signal is not None or not termination_boundary_safe
+        ):
+            proposed_exit_code = 2
+            if final_status is not None:
+                final_status["internal_restart"] = {
+                    "requested": False,
+                    "reason": None,
+                }
+                status_changed = True
+        if status_changed:
+            _atomic_json(args.status_file, final_status)
+    finally:
+        if termination_boundary_previous_mask is not None:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                termination_boundary_previous_mask,
+            )
+    return proposed_exit_code
 
 
 if __name__ == "__main__":

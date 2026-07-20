@@ -352,6 +352,15 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
 
 
 class LauncherArgumentChainIntegrationTest(unittest.TestCase):
+    GAME_CONTROL_DEPENDENCIES = (
+        "matrix_game_control_input.py",
+        "matrix_calibration_overlay.py",
+        "matrix_mc_commands.py",
+        "matrix_world_state.py",
+        "prepare_sonic_physics_model.py",
+        "compose_custom_scene.py",
+    )
+
     @staticmethod
     def write(path: Path, contents: str = "", *, executable: bool = False) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +377,11 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "matrix_mouse_settings.py",
             "matrix_restart_request.py",
             "matrix_ue_overlay.py",
+            "matrix_calibration_overlay.py",
+            "matrix_mc_commands.py",
+            "matrix_world_state.py",
+            "compose_custom_scene.py",
+            "prepare_sonic_physics_model.py",
         ):
             shutil.copy2(SCRIPTS / name, scripts / name)
         self.write(
@@ -375,10 +389,8 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "load_matrix_local_env() { return 0; }\n",
         )
         for name in (
-            "compose_custom_scene.py",
             "matrix_game_control.py",
             "matrix_game_control_input.py",
-            "prepare_sonic_physics_model.py",
             "run_matrix_sonic.py",
             "supervise_matrix_ue.py",
         ):
@@ -570,7 +582,31 @@ import time
 script = Path(sys.argv[1]).name
 args = sys.argv[2:]
 
-if script == "compose_custom_scene.py":
+if script == "-":
+    # run_sim uses the locked runtime Python to merge a late UE failure into
+    # the already-written SONIC status.  The fixture mirrors that narrow helper
+    # without importing the placeholder runtime module.
+    status_path = Path(args[0])
+    failure_path = Path(args[1])
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    failure = json.loads(failure_path.read_text(encoding="utf-8"))
+    label = f"native_child_exit:{failure['name']}:{failure['exit_code']}"
+    failures = payload.setdefault("acceptance_failures", [])
+    if label not in failures:
+        failures.append(label)
+    payload["failed_child_name"] = failure["name"]
+    payload["failed_child_exit_code"] = failure["exit_code"]
+    payload["pre_external_termination_reason"] = payload.get("termination_reason")
+    payload["termination_reason"] = "child_exit"
+    payload["passed"] = False
+    payload["completed"] = False
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+elif script == "matrix_world_state.py":
+    os.execv(
+        "/usr/bin/python3",
+        ["/usr/bin/python3", "-I", sys.argv[1], *args],
+    )
+elif script == "compose_custom_scene.py":
     target = Path(args[1])
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args[0], target)
@@ -637,6 +673,14 @@ elif script == "supervise_matrix_ue.py":
     for line in sys.stdin:
         if line.strip() == "stop":
             break
+    late_ue_exit = os.environ.get("FAKE_UE_LATE_FAILURE_EXIT_CODE")
+    if late_ue_exit:
+        failure_file = Path(args[args.index("--failure-file") + 1])
+        failure_file.write_text(
+            json.dumps({"name": "ue", "exit_code": int(late_ue_exit)}),
+            encoding="utf-8",
+        )
+        raise SystemExit(int(late_ue_exit))
 elif script == "run_matrix_sonic.py":
     socket_path = Path(args[args.index("--game-input-socket") + 1])
     status_path = Path(os.environ["MATRIX_GAME_INPUT_STATUS_FILE"])
@@ -646,6 +690,8 @@ elif script == "run_matrix_sonic.py":
         "input_source_env": os.environ.get("MATRIX_GAME_INPUT_SOURCE"),
         "yaw_source_env": os.environ.get("MATRIX_GAME_CAMERA_YAW_SOURCE"),
         "socket_env": os.environ.get("MATRIX_GAME_INPUT_SOCKET"),
+        "world_persistence_env": os.environ.get("MATRIX_GAME_WORLD_PERSISTENCE"),
+        "auto_respawn_env": os.environ.get("MATRIX_GAME_AUTO_RESPAWN"),
         "socket_parent_mode": oct(socket_path.parent.stat().st_mode & 0o777),
         "stale_status_existed": status_path.exists(),
     }
@@ -657,9 +703,41 @@ elif script == "run_matrix_sonic.py":
         generation_path = Path(generation_file)
         generation = int(generation_path.read_text()) + 1 if generation_path.exists() else 1
         generation_path.write_text(str(generation), encoding="utf-8")
+    internal_reason = os.environ.get("FAKE_WORLD_INTERNAL_RESTART")
+    if internal_reason:
+        sonic_status = Path(args[args.index("--status-file") + 1])
+        sonic_status.write_text(
+            json.dumps(
+                {
+                    "acceptance_failures": [],
+                    "completed": False,
+                    "failed_child_exit_code": None,
+                    "failed_child_name": None,
+                    "game_auto_respawn": os.environ.get(
+                        "MATRIX_GAME_AUTO_RESPAWN"
+                    ) == "1",
+                    "game_world_state": {
+                        "has_last_exit": True,
+                        "last_error": None,
+                    },
+                    "internal_restart": {
+                        "requested": True,
+                        "reason": internal_reason,
+                    },
+                    "passed": False,
+                    "termination_reason": internal_reason,
+                    "termination_signal": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        raise SystemExit(75)
     marker_value = os.environ.get("TRIGGER_RESTART_MARKER")
     if marker_value and not Path(marker_value).exists():
         Path(marker_value).write_text("requested", encoding="utf-8")
+        os.environ["FAKE_SONIC_STATUS_FILE"] = args[
+            args.index("--status-file") + 1
+        ]
         provider = Path(args[args.index("--game-input-provider") + 1])
         os.execv(
             sys.argv[0],
@@ -702,6 +780,35 @@ elif script == "matrix_game_control_input.py":
                 else "term-complete"
             )
             Path(marker).write_text(observed, encoding="utf-8")
+        sonic_status_file = os.environ.get("FAKE_SONIC_STATUS_FILE")
+        if sonic_status_file:
+            checkpoint_error = os.environ.get("FAKE_FINAL_CHECKPOINT_ERROR")
+            Path(sonic_status_file).write_text(
+                json.dumps(
+                    {
+                        "acceptance_failures": (
+                            ["world_state_checkpoint_failed"]
+                            if checkpoint_error
+                            else []
+                        ),
+                        "completed": False,
+                        "failed_child_exit_code": None,
+                        "failed_child_name": None,
+                        "game_world_state": {
+                            "has_last_exit": True,
+                            "last_error": checkpoint_error,
+                        },
+                        "internal_restart": {
+                            "requested": False,
+                            "reason": None,
+                        },
+                        "passed": False,
+                        "termination_reason": "signal",
+                        "termination_signal": signal.SIGTERM,
+                    }
+                ),
+                encoding="utf-8",
+            )
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stop_provider)
     while True:
@@ -720,6 +827,145 @@ else:
             "sonic": sonic,
             "stale_status": stale_status,
         }
+
+    def test_outer_game_dependency_preflight_applies_with_persistence_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            environment = {
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_GAME_CENTERED_CAMERA": "off",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            command = [
+                "/bin/bash",
+                os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                "--scene",
+                "21",
+                "--control-source",
+                "game",
+                "--game-world-persistence",
+                "off",
+                "--game-auto-respawn",
+                "off",
+            ]
+
+            for dependency in self.GAME_CONTROL_DEPENDENCIES:
+                with self.subTest(dependency=dependency):
+                    path = project / "scripts" / dependency
+                    held = path.with_name(f".{path.name}.missing")
+                    path.rename(held)
+                    fixture["capture"].unlink(missing_ok=True)
+                    try:
+                        result = subprocess.run(
+                            command,
+                            env={
+                                **environment,
+                                "MATRIX_SONIC_HOST_LOCK": os.fspath(
+                                    project / f"launcher-missing-{dependency}.lock"
+                                ),
+                            },
+                            text=True,
+                            capture_output=True,
+                            timeout=20.0,
+                            check=False,
+                        )
+                    finally:
+                        held.rename(path)
+                    self.assertEqual(
+                        result.returncode,
+                        1,
+                        msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    self.assertIn(
+                        f"Matrix game-control dependency is missing: {path}",
+                        result.stderr,
+                    )
+                    self.assertFalse(fixture["capture"].exists())
+
+    def test_run_sim_game_dependency_preflight_applies_with_persistence_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_DISABLE_MC": "1",
+                "MATRIX_GAME_AUTO_RESPAWN": "0",
+                "MATRIX_GAME_CENTERED_CAMERA": "off",
+                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
+                    project / "outputs/game-input.json"
+                ),
+                "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
+                "MATRIX_GAME_WORLD_PERSISTENCE": "0",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC": "1",
+                "MATRIX_SONIC_CONTROL_SOURCE": "game",
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UNITREE_SDK2_ROOT": os.fspath(
+                    fixture["sonic"] / "gear_sonic_deploy/thirdparty/unitree_sdk2"
+                ),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            command = [
+                "/bin/bash",
+                os.fspath(project / "scripts/run_sim.sh"),
+                "xgb",
+                "21",
+                "0",
+                "0",
+                "1",
+            ]
+
+            for dependency in self.GAME_CONTROL_DEPENDENCIES:
+                with self.subTest(dependency=dependency):
+                    path = project / "scripts" / dependency
+                    held = path.with_name(f".{path.name}.missing")
+                    path.rename(held)
+                    fixture["capture"].unlink(missing_ok=True)
+                    try:
+                        result = subprocess.run(
+                            command,
+                            env=environment,
+                            text=True,
+                            capture_output=True,
+                            timeout=20.0,
+                            check=False,
+                        )
+                    finally:
+                        held.rename(path)
+                    self.assertEqual(
+                        result.returncode,
+                        1,
+                        msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    self.assertIn(
+                        f"Matrix game-control dependency is missing: {path}",
+                        result.stderr,
+                    )
+                    self.assertFalse(fixture["capture"].exists())
 
     def test_bounded_game_launcher_rejects_input_provider_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -783,6 +1029,66 @@ else:
             self.assertIn(
                 "rejects MATRIX_GAME_INPUT_PYTHON",
                 interpreter_result.stderr,
+            )
+
+    def test_bounded_qualification_auto_disables_persistent_world_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            self.make_project(project)
+            self.write(project / "config/hosts/test.env", "\n")
+            environment = {
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            }
+            command = [
+                "/bin/bash",
+                os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                "--profile",
+                "test",
+                "--control-source",
+                "game",
+                "--game-camera-yaw-source",
+                "x11-mirror",
+                "--max-seconds",
+                "1",
+            ]
+
+            automatic = subprocess.run(
+                command,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(automatic.returncode, 2)
+            self.assertIn(
+                "Bounded qualification cannot disable runtime verification",
+                automatic.stderr,
+            )
+            self.assertNotIn(
+                "rejects persistent world state",
+                automatic.stderr,
+            )
+
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-forced-persistence.lock"
+            )
+            forced = subprocess.run(
+                [*command, "--game-world-persistence", "on"],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(forced.returncode, 2)
+            self.assertIn(
+                "Bounded qualification rejects persistent world state",
+                forced.stderr,
             )
 
     def test_bounded_launcher_rejects_experimental_camera_sources(self) -> None:
@@ -938,6 +1244,8 @@ else:
             self.assertEqual(capture["control_source_env"], "game")
             self.assertEqual(capture["input_source_env"], "keyboard")
             self.assertEqual(capture["yaw_source_env"], "x11-mirror")
+            self.assertEqual(capture["world_persistence_env"], "1")
+            self.assertEqual(capture["auto_respawn_env"], "1")
             self.assertEqual(capture["socket_parent_mode"], "0o700")
             self.assertFalse(capture["stale_status_existed"])
             ue_capture = json.loads(
@@ -1023,6 +1331,21 @@ else:
             self.assertEqual(parsed.gamepad_look_max_pitch_deg, 50.0)
             self.assertEqual(parsed.game_max_speed, 0.27)
             self.assertEqual(parsed.game_input_timeout, 0.14)
+            self.assertEqual(
+                parsed.game_world_id,
+                "g1_29dof:scene_terrain_apart2",
+            )
+            self.assertRegex(parsed.game_world_revision, r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                parsed.game_world_state_file,
+                project
+                / "home/.local/state/matrix/local/"
+                "g1_29dof_scene_terrain_apart2-"
+                "c1ddf02ac13d294fcb07af591694e3fb.json",
+            )
+            self.assertEqual(parsed.game_world_checkpoint_seconds, 0.75)
+            self.assertTrue(parsed.game_auto_respawn)
+            self.assertFalse(parsed.fail_on_fall)
             self.assertIsNotNone(parsed.ue_pid)
             self.assertGreater(parsed.ue_pid, 1)
             self.assertEqual(parsed.game_max_snapshot_age, 0.15)
@@ -1722,10 +2045,12 @@ print(json.dumps(payload, sort_keys=True))
                 "HOME": os.fspath(project / "home"),
                 "LANG": "C.UTF-8",
                 "MATRIX_DISABLE_MC": "1",
+                "MATRIX_GAME_AUTO_RESPAWN": "0",
                 "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
                     project / "outputs/game-input.json"
                 ),
                 "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
+                "MATRIX_GAME_WORLD_PERSISTENCE": "0",
                 "MATRIX_SKIP_ENV_CHECK": "1",
                 "MATRIX_SONIC": "1",
                 "MATRIX_SONIC_CONTROL_SOURCE": "game",
@@ -1764,6 +2089,19 @@ print(json.dumps(payload, sort_keys=True))
                         0,
                         msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
                     )
+                    runtime_capture = json.loads(
+                        fixture["capture"].read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(runtime_capture["world_persistence_env"], "0")
+                    self.assertEqual(runtime_capture["auto_respawn_env"], "0")
+                    for flag in (
+                        "--game-world-id",
+                        "--game-world-revision",
+                        "--game-world-state-file",
+                        "--game-world-checkpoint-seconds",
+                        "--game-auto-respawn",
+                    ):
+                        self.assertNotIn(flag, runtime_capture["argv"])
                     ue_command = json.loads(
                         fixture["ue_capture"].read_text(encoding="utf-8")
                     )["command"]
@@ -1776,6 +2114,277 @@ print(json.dumps(payload, sort_keys=True))
                         exec_cmds.endswith(f",viewclass {expected_class}"),
                         exec_cmds,
                     )
+
+    def test_late_ue_failure_invalidates_world_internal_restart_exit_75(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            status_file = project / "outputs/matrix-sonic-status.json"
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_UE_LATE_FAILURE_EXIT_CODE": "42",
+                "FAKE_WORLD_INTERNAL_RESTART": "game_teleport",
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_DISABLE_MC": "1",
+                "MATRIX_GAME_AUTO_RESPAWN": "0",
+                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
+                    project / "outputs/game-input.json"
+                ),
+                "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
+                "MATRIX_GAME_WORLD_PERSISTENCE": "0",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC": "1",
+                "MATRIX_SONIC_CONTROL_SOURCE": "game",
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(status_file),
+                "MATRIX_UNITREE_SDK2_ROOT": os.fspath(
+                    fixture["sonic"]
+                    / "gear_sonic_deploy/thirdparty/unitree_sdk2"
+                ),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_sim.sh"),
+                    "xgb",
+                    "21",
+                    "0",
+                    "0",
+                    "1",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                2,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+            self.assertEqual(status["pre_external_termination_reason"], "game_teleport")
+            self.assertEqual(status["termination_reason"], "child_exit")
+            self.assertEqual(status["failed_child_name"], "ue")
+            self.assertEqual(status["failed_child_exit_code"], 42)
+
+    def test_outer_launcher_rejects_exit_75_status_with_late_child_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            self.write(
+                project / "scripts/run_sim.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+printf 'x' >> "${GENERATION_FILE:?}"
+mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
+printf '%s\n' '{"internal_restart":{"requested":true,"reason":"game_teleport"},"game_world_state":{"has_last_exit":true,"last_error":null},"game_auto_respawn":true,"termination_reason":"child_exit","termination_signal":null,"failed_child_name":"ue","failed_child_exit_code":42}' > "$MATRIX_SONIC_STATUS_FILE"
+exit 75
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                75,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "x")
+            self.assertIn(
+                "Refusing unverified Matrix world reload request",
+                result.stderr,
+            )
+            self.assertNotIn("Validated Matrix world reload", result.stdout)
+
+    def test_outer_launcher_rejects_exit_75_with_termination_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            self.write(
+                project / "scripts/run_sim.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+printf 'x' >> "${GENERATION_FILE:?}"
+mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
+printf '%s\n' '{"internal_restart":{"requested":true,"reason":"game_teleport"},"game_world_state":{"has_last_exit":true,"last_error":null},"game_auto_respawn":true,"termination_reason":"game_teleport","termination_signal":15,"failed_child_name":null,"failed_child_exit_code":null}' > "$MATRIX_SONIC_STATUS_FILE"
+exit 75
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                75,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "x")
+            self.assertIn(
+                "Refusing unverified Matrix world reload request",
+                result.stderr,
+            )
+            self.assertNotIn("Validated Matrix world reload", result.stdout)
+
+    def test_outer_launcher_accepts_clean_exit_75_and_carries_rate_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            rate_trace = project / "rate-trace.txt"
+            self.write(
+                project / "scripts/run_sim.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+generation=1
+if [[ -f "${GENERATION_FILE:?}" ]]; then
+    generation=$(( $(<"$GENERATION_FILE") + 1 ))
+fi
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s,%s\n' \
+    "${MATRIX_GAME_INTERNAL_RESTART_COUNT:-missing}" \
+    "${MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH:-missing}" \
+    >> "${RATE_TRACE_FILE:?}"
+if [[ "$generation" == "1" ]]; then
+    mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
+    printf '%s\n' '{"internal_restart":{"requested":true,"reason":"game_teleport"},"game_world_state":{"has_last_exit":true,"last_error":null},"game_auto_respawn":true,"termination_reason":"game_teleport","termination_signal":null,"failed_child_name":null,"failed_child_exit_code":null}' > "$MATRIX_SONIC_STATUS_FILE"
+    exit 75
+fi
+exit 0
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "RATE_TRACE_FILE": os.fspath(rate_trace),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
+            first, second = rate_trace.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(first, "missing,missing")
+            count, window = second.split(",", 1)
+            self.assertEqual(count, "1")
+            self.assertRegex(window, r"^[0-9]+$")
+            self.assertGreater(int(window), 0)
+            self.assertIn("Validated Matrix world reload", result.stdout)
+            self.assertIn("count=1/6", result.stdout)
 
     def test_private_request_restarts_whole_runtime_after_clean_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1840,6 +2449,70 @@ print(json.dumps(payload, sort_keys=True))
             )
             for path, expected in originals.items():
                 self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
+
+    def test_private_request_refuses_restart_when_final_checkpoint_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            marker = project / "restart-once.marker"
+            generations = project / "generations.txt"
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_FINAL_CHECKPOINT_ERROR": "simulated durable write failure",
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TRIGGER_RESTART_MARKER": os.fspath(marker),
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                143,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
+            self.assertIn(
+                "Refusing Matrix restart without a verified final world checkpoint",
+                result.stderr,
+            )
+            self.assertNotIn(
+                "Verified final Matrix world checkpoint",
+                result.stdout,
+            )
 
     def test_internal_restart_timeout_keeps_supervising_original_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

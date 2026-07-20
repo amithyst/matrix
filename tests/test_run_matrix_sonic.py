@@ -23,6 +23,8 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 GAME_CONTROL = sys.modules["matrix_game_control"]
+MC_COMMANDS = sys.modules["matrix_mc_commands"]
+WORLD_STATE = sys.modules["matrix_world_state"]
 
 
 class MatrixSonicRuntimeTest(unittest.TestCase):
@@ -97,6 +99,22 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
 
     @staticmethod
+    def game_command_request(
+        command_text: str,
+        *,
+        sequence: int,
+        request_character: str,
+        session: str = "a" * 32,
+    ):
+        parsed = MC_COMMANDS.parse_mc_command(command_text)
+        return MC_COMMANDS.GameCommandRequest(
+            session=session,
+            sequence=sequence,
+            request_id="cmd-" + request_character * 32,
+            command=parsed.command,
+        )
+
+    @staticmethod
     def process_is_running(pid: int) -> bool:
         try:
             state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
@@ -122,6 +140,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
+
+    def test_world_safe_checkpoint_rejects_fall_motion_but_allows_horizontal_walk(self) -> None:
+        def upright_snapshot() -> SimpleNamespace:
+            snapshot = self.snapshot()
+            snapshot.qpos[2] = 0.8
+            snapshot.qpos[3] = 1.0
+            return snapshot
+
+        walking = upright_snapshot()
+        walking.qvel[0] = 2.5
+        walking.qvel[1] = -2.5
+        self.assertTrue(MODULE._snapshot_world_upright(walking))
+
+        unsafe_velocities = (
+            (2, MODULE._WORLD_SAFE_MAX_VERTICAL_SPEED_M_S + 0.01),
+            (2, math.nan),
+            (3, MODULE._WORLD_SAFE_MAX_TILT_RATE_RAD_S + 0.01),
+            (3, math.inf),
+            (4, -MODULE._WORLD_SAFE_MAX_TILT_RATE_RAD_S - 0.01),
+            (4, -math.inf),
+        )
+        for index, value in unsafe_velocities:
+            with self.subTest(qvel_index=index, value=value):
+                snapshot = upright_snapshot()
+                snapshot.qvel[index] = value
+                self.assertFalse(MODULE._snapshot_world_upright(snapshot))
+
+        tilted = upright_snapshot()
+        tilt_radians = math.acos(MODULE._WORLD_SAFE_MIN_ROOT_UP_Z - 0.01)
+        tilted.qpos[3] = math.cos(tilt_radians / 2.0)
+        tilted.qpos[4] = math.sin(tilt_radians / 2.0)
+        self.assertFalse(MODULE._snapshot_world_upright(tilted))
 
     def test_root_yaw_uses_normalized_mujoco_wxyz_quaternion(self) -> None:
         half = math.pi / 4.0
@@ -1870,6 +1920,219 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 runtime.close()
             self.assertFalse(path.exists())
 
+    def test_game_command_runtime_persists_summon_and_teleport_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            current_pose = WORLD_STATE.WorldPose(10.0, 20.0, 0.8, 0.5)
+            try:
+                summon = self.game_command_request(
+                    '/summon matrix:teleport_point ~1 ~-2 ~ {Tags:["XX"]}',
+                    sequence=1,
+                    request_character="b",
+                )
+                provider_socket.send(MC_COMMANDS.encode_command_request(summon))
+
+                self.assertFalse(
+                    runtime.poll(current_pose=current_pose, command_allowed=True)
+                )
+                summon_response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(summon_response.ok)
+                self.assertEqual(summon_response.code, "OK_SUMMONED")
+                self.assertFalse(summon_response.restart_required)
+                self.assertEqual(
+                    summon_response.data["position"],
+                    [11.0, 18.0, 0.8],
+                )
+                persisted = WORLD_STATE.WorldStateStore(
+                    state_path,
+                    world_id="town10:test",
+                    world_revision="a" * 64,
+                ).load()
+                self.assertEqual(len(persisted.teleport_points), 1)
+                self.assertIsNone(persisted.last_exit)
+
+                teleport = self.game_command_request(
+                    "/tp @s @e["
+                    "type=matrix:teleport_point,tag=XX,limit=1,sort=nearest]",
+                    sequence=2,
+                    request_character="c",
+                )
+                provider_socket.send(MC_COMMANDS.encode_command_request(teleport))
+
+                # The successful response must be queued before poll asks the
+                # supervisor to cold-restart the complete runtime generation.
+                self.assertTrue(
+                    runtime.poll(current_pose=current_pose, command_allowed=True)
+                )
+                teleport_response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(teleport_response.ok)
+                self.assertEqual(teleport_response.code, "OK_TELEPORT_RESTART")
+                self.assertTrue(teleport_response.restart_required)
+                self.assertTrue(runtime.restart_requested)
+
+                reloaded = WORLD_STATE.WorldStateStore(
+                    state_path,
+                    world_id="town10:test",
+                    world_revision="a" * 64,
+                ).load()
+                self.assertEqual(
+                    reloaded.last_exit,
+                    WORLD_STATE.WorldPose(11.0, 18.0, 0.8, 0.5),
+                )
+                self.assertEqual(runtime.commands_executed, 2)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
+    def test_required_world_checkpoint_surfaces_durable_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            world = MODULE._GameWorldStateRuntime(
+                path=Path(temporary) / "world-state.json",
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            snapshot = self.snapshot()
+            snapshot.qpos[2] = 0.8
+            snapshot.qpos[3] = 1.0
+            failure = WORLD_STATE.WorldStateError("simulated fsync failure")
+
+            with mock.patch.object(world.store, "save", side_effect=failure):
+                with self.assertRaisesRegex(
+                    WORLD_STATE.WorldStateError,
+                    "simulated fsync failure",
+                ):
+                    world.checkpoint(
+                        snapshot,
+                        now_s=1.0,
+                        force=True,
+                        required=True,
+                    )
+
+            self.assertEqual(world.last_error, "simulated fsync failure")
+            self.assertEqual(world.checkpoint_count, 0)
+            self.assertIsNone(world.state.last_exit)
+
+    def test_game_command_runtime_rejects_commands_until_panel_safe_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            request = self.game_command_request(
+                '/summon matrix:teleport_point ~ ~ ~ {Tags:["blocked"]}',
+                sequence=1,
+                request_character="b",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(
+                        current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                        command_allowed=False,
+                    )
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertFalse(response.ok)
+                self.assertEqual(response.code, "E_NOT_PAUSED")
+                self.assertFalse(response.restart_required)
+                self.assertEqual(world.state.teleport_points, ())
+                self.assertFalse(state_path.exists())
+                self.assertEqual(runtime.rejected_commands, 1)
+                self.assertEqual(runtime.commands_executed, 0)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
+    def test_game_command_runtime_rejects_out_of_order_and_reused_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+            requests = (
+                self.game_command_request(
+                    '/summon matrix:teleport_point ~ ~ ~ {Tags:["first"]}',
+                    sequence=3,
+                    request_character="b",
+                ),
+                self.game_command_request(
+                    '/summon matrix:teleport_point ~ ~ ~ {Tags:["stale"]}',
+                    sequence=2,
+                    request_character="c",
+                ),
+                self.game_command_request(
+                    '/summon matrix:teleport_point ~ ~ ~ {Tags:["reused"]}',
+                    sequence=4,
+                    request_character="b",
+                ),
+            )
+            try:
+                responses = []
+                for request in requests:
+                    provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                    self.assertFalse(
+                        runtime.poll(current_pose=pose, command_allowed=True)
+                    )
+                    responses.append(
+                        MC_COMMANDS.decode_command_response(
+                            provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                        )
+                    )
+
+                self.assertTrue(responses[0].ok)
+                self.assertEqual(responses[0].code, "OK_SUMMONED")
+                self.assertFalse(responses[1].ok)
+                self.assertEqual(responses[1].code, "E_PROTOCOL_IDENTITY")
+                self.assertIn("sequence", responses[1].message)
+                self.assertFalse(responses[2].ok)
+                self.assertEqual(responses[2].code, "E_PROTOCOL_IDENTITY")
+                self.assertIn("request_id", responses[2].message)
+                self.assertEqual(len(world.state.teleport_points), 1)
+                self.assertEqual(runtime.commands_executed, 1)
+                self.assertEqual(runtime.protocol_errors, 2)
+                self.assertEqual(runtime.last_sequence, 4)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_native_process_group_runs_locked_binary_directly(self, popen) -> None:
         process = mock.Mock()
@@ -1903,34 +2166,46 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         process.pid = 4243
         popen.return_value = process
         group = MODULE.NativeProcessGroup(Path("/sonic"), {})
-        provider_pid = group.start_game_input(
-            "/runtime/python",
-            Path("/matrix/scripts/matrix_game_control_input.py"),
-            input_socket=Path("/run/user/1000/matrix-game.sock"),
-            input_source="auto",
-            camera_yaw_source="x11-mirror",
-            look_button="left",
-            initial_camera_yaw_deg=5.0,
-            mouse_sensitivity_deg=0.12,
-            mouse_settings_file=Path("/home/user/.config/matrix/mouse-control.json"),
-            applied_mouse_profile="remote",
-            applied_mouse_speed_scale=0.5,
-            restart_request_file=Path("/run/user/1000/matrix/restart.json"),
-            restart_capability_file=Path("/run/user/1000/matrix/capability"),
-            restart_launcher_pid=4000,
-            camera_yaw_sign=-1,
-            camera_yaw_offset_deg=90.0,
-            carla_host="127.0.0.2",
-            carla_port=2100,
-            gamepad_look_yaw_rate_deg_s=140.0,
-            gamepad_look_pitch_rate_deg_s=95.0,
-            gamepad_look_deadzone=0.13,
-            gamepad_look_min_pitch_deg=-70.0,
-            gamepad_look_max_pitch_deg=50.0,
-            focus_title="matrix",
-            expected_ue_pid=4242,
-            status_file=Path("/matrix/outputs/game-input.json"),
+        command_parent, command_child = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
         )
+        command_fd = command_child.fileno()
+        try:
+            provider_pid = group.start_game_input(
+                "/runtime/python",
+                Path("/matrix/scripts/matrix_game_control_input.py"),
+                input_socket=Path("/run/user/1000/matrix-game.sock"),
+                input_source="auto",
+                camera_yaw_source="x11-mirror",
+                look_button="left",
+                initial_camera_yaw_deg=5.0,
+                mouse_sensitivity_deg=0.12,
+                mouse_settings_file=Path(
+                    "/home/user/.config/matrix/mouse-control.json"
+                ),
+                applied_mouse_profile="remote",
+                applied_mouse_speed_scale=0.5,
+                restart_request_file=Path("/run/user/1000/matrix/restart.json"),
+                restart_capability_file=Path("/run/user/1000/matrix/capability"),
+                restart_launcher_pid=4000,
+                camera_yaw_sign=-1,
+                camera_yaw_offset_deg=90.0,
+                carla_host="127.0.0.2",
+                carla_port=2100,
+                gamepad_look_yaw_rate_deg_s=140.0,
+                gamepad_look_pitch_rate_deg_s=95.0,
+                gamepad_look_deadzone=0.13,
+                gamepad_look_min_pitch_deg=-70.0,
+                gamepad_look_max_pitch_deg=50.0,
+                focus_title="matrix",
+                expected_ue_pid=4242,
+                status_file=Path("/matrix/outputs/game-input.json"),
+                command_fd=command_fd,
+            )
+        finally:
+            command_parent.close()
+            command_child.close()
 
         guarded = popen.call_args.args[0]
         self.assertIn("--exec-command", guarded[: guarded.index("--")])
@@ -1953,6 +2228,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             command[command.index("--camera-yaw-offset-deg") + 1], "90.0"
         )
         self.assertEqual(command[command.index("--expected-ue-pid") + 1], "4242")
+        self.assertEqual(
+            command[command.index("--game-command-fd") + 1],
+            str(command_fd),
+        )
         self.assertNotIn("--ue-camera-state-file", command)
         self.assertEqual(
             command[command.index("--mouse-settings-file") + 1],
@@ -1989,6 +2268,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "50.0",
         )
         self.assertEqual(popen.call_args.kwargs["cwd"], Path("/matrix"))
+        self.assertEqual(popen.call_args.kwargs["pass_fds"], (command_fd,))
 
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_native_process_group_forwards_final_pov_state_file(self, popen) -> None:

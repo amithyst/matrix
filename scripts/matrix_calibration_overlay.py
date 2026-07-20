@@ -5,9 +5,11 @@ The cooked Matrix build has no project sources with which to add a native UMG
 pause widget.  This process therefore renders a large pointer-driven panel, a
 modal InputOnly shield, four click-through crosshair bars, and a shaped visible
 proxy for UE's hidden cursor directly on X11.  The override-redirect controls do
-not take keyboard focus.  The child can publish bounded pointer *intents* over
-an inherited socket, while the provider remains the sole owner of persistence,
-the neutral-frame gate, calibration state, and restart authority.
+not take keyboard focus.  Clicking the command field holds an active X11
+keyboard grab only for the bounded editor lifetime.  The child publishes strict
+UI *intents* over an inherited socket, while the provider remains the sole owner
+of parsing, persistence, the neutral-frame gate, calibration state, and restart
+authority.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from matrix_mouse_settings import (
     MIN_REMOTE_SPEED_SCALE,
     canonical_remote_speed_scale,
 )
+from matrix_mc_commands import MAX_COMMAND_CHARS
 
 
 _IS_VIEWABLE = 2
@@ -44,17 +47,38 @@ _CW_EVENT_MASK = 1 << 11
 _SHAPE_BOUNDING = 0
 _SHAPE_INPUT = 2
 _INPUT_ONLY = 2
+_KEY_PRESS = 2
+_KEY_RELEASE = 3
 _BUTTON_PRESS = 4
 _BUTTON_RELEASE = 5
+_KEY_PRESS_MASK = 1 << 0
+_KEY_RELEASE_MASK = 1 << 1
 _BUTTON_PRESS_MASK = 1 << 2
 _BUTTON_RELEASE_MASK = 1 << 3
+_GRAB_SUCCESS = 0
+_GRAB_MODE_ASYNC = 1
+_CURRENT_TIME = 0
 _PR_SET_PDEATHSIG = 1
 _CURSOR_WIDTH = 20
 _CURSOR_HEIGHT = 28
 _MIN_CLIENT_WIDTH = 480
 _MIN_CLIENT_HEIGHT = 360
+_MAX_COMMAND_HISTORY = 24
+_MAX_INTENT_PACKET_BYTES = 2048
 _BODY_FONT_CANDIDATES = (b"10x20", b"9x15", b"fixed")
 _LARGE_FONT_CANDIDATES = (b"12x24", b"10x20", b"fixed")
+
+_XK_BACK_SPACE = 0xFF08
+_XK_RETURN = 0xFF0D
+_XK_ESCAPE = 0xFF1B
+_XK_HOME = 0xFF50
+_XK_LEFT = 0xFF51
+_XK_UP = 0xFF52
+_XK_RIGHT = 0xFF53
+_XK_DOWN = 0xFF54
+_XK_END = 0xFF57
+_XK_KP_ENTER = 0xFF8D
+_XK_DELETE = 0xFFFF
 
 
 class XWindowAttributes(ctypes.Structure):
@@ -145,10 +169,31 @@ class XButtonEvent(ctypes.Structure):
     ]
 
 
+class XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
 class XEvent(ctypes.Union):
     _fields_ = [
         ("type", ctypes.c_int),
         ("xbutton", XButtonEvent),
+        ("xkey", XKeyEvent),
         ("padding", ctypes.c_long * 24),
     ]
 
@@ -245,8 +290,19 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
     speed_width = max(48, min(132, (panel_width - 2 * margin) // 4))
     apply_height = max(42, min(80, button_height + 6))
-    footer_space = 30 if compact else 42
+    footer_space = 8 if compact else 42
     apply_y = panel_y + panel_height - footer_space - apply_height
+    console_left = panel_x + margin
+    console_width = panel_width - 2 * margin
+    console_top = centre_y + safe_half_size + (4 if compact else gap // 2)
+    console_bottom = apply_y - (6 if compact else gap)
+    console_height = max(1, console_bottom - console_top)
+    command_input_height = min(28 if compact else 42, max(22, console_height))
+    command_input_y = max(console_top, console_bottom - command_input_height)
+    result_space = max(0, command_input_y - console_top - 4)
+    command_result_height = min(24, result_space)
+    command_result_y = command_input_y - 4 - command_result_height
+    history_height = max(0, command_result_y - console_top - 4)
     speed_value = (
         panel_x + margin + speed_width,
         speed_y,
@@ -256,6 +312,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     return {
         "shield": (geometry.x, geometry.y, geometry.width, geometry.height),
         "panel": (panel_x, panel_y, panel_width, panel_height),
+        "title": (
+            panel_x + (24 if compact else 40),
+            panel_y + (2 if compact else 24),
+            panel_width - (48 if compact else 80),
+            18 if compact else 32,
+        ),
         "horizontal-shadow": (centre_x - 34, centre_y - 3, 69, 7),
         "vertical-shadow": (centre_x - 3, centre_y - 34, 7, 69),
         "horizontal": (centre_x - 32, centre_y - 1, 65, 3),
@@ -286,6 +348,24 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             max(1, panel_width - 2 * margin),
             apply_height,
         ),
+        "command_history": (
+            console_left,
+            console_top,
+            console_width,
+            history_height,
+        ),
+        "command_result": (
+            console_left,
+            command_result_y,
+            console_width,
+            command_result_height,
+        ),
+        "command_input": (
+            console_left,
+            command_input_y,
+            console_width,
+            command_input_height,
+        ),
         "crosshair_safe": (
             centre_x - safe_half_size,
             centre_y - safe_half_size,
@@ -303,6 +383,8 @@ _PANEL_ACTIONS = (
     "apply_return",
 )
 
+_PANEL_HIT_TARGETS = _PANEL_ACTIONS + ("command_input",)
+
 
 def point_in_rectangle(
     point: tuple[int, int], rectangle: tuple[int, int, int, int]
@@ -319,7 +401,7 @@ def panel_action_at(
 ) -> str | None:
     """Hit-test X11 root coordinates, including remote-desktop absolute input."""
 
-    for action in _PANEL_ACTIONS:
+    for action in _PANEL_HIT_TARGETS:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
             return action
@@ -396,6 +478,318 @@ class SettingsPanelModel:
                 and (not self.pending_restart or self.restart_available)
             )
         return False
+
+
+_COMMAND_STATUSES = frozenset(
+    {"unavailable", "idle", "editing", "pending", "success", "error", "restarting"}
+)
+_WARNING_DISPLAY_ALIASES = {
+    "已兼容执行；标准命令是 /summon": (
+        "Accepted /summom alias; standard command is /summon"
+    ),
+}
+
+
+def _bounded_status_text(value: object, *, maximum: int) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    cleaned = "".join(
+        character if ord(character) >= 0x20 and ord(character) != 0x7F else "?"
+        for character in value[:maximum]
+    )
+    return cleaned or None
+
+
+@dataclass(frozen=True)
+class CommandConsoleStatus:
+    available: bool
+    provider_editing: bool
+    in_flight: bool
+    status: str
+    request_id: str | None
+    sequence: int | None
+    result_revision: int
+    ok: bool | None
+    code: str | None
+    message: str | None
+    warning: str | None
+    restart_required: bool
+    outcome_unknown: bool
+
+    @property
+    def result_identity(self) -> tuple[object, ...]:
+        """Identity used to distinguish a new response from stale state JSON."""
+
+        return (
+            self.in_flight,
+            self.status,
+            self.request_id,
+            self.sequence,
+            self.result_revision,
+            self.ok,
+            self.code,
+            self.message,
+            self.warning,
+            self.restart_required,
+            self.outcome_unknown,
+        )
+
+
+def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
+    """Validate the provider's command result before rendering or gating input."""
+
+    raw = state.get("command_console")
+    raw = raw if isinstance(raw, dict) else {}
+    status_value = raw.get("status")
+    status = (
+        status_value
+        if isinstance(status_value, str) and status_value in _COMMAND_STATUSES
+        else "unavailable"
+    )
+    sequence_value = raw.get("sequence")
+    sequence = (
+        sequence_value
+        if type(sequence_value) is int and 1 <= sequence_value < 2**63
+        else None
+    )
+    revision_value = raw.get("result_revision", 0)
+    result_revision = (
+        revision_value
+        if type(revision_value) is int and 0 <= revision_value < 2**63
+        else 0
+    )
+    ok_value = raw.get("ok")
+    ok = ok_value if type(ok_value) is bool else None
+    warning = _bounded_status_text(raw.get("warning"), maximum=512)
+    warning = _WARNING_DISPLAY_ALIASES.get(warning, warning)
+    return CommandConsoleStatus(
+        available=raw.get("available") is True,
+        provider_editing=raw.get("editing") is True,
+        in_flight=raw.get("in_flight") is True,
+        status=status,
+        request_id=_bounded_status_text(raw.get("request_id"), maximum=128),
+        sequence=sequence,
+        result_revision=result_revision,
+        ok=ok,
+        code=_bounded_status_text(raw.get("code"), maximum=64),
+        message=_bounded_status_text(raw.get("message"), maximum=512),
+        warning=warning,
+        restart_required=raw.get("restart_required") is True,
+        outcome_unknown=raw.get("outcome_unknown") is True,
+    )
+
+
+@dataclass(frozen=True)
+class CommandEditOutcome:
+    action: str | None = None
+    command: str | None = None
+
+
+class CommandLineEditor:
+    """Small bounded ASCII editor; execution remains provider/runtime authority."""
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.cursor = 0
+        self.history: list[str] = []
+        self.history_index: int | None = None
+        self._history_draft = ""
+        self.editing = False
+        self.pending = False
+        self.revision = 0
+        self._pending_baseline: tuple[object, ...] | None = None
+        self._pending_acknowledged = False
+
+    def _changed(self) -> None:
+        self.revision += 1
+
+    def begin(self) -> bool:
+        if self.editing or self.pending:
+            return False
+        self.editing = True
+        self.history_index = None
+        self._history_draft = ""
+        self._changed()
+        return True
+
+    def end(self, *, force: bool = False) -> bool:
+        if self.pending and not force:
+            return False
+        changed = bool(self.editing or self.text or self.pending)
+        self.editing = False
+        self.pending = False
+        self.text = ""
+        self.cursor = 0
+        self.history_index = None
+        self._history_draft = ""
+        self._pending_baseline = None
+        self._pending_acknowledged = False
+        if changed:
+            self._changed()
+        return changed
+
+    def _leave_history_navigation(self) -> None:
+        self.history_index = None
+        self._history_draft = ""
+
+    def _replace_text(self, text: str) -> None:
+        self.text = text[:MAX_COMMAND_CHARS]
+        self.cursor = len(self.text)
+        self._changed()
+
+    def _history_up(self) -> bool:
+        if not self.history:
+            return False
+        if self.history_index is None:
+            self._history_draft = self.text
+            self.history_index = len(self.history) - 1
+        elif self.history_index > 0:
+            self.history_index -= 1
+        else:
+            return False
+        self._replace_text(self.history[self.history_index])
+        return True
+
+    def _history_down(self) -> bool:
+        if self.history_index is None:
+            return False
+        if self.history_index + 1 < len(self.history):
+            self.history_index += 1
+            replacement = self.history[self.history_index]
+        else:
+            self.history_index = None
+            replacement = self._history_draft
+            self._history_draft = ""
+        self._replace_text(replacement)
+        return True
+
+    def _submit(self, status: CommandConsoleStatus) -> CommandEditOutcome:
+        if (
+            not status.available
+            or status.in_flight
+            or status.outcome_unknown
+            or status.status in {"pending", "restarting", "unavailable"}
+        ):
+            return CommandEditOutcome()
+        command = self.text.strip()
+        if not command:
+            return CommandEditOutcome()
+        if len(command) > MAX_COMMAND_CHARS or any(
+            ord(character) < 0x20 or ord(character) > 0x7E
+            for character in command
+        ):
+            return CommandEditOutcome()
+        if not self.history or self.history[-1] != command:
+            self.history.append(command)
+            del self.history[:-_MAX_COMMAND_HISTORY]
+        self.text = ""
+        self.cursor = 0
+        self.history_index = None
+        self._history_draft = ""
+        self.pending = True
+        self._pending_baseline = status.result_identity
+        self._pending_acknowledged = False
+        self._changed()
+        return CommandEditOutcome(action="submit", command=command)
+
+    def reconcile(self, status: CommandConsoleStatus) -> bool:
+        """Clear the local pending latch only after a new terminal provider result."""
+
+        if not self.pending:
+            return False
+        if (
+            status.in_flight
+            or status.status in {"pending", "restarting"}
+            or status.result_identity != self._pending_baseline
+        ):
+            self._pending_acknowledged = True
+        if (
+            self._pending_acknowledged
+            and not status.in_flight
+            and status.status in {"success", "error"}
+        ):
+            self.pending = False
+            self._pending_baseline = None
+            self._pending_acknowledged = False
+            self._changed()
+            return True
+        return False
+
+    def handle_key(
+        self,
+        *,
+        keysym: int,
+        printable: str,
+        status: CommandConsoleStatus,
+    ) -> CommandEditOutcome:
+        if not self.editing or self.pending:
+            return CommandEditOutcome()
+        if keysym == _XK_ESCAPE:
+            self.end()
+            return CommandEditOutcome(action="end")
+        if keysym in {_XK_RETURN, _XK_KP_ENTER}:
+            return self._submit(status)
+        if keysym == _XK_LEFT:
+            if self.cursor > 0:
+                self.cursor -= 1
+                self._changed()
+            return CommandEditOutcome()
+        if keysym == _XK_RIGHT:
+            if self.cursor < len(self.text):
+                self.cursor += 1
+                self._changed()
+            return CommandEditOutcome()
+        if keysym == _XK_HOME:
+            if self.cursor != 0:
+                self.cursor = 0
+                self._changed()
+            return CommandEditOutcome()
+        if keysym == _XK_END:
+            if self.cursor != len(self.text):
+                self.cursor = len(self.text)
+                self._changed()
+            return CommandEditOutcome()
+        if keysym == _XK_UP:
+            self._history_up()
+            return CommandEditOutcome()
+        if keysym == _XK_DOWN:
+            self._history_down()
+            return CommandEditOutcome()
+        if keysym == _XK_BACK_SPACE:
+            if self.cursor > 0:
+                self._leave_history_navigation()
+                self.text = self.text[: self.cursor - 1] + self.text[self.cursor :]
+                self.cursor -= 1
+                self._changed()
+            return CommandEditOutcome()
+        if keysym == _XK_DELETE:
+            if self.cursor < len(self.text):
+                self._leave_history_navigation()
+                self.text = self.text[: self.cursor] + self.text[self.cursor + 1 :]
+                self._changed()
+            return CommandEditOutcome()
+        if printable and all(0x20 <= ord(character) <= 0x7E for character in printable):
+            available = MAX_COMMAND_CHARS - len(self.text)
+            addition = printable[:available]
+            if addition:
+                self._leave_history_navigation()
+                self.text = self.text[: self.cursor] + addition + self.text[self.cursor :]
+                self.cursor += len(addition)
+                self._changed()
+        return CommandEditOutcome()
+
+    def display_line(self, maximum_characters: int) -> str:
+        """Return a cursor-bearing window into the current command."""
+
+        maximum = max(1, int(maximum_characters))
+        if not self.editing and not self.text:
+            return "Click to type /summon or /tp"[:maximum]
+        content_width = max(1, maximum - 1)
+        start = max(0, self.cursor - content_width // 2)
+        start = min(start, max(0, len(self.text) - content_width))
+        visible = self.text[start : start + content_width]
+        cursor = min(len(visible), max(0, self.cursor - start))
+        return (visible[:cursor] + "|" + visible[cursor:])[:maximum]
 
 
 def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
@@ -496,8 +890,8 @@ def settings_hint_lines(state: dict[str, object]) -> tuple[bytes, bytes, bytes]:
         f"{'ERROR' if model.error else 'SAVED'}"
     )
     line3 = (
-        f"Click or M/-/+ to configure | Enter: {model.apply_label} | "
-        "F9: fallback  F10/F12: MouseLock  ESC: return"
+        f"Mouse buttons configure ({model.apply_label}) | "
+        "Click command box; Enter runs; ESC leaves editor first"
     )
     encoded = tuple(
         line.encode("ascii", errors="replace")
@@ -522,7 +916,7 @@ def atomic_json(path: Path, payload: dict[str, object]) -> None:
 
 
 class PointerActionPublisher:
-    """Publish one bounded JSON packet per completed pointer click."""
+    """Publish strict one-shot overlay intents on the inherited seqpacket."""
 
     def __init__(self, *, file_descriptor: int, session: str) -> None:
         if file_descriptor < 0:
@@ -534,26 +928,55 @@ class PointerActionPublisher:
         self._session = session
         self._sequence = 0
 
-    def publish(self, action: str) -> None:
-        if action not in _PANEL_ACTIONS:
-            raise ValueError(f"unsupported pointer action: {action}")
+    def _publish(self, kind: str, extra: dict[str, object]) -> None:
         self._sequence += 1
         payload = json.dumps(
             {
                 "version": 1,
                 "session": self._session,
                 "sequence": self._sequence,
-                "action": action,
+                "kind": kind,
+                **extra,
             },
             separators=(",", ":"),
             sort_keys=True,
+            allow_nan=False,
         ).encode("ascii")
-        if len(payload) >= 1024:
-            raise RuntimeError("pointer action packet is oversized")
+        if len(payload) > _MAX_INTENT_PACKET_BYTES:
+            raise RuntimeError("overlay intent packet is oversized")
         try:
-            self._socket.send(payload)
+            sent = self._socket.send(payload)
         except BlockingIOError as exc:
-            raise RuntimeError("pointer action channel is full") from exc
+            raise RuntimeError("overlay intent channel is full") from exc
+        if sent != len(payload):
+            raise RuntimeError(
+                f"partial overlay intent packet: sent {sent}/{len(payload)}"
+            )
+
+    def publish(self, action: str) -> None:
+        """Compatibility entry point for the existing pointer actions."""
+
+        if action not in _PANEL_ACTIONS:
+            raise ValueError(f"unsupported pointer action: {action}")
+        self._publish("action", {"action": action})
+
+    def publish_command_edit(self, active: bool) -> None:
+        if type(active) is not bool:
+            raise ValueError("command edit active flag must be boolean")
+        self._publish("command_edit", {"active": active})
+
+    def publish_command_submit(self, command: str) -> None:
+        if (
+            not isinstance(command, str)
+            or not command
+            or len(command) > MAX_COMMAND_CHARS
+            or any(
+                ord(character) < 0x20 or ord(character) > 0x7E
+                for character in command
+            )
+        ):
+            raise ValueError("command submit text must be bounded printable ASCII")
+        self._publish("command_submit", {"command": command})
 
     def close(self) -> None:
         self._socket.close()
@@ -655,11 +1078,16 @@ class X11CalibrationOverlay:
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
         self._last_geometry: WindowGeometry | None = None
         self._last_panel_model: SettingsPanelModel | None = None
+        self._last_command_status = command_console_status({})
+        self._last_command_revision = -1
         self._last_pointer: tuple[int, int] | None = None
         self._last_raise_s: float | None = None
         self._pressed_action: str | None = None
         self._pressed_window: int | None = None
         self._target_window: int | None = None
+        self._command_editor = CommandLineEditor()
+        self._keyboard_grabbed = False
+        self._deferred_ungrab_keycode: int | None = None
         self._create_windows()
 
     def _configure_signatures(self) -> None:
@@ -787,6 +1215,32 @@ class X11CalibrationOverlay:
                 [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long],
                 ctypes.c_int,
             ),
+            "XGrabKeyboard": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_ulong,
+                ],
+                ctypes.c_int,
+            ),
+            "XUngrabKeyboard": (
+                [ctypes.c_void_p, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
+            "XLookupString": (
+                [
+                    ctypes.POINTER(XKeyEvent),
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_ulong),
+                    ctypes.c_void_p,
+                ],
+                ctypes.c_int,
+            ),
+            "XQueryKeymap": ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
             "XStoreName": (
                 [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p],
                 ctypes.c_int,
@@ -957,7 +1411,12 @@ class X11CalibrationOverlay:
     def _make_interactive(self, window: int) -> None:
         attributes = XSetWindowAttributes()
         attributes.override_redirect = 1
-        attributes.event_mask = _BUTTON_PRESS_MASK | _BUTTON_RELEASE_MASK
+        attributes.event_mask = (
+            _BUTTON_PRESS_MASK
+            | _BUTTON_RELEASE_MASK
+            | _KEY_PRESS_MASK
+            | _KEY_RELEASE_MASK
+        )
         self._x11.XChangeWindowAttributes(
             self._display,
             window,
@@ -967,8 +1426,51 @@ class X11CalibrationOverlay:
         self._x11.XSelectInput(
             self._display,
             window,
-            _BUTTON_PRESS_MASK | _BUTTON_RELEASE_MASK,
+            attributes.event_mask,
         )
+
+    def _grab_keyboard(self) -> None:
+        if self._keyboard_grabbed:
+            return
+        if not self._visible:
+            raise RuntimeError("refusing to grab the keyboard while the panel is hidden")
+        # Mapping is asynchronous.  Synchronize before the grab so Xlib cannot
+        # legitimately answer GrabNotViewable for the just-mapped panel.
+        self._x11.XSync(self._display, 0)
+        result = int(
+            self._x11.XGrabKeyboard(
+                self._display,
+                self._windows["panel"],
+                0,
+                _GRAB_MODE_ASYNC,
+                _GRAB_MODE_ASYNC,
+                _CURRENT_TIME,
+            )
+        )
+        if result != _GRAB_SUCCESS:
+            raise RuntimeError(f"cannot grab command keyboard input: X11 status {result}")
+        self._keyboard_grabbed = True
+        self._deferred_ungrab_keycode = None
+        self._x11.XFlush(self._display)
+
+    def _ungrab_keyboard(self) -> None:
+        if not getattr(self, "_keyboard_grabbed", False):
+            return
+        try:
+            self._x11.XUngrabKeyboard(self._display, _CURRENT_TIME)
+            self._x11.XFlush(self._display)
+        finally:
+            self._keyboard_grabbed = False
+            self._deferred_ungrab_keycode = None
+
+    def _release_key_is_still_down(self, keycode: int) -> bool:
+        if not 0 <= keycode <= 255:
+            return False
+        keymap = ctypes.create_string_buffer(32)
+        if not self._x11.XQueryKeymap(self._display, keymap):
+            # A failed query cannot prove that the physical Escape was released.
+            return True
+        return bool(keymap.raw[keycode >> 3] & (1 << (keycode & 7)))
 
     def _set_bounding_shape(
         self,
@@ -1320,21 +1822,132 @@ class X11CalibrationOverlay:
             centred_in=(x, y, width, height),
         )
 
+    @staticmethod
+    def _clip_console_line(value: str, width: int) -> str:
+        maximum = max(1, width // 10)
+        if len(value) <= maximum:
+            return value
+        if maximum <= 3:
+            return value[:maximum]
+        return value[: maximum - 3] + "..."
+
+    def _draw_command_console(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        status: CommandConsoleStatus,
+    ) -> None:
+        editor = self._command_editor
+        history_x, history_y, history_width, history_height = self._panel_rectangle(
+            layout, "command_history"
+        )
+        if history_height >= 18:
+            self._draw_text(
+                "RECENT COMMANDS  (Up/Down to recall)",
+                x=history_x,
+                y=history_y + 14,
+                colour=self._colours["muted"],
+            )
+            available_lines = max(0, history_height // 20 - 1)
+            recent = editor.history[-available_lines:] if available_lines else []
+            for index, command in enumerate(recent):
+                self._draw_text(
+                    self._clip_console_line(f"> {command}", history_width),
+                    x=history_x,
+                    y=history_y + 34 + index * 20,
+                    colour=self._colours["white"],
+                )
+
+        result_x, result_y, result_width, result_height = self._panel_rectangle(
+            layout, "command_result"
+        )
+        if editor.pending or status.in_flight or status.status in {"pending", "restarting"}:
+            result_text = "[PENDING] Waiting for Matrix command response..."
+            result_colour = self._colours["pending"]
+        elif status.status == "success":
+            result_text = f"[OK {status.code or 'OK'}] {status.message or 'Command completed'}"
+            if status.warning:
+                result_text += f" | {status.warning}"
+            result_colour = self._colours["apply"]
+        elif status.status == "error":
+            result_text = f"[ERROR {status.code or 'ERROR'}] {status.message or 'Command failed'}"
+            result_colour = self._colours["error"]
+        elif not status.available:
+            result_text = "[UNAVAILABLE] Game command channel is not available"
+            result_colour = self._colours["disabled"]
+        else:
+            result_text = "Enter runs the command; Escape clears and leaves command editing"
+            result_colour = self._colours["muted"]
+        if result_height >= 14:
+            self._draw_text(
+                self._clip_console_line(result_text, result_width),
+                x=result_x,
+                y=result_y + min(result_height - 2, 16),
+                colour=result_colour,
+            )
+
+        input_x, input_y, input_width, input_height = self._panel_rectangle(
+            layout, "command_input"
+        )
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        if editor.pending:
+            fill = self._colours["disabled"]
+        elif editor.editing:
+            fill = self._colours["selected"]
+        else:
+            fill = self._colours["button"]
+        self._x11.XSetForeground(self._display, gc, fill)
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            input_x,
+            input_y,
+            input_width,
+            input_height,
+        )
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["pending" if editor.pending else "outline"],
+        )
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            input_x,
+            input_y,
+            max(1, input_width - 1),
+            max(1, input_height - 1),
+        )
+        maximum_characters = max(1, (input_width - 28) // 10)
+        input_text = editor.display_line(maximum_characters)
+        self._draw_text(
+            self._clip_console_line(f"> {input_text}", input_width - 18),
+            x=input_x + 10,
+            y=input_y + input_height // 2 + 6,
+            colour=self._colours["muted" if editor.pending else "white"],
+        )
+
     def _draw_panel(
         self,
         layout: dict[str, tuple[int, int, int, int]],
         model: SettingsPanelModel,
+        command_status: CommandConsoleStatus | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         compact = panel_height < 600
         panel = self._windows["panel"]
         self._x11.XClearWindow(self._display, panel)
+        title_x, title_y, _title_width, title_height = self._panel_rectangle(
+            layout, "title"
+        )
         self._draw_text(
-            "MATRIX MOUSE CONTROLS",
-            x=24 if compact else 40,
-            y=20 if compact else max(36, panel_height // 14),
+            "MATRIX SETTINGS + COMMANDS",
+            x=title_x,
+            y=title_y + title_height - (6 if compact else 4),
             colour=self._colours["white"],
-            large=True,
+            large=not compact,
         )
         if not compact:
             self._draw_text(
@@ -1402,7 +2015,6 @@ class X11CalibrationOverlay:
                 speed_value[3],
             ),
         )
-        status_y = panel_height // 2 + (62 if compact else 72)
         if model.status == "restarting":
             status_text = "Reloading the complete Matrix runtime - keep controls released"
             status_colour = self._colours["pending"]
@@ -1418,19 +2030,25 @@ class X11CalibrationOverlay:
         else:
             status_text = "No reload needed"
             status_colour = self._colours["muted"]
-        self._draw_text(
-            status_text,
-            x=32,
-            y=status_y,
-            colour=status_colour,
-        )
         if not compact:
+            profile_y = self._panel_rectangle(layout, "profile_local")[1]
+            self._draw_text(
+                status_text,
+                x=40,
+                y=max(96, profile_y - 42),
+                colour=status_colour,
+            )
             self._draw_text(
                 "Fine: 0.01-0.10 by 0.01 | Coarse: 0.20-1.00 by 0.10",
-                x=32,
-                y=status_y + 22,
+                x=40,
+                y=max(116, profile_y - 20),
                 colour=self._colours["muted"],
             )
+        self._draw_command_console(
+            layout,
+            command_status
+            or getattr(self, "_last_command_status", command_console_status({})),
+        )
         apply_disabled = not model.action_enabled("apply_return")
         apply_fill = self._colours[
             "disabled"
@@ -1444,21 +2062,132 @@ class X11CalibrationOverlay:
             fill=apply_fill,
             disabled=apply_disabled,
         )
-        footer = "Enter: Apply/Return   Esc: Back   F9: fallback   F10/F12: MouseLock"
-        self._draw_text(
-            footer,
-            x=20 if compact else 40,
-            y=max(18, panel_height - 10),
-            colour=self._colours["muted"],
+        if not compact:
+            footer = "Click command box to type | Enter: run | Esc: leave editor, then back"
+            self._draw_text(
+                footer,
+                x=40,
+                y=max(18, panel_height - 10),
+                colour=self._colours["muted"],
+            )
+
+    def _begin_command_editing(self, publisher: PointerActionPublisher) -> bool:
+        status = self._last_command_status
+        if (
+            not self._visible
+            or not status.available
+            or self._command_editor.pending
+            or status.in_flight
+            or status.restart_required
+            or status.outcome_unknown
+            or status.status in {"pending", "restarting", "unavailable"}
+            or self._deferred_ungrab_keycode is not None
+            or self._keyboard_grabbed
+            or not self._command_editor.begin()
+        ):
+            return False
+        try:
+            self._grab_keyboard()
+            publisher.publish_command_edit(True)
+        except Exception:
+            self._command_editor.end(force=True)
+            self._ungrab_keyboard()
+            raise
+        return True
+
+    def _force_end_command_editing(
+        self,
+        publisher: PointerActionPublisher | None,
+    ) -> bool:
+        was_editing = self._command_editor.editing
+        if not was_editing and not self._keyboard_grabbed:
+            return False
+        self._command_editor.end(force=True)
+        try:
+            if was_editing and publisher is not None:
+                publisher.publish_command_edit(False)
+        finally:
+            self._ungrab_keyboard()
+        return True
+
+    def _lookup_key(self, event: XKeyEvent) -> tuple[int, str]:
+        buffer = ctypes.create_string_buffer(32)
+        keysym = ctypes.c_ulong()
+        count = int(
+            self._x11.XLookupString(
+                ctypes.byref(event),
+                ctypes.cast(buffer, ctypes.c_void_p),
+                len(buffer) - 1,
+                ctypes.byref(keysym),
+                None,
+            )
         )
+        if count <= 0:
+            return (int(keysym.value), "")
+        raw = bytes(buffer.raw[: min(count, len(buffer) - 1)])
+        try:
+            printable = raw.decode("ascii")
+        except UnicodeDecodeError:
+            printable = ""
+        return (int(keysym.value), printable)
+
+    def _handle_key_press(
+        self,
+        event: XKeyEvent,
+        publisher: PointerActionPublisher,
+    ) -> int:
+        if not self._visible or not self._keyboard_grabbed:
+            return 0
+        keysym, printable = self._lookup_key(event)
+        outcome = self._command_editor.handle_key(
+            keysym=keysym,
+            printable=printable,
+            status=self._last_command_status,
+        )
+        if outcome.action == "submit":
+            assert outcome.command is not None
+            publisher.publish_command_submit(outcome.command)
+            return 1
+        if outcome.action == "end":
+            publisher.publish_command_edit(False)
+            # Keep the active grab through the physical Escape release.  This
+            # prevents its release or auto-repeat presses from leaking into the
+            # still-focused UE window after command editing ends.
+            keycode = int(event.keycode)
+            if not 8 <= keycode <= 255:
+                # A real X11 keyboard event cannot carry an out-of-range
+                # keycode.  Escalate to the main fail-closed exception path;
+                # close() will immediately release the grab there.
+                raise RuntimeError(f"invalid Escape keycode from X11: {keycode}")
+            self._deferred_ungrab_keycode = keycode
+            return 1
+        return 0
+
+    def _handle_key_release(self, event: XKeyEvent) -> None:
+        deferred = self._deferred_ungrab_keycode
+        if (
+            deferred is not None
+            and int(event.keycode) == deferred
+            and not self._release_key_is_still_down(deferred)
+        ):
+            self._ungrab_keyboard()
 
     def drain_pointer_actions(self, publisher: PointerActionPublisher) -> int:
-        """Commit only a left-button release inside its original large button."""
+        """Drain bounded keyboard intents and completed left-button clicks."""
 
         emitted = 0
         while self._x11.XPending(self._display) > 0:
             event = XEvent()
             self._x11.XNextEvent(self._display, ctypes.byref(event))
+            event_type = int(event.type)
+            if event_type == _KEY_PRESS:
+                emitted += self._handle_key_press(event.xkey, publisher)
+                continue
+            if event_type == _KEY_RELEASE:
+                self._handle_key_release(event.xkey)
+                continue
+            if event_type not in {_BUTTON_PRESS, _BUTTON_RELEASE}:
+                continue
             button = event.xbutton
             if button.button != 1:
                 continue
@@ -1468,20 +2197,34 @@ class X11CalibrationOverlay:
                 if layout is not None
                 else None
             )
-            if event.type == _BUTTON_PRESS:
+            if event_type == _BUTTON_PRESS:
                 self._pressed_action = action
                 self._pressed_window = int(button.window)
-            elif event.type == _BUTTON_RELEASE:
+            elif event_type == _BUTTON_RELEASE:
                 pressed = self._pressed_action
                 pressed_window = self._pressed_window
                 self._pressed_action = None
                 self._pressed_window = None
                 if (
-                    pressed is not None
-                    and action == pressed
-                    and pressed_window == int(button.window)
-                    and self._last_panel_model is not None
+                    pressed is None
+                    or action != pressed
+                    or pressed_window != int(button.window)
+                    or not self._visible
+                ):
+                    continue
+                if action == "command_input":
+                    if self._begin_command_editing(publisher):
+                        emitted += 1
+                elif (
+                    self._last_panel_model is not None
                     and self._last_panel_model.action_enabled(action)
+                    and not self._command_editor.editing
+                    and not self._command_editor.pending
+                    and not self._last_command_status.in_flight
+                    and not self._last_command_status.restart_required
+                    and not self._last_command_status.outcome_unknown
+                    and self._last_command_status.status
+                    not in {"pending", "restarting"}
                 ):
                     publisher.publish(action)
                     emitted += 1
@@ -1499,7 +2242,13 @@ class X11CalibrationOverlay:
         first_show = not self._visible
         geometry_changed = geometry != self._last_geometry
         model = settings_panel_model(state)
-        model_changed = model != self._last_panel_model
+        command_status = command_console_status(state)
+        self._command_editor.reconcile(command_status)
+        model_changed = bool(
+            model != self._last_panel_model
+            or command_status != self._last_command_status
+            or self._command_editor.revision != self._last_command_revision
+        )
         if geometry_changed or self._last_layout is None:
             layout = overlay_layout(geometry)
         else:
@@ -1525,7 +2274,7 @@ class X11CalibrationOverlay:
             for name in static_order:
                 self._x11.XRaiseWindow(self._display, self._windows[name])
         if first_show or geometry_changed or model_changed:
-            self._draw_panel(layout, model)
+            self._draw_panel(layout, model, command_status)
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
         if not self._cursor_visible or pointer_changed:
@@ -1558,13 +2307,16 @@ class X11CalibrationOverlay:
         self._last_layout = layout
         self._last_geometry = geometry
         self._last_panel_model = model
+        self._last_command_status = command_status
+        self._last_command_revision = self._command_editor.revision
         self._last_pointer = pointer
         if raise_due:
             self._last_raise_s = now
         self._visible = True
         self._cursor_visible = True
 
-    def hide(self) -> None:
+    def hide(self, publisher: PointerActionPublisher | None = None) -> None:
+        self._force_end_command_editing(publisher)
         if not self._visible and not self._cursor_visible:
             return
         for window in self._windows.values():
@@ -1575,6 +2327,8 @@ class X11CalibrationOverlay:
         self._last_layout = None
         self._last_geometry = None
         self._last_panel_model = None
+        self._last_command_status = command_console_status({})
+        self._last_command_revision = self._command_editor.revision
         self._last_pointer = None
         self._last_raise_s = None
         self._pressed_action = None
@@ -1584,17 +2338,23 @@ class X11CalibrationOverlay:
         display = getattr(self, "_display", None)
         if not display:
             return
-        if self._panel_gc is not None:
-            self._x11.XFreeGC(display, ctypes.c_void_p(self._panel_gc))
+        editor = getattr(self, "_command_editor", None)
+        if editor is not None:
+            editor.end(force=True)
+        self._ungrab_keyboard()
+        panel_gc = getattr(self, "_panel_gc", None)
+        if panel_gc is not None:
+            self._x11.XFreeGC(display, ctypes.c_void_p(panel_gc))
             self._panel_gc = None
         for attribute in ("_body_font", "_large_font"):
             font = getattr(self, attribute, None)
             if font is not None:
                 self._x11.XFreeFont(display, font)
                 setattr(self, attribute, None)
-        for window in self._windows.values():
+        windows = getattr(self, "_windows", {})
+        for window in windows.values():
             self._x11.XDestroyWindow(display, window)
-        self._windows.clear()
+        windows.clear()
         self._x11.XSync(display, 0)
         self._x11.XCloseDisplay(display)
         self._display = None
@@ -1686,13 +2446,13 @@ def main() -> int:
                     or pointer is None
                     or not overlay_supported(target)
                 ):
-                    overlay.hide()
+                    overlay.hide(action_publisher)
                 else:
                     overlay.show(target, pointer, state)
                 assert action_publisher is not None
                 overlay.drain_pointer_actions(action_publisher)
             else:
-                overlay.hide()
+                overlay.hide(action_publisher)
                 assert action_publisher is not None
                 overlay.drain_pointer_actions(action_publisher)
             time.sleep(interval)

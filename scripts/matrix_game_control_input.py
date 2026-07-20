@@ -61,6 +61,16 @@ from matrix_game_control import (
     encode_input_packet,
     wrap_angle_rad,
 )
+from matrix_mc_commands import (
+    CommandParseError,
+    CommandProtocolError,
+    GameCommandRequest,
+    MAX_COMMAND_CHARS,
+    MAX_COMMAND_PACKET_BYTES,
+    decode_command_response,
+    encode_command_request,
+    parse_mc_command,
+)
 
 
 DEFAULT_SOCKET = Path(
@@ -527,6 +537,16 @@ class ApplyReturnController:
             "status": self.status,
             "error": self.error,
         }
+
+    def cancel_pending(self) -> bool:
+        """Cancel a deferred Apply/Return when command editing takes ownership."""
+
+        changed = self.pending_intent or self.status == "waiting_neutral"
+        self.pending_intent = False
+        if self.status == "waiting_neutral":
+            self.status = "idle"
+            self.error = None
+        return changed
 
 
 def calibration_interlock_required(
@@ -2957,9 +2977,380 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+@dataclass(frozen=True)
+class OverlayIntent:
+    """One authenticated action emitted by the supervised overlay child."""
+
+    kind: str
+    action: str | None = None
+    command: str | None = None
+    active: bool | None = None
+
+
+class GameCommandClient:
+    """Send one typed MC command at a time over an inherited socketpair.
+
+    Raw command text terminates here: :func:`parse_mc_command` produces the
+    typed AST carried by ``matrix-game-command/v1``.  A successfully sent
+    request remains authoritative until its exact response arrives.  The
+    client never reconnects, resends, or converts a timeout into a retry.
+    """
+
+    def __init__(self, file_descriptor: int | None) -> None:
+        self._connection: socket.socket | None = None
+        self._session = os.urandom(16).hex()
+        self._sequence = 0
+        self._result_revision = 0
+        self._pending: GameCommandRequest | None = None
+        self._pending_warning: str | None = None
+        self._outcome_unknown = False
+        self.editing = False
+        self._escape_release_required = False
+        self.status = "unavailable" if file_descriptor is None else "idle"
+        self.ok: bool | None = None
+        self.code: str | None = None
+        self.message: str | None = (
+            "Game commands are unavailable for this run"
+            if file_descriptor is None
+            else None
+        )
+        self.warning: str | None = None
+        self.restart_required = False
+        self.data: dict[str, object] | None = None
+        self.last_request_id: str | None = None
+        if file_descriptor is None:
+            return
+        if (
+            isinstance(file_descriptor, bool)
+            or not isinstance(file_descriptor, int)
+            or file_descriptor < 0
+        ):
+            raise ValueError("game command file descriptor must be non-negative")
+        connection: socket.socket | None = None
+        try:
+            connection = socket.socket(fileno=file_descriptor)
+            if connection.family != socket.AF_UNIX:
+                raise ValueError("game command channel must be an AF_UNIX socket")
+            if (
+                connection.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+                != socket.SOCK_SEQPACKET
+            ):
+                raise ValueError("game command channel must use SOCK_SEQPACKET")
+            connection.setblocking(False)
+        except Exception:
+            if connection is not None:
+                connection.close()
+            raise
+        self._connection = connection
+
+    @property
+    def available(self) -> bool:
+        return self._connection is not None
+
+    @property
+    def in_flight(self) -> bool:
+        return self._pending is not None
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return self._outcome_unknown
+
+    def _local_error(self, code: str, message: str) -> None:
+        self._result_revision += 1
+        self._outcome_unknown = False
+        self.status = "error"
+        self.ok = False
+        self.code = code
+        self.message = message
+        self.warning = None
+        self.restart_required = False
+        self.data = None
+        self.last_request_id = None
+
+    def _close_channel(self) -> None:
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            connection.close()
+
+    def _protocol_failure(self, message: str) -> None:
+        pending = self._pending
+        self._pending = None
+        self._pending_warning = None
+        self._close_channel()
+        if pending is not None:
+            # A full SOCK_SEQPACKET record was accepted before this failure.
+            # The runtime may already have committed the world-state mutation,
+            # so presenting an ordinary failure would invite a duplicate
+            # summon if the operator retried.  Preserve the correlation id and
+            # make the ambiguity terminal for this provider generation.
+            detail = message[:256]
+            self._result_revision += 1
+            self._outcome_unknown = True
+            self.status = "error"
+            self.ok = None
+            self.code = "E_COMMAND_OUTCOME_UNKNOWN"
+            self.message = (
+                f"Command outcome unknown ({detail}); do not retry blindly. "
+                "Restart Matrix and inspect the persisted world state"
+            )
+            self.warning = None
+            self.restart_required = False
+            self.data = None
+            self.last_request_id = pending.request_id
+            return
+        self._local_error("E_COMMAND_PROTOCOL", message)
+
+    def set_editing(
+        self,
+        editing: bool,
+        *,
+        panel_active: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Apply an overlay editor-level intent without weakening panel gates."""
+
+        if type(editing) is not bool:
+            raise TypeError("command editing state must be boolean")
+        if editing and (
+            self.restart_required
+            or self._outcome_unknown
+            or not self.available
+            or not panel_active
+            or restart_requested
+            or self.in_flight
+        ):
+            return False
+        changed = self.editing != editing
+        self.editing = editing
+        if changed and self.code is None:
+            self.status = "editing" if editing and self.available else (
+                "idle" if self.available else "unavailable"
+            )
+        return changed
+
+    def panel_closed(self) -> bool:
+        """Clear editor state after a legitimate panel exit."""
+
+        if self.in_flight or self.restart_required or self.outcome_unknown:
+            return False
+        changed = self.editing
+        self.editing = False
+        self._escape_release_required = False
+        if self.code is None:
+            self.status = "idle" if self.available else "unavailable"
+        return changed
+
+    def panel_escape_pressed(
+        self, pressed: bool, *, editor_owned_this_frame: bool = False
+    ) -> bool:
+        """Return the Escape level visible to the outer calibration toggle.
+
+        The first Escape while editing belongs to the editor.  Even after the
+        overlay publishes ``command_edit(false)``, the held level stays masked
+        until a physical release, so it cannot become a synthetic panel-close
+        edge on the following provider frame.  Pending commands likewise keep
+        the safe panel open.
+        """
+
+        if type(pressed) is not bool:
+            raise TypeError("Escape level must be boolean")
+        if type(editor_owned_this_frame) is not bool:
+            raise TypeError("editor-owned Escape flag must be boolean")
+        editor_owned_this_frame = bool(editor_owned_this_frame and self.available)
+        if not pressed:
+            self._escape_release_required = False
+            return False
+        if (
+            self.editing
+            or self.in_flight
+            or self.restart_required
+            or self._outcome_unknown
+            or editor_owned_this_frame
+        ):
+            self._escape_release_required = True
+            return False
+        if self._escape_release_required:
+            return False
+        return True
+
+    def submit(
+        self,
+        command_text: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Parse and atomically send one request when every ESC gate is true."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before commands")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if not self.editing:
+            self._local_error(
+                "E_COMMAND_EDIT_REQUIRED", "Activate the command input first"
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        connection = self._connection
+        if connection is None:
+            self._local_error(
+                "E_COMMAND_UNAVAILABLE", "Game commands are unavailable for this run"
+            )
+            return False
+        try:
+            parsed = parse_mc_command(command_text)
+        except CommandParseError as exc:
+            message = exc.message
+            if exc.column is not None:
+                message = f"{message} (column {exc.column})"
+            self._local_error(exc.code, message)
+            return False
+        self._sequence += 1
+        request = GameCommandRequest(
+            session=self._session,
+            sequence=self._sequence,
+            request_id=f"cmd-{os.urandom(16).hex()}",
+            command=parsed.command,
+        )
+        payload = encode_command_request(request)
+        try:
+            sent = connection.send(payload)
+        except BlockingIOError as exc:
+            # SOCK_SEQPACKET writes are atomic.  No bytes were accepted on
+            # BlockingIOError, but retrying automatically would make execution
+            # ambiguous if the failure mode ever changes.
+            self._local_error("E_COMMAND_SEND", f"Could not send command: {exc}")
+            return False
+        except OSError as exc:
+            self._close_channel()
+            self._local_error("E_COMMAND_SEND", f"Could not send command: {exc}")
+            return False
+        if sent != len(payload):
+            self._close_channel()
+            self._local_error(
+                "E_COMMAND_SEND",
+                f"Partial command packet write: sent {sent}/{len(payload)}",
+            )
+            return False
+        self._pending = request
+        self._pending_warning = parsed.warning
+        self._result_revision += 1
+        self.status = "pending"
+        self.ok = None
+        self.code = None
+        self.message = "Command submitted; waiting for the runtime"
+        self.warning = parsed.warning
+        self.restart_required = False
+        self.data = None
+        self.last_request_id = request.request_id
+        return True
+
+    def poll(self) -> bool:
+        """Receive at most one exact response; never resend a pending request."""
+
+        connection = self._connection
+        if connection is None:
+            return False
+        try:
+            payload = connection.recv(MAX_COMMAND_PACKET_BYTES + 1)
+        except BlockingIOError:
+            return False
+        except OSError as exc:
+            self._protocol_failure(f"Game command channel failed: {exc}")
+            return True
+        if not payload:
+            if self.restart_required:
+                self._close_channel()
+                return True
+            self._protocol_failure("Game command runtime closed its channel")
+            return True
+        try:
+            response = decode_command_response(payload)
+        except CommandProtocolError as exc:
+            self._protocol_failure(f"Invalid game command response: {exc}")
+            return True
+        pending = self._pending
+        if pending is None:
+            self._protocol_failure("Received an unsolicited game command response")
+            return True
+        if (
+            response.session != pending.session
+            or response.sequence != pending.sequence
+            or response.request_id != pending.request_id
+        ):
+            self._protocol_failure("Game command response identity did not match")
+            return True
+        self._pending = None
+        warning = self._pending_warning
+        self._pending_warning = None
+        self._result_revision += 1
+        self._outcome_unknown = False
+        self.ok = response.ok
+        self.code = response.code
+        self.message = response.message
+        self.warning = warning
+        self.restart_required = response.restart_required
+        self.data = dict(response.data) if response.data is not None else None
+        self.last_request_id = response.request_id
+        if response.ok and response.restart_required:
+            self.status = "restarting"
+        else:
+            self.status = "success" if response.ok else "error"
+        return True
+
+    def mapping(self) -> dict[str, object]:
+        return {
+            "available": self.available,
+            "editing": self.editing,
+            "in_flight": self.in_flight,
+            "status": self.status,
+            "request_id": self.last_request_id,
+            "sequence": self._sequence,
+            "result_revision": self._result_revision,
+            "ok": self.ok,
+            "code": self.code,
+            "message": self.message,
+            "warning": self.warning,
+            "restart_required": self.restart_required,
+            "outcome_unknown": self.outcome_unknown,
+            "data": self.data,
+        }
+
+    def close(self) -> None:
+        # The provider can receive SIGTERM after the runtime closed its side
+        # of the socket but before the next frame polls EOF.  First drain one
+        # already-buffered response; if the request is still unresolved, keep
+        # its correlation id and report a terminal outcome-unknown instead of
+        # silently erasing the in-flight command during cleanup.
+        if self._pending is not None:
+            self.poll()
+        if self._pending is not None:
+            self._protocol_failure(
+                "Game command provider stopped before the runtime response"
+            )
+            return
+        self._pending_warning = None
+        self._close_channel()
+
+
 class CalibrationOverlaySupervisor:
     """Own the X11 overlay and its private pointer-intent socket."""
 
+    _MAX_INTENT_PACKET_BYTES = 2048
     _ALLOWED_ACTIONS = frozenset(
         {
             "profile_local",
@@ -3082,47 +3473,96 @@ class CalibrationOverlaySupervisor:
         if code is not None:
             raise RuntimeError(f"calibration overlay exited with code {code}")
 
-    def drain_actions(self) -> tuple[str, ...]:
-        """Drain bounded, versioned pointer intents from the known child."""
+    @staticmethod
+    def _strict_intent_object(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise RuntimeError(f"duplicate overlay intent field {key!r}")
+            result[key] = value
+        return result
+
+    def drain_intents(self) -> tuple[OverlayIntent, ...]:
+        """Drain bounded, versioned intents from the known overlay child."""
 
         connection = self._action_socket
         if connection is None:
             raise RuntimeError("calibration overlay action channel is unavailable")
-        actions: list[str] = []
+        intents: list[OverlayIntent] = []
         for _ in range(32):
             try:
-                payload = connection.recv(1024)
+                payload = connection.recv(self._MAX_INTENT_PACKET_BYTES + 1)
             except BlockingIOError:
                 break
             if not payload:
                 self.ensure_running()
                 raise RuntimeError("calibration overlay action channel closed")
-            if len(payload) >= 1024:
-                raise RuntimeError("calibration overlay action packet is oversized")
+            if len(payload) > self._MAX_INTENT_PACKET_BYTES:
+                raise RuntimeError("calibration overlay intent packet is oversized")
             try:
-                value = json.loads(payload.decode("ascii"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError("invalid calibration overlay action packet") from exc
-            if not isinstance(value, dict) or set(value) != {
-                "version",
-                "session",
-                "sequence",
-                "action",
-            }:
-                raise RuntimeError("invalid calibration overlay action schema")
+                value = json.loads(
+                    payload.decode("utf-8"),
+                    object_pairs_hook=self._strict_intent_object,
+                    parse_constant=lambda token: (_ for _ in ()).throw(
+                        RuntimeError(f"invalid overlay JSON constant {token}")
+                    ),
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, RuntimeError) as exc:
+                raise RuntimeError("invalid calibration overlay intent packet") from exc
+            if not isinstance(value, dict):
+                raise RuntimeError("invalid calibration overlay intent schema")
             sequence = value.get("sequence")
-            action = value.get("action")
             if (
                 value.get("version") != 1
                 or value.get("session") != self._action_session
                 or type(sequence) is not int
                 or sequence <= self._last_action_sequence
-                or action not in self._ALLOWED_ACTIONS
             ):
-                raise RuntimeError("invalid calibration overlay action identity")
+                raise RuntimeError("invalid calibration overlay intent identity")
+            kind = value.get("kind")
+            if kind == "action":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "action",
+                } or value.get("action") not in self._ALLOWED_ACTIONS:
+                    raise RuntimeError("invalid calibration overlay action intent")
+                intent = OverlayIntent(kind="action", action=value["action"])
+            elif kind == "command_edit":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "active",
+                } or type(value.get("active")) is not bool:
+                    raise RuntimeError("invalid calibration overlay command-edit intent")
+                intent = OverlayIntent(kind="command_edit", active=value["active"])
+            elif kind == "command_submit":
+                command = value.get("command")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "command",
+                    }
+                    or not isinstance(command, str)
+                    or len(command) > MAX_COMMAND_CHARS
+                ):
+                    raise RuntimeError("invalid calibration overlay command-submit intent")
+                intent = OverlayIntent(kind="command_submit", command=command)
+            else:
+                raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
-            actions.append(action)
-        return tuple(actions)
+            intents.append(intent)
+        return tuple(intents)
 
     def close(self) -> None:
         process = self.process
@@ -3282,6 +3722,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--restart-request-file", type=Path)
     parser.add_argument("--restart-capability-file", type=Path)
     parser.add_argument("--restart-launcher-pid", type=int)
+    parser.add_argument(
+        "--game-command-fd",
+        type=int,
+        help="Inherited private SOCK_SEQPACKET channel for typed ESC commands",
+    )
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print canonical packets; do not connect"
@@ -3375,6 +3820,14 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise SystemExit(f"--{name.replace('_', '-')} must be absolute")
     if args.restart_launcher_pid is not None and args.restart_launcher_pid <= 1:
         raise SystemExit("--restart-launcher-pid must be greater than one")
+    game_command_fd = getattr(args, "game_command_fd", None)
+    if game_command_fd is not None:
+        if game_command_fd < 0:
+            raise SystemExit("--game-command-fd must be non-negative")
+        try:
+            os.fstat(game_command_fd)
+        except OSError as exc:
+            raise SystemExit(f"--game-command-fd is not open: {exc}") from exc
 
 
 def main() -> int:
@@ -3477,6 +3930,12 @@ def main() -> int:
                 f"Matrix game-control input cannot initialize UE final-POV reader: {exc}"
             ) from exc
     publisher = None if args.dry_run else UnixSeqpacketPublisher(args.socket)
+    try:
+        game_command_client = GameCommandClient(getattr(args, "game_command_fd", None))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(
+            f"Matrix game-control input cannot initialize command channel: {exc}"
+        ) from exc
     calibration = CalibrationModeController()
     shortcut_arming = StartupShortcutArming()
 
@@ -3530,6 +3989,7 @@ def main() -> int:
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
+                    "command_console": game_command_client.mapping(),
                     "mirror_sensitivity": sensitivity_telemetry,
                     "pointer": x11.pointer_telemetry,
                     "camera_yaw": camera_yaw_telemetry(
@@ -3557,25 +4017,91 @@ def main() -> int:
             previous_frame = now
             next_frame = max(next_frame + 1.0 / args.rate_hz, now)
 
+            command_state_changed = game_command_client.poll()
             raw_keyboard = x11.poll()
             last_keyboard = raw_keyboard
             raw_pad = gamepad.poll(now)
+            panel_intents = overlay.drain_intents() if overlay is not None else ()
             shortcuts_armed = shortcut_arming.update(
                 escape_pressed=raw_keyboard.escape,
                 restart_pressed=raw_keyboard.apply_restart,
             )
             panel_was_active = calibration.active
+            panel_escape = game_command_client.panel_escape_pressed(
+                raw_keyboard.escape if shortcuts_armed else False,
+                # A begin/end pair can both arrive inside one 20 ms provider
+                # frame.  The overlay still owned that physical Escape even if
+                # the provider had not published the intermediate edit state.
+                editor_owned_this_frame=any(
+                    intent.kind == "command_edit" for intent in panel_intents
+                )
+                and game_command_client.available,
+            )
             calibration_toggled = calibration.update(
-                escape_pressed=raw_keyboard.escape if shortcuts_armed else False,
+                escape_pressed=panel_escape,
                 ue_focused=raw_keyboard.focused,
             )
             if calibration_toggled or not calibration.active:
                 calibration_neutral_frames = 0
-            panel_actions = overlay.drain_actions() if overlay is not None else ()
+            if panel_was_active and not calibration.active:
+                command_state_changed = bool(
+                    game_command_client.panel_closed() or command_state_changed
+                )
+            neutral_frame_ready = bool(
+                calibration_neutral_frames >= 1
+                and (publisher is None or publisher.connected)
+            )
+            panel_actions: list[str] = []
+            for intent in panel_intents:
+                if intent.kind == "action":
+                    assert intent.action is not None
+                    panel_actions.append(intent.action)
+                    continue
+                if intent.kind == "command_edit":
+                    assert intent.active is not None
+                    command_state_changed = bool(
+                        game_command_client.set_editing(
+                            intent.active,
+                            panel_active=calibration.active,
+                            restart_requested=restart_requester.requested,
+                        )
+                        or command_state_changed
+                    )
+                    if intent.active:
+                        apply_return.cancel_pending()
+                    continue
+                assert intent.kind == "command_submit"
+                assert intent.command is not None
+                command_submitted = game_command_client.submit(
+                    intent.command,
+                    calibration_active=calibration.active,
+                    neutral_frame_ready=neutral_frame_ready,
+                    restart_requested=restart_requester.requested,
+                )
+                # Local parse/gate failures also change the visible result.
+                command_state_changed = True
+                if command_submitted:
+                    apply_return.cancel_pending()
+            command_controls_blocked = bool(
+                game_command_client.editing
+                or game_command_client.in_flight
+                or game_command_client.restart_required
+                or game_command_client.outcome_unknown
+                # A command-edit transition owns this entire sampled frame.
+                # XQueryKeymap was polled before the intent drain, so allowing
+                # settings shortcuts immediately after command_edit(false)
+                # would turn a same-frame M/-/+/Enter/F9 press into a fresh
+                # settings edge even though the overlay still owned it.
+                or any(
+                    intent.kind in {"command_edit", "command_submit"}
+                    for intent in panel_intents
+                )
+            )
             keyboard_panel_active = bool(
                 calibration.active
                 and raw_keyboard.focused
                 and not restart_requester.requested
+                and not command_controls_blocked
             )
             mouse_settings_changed = mouse_settings.update(
                 active=keyboard_panel_active,
@@ -3587,25 +4113,35 @@ def main() -> int:
                 mouse_settings_changed = bool(
                     mouse_settings.apply_panel_action(
                         panel_action,
-                        active=calibration.active and not restart_requester.requested,
+                        active=(
+                            calibration.active
+                            and not restart_requester.requested
+                            and not command_controls_blocked
+                        ),
                     )
                     or mouse_settings_changed
                 )
             restart_requested = apply_restart_key.update(
                 pressed=raw_keyboard.apply_restart,
                 calibration_active=keyboard_panel_active,
-                neutral_frame_ready=calibration_neutral_frames >= 1,
+                neutral_frame_ready=neutral_frame_ready,
                 pending_restart=mouse_settings.pending_restart(applied_mouse),
                 persistence_ok=mouse_settings.persistence_error is None,
                 requester=restart_requester,
             )
             left_calibration, ui_restart_requested = apply_return.update(
                 enter_pressed=raw_keyboard.apply_return,
-                clicked="apply_return" in panel_actions,
-                ue_focused=raw_keyboard.focused,
+                clicked=(
+                    "apply_return" in panel_actions
+                    and not command_controls_blocked
+                ),
+                ue_focused=raw_keyboard.focused and not command_controls_blocked,
                 panel_was_active=panel_was_active,
                 calibration=calibration,
-                neutral_frame_ready=calibration_neutral_frames >= 1,
+                neutral_frame_ready=(
+                    neutral_frame_ready
+                    and not command_controls_blocked
+                ),
                 pending_restart=mouse_settings.pending_restart(applied_mouse),
                 persistence_error=mouse_settings.persistence_error,
                 requester=restart_requester,
@@ -3613,6 +4149,9 @@ def main() -> int:
             restart_requested = restart_requested or ui_restart_requested
             if left_calibration:
                 calibration_neutral_frames = 0
+                command_state_changed = bool(
+                    game_command_client.panel_closed() or command_state_changed
+                )
             calibration_interlock_active = calibration_interlock_required(
                 panel_was_active=panel_was_active,
                 panel_active=calibration.active,
@@ -3686,7 +4225,8 @@ def main() -> int:
                 if (
                     calibration_toggled
                     or left_calibration
-                    or bool(panel_actions)
+                    or bool(panel_intents)
+                    or command_state_changed
                     or mouse_settings_changed
                     or restart_requested
                     or teleport_rejections != last_teleport_rejections
@@ -3708,6 +4248,7 @@ def main() -> int:
                             ),
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
+                            "command_console": game_command_client.mapping(),
                             "mirror_sensitivity": sensitivity_telemetry,
                             "camera_yaw": camera_yaw_telemetry(
                                 args.camera_yaw_source,
@@ -3741,8 +4282,10 @@ def main() -> int:
             elif publisher.send(snapshot, now=now):
                 sent_frames += 1
                 neutral_delivered = True
-            if calibration.active and neutral_delivered:
-                calibration_neutral_frames += 1
+            if calibration.active:
+                calibration_neutral_frames = (
+                    calibration_neutral_frames + 1 if neutral_delivered else 0
+                )
             sequence += 1
             sampled_frames += 1
         if exit_reason == "unknown":
@@ -3764,6 +4307,10 @@ def main() -> int:
                 move_stick=MoveStickSnapshot(0.0, 0.0),
             )
             publisher.send(release, now=time.monotonic())
+        # Resolve a response already queued at the shutdown boundary, or mark
+        # a successfully sent but unacknowledged command outcome-unknown.  This
+        # must happen before the final status snapshot is serialized.
+        game_command_client.close()
         _atomic_json(
             args.status_file,
             {
@@ -3787,6 +4334,7 @@ def main() -> int:
                 ),
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),
+                "command_console": game_command_client.mapping(),
                 "gamepad_camera": {
                     "driver": "carla-spectator"
                     if args.camera_yaw_source == "carla"
