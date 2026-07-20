@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT="${MATRIX_G1_MATERIAL_PALETTE:-}"
+MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT="${MATRIX_G1_MATERIAL_SCOPE_ALPHA:-}"
+unset MATRIX_G1_MATERIAL_PALETTE MATRIX_G1_MATERIAL_SCOPE_ALPHA
+
 #######################################
 # 基础
 #######################################
@@ -426,6 +430,56 @@ PY
     echo "[ERROR] UE log did not confirm Found and Mounted IoStore events for" \
         "$CENTERED_CAMERA_OVERLAY_STEM: $ue_log" >&2
     return 1
+}
+
+verify_material_fix_install() {
+    local ue_log="$1"
+    local start_offset="$2"
+    local status
+    status="$(/usr/bin/python3 -I - "$ue_log" "$start_offset" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+offset = int(sys.argv[2])
+marker = "matrix-ue-material-fix: installed audited Matrix 0.1.2 material bridge"
+if not path.is_file():
+    print("missing-log")
+    raise SystemExit(0)
+size = path.stat().st_size
+if size < offset:
+    print("truncated")
+    raise SystemExit(0)
+with path.open("rb") as stream:
+    stream.seek(offset)
+    lines = stream.read().decode("utf-8", errors="replace").splitlines()
+if any(line.strip().startswith("matrix-ue-material-fix FATAL:") for line in lines):
+    print("fatal")
+elif any(line.strip() == marker for line in lines):
+    print("installed")
+else:
+    print("missing-marker")
+PY
+    )" || return 1
+    case "$status" in
+        installed)
+            echo "[INFO] Verified Matrix UE material fix installation"
+            ;;
+        fatal)
+            echo "[ERROR] Matrix UE material fix reported a fatal guard failure:" \
+                "$ue_log" >&2
+            return 1
+            ;;
+        missing-log|truncated|missing-marker)
+            echo "[ERROR] Matrix UE material fix did not emit its current-run" \
+                "installation marker ($status): $ue_log" >&2
+            return 1
+            ;;
+        *)
+            echo "[ERROR] Invalid Matrix UE material-fix verifier status: $status" >&2
+            return 1
+            ;;
+    esac
 }
 
 schedule_forced_cleanup() {
@@ -1134,6 +1188,63 @@ fi
 UE_COMMAND=(
     /usr/bin/env
     "LD_LIBRARY_PATH=$(ue_ld_library_path)"
+)
+UE_MATERIAL_FIX_PRELOAD="${MATRIX_UE_MATERIAL_FIX_PRELOAD:-}"
+UE_MATERIAL_FIX_BINARY=""
+UE_G1_SKIN="${MATRIX_G1_SKIN:-}"
+UE_G1_MATERIAL_PALETTE="$MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT"
+UE_G1_MATERIAL_SCOPE_ALPHA="$MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT"
+UE_G1_PALETTE_PATTERN='^[-0-9eE+.,;]+$'
+UE_G1_COMPONENT_PATTERN='^[-0-9eE+.]+$'
+if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
+    if [[ ! "$UE_G1_SKIN" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]; then
+        echo "[ERROR] MATRIX_G1_SKIN must name a registered skin" >&2
+        exit 1
+    fi
+    if [[ -z "$UE_G1_MATERIAL_PALETTE" \
+        || ! "$UE_G1_MATERIAL_PALETTE" =~ $UE_G1_PALETTE_PATTERN ]]; then
+        echo "[ERROR] MATRIX_G1_MATERIAL_PALETTE is missing or malformed" >&2
+        exit 1
+    fi
+    if [[ -z "$UE_G1_MATERIAL_SCOPE_ALPHA" \
+        || ! "$UE_G1_MATERIAL_SCOPE_ALPHA" =~ $UE_G1_COMPONENT_PATTERN ]]; then
+        echo "[ERROR] MATRIX_G1_MATERIAL_SCOPE_ALPHA is missing or malformed" >&2
+        exit 1
+    fi
+    if [[ "$UE_MATERIAL_FIX_PRELOAD" != /* ]]; then
+        echo "[ERROR] MATRIX_UE_MATERIAL_FIX_PRELOAD must be absolute" >&2
+        exit 1
+    fi
+    if [[ ! -f "$UE_MATERIAL_FIX_PRELOAD" || -L "$UE_MATERIAL_FIX_PRELOAD" ]]; then
+        echo "[ERROR] MATRIX_UE_MATERIAL_FIX_PRELOAD must be a regular non-symlink file:" \
+            "$UE_MATERIAL_FIX_PRELOAD" >&2
+        exit 1
+    fi
+    UE_MATERIAL_FIX_PRELOAD="$(realpath -- "$UE_MATERIAL_FIX_PRELOAD")"
+    UE_COMMAND+=(
+        "LD_PRELOAD=$UE_MATERIAL_FIX_PRELOAD"
+        "MATRIX_G1_SKIN=$UE_G1_SKIN"
+        "MATRIX_G1_MATERIAL_PALETTE=$UE_G1_MATERIAL_PALETTE"
+        "MATRIX_G1_MATERIAL_SCOPE_ALPHA=$UE_G1_MATERIAL_SCOPE_ALPHA"
+    )
+    for candidate in \
+        "$PWD/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue-Linux-Shipping" \
+        "$PWD/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue-Linux-Development" \
+        "$PWD/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue"
+    do
+        if [[ -f "$candidate" ]]; then
+            UE_MATERIAL_FIX_BINARY="$candidate"
+            break
+        fi
+    done
+    if [[ -z "$UE_MATERIAL_FIX_BINARY" ]]; then
+        echo "[ERROR] Matrix UE material fix cannot find the packaged executable" >&2
+        exit 1
+    fi
+    echo "[INFO] Matrix UE material fix enabled: $UE_MATERIAL_FIX_PRELOAD"
+    echo "[INFO] Matrix UE material skin: $UE_G1_SKIN"
+fi
+UE_COMMAND+=(
     # Force SDL's raw relative-motion path.  These hints make the behavior
     # explicit across local Xorg and remote nxagent sessions: no warp
     # emulation, viewport scaling, or system pointer acceleration is allowed
@@ -1142,7 +1253,16 @@ UE_COMMAND=(
     "SDL_MOUSE_RELATIVE_SCALING=0"
     "SDL_MOUSE_RELATIVE_SPEED_SCALE=$UE_MOUSE_RELATIVE_SPEED_SCALE"
     "SDL_MOUSE_RELATIVE_SYSTEM_SCALE=0"
-    ./zsibot_mujoco_ue.sh -game "$MAPNAME"
+)
+if [[ -n "$UE_MATERIAL_FIX_BINARY" ]]; then
+    # LD_PRELOAD must reach only the packaged ELF.  Applying it to the stock
+    # shell launcher would load the guarded bridge into bash before exec.
+    UE_COMMAND+=("$UE_MATERIAL_FIX_BINARY" zsibot_mujoco_ue)
+else
+    UE_COMMAND+=(./zsibot_mujoco_ue.sh)
+fi
+UE_COMMAND+=(
+    -game "$MAPNAME"
     # The stock cooked package enables UE's legacy PlayerInput mouse
     # smoothing.  Override it in the Input config hierarchy so a released
     # drag has no interpolated tail; disabling FOV scaling also keeps one
@@ -1158,7 +1278,8 @@ fi
 configure_remote_pointer_acceleration
 UE_LOG="$PWD/zsibot_mujoco_ue.log"
 UE_LOG_START_OFFSET=0
-if $CENTERED_CAMERA_OVERLAY_ENABLED; then
+if $CENTERED_CAMERA_OVERLAY_ENABLED \
+    || [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
     if [[ -f "$UE_LOG" ]]; then
         UE_LOG_START_OFFSET="$(/usr/bin/stat -c '%s' -- "$UE_LOG")"
     fi
@@ -1176,6 +1297,9 @@ if [[ ! "$UE_STARTUP_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     exit 1
 fi
 sleep "$UE_STARTUP_SECONDS"
+if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
+    verify_material_fix_install "$UE_LOG" "$UE_LOG_START_OFFSET"
+fi
 if $CENTERED_CAMERA_OVERLAY_ENABLED; then
     verify_centered_camera_overlay_mount "$UE_LOG" "$UE_LOG_START_OFFSET"
 fi

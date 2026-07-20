@@ -455,6 +455,13 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "#!/usr/bin/env bash\nexit 0\n",
             executable=True,
         )
+        self.write(
+            project
+            / "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux"
+            / "zsibot_mujoco_ue",
+            "fixture UE executable\n",
+            executable=True,
+        )
 
         sonic = project / "fake-sonic"
         for relative in (
@@ -598,6 +605,16 @@ elif script == "supervise_matrix_ue.py":
     Path(os.environ["UE_CAPTURE_PATH"]).write_text(
         json.dumps(ue_capture), encoding="utf-8"
     )
+    if any(
+        value.startswith("LD_PRELOAD=") for value in ue_capture["command"]
+    ) and os.environ.get("FAKE_UE_MATERIAL_FIX_LOG") != "missing":
+        with Path(args[args.index("--log") + 1]).open(
+            "a", encoding="utf-8"
+        ) as log_stream:
+            log_stream.write(
+                "matrix-ue-material-fix: installed audited Matrix 0.1.2 "
+                "material bridge\\n"
+            )
     overlay_log_mode = os.environ.get("FAKE_UE_OVERLAY_LOG", "")
     if overlay_log_mode:
         stem = "pakchunk99-MatrixCentered-Linux_P"
@@ -815,6 +832,7 @@ else:
             mouse_settings = project / "home/.config/matrix/mouse-control.json"
             xset_log = project / "xset.log"
             xset_state = project / "xset.state"
+            material_fix = project / "libmatrix_ue_material_fix.so"
             self.write(
                 mouse_settings,
                 json.dumps(
@@ -823,6 +841,7 @@ else:
             )
             self.write(xset_log)
             self.write(xset_state, "2/1 4\n")
+            self.write(material_fix, "fixture material fix\n")
             environment = {
                 "CAPTURE_PATH": os.fspath(fixture["capture"]),
                 "DISPLAY": ":fixture",
@@ -833,6 +852,11 @@ else:
                 ),
                 "MATRIX_MOUSE_SETTINGS_FILE": os.fspath(mouse_settings),
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_G1_MATERIAL_PALETTE": (
+                    "0.018,0.024,0.035;0.055,0.075,0.11;"
+                    "0.9,0.94,1;0.015,0.2,0.95"
+                ),
+                "MATRIX_G1_MATERIAL_SCOPE_ALPHA": "0.99609375",
                 "MATRIX_SKIP_ENV_CHECK": "1",
                 # The fixture must not contend with a real Matrix runtime on
                 # the host that happens to execute this integration test.
@@ -843,6 +867,7 @@ else:
                     "set Engine.SpringArmComponent bEnableCameraLag True,"
                     "viewclass OperatorCamera_C"
                 ),
+                "MATRIX_UE_MATERIAL_FIX_PRELOAD": os.fspath(material_fix),
                 "MATRIX_UE_STARTUP_SECONDS": "0",
                 "MATRIX_VERIFY_RUNTIME": "0",
                 "PATH": os.fspath(fixture["fake_bin"])
@@ -859,6 +884,8 @@ else:
                 os.fspath(project / "scripts/run_matrix_sonic.sh"),
                 "--scene",
                 "21",
+                "--skin",
+                "matrix-blue",
                 "--control-source",
                 "game",
                 "--game-input-source",
@@ -924,6 +951,24 @@ else:
             )
             self.assertIn(
                 "SDL_MOUSE_RELATIVE_SPEED_SCALE=0.010000",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                f"LD_PRELOAD={material_fix.resolve()}",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                "MATRIX_G1_SKIN=matrix-blue",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                "MATRIX_G1_MATERIAL_PALETTE="
+                "0.018,0.024,0.035;0.055,0.075,0.11;"
+                "0.9,0.94,1;0.015,0.2,0.95",
+                ue_capture["command"],
+            )
+            self.assertIn(
+                "MATRIX_G1_MATERIAL_SCOPE_ALPHA=0.99609375",
                 ue_capture["command"],
             )
             for direct_hint in (
@@ -1270,6 +1315,54 @@ print(json.dumps(payload, sort_keys=True))
             self.assertLess(install_index, ue_index)
             self.assertLess(ue_index, mounted_index)
             self.assertLess(mounted_index, remove_index)
+
+            material_fix = project / "libmatrix_ue_material_fix.so"
+            self.write(material_fix, "invalid fixture library\n")
+            with ue_log.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "matrix-ue-material-fix: installed audited Matrix 0.1.2 "
+                    "material bridge\n"
+                )
+            fixture["ue_capture"].unlink(missing_ok=True)
+            environment["MATRIX_UE_MATERIAL_FIX_PRELOAD"] = os.fspath(
+                material_fix
+            )
+            environment["MATRIX_G1_SKIN"] = "unitree-stock"
+            environment["MATRIX_G1_MATERIAL_PALETTE"] = (
+                "0.018,0.024,0.035;0.055,0.075,0.11;"
+                "0.9,0.94,1;0.42,0.42,0.42"
+            )
+            environment["MATRIX_G1_MATERIAL_SCOPE_ALPHA"] = "0.99609375"
+            environment["FAKE_UE_MATERIAL_FIX_LOG"] = "missing"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-missing-material-marker.lock"
+            )
+            missing_material_marker = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(missing_material_marker.returncode, 1)
+            self.assertIn(
+                "did not emit its current-run installation marker",
+                missing_material_marker.stderr,
+            )
+            self.assertFalse(active.exists())
+            environment.pop("MATRIX_UE_MATERIAL_FIX_PRELOAD")
+            environment.pop("MATRIX_G1_SKIN")
+            environment.pop("MATRIX_G1_MATERIAL_PALETTE")
+            environment.pop("MATRIX_G1_MATERIAL_SCOPE_ALPHA")
+            environment.pop("FAKE_UE_MATERIAL_FIX_LOG")
 
             for invalid_distance in ("79", "501", "150,quit", "1e2"):
                 with self.subTest(invalid_distance=invalid_distance):

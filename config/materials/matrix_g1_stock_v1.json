@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "profile_id": "matrix_g1_stock_v1",
+  "description": "Stock-inspired neutral Matrix G1 appearance for the released RGBA-only UE custom-robot bridge.",
+  "provenance": {
+    "base_profile": "config/materials/matrix_g1_v2.json",
+    "unitree_reference": "unitree_ros robots/g1_description/g1_29dof.urdf at 9926cc2f179ae3b86f4f74087bd32ef0c8b6fd90",
+    "design_revision": "matrix-g1-stock-silver-20260720",
+    "reason": "Official G1 assets are achromatic. The 0.42 linear silver accent is a documented Town10 exposure compensation rather than a claimed vendor paint measurement."
+  },
+  "matcher": {
+    "required_links": [
+      "pelvis",
+      "left_hip_pitch_link",
+      "right_hip_pitch_link",
+      "left_ankle_roll_link",
+      "right_ankle_roll_link",
+      "torso_link",
+      "head_link",
+      "left_shoulder_pitch_link",
+      "right_shoulder_pitch_link"
+    ]
+  },
+  "materials": {
+    "black_soft": {
+      "rgba": [0.018, 0.024, 0.035, 1.0],
+      "roughness": 0.62,
+      "metallic": 0.0
+    },
+    "graphite_structure": {
+      "rgba": [0.055, 0.075, 0.11, 1.0],
+      "roughness": 0.58,
+      "metallic": 0.0
+    },
+    "cool_white_shell": {
+      "rgba": [0.9, 0.94, 1.0, 1.0],
+      "roughness": 0.48,
+      "metallic": 0.0
+    },
+    "silver_gray_accent": {
+      "rgba": [0.42, 0.42, 0.42, 1.0],
+      "roughness": 0.38,
+      "metallic": 0.35
+    }
+  },
+  "rules": [
+    {
+      "material": "silver_gray_accent",
+      "tokens": [
+        "pelvis_contour",
+        "logo",
+        "hip_yaw",
+        "shoulder_roll",
+        "elbow",
+        "knee"
+      ]
+    },
+    {
+      "material": "black_soft",
+      "tokens": [
+        "pelvis",
+        "ankle",
+        "wrist",
+        "rubber_hand",
+        "hand_",
+        "thumb",
+        "index",
+        "middle",
+        "ring",
+        "little"
+      ]
+    },
+    {
+      "material": "graphite_structure",
+      "tokens": ["head", "hip_pitch", "waist_yaw", "waist_roll"]
+    }
+  ],
+  "default_material": "cool_white_shell",
+  "renderer_contract": {
+    "mujoco_3_3": ["rgba", "roughness", "metallic"],
+    "matrix_ue_0_1_2": ["rgba"],
+    "textures": false,
+    "texture_reason": "The canonical STL visual meshes have no UV coordinates and the released Matrix UE bridge exposes only FLinearColor."
+  }
+}

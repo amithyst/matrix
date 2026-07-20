@@ -50,6 +50,7 @@ fi
 SCENE_ID=21
 CUSTOM_URDF="${MATRIX_G1_URDF:-}"
 CUSTOM_NAME="g1_29dof"
+G1_SKIN="${MATRIX_G1_SKIN:-}"
 CONTROL_SOURCE="planner"
 GAME_INPUT_SOURCE="${MATRIX_GAME_INPUT_SOURCE:-auto}"
 GAME_CAMERA_YAW_SOURCE="${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}"
@@ -100,6 +101,7 @@ usage() {
         "  --scene ID                 Matrix native scene id (default: 21 ApartmentWorld)" \
         "  --urdf PATH                G1 visual URDF; defaults to the locked runtime" \
         "  --name NAME                Custom robot cache name (default: g1_29dof)" \
+        "  --skin ID                  Registered G1 skin (default: unitree-stock)" \
         "  --control-source SOURCE    planner, game, pico, or external (default: planner)" \
         "  --game-input-source SOURCE auto, keyboard, or gamepad (default: auto)" \
         "  --game-camera-yaw-source S ue-final-pov, x11-mirror, x11-core-gated, x11-absolute, carla, or fixed" \
@@ -140,6 +142,7 @@ while [[ $# -gt 0 ]]; do
         --scene) SCENE_ID="$2"; shift 2 ;;
         --urdf) CUSTOM_URDF="$2"; shift 2 ;;
         --name) CUSTOM_NAME="$2"; shift 2 ;;
+        --skin) G1_SKIN="$2"; shift 2 ;;
         --control-source) CONTROL_SOURCE="$2"; shift 2 ;;
         --game-input-source) GAME_INPUT_SOURCE="$2"; shift 2 ;;
         --game-camera-yaw-source) GAME_CAMERA_YAW_SOURCE="$2"; shift 2 ;;
@@ -177,6 +180,10 @@ while [[ $# -gt 0 ]]; do
         *) echo "[ERROR] Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [[ -n "$G1_SKIN" ]]; then
+    export MATRIX_G1_SKIN="$G1_SKIN"
+fi
 
 if [[ -n "${MATRIX_CPUSET:-}" && "${MATRIX_CPUSET_APPLIED:-0}" != "1" ]]; then
     if ! command -v taskset >/dev/null; then
