@@ -71,6 +71,33 @@ GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
 GAME_WORLD_PERSISTENCE="${MATRIX_GAME_WORLD_PERSISTENCE:-auto}"
 GAME_AUTO_RESPAWN="${MATRIX_GAME_AUTO_RESPAWN:-auto}"
 GAME_WORLD_CHECKPOINT_SECONDS="${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
+GAME_FALL_RECOVERY="${MATRIX_GAME_FALL_RECOVERY:-auto}"
+GAME_FALL_RECOVERY_TIMEOUT="${MATRIX_GAME_FALL_RECOVERY_TIMEOUT:-15.0}"
+PHYSICAL_RECOVERY_WORKER="${MATRIX_PHYSICAL_RECOVERY_WORKER:-$PROJECT_ROOT/scripts/matrix_sonic_host_worker.py}"
+PHYSICAL_RECOVERY_INITIAL_CONTROLLER="${MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-host}"
+PHYSICAL_RECOVERY_HANDOFF="${MATRIX_PHYSICAL_RECOVERY_HANDOFF:-amp}"
+PHYSICAL_RECOVERY_RESIDENT_POLICIES="${MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES:-0}"
+PHYSICAL_RECOVERY_EXECUTION_PROVIDER="${MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER:-cpu}"
+PHYSICAL_RECOVERY_PYTHON="${MATRIX_PHYSICAL_RECOVERY_PYTHON:-}"
+PHYSICAL_RECOVERY_MODEL="${MATRIX_PHYSICAL_RECOVERY_MODEL:-}"
+PHYSICAL_RECOVERY_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_MODEL_SHA256:-}"
+PHYSICAL_RECOVERY_FALLBACK_MODEL="${MATRIX_PHYSICAL_RECOVERY_FALLBACK_MODEL:-}"
+PHYSICAL_RECOVERY_AMP_CONFIG="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG:-}"
+PHYSICAL_RECOVERY_AMP_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL:-}"
+PHYSICAL_RECOVERY_AMP_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256:-}"
+PHYSICAL_RECOVERY_AMP_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256:-}"
+PHYSICAL_RECOVERY_KUNGFU_MODEL="${MATRIX_KUNGFU_RECOVERY_MODEL:-}"
+PHYSICAL_RECOVERY_KUNGFU_MOTION="${MATRIX_KUNGFU_RECOVERY_MOTION:-}"
+PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256="${MATRIX_KUNGFU_RECOVERY_MODEL_SHA256:-}"
+PHYSICAL_RECOVERY_KUNGFU_MODEL_DATA_SHA256="${MATRIX_KUNGFU_RECOVERY_MODEL_DATA_SHA256:-}"
+PHYSICAL_RECOVERY_KUNGFU_MOTION_SHA256="${MATRIX_KUNGFU_RECOVERY_MOTION_SHA256:-}"
+PHYSICAL_RECOVERY_KUNGFU_REFERENCE_FRAME="${MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME:-0}"
+PHYSICAL_RECOVERY_KUNGFU_GAIN_SCALE="${MATRIX_KUNGFU_RECOVERY_GAIN_SCALE:-1.0}"
+PHYSICAL_RECOVERY_FALLBACK_AFTER_SECONDS="${MATRIX_PHYSICAL_RECOVERY_FALLBACK_AFTER_SECONDS:-10.0}"
+PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS="${MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-1.5}"
+PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS="${MATRIX_PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS:-0}"
+PHYSICAL_RECOVERY_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-sonic-recovery-${UID}-$$.sock}"
+PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-sonic-recovery-sonic-${UID}-$$.sock}"
 WALK_AFTER="-1"
 VX="0.30"
 VY="0.0"
@@ -125,6 +152,24 @@ usage() {
         "  --game-world-persistence MODE  auto, on, or off (default: auto)" \
         "  --game-auto-respawn MODE   auto, on, or off; cold-reloads after a fall" \
         "  --game-world-checkpoint-seconds SEC  Durable last-exit interval (default: 0.75)" \
+        "  --game-fall-recovery MODE  auto, off, sonic, or physical (Heyuan/TRNA auto uses physical for unbounded game runs)" \
+        "  --game-fall-recovery-timeout SEC  Mark recovery timed out after SEC while continuing IDLE" \
+        "  --physical-recovery-worker PATH  Writer-gated physical get-up worker" \
+        "  --physical-recovery-initial-controller NAME  Initial policy: host, amp, or kungfu" \
+        "  --physical-recovery-handoff NAME  Stable handoff: amp or sonic" \
+        "  --physical-recovery-python PATH  Python with numpy, onnxruntime, and unitree_sdk2py" \
+        "  --physical-recovery-model PATH   Primary physical get-up ONNX" \
+        "  --physical-recovery-amp-config PATH  AMP dynamic-hold JSON" \
+        "  --physical-recovery-amp-model PATH   AMP dynamic-hold ONNX" \
+        "  --physical-recovery-fallback-model PATH  Physically continuous fallback ONNX" \
+        "  --physical-recovery-kungfu-model PATH  KungFuAthleteBot recovery ONNX" \
+        "  --physical-recovery-kungfu-motion PATH  KungFuAthleteBot 1307 NPZ" \
+        "  --physical-recovery-kungfu-reference-frame N  0=50 Hz sequence; N>0=frozen target" \
+        "  --physical-recovery-kungfu-gain-scale N  Recovery PD gain multiplier" \
+        "  --physical-recovery-fallback-after-seconds SEC  Switch to fallback policy after SEC" \
+        "  --physical-recovery-stable-hold-seconds SEC  Parent snapshot stability hold" \
+        "  --physical-recovery-policy-exit-hold-seconds SEC  Optional recovery-policy terminal dwell" \
+        "  --physical-recovery-control-socket PATH  Private worker handoff socket" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -169,6 +214,24 @@ while [[ $# -gt 0 ]]; do
         --game-world-persistence) GAME_WORLD_PERSISTENCE="$2"; shift 2 ;;
         --game-auto-respawn) GAME_AUTO_RESPAWN="$2"; shift 2 ;;
         --game-world-checkpoint-seconds) GAME_WORLD_CHECKPOINT_SECONDS="$2"; shift 2 ;;
+        --game-fall-recovery) GAME_FALL_RECOVERY="$2"; shift 2 ;;
+        --game-fall-recovery-timeout) GAME_FALL_RECOVERY_TIMEOUT="$2"; shift 2 ;;
+        --physical-recovery-worker) PHYSICAL_RECOVERY_WORKER="$2"; shift 2 ;;
+        --physical-recovery-initial-controller) PHYSICAL_RECOVERY_INITIAL_CONTROLLER="$2"; shift 2 ;;
+        --physical-recovery-handoff) PHYSICAL_RECOVERY_HANDOFF="$2"; shift 2 ;;
+        --physical-recovery-python) PHYSICAL_RECOVERY_PYTHON="$2"; shift 2 ;;
+        --physical-recovery-model) PHYSICAL_RECOVERY_MODEL="$2"; shift 2 ;;
+        --physical-recovery-amp-config) PHYSICAL_RECOVERY_AMP_CONFIG="$2"; shift 2 ;;
+        --physical-recovery-amp-model) PHYSICAL_RECOVERY_AMP_MODEL="$2"; shift 2 ;;
+        --physical-recovery-fallback-model) PHYSICAL_RECOVERY_FALLBACK_MODEL="$2"; shift 2 ;;
+        --physical-recovery-kungfu-model) PHYSICAL_RECOVERY_KUNGFU_MODEL="$2"; shift 2 ;;
+        --physical-recovery-kungfu-motion) PHYSICAL_RECOVERY_KUNGFU_MOTION="$2"; shift 2 ;;
+        --physical-recovery-kungfu-reference-frame) PHYSICAL_RECOVERY_KUNGFU_REFERENCE_FRAME="$2"; shift 2 ;;
+        --physical-recovery-kungfu-gain-scale) PHYSICAL_RECOVERY_KUNGFU_GAIN_SCALE="$2"; shift 2 ;;
+        --physical-recovery-fallback-after-seconds) PHYSICAL_RECOVERY_FALLBACK_AFTER_SECONDS="$2"; shift 2 ;;
+        --physical-recovery-stable-hold-seconds) PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS="$2"; shift 2 ;;
+        --physical-recovery-policy-exit-hold-seconds) PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS="$2"; shift 2 ;;
+        --physical-recovery-control-socket) PHYSICAL_RECOVERY_CONTROL_SOCKET="$2"; shift 2 ;;
         --walk-after) WALK_AFTER="$2"; shift 2 ;;
         --vx) VX="$2"; shift 2 ;;
         --vy) VY="$2"; shift 2 ;;
@@ -357,6 +420,40 @@ then
     exit 2
 fi
 export MATRIX_PROFILE="${PROFILE:-local}"
+case "$GAME_FALL_RECOVERY" in
+    auto)
+        if [[ "$CONTROL_SOURCE" == "game" \
+            && "$QUALIFICATION_REQUESTED" == "0" ]]; then
+            if [[ "$PROFILE" == "heyuan" \
+                || "$PROFILE" == "trna" \
+                || "${MATRIX_HOST_PROFILE:-}" == "heyuan" \
+                || "${MATRIX_HOST_PROFILE:-}" == "trna" ]]; then
+                GAME_FALL_RECOVERY="physical"
+            else
+                GAME_FALL_RECOVERY="sonic"
+            fi
+        else
+            GAME_FALL_RECOVERY="off"
+        fi
+        ;;
+    off|sonic|physical) ;;
+    *)
+        echo "[ERROR] --game-fall-recovery must be auto, off, sonic, or physical" >&2
+        exit 2
+        ;;
+esac
+if [[ "$GAME_FALL_RECOVERY" == "sonic" \
+    || "$GAME_FALL_RECOVERY" == "physical" ]]; then
+    if [[ "$CONTROL_SOURCE" != "game" ]]; then
+        echo "[ERROR] Fall recovery requires --control-source game" >&2
+        exit 2
+    fi
+    if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
+        echo "[ERROR] Bounded qualification requires fail-fast fall handling" >&2
+        exit 2
+    fi
+fi
+echo "[INFO] Fall policy: $GAME_FALL_RECOVERY timeout=${GAME_FALL_RECOVERY_TIMEOUT}s"
 MATRIX_SONIC_QUALIFIED_RUNTIME=0
 MATRIX_SONIC_QUALIFICATION_PROFILE=""
 MATRIX_SONIC_RUNTIME_LOCK_SHA256=""
@@ -469,6 +566,156 @@ else
 fi
 MATRIX_SONIC_PYTHON="${MATRIX_SONIC_PYTHON:-$DEFAULT_PYTHON}"
 MATRIX_PICO_PYTHON="${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}"
+
+physical_recovery_python_works() {
+    local candidate="$1"
+    PYTHONNOUSERSITE=1 \
+        PYTHONPATH="$MATRIX_SONIC_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+        "$candidate" -c \
+        'import numpy, onnxruntime; from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber; from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_; from unitree_sdk2py.utils.crc import CRC' \
+        >/dev/null 2>&1
+}
+
+select_physical_recovery_python() {
+    local -a candidates=()
+    local candidate resolved
+    if [[ -n "$PHYSICAL_RECOVERY_PYTHON" ]]; then
+        candidates+=("$PHYSICAL_RECOVERY_PYTHON")
+    else
+        local artifact_root="${MATRIX_PHYSICAL_RECOVERY_ARTIFACT_ROOT:-/home/kaijie/matrix-artifacts/g1-host-getup-v1}"
+        candidates+=(
+            "$artifact_root/.venv/bin/python"
+            "$artifact_root/venv/bin/python"
+            "$artifact_root/.venv-host/bin/python"
+            "$PROJECT_ROOT/.venv-physical-recovery/bin/python"
+            "$MATRIX_SONIC_PYTHON"
+        )
+    fi
+    for candidate in "${candidates[@]}"; do
+        resolved="$candidate"
+        if [[ "$candidate" != */* ]]; then
+            resolved="$(command -v "$candidate" 2>/dev/null || true)"
+        fi
+        if [[ -n "$resolved" && -x "$resolved" ]] \
+            && physical_recovery_python_works "$resolved"; then
+            PHYSICAL_RECOVERY_PYTHON="$resolved"
+            return 0
+        fi
+    done
+    echo "[ERROR] Physical recovery requires one Python importing numpy," \
+        "onnxruntime, and unitree_sdk2py; set MATRIX_PHYSICAL_RECOVERY_PYTHON" >&2
+    return 1
+}
+
+if [[ "$GAME_FALL_RECOVERY" == "physical" ]]; then
+    case "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" in
+        host|amp|kungfu) ;;
+        *)
+            echo "[ERROR] Physical recovery initial controller must be host, amp, or kungfu" >&2
+            exit 2
+            ;;
+    esac
+    case "$PHYSICAL_RECOVERY_HANDOFF" in
+        amp|sonic) ;;
+        *)
+            echo "[ERROR] Physical recovery handoff must be amp or sonic" >&2
+            exit 2
+            ;;
+    esac
+    case "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" in
+        cuda|cpu) ;;
+        *)
+            echo "[ERROR] Physical recovery execution provider must be cuda or cpu" >&2
+            exit 2
+            ;;
+    esac
+    if [[ "$PHYSICAL_RECOVERY_RESIDENT_POLICIES" == "1" ]]; then
+        if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" != "kungfu" \
+            || "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
+            || "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" != "cuda" ]]; then
+            echo "[ERROR] Resident recovery requires kungfu -> sonic with CUDA" >&2
+            exit 2
+        fi
+    fi
+    for recovery_file in \
+        "$PHYSICAL_RECOVERY_WORKER" \
+        "$PHYSICAL_RECOVERY_MODEL" \
+        "$PHYSICAL_RECOVERY_AMP_CONFIG" \
+        "$PHYSICAL_RECOVERY_AMP_MODEL"; do
+        if [[ -z "$recovery_file" || ! -f "$recovery_file" ]]; then
+            echo "[ERROR] Physical recovery artifact is missing: $recovery_file" >&2
+            exit 1
+        fi
+    done
+    if [[ -n "$PHYSICAL_RECOVERY_FALLBACK_MODEL" \
+        && ! -f "$PHYSICAL_RECOVERY_FALLBACK_MODEL" ]]; then
+        echo "[ERROR] Physical recovery fallback model is missing:" \
+            "$PHYSICAL_RECOVERY_FALLBACK_MODEL" >&2
+        exit 1
+    fi
+    if [[ -n "$PHYSICAL_RECOVERY_MODEL_SHA256" ]]; then
+        if [[ ! "$PHYSICAL_RECOVERY_MODEL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "[ERROR] Physical recovery model SHA256 must be 64 lowercase hex characters" >&2
+            exit 2
+        fi
+        actual_recovery_sha256="$(/usr/bin/python3 -I - "$PHYSICAL_RECOVERY_MODEL" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+        if [[ "$actual_recovery_sha256" != "$PHYSICAL_RECOVERY_MODEL_SHA256" ]]; then
+            echo "[ERROR] Physical recovery model SHA256 mismatch:" \
+                "expected=$PHYSICAL_RECOVERY_MODEL_SHA256 actual=$actual_recovery_sha256" >&2
+            exit 1
+        fi
+    fi
+    if [[ "$PHYSICAL_RECOVERY_CONTROL_SOCKET" != /* ]]; then
+        echo "[ERROR] Physical recovery control socket must be absolute" >&2
+        exit 2
+    fi
+    for digest in \
+        "$PHYSICAL_RECOVERY_AMP_CONFIG_SHA256" \
+        "$PHYSICAL_RECOVERY_AMP_MODEL_SHA256"; do
+        if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "[ERROR] Physical recovery AMP SHA256 values are required" >&2
+            exit 2
+        fi
+    done
+    if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then
+        for kungfu_file in \
+            "$PHYSICAL_RECOVERY_KUNGFU_MODEL" \
+            "${PHYSICAL_RECOVERY_KUNGFU_MODEL}.data" \
+            "$PHYSICAL_RECOVERY_KUNGFU_MOTION"; do
+            if [[ -z "$kungfu_file" || ! -f "$kungfu_file" ]]; then
+                echo "[ERROR] KungFu recovery artifact is missing: $kungfu_file" >&2
+                exit 1
+            fi
+        done
+        for digest in \
+            "$PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256" \
+            "$PHYSICAL_RECOVERY_KUNGFU_MODEL_DATA_SHA256" \
+            "$PHYSICAL_RECOVERY_KUNGFU_MOTION_SHA256"; do
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "[ERROR] KungFu recovery SHA256 values are required" >&2
+                exit 2
+            fi
+        done
+        if [[ ! "$PHYSICAL_RECOVERY_KUNGFU_REFERENCE_FRAME" =~ ^[0-9]+$ ]]; then
+            echo "[ERROR] KungFu reference frame must be a non-negative integer" >&2
+            exit 2
+        fi
+    fi
+    if [[ "$PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET" != /* ]]; then
+        echo "[ERROR] SONIC writer control socket must be absolute" >&2
+        exit 2
+    fi
+    if ! select_physical_recovery_python; then
+        exit 1
+    fi
+    echo "[INFO] Physical recovery Python: $PHYSICAL_RECOVERY_PYTHON"
+fi
 
 for required in \
     "$PROJECT_ROOT/scripts/matrix_game_control.py" \
@@ -691,6 +938,33 @@ export MATRIX_GAME_INPUT_TIMEOUT="$GAME_INPUT_TIMEOUT"
 export MATRIX_GAME_WORLD_PERSISTENCE="$GAME_WORLD_PERSISTENCE"
 export MATRIX_GAME_AUTO_RESPAWN="$GAME_AUTO_RESPAWN"
 export MATRIX_GAME_WORLD_CHECKPOINT_SECONDS="$GAME_WORLD_CHECKPOINT_SECONDS"
+export MATRIX_GAME_FALL_RECOVERY="$GAME_FALL_RECOVERY"
+export MATRIX_GAME_FALL_RECOVERY_TIMEOUT="$GAME_FALL_RECOVERY_TIMEOUT"
+export MATRIX_PHYSICAL_RECOVERY_WORKER="$PHYSICAL_RECOVERY_WORKER"
+export MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER="$PHYSICAL_RECOVERY_INITIAL_CONTROLLER"
+export MATRIX_PHYSICAL_RECOVERY_HANDOFF="$PHYSICAL_RECOVERY_HANDOFF"
+export MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES="$PHYSICAL_RECOVERY_RESIDENT_POLICIES"
+export MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER="$PHYSICAL_RECOVERY_EXECUTION_PROVIDER"
+export MATRIX_PHYSICAL_RECOVERY_PYTHON="$PHYSICAL_RECOVERY_PYTHON"
+export MATRIX_PHYSICAL_RECOVERY_MODEL="$PHYSICAL_RECOVERY_MODEL"
+export MATRIX_PHYSICAL_RECOVERY_MODEL_SHA256="$PHYSICAL_RECOVERY_MODEL_SHA256"
+export MATRIX_PHYSICAL_RECOVERY_FALLBACK_MODEL="$PHYSICAL_RECOVERY_FALLBACK_MODEL"
+export MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG="$PHYSICAL_RECOVERY_AMP_CONFIG"
+export MATRIX_PHYSICAL_RECOVERY_AMP_MODEL="$PHYSICAL_RECOVERY_AMP_MODEL"
+export MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256="$PHYSICAL_RECOVERY_AMP_CONFIG_SHA256"
+export MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256="$PHYSICAL_RECOVERY_AMP_MODEL_SHA256"
+export MATRIX_KUNGFU_RECOVERY_MODEL="$PHYSICAL_RECOVERY_KUNGFU_MODEL"
+export MATRIX_KUNGFU_RECOVERY_MOTION="$PHYSICAL_RECOVERY_KUNGFU_MOTION"
+export MATRIX_KUNGFU_RECOVERY_MODEL_SHA256="$PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256"
+export MATRIX_KUNGFU_RECOVERY_MODEL_DATA_SHA256="$PHYSICAL_RECOVERY_KUNGFU_MODEL_DATA_SHA256"
+export MATRIX_KUNGFU_RECOVERY_MOTION_SHA256="$PHYSICAL_RECOVERY_KUNGFU_MOTION_SHA256"
+export MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME="$PHYSICAL_RECOVERY_KUNGFU_REFERENCE_FRAME"
+export MATRIX_KUNGFU_RECOVERY_GAIN_SCALE="$PHYSICAL_RECOVERY_KUNGFU_GAIN_SCALE"
+export MATRIX_PHYSICAL_RECOVERY_FALLBACK_AFTER_SECONDS="$PHYSICAL_RECOVERY_FALLBACK_AFTER_SECONDS"
+export MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS="$PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS"
+export MATRIX_PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS="$PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS"
+export MATRIX_PHYSICAL_RECOVERY_CONTROL_SOCKET="$PHYSICAL_RECOVERY_CONTROL_SOCKET"
+export MATRIX_PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET="$PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET"
 export MATRIX_GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
 if [[ "$CONTROL_SOURCE" == "game" ]]; then
     rm -f -- "$MATRIX_GAME_INPUT_STATUS_FILE"
@@ -711,7 +985,9 @@ export MATRIX_SONIC_QUALIFICATION_PROFILE
 export MATRIX_SONIC_RUNTIME_LOCK_SHA256
 export MATRIX_SONIC_MATRIX_COMMIT
 export MATRIX_SONIC_VERIFICATION_RECEIPT
-if [[ "$GAME_AUTO_RESPAWN" == "1" ]]; then
+if [[ "$GAME_AUTO_RESPAWN" == "1" \
+    || "$GAME_FALL_RECOVERY" == "sonic" \
+    || "$GAME_FALL_RECOVERY" == "physical" ]]; then
     export MATRIX_SONIC_FAIL_ON_FALL=0
 else
     export MATRIX_SONIC_FAIL_ON_FALL=1

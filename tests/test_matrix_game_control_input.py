@@ -236,6 +236,14 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "kind": "command_submit",
                     "command": "/tp @s ~1 ~ ~",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 3,
+                    "kind": "strategy_select",
+                    "slot": "recovery",
+                    "policy_id": "kungfu",
+                },
             )
             try:
                 for packet in packets:
@@ -246,6 +254,11 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                         MODULE.OverlayIntent(kind="command_edit", active=True),
                         MODULE.OverlayIntent(
                             kind="command_submit", command="/tp @s ~1 ~ ~"
+                        ),
+                        MODULE.OverlayIntent(
+                            kind="strategy_select",
+                            slot="recovery",
+                            policy_id="kungfu",
                         ),
                     ),
                 )
@@ -328,6 +341,44 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
     hasattr(socket, "SOCK_SEQPACKET"), "Unix SOCK_SEQPACKET is required"
 )
 class GameCommandClientTest(unittest.TestCase):
+    @staticmethod
+    def strategy_loadout(recovery="kungfu", status="ready"):
+        return {
+            "version": 1,
+            "available": True,
+            "status": status,
+            "active_slot": "locomotion",
+            "pending": None,
+            "slots": [
+                {
+                    "slot": "locomotion",
+                    "selected_policy_id": "sonic",
+                    "locked": True,
+                    "candidates": [
+                        {
+                            "policy_id": "sonic",
+                            "resident": True,
+                            "available": True,
+                        }
+                    ],
+                },
+                {
+                    "slot": "recovery",
+                    "selected_policy_id": recovery,
+                    "locked": False,
+                    "candidates": [
+                        {
+                            "policy_id": policy_id,
+                            "resident": True,
+                            "available": True,
+                        }
+                        for policy_id in ("kungfu", "host", "amp")
+                    ],
+                },
+            ],
+            "resident_models": [],
+        }
+
     def make_client(self):
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         client = MODULE.GameCommandClient(provider.detach())
@@ -411,6 +462,52 @@ class GameCommandClientTest(unittest.TestCase):
                 "outcome_unknown": False,
                 "data": {"position": [1.0, 2.0, 3.0]},
             },
+        )
+
+    def test_strategy_slot_select_skips_text_editor_and_tracks_runtime_ack(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            initial_strategy_loadout=self.strategy_loadout(),
+        )
+        runtime.settimeout(1.0)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertTrue(
+            client.select_policy(
+                "recovery",
+                "host",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            request.command,
+            MC_COMMANDS.PolicySlotAssignment("recovery", "host"),
+        )
+        self.assertFalse(client.editing)
+        changed = self.strategy_loadout(recovery="host")
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_POLICY_SLOT_ASSIGNED",
+                    message="assigned",
+                    data={"strategy_loadout": changed},
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(
+            client.strategy_loadout_mapping()["slots"][1]["selected_policy_id"],
+            "host",
         )
 
     def test_only_one_request_is_in_flight_and_restart_response_is_terminal(self) -> None:

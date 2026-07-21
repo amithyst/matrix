@@ -315,7 +315,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
 
         self.assertEqual(MODULE.HOST_PROFILES, ("heyuan", "trna", "zza"))
         trna = (REPO_ROOT / "config/hosts/trna.env").read_text(encoding="utf-8")
-        self.assertIn("worktrees/sonic-matrix-native-final", trna)
+        self.assertIn("worktrees/sonic-matrix-recovery-v77", trna)
         self.assertNotIn("code_bryce", trna)
         zza = (REPO_ROOT / "config/hosts/zza.env").read_text(encoding="utf-8")
         self.assertIn('DISPLAY="${DISPLAY:-:1}"', zza)
@@ -402,6 +402,86 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "Matrix motion controller: disabled by selected runtime topology",
             check_env,
         )
+
+    def test_physical_recovery_launch_contract_is_fail_closed(self) -> None:
+        launcher = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+        run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(encoding="utf-8")
+        heyuan = (REPO_ROOT / "config/hosts/heyuan.env").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('GAME_FALL_RECOVERY="physical"', launcher)
+        self.assertIn('GAME_FALL_RECOVERY="off"', launcher)
+        self.assertIn("select_physical_recovery_python", launcher)
+        self.assertIn("import numpy, onnxruntime", launcher)
+        self.assertIn("ChannelPublisher, ChannelSubscriber", launcher)
+        self.assertIn("LowCmd_, LowState_", launcher)
+        self.assertIn("MATRIX_PHYSICAL_RECOVERY_PYTHON", launcher)
+        self.assertIn("MATRIX_SONIC_FAIL_ON_FALL=0", launcher)
+        for argument in (
+            "--physical-recovery-worker",
+            "--physical-recovery-python",
+            "--physical-recovery-model",
+            "--physical-recovery-fallback-model",
+            "--physical-recovery-fallback-after-seconds",
+            "--physical-recovery-stable-hold-seconds",
+            "--physical-recovery-control-socket",
+            "--physical-recovery-kungfu-model",
+            "--physical-recovery-kungfu-motion",
+            "--physical-recovery-kungfu-reference-frame",
+            "--physical-recovery-kungfu-gain-scale",
+        ):
+            self.assertIn(argument, launcher)
+            self.assertIn(argument, run_sim)
+        for argument in (
+            "--physical-recovery-kungfu-model-sha256",
+            "--physical-recovery-kungfu-model-data-sha256",
+            "--physical-recovery-kungfu-motion-sha256",
+        ):
+            self.assertIn(argument, run_sim)
+        self.assertIn("import numpy, onnxruntime", run_sim)
+        self.assertIn("ChannelPublisher, ChannelSubscriber", run_sim)
+        self.assertIn("MATRIX_GAME_FALL_RECOVERY=physical", run_sim)
+        self.assertIn("host|amp|kungfu", run_sim)
+        self.assertIn(
+            'MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-kungfu',
+            heyuan,
+        )
+        self.assertIn("MATRIX_PHYSICAL_RECOVERY_HANDOFF:-amp", heyuan)
+        self.assertIn("1307-sonic-default-frame15689.npz", heyuan)
+        self.assertIn(
+            "164fb1be98102a6e0ca45ecf9aaf5fd1dedcd28e0cd53bc3bdbd80c9b94ee863",
+            heyuan,
+        )
+        self.assertIn("MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME:-15689", heyuan)
+        self.assertIn("MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-0.2", heyuan)
+        self.assertIn("host_prone_v1_0322.onnx", heyuan)
+        self.assertIn(
+            "62abf58c9a3d50dbe22ba1f950f288795fb3ae54bd3ca6221cc12cb1d45de155",
+            heyuan,
+        )
+        self.assertIn("Fallback stays opt-in", heyuan)
+        self.assertIn(
+            "/home/kaijie/matrix-artifacts/g1-host-getup-v1", heyuan
+        )
+        self.assertIn("$MATRIX_PHYSICAL_RECOVERY_ARTIFACT_ROOT/venv/bin/python", heyuan)
+        self.assertIn(
+            "/home/kaijie/worktrees/sonic-matrix-recovery-gate-20260719",
+            heyuan,
+        )
+        trna = (REPO_ROOT / "config/hosts/trna.env").read_text(encoding="utf-8")
+        self.assertIn('MATRIX_GAME_AUTO_RESPAWN:-off', trna)
+        self.assertIn('miniconda3/envs/sonic-h2-sim/bin/python', trna)
+        self.assertIn('MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-kungfu', trna)
+        self.assertIn('MATRIX_PHYSICAL_RECOVERY_HANDOFF:-sonic', trna)
+        self.assertIn('MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES:-1', trna)
+        self.assertIn('MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER:-cuda', trna)
+        self.assertIn('1307-sonic-default-frame15689.npz', trna)
+        self.assertIn('MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME:-15689', trna)
+        self.assertIn('MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-1.5', trna)
+        self.assertIn('"$PROFILE" == "trna"', launcher)
 
     def test_env_check_skips_mc_only_for_external_control_topology(self) -> None:
         command = [

@@ -32,14 +32,24 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             (native / "height.png").write_bytes(b"height")
             canonical.write_text(
                 """<mujoco><compiler meshdir="meshes" />
-<asset><mesh name="body" file="body.stl" /></asset>
+<default><default class="visual"><geom material="body_material" /></default></default>
+<asset><mesh name="body" file="body.stl" />
+<texture name="body_texture" builtin="flat" rgb1="0.7 0.2 0.1" width="1" height="1" />
+<material name="body_material" texture="body_texture" />
+<texture name="demo_ground" builtin="checker" />
+<material name="demo_ground_material" texture="demo_ground" /></asset>
 <worldbody><body name="pelvis"><freejoint name="floating" />
+<geom class="visual" mesh="body" />
 <joint name="joint_a" /><joint name="joint_b" /><body name="finger">
-<joint name="finger_joint" /></body></body></worldbody>
+<joint name="finger_joint" /></body></body>
+<light name="demo_light" /><geom name="demo_floor" type="plane"
+material="demo_ground_material" /></worldbody>
 <actuator><motor name="a" joint="joint_a" /><motor name="b" joint="joint_b" />
 <motor name="finger" joint="finger_joint" /></actuator>
 <sensor><jointpos name="a_pos" joint="joint_a" />
-<jointpos name="finger_pos" joint="finger_joint" /></sensor></mujoco>""",
+<jointpos name="finger_pos" joint="finger_joint" /></sensor>
+<statistic center="1 2 3" /><visual><global azimuth="10" /></visual>
+</mujoco>""",
                 encoding="utf-8",
             )
             scene = native / "scene.xml"
@@ -68,6 +78,32 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
                 ["joint_a", "joint_b"],
             )
             self.assertEqual(robot.find("worldbody/body/freejoint").get("name"), "floating")
+            self.assertEqual(len(robot.findall("worldbody")), 1)
+            self.assertEqual(
+                [(item.tag, item.get("name")) for item in robot.find("worldbody")],
+                [("body", "pelvis")],
+            )
+            self.assertIsNone(robot.find("statistic"))
+            self.assertIsNone(robot.find("visual"))
+            self.assertIsNone(
+                next(
+                    (
+                        item
+                        for asset in robot.findall("asset")
+                        for item in asset
+                        if item.get("name") == "demo_ground"
+                    ),
+                    None,
+                )
+            )
+            retained_assets = {
+                item.get("name")
+                for asset in robot.findall("asset")
+                for item in asset
+            }
+            self.assertIn("body_material", retained_assets)
+            self.assertIn("body_texture", retained_assets)
+            self.assertNotIn("demo_ground_material", retained_assets)
             self.assertEqual(
                 [item.get("joint") for item in robot.find("sensor")],
                 ["joint_a"],

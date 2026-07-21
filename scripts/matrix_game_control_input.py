@@ -67,6 +67,7 @@ from matrix_mc_commands import (
     GameCommandRequest,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
+    PolicySlotAssignment,
     decode_command_response,
     encode_command_request,
     parse_mc_command,
@@ -2985,6 +2986,8 @@ class OverlayIntent:
     action: str | None = None
     command: str | None = None
     active: bool | None = None
+    slot: str | None = None
+    policy_id: str | None = None
 
 
 class GameCommandClient:
@@ -2996,7 +2999,12 @@ class GameCommandClient:
     client never reconnects, resends, or converts a timeout into a retry.
     """
 
-    def __init__(self, file_descriptor: int | None) -> None:
+    def __init__(
+        self,
+        file_descriptor: int | None,
+        *,
+        initial_strategy_loadout: object = None,
+    ) -> None:
         self._connection: socket.socket | None = None
         self._session = os.urandom(16).hex()
         self._sequence = 0
@@ -3018,6 +3026,9 @@ class GameCommandClient:
         self.restart_required = False
         self.data: dict[str, object] | None = None
         self.last_request_id: str | None = None
+        self._strategy_loadout = self._validate_strategy_loadout(
+            initial_strategy_loadout
+        )
         if file_descriptor is None:
             return
         if (
@@ -3042,6 +3053,83 @@ class GameCommandClient:
                 connection.close()
             raise
         self._connection = connection
+
+    @staticmethod
+    def _validate_strategy_loadout(value: object) -> dict[str, object]:
+        if value is None:
+            return {
+                "version": 1,
+                "available": False,
+                "status": "unavailable",
+                "active_slot": "locomotion",
+                "pending": None,
+                "slots": [],
+                "resident_models": [],
+            }
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise ValueError("strategy loadout has an invalid version")
+        if type(value.get("available")) is not bool:
+            raise ValueError("strategy loadout availability is invalid")
+        if value.get("status") not in {
+            "unavailable",
+            "loading",
+            "ready",
+            "switching",
+        }:
+            raise ValueError("strategy loadout status is invalid")
+        if value.get("active_slot") not in {"locomotion", "recovery"}:
+            raise ValueError("strategy loadout active slot is invalid")
+        slots = value.get("slots")
+        resident_models = value.get("resident_models")
+        if not isinstance(slots, list) or not isinstance(resident_models, list):
+            raise ValueError("strategy loadout collections are invalid")
+        seen_slots: set[str] = set()
+        for slot in slots:
+            if not isinstance(slot, dict):
+                raise ValueError("strategy slot must be an object")
+            slot_id = slot.get("slot")
+            selected = slot.get("selected_policy_id")
+            candidates = slot.get("candidates")
+            if (
+                slot_id not in {"locomotion", "recovery"}
+                or slot_id in seen_slots
+                or not isinstance(selected, str)
+                or type(slot.get("locked")) is not bool
+                or not isinstance(candidates, list)
+            ):
+                raise ValueError("strategy slot has an invalid schema")
+            seen_slots.add(slot_id)
+            candidate_ids: set[str] = set()
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    raise ValueError("strategy candidate must be an object")
+                try:
+                    validated = PolicySlotAssignment(
+                        slot=slot_id,
+                        policy_id=candidate.get("policy_id"),
+                    )
+                except CommandParseError as exc:
+                    raise ValueError(str(exc)) from exc
+                if (
+                    validated.policy_id in candidate_ids
+                    or type(candidate.get("resident")) is not bool
+                    or type(candidate.get("available")) is not bool
+                ):
+                    raise ValueError("strategy candidate has an invalid schema")
+                candidate_ids.add(validated.policy_id)
+            if selected not in candidate_ids:
+                raise ValueError("strategy slot selection is not a candidate")
+        if slots and seen_slots != {"locomotion", "recovery"}:
+            raise ValueError("strategy loadout must define both slots")
+        try:
+            cloned = json.loads(json.dumps(value, allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("strategy loadout is not strict JSON") from exc
+        assert isinstance(cloned, dict)
+        return cloned
+
+    def strategy_loadout_mapping(self) -> dict[str, object]:
+        return json.loads(json.dumps(self._strategy_loadout, allow_nan=False))
 
     @property
     def available(self) -> bool:
@@ -3205,12 +3293,6 @@ class GameCommandClient:
                 "E_RESTART_PENDING", "A whole-runtime restart is already pending"
             )
             return False
-        connection = self._connection
-        if connection is None:
-            self._local_error(
-                "E_COMMAND_UNAVAILABLE", "Game commands are unavailable for this run"
-            )
-            return False
         try:
             parsed = parse_mc_command(command_text)
         except CommandParseError as exc:
@@ -3219,12 +3301,31 @@ class GameCommandClient:
                 message = f"{message} (column {exc.column})"
             self._local_error(exc.code, message)
             return False
+        return self._send_typed_command(
+            parsed.command,
+            warning=parsed.warning,
+            pending_message="Command submitted; waiting for the runtime",
+        )
+
+    def _send_typed_command(
+        self,
+        command: object,
+        *,
+        warning: str | None,
+        pending_message: str,
+    ) -> bool:
+        connection = self._connection
+        if connection is None:
+            self._local_error(
+                "E_COMMAND_UNAVAILABLE", "Game commands are unavailable for this run"
+            )
+            return False
         self._sequence += 1
         request = GameCommandRequest(
             session=self._session,
             sequence=self._sequence,
             request_id=f"cmd-{os.urandom(16).hex()}",
-            command=parsed.command,
+            command=command,
         )
         payload = encode_command_request(request)
         try:
@@ -3247,17 +3348,55 @@ class GameCommandClient:
             )
             return False
         self._pending = request
-        self._pending_warning = parsed.warning
+        self._pending_warning = warning
         self._result_revision += 1
         self.status = "pending"
         self.ok = None
         self.code = None
-        self.message = "Command submitted; waiting for the runtime"
-        self.warning = parsed.warning
+        self.message = pending_message
+        self.warning = warning
         self.restart_required = False
         self.data = None
         self.last_request_id = request.request_id
         return True
+
+    def select_policy(
+        self,
+        slot: object,
+        policy_id: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Send one strategy-slot transaction without entering text editing."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before switching")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        try:
+            command = PolicySlotAssignment(slot=slot, policy_id=policy_id)
+        except CommandParseError as exc:
+            self._local_error(exc.code, exc.message)
+            return False
+        return self._send_typed_command(
+            command,
+            warning=None,
+            pending_message="Switching resident policy; waiting for writer ACK",
+        )
 
     def poll(self) -> bool:
         """Receive at most one exact response; never resend a pending request."""
@@ -3294,6 +3433,18 @@ class GameCommandClient:
         ):
             self._protocol_failure("Game command response identity did not match")
             return True
+        response_data = dict(response.data) if response.data is not None else None
+        validated_loadout: dict[str, object] | None = None
+        if response_data is not None and "strategy_loadout" in response_data:
+            try:
+                validated_loadout = self._validate_strategy_loadout(
+                    response_data["strategy_loadout"]
+                )
+            except ValueError as exc:
+                self._protocol_failure(
+                    f"Invalid strategy loadout in command response: {exc}"
+                )
+                return True
         self._pending = None
         warning = self._pending_warning
         self._pending_warning = None
@@ -3304,7 +3455,9 @@ class GameCommandClient:
         self.message = response.message
         self.warning = warning
         self.restart_required = response.restart_required
-        self.data = dict(response.data) if response.data is not None else None
+        self.data = response_data
+        if validated_loadout is not None:
+            self._strategy_loadout = validated_loadout
         self.last_request_id = response.request_id
         if response.ok and response.restart_required:
             self.status = "restarting"
@@ -3558,6 +3711,30 @@ class CalibrationOverlaySupervisor:
                 ):
                     raise RuntimeError("invalid calibration overlay command-submit intent")
                 intent = OverlayIntent(kind="command_submit", command=command)
+            elif kind == "strategy_select":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "slot",
+                    "policy_id",
+                }:
+                    raise RuntimeError("invalid strategy-selection intent schema")
+                try:
+                    assignment = PolicySlotAssignment(
+                        slot=value.get("slot"),
+                        policy_id=value.get("policy_id"),
+                    )
+                except CommandParseError as exc:
+                    raise RuntimeError(
+                        "invalid strategy-selection intent"
+                    ) from exc
+                intent = OverlayIntent(
+                    kind="strategy_select",
+                    slot=assignment.slot,
+                    policy_id=assignment.policy_id,
+                )
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -3726,6 +3903,10 @@ def _parse_args() -> argparse.Namespace:
         "--game-command-fd",
         type=int,
         help="Inherited private SOCK_SEQPACKET channel for typed ESC commands",
+    )
+    parser.add_argument(
+        "--strategy-loadout-json",
+        help="Initial resident strategy-slot state supplied by the physics runtime",
     )
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
@@ -3930,8 +4111,19 @@ def main() -> int:
                 f"Matrix game-control input cannot initialize UE final-POV reader: {exc}"
             ) from exc
     publisher = None if args.dry_run else UnixSeqpacketPublisher(args.socket)
+    initial_strategy_loadout: object = None
+    if args.strategy_loadout_json is not None:
+        try:
+            initial_strategy_loadout = json.loads(args.strategy_loadout_json)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"Matrix game-control input received invalid strategy loadout: {exc}"
+            ) from exc
     try:
-        game_command_client = GameCommandClient(getattr(args, "game_command_fd", None))
+        game_command_client = GameCommandClient(
+            getattr(args, "game_command_fd", None),
+            initial_strategy_loadout=initial_strategy_loadout,
+        )
     except (OSError, ValueError) as exc:
         raise SystemExit(
             f"Matrix game-control input cannot initialize command channel: {exc}"
@@ -3990,6 +4182,7 @@ def main() -> int:
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "command_console": game_command_client.mapping(),
+                    "strategy_loadout": game_command_client.strategy_loadout_mapping(),
                     "mirror_sensitivity": sensitivity_telemetry,
                     "pointer": x11.pointer_telemetry,
                     "camera_yaw": camera_yaw_telemetry(
@@ -4070,6 +4263,19 @@ def main() -> int:
                     if intent.active:
                         apply_return.cancel_pending()
                     continue
+                if intent.kind == "strategy_select":
+                    assert intent.slot is not None
+                    assert intent.policy_id is not None
+                    game_command_client.select_policy(
+                        intent.slot,
+                        intent.policy_id,
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    apply_return.cancel_pending()
+                    continue
                 assert intent.kind == "command_submit"
                 assert intent.command is not None
                 command_submitted = game_command_client.submit(
@@ -4093,7 +4299,8 @@ def main() -> int:
                 # would turn a same-frame M/-/+/Enter/F9 press into a fresh
                 # settings edge even though the overlay still owned it.
                 or any(
-                    intent.kind in {"command_edit", "command_submit"}
+                    intent.kind
+                    in {"command_edit", "command_submit", "strategy_select"}
                     for intent in panel_intents
                 )
             )
@@ -4249,6 +4456,9 @@ def main() -> int:
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
                             "command_console": game_command_client.mapping(),
+                            "strategy_loadout": (
+                                game_command_client.strategy_loadout_mapping()
+                            ),
                             "mirror_sensitivity": sensitivity_telemetry,
                             "camera_yaw": camera_yaw_telemetry(
                                 args.camera_yaw_source,
@@ -4335,6 +4545,7 @@ def main() -> int:
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),
                 "command_console": game_command_client.mapping(),
+                "strategy_loadout": game_command_client.strategy_loadout_mapping(),
                 "gamepad_camera": {
                     "driver": "carla-spectator"
                     if args.camera_yaw_source == "carla"

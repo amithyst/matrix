@@ -140,7 +140,12 @@ class InputProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.InputProtocolError, "UTF-8"):
             MODULE.decode_input_packet(b"\xff")
         nested = (b"[" * 1100) + b"0" + (b"]" * 1100)
-        with self.assertRaisesRegex(MODULE.InputProtocolError, "valid JSON"):
+        # CPython may reject this at the JSON recursion boundary or parse it
+        # as a valid (but schema-invalid) top-level list, depending on the
+        # interpreter's recursion headroom.  Both outcomes are fail-closed.
+        with self.assertRaisesRegex(
+            MODULE.InputProtocolError, "valid JSON|must be an object"
+        ):
             MODULE.decode_input_packet(nested)
 
 
@@ -514,7 +519,9 @@ class GameControlCoreTest(unittest.TestCase):
         command = core.command(now_s=10.0, dt_s=1.0)
         self.assertAlmostEqual(math.atan2(command.facing[1], command.facing[0]), 0.1)
         self.assertEqual(command.speed_mps, 0.0)
-        self.assertEqual(command.mode, "idle")
+        self.assertEqual(command.mode, "turn")
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertEqual(command.movement, (0.0, 0.0, 0.0))
 
         core.accept_snapshot(
             snapshot(sequence=2, timestamp=10.1, yaw=math.pi / 2.0, pressed=("w",)),
@@ -525,7 +532,11 @@ class GameControlCoreTest(unittest.TestCase):
             math.atan2(still_turning.facing[1], still_turning.facing[0]),
             0.2,
         )
-        self.assertEqual(still_turning.mode, "idle")
+        self.assertEqual(still_turning.mode, "turn")
+        self.assertEqual(
+            still_turning.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
+        )
+        self.assertEqual(still_turning.movement, (0.0, 0.0, 0.0))
 
         forward = armed_core(config)
         forward.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
@@ -542,9 +553,13 @@ class GameControlCoreTest(unittest.TestCase):
 
         turning = core.command(now_s=10.0, dt_s=0.1)
 
-        self.assertEqual(turning.mode, "idle")
+        self.assertEqual(turning.mode, "turn")
+        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
         self.assertEqual(turning.speed_mps, 0.0)
-        self.assertAlmostEqual(abs(core.heading_rad), math.pi)
+        self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(
+            abs(core.heading_rad), MODULE.MAX_MEASURED_FACING_LEAD_RAD
+        )
         self.assertEqual(core.measured_heading_rad, 0.0)
 
         core.synchronize_heading(math.pi)
@@ -570,8 +585,9 @@ class GameControlCoreTest(unittest.TestCase):
         core.accept_snapshot(
             snapshot(sequence=0, timestamp=9.99), received_at_s=9.99
         )
-        # The body already faces the new camera-forward request, but the
-        # rate-limited planner target still points near the old reverse heading.
+        # The body already faces the new camera-forward request.  Runtime
+        # feedback must re-anchor the rate-limited planner target near that
+        # measured heading instead of preserving a stale open-loop lead.
         core.synchronize_heading(math.pi / 2.0)
         core.accept_snapshot(
             snapshot(sequence=1, yaw=math.pi / 2.0, pressed=("w",)),
@@ -581,12 +597,16 @@ class GameControlCoreTest(unittest.TestCase):
         still_turning = core.command(now_s=10.0, dt_s=0.1)
 
         self.assertEqual(core.measured_heading_rad, math.pi / 2.0)
-        self.assertGreater(
+        self.assertLessEqual(
             abs(MODULE.wrap_angle_rad(core.heading_rad - (math.pi / 2.0))),
-            math.radians(80.0),
+            config.max_turn_rate_rad_s * 0.1 + 1e-12,
         )
-        self.assertEqual(still_turning.mode, "idle")
-        self.assertEqual(still_turning.speed_mps, 0.0)
+        self.assertEqual(still_turning.mode, "move")
+        self.assertEqual(
+            still_turning.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
+        )
+        self.assertGreater(still_turning.speed_mps, 0.0)
+        self.assertEqual(still_turning.movement, still_turning.facing)
 
     def test_safety_stop_holds_measured_heading_not_stale_turn_target(self) -> None:
         core = MODULE.GameControlCore(
@@ -640,8 +660,10 @@ class GameControlCoreTest(unittest.TestCase):
             received_at_s=10.01,
         )
         turning = core.command(now_s=10.01, dt_s=0.02)
-        self.assertEqual(turning.mode, "idle")
+        self.assertEqual(turning.mode, "turn")
+        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
         self.assertEqual(turning.speed_mps, 0.0)
+        self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
 
     def test_antipodal_camera_noise_keeps_one_turn_direction(self) -> None:
         config = MODULE.ControlConfig(
@@ -666,6 +688,8 @@ class GameControlCoreTest(unittest.TestCase):
             )
             core.command(now_s=now, dt_s=0.1)
             headings.append(core.heading_rad)
+        # Without runtime feedback this unit-level fallback remains open-loop,
+        # but the antipodal sign latch must keep one direction.
         self.assertTrue(
             all(later > earlier for earlier, later in zip(headings, headings[1:]))
         )
@@ -811,11 +835,11 @@ class GameControlCoreTest(unittest.TestCase):
                 received_at_s=now,
             )
             active_modes.append(core.command(now_s=now, dt_s=0.02).mode)
-        self.assertEqual(active_modes, ["move", "idle", "idle", "idle"])
+        self.assertEqual(active_modes, ["move", "turn", "turn", "turn"])
 
-        # A request outside the 15-degree start edge stays idle. Crossing that
-        # edge starts once, and drifting just outside it remains active because
-        # the wider 30-degree stop edge has not been crossed.
+        # A request outside the 15-degree start edge remains turn-only.
+        # Crossing that edge starts once, and drifting just outside it remains
+        # active because the wider 30-degree stop edge has not been crossed.
         sequence = 6
         now = 10.06
         core.synchronize_heading(math.radians(16.0))
@@ -828,7 +852,7 @@ class GameControlCoreTest(unittest.TestCase):
             ),
             received_at_s=now,
         )
-        self.assertEqual(core.command(now_s=now, dt_s=0.02).mode, "idle")
+        self.assertEqual(core.command(now_s=now, dt_s=0.02).mode, "turn")
 
         restart_modes = []
         for sequence, error_deg in enumerate((15.1, 14.9, 15.1), start=7):
@@ -844,7 +868,7 @@ class GameControlCoreTest(unittest.TestCase):
                 received_at_s=now,
             )
             restart_modes.append(core.command(now_s=now, dt_s=0.02).mode)
-        self.assertEqual(restart_modes, ["idle", "move", "move"])
+        self.assertEqual(restart_modes, ["turn", "move", "move"])
 
     def test_slow_walk_tolerates_small_measured_heading_error(self) -> None:
         config = immediate_config(max_speed_mps=0.3)
@@ -864,7 +888,13 @@ class GameControlCoreTest(unittest.TestCase):
             snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
             received_at_s=10.0,
         )
-        self.assertEqual(turning.command(now_s=10.0, dt_s=0.1).mode, "idle")
+        turn_only = turning.command(now_s=10.0, dt_s=0.1)
+        self.assertEqual(turn_only.mode, "turn")
+        self.assertEqual(
+            turn_only.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
+        )
+        self.assertEqual(turn_only.speed_mps, 0.0)
+        self.assertEqual(turn_only.movement, (0.0, 0.0, 0.0))
 
     def test_small_effective_stick_input_can_enter_native_gait(self) -> None:
         core = armed_core(

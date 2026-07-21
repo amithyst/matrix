@@ -91,6 +91,75 @@ class SonicPhysicsModelError(RuntimeError):
     """Raised when the canonical SONIC model contract is not satisfied."""
 
 
+def _strip_canonical_scene_sections(
+    root: ET.Element,
+    *,
+    robot_worldbody: ET.Element,
+    robot_root_body: ET.Element,
+) -> None:
+    """Keep the canonical robot while dropping any bundled demo scene.
+
+    Some policy releases ship a self-contained MJCF with both the robot and a
+    floor/light/skybox.  Matrix composes that robot into its own native scene;
+    retaining the demo floor creates duplicate assets and collision geometry.
+    Asset pruning is based on references from the retained robot worldbody, so
+    robot meshes and materials remain intact.
+    """
+
+    for worldbody in list(root.findall("worldbody")):
+        if worldbody is not robot_worldbody:
+            root.remove(worldbody)
+    # MJCF also commonly places the robot and demo floor/light in one
+    # worldbody.  Retain only the top-level branch containing the free-root
+    # robot; Matrix supplies all scene siblings itself.
+    for child in list(robot_worldbody):
+        if child is robot_root_body or any(
+            item is robot_root_body for item in child.iter()
+        ):
+            continue
+        robot_worldbody.remove(child)
+    for tag in ("statistic", "visual"):
+        for element in list(root.findall(tag)):
+            root.remove(element)
+
+    referenced_assets: set[str] = set()
+    reference_roots = [robot_worldbody, *root.findall("default")]
+    for reference_root in reference_roots:
+        for element in reference_root.iter():
+            for attribute in ("mesh", "material", "hfield", "texture", "skin"):
+                value = element.get(attribute)
+                if value:
+                    referenced_assets.add(value)
+
+    asset_sections = list(root.findall("asset"))
+    named_assets: dict[str, ET.Element] = {}
+    for section in asset_sections:
+        for item in list(section):
+            name = item.get("name")
+            if name:
+                named_assets[name] = item
+
+    pending = list(referenced_assets)
+    while pending:
+        name = pending.pop()
+        item = named_assets.get(name)
+        if item is None:
+            continue
+        for attribute in ("mesh", "material", "texture", "hfield", "skin"):
+            dependency = item.get(attribute)
+            if dependency and dependency not in referenced_assets:
+                referenced_assets.add(dependency)
+                pending.append(dependency)
+
+    for section in asset_sections:
+        for item in list(section):
+            name = item.get("name")
+            if name and name not in referenced_assets:
+                section.remove(item)
+        if not list(section):
+            root.remove(section)
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -398,26 +467,37 @@ def _strip_non_body_joints(
             f"canonical SONIC model is missing body actuators: {missing_actuators}"
         )
 
-    worldbody = root.find("worldbody")
-    if worldbody is None:
+    worldbodies = list(root.findall("worldbody"))
+    if not worldbodies:
         raise SonicPhysicsModelError("canonical SONIC model has no worldbody")
-    if spawn_xyz is not None or spawn_yaw is not None:
-        root_body = next(
-            (
-                body
-                for body in worldbody.iter("body")
-                if any(
-                    child.tag == "freejoint"
-                    or (child.tag == "joint" and child.get("type") == "free")
-                    for child in list(body)
-                )
-            ),
-            None,
-        )
-        if root_body is None:
-            raise SonicPhysicsModelError(
-                "canonical SONIC model has no body with a free root joint"
+    root_body = next(
+        (
+            body
+            for worldbody in worldbodies
+            for body in worldbody.iter("body")
+            if any(
+                child.tag == "freejoint"
+                or (child.tag == "joint" and child.get("type") == "free")
+                for child in list(body)
             )
+        ),
+        None,
+    )
+    if root_body is None:
+        raise SonicPhysicsModelError(
+            "canonical SONIC model has no body with a free root joint"
+        )
+    worldbody = next(
+        worldbody
+        for worldbody in worldbodies
+        if any(body is root_body for body in worldbody.iter("body"))
+    )
+    _strip_canonical_scene_sections(
+        root,
+        robot_worldbody=worldbody,
+        robot_root_body=root_body,
+    )
+    if spawn_xyz is not None or spawn_yaw is not None:
         if spawn_xyz is not None:
             root_body.set("pos", " ".join(f"{value:.12g}" for value in spawn_xyz))
         if spawn_yaw is not None:
