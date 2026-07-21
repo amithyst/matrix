@@ -18,6 +18,14 @@ REQUEST_ID = "cmd-" + "b" * 32
 
 
 class McCommandParserTest(unittest.TestCase):
+    def test_parses_policy_slot_assignment(self) -> None:
+        parsed = MODULE.parse_mc_command("/policy recovery KungFu")
+
+        self.assertEqual(
+            parsed.command,
+            MODULE.PolicySlotAssignment(slot="recovery", policy_id="kungfu"),
+        )
+
     def test_parses_canonical_summon_with_relative_coordinates_and_tags(self) -> None:
         parsed = MODULE.parse_mc_command(
             '/summon matrix:teleport_point ~ ~1.5 -2 {Tags:["XX","home"]}'
@@ -96,6 +104,20 @@ class McCommandParserTest(unittest.TestCase):
 
 
 class McCommandProtocolTest(unittest.TestCase):
+    def test_policy_slot_assignment_round_trip_is_typed(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=4,
+            request_id=REQUEST_ID,
+            command=MODULE.PolicySlotAssignment("recovery", "host"),
+        )
+
+        payload = MODULE.encode_command_request(request)
+        decoded = MODULE.decode_command_request(payload)
+
+        self.assertEqual(decoded, request)
+        self.assertNotIn(b"/policy", payload)
+
     def test_request_round_trip_carries_typed_ast_not_command_text(self) -> None:
         command = MODULE.parse_mc_command("/tp @s ~1 2 ~-3").command
         request = MODULE.GameCommandRequest(

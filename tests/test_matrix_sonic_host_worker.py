@@ -402,6 +402,101 @@ class FakeKungFuPolicy:
 
 @unittest.skipUnless(hasattr(socket, "SOCK_SEQPACKET"), "requires SOCK_SEQPACKET")
 class WorkerHandoffTests(unittest.TestCase):
+    def test_writer_free_policy_selection_changes_the_next_resident_episode(self):
+        supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        supervisor.settimeout(2.0)
+        state_store = worker.LatestLowState()
+        state_store.set(snapshot())
+        dds = FakeDds()
+        kungfu = FakeKungFuPolicy()
+        host_runner = RecordingRunner(
+            "host_selected",
+            [np.zeros(23, dtype=np.float32) for _ in range(200)],
+        )
+        cascade = worker.HostPolicyCascade(
+            config=worker.HostControlConfig.create(),
+            runners=(host_runner,),
+            fallback_after_s=8.0,
+        )
+        resident_manifest = (
+            {
+                "name": "host:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+            {
+                "name": "kungfu:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+        )
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                worker.run_worker(
+                    cascade=cascade,
+                    amp_hold_policy=None,
+                    kungfu_policy=kungfu,
+                    dds=dds,
+                    state_store=state_store,
+                    control=child,
+                    publish_hz=50.0,
+                    lowstate_timeout_s=2.0,
+                    status_hz=20.0,
+                    initial_controller="kungfu",
+                    resident_policies=resident_manifest,
+                )
+            )
+        )
+
+        def receive_event(expected):
+            while True:
+                packet = json.loads(supervisor.recv(4096).decode("utf-8"))
+                if packet["event"] == expected:
+                    return packet
+
+        thread.start()
+        try:
+            ready = receive_event("READY_NO_WRITER")
+            self.assertEqual(ready["selected_policy_id"], "kungfu")
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": "matrix.sonic_host_worker.control.v1",
+                        "command": "SELECT_POLICY",
+                        "slot": "recovery",
+                        "policy_id": "host",
+                        "transition_id": "slot-test-1",
+                    }
+                ).encode("utf-8")
+            )
+            selected = receive_event("POLICY_SELECTED")
+            self.assertEqual(selected["policy_id"], "host")
+            self.assertEqual(selected["previous_policy_id"], "kungfu")
+            self.assertTrue(selected["models_reused"])
+            self.assertFalse(selected["writer_active"])
+
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": "matrix.sonic_host_worker.control.v1",
+                        "command": "GO",
+                        "episode_id": 1,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("FIRST_WRITE")
+            self.assertGreaterEqual(len(host_runner.inputs), 1)
+            self.assertEqual(kungfu.start_calls, [])
+            supervisor.send(b"STOP")
+            receive_event("STOPPED")
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [0])
+        finally:
+            supervisor.close()
+            child.close()
+
     def test_pause_then_go_reuses_resident_worker_and_policy(self):
         supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         supervisor.settimeout(2.0)

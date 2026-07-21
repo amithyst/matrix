@@ -50,6 +50,7 @@ from matrix_mc_commands import (
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
+    PolicySlotAssignment,
     decode_command_request,
     encode_command_response,
     execute_command,
@@ -2879,7 +2880,13 @@ class GameInputRuntime:
 class GameCommandRuntime:
     """Execute typed ESC-panel commands over one inherited private socketpair."""
 
-    def __init__(self, connection: socket.socket, world: _GameWorldStateRuntime) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        world: _GameWorldStateRuntime | None,
+        *,
+        policy_slots: Any | None = None,
+    ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
         self.world = world
@@ -2893,6 +2900,9 @@ class GameCommandRuntime:
         self.response_errors = 0
         self.restart_requested = False
         self.last_response: dict[str, object] | None = None
+        self.policy_slots = policy_slots
+        self.pending_policy_request: GameCommandRequest | None = None
+        self.policy_changes_executed = 0
 
     def _send(self, response: GameCommandResponse) -> None:
         payload = encode_command_response(response)
@@ -2948,6 +2958,32 @@ class GameCommandRuntime:
     def poll(self, *, current_pose: WorldPose, command_allowed: bool) -> bool:
         if self.restart_requested:
             return True
+        if self.pending_policy_request is not None:
+            if self.policy_slots is None:
+                raise RuntimeError("pending policy selection lost its coordinator")
+            request = self.pending_policy_request
+            result = self.policy_slots.poll_policy_slot_assignment(
+                request.request_id
+            )
+            if result is None:
+                return False
+            ok, code, message, loadout = result
+            self.pending_policy_request = None
+            if ok:
+                self.commands_executed += 1
+                self.policy_changes_executed += 1
+            else:
+                self.rejected_commands += 1
+            self._send(
+                self._response(
+                    request,
+                    ok=ok,
+                    code=code,
+                    message=message,
+                    data={"strategy_loadout": loadout},
+                )
+            )
+            return False
         for _ in range(16):
             try:
                 payload = self.connection.recv(MAX_COMMAND_PACKET_BYTES + 1)
@@ -2992,6 +3028,68 @@ class GameCommandRuntime:
                         ok=False,
                         code="E_NOT_PAUSED",
                         message="Open ESC and wait for a neutral frame before commands",
+                    )
+                )
+                continue
+            if isinstance(request.command, PolicySlotAssignment):
+                if self.policy_slots is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_POLICY_UNAVAILABLE",
+                            message="Resident policy slots are unavailable for this run",
+                        )
+                    )
+                    continue
+                try:
+                    loadout = self.policy_slots.request_policy_slot_assignment(
+                        request.command,
+                        transition_id=request.request_id,
+                    )
+                except CommandExecutionError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={
+                                "strategy_loadout": (
+                                    self.policy_slots.strategy_loadout_mapping()
+                                )
+                            },
+                        )
+                    )
+                    continue
+                if loadout is None:
+                    self.pending_policy_request = request
+                    return False
+                self.commands_executed += 1
+                self.policy_changes_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code="OK_POLICY_SLOT_ASSIGNED",
+                        message=(
+                            f"Assigned {request.command.policy_id} to "
+                            f"{request.command.slot}"
+                        ),
+                        data={"strategy_loadout": loadout},
+                    )
+                )
+                continue
+            if self.world is None:
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_WORLD_UNAVAILABLE",
+                        message="Persistent world commands are unavailable for this run",
                     )
                 )
                 continue
@@ -3051,6 +3149,8 @@ class GameCommandRuntime:
             "last_sequence": self.last_sequence,
             "requests_received": self.requests_received,
             "commands_executed": self.commands_executed,
+            "policy_changes_executed": self.policy_changes_executed,
+            "policy_change_pending": self.pending_policy_request is not None,
             "protocol_errors": self.protocol_errors,
             "rejected_commands": self.rejected_commands,
             "response_errors": self.response_errors,
@@ -3204,6 +3304,7 @@ class NativeProcessGroup:
         restart_capability_file: Path | None = None,
         restart_launcher_pid: int | None = None,
         command_fd: int | None = None,
+        strategy_loadout_json: str | None = None,
     ) -> int:
         command = [
             python,
@@ -3270,6 +3371,8 @@ class NativeProcessGroup:
             )
         if status_file is not None:
             command.extend(("--status-file", str(status_file)))
+        if strategy_loadout_json is not None:
+            command.extend(("--strategy-loadout-json", strategy_loadout_json))
         extra_pass_fds: tuple[int, ...] = ()
         if command_fd is not None:
             if isinstance(command_fd, bool) or not isinstance(command_fd, int):
@@ -3596,6 +3699,11 @@ class _RecoveryWorkerControl:
         self.resident_policies: list[dict[str, Any]] = []
         self.registered_policy_ids: list[str] = []
         self.initial_policy_id: str | None = None
+        self.selected_policy_id: str | None = None
+        self.policy_selection_transition_id: str | None = None
+        self.policy_selection_requested_id: str | None = None
+        self.last_policy_selection: dict[str, Any] | None = None
+        self.last_policy_selection_rejection: dict[str, Any] | None = None
         self.models_loaded_once = False
         self.models_warmed = False
         self.last_event: str | None = None
@@ -3640,6 +3748,9 @@ class _RecoveryWorkerControl:
             "resident_policies": list(self.resident_policies),
             "registered_policy_ids": list(self.registered_policy_ids),
             "initial_policy_id": self.initial_policy_id,
+            "selected_policy_id": self.selected_policy_id,
+            "last_policy_selection": self.last_policy_selection,
+            "last_policy_selection_rejection": self.last_policy_selection_rejection,
             "models_loaded_once": self.models_loaded_once,
             "models_warmed": self.models_warmed,
             "last_event": self.last_event,
@@ -3713,6 +3824,11 @@ class _RecoveryWorkerControl:
         self.resident_policies = []
         self.registered_policy_ids = []
         self.initial_policy_id = None
+        self.selected_policy_id = None
+        self.policy_selection_transition_id = None
+        self.policy_selection_requested_id = None
+        self.last_policy_selection = None
+        self.last_policy_selection_rejection = None
         self.models_loaded_once = False
         self.models_warmed = False
         self.last_event = None
@@ -3747,6 +3863,8 @@ class _RecoveryWorkerControl:
 
         if not self.ready or self.connection is None or not self.paused:
             raise RuntimeError("resident recovery worker is not ready and paused")
+        if self.policy_selection_transition_id is not None:
+            raise RuntimeError("cannot start recovery during a policy selection")
         if self.episode_id is not None and self.go_sent:
             self.completed_episodes.append(self._episode_snapshot())
             self.completed_episodes[:] = self.completed_episodes[-8:]
@@ -3828,6 +3946,7 @@ class _RecoveryWorkerControl:
             resident_policies = payload.get("resident_policies")
             registered_policy_ids = payload.get("registered_policy_ids")
             initial_policy_id = payload.get("initial_policy_id")
+            selected_policy_id = payload.get("selected_policy_id", initial_policy_id)
             has_resident_attestation = any(
                 key in payload
                 for key in (
@@ -3880,11 +3999,20 @@ class _RecoveryWorkerControl:
                         raise RuntimeError(
                             "recovery worker initial policy is not registered"
                         )
+                    if selected_policy_id not in registered_policy_ids:
+                        raise RuntimeError(
+                            "recovery worker selected policy is not registered"
+                        )
                 self.execution_provider = provider
                 self.resident_policies = [dict(item) for item in resident_policies]
                 self.registered_policy_ids = list(registered_policy_ids or [])
                 self.initial_policy_id = (
                     str(initial_policy_id) if initial_policy_id is not None else None
+                )
+                self.selected_policy_id = (
+                    str(selected_policy_id)
+                    if selected_policy_id is not None
+                    else self.initial_policy_id
                 )
                 self.models_loaded_once = True
                 self.models_warmed = True
@@ -3967,6 +4095,33 @@ class _RecoveryWorkerControl:
                         "resident standby STATUS retained write authority"
                     )
             self.last_status = dict(payload)
+            selected_policy_id = payload.get("selected_policy_id")
+            if selected_policy_id is not None:
+                if selected_policy_id not in self.registered_policy_ids:
+                    raise RuntimeError("worker STATUS selected an unknown policy")
+                self.selected_policy_id = str(selected_policy_id)
+        elif event == "POLICY_SELECTED":
+            if payload.get("transition_id") != self.policy_selection_transition_id:
+                raise RuntimeError("policy selection transition_id mismatch")
+            if payload.get("slot") != "recovery":
+                raise RuntimeError("policy selection targeted an unknown slot")
+            if payload.get("policy_id") != self.policy_selection_requested_id:
+                raise RuntimeError("policy selection acknowledged the wrong policy")
+            if payload.get("writer_active") is not False:
+                raise RuntimeError("policy selection changed an active writer")
+            if payload.get("models_reused") is not True:
+                raise RuntimeError("policy selection did not reuse resident models")
+            self.selected_policy_id = str(payload["policy_id"])
+            self.last_policy_selection = dict(payload)
+            self.last_policy_selection_rejection = None
+            self.policy_selection_transition_id = None
+            self.policy_selection_requested_id = None
+        elif event == "POLICY_SELECTION_REJECTED":
+            if payload.get("transition_id") != self.policy_selection_transition_id:
+                raise RuntimeError("policy selection rejection transition_id mismatch")
+            self.last_policy_selection_rejection = dict(payload)
+            self.policy_selection_transition_id = None
+            self.policy_selection_requested_id = None
         elif event == "ERROR":
             self.error = str(payload.get("message", "worker error"))
         elif event == "POLICY_FALLBACK_DUE":
@@ -4187,6 +4342,48 @@ class _RecoveryWorkerControl:
             self.advance_transition_id = str(payload["transition_id"])
             self.policy_switch_accepted = False
 
+    def select_policy(self, policy_id: str, *, transition_id: str) -> None:
+        """Assign the next recovery policy while the resident writer is paused."""
+
+        selected = str(policy_id).strip().lower()
+        if selected not in self.registered_policy_ids:
+            raise ValueError(f"recovery policy is not registered: {selected!r}")
+        if not transition_id or len(transition_id) > 128:
+            raise ValueError("policy selection transition_id is invalid")
+        if self.connection is None or not self.ready or not self.paused:
+            raise RuntimeError("recovery worker is not ready and paused")
+        if self.go_sent and not self.pause_sent:
+            raise RuntimeError("recovery worker still owns the active episode")
+        if self.policy_selection_transition_id is not None:
+            raise RuntimeError("a recovery policy selection is already pending")
+        payload = {
+            "schema": "matrix.sonic_host_worker.control.v1",
+            "command": "SELECT_POLICY",
+            "slot": "recovery",
+            "policy_id": selected,
+            "transition_id": transition_id,
+        }
+        packet = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        written = self.connection.send(packet)
+        if written != len(packet):
+            raise RuntimeError("short recovery policy selection packet")
+        self.policy_selection_transition_id = transition_id
+        self.policy_selection_requested_id = selected
+        self.last_policy_selection_rejection = None
+        self.command_history.append(
+            {
+                "command": "SELECT_POLICY",
+                "episode_id": self.episode_id,
+                "transition_id": transition_id,
+                "policy_id": selected,
+                "sent_monotonic": time.monotonic(),
+            }
+        )
+
     def ready_recent(self, *, max_age_s: float) -> bool:
         if not math.isfinite(max_age_s) or max_age_s <= 0.0:
             raise ValueError("max_age_s must be finite and positive")
@@ -4248,6 +4445,10 @@ class _RecoveryWorkerControl:
             "resident_policies": list(self.resident_policies),
             "registered_policy_ids": list(self.registered_policy_ids),
             "initial_policy_id": self.initial_policy_id,
+            "selected_policy_id": self.selected_policy_id,
+            "policy_selection_pending": self.policy_selection_transition_id is not None,
+            "last_policy_selection": self.last_policy_selection,
+            "last_policy_selection_rejection": self.last_policy_selection_rejection,
             "models_loaded_once": self.models_loaded_once,
             "models_warmed": self.models_warmed,
             "resident_attestation_required": self.require_resident_attestation,
@@ -4694,7 +4895,7 @@ class _PhysicalRecoveryCoordinator:
         self.worker_script = args.physical_recovery_worker.resolve()
         self.initial_controller = str(
             getattr(args, "physical_recovery_initial_controller", "host")
-        )
+        ).strip().lower()
         self.handoff_mode = str(
             getattr(args, "physical_recovery_handoff", "amp")
         )
@@ -4782,6 +4983,212 @@ class _PhysicalRecoveryCoordinator:
         self.policy_advances = 0
         self.current_recovery_worker_episode_id: int | None = None
         self.latest_completed_recovery_worker_episode_id: int | None = None
+        self._policy_selection_pending: dict[str, object] | None = None
+        self._policy_selection_results: dict[
+            str, tuple[bool, str, str, dict[str, object]]
+        ] = {}
+
+    def _configured_recovery_policy_ids(self) -> tuple[str, ...]:
+        configured = ["kungfu", "host", "amp"]
+        if (
+            getattr(self, "kungfu_model", None) is None
+            or getattr(self, "kungfu_motion", None) is None
+        ):
+            configured.remove("kungfu")
+        initial_controller = str(getattr(self, "initial_controller", "host"))
+        if initial_controller not in configured:
+            configured.append(initial_controller)
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.registered_policy_ids:
+            registered = set(worker.registered_policy_ids)
+            configured = [policy for policy in configured if policy in registered]
+        return tuple(dict.fromkeys(configured))
+
+    def strategy_loadout_mapping(self) -> dict[str, object]:
+        """Return the game-facing two-slot view over resident policy sessions."""
+
+        state = self.fsm.state
+        game_state = state in {
+            RecoveryState.GAME_SONIC,
+            ResidentRecoveryState.GAME_SONIC,
+        }
+        recovery_ids = self._configured_recovery_policy_ids()
+        pending_value = getattr(self, "_policy_selection_pending", None)
+        pending = (
+            dict(pending_value)
+            if pending_value is not None
+            else None
+        )
+        worker = self.worker
+        resident_ready = bool(
+            self.resident_policies
+            and worker.ready
+            and worker.models_loaded_once
+            and worker.models_warmed
+        )
+        selected_recovery = (
+            worker.selected_policy_id
+            if getattr(worker, "selected_policy_id", None) in recovery_ids
+            else str(getattr(self, "initial_controller", "host"))
+        )
+        return {
+            "version": 1,
+            "available": bool(self.resident_policies),
+            "status": (
+                "unavailable"
+                if not self.resident_policies
+                else (
+                    "switching"
+                    if pending is not None
+                    else ("ready" if resident_ready else "loading")
+                )
+            ),
+            "active_slot": "locomotion" if game_state else "recovery",
+            "pending": pending,
+            "slots": [
+                {
+                    "slot": "locomotion",
+                    "selected_policy_id": "sonic",
+                    "locked": True,
+                    "candidates": [
+                        {
+                            "policy_id": "sonic",
+                            "resident": True,
+                            "available": True,
+                        }
+                    ],
+                },
+                {
+                    "slot": "recovery",
+                    "selected_policy_id": selected_recovery,
+                    "locked": not self.resident_policies,
+                    "candidates": [
+                        {
+                            "policy_id": policy_id,
+                            "resident": bool(self.resident_policies),
+                            "available": bool(self.resident_policies),
+                        }
+                        for policy_id in recovery_ids
+                    ],
+                },
+            ],
+            "resident_models": [
+                {"policy_id": "sonic", "name": "sonic", "resident": True},
+                *[
+                    {
+                        "policy_id": policy_id,
+                        "name": policy_id,
+                        "resident": bool(self.resident_policies),
+                    }
+                    for policy_id in recovery_ids
+                ],
+            ],
+        }
+
+    def request_policy_slot_assignment(
+        self,
+        command: PolicySlotAssignment,
+        *,
+        transition_id: str,
+    ) -> dict[str, object] | None:
+        """Begin one writer-free slot assignment, or return an idempotent result."""
+
+        if command.slot == "locomotion":
+            if command.policy_id != "sonic":
+                raise CommandExecutionError(
+                    "E_POLICY_NOT_REGISTERED",
+                    "The locomotion slot currently accepts only sonic",
+                )
+            return self.strategy_loadout_mapping()
+        if not self.resident_policies:
+            raise CommandExecutionError(
+                "E_POLICY_UNAVAILABLE",
+                "Resident recovery policy slots are disabled",
+            )
+        if self._policy_selection_pending is not None:
+            raise CommandExecutionError(
+                "E_POLICY_SWITCH_BUSY",
+                "A recovery policy selection is already pending",
+            )
+        if self.fsm.state is not ResidentRecoveryState.GAME_SONIC:
+            raise CommandExecutionError(
+                "E_POLICY_SLOT_ACTIVE",
+                "Recovery policy can change only while SONIC owns control",
+            )
+        candidates = self._configured_recovery_policy_ids()
+        if command.policy_id not in candidates:
+            raise CommandExecutionError(
+                "E_POLICY_NOT_REGISTERED",
+                f"Recovery policy is not resident: {command.policy_id}",
+            )
+        if (
+            command.policy_id == self.initial_controller
+            and self.worker.selected_policy_id == command.policy_id
+        ):
+            return self.strategy_loadout_mapping()
+        if not self.worker.ready or not self.worker.paused:
+            raise CommandExecutionError(
+                "E_POLICY_WORKER_NOT_READY",
+                "Resident recovery policies are not ready and writer-free",
+            )
+        try:
+            self.worker.select_policy(
+                command.policy_id,
+                transition_id=transition_id,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise CommandExecutionError(
+                "E_POLICY_SWITCH_REJECTED",
+                str(exc),
+            ) from exc
+        self._policy_selection_pending = {
+            "slot": command.slot,
+            "policy_id": command.policy_id,
+            "transition_id": transition_id,
+            "requested_monotonic_s": time.monotonic(),
+        }
+        return None
+
+    def _reconcile_policy_slot_assignment(self) -> None:
+        pending = getattr(self, "_policy_selection_pending", None)
+        if pending is None:
+            return
+        transition_id = str(pending["transition_id"])
+        rejection = self.worker.last_policy_selection_rejection
+        if (
+            rejection is not None
+            and rejection.get("transition_id") == transition_id
+        ):
+            self._policy_selection_pending = None
+            self._policy_selection_results[transition_id] = (
+                False,
+                "E_POLICY_SWITCH_REJECTED",
+                str(rejection.get("message", "Recovery policy selection failed")),
+                self.strategy_loadout_mapping(),
+            )
+            return
+        selection = self.worker.last_policy_selection
+        if selection is None or selection.get("transition_id") != transition_id:
+            return
+        selected = str(selection["policy_id"])
+        self.fsm.select_recovery_policy(selected)
+        self.initial_controller = selected
+        self._policy_selection_pending = None
+        self._policy_selection_results[transition_id] = (
+            True,
+            "OK_POLICY_SLOT_ASSIGNED",
+            f"Assigned {selected} to recovery",
+            self.strategy_loadout_mapping(),
+        )
+
+    def poll_policy_slot_assignment(
+        self,
+        transition_id: str,
+    ) -> tuple[bool, str, str, dict[str, object]] | None:
+        self._reconcile_policy_slot_assignment()
+        return getattr(self, "_policy_selection_results", {}).pop(
+            transition_id, None
+        )
 
     def _capture_restart_anchor(self, qpos: Any) -> None:
         self.restarted_root_yaw_rad = _root_yaw_rad(qpos)
@@ -4968,6 +5375,7 @@ class _PhysicalRecoveryCoordinator:
     ) -> RecoveryOutput | ResidentRecoveryOutput:
         self.worker.poll()
         self.sonic_writer.poll()
+        self._reconcile_policy_slot_assignment()
         if self.fsm.state not in {
             RecoveryState.GAME_SONIC,
             ResidentRecoveryState.GAME_SONIC,
@@ -5772,6 +6180,7 @@ class _PhysicalRecoveryCoordinator:
                 self.policy_fallback_last_near_upright_s
             ),
             "initial_controller": self.initial_controller,
+            "strategy_loadout": self.strategy_loadout_mapping(),
             "kungfu_reference_frame": (
                 self.kungfu_reference_frame
                 if self.initial_controller == "kungfu"
@@ -6263,12 +6672,6 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     GameControlCore(game_config),
                 )
                 game_readiness = _GameSonicReadinessGate(snapshot)
-                if game_world is not None and not args.no_game_input_provider:
-                    command_parent, game_command_child_socket = socket.socketpair(
-                        socket.AF_UNIX,
-                        socket.SOCK_SEQPACKET,
-                    )
-                    game_commands = GameCommandRuntime(command_parent, game_world)
                 if getattr(args, "game_fall_recovery", "off") == "sonic":
                     game_fall_recovery = _GameFallRecoveryGate(
                         timeout_s=args.game_fall_recovery_timeout
@@ -6279,6 +6682,18 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         initial_root_yaw_rad=initial_root_yaw_rad,
                     )
                     physical_recovery.open(zmq_port=planner_port)
+                if not args.no_game_input_provider and (
+                    game_world is not None or physical_recovery is not None
+                ):
+                    command_parent, game_command_child_socket = socket.socketpair(
+                        socket.AF_UNIX,
+                        socket.SOCK_SEQPACKET,
+                    )
+                    game_commands = GameCommandRuntime(
+                        command_parent,
+                        game_world,
+                        policy_slots=physical_recovery,
+                    )
                 try:
                     game_input.open()
                 except OSError as exc:
@@ -6331,6 +6746,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         command_fd=(
                             game_command_child_socket.fileno()
                             if game_command_child_socket is not None
+                            else None
+                        ),
+                        strategy_loadout_json=(
+                            json.dumps(
+                                physical_recovery.strategy_loadout_mapping(),
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            if physical_recovery is not None
                             else None
                         ),
                     )

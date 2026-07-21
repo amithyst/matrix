@@ -513,6 +513,7 @@ def decode_command_envelope(packet: bytes) -> tuple[str, dict[str, Any]]:
         "ENTER_AMP_HOLD",
         "ENTER_JOINT_HOLD",
         "ADVANCE_POLICY",
+        "SELECT_POLICY",
     }:
         return text.upper(), {}
     try:
@@ -532,6 +533,7 @@ def decode_command_envelope(packet: bytes) -> tuple[str, dict[str, Any]]:
         "ENTER_AMP_HOLD",
         "ENTER_JOINT_HOLD",
         "ADVANCE_POLICY",
+        "SELECT_POLICY",
     }:
         raise ValueError(f"unsupported control command: {command!r}")
     return command, dict(payload)
@@ -670,7 +672,7 @@ def run_worker(
         kungfu_policy=kungfu_policy,
         execution_provider=execution_provider,
     )
-    initial_policy = policy_registry.require(initial_controller)
+    selected_policy = policy_registry.require(initial_controller)
     resident_manifest = [dict(item) for item in resident_policies]
     if not resident_manifest:
         raise ValueError("resident policy manifest cannot be empty")
@@ -683,7 +685,8 @@ def run_worker(
             "resident_policies": resident_manifest,
             "resident_policy_count": len(resident_manifest),
             "registered_policy_ids": list(policy_registry.policy_ids),
-            "initial_policy_id": initial_policy.policy_id,
+            "initial_policy_id": selected_policy.policy_id,
+            "selected_policy_id": selected_policy.policy_id,
             "models_loaded_once": True,
             "models_warmed": True,
         }
@@ -697,7 +700,7 @@ def run_worker(
     next_status = now
     go_time: float | None = None
     latest_target: np.ndarray | None = None
-    controller = initial_policy.controller
+    controller = selected_policy.controller
     amp_started_monotonic: float | None = None
     kungfu_started_monotonic: float | None = None
     amp_hold_first_write_pending = False
@@ -726,7 +729,7 @@ def run_worker(
         nonlocal amp_hold_transition_id, amp_hold_previous_controller
         nonlocal amp_hold_history_reset, pending_policy_switch_first_write
 
-        controller = initial_policy.controller
+        controller = selected_policy.controller
         latest_target = None
         amp_started_monotonic = None
         kungfu_started_monotonic = None
@@ -849,6 +852,60 @@ def run_worker(
                         active_episode_id = None
                     if command == "STOP":
                         break
+                elif command == "SELECT_POLICY":
+                    if handoff.state == HandoffStateMachine.ACTIVE:
+                        send_event(
+                            "ERROR",
+                            {"message": "SELECT_POLICY requires a paused writer"},
+                        )
+                        continue
+                    policy_id = command_fields.get("policy_id")
+                    transition_id = command_fields.get("transition_id")
+                    if not isinstance(policy_id, str) or not policy_id:
+                        send_event(
+                            "ERROR",
+                            {"message": "SELECT_POLICY policy_id must be non-empty"},
+                        )
+                        continue
+                    if not isinstance(transition_id, str) or not transition_id:
+                        send_event(
+                            "ERROR",
+                            {
+                                "message": (
+                                    "SELECT_POLICY transition_id must be non-empty"
+                                )
+                            },
+                        )
+                        continue
+                    try:
+                        next_policy = policy_registry.require(policy_id)
+                    except ValueError as exc:
+                        send_event(
+                            "POLICY_SELECTION_REJECTED",
+                            {
+                                "slot": "recovery",
+                                "policy_id": str(policy_id).strip().lower(),
+                                "transition_id": transition_id,
+                                "message": str(exc),
+                            },
+                        )
+                        continue
+                    previous_policy = selected_policy
+                    selected_policy = next_policy
+                    controller = selected_policy.controller
+                    latest_target = None
+                    send_event(
+                        "POLICY_SELECTED",
+                        {
+                            "slot": "recovery",
+                            "policy_id": selected_policy.policy_id,
+                            "previous_policy_id": previous_policy.policy_id,
+                            "transition_id": transition_id,
+                            "writer_active": False,
+                            "models_reused": True,
+                        },
+                    )
+                    next_status = monotonic()
                 elif command == "ADVANCE_POLICY":
                     if handoff.state != HandoffStateMachine.ACTIVE:
                         send_event(
@@ -1174,6 +1231,7 @@ def run_worker(
                                 else "WRITER_FREE_STANDBY"
                             ),
                             "active_policy_id": None,
+                            "selected_policy_id": selected_policy.policy_id,
                             "registered_policy_ids": list(
                                 policy_registry.policy_ids
                             ),
@@ -1312,11 +1370,13 @@ def run_worker(
                 if active_policy is not None:
                     status.update(active_policy.status_fields(now))
                     status["active_policy_id"] = active_policy.policy_id
+                    status["selected_policy_id"] = selected_policy.policy_id
                 elif controller == JOINT_POSE_HOLD_CONTROLLER:
                     assert joint_hold_started_monotonic is not None
                     status.update(
                         {
                             "active_policy_id": "joint_pose_hold",
+                            "selected_policy_id": selected_policy.policy_id,
                             "policy_index": cascade.index,
                             "policy": "measured_joint_pose_hold",
                             "policy_elapsed_s": now
@@ -1334,6 +1394,7 @@ def run_worker(
                     status.update(
                         {
                             "active_policy_id": "amp",
+                            "selected_policy_id": selected_policy.policy_id,
                             "policy_index": None,
                             "policy": (
                                 "amp_walk_run_getup"

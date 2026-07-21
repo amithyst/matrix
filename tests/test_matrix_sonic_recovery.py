@@ -1019,6 +1019,17 @@ class RecoveryFsmTests(unittest.TestCase):
 
 
 class ResidentRecoveryFsmTests(unittest.TestCase):
+    def test_recovery_policy_slot_changes_only_while_sonic_owns_control(self):
+        machine = recovery.ResidentPolicyRecoveryFSM(
+            recovery_policy_id="kungfu"
+        )
+
+        self.assertEqual(machine.select_recovery_policy("host"), "kungfu")
+        self.assertEqual(machine.recovery_policy_id, "host")
+        machine.step(resident_sample(0.0, fall_detected=True))
+        with self.assertRaisesRegex(RuntimeError, "GAME_SONIC"):
+            machine.select_recovery_policy("amp")
+
     def test_sonic_kungfu_same_sonic_authority_cycle(self):
         machine = recovery.ResidentPolicyRecoveryFSM()
         outputs = []

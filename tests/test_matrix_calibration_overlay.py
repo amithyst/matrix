@@ -158,6 +158,23 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertFalse(self.intersects(layout["title"], layout["profile_local"]))
         self.assertFalse(self.intersects(layout["title"], layout["profile_remote"]))
 
+    def test_strategy_targets_are_page_scoped_and_outside_crosshair(self) -> None:
+        geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
+        layout = MODULE.overlay_layout(geometry)
+        for index in range(3):
+            name = f"recovery_policy_{index}"
+            x, y, width, height = layout[name]
+            self.assertEqual(
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="loadout",
+                ),
+                name,
+            )
+            self.assertFalse(self.intersects(layout[name], layout["crosshair_safe"]))
+
     def test_root_coordinate_hit_test_handles_offset_remote_desktop_client(self) -> None:
         geometry = MODULE.WindowGeometry(1, -640, 120, 1600, 900)
         layout = MODULE.overlay_layout(geometry)
@@ -323,6 +340,49 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIsNone(malformed.sequence)
         self.assertEqual(malformed.result_revision, 0)
 
+    def test_strategy_loadout_model_exposes_two_slots_and_pending_selection(self) -> None:
+        model = MODULE.strategy_loadout_model(
+            {
+                "strategy_loadout": {
+                    "version": 1,
+                    "available": True,
+                    "status": "switching",
+                    "active_slot": "locomotion",
+                    "pending": {"policy_id": "host"},
+                    "slots": [
+                        {
+                            "slot": "locomotion",
+                            "selected_policy_id": "sonic",
+                        },
+                        {
+                            "slot": "recovery",
+                            "selected_policy_id": "kungfu",
+                            "candidates": [
+                                {
+                                    "policy_id": "kungfu",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                                {
+                                    "policy_id": "host",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                            ],
+                        },
+                    ],
+                }
+            }
+        )
+        self.assertEqual(model.locomotion_policy_id, "sonic")
+        self.assertEqual(model.recovery_policy_id, "kungfu")
+        self.assertEqual(model.pending_policy_id, "host")
+        self.assertEqual(
+            [candidate.policy_id for candidate in model.recovery_candidates],
+            ["kungfu", "host"],
+        )
+        self.assertFalse(model.policy_enabled("host"))
+
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):
             return MODULE.settings_panel_model(
@@ -434,6 +494,24 @@ class OverlayStateTest(unittest.TestCase):
 
 
 class PointerActionPublisherTest(unittest.TestCase):
+    def test_strategy_selection_is_a_strict_typed_intent(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_strategy_select("recovery", "KungFu")
+            packet = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(packet["kind"], "strategy_select")
+            self.assertEqual(packet["slot"], "recovery")
+            self.assertEqual(packet["policy_id"], "kungfu")
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                publisher.publish_strategy_select("recovery", "bad policy")
+        finally:
+            publisher.close()
+            receiver.close()
+
     def test_packets_are_bounded_ordered_and_session_bound(self) -> None:
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         publisher = MODULE.PointerActionPublisher(
@@ -1157,9 +1235,15 @@ class X11IntegrationTest(unittest.TestCase):
                     is True
                     and value
                 )
+                font_backend = ready_status["fonts"]["backend"]
+                expected_fonts = (
+                    MODULE._XFT_LARGE_FONT_CANDIDATES
+                    if font_backend == "xft-utf8"
+                    else MODULE._LARGE_FONT_CANDIDATES
+                )
                 self.assertIn(
                     ready_status["fonts"]["large"],
-                    [name.decode("ascii") for name in MODULE._LARGE_FONT_CANDIDATES],
+                    [name.decode("ascii") for name in expected_fonts],
                 )
                 horizontal = self.wait_until(
                     lambda: self.run_x11(
@@ -1225,6 +1309,18 @@ class X11IntegrationTest(unittest.TestCase):
                         target_geometry["HEIGHT"],
                     )
                 )
+                settings_tab = layout["tab_settings"]
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(settings_tab[0] + settings_tab[2] // 2),
+                    str(settings_tab[1] + settings_tab[3] // 2),
+                    "click",
+                    "1",
+                )
+                time.sleep(0.08)
                 remote_button = layout["profile_remote"]
                 remote_point = (
                     remote_button[0] + remote_button[2] // 2,
@@ -1271,6 +1367,18 @@ class X11IntegrationTest(unittest.TestCase):
                 # overlay until its first Escape ends editing.
                 read_target_events()
                 target_events.clear()
+                console_tab = layout["tab_console"]
+                self.run_x11(
+                    environment,
+                    "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(console_tab[0] + console_tab[2] // 2),
+                    str(console_tab[1] + console_tab[3] // 2),
+                    "click",
+                    "1",
+                )
+                time.sleep(0.08)
                 command_input = layout["command_input"]
                 command_point = (
                     command_input[0] + command_input[2] // 2,
@@ -1345,10 +1453,6 @@ class X11IntegrationTest(unittest.TestCase):
                 self.run_x11(
                     environment,
                     "xdotool",
-                    "mousemove",
-                    "--sync",
-                    str(command_point[0]),
-                    str(command_point[1]),
                     "click",
                     "1",
                 )

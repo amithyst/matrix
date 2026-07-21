@@ -2316,6 +2316,78 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(world.checkpoint_count, 0)
             self.assertIsNone(world.state.last_exit)
 
+    def test_game_command_runtime_waits_for_policy_writer_ack(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.setblocking(False)
+
+        class PolicySlots:
+            def __init__(self):
+                self.transition_id = None
+                self.result = None
+
+            @staticmethod
+            def strategy_loadout_mapping():
+                return {
+                    "version": 1,
+                    "available": True,
+                    "status": "ready",
+                    "active_slot": "locomotion",
+                    "pending": None,
+                    "slots": [],
+                    "resident_models": [],
+                }
+
+            def request_policy_slot_assignment(self, command, *, transition_id):
+                self.transition_id = transition_id
+                self.command = command
+                return None
+
+            def poll_policy_slot_assignment(self, transition_id):
+                self.assert_transition = transition_id
+                return self.result
+
+        slots = PolicySlots()
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            policy_slots=slots,
+        )
+        request = self.game_command_request(
+            "/policy recovery host",
+            sequence=1,
+            request_character="f",
+        )
+        pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(runtime.poll(current_pose=pose, command_allowed=True))
+            self.assertEqual(slots.command, request.command)
+            self.assertEqual(slots.transition_id, request.request_id)
+            with self.assertRaises(BlockingIOError):
+                provider_socket.recv(4096)
+
+            loadout = slots.strategy_loadout_mapping()
+            slots.result = (
+                True,
+                "OK_POLICY_SLOT_ASSIGNED",
+                "assigned",
+                loadout,
+            )
+            self.assertFalse(runtime.poll(current_pose=pose, command_allowed=True))
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(4096)
+            )
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_POLICY_SLOT_ASSIGNED")
+            self.assertEqual(response.data["strategy_loadout"], loadout)
+            self.assertEqual(runtime.policy_changes_executed, 1)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
     def test_game_command_runtime_rejects_commands_until_panel_safe_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"

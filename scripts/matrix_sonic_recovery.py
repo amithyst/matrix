@@ -1100,6 +1100,18 @@ class ResidentPolicyRecoveryFSM:
     def failed(self) -> bool:
         return self.state is ResidentRecoveryState.FAILED
 
+    def select_recovery_policy(self, policy_id: str) -> str:
+        """Change the next recovery-slot assignment while SONIC owns control."""
+
+        if self.state is not ResidentRecoveryState.GAME_SONIC:
+            raise RuntimeError("recovery policy can only change in GAME_SONIC")
+        selected = self._normalize_policy_id(policy_id)
+        if selected == self.game_policy_id:
+            raise ValueError("game and recovery policy IDs must be distinct")
+        previous = self.recovery_policy_id
+        self.recovery_policy_id = selected
+        return previous
+
     def _transition(
         self, state: ResidentRecoveryState, now_s: float
     ) -> ResidentRecoveryState:

@@ -67,6 +67,16 @@ _MAX_COMMAND_HISTORY = 24
 _MAX_INTENT_PACKET_BYTES = 2048
 _BODY_FONT_CANDIDATES = (b"10x20", b"9x15", b"fixed")
 _LARGE_FONT_CANDIDATES = (b"12x24", b"10x20", b"fixed")
+_XFT_BODY_FONT_CANDIDATES = (
+    b"Noto Sans CJK SC:size=13",
+    b"WenQuanYi Micro Hei:size=13",
+    b"sans:size=13",
+)
+_XFT_LARGE_FONT_CANDIDATES = (
+    b"Noto Sans CJK SC:size=18:weight=bold",
+    b"WenQuanYi Micro Hei:size=18:weight=bold",
+    b"sans:size=18:weight=bold",
+)
 
 _XK_BACK_SPACE = 0xFF08
 _XK_RETURN = 0xFF0D
@@ -203,6 +213,30 @@ class XFontStruct(ctypes.Structure):
     _fields_ = [("ext_data", ctypes.c_void_p), ("fid", ctypes.c_ulong)]
 
 
+class XRenderColor(ctypes.Structure):
+    _fields_ = [
+        ("red", ctypes.c_ushort),
+        ("green", ctypes.c_ushort),
+        ("blue", ctypes.c_ushort),
+        ("alpha", ctypes.c_ushort),
+    ]
+
+
+class XftColor(ctypes.Structure):
+    _fields_ = [("pixel", ctypes.c_ulong), ("color", XRenderColor)]
+
+
+class XGlyphInfo(ctypes.Structure):
+    _fields_ = [
+        ("width", ctypes.c_ushort),
+        ("height", ctypes.c_ushort),
+        ("x", ctypes.c_short),
+        ("y", ctypes.c_short),
+        ("xOff", ctypes.c_short),
+        ("yOff", ctypes.c_short),
+    ]
+
+
 @dataclass(frozen=True)
 class WindowGeometry:
     window: int
@@ -285,8 +319,13 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         min(52 if compact else 76, panel_height // 8),
     )
     safe_half_size = 50
-    speed_y = panel_y + panel_height // 2 - safe_half_size - button_height
-    profile_y = speed_y - gap - button_height
+    centre_panel_y = panel_y + panel_height // 2
+    tab_height = 32 if compact else 46
+    tab_y = panel_y + (30 if compact else 76)
+    tab_gap = 4 if compact else 8
+    tab_width = max(1, (panel_width - 2 * margin - 2 * tab_gap) // 3)
+    profile_y = centre_panel_y - safe_half_size - gap - button_height
+    speed_y = centre_panel_y + safe_half_size + gap
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
     speed_width = max(48, min(132, (panel_width - 2 * margin) // 4))
     apply_height = max(42, min(80, button_height + 6))
@@ -294,7 +333,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     apply_y = panel_y + panel_height - footer_space - apply_height
     console_left = panel_x + margin
     console_width = panel_width - 2 * margin
-    console_top = centre_y + safe_half_size + (4 if compact else gap // 2)
+    console_top = tab_y + tab_height + gap
     console_bottom = apply_y - (6 if compact else gap)
     console_height = max(1, console_bottom - console_top)
     command_input_height = min(28 if compact else 42, max(22, console_height))
@@ -309,7 +348,20 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         panel_width - 2 * margin - 2 * speed_width,
         button_height,
     )
-    return {
+    recovery_top = centre_panel_y + safe_half_size + gap
+    recovery_bottom = apply_y - gap
+    recovery_height = max(1, recovery_bottom - recovery_top)
+    candidate_gap = 6 if compact else 12
+    candidate_width = max(
+        1,
+        (panel_width - 2 * margin - 2 * candidate_gap) // 3,
+    )
+    candidate_height = max(28, min(button_height, recovery_height - 30))
+    candidate_y = recovery_bottom - candidate_height - (4 if compact else 10)
+    locomotion_bottom = centre_panel_y - safe_half_size - gap
+    locomotion_top = tab_y + tab_height + gap
+    locomotion_height = max(1, locomotion_bottom - locomotion_top)
+    result = {
         "shield": (geometry.x, geometry.y, geometry.width, geometry.height),
         "panel": (panel_x, panel_y, panel_width, panel_height),
         "title": (
@@ -317,6 +369,24 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             panel_y + (2 if compact else 24),
             panel_width - (48 if compact else 80),
             18 if compact else 32,
+        ),
+        "tab_loadout": (
+            panel_x + margin,
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_settings": (
+            panel_x + margin + tab_width + tab_gap,
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_console": (
+            panel_x + margin + 2 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
         ),
         "horizontal-shadow": (centre_x - 34, centre_y - 3, 69, 7),
         "vertical-shadow": (centre_x - 3, centre_y - 34, 7, 69),
@@ -372,7 +442,27 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             safe_half_size * 2,
             safe_half_size * 2,
         ),
+        "locomotion_slot": (
+            panel_x + margin,
+            locomotion_top,
+            panel_width - 2 * margin,
+            locomotion_height,
+        ),
+        "recovery_slot": (
+            panel_x + margin,
+            recovery_top,
+            panel_width - 2 * margin,
+            recovery_height,
+        ),
     }
+    for index in range(3):
+        result[f"recovery_policy_{index}"] = (
+            panel_x + margin + index * (candidate_width + candidate_gap),
+            candidate_y,
+            candidate_width,
+            candidate_height,
+        )
+    return result
 
 
 _PANEL_ACTIONS = (
@@ -383,7 +473,14 @@ _PANEL_ACTIONS = (
     "apply_return",
 )
 
-_PANEL_HIT_TARGETS = _PANEL_ACTIONS + ("command_input",)
+_PANEL_TABS = ("tab_loadout", "tab_settings", "tab_console")
+_POLICY_HIT_TARGETS = tuple(f"recovery_policy_{index}" for index in range(3))
+_PANEL_HIT_TARGETS = (
+    _PANEL_TABS
+    + _PANEL_ACTIONS
+    + ("command_input",)
+    + _POLICY_HIT_TARGETS
+)
 
 
 def point_in_rectangle(
@@ -398,14 +495,109 @@ def panel_action_at(
     layout: dict[str, tuple[int, int, int, int]],
     root_x: int,
     root_y: int,
+    *,
+    page: str | None = None,
 ) -> str | None:
     """Hit-test X11 root coordinates, including remote-desktop absolute input."""
 
-    for action in _PANEL_HIT_TARGETS:
+    targets = _PANEL_HIT_TARGETS
+    if page == "loadout":
+        targets = _PANEL_TABS + ("apply_return",) + _POLICY_HIT_TARGETS
+    elif page == "settings":
+        targets = _PANEL_TABS + _PANEL_ACTIONS
+    elif page == "console":
+        targets = _PANEL_TABS + ("apply_return", "command_input")
+    for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
             return action
     return None
+
+
+@dataclass(frozen=True)
+class StrategyPolicyModel:
+    policy_id: str
+    resident: bool
+    available: bool
+
+
+@dataclass(frozen=True)
+class StrategyLoadoutModel:
+    available: bool
+    status: str
+    active_slot: str
+    locomotion_policy_id: str
+    recovery_policy_id: str
+    recovery_candidates: tuple[StrategyPolicyModel, ...]
+    pending_policy_id: str | None
+
+    def policy_enabled(self, policy_id: str) -> bool:
+        if not self.available or self.status in {"loading", "switching"}:
+            return False
+        if policy_id == self.recovery_policy_id:
+            return False
+        return any(
+            candidate.policy_id == policy_id and candidate.available
+            for candidate in self.recovery_candidates
+        )
+
+
+def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
+    raw = state.get("strategy_loadout")
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return StrategyLoadoutModel(
+            False, "unavailable", "locomotion", "sonic", "kungfu", (), None
+        )
+    status = raw.get("status")
+    if status not in {"unavailable", "loading", "ready", "switching"}:
+        status = "unavailable"
+    active_slot = raw.get("active_slot")
+    if active_slot not in {"locomotion", "recovery"}:
+        active_slot = "locomotion"
+    locomotion = "sonic"
+    recovery = "kungfu"
+    candidates: list[StrategyPolicyModel] = []
+    slots = raw.get("slots")
+    if isinstance(slots, list):
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            slot_id = slot.get("slot")
+            selected = slot.get("selected_policy_id")
+            if slot_id == "locomotion" and isinstance(selected, str):
+                locomotion = selected
+            elif slot_id == "recovery" and isinstance(selected, str):
+                recovery = selected
+                raw_candidates = slot.get("candidates")
+                if isinstance(raw_candidates, list):
+                    for candidate in raw_candidates[:3]:
+                        if not isinstance(candidate, dict):
+                            continue
+                        policy_id = candidate.get("policy_id")
+                        if not isinstance(policy_id, str) or not policy_id:
+                            continue
+                        candidates.append(
+                            StrategyPolicyModel(
+                                policy_id=policy_id,
+                                resident=candidate.get("resident") is True,
+                                available=candidate.get("available") is True,
+                            )
+                        )
+    pending = raw.get("pending")
+    pending_policy_id = (
+        pending.get("policy_id")
+        if isinstance(pending, dict) and isinstance(pending.get("policy_id"), str)
+        else None
+    )
+    return StrategyLoadoutModel(
+        available=raw.get("available") is True,
+        status=status,
+        active_slot=active_slot,
+        locomotion_policy_id=locomotion,
+        recovery_policy_id=recovery,
+        recovery_candidates=tuple(candidates),
+        pending_policy_id=pending_policy_id,
+    )
 
 
 def read_active_state(path: Path) -> bool:
@@ -783,7 +975,7 @@ class CommandLineEditor:
 
         maximum = max(1, int(maximum_characters))
         if not self.editing and not self.text:
-            return "Click to type /summon or /tp"[:maximum]
+            return "点击输入 /summon、/tp 或 /policy"[:maximum]
         content_width = max(1, maximum - 1)
         start = max(0, self.cursor - content_width // 2)
         start = min(start, max(0, len(self.text) - content_width))
@@ -978,6 +1170,27 @@ class PointerActionPublisher:
             raise ValueError("command submit text must be bounded printable ASCII")
         self._publish("command_submit", {"command": command})
 
+    def publish_strategy_select(self, slot: str, policy_id: str) -> None:
+        if slot not in {"locomotion", "recovery"}:
+            raise ValueError("strategy slot is invalid")
+        if (
+            not isinstance(policy_id, str)
+            or not policy_id
+            or len(policy_id) > 64
+            or any(
+                not (
+                    character.isascii()
+                    and (character.isalnum() or character in "._-")
+                )
+                for character in policy_id
+            )
+        ):
+            raise ValueError("strategy policy id is invalid")
+        self._publish(
+            "strategy_select",
+            {"slot": slot, "policy_id": policy_id.lower()},
+        )
+
     def close(self) -> None:
         self._socket.close()
 
@@ -1030,9 +1243,11 @@ class X11CalibrationOverlay:
         expected_ue_pid: int,
         x11: Any | None = None,
         xfixes: Any | None = None,
+        xft: Any | None = None,
     ) -> None:
         if expected_ue_pid <= 1:
             raise ValueError("expected UE PID must be greater than 1")
+        x11_injected = x11 is not None
         if x11 is None:
             name = ctypes.util.find_library("X11")
             if not name:
@@ -1043,8 +1258,13 @@ class X11CalibrationOverlay:
             if not name:
                 raise RuntimeError("libXfixes was not found")
             xfixes = ctypes.CDLL(name)
+        if xft is None and not x11_injected:
+            name = ctypes.util.find_library("Xft")
+            if name:
+                xft = ctypes.CDLL(name)
         self._x11 = x11
         self._xfixes = xfixes
+        self._xft = xft
         self._configure_signatures()
         encoded_display = display_name.encode() if display_name else None
         self._display = self._x11.XOpenDisplay(encoded_display)
@@ -1053,6 +1273,14 @@ class X11CalibrationOverlay:
             raise RuntimeError(f"cannot open X11 display {label}")
         self._screen = int(self._x11.XDefaultScreen(self._display))
         self._root = int(self._x11.XRootWindow(self._display, self._screen))
+        self._visual = (
+            self._x11.XDefaultVisual(self._display, self._screen)
+            if self._xft is not None
+            else None
+        )
+        self._colormap = int(
+            self._x11.XDefaultColormap(self._display, self._screen)
+        )
         self._pid_atom = int(
             self._x11.XInternAtom(self._display, b"_NET_WM_PID", 0)
         )
@@ -1072,12 +1300,20 @@ class X11CalibrationOverlay:
         self._large_font: ctypes.POINTER(XFontStruct) | None = None
         self._body_font_name: str | None = None
         self._large_font_name: str | None = None
+        self._xft_draw: int | None = None
+        self._xft_body_font: int | None = None
+        self._xft_large_font: int | None = None
+        self._xft_body_font_name: str | None = None
+        self._xft_large_font_name: str | None = None
+        self._xft_colours: dict[int, XftColor] = {}
         self._colours: dict[str, int] = {}
         self._visible = False
         self._cursor_visible = False
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
         self._last_geometry: WindowGeometry | None = None
         self._last_panel_model: SettingsPanelModel | None = None
+        self._last_strategy_model: StrategyLoadoutModel | None = None
+        self._last_page: str | None = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = -1
         self._last_pointer: tuple[int, int] | None = None
@@ -1088,12 +1324,14 @@ class X11CalibrationOverlay:
         self._command_editor = CommandLineEditor()
         self._keyboard_grabbed = False
         self._deferred_ungrab_keycode: int | None = None
+        self._active_page = "loadout"
         self._create_windows()
 
     def _configure_signatures(self) -> None:
         signatures = {
             "XOpenDisplay": ([ctypes.c_char_p], ctypes.c_void_p),
             "XDefaultScreen": ([ctypes.c_void_p], ctypes.c_int),
+            "XDefaultVisual": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_void_p),
             "XRootWindow": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_ulong),
             "XDefaultColormap": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_ulong),
             "XBlackPixel": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_ulong),
@@ -1369,6 +1607,72 @@ class X11CalibrationOverlay:
             function = getattr(self._xfixes, name)
             function.argtypes = argtypes
             function.restype = restype
+        if self._xft is not None:
+            xft_signatures = {
+                "XftDrawCreate": (
+                    [
+                        ctypes.c_void_p,
+                        ctypes.c_ulong,
+                        ctypes.c_void_p,
+                        ctypes.c_ulong,
+                    ],
+                    ctypes.c_void_p,
+                ),
+                "XftDrawDestroy": ([ctypes.c_void_p], None),
+                "XftFontOpenName": (
+                    [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p],
+                    ctypes.c_void_p,
+                ),
+                "XftFontClose": (
+                    [ctypes.c_void_p, ctypes.c_void_p],
+                    None,
+                ),
+                "XftColorAllocName": (
+                    [
+                        ctypes.c_void_p,
+                        ctypes.c_void_p,
+                        ctypes.c_ulong,
+                        ctypes.c_char_p,
+                        ctypes.POINTER(XftColor),
+                    ],
+                    ctypes.c_int,
+                ),
+                "XftColorFree": (
+                    [
+                        ctypes.c_void_p,
+                        ctypes.c_void_p,
+                        ctypes.c_ulong,
+                        ctypes.POINTER(XftColor),
+                    ],
+                    None,
+                ),
+                "XftTextExtentsUtf8": (
+                    [
+                        ctypes.c_void_p,
+                        ctypes.c_void_p,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                        ctypes.POINTER(XGlyphInfo),
+                    ],
+                    None,
+                ),
+                "XftDrawStringUtf8": (
+                    [
+                        ctypes.c_void_p,
+                        ctypes.POINTER(XftColor),
+                        ctypes.c_void_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                    ],
+                    None,
+                ),
+            }
+            for name, (argtypes, restype) in xft_signatures.items():
+                function = getattr(self._xft, name)
+                function.argtypes = argtypes
+                function.restype = restype
 
     def _named_colour(self, name: bytes, fallback: int) -> int:
         screen = XColor()
@@ -1502,8 +1806,21 @@ class X11CalibrationOverlay:
     def _create_windows(self) -> None:
         black = int(self._x11.XBlackPixel(self._display, self._screen))
         white = int(self._x11.XWhitePixel(self._display, self._screen))
-        accent = self._named_colour(b"#ff3158", white)
-        panel_background = self._named_colour(b"#151a24", black)
+        colour_names = {
+            "white": b"#f4f7fb",
+            "muted": b"#a9b4c3",
+            "button": b"#26313b",
+            "selected": b"#087f8c",
+            "disabled": b"#343a40",
+            "apply": b"#23845f",
+            "pending": b"#d18b2c",
+            "error": b"#d64b5f",
+            "outline": b"#71808e",
+            "cyan": b"#25c2d1",
+            "panel": b"#14191e",
+        }
+        accent = self._named_colour(colour_names["cyan"], white)
+        panel_background = self._named_colour(colour_names["panel"], black)
         colours = {
             "panel": panel_background,
             "horizontal-shadow": black,
@@ -1514,15 +1831,9 @@ class X11CalibrationOverlay:
             "cursor": white,
         }
         self._colours = {
-            "white": white,
-            "muted": self._named_colour(b"#aeb8ca", white),
-            "button": self._named_colour(b"#293345", white),
-            "selected": self._named_colour(b"#3975e8", white),
-            "disabled": self._named_colour(b"#343946", white),
-            "apply": self._named_colour(b"#25845c", white),
-            "pending": self._named_colour(b"#c07a28", white),
-            "error": self._named_colour(b"#cf4655", white),
-            "outline": self._named_colour(b"#71809a", white),
+            key: self._named_colour(name, white)
+            for key, name in colour_names.items()
+            if key != "panel"
         }
         try:
             for name in self._WINDOW_ORDER:
@@ -1591,6 +1902,8 @@ class X11CalibrationOverlay:
             self._large_font, self._large_font_name = self._load_font(
                 _LARGE_FONT_CANDIDATES
             )
+            if self._xft is not None:
+                self._initialize_xft(panel, colour_names)
             self._x11.XSync(self._display, 0)
         except Exception:
             self.close()
@@ -1605,11 +1918,56 @@ class X11CalibrationOverlay:
                 return (font, name.decode("ascii"))
         raise RuntimeError("cannot load an X11 overlay font")
 
+    def _load_xft_font(self, candidates: tuple[bytes, ...]) -> tuple[int, str]:
+        assert self._xft is not None
+        for name in candidates:
+            font = self._xft.XftFontOpenName(self._display, self._screen, name)
+            if font:
+                return (int(font), name.decode("ascii"))
+        raise RuntimeError("cannot load a UTF-8 Xft overlay font")
+
+    def _initialize_xft(
+        self,
+        panel: int,
+        colour_names: dict[str, bytes],
+    ) -> None:
+        assert self._xft is not None
+        if not self._visual:
+            raise RuntimeError("Xft requires the default X11 visual")
+        draw = self._xft.XftDrawCreate(
+            self._display,
+            panel,
+            self._visual,
+            self._colormap,
+        )
+        if not draw:
+            raise RuntimeError("cannot create the UTF-8 Xft drawing context")
+        self._xft_draw = int(draw)
+        self._xft_body_font, self._xft_body_font_name = self._load_xft_font(
+            _XFT_BODY_FONT_CANDIDATES
+        )
+        self._xft_large_font, self._xft_large_font_name = self._load_xft_font(
+            _XFT_LARGE_FONT_CANDIDATES
+        )
+        for key, pixel in self._colours.items():
+            colour = XftColor()
+            name = colour_names.get(key, colour_names["white"])
+            if not self._xft.XftColorAllocName(
+                self._display,
+                self._visual,
+                self._colormap,
+                name,
+                ctypes.byref(colour),
+            ):
+                raise RuntimeError(f"cannot allocate Xft colour {key}")
+            self._xft_colours[pixel] = colour
+
     @property
     def font_diagnostics(self) -> dict[str, str | None]:
         return {
-            "body": self._body_font_name,
-            "large": self._large_font_name,
+            "backend": "xft-utf8" if self._xft_draw is not None else "xlib-core",
+            "body": self._xft_body_font_name or self._body_font_name,
+            "large": self._xft_large_font_name or self._large_font_name,
         }
 
     def _window_pid(self, window: int) -> int | None:
@@ -1762,6 +2120,42 @@ class X11CalibrationOverlay:
         large: bool = False,
         centred_in: tuple[int, int, int, int] | None = None,
     ) -> None:
+        xft_draw = getattr(self, "_xft_draw", None)
+        xft_font = (
+            getattr(self, "_xft_large_font", None)
+            if large
+            else getattr(self, "_xft_body_font", None)
+        )
+        xft_colour = getattr(self, "_xft_colours", {}).get(colour)
+        if (
+            xft_draw is not None
+            and xft_font is not None
+            and xft_colour is not None
+            and self._xft is not None
+        ):
+            encoded_utf8 = message[:160].encode("utf-8")
+            if centred_in is not None:
+                extents = XGlyphInfo()
+                self._xft.XftTextExtentsUtf8(
+                    self._display,
+                    ctypes.c_void_p(xft_font),
+                    encoded_utf8,
+                    len(encoded_utf8),
+                    ctypes.byref(extents),
+                )
+                left, top, width, height = centred_in
+                x = left + max(4, (width - int(extents.xOff)) // 2)
+                y = top + height // 2 + (8 if large else 6)
+            self._xft.XftDrawStringUtf8(
+                ctypes.c_void_p(xft_draw),
+                ctypes.byref(xft_colour),
+                ctypes.c_void_p(xft_font),
+                x,
+                y,
+                encoded_utf8,
+                len(encoded_utf8),
+            )
+            return
         gc = ctypes.c_void_p(self._panel_gc)
         font = self._large_font if large else self._body_font
         assert font is not None
@@ -1818,7 +2212,7 @@ class X11CalibrationOverlay:
             x=0,
             y=0,
             colour=self._colours["muted" if disabled else "white"],
-            large=True,
+            large=height >= 38,
             centred_in=(x, y, width, height),
         )
 
@@ -1842,7 +2236,7 @@ class X11CalibrationOverlay:
         )
         if history_height >= 18:
             self._draw_text(
-                "RECENT COMMANDS  (Up/Down to recall)",
+                "最近命令",
                 x=history_x,
                 y=history_y + 14,
                 colour=self._colours["muted"],
@@ -1861,21 +2255,21 @@ class X11CalibrationOverlay:
             layout, "command_result"
         )
         if editor.pending or status.in_flight or status.status in {"pending", "restarting"}:
-            result_text = "[PENDING] Waiting for Matrix command response..."
+            result_text = "[处理中] 等待 Matrix 确认..."
             result_colour = self._colours["pending"]
         elif status.status == "success":
-            result_text = f"[OK {status.code or 'OK'}] {status.message or 'Command completed'}"
+            result_text = f"[完成 {status.code or 'OK'}] 命令已执行"
             if status.warning:
-                result_text += f" | {status.warning}"
+                result_text += " | 有兼容性提示"
             result_colour = self._colours["apply"]
         elif status.status == "error":
-            result_text = f"[ERROR {status.code or 'ERROR'}] {status.message or 'Command failed'}"
+            result_text = f"[失败 {status.code or 'ERROR'}] 命令未执行"
             result_colour = self._colours["error"]
         elif not status.available:
-            result_text = "[UNAVAILABLE] Game command channel is not available"
+            result_text = "[不可用] 本次运行未启用命令通道"
             result_colour = self._colours["disabled"]
         else:
-            result_text = "Enter runs the command; Escape clears and leaves command editing"
+            result_text = "命令台就绪"
             result_colour = self._colours["muted"]
         if result_height >= 14:
             self._draw_text(
@@ -1929,7 +2323,7 @@ class X11CalibrationOverlay:
             colour=self._colours["muted" if editor.pending else "white"],
         )
 
-    def _draw_panel(
+    def _draw_settings_page_legacy(
         self,
         layout: dict[str, tuple[int, int, int, int]],
         model: SettingsPanelModel,
@@ -2071,6 +2465,295 @@ class X11CalibrationOverlay:
                 colour=self._colours["muted"],
             )
 
+    def _fill_panel_band(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        name: str,
+        *,
+        fill: int,
+        outline: int,
+    ) -> tuple[int, int, int, int]:
+        rectangle = self._panel_rectangle(layout, name)
+        x, y, width, height = rectangle
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._x11.XSetForeground(self._display, gc, fill)
+        self._x11.XFillRectangle(
+            self._display, panel, gc, x, y, width, height
+        )
+        self._x11.XSetForeground(self._display, gc, outline)
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
+        )
+        return rectangle
+
+    def _draw_tabs(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        page: str,
+    ) -> None:
+        for name, label, target_page in (
+            ("tab_loadout", "策略装配", "loadout"),
+            ("tab_settings", "控制设置", "settings"),
+            ("tab_console", "命令台", "console"),
+        ):
+            self._draw_button(
+                layout,
+                name,
+                label,
+                fill=self._colours[
+                    "selected" if page == target_page else "button"
+                ],
+            )
+
+    @staticmethod
+    def _policy_display_name(policy_id: str) -> str:
+        return {
+            "sonic": "SONIC",
+            "kungfu": "KungFu",
+            "host": "HoST",
+            "amp": "AMP",
+        }.get(policy_id, policy_id.upper())
+
+    def _draw_loadout_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: StrategyLoadoutModel,
+    ) -> None:
+        locomotion = self._fill_panel_band(
+            layout,
+            "locomotion_slot",
+            fill=self._colours["button"],
+            outline=self._colours[
+                "cyan" if model.active_slot == "locomotion" else "outline"
+            ],
+        )
+        compact = layout["panel"][3] < 500
+        if compact:
+            locomotion_text = (
+                f"移动槽  {self._policy_display_name(model.locomotion_policy_id)}"
+            )
+            self._draw_text(
+                locomotion_text,
+                x=0,
+                y=0,
+                colour=self._colours["white"],
+                centred_in=locomotion,
+            )
+        else:
+            self._draw_text(
+                "移动策略槽",
+                x=locomotion[0] + 18,
+                y=locomotion[1] + 26,
+                colour=self._colours["muted"],
+            )
+            self._draw_text(
+                self._policy_display_name(model.locomotion_policy_id),
+                x=locomotion[0] + 18,
+                y=locomotion[1] + max(50, locomotion[3] - 18),
+                colour=self._colours["white"],
+                large=True,
+            )
+            self._draw_text(
+                "当前控制" if model.active_slot == "locomotion" else "已装配",
+                x=max(18, locomotion[0] + locomotion[2] - 120),
+                y=locomotion[1] + 30,
+                colour=self._colours[
+                    "cyan" if model.active_slot == "locomotion" else "muted"
+                ],
+            )
+
+        recovery = self._panel_rectangle(layout, "recovery_slot")
+        if not compact and recovery[3] >= 70:
+            self._draw_text(
+                "起身策略槽",
+                x=recovery[0],
+                y=recovery[1] + 20,
+                colour=self._colours[
+                    "cyan" if model.active_slot == "recovery" else "muted"
+                ],
+            )
+        candidates = model.recovery_candidates[:3]
+        for index, candidate in enumerate(candidates):
+            selected = candidate.policy_id == model.recovery_policy_id
+            pending = candidate.policy_id == model.pending_policy_id
+            enabled = model.policy_enabled(candidate.policy_id)
+            fill_name = (
+                "pending"
+                if pending
+                else ("selected" if selected else ("button" if enabled else "disabled"))
+            )
+            label = self._policy_display_name(candidate.policy_id)
+            if pending:
+                label = f"{label} · 切换中"
+            self._draw_button(
+                layout,
+                f"recovery_policy_{index}",
+                label,
+                fill=self._colours[fill_name],
+                disabled=not enabled and not selected and not pending,
+            )
+        if not candidates:
+            self._draw_text(
+                "起身策略尚未就绪",
+                x=0,
+                y=0,
+                colour=self._colours["pending"],
+                centred_in=recovery,
+            )
+
+    def _draw_control_settings_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: SettingsPanelModel,
+    ) -> None:
+        local_selected = model.next_profile == "Local"
+        controls_disabled = model.restart_requested or model.status == "restarting"
+        self._draw_button(
+            layout,
+            "profile_local",
+            "本机控制",
+            fill=self._colours["selected" if local_selected else "button"],
+            disabled=controls_disabled,
+        )
+        self._draw_button(
+            layout,
+            "profile_remote",
+            "远程控制",
+            fill=self._colours["selected" if not local_selected else "button"],
+            disabled=controls_disabled,
+        )
+        down_disabled = not model.action_enabled("speed_down")
+        up_disabled = not model.action_enabled("speed_up")
+        self._draw_button(
+            layout,
+            "speed_down",
+            "-",
+            fill=self._colours["disabled" if down_disabled else "button"],
+            disabled=down_disabled,
+        )
+        self._draw_button(
+            layout,
+            "speed_up",
+            "+",
+            fill=self._colours["disabled" if up_disabled else "button"],
+            disabled=up_disabled,
+        )
+        speed_value = self._panel_rectangle(layout, "speed_value")
+        self._draw_text(
+            "远程鼠标速度",
+            x=0,
+            y=0,
+            colour=self._colours["muted"],
+            centred_in=(
+                speed_value[0],
+                speed_value[1] - 10,
+                speed_value[2],
+                speed_value[3],
+            ),
+        )
+        self._draw_text(
+            f"{model.next_scale:.2f}x",
+            x=0,
+            y=0,
+            colour=self._colours["white"],
+            large=True,
+            centred_in=(
+                speed_value[0],
+                speed_value[1] + 10,
+                speed_value[2],
+                speed_value[3],
+            ),
+        )
+        if layout["panel"][3] >= 500:
+            status = (
+                "正在重载 Matrix"
+                if model.status == "restarting"
+                else (
+                    "设置已保存，返回后生效"
+                    if model.pending_restart
+                    else "当前设置已生效"
+                )
+            )
+            self._draw_text(
+                status,
+                x=self._panel_rectangle(layout, "profile_local")[0],
+                y=max(92, self._panel_rectangle(layout, "profile_local")[1] - 18),
+                colour=self._colours[
+                    "pending" if model.pending_restart else "muted"
+                ],
+            )
+            self._draw_text(
+                "精细 0.01-0.10 / 粗调 0.20-1.00",
+                x=self._panel_rectangle(layout, "profile_local")[0],
+                y=max(112, self._panel_rectangle(layout, "profile_local")[1] - 40),
+                colour=self._colours["muted"],
+            )
+
+    @staticmethod
+    def _apply_label_chinese(model: SettingsPanelModel) -> str:
+        if model.restart_requested or model.status == "restarting":
+            return "正在重载 MATRIX..."
+        if model.pending_restart and not model.restart_available:
+            return "暂时无法应用"
+        if model.pending_restart:
+            return "返回游戏并应用"
+        return "返回游戏"
+
+    def _draw_panel(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: SettingsPanelModel,
+        command_status: CommandConsoleStatus | None = None,
+        strategy_model: StrategyLoadoutModel | None = None,
+    ) -> None:
+        _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
+        panel = self._windows["panel"]
+        self._x11.XClearWindow(self._display, panel)
+        page = getattr(self, "_active_page", "settings")
+        title_x, title_y, _title_width, title_height = self._panel_rectangle(
+            layout, "title"
+        )
+        self._draw_text(
+            "MATRIX 战术终端",
+            x=title_x,
+            y=title_y + title_height - 4,
+            colour=self._colours["white"],
+            large=panel_height >= 500,
+        )
+        self._draw_tabs(layout, page)
+        if page == "loadout":
+            self._draw_loadout_page(
+                layout,
+                strategy_model or strategy_loadout_model({}),
+            )
+        elif page == "settings":
+            self._draw_control_settings_page(layout, model)
+        else:
+            self._draw_command_console(
+                layout,
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+            )
+        apply_disabled = not model.action_enabled("apply_return")
+        self._draw_button(
+            layout,
+            "apply_return",
+            self._apply_label_chinese(model),
+            fill=self._colours[
+                "disabled"
+                if apply_disabled
+                else ("pending" if model.pending_restart else "apply")
+            ],
+            disabled=apply_disabled,
+        )
+
     def _begin_command_editing(self, publisher: PointerActionPublisher) -> bool:
         status = self._last_command_status
         if (
@@ -2193,7 +2876,12 @@ class X11CalibrationOverlay:
                 continue
             layout = self._last_layout
             action = (
-                panel_action_at(layout, button.x_root, button.y_root)
+                panel_action_at(
+                    layout,
+                    button.x_root,
+                    button.y_root,
+                    page=getattr(self, "_active_page", "loadout"),
+                )
                 if layout is not None
                 else None
             )
@@ -2212,9 +2900,34 @@ class X11CalibrationOverlay:
                     or not self._visible
                 ):
                     continue
+                if action in _PANEL_TABS:
+                    next_page = action.removeprefix("tab_")
+                    if next_page != getattr(self, "_active_page", "loadout"):
+                        if self._force_end_command_editing(publisher):
+                            emitted += 1
+                        self._active_page = next_page
+                        self._last_page = None
+                    continue
                 if action == "command_input":
                     if self._begin_command_editing(publisher):
                         emitted += 1
+                elif action.startswith("recovery_policy_"):
+                    strategy = getattr(self, "_last_strategy_model", None)
+                    try:
+                        policy_index = int(action.rsplit("_", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    if (
+                        strategy is not None
+                        and policy_index < len(strategy.recovery_candidates)
+                    ):
+                        candidate = strategy.recovery_candidates[policy_index]
+                        if strategy.policy_enabled(candidate.policy_id):
+                            publisher.publish_strategy_select(
+                                "recovery",
+                                candidate.policy_id,
+                            )
+                            emitted += 1
                 elif (
                     self._last_panel_model is not None
                     and self._last_panel_model.action_enabled(action)
@@ -2242,10 +2955,14 @@ class X11CalibrationOverlay:
         first_show = not self._visible
         geometry_changed = geometry != self._last_geometry
         model = settings_panel_model(state)
+        strategy_model = strategy_loadout_model(state)
         command_status = command_console_status(state)
         self._command_editor.reconcile(command_status)
         model_changed = bool(
             model != self._last_panel_model
+            or strategy_model != getattr(self, "_last_strategy_model", None)
+            or getattr(self, "_active_page", "loadout")
+            != getattr(self, "_last_page", None)
             or command_status != self._last_command_status
             or self._command_editor.revision != self._last_command_revision
         )
@@ -2274,7 +2991,7 @@ class X11CalibrationOverlay:
             for name in static_order:
                 self._x11.XRaiseWindow(self._display, self._windows[name])
         if first_show or geometry_changed or model_changed:
-            self._draw_panel(layout, model, command_status)
+            self._draw_panel(layout, model, command_status, strategy_model)
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
         if not self._cursor_visible or pointer_changed:
@@ -2307,6 +3024,8 @@ class X11CalibrationOverlay:
         self._last_layout = layout
         self._last_geometry = geometry
         self._last_panel_model = model
+        self._last_strategy_model = strategy_model
+        self._last_page = getattr(self, "_active_page", "loadout")
         self._last_command_status = command_status
         self._last_command_revision = self._command_editor.revision
         self._last_pointer = pointer
@@ -2327,12 +3046,15 @@ class X11CalibrationOverlay:
         self._last_layout = None
         self._last_geometry = None
         self._last_panel_model = None
+        self._last_strategy_model = None
+        self._last_page = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision
         self._last_pointer = None
         self._last_raise_s = None
         self._pressed_action = None
         self._pressed_window = None
+        self._active_page = "loadout"
 
     def close(self) -> None:
         display = getattr(self, "_display", None)
@@ -2342,6 +3064,27 @@ class X11CalibrationOverlay:
         if editor is not None:
             editor.end(force=True)
         self._ungrab_keyboard()
+        xft = getattr(self, "_xft", None)
+        visual = getattr(self, "_visual", None)
+        colormap = getattr(self, "_colormap", None)
+        if xft is not None and visual and colormap is not None:
+            for colour in getattr(self, "_xft_colours", {}).values():
+                xft.XftColorFree(
+                    display,
+                    visual,
+                    colormap,
+                    ctypes.byref(colour),
+                )
+            getattr(self, "_xft_colours", {}).clear()
+            for attribute in ("_xft_body_font", "_xft_large_font"):
+                font = getattr(self, attribute, None)
+                if font is not None:
+                    xft.XftFontClose(display, ctypes.c_void_p(font))
+                    setattr(self, attribute, None)
+            xft_draw = getattr(self, "_xft_draw", None)
+            if xft_draw is not None:
+                xft.XftDrawDestroy(ctypes.c_void_p(xft_draw))
+                self._xft_draw = None
         panel_gc = getattr(self, "_panel_gc", None)
         if panel_gc is not None:
             self._x11.XFreeGC(display, ctypes.c_void_p(panel_gc))
