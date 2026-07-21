@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import json
 import math
@@ -342,8 +343,11 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(core.heading_rad, heading_before_telemetry)
         command = core.command(now_s=10.01, dt_s=0.1)
         self.assertEqual(command.mode, "move")
-        self.assertAlmostEqual(command.movement[0], math.cos(0.4))
-        self.assertAlmostEqual(command.movement[1], math.sin(0.4))
+        expected_heading = GAME_CONTROL.wrap_angle_rad(
+            measured_heading + GAME_CONTROL.MAX_MEASURED_FACING_LEAD_RAD
+        )
+        self.assertAlmostEqual(command.movement[0], math.cos(expected_heading))
+        self.assertAlmostEqual(command.movement[1], math.sin(expected_heading))
 
         source_lines = [
             line.strip()
@@ -568,6 +572,245 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     MODULE._snapshot_validation_error(snapshot),
                     f"snapshot_invalid_elastic_band_scale:{invalid!r}",
                 )
+
+    def test_sonic_fall_recovery_holds_idle_until_stably_upright(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+
+        def pose(*, root_z: float, upright: bool) -> SimpleNamespace:
+            snapshot = self.snapshot(
+                fall_detected=True,
+                low_cmd_fresh=True,
+                elastic_band_scale=0.0,
+            )
+            snapshot.qpos[2] = root_z
+            snapshot.qpos[3] = 1.0 if upright else 0.0
+            snapshot.qpos[4] = 0.0 if upright else 1.0
+            return snapshot
+
+        self.assertEqual(
+            gate.observe(pose(root_z=0.19, upright=False), now_s=10.0),
+            "entered",
+        )
+        self.assertTrue(gate.recovering)
+        self.assertTrue(gate.current_fallen)
+        self.assertEqual(gate.episodes, 1)
+        self.assertEqual(gate.last_entry_source, "sonic_fall_detected")
+        self.assertEqual(gate.native_mode, 5)
+        self.assertEqual(gate.target_height, 0.4)
+
+        # Height alone is insufficient: the base must also be upright and the
+        # native readiness contract must stay healthy for a continuous second.
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=False), now_s=10.5)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=11.0)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=11.99)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=12.0)
+        )
+        self.assertEqual(
+            gate.observe(pose(root_z=0.72, upright=True), now_s=13.0),
+            "recovered",
+        )
+        self.assertFalse(gate.recovering)
+        self.assertEqual(gate.recoveries, 1)
+        self.assertAlmostEqual(gate.last_duration_s, 3.0)
+        status = gate.status(now_s=13.0)
+        self.assertEqual(status["state"], "monitoring")
+        self.assertEqual(status["policy_command"], "KNEEL_TWO_LEGS_TO_IDLE")
+        self.assertTrue(status["recovered_requires_neutral"])
+
+        # SONIC's historical fall flag remains sticky. A later current-height
+        # fall must still start a distinct recovery episode.
+        self.assertEqual(
+            gate.observe(pose(root_z=0.18, upright=False), now_s=14.0),
+            "entered",
+        )
+        self.assertEqual(gate.episodes, 2)
+
+    def test_sonic_fall_recovery_timeout_is_telemetry_not_runtime_exit(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=2.0)
+        fallen = self.snapshot(
+            fall_detected=True,
+            low_cmd_fresh=True,
+            elastic_band_scale=0.0,
+        )
+        fallen.qpos[2] = 0.15
+        fallen.qpos[4] = 1.0
+        self.assertEqual(gate.observe(fallen, now_s=1.0), "entered")
+        self.assertIsNone(gate.observe(fallen, now_s=3.1))
+        self.assertTrue(gate.recovering)
+        self.assertTrue(gate.timed_out)
+        self.assertEqual(gate.status(now_s=3.1)["state"], "recovering_timeout")
+
+    def test_sonic_fall_recovery_debounces_side_fall_above_native_height(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        side_fallen = self.snapshot(
+            fall_detected=False,
+            low_cmd_fresh=True,
+            elastic_band_scale=0.0,
+        )
+        side_fallen.qpos[2] = 0.34
+        side_fallen.qpos[3] = 0.0
+        side_fallen.qpos[4] = 1.0
+
+        self.assertIsNone(gate.observe(side_fallen, now_s=1.0))
+        self.assertFalse(gate.current_fallen)
+        self.assertTrue(gate.pose_candidate)
+        self.assertFalse(gate.recovering)
+        self.assertIsNone(gate.observe(side_fallen, now_s=1.34))
+        self.assertEqual(gate.observe(side_fallen, now_s=1.36), "entered")
+        self.assertTrue(gate.recovering)
+        self.assertEqual(gate.last_entry_source, "pose_debounce")
+        status = gate.status(now_s=1.36)
+        self.assertEqual(status["last_entry_source"], "pose_debounce")
+        self.assertEqual(status["pose_trigger_height_m"], 0.45)
+        self.assertEqual(status["pose_trigger_up_z"], 0.5)
+        self.assertEqual(status["pose_trigger_hold_s"], 0.35)
+
+    def test_sonic_fall_recovery_pose_debounce_resets_when_pose_clears(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+
+        def pose(*, root_z: float, upright: bool) -> SimpleNamespace:
+            snapshot = self.snapshot(
+                fall_detected=False,
+                low_cmd_fresh=True,
+                elastic_band_scale=0.0,
+            )
+            snapshot.qpos[2] = root_z
+            snapshot.qpos[3] = 1.0 if upright else 0.0
+            snapshot.qpos[4] = 0.0 if upright else 1.0
+            return snapshot
+
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.0)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.70, upright=True), now_s=1.2)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.5)
+        )
+        self.assertIsNone(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.84)
+        )
+        self.assertEqual(
+            gate.observe(pose(root_z=0.34, upright=False), now_s=1.86),
+            "entered",
+        )
+
+        upright_low = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        self.assertIsNone(
+            upright_low.observe(pose(root_z=0.40, upright=True), now_s=3.0)
+        )
+        self.assertIsNone(
+            upright_low.observe(pose(root_z=0.40, upright=True), now_s=4.0)
+        )
+        self.assertFalse(upright_low.pose_candidate)
+        self.assertFalse(upright_low.recovering)
+
+        high_side = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        self.assertIsNone(
+            high_side.observe(pose(root_z=0.45, upright=False), now_s=5.0)
+        )
+        self.assertIsNone(
+            high_side.observe(pose(root_z=0.45, upright=False), now_s=6.0)
+        )
+        self.assertFalse(high_side.pose_candidate)
+        self.assertFalse(high_side.recovering)
+
+    def test_sonic_fall_recovery_redebounces_later_side_fall(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=10.0)
+
+        def pose(*, root_z: float, upright: bool) -> SimpleNamespace:
+            snapshot = self.snapshot(
+                fall_detected=False,
+                low_cmd_fresh=True,
+                elastic_band_scale=0.0,
+            )
+            snapshot.qpos[2] = root_z
+            snapshot.qpos[3] = 1.0 if upright else 0.0
+            snapshot.qpos[4] = 0.0 if upright else 1.0
+            return snapshot
+
+        side = pose(root_z=0.34, upright=False)
+        upright = pose(root_z=0.72, upright=True)
+        self.assertIsNone(gate.observe(side, now_s=1.0))
+        self.assertEqual(gate.observe(side, now_s=1.36), "entered")
+        self.assertIsNone(gate.observe(upright, now_s=3.50))
+        self.assertEqual(gate.observe(upright, now_s=4.50), "recovered")
+        self.assertEqual(gate.recoveries, 1)
+
+        self.assertIsNone(gate.observe(side, now_s=5.0))
+        self.assertFalse(gate.recovering)
+        self.assertEqual(gate.observe(side, now_s=5.36), "entered")
+        self.assertEqual(gate.episodes, 2)
+        self.assertEqual(gate.last_entry_source, "pose_debounce")
+
+    def test_sonic_fall_recovery_validation_is_interactive_only(self) -> None:
+        allowed = SimpleNamespace(
+            game_fall_recovery="sonic",
+            game_fall_recovery_timeout=15.0,
+            control_source="game",
+            fail_on_fall=False,
+            qualified_runtime=False,
+        )
+        MODULE._validate_game_fall_recovery(allowed)
+
+        invalid = (
+            ("control", {"control_source": "planner"}),
+            ("conflicts", {"fail_on_fall": True}),
+            ("qualified", {"qualified_runtime": True}),
+            ("positive", {"game_fall_recovery_timeout": 0.0}),
+        )
+        for expected, changes in invalid:
+            values = vars(allowed).copy()
+            values.update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                SystemExit, expected
+            ):
+                MODULE._validate_game_fall_recovery(SimpleNamespace(**values))
+
+    def test_physical_recovery_validation_requires_local_worker_and_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker = root / "worker.py"
+            model = root / "prone-v1.onnx"
+            fallback = root / "prone-v2.onnx"
+            amp_config = root / "amp.json"
+            amp_model = root / "amp.onnx"
+            for path in (worker, model, fallback, amp_config, amp_model):
+                path.write_bytes(b"test")
+            values = {
+                "game_fall_recovery": "physical",
+                "game_fall_recovery_timeout": 20.0,
+                "control_source": "game",
+                "fail_on_fall": False,
+                "qualified_runtime": False,
+                "physical_recovery_worker": worker,
+                "physical_recovery_python": sys.executable,
+                "physical_recovery_model": model,
+                "physical_recovery_fallback_model": [fallback],
+                "physical_recovery_amp_config": amp_config,
+                "physical_recovery_amp_model": amp_model,
+                "physical_recovery_amp_config_sha256": "1" * 64,
+                "physical_recovery_amp_model_sha256": "2" * 64,
+                "physical_recovery_control_socket": root / "control.sock",
+                "physical_recovery_sonic_control_socket": root / "sonic.sock",
+                "physical_recovery_fallback_after_seconds": 8.0,
+                "physical_recovery_stable_hold_seconds": 1.5,
+                "physical_recovery_timeout_seconds": 30.0,
+                "physical_recovery_sonic_prewarm_timeout_seconds": 35.0,
+            }
+            MODULE._validate_game_fall_recovery(SimpleNamespace(**values))
+
+            values["physical_recovery_model"] = root / "missing.onnx"
+            with self.assertRaisesRegex(SystemExit, "model is missing"):
+                MODULE._validate_game_fall_recovery(SimpleNamespace(**values))
 
     def test_absolute_physics_pacing_compensates_sleep_overshoot(self) -> None:
         with mock.patch.object(
@@ -1403,6 +1646,18 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(completed["passed"])
         self.assertTrue(completed["completed"])
 
+        scenario_complete = MODULE._qualification_state(
+            max_seconds=360.0,
+            termination_reason="scenario_complete",
+            failures=[],
+            runtime_verified=False,
+        )
+        self.assertTrue(scenario_complete["passed"])
+        self.assertTrue(scenario_complete["completed"])
+        self.assertFalse(scenario_complete["qualification_attempted"])
+        self.assertFalse(scenario_complete["interrupted"])
+        self.assertEqual(scenario_complete["acceptance_failures"], [])
+
         bounded_signal = MODULE._qualification_state(
             max_seconds=120.0,
             termination_reason="signal",
@@ -1639,6 +1894,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.bound = None
                 self.sent = []
+                self.close_calls = 0
 
             def setsockopt(self, *_args) -> None:
                 pass
@@ -1650,7 +1906,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.sent.append(payload)
 
             def close(self, **_kwargs) -> None:
-                pass
+                self.close_calls += 1
 
         socket = FakeSocket()
 
@@ -1691,6 +1947,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(socket.sent, [b"command", b"planner"])
         self.assertTrue(commands[0]["start"])
         self.assertEqual(planners[0]["mode"], 2)
+        with mock.patch.object(MODULE.time, "sleep"):
+            client.request_deploy_stop()
+        self.assertEqual(socket.sent[-3:], [b"command"] * 3)
+        self.assertEqual(socket.close_calls, 0)
+        self.assertFalse(commands[-1]["start"])
+        self.assertTrue(commands[-1]["stop"])
         self.assertAlmostEqual(planners[0]["movement"][0], math.cos(0.1))
         self.assertAlmostEqual(planners[0]["movement"][1], math.sin(0.1))
         self.assertAlmostEqual(planners[0]["facing"][0], math.cos(0.1))
@@ -1750,6 +2012,31 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[4]["mode"], 0)
         self.assertEqual(planners[4]["movement"], [0.0, 0.0, 0.0])
         self.assertEqual(planners[4]["speed"], -1.0)
+
+        client.send_recovery_posture(
+            locomotion_mode=5,
+            height=0.4,
+            facing=(0.0, 1.0, 0.0),
+        )
+        self.assertEqual(planners[5]["mode"], 5)
+        self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[5]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[5]["speed"], -1.0)
+        self.assertEqual(planners[5]["height"], 0.4)
+
+        client.send_recovery_posture(
+            locomotion_mode=0,
+            height=-1.0,
+            facing=(1.0, 0.0, 0.0),
+        )
+        self.assertEqual(planners[6]["mode"], 0)
+        self.assertEqual(planners[6]["height"], -1.0)
+        with self.assertRaisesRegex(ValueError, "IDLE or KNEEL"):
+            client.send_recovery_posture(
+                locomotion_mode=7,
+                height=0.4,
+                facing=(1.0, 0.0, 0.0),
+            )
 
         with self.assertRaisesRegex(ValueError, "SLOW_WALK"):
             client.send_game_command(
@@ -2146,11 +2433,16 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             Path(guarded_command[1]).name,
             "exec_with_parent_death_signal.py",
         )
+        self.assertIn("--exec-command", guarded_command[: guarded_command.index("--")])
         command = guarded_command[guarded_command.index("--") + 1 :]
         self.assertEqual(command[0], "/sonic/gear_sonic_deploy/target/release/g1_deploy_onnx_ref")
         self.assertNotIn("deploy.sh", command)
         self.assertEqual(command[1], "lo")
         self.assertIn("--disable-crc-check", command)
+        self.assertEqual(
+            command[command.index("--planner-backend") + 1],
+            "onnx",
+        )
         self.assertEqual(command[command.index("--zmq-port") + 1], "6000")
         self.assertEqual(
             group.env["FASTRTPS_DEFAULT_PROFILES_FILE"],
@@ -2159,6 +2451,1485 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(group.env["ROS_LOCALHOST_ONLY"], "1")
         self.assertEqual(group.env["PYTHONNOUSERSITE"], "1")
         self.assertEqual(group.env["PYTHONPATH"], "/sonic")
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_replacement_deploy_receives_private_writer_gate(self, popen) -> None:
+        popen.return_value = mock.Mock(pid=4001)
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        group.start_deploy(
+            interface="lo",
+            zmq_port=6000,
+            writer_control_socket=Path("/run/user/1000/sonic.sock"),
+            physical_reentry=True,
+        )
+        guarded = popen.call_args.args[0]
+        command = guarded[guarded.index("--") + 1 :]
+        self.assertEqual(
+            command[command.index("--writer-control-socket") + 1],
+            "/run/user/1000/sonic.sock",
+        )
+        self.assertIn("--writer-reentry", command)
+        self.assertEqual(
+            command[command.index("--planner-backend") + 1],
+            "onnx",
+        )
+        self.assertEqual(
+            command[command.index("--writer-reentry-hold-seconds") + 1],
+            "0.5",
+        )
+        self.assertEqual(
+            command[command.index("--writer-reentry-align-seconds") + 1],
+            "5.0",
+        )
+        self.assertEqual(
+            command[command.index("--writer-reentry-align-fraction") + 1],
+            "0.0",
+        )
+        self.assertEqual(
+            command[command.index("--writer-reentry-settle-seconds") + 1],
+            "1.0",
+        )
+        self.assertEqual(
+            command[command.index("--writer-reentry-blend-seconds") + 1],
+            "6.0",
+        )
+        self.assertEqual(group.deploy_pid(), 4001)
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_physical_reentry_requires_writer_gate(self, popen) -> None:
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+
+        with self.assertRaisesRegex(RuntimeError, "requires a writer gate"):
+            group.start_deploy(
+                interface="lo",
+                zmq_port=6000,
+                physical_reentry=True,
+            )
+
+        popen.assert_not_called()
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_deploy_only_restart_advances_generation_and_preserves_game_input(
+        self, popen
+    ) -> None:
+        first = mock.Mock(pid=4101)
+        second = mock.Mock(pid=4102)
+        game_input = mock.Mock(pid=4200)
+        popen.side_effect = (first, second)
+        returncodes = {4101: None, 4102: None, 4200: None}
+
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        with mock.patch.object(
+            MODULE,
+            "_peek_child_returncode",
+            side_effect=lambda process: returncodes[process.pid],
+        ), mock.patch.object(MODULE.os, "killpg") as killpg:
+            self.assertEqual(group.start_deploy(interface="lo", zmq_port=6000), 1)
+            group.children.append(("game-input", game_input))
+            group.begin_deploy_stop()
+            returncodes[4101] = 0
+
+            self.assertIsNone(group.failed_child())
+            self.assertFalse(group.deploy_alive())
+            self.assertEqual(group.start_deploy(interface="lo", zmq_port=6000), 2)
+            self.assertTrue(group.deploy_alive())
+
+        killpg.assert_not_called()
+        self.assertEqual(group.deploy_generation, 2)
+        self.assertIn(("game-input", game_input), group.children)
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_recovery_worker_command_is_writer_gated_host_process(self, popen) -> None:
+        process = mock.Mock(pid=4300)
+        popen.return_value = process
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+
+        group.start_recovery_policy(
+            "/policy/python",
+            Path("/matrix/scripts/matrix_sonic_host_worker.py"),
+            interface="lo",
+            control_socket=Path("/run/user/1000/recovery.sock"),
+            model=Path("/models/prone-v1.onnx"),
+            fallback_models=(Path("/models/prone-v2.onnx"),),
+            fallback_after_s=8.0,
+            amp_config=Path("/models/amp.json"),
+            amp_model=Path("/models/amp.onnx"),
+            amp_config_sha256="1" * 64,
+            amp_model_sha256="2" * 64,
+            initial_controller="amp",
+        )
+
+        guarded = popen.call_args.args[0]
+        self.assertIn("--exec-command", guarded[: guarded.index("--")])
+        command = guarded[guarded.index("--") + 1 :]
+        self.assertEqual(
+            command[:3],
+            [
+                "/policy/python",
+                "-u",
+                "/matrix/scripts/matrix_sonic_host_worker.py",
+            ],
+        )
+        self.assertEqual(command[command.index("--interface") + 1], "lo")
+        self.assertEqual(
+            command[command.index("--control-socket") + 1],
+            "/run/user/1000/recovery.sock",
+        )
+        self.assertEqual(
+            command[command.index("--initial-controller") + 1], "amp"
+        )
+        self.assertEqual(
+            command[command.index("--fallback-model") + 1],
+            "/models/prone-v2.onnx",
+        )
+        self.assertEqual(
+            command[command.index("--amp-hold-config") + 1],
+            "/models/amp.json",
+        )
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_recovery_worker_control_enforces_ready_before_go(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "recovery.sock"
+            control = MODULE._RecoveryWorkerControl(path)
+            control.open()
+            control.bind_expected_peer_pid(os.getpid())
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                peer.connect(str(path))
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "READY_NO_WRITER",
+                            "writer_created": False,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                self.assertTrue(control.ready)
+                self.assertFalse(control.first_write)
+
+                control.send("GO")
+                command = json.loads(peer.recv(4096).decode("utf-8"))
+                self.assertEqual(command["command"], "GO")
+                episode_id = command["episode_id"]
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "FIRST_WRITE",
+                            "episode_id": episode_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                self.assertTrue(control.first_write)
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "POLICY_FALLBACK_DUE",
+                            "requires_supervisor_authorization": True,
+                            "policy_index": 0,
+                            "next_policy_index": 1,
+                            "episode_id": episode_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                self.assertTrue(control.fallback_due)
+
+                control.send("ADVANCE_POLICY")
+                command = json.loads(peer.recv(4096).decode("utf-8"))
+                self.assertEqual(command["command"], "ADVANCE_POLICY")
+                transition_id = command["transition_id"]
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "POLICY_SWITCH",
+                            "from_policy_index": 0,
+                            "to_policy_index": 1,
+                            "physical_continuation": True,
+                            "episode_id": episode_id,
+                            "transition_id": transition_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                self.assertTrue(control.fallback_due)
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "POLICY_SWITCH_FIRST_WRITE",
+                            "from_policy_index": 0,
+                            "to_policy_index": 1,
+                            "physical_continuation": True,
+                            "writer_reused": True,
+                            "episode_id": episode_id,
+                            "transition_id": transition_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                self.assertFalse(control.fallback_due)
+                self.assertEqual(
+                    control.telemetry()["last_policy_switch"]["to_policy_index"],
+                    1,
+                )
+                control.send("STOP")
+                self.assertEqual(
+                    json.loads(peer.recv(4096).decode("utf-8"))["command"],
+                    "STOP",
+                )
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "STOPPED",
+                            "episode_id": episode_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                control.reset_for_start()
+                completed = control.telemetry()["completed_episodes"]
+                self.assertEqual(len(completed), 1)
+                self.assertTrue(completed[0]["first_write"])
+                self.assertTrue(completed[0]["stopped"])
+                self.assertEqual(
+                    completed[0]["last_policy_switch"]["to_policy_index"], 1
+                )
+            finally:
+                peer.close()
+                control.close()
+            self.assertFalse(path.exists())
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_joint_hold_supersedes_in_flight_fallback_due(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "recovery.sock"
+            control = MODULE._RecoveryWorkerControl(path)
+            control.open()
+            control.bind_expected_peer_pid(os.getpid())
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                peer.connect(str(path))
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "READY_NO_WRITER",
+                            "writer_created": False,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                control.send("GO")
+                go = json.loads(peer.recv(4096).decode("utf-8"))
+                episode_id = go["episode_id"]
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "FIRST_WRITE",
+                            "episode_id": episode_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+
+                # Queue the worker event but deliberately do not poll it.  The
+                # opposite socket direction has no shared ordering, so this is
+                # the real race seen when the stable gate requests hold.
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "POLICY_FALLBACK_DUE",
+                            "requires_supervisor_authorization": True,
+                            "policy_index": 0,
+                            "next_policy_index": 1,
+                            "episode_id": episode_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.send("ENTER_JOINT_HOLD")
+                hold = json.loads(peer.recv(4096).decode("utf-8"))
+                self.assertEqual(hold["command"], "ENTER_JOINT_HOLD")
+                self.assertEqual(hold["hold_kind"], "joint_pose")
+
+                control.poll()
+                self.assertFalse(control.fallback_due)
+                self.assertEqual(len(control.superseded_fallback_due_events), 1)
+                self.assertEqual(
+                    control.superseded_fallback_due_events[0]["superseded_by"],
+                    "joint_pose",
+                )
+
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "JOINT_HOLD_FIRST_WRITE",
+                            "episode_id": episode_id,
+                            "transition_id": hold["transition_id"],
+                            "writer_reused": True,
+                            "measured_joint_target": True,
+                            "measured_joint_count": 29,
+                            "capture_once": True,
+                            "lowstate_capture_age_s": 0.01,
+                            "target_velocity_zero": True,
+                            "feedforward_torque_zero": True,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                self.assertTrue(control.joint_hold_first_write)
+
+                control.send("STOP")
+                self.assertEqual(
+                    json.loads(peer.recv(4096).decode("utf-8"))["command"],
+                    "STOP",
+                )
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_host_worker.control.v1",
+                            "event": "STOPPED",
+                            "episode_id": episode_id,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+            finally:
+                peer.close()
+                control.close()
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_recovery_worker_control_rejects_unexpected_peer_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "recovery.sock"
+            control = MODULE._RecoveryWorkerControl(path)
+            control.open()
+            control.bind_expected_peer_pid(os.getpid() + 100000)
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                peer.connect(str(path))
+                with self.assertRaisesRegex(RuntimeError, "peer PID mismatch"):
+                    control.poll()
+                self.assertEqual(control.peer_pid_mismatches, 1)
+                self.assertIsNone(control.connection)
+            finally:
+                peer.close()
+                control.close()
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_sonic_writer_control_tracks_hard_writer_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sonic.sock"
+            control = MODULE._SonicWriterControl(path)
+            control.open()
+            control.bind_expected_peer_pid(os.getpid())
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                peer.connect(str(path))
+
+                def event(
+                    name: str,
+                    created: bool,
+                    *,
+                    authorized: bool | None = None,
+                ) -> bytes:
+                    payload = {
+                        "schema": "matrix.sonic_deploy.control.v1",
+                        "event": name,
+                        "writer_scope": "rt/lowcmd",
+                        "lowcmd_writer_created": created,
+                    }
+                    if authorized is not None:
+                        payload["write_authorized"] = authorized
+                    return json.dumps(payload).encode("utf-8")
+
+                peer.send(event("READY_NO_LOWCMD_WRITER", False))
+                peer.send(event("SHADOW_READY_NO_LOWCMD_WRITER", False))
+                control.poll()
+                self.assertTrue(control.ready)
+                self.assertTrue(control.shadow_ready)
+                self.assertFalse(control.writer_created)
+                control.send("GO")
+                self.assertEqual(peer.recv(4096), b"GO")
+                peer.send(event("WRITER_CREATED", True))
+                peer.send(event("FIRST_WRITE", True))
+                control.poll()
+                self.assertTrue(control.writer_created)
+                self.assertTrue(control.first_write)
+                self.assertTrue(control.current_first_write)
+                peer.send(
+                    event(
+                        "REENTRY_ALIGNMENT_COMPLETE",
+                        True,
+                        authorized=True,
+                    )
+                )
+                peer.send(
+                    event(
+                        "REENTRY_SAFE_IDLE_HOLD_ACTIVE",
+                        True,
+                        authorized=True,
+                    )
+                )
+                control.poll()
+                self.assertTrue(control.reentry_alignment_complete)
+                self.assertTrue(control.reentry_safe_idle_hold_active)
+                self.assertFalse(control.reentry_policy_full_control)
+                self.assertTrue(
+                    control.telemetry()["reentry_safe_idle_hold_active"]
+                )
+                peer.send(
+                    event(
+                        "REENTRY_POLICY_FULL_CONTROL",
+                        True,
+                        authorized=True,
+                    )
+                )
+                control.poll()
+                self.assertTrue(control.reentry_policy_full_control)
+                control.send("STOP")
+                self.assertEqual(peer.recv(4096), b"STOP")
+                peer.send(
+                    json.dumps(
+                        {
+                            "schema": "matrix.sonic_deploy.control.v1",
+                            "event": "WRITER_REVOKED",
+                            "writer_scope": "rt/lowcmd",
+                            "lowcmd_writer_created": True,
+                            "write_authorized": False,
+                        }
+                    ).encode("utf-8")
+                )
+                control.poll()
+                self.assertTrue(control.writer_created)
+                self.assertTrue(control.writer_revoked)
+                self.assertFalse(control.current_first_write)
+                peer.send(event("STOPPED", False))
+                control.poll()
+                self.assertTrue(control.stopped)
+                self.assertFalse(control.writer_created)
+            finally:
+                peer.close()
+                control.close()
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_resident_sonic_pause_resume_advances_writer_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sonic.sock"
+            control = MODULE._SonicWriterControl(
+                path,
+                require_authority_epoch=True,
+            )
+            control.open()
+            control.bind_expected_peer_pid(os.getpid())
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                peer.connect(str(path))
+
+                def event(
+                    name: str,
+                    created: bool,
+                    authorized: bool,
+                    epoch: int,
+                ) -> bytes:
+                    return json.dumps(
+                        {
+                            "schema": "matrix.sonic_deploy.control.v1",
+                            "event": name,
+                            "writer_scope": "rt/lowcmd",
+                            "lowcmd_writer_created": created,
+                            "write_authorized": authorized,
+                            "authority_epoch": epoch,
+                        }
+                    ).encode("utf-8")
+
+                peer.send(event("READY_NO_LOWCMD_WRITER", False, False, 0))
+                control.poll()
+                control.send("GO")
+                self.assertEqual(peer.recv(4096), b"GO")
+                peer.send(event("WRITER_CREATED", True, True, 1))
+                peer.send(event("FIRST_WRITE", True, True, 1))
+                control.poll()
+                self.assertTrue(control.current_first_write)
+                self.assertEqual(control.authority_epoch, 1)
+
+                control.send("PAUSE")
+                self.assertEqual(peer.recv(4096), b"PAUSE")
+                peer.send(event("WRITER_PAUSED", True, False, 1))
+                control.poll()
+                self.assertTrue(control.paused)
+                self.assertFalse(control.current_first_write)
+                self.assertFalse(control.stopped)
+                self.assertFalse(control.writer_revoked)
+
+                control.send("RESUME")
+                self.assertEqual(peer.recv(4096), b"RESUME")
+                peer.send(event("WRITER_RESUMED", True, True, 2))
+                control.poll()
+                self.assertFalse(control.current_first_write)
+                self.assertEqual(control.authority_epoch, 2)
+                peer.send(event("FIRST_WRITE", True, True, 2))
+                control.poll()
+                self.assertTrue(control.current_first_write)
+                self.assertEqual(control.resume_count, 1)
+                self.assertFalse(control.stopped)
+                self.assertFalse(control.writer_revoked)
+            finally:
+                peer.close()
+                control.close()
+
+    def test_resident_worker_ready_requires_gpu_policy_attestation(self) -> None:
+        control = MODULE._RecoveryWorkerControl(
+            Path("/unused/recovery.sock"),
+            require_resident_attestation=True,
+        )
+        incomplete = json.dumps(
+            {
+                "schema": "matrix.sonic_host_worker.control.v1",
+                "event": "READY_NO_WRITER",
+                "writer_created": False,
+            }
+        ).encode("utf-8")
+        with self.assertRaisesRegex(RuntimeError, "provider attestation"):
+            control._handle_packet(incomplete)
+
+        policies = [
+            {
+                "name": "host:prone",
+                "execution_provider": "CUDAExecutionProvider",
+                "warmed": True,
+            },
+            {
+                "name": "amp:walk_run_getup",
+                "execution_provider": "CUDAExecutionProvider",
+                "warmed": True,
+            },
+            {
+                "name": "kungfu:1307_recovery",
+                "execution_provider": "CUDAExecutionProvider",
+                "warmed": True,
+            },
+        ]
+        ready = json.dumps(
+            {
+                "schema": "matrix.sonic_host_worker.control.v1",
+                "event": "READY_NO_WRITER",
+                "writer_created": False,
+                "execution_provider": "CUDAExecutionProvider",
+                "resident_policies": policies,
+                "resident_policy_count": len(policies),
+                "registered_policy_ids": ["host", "amp", "kungfu"],
+                "initial_policy_id": "kungfu",
+                "models_loaded_once": True,
+                "models_warmed": True,
+            }
+        ).encode("utf-8")
+        control._handle_packet(ready)
+        self.assertTrue(control.ready)
+        self.assertTrue(control.paused)
+        self.assertEqual(control.execution_provider, "CUDAExecutionProvider")
+        self.assertEqual(len(control.resident_policies), 3)
+        self.assertEqual(control.registered_policy_ids, ["host", "amp", "kungfu"])
+        self.assertEqual(control.initial_policy_id, "kungfu")
+
+    def test_recovery_worker_control_tracks_resident_paused_writer(self) -> None:
+        control = MODULE._RecoveryWorkerControl(Path("/unused/recovery.sock"))
+        control.ready = True
+        control.episode_id = 2
+        control.pause_sent = True
+
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": "matrix.sonic_host_worker.control.v1",
+                    "event": "PAUSED_RESIDENT_WRITER",
+                    "episode_id": 2,
+                    "writer_created": True,
+                    "write_authorized": False,
+                    "writer_reused": True,
+                }
+            ).encode("utf-8")
+        )
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": "matrix.sonic_host_worker.control.v1",
+                    "event": "STATUS",
+                    "controller": "PAUSED_RESIDENT_WRITER",
+                    "writer_created": True,
+                    "write_authorized": False,
+                }
+            ).encode("utf-8")
+        )
+
+        telemetry = control.telemetry()
+        self.assertTrue(telemetry["resident_paused"])
+        self.assertTrue(telemetry["resident_writer_created"])
+        self.assertFalse(telemetry["paused_no_writer"])
+
+    def test_sonic_writer_safe_idle_hold_rejects_invalid_attestations(
+        self,
+    ) -> None:
+        def packet(
+            *,
+            created: object = True,
+            authorized: object = True,
+        ) -> bytes:
+            return json.dumps(
+                {
+                    "schema": "matrix.sonic_deploy.control.v1",
+                    "event": "REENTRY_SAFE_IDLE_HOLD_ACTIVE",
+                    "writer_scope": "rt/lowcmd",
+                    "lowcmd_writer_created": created,
+                    "write_authorized": authorized,
+                }
+            ).encode("utf-8")
+
+        def eligible_control() -> MODULE._SonicWriterControl:
+            control = MODULE._SonicWriterControl(Path("/unused/sonic.sock"))
+            control.shadow_ready = True
+            control.reentry_alignment_complete = True
+            control.first_write = True
+            control.writer_created = True
+            return control
+
+        invalid_states = (
+            ("without shadow readiness", {"shadow_ready": False}, packet()),
+            (
+                "before alignment",
+                {"reentry_alignment_complete": False},
+                packet(),
+            ),
+            ("before first write", {"first_write": False}, packet()),
+            ("without writer", {"writer_created": False}, packet()),
+            ("payload reports no writer", {}, packet(created=False)),
+            ("payload writer flag is not bool", {}, packet(created=1)),
+            ("without authority", {}, packet(authorized=False)),
+            ("authority flag is not bool", {}, packet(authorized=1)),
+            ("after revocation", {"writer_revoked": True}, packet()),
+        )
+        for label, state, event_packet in invalid_states:
+            control = eligible_control()
+            for name, value in state.items():
+                setattr(control, name, value)
+            with self.subTest(label=label), self.assertRaises(RuntimeError):
+                control._handle_packet(event_packet)
+            self.assertFalse(control.reentry_safe_idle_hold_active)
+            self.assertFalse(control.reentry_policy_full_control)
+
+    def test_sonic_writer_safe_idle_hold_is_distinct_and_can_upgrade(
+        self,
+    ) -> None:
+        def packet(event: str) -> bytes:
+            return json.dumps(
+                {
+                    "schema": "matrix.sonic_deploy.control.v1",
+                    "event": event,
+                    "writer_scope": "rt/lowcmd",
+                    "lowcmd_writer_created": True,
+                    "write_authorized": True,
+                }
+            ).encode("utf-8")
+
+        control = MODULE._SonicWriterControl(Path("/unused/sonic.sock"))
+        control.shadow_ready = True
+        control.reentry_alignment_complete = True
+        control.first_write = True
+        control.writer_created = True
+
+        safe_hold = packet("REENTRY_SAFE_IDLE_HOLD_ACTIVE")
+        control._handle_packet(safe_hold)
+        self.assertTrue(control.reentry_safe_idle_hold_active)
+        self.assertFalse(control.reentry_policy_full_control)
+        with self.assertRaisesRegex(RuntimeError, "duplicate"):
+            control._handle_packet(safe_hold)
+
+        control._handle_packet(packet("REENTRY_POLICY_FULL_CONTROL"))
+        self.assertTrue(control.reentry_policy_full_control)
+
+        control.reset_for_start()
+        self.assertFalse(control.reentry_safe_idle_hold_active)
+        self.assertFalse(control.reentry_policy_full_control)
+
+    def test_sonic_writer_rejects_safe_idle_hold_after_full_control(
+        self,
+    ) -> None:
+        control = MODULE._SonicWriterControl(Path("/unused/sonic.sock"))
+        control.shadow_ready = True
+        control.reentry_alignment_complete = True
+        control.first_write = True
+        control.writer_created = True
+        control.reentry_policy_full_control = True
+        packet = json.dumps(
+            {
+                "schema": "matrix.sonic_deploy.control.v1",
+                "event": "REENTRY_SAFE_IDLE_HOLD_ACTIVE",
+                "writer_scope": "rt/lowcmd",
+                "lowcmd_writer_created": True,
+                "write_authorized": True,
+            }
+        ).encode("utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "regressed"):
+            control._handle_packet(packet)
+        self.assertFalse(control.reentry_safe_idle_hold_active)
+        self.assertTrue(control.reentry_policy_full_control)
+
+    def test_physical_recovery_observation_reports_safe_idle_hold(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.worker = SimpleNamespace(
+            poll=lambda: None,
+            error=None,
+            fallback_due=False,
+            last_status=None,
+            first_write=False,
+            amp_hold_first_write=False,
+            joint_hold_first_write=False,
+            ready_recent=lambda **kwargs: False,
+        )
+        coordinator.sonic_writer = SimpleNamespace(
+            poll=lambda: None,
+            error=None,
+            ready=False,
+            expected_peer_pid=4321,
+            shadow_ready=True,
+            writer_created=True,
+            writer_revoked=False,
+            current_first_write=True,
+            reentry_policy_full_control=False,
+            reentry_safe_idle_hold_active=True,
+        )
+        coordinator.fsm = mock.Mock()
+        coordinator.fsm.state = MODULE.RecoveryState.GAME_SONIC
+        coordinator.fsm.step.return_value = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.GAME_SONIC,
+            state=MODULE.RecoveryState.GAME_SONIC,
+        )
+        coordinator.handoff_mode = "amp"
+        coordinator.replacement_sonic_ready_s = None
+        coordinator.replacement_sonic_first_fresh_s = None
+        coordinator.command_frame_epoch = 0
+        coordinator.last_output = None
+        coordinator._maybe_authorize_policy_advance = mock.Mock()
+        coordinator._fall_level = mock.Mock(return_value=False)
+        snapshot = self.snapshot(
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+            low_cmd_age_s=0.01,
+        )
+        snapshot.qpos[2] = 0.7
+        snapshot.qpos[3] = 1.0
+        processes = SimpleNamespace(
+            deploy_generation=8,
+            deploy_alive=lambda: True,
+            recovery_policy_alive=lambda: False,
+        )
+
+        coordinator.observe(
+            snapshot,
+            now_s=1.0,
+            neutral_confirmed=False,
+            foot_contact=True,
+            grounded_contact=True,
+            processes=processes,
+        )
+
+        observation = coordinator.fsm.step.call_args.args[0]
+        self.assertTrue(observation.deploy_safe_idle_hold)
+        self.assertFalse(observation.deploy_policy_full_control)
+        self.assertTrue(observation.deploy_first_write)
+
+    def test_stabilizing_to_wait_neutral_reanchors_game_core_once(self) -> None:
+        core = mock.Mock(spec=GAME_CONTROL.GameControlCore)
+        measured_heading = math.radians(100.0)
+        transition = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.SONIC_STABILIZING,
+            state=MODULE.RecoveryState.WAIT_NEUTRAL,
+            inhibit_game_input=True,
+        )
+        steady_wait = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.WAIT_NEUTRAL,
+            state=MODULE.RecoveryState.WAIT_NEUTRAL,
+            inhibit_game_input=True,
+        )
+
+        self.assertTrue(
+            MODULE._reanchor_game_heading_after_recovery_transition(
+                transition,
+                core,
+                measured_heading_rad=measured_heading,
+            )
+        )
+        self.assertFalse(
+            MODULE._reanchor_game_heading_after_recovery_transition(
+                steady_wait,
+                core,
+                measured_heading_rad=math.radians(-40.0),
+            )
+        )
+
+        core.reanchor_heading.assert_called_once_with(measured_heading)
+
+    def test_stabilizing_to_wait_neutral_captures_restart_anchor_once(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.worker = SimpleNamespace(
+            poll=lambda: None,
+            error=None,
+            last_status=None,
+            first_write=False,
+            amp_hold_first_write=False,
+            joint_hold_first_write=False,
+            ready_recent=lambda **kwargs: False,
+        )
+        coordinator.sonic_writer = SimpleNamespace(
+            poll=lambda: None,
+            error=None,
+            ready=False,
+            expected_peer_pid=4321,
+            shadow_ready=True,
+            writer_created=True,
+            writer_revoked=False,
+            stopped=False,
+            current_first_write=True,
+            reentry_policy_full_control=False,
+            reentry_safe_idle_hold_active=True,
+        )
+        coordinator.fsm = mock.Mock()
+        coordinator.fsm.state = MODULE.RecoveryState.SONIC_STABILIZING
+        outputs = iter(
+            (
+                MODULE.RecoveryOutput(
+                    previous_state=MODULE.RecoveryState.SONIC_STABILIZING,
+                    state=MODULE.RecoveryState.WAIT_NEUTRAL,
+                    inhibit_game_input=True,
+                ),
+                MODULE.RecoveryOutput(
+                    previous_state=MODULE.RecoveryState.WAIT_NEUTRAL,
+                    state=MODULE.RecoveryState.WAIT_NEUTRAL,
+                    inhibit_game_input=True,
+                ),
+            )
+        )
+
+        def transition(_observation):
+            output = next(outputs)
+            coordinator.fsm.state = output.state
+            return output
+
+        coordinator.fsm.step.side_effect = transition
+        coordinator.handoff_mode = "amp"
+        coordinator.replacement_sonic_ready_s = None
+        coordinator.replacement_sonic_first_fresh_s = None
+        coordinator.last_output = None
+        coordinator.last_transition_s = None
+        coordinator.episodes = 0
+        coordinator.recoveries = 0
+        coordinator.initial_root_yaw_rad = math.radians(10.0)
+        coordinator.restarted_root_yaw_rad = None
+        coordinator.command_frame_rotation_rad = 0.0
+        coordinator.command_frame_epoch = 0
+        coordinator.reframe_limited_frames = 0
+        coordinator.last_reframe_limited = False
+        coordinator.last_reframe_heading_error_rad = 0.0
+        coordinator.previous_sonic_writer_revoked = False
+        coordinator.previous_sonic_stopped = False
+        coordinator._maybe_authorize_policy_advance = mock.Mock()
+        coordinator._fall_level = mock.Mock(return_value=False)
+        processes = SimpleNamespace(
+            deploy_generation=8,
+            deploy_alive=lambda: True,
+            recovery_policy_alive=lambda: False,
+        )
+
+        first_heading = math.radians(100.0)
+        first_snapshot = self.snapshot_with_yaw(
+            first_heading,
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+            low_cmd_age_s=0.01,
+        )
+        first_snapshot.qpos[2] = 0.7
+        second_snapshot = self.snapshot_with_yaw(
+            math.radians(-40.0),
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+            low_cmd_age_s=0.01,
+        )
+        second_snapshot.qpos[2] = 0.7
+
+        with mock.patch.object(
+            coordinator,
+            "_capture_restart_anchor",
+            wraps=coordinator._capture_restart_anchor,
+        ) as capture_restart_anchor:
+            first = coordinator.observe(
+                first_snapshot,
+                now_s=1.0,
+                neutral_confirmed=False,
+                foot_contact=True,
+                grounded_contact=True,
+                processes=processes,
+            )
+            captured_rotation = coordinator.command_frame_rotation_rad
+            second = coordinator.observe(
+                second_snapshot,
+                now_s=1.02,
+                neutral_confirmed=False,
+                foot_contact=True,
+                grounded_contact=True,
+                processes=processes,
+            )
+
+        self.assertIs(first.previous_state, MODULE.RecoveryState.SONIC_STABILIZING)
+        self.assertIs(first.state, MODULE.RecoveryState.WAIT_NEUTRAL)
+        self.assertIs(second.previous_state, MODULE.RecoveryState.WAIT_NEUTRAL)
+        self.assertIs(second.state, MODULE.RecoveryState.WAIT_NEUTRAL)
+        capture_restart_anchor.assert_called_once_with(first_snapshot.qpos)
+        self.assertEqual(coordinator.command_frame_epoch, 1)
+        self.assertEqual(coordinator.last_wire_facing_heading_rad, 0.0)
+        self.assertAlmostEqual(coordinator.restarted_root_yaw_rad, first_heading)
+        self.assertAlmostEqual(
+            captured_rotation,
+            -MODULE.wrap_angle_rad(
+                first_heading - coordinator.initial_root_yaw_rad
+            ),
+        )
+        self.assertAlmostEqual(
+            coordinator.command_frame_rotation_rad, captured_rotation
+        )
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_sonic_writer_control_accepts_internal_fail_closed_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sonic-fatal.sock"
+            control = MODULE._SonicWriterControl(path)
+            control.open()
+            control.bind_expected_peer_pid(os.getpid())
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                peer.connect(str(path))
+
+                def event(
+                    name: str,
+                    created: bool,
+                    *,
+                    authorized: bool | None = None,
+                ) -> bytes:
+                    payload = {
+                        "schema": "matrix.sonic_deploy.control.v1",
+                        "event": name,
+                        "writer_scope": "rt/lowcmd",
+                        "lowcmd_writer_created": created,
+                    }
+                    if authorized is not None:
+                        payload["write_authorized"] = authorized
+                    return json.dumps(payload).encode("utf-8")
+
+                peer.send(event("READY_NO_LOWCMD_WRITER", False))
+                control.poll()
+                self.assertFalse(control.shadow_ready)
+                control.send("GO")
+                self.assertEqual(peer.recv(4096), b"GO")
+                peer.send(event("WRITER_CREATED", True))
+                peer.send(event("FIRST_WRITE", True))
+                control.poll()
+
+                peer.send(
+                    event(
+                        "WRITER_FAILED_CLOSED",
+                        True,
+                        authorized=False,
+                    )
+                )
+                control.poll()
+                self.assertTrue(control.writer_failed_closed)
+                self.assertTrue(control.writer_revoked)
+                self.assertFalse(control.current_first_write)
+                self.assertIn("failed closed", control.error)
+
+                # Internal fatal cleanup is allowed to finish without a
+                # supervisor STOP, but it must attest that the publisher is
+                # gone and authority remains revoked.
+                peer.send(event("STOPPED", False, authorized=False))
+                control.poll()
+                self.assertTrue(control.stopped)
+                self.assertFalse(control.writer_created)
+            finally:
+                peer.close()
+                control.close()
+
+    def test_restarted_deploy_reframes_game_command_from_new_yaw_anchor(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_root_yaw_rad = 0.0
+        coordinator.restarted_root_yaw_rad = None
+        coordinator.command_frame_rotation_rad = 0.0
+        coordinator.command_frame_epoch = 0
+        coordinator.last_wire_facing_heading_rad = None
+        coordinator.reframe_limited_frames = 0
+        coordinator.last_reframe_limited = False
+        coordinator.last_reframe_heading_error_rad = 0.0
+        half = math.pi / 4.0
+        coordinator._capture_restart_anchor(
+            [0.0, 0.0, 0.7, math.cos(half), 0.0, 0.0, math.sin(half)]
+        )
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=5,
+            movement=(1.0, 0.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=1.0,
+            locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
+            mode="move",
+            safe_stop=False,
+            reason="active",
+        )
+
+        reframed = coordinator.reframe_game_command(command)
+
+        self.assertAlmostEqual(coordinator.restarted_root_yaw_rad, math.pi / 2.0)
+        self.assertAlmostEqual(coordinator.command_frame_rotation_rad, -math.pi / 2.0)
+        self.assertAlmostEqual(reframed.movement[0], 0.0, places=7)
+        self.assertAlmostEqual(reframed.movement[1], -1.0, places=7)
+        self.assertAlmostEqual(reframed.facing[0], 1.0, places=7)
+        self.assertAlmostEqual(reframed.facing[1], 0.0, places=7)
+        self.assertEqual(reframed.speed_mps, command.speed_mps)
+
+        bootstrap = coordinator.sonic_bootstrap_command(command)
+        self.assertEqual(bootstrap.movement, (0.0, 0.0, 0.0))
+        self.assertEqual(bootstrap.facing, (1.0, 0.0, 0.0))
+        self.assertEqual(bootstrap.locomotion_mode, GAME_CONTROL.SONIC_IDLE_MODE)
+        self.assertTrue(bootstrap.safe_stop)
+
+        # Even an external moving candidate is replaced by the exact IDLE
+        # bootstrap while WAIT_NEUTRAL has not observed policy full control.
+        coordinator.sonic_writer = SimpleNamespace(
+            reentry_policy_full_control=False
+        )
+        waiting = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.WAIT_NEUTRAL,
+            state=MODULE.RecoveryState.WAIT_NEUTRAL,
+            inhibit_game_input=True,
+        )
+        gated = coordinator.recovery_wire_command(
+            command,
+            waiting,
+            measured_heading_rad=math.pi / 2.0,
+            dt_s=0.02,
+        )
+        self.assertEqual(gated, bootstrap)
+
+    def test_resident_recovery_holds_sonic_at_live_body_heading(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.command_frame_rotation_rad = 0.0
+        coordinator.last_wire_facing_heading_rad = None
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=9,
+            movement=(1.0, 0.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=1.0,
+            locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
+            mode="move",
+            safe_stop=False,
+            reason="active",
+        )
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.KUNGFU_STARTING,
+            state=MODULE.ResidentRecoveryState.KUNGFU_RECOVERING,
+            inhibit_game_input=True,
+        )
+        measured_heading = math.radians(125.0)
+
+        held = coordinator.recovery_wire_command(
+            command,
+            output,
+            measured_heading_rad=measured_heading,
+            dt_s=0.02,
+        )
+
+        self.assertEqual(held.movement, (0.0, 0.0, 0.0))
+        self.assertEqual(held.speed_mps, 0.0)
+        self.assertEqual(held.locomotion_mode, GAME_CONTROL.SONIC_IDLE_MODE)
+        self.assertTrue(held.safe_stop)
+        self.assertEqual(held.reason, "physical_recovery_resident_sonic_hold")
+        self.assertAlmostEqual(held.facing[0], math.cos(measured_heading))
+        self.assertAlmostEqual(held.facing[1], math.sin(measured_heading))
+        self.assertAlmostEqual(
+            coordinator.last_wire_facing_heading_rad,
+            measured_heading,
+        )
+
+    def test_policy_fallback_uses_full_pose_grace_and_low_dynamics(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.worker = mock.Mock()
+        coordinator.worker.fallback_due = True
+        coordinator.worker.connection = object()
+        coordinator.worker.go_sent = True
+        coordinator.worker.stop_sent = False
+        coordinator.worker.amp_hold_sent = False
+        coordinator.worker.joint_hold_sent = False
+        coordinator.policy_fallback_last_near_upright_s = None
+        coordinator.policy_fallback_quiet_since_s = None
+        coordinator.policy_advance_requested = False
+        coordinator.policy_advances = 0
+
+        def evaluate(
+            now_s,
+            *,
+            root_z,
+            root_up,
+            linear=0.0,
+            angular=0.0,
+            joint_rms=0.0,
+        ):
+            coordinator._maybe_authorize_policy_advance(
+                now_s=now_s,
+                root_z_m=root_z,
+                root_up_z=root_up,
+                root_linear_speed_m_s=linear,
+                root_angular_speed_rad_s=angular,
+                joint_velocity_rms_rad_s=joint_rms,
+                grounded_contact=True,
+                recovery_state=MODULE.RecoveryState.POLICY_RECOVERING,
+                policy_alive=True,
+                worker_controller="HOST_GETUP",
+            )
+
+        # True standing uses both height and orientation, so a policy that has
+        # just reached z=.75/up=.99 is not replaced at its timeout.
+        evaluate(10.0, root_z=0.75, root_up=0.99)
+        coordinator.worker.send.assert_not_called()
+
+        # Falling out of upright grace or moving rapidly still cannot trigger
+        # a hard policy switch.
+        evaluate(12.1, root_z=0.25, root_up=0.2, angular=3.0, joint_rms=2.0)
+        evaluate(12.2, root_z=0.25, root_up=0.2)
+        coordinator.worker.send.assert_not_called()
+
+        # Only a continuous grounded low-energy window authorizes the next
+        # already-loaded policy.
+        evaluate(12.71, root_z=0.25, root_up=0.2)
+        coordinator.worker.send.assert_called_once_with("ADVANCE_POLICY")
+        self.assertTrue(coordinator.policy_advance_requested)
+        self.assertEqual(coordinator.policy_advances, 1)
+
+    def test_low_supine_pose_is_not_mistaken_for_upright(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.worker = mock.Mock()
+        coordinator.worker.fallback_due = True
+        coordinator.worker.connection = object()
+        coordinator.worker.go_sent = True
+        coordinator.worker.stop_sent = False
+        coordinator.worker.amp_hold_sent = False
+        coordinator.worker.joint_hold_sent = False
+        coordinator.policy_fallback_last_near_upright_s = None
+        coordinator.policy_fallback_quiet_since_s = None
+        coordinator.policy_advance_requested = False
+        coordinator.policy_advances = 0
+        arguments = {
+            "root_z_m": 0.12,
+            "root_up_z": 0.99,
+            "root_linear_speed_m_s": 0.0,
+            "root_angular_speed_rad_s": 0.0,
+            "joint_velocity_rms_rad_s": 0.0,
+            "grounded_contact": True,
+            "recovery_state": MODULE.RecoveryState.POLICY_RECOVERING,
+            "policy_alive": True,
+            "worker_controller": "HOST_GETUP",
+        }
+
+        coordinator._maybe_authorize_policy_advance(now_s=20.0, **arguments)
+        coordinator._maybe_authorize_policy_advance(now_s=20.51, **arguments)
+
+        coordinator.worker.send.assert_called_once_with("ADVANCE_POLICY")
+
+    def test_initial_sonic_uses_writer_gate_and_goes_only_after_ready(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.sonic_writer = mock.Mock()
+        coordinator.sonic_writer.path = Path("/run/user/1000/initial-sonic.sock")
+        coordinator.sonic_writer.ready = False
+        coordinator.sonic_writer.writer_created = False
+        coordinator.sonic_writer.first_write = False
+        coordinator.initial_sonic_gate_pending = False
+        processes = mock.Mock()
+        processes.deploy_pid.return_value = 4321
+        planner = mock.Mock()
+        output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.GAME_SONIC,
+            state=MODULE.RecoveryState.GAME_SONIC,
+        )
+
+        self.assertEqual(
+            coordinator.prepare_initial_sonic_gate(),
+            Path("/run/user/1000/initial-sonic.sock"),
+        )
+        coordinator.bind_initial_sonic_gate(processes=processes)
+        coordinator.execute(output, processes=processes, planner=planner)
+        coordinator.sonic_writer.send.assert_not_called()
+
+        coordinator.sonic_writer.ready = True
+        coordinator.execute(output, processes=processes, planner=planner)
+        coordinator.sonic_writer.send.assert_called_once_with("GO")
+        self.assertFalse(coordinator.initial_sonic_gate_pending)
+        coordinator.sonic_writer.reset_for_start.assert_called_once_with()
+        coordinator.sonic_writer.bind_expected_peer_pid.assert_called_once_with(4321)
+
+    def test_sonic_stop_execute_is_idempotent_for_consecutive_outputs(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_sonic_gate_pending = False
+        writer = MODULE._SonicWriterControl(Path("/unused/sonic-stop.sock"))
+        writer.reset_for_start()
+        writer.expected_peer_pid = 4321
+        writer.connection = mock.Mock()
+        writer.connection.send.return_value = len(b"STOP")
+        coordinator.sonic_writer = writer
+        processes = mock.Mock()
+        planner = mock.Mock()
+        output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.SONIC_STOP_REQUESTED,
+            state=MODULE.RecoveryState.FAILED,
+            request_sonic_stop=True,
+            fail_closed=True,
+            failure_reason="timeout_sonic_stop_requested",
+        )
+
+        coordinator.execute(output, processes=processes, planner=planner)
+        coordinator.execute(output, processes=processes, planner=planner)
+
+        self.assertTrue(writer.stop_sent)
+        writer.connection.send.assert_called_once_with(b"STOP")
+        self.assertEqual(processes.begin_deploy_stop.call_count, 2)
+        planner.request_deploy_stop.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "STOP was already sent"):
+            writer.send("STOP")
+
+    def test_sonic_stop_timeout_failure_does_not_resend_protocol_stop(self) -> None:
+        machine = MODULE.SingleWriterRecoveryFSM(
+            MODULE.RecoveryConfig(sonic_stop_timeout_s=0.2)
+        )
+        observation = MODULE.RecoveryInput(
+            now_s=0.0,
+            fall_detected=False,
+            root_z_m=0.30,
+            root_up_z=0.20,
+            root_linear_speed_m_s=0.0,
+            root_angular_speed_rad_s=0.0,
+            joint_velocity_rms_rad_s=0.0,
+            lowcmd_fresh=True,
+            lowcmd_age_s=0.01,
+            deploy_alive=True,
+            deploy_generation=7,
+            deploy_process_ready=False,
+            deploy_writer_ready=False,
+            deploy_writer_created=True,
+            deploy_writer_revoked=False,
+            deploy_first_write=False,
+            deploy_policy_full_control=False,
+            deploy_safe_idle_hold=False,
+            policy_alive=False,
+            policy_ready=False,
+            policy_first_write=False,
+            policy_hold_first_write=False,
+            reset_count=0,
+            foot_contact=True,
+            grounded_contact=True,
+            neutral_confirmed=False,
+        )
+        machine.step(observation)
+        first_stop = machine.step(
+            replace(observation, now_s=0.1, fall_detected=True)
+        )
+        self.assertTrue(first_stop.request_sonic_stop)
+
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_sonic_gate_pending = False
+        writer = MODULE._SonicWriterControl(Path("/unused/sonic-timeout.sock"))
+        writer.reset_for_start()
+        writer.expected_peer_pid = 4321
+        writer.connection = mock.Mock()
+        writer.connection.send.return_value = len(b"STOP")
+        coordinator.sonic_writer = writer
+        processes = mock.Mock()
+        planner = mock.Mock()
+
+        coordinator.execute(first_stop, processes=processes, planner=planner)
+        timed_out = machine.step(
+            replace(observation, now_s=0.31, fall_detected=True)
+        )
+        self.assertEqual(timed_out.state, MODULE.RecoveryState.FAILED)
+        self.assertEqual(
+            timed_out.failure_reason, "timeout_sonic_stop_requested"
+        )
+        self.assertTrue(timed_out.request_sonic_stop)
+        coordinator.execute(timed_out, processes=processes, planner=planner)
+
+        writer.connection.send.assert_called_once_with(b"STOP")
+        self.assertEqual(processes.begin_deploy_stop.call_count, 2)
+        planner.request_deploy_stop.assert_not_called()
+
+    def test_policy_stop_marks_expected_exit_before_protocol_stop(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_sonic_gate_pending = False
+        coordinator.worker = mock.Mock()
+        coordinator.worker.connection = object()
+        processes = mock.Mock()
+        output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.POLICY_AMP_HOLDING,
+            state=MODULE.RecoveryState.POLICY_STOP_REQUESTED,
+            request_policy_stop=True,
+        )
+
+        coordinator.execute(output, processes=processes, planner=mock.Mock())
+
+        coordinator.worker.send.assert_called_once_with("STOP")
+        processes.begin_recovery_policy_stop.assert_called_once_with()
+
+    def test_disconnected_policy_stop_marks_expected_exit(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_sonic_gate_pending = False
+        coordinator.worker = mock.Mock()
+        coordinator.worker.connection = None
+        processes = mock.Mock()
+        output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.POLICY_AMP_HOLDING,
+            state=MODULE.RecoveryState.POLICY_STOP_REQUESTED,
+            request_policy_stop=True,
+        )
+
+        coordinator.execute(output, processes=processes, planner=mock.Mock())
+
+        coordinator.worker.send.assert_not_called()
+        processes.begin_recovery_policy_stop.assert_called_once_with()
+
+    def test_writer_free_prewarm_start_stays_in_policy_phase(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.sonic_writer = SimpleNamespace(
+            writer_created=False,
+            first_write=False,
+        )
+        processes = SimpleNamespace(
+            deploy_generation=8,
+            deploy_alive=lambda: True,
+        )
+        output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.POLICY_RECOVERING,
+            state=MODULE.RecoveryState.POLICY_RECOVERING,
+            inhibit_game_input=True,
+        )
+
+        coordinator.verify_writer_free_prewarm_start(
+            output,
+            processes=processes,
+            previous_generation=7,
+        )
+
+        for bad_output, bad_processes, writer_created in (
+            (output, SimpleNamespace(deploy_generation=7, deploy_alive=lambda: True), False),
+            (output, SimpleNamespace(deploy_generation=8, deploy_alive=lambda: False), False),
+            (
+                MODULE.RecoveryOutput(
+                    previous_state=MODULE.RecoveryState.POLICY_RECOVERING,
+                    state=MODULE.RecoveryState.SONIC_STABILIZING,
+                    inhibit_game_input=True,
+                ),
+                processes,
+                False,
+            ),
+            (output, processes, True),
+        ):
+            coordinator.sonic_writer.writer_created = writer_created
+            with self.subTest(
+                state=bad_output.state,
+                generation=bad_processes.deploy_generation,
+                alive=bad_processes.deploy_alive(),
+                writer_created=writer_created,
+            ), self.assertRaises(RuntimeError):
+                coordinator.verify_writer_free_prewarm_start(
+                    bad_output,
+                    processes=bad_processes,
+                    previous_generation=7,
+                )
+
+    def test_replacement_sonic_uses_measured_pose_writer_reentry(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_sonic_gate_pending = False
+        coordinator.zmq_port = 5556
+        coordinator.interface = "lo"
+        coordinator.worker = mock.Mock()
+        coordinator.sonic_writer = mock.Mock()
+        coordinator.sonic_writer.path = Path("/run/user/1000/replacement.sock")
+        processes = mock.Mock()
+        processes.deploy_pid.return_value = 4321
+        output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.POLICY_RECOVERING,
+            state=MODULE.RecoveryState.POLICY_RECOVERING,
+            start_sonic=True,
+            inhibit_game_input=True,
+        )
+
+        coordinator.execute(output, processes=processes, planner=mock.Mock())
+
+        processes.start_deploy.assert_called_once_with(
+            interface="lo",
+            zmq_port=5556,
+            writer_control_socket=Path("/run/user/1000/replacement.sock"),
+            physical_reentry=True,
+        )
+        coordinator.sonic_writer.bind_expected_peer_pid.assert_called_once_with(4321)
 
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_native_process_group_starts_the_exact_game_input_adapter(self, popen) -> None:
@@ -3040,6 +4811,86 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertIn(
                 "native_child_exit:deploy:0",
                 boundary_payload["acceptance_failures"],
+            )
+
+            # A harness-owned in-process completion is a clean scenario
+            # boundary, not a signal and not a formal max-seconds qualification.
+            status_file.unlink()
+            process_group.reset_mock()
+            simulator.reset_mock()
+            simulator.get_state_snapshot.return_value = self.snapshot(
+                low_cmd_fresh=True,
+                low_cmd_received=True,
+                low_cmd_age_s=0.01,
+            )
+            process_group.failed_child.return_value = None
+            process_group.begin_expected_stop.return_value = None
+            args.max_seconds = 360.0
+            completion_event = MODULE.threading.Event()
+            completion_event.set()
+            with (
+                mock.patch.dict(MODULE.sys.modules, fake_modules),
+                mock.patch.object(MODULE, "_parse_args", return_value=args),
+                mock.patch.object(
+                    MODULE, "_configure_native_runtime", return_value=Path("/sonic")
+                ),
+                mock.patch.object(MODULE, "_sonic_commit", return_value="deadbeef"),
+                mock.patch.object(
+                    MODULE, "NativeProcessGroup", return_value=process_group
+                ),
+                mock.patch.object(MODULE.signal, "getsignal", return_value="previous"),
+                mock.patch.object(MODULE.signal, "signal"),
+            ):
+                scenario_result = MODULE.main(completion_event=completion_event)
+
+            self.assertEqual(scenario_result, 0)
+            scenario_payload = json.loads(
+                status_file.read_text(encoding="utf-8")
+            )
+            self.assertTrue(scenario_payload["passed"])
+            self.assertTrue(scenario_payload["completed"])
+            self.assertFalse(scenario_payload["qualification_attempted"])
+            self.assertFalse(scenario_payload["interrupted"])
+            self.assertEqual(
+                scenario_payload["termination_reason"], "scenario_complete"
+            )
+            self.assertEqual(scenario_payload["acceptance_failures"], [])
+
+            # The outer runtime deadline is authoritative when it and the
+            # harness event are both ready at the same loop boundary.
+            status_file.unlink()
+            process_group.reset_mock()
+            simulator.reset_mock()
+            simulator.get_state_snapshot.return_value = self.snapshot(
+                low_cmd_fresh=True,
+                low_cmd_received=True,
+                low_cmd_age_s=0.01,
+            )
+            process_group.failed_child.return_value = None
+            process_group.begin_expected_stop.return_value = None
+            args.max_seconds = 1e-12
+            with (
+                mock.patch.dict(MODULE.sys.modules, fake_modules),
+                mock.patch.object(MODULE, "_parse_args", return_value=args),
+                mock.patch.object(
+                    MODULE, "_configure_native_runtime", return_value=Path("/sonic")
+                ),
+                mock.patch.object(MODULE, "_sonic_commit", return_value="deadbeef"),
+                mock.patch.object(
+                    MODULE, "NativeProcessGroup", return_value=process_group
+                ),
+                mock.patch.object(MODULE.signal, "getsignal", return_value="previous"),
+                mock.patch.object(MODULE.signal, "signal"),
+            ):
+                deadline_result = MODULE.main(completion_event=completion_event)
+
+            self.assertEqual(deadline_result, 2)
+            deadline_payload = json.loads(status_file.read_text(encoding="utf-8"))
+            self.assertEqual(deadline_payload["termination_reason"], "max_seconds")
+            self.assertTrue(deadline_payload["qualification_attempted"])
+            self.assertIn(
+                "runtime_not_verified_for_qualification",
+                deadline_payload["acceptance_failures"],
             )
 
 

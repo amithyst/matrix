@@ -12,9 +12,11 @@ from pathlib import Path
 import re
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Callable, TypedDict
 from urllib.parse import urlsplit
@@ -68,6 +70,21 @@ _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
+from matrix_mujoco_contacts import (
+    has_external_foot_support,
+    has_external_ground_support,
+)
+from matrix_sonic_recovery import (
+    RecoveryConfig,
+    RecoveryInput,
+    RecoveryOutput,
+    RecoveryState,
+    ResidentPolicyRecoveryFSM,
+    ResidentRecoveryInput,
+    ResidentRecoveryOutput,
+    ResidentRecoveryState,
+    SingleWriterRecoveryFSM,
+)
 
 
 def _remote_speed_scale_argument(value: str) -> float:
@@ -108,6 +125,181 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-input-timeout", type=float, default=0.15)
     parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
     parser.add_argument("--game-max-future-skew", type=float, default=0.05)
+    parser.add_argument(
+        "--game-fall-recovery",
+        choices=("off", "sonic", "physical"),
+        default="off",
+        help=(
+            "Interactive fall behavior: 'sonic' keeps the runtime alive and "
+            "holds native IDLE; 'physical' hands LowCmd to a get-up policy, "
+            "then returns authority to SONIC"
+        ),
+    )
+    parser.add_argument(
+        "--game-fall-recovery-timeout",
+        type=float,
+        default=15.0,
+        help="Seconds before an active SONIC recovery is marked timed out",
+    )
+    parser.add_argument(
+        "--physical-recovery-worker",
+        type=Path,
+        default=_SCRIPT_DIR / "matrix_sonic_host_worker.py",
+        help="Writer-gated physical get-up worker",
+    )
+    parser.add_argument(
+        "--physical-recovery-initial-controller",
+        choices=("host", "amp", "kungfu"),
+        default=os.environ.get(
+            "MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER", "host"
+        ),
+        help="Physical policy that receives the first post-fall LowCmd lease",
+    )
+    parser.add_argument(
+        "--physical-recovery-handoff",
+        choices=("amp", "sonic"),
+        default=os.environ.get("MATRIX_PHYSICAL_RECOVERY_HANDOFF", "amp"),
+        help="Stabilize through AMP or hand a stable get-up pose directly to SONIC",
+    )
+    parser.add_argument(
+        "--physical-recovery-python",
+        default=sys.executable,
+        help="Python interpreter containing NumPy and ONNX Runtime",
+    )
+    parser.add_argument(
+        "--physical-recovery-resident-policies",
+        action="store_true",
+        default=os.environ.get(
+            "MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES", "0"
+        ).strip().lower()
+        in {"1", "true", "yes", "on"},
+        help="Keep SONIC and every recovery policy loaded; switch writer authority only",
+    )
+    parser.add_argument(
+        "--physical-recovery-execution-provider",
+        choices=("cuda", "cpu"),
+        default=os.environ.get(
+            "MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER", "cpu"
+        ),
+        help="ONNX execution provider used by all resident recovery policies",
+    )
+    parser.add_argument(
+        "--physical-recovery-model",
+        type=Path,
+        help="Primary physical get-up ONNX model (required for physical mode)",
+    )
+    parser.add_argument(
+        "--physical-recovery-fallback-model",
+        action="append",
+        default=[],
+        type=Path,
+        help="Optional physically continuous fallback ONNX (repeatable)",
+    )
+    parser.add_argument(
+        "--physical-recovery-kungfu-model",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_KUNGFU_RECOVERY_MODEL"])
+            if os.environ.get("MATRIX_KUNGFU_RECOVERY_MODEL")
+            else None
+        ),
+        help="KungFuAthleteBot 154 -> 29 recovery ONNX",
+    )
+    parser.add_argument(
+        "--physical-recovery-kungfu-motion",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_KUNGFU_RECOVERY_MOTION"])
+            if os.environ.get("MATRIX_KUNGFU_RECOVERY_MOTION")
+            else None
+        ),
+        help="KungFuAthleteBot 1307 reference NPZ",
+    )
+    parser.add_argument(
+        "--physical-recovery-kungfu-model-sha256",
+        default=os.environ.get("MATRIX_KUNGFU_RECOVERY_MODEL_SHA256"),
+    )
+    parser.add_argument(
+        "--physical-recovery-kungfu-model-data-sha256",
+        default=os.environ.get("MATRIX_KUNGFU_RECOVERY_MODEL_DATA_SHA256"),
+    )
+    parser.add_argument(
+        "--physical-recovery-kungfu-motion-sha256",
+        default=os.environ.get("MATRIX_KUNGFU_RECOVERY_MOTION_SHA256"),
+    )
+    parser.add_argument(
+        "--physical-recovery-kungfu-reference-frame",
+        type=int,
+        default=int(
+            os.environ.get("MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME", "0")
+        ),
+    )
+    parser.add_argument(
+        "--physical-recovery-kungfu-gain-scale",
+        type=float,
+        default=float(
+            os.environ.get("MATRIX_KUNGFU_RECOVERY_GAIN_SCALE", "1.0")
+        ),
+    )
+    parser.add_argument(
+        "--physical-recovery-amp-config",
+        type=Path,
+        help="AMP zero-command dynamic-hold JSON (required for physical mode)",
+    )
+    parser.add_argument(
+        "--physical-recovery-amp-model",
+        type=Path,
+        help="AMP zero-command dynamic-hold ONNX (required for physical mode)",
+    )
+    parser.add_argument("--physical-recovery-amp-config-sha256")
+    parser.add_argument("--physical-recovery-amp-model-sha256")
+    parser.add_argument(
+        "--physical-recovery-fallback-after-seconds", type=float, default=10.0
+    )
+    parser.add_argument(
+        "--physical-recovery-stable-hold-seconds", type=float, default=1.5
+    )
+    parser.add_argument(
+        "--physical-recovery-policy-exit-hold-seconds",
+        type=float,
+        default=float(
+            os.environ.get("MATRIX_PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS", "0")
+        ),
+        help=(
+            "Optional terminal dwell before a stable resident recovery policy "
+            "releases writer authority"
+        ),
+    )
+    parser.add_argument(
+        "--physical-recovery-timeout-seconds",
+        type=float,
+        default=90.0,
+        help="Fail-closed deadline after the physical policy receives GO",
+    )
+    parser.add_argument(
+        "--physical-recovery-sonic-prewarm-timeout-seconds",
+        type=float,
+        default=45.0,
+        help="Deadline for replacement SONIC writer-free shadow readiness",
+    )
+    parser.add_argument(
+        "--physical-recovery-sonic-full-control-timeout-seconds",
+        type=float,
+        default=10.0,
+        help="Deadline from replacement first LowCmd to full SONIC policy control",
+    )
+    parser.add_argument(
+        "--physical-recovery-control-socket",
+        type=Path,
+        default=Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+        / f"matrix-sonic-recovery-{os.getuid()}-{os.getpid()}.sock",
+    )
+    parser.add_argument(
+        "--physical-recovery-sonic-control-socket",
+        type=Path,
+        default=Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+        / f"matrix-sonic-recovery-sonic-{os.getuid()}-{os.getpid()}.sock",
+    )
     parser.add_argument(
         "--game-input-provider",
         type=Path,
@@ -952,6 +1144,152 @@ def _validate_qualified_acceptance(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_game_fall_recovery(args: argparse.Namespace) -> None:
+    """Keep both recovery implementations isolated to interactive game runs."""
+
+    mode = getattr(args, "game_fall_recovery", "off")
+    if mode == "off":
+        return
+    if mode not in {"sonic", "physical"}:
+        raise SystemExit(f"unsupported game fall recovery mode: {mode}")
+    if args.control_source != "game":
+        raise SystemExit("SONIC fall recovery requires --control-source game")
+    if bool(args.fail_on_fall):
+        raise SystemExit("SONIC fall recovery conflicts with --fail-on-fall")
+    if bool(args.qualified_runtime):
+        raise SystemExit("qualified runtime requires fail-fast fall handling")
+    timeout = float(getattr(args, "game_fall_recovery_timeout", 15.0))
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise SystemExit(
+            "--game-fall-recovery-timeout must be positive and finite"
+        )
+    if mode != "physical":
+        return
+
+    initial_controller = str(
+        getattr(args, "physical_recovery_initial_controller", "host")
+    )
+    if initial_controller not in {"host", "amp", "kungfu"}:
+        raise SystemExit(
+            "--physical-recovery-initial-controller must be host, amp, or kungfu"
+        )
+    handoff = str(getattr(args, "physical_recovery_handoff", "amp"))
+    if handoff not in {"amp", "sonic"}:
+        raise SystemExit("--physical-recovery-handoff must be amp or sonic")
+    resident_policies = bool(
+        getattr(args, "physical_recovery_resident_policies", False)
+    )
+    execution_provider = str(
+        getattr(args, "physical_recovery_execution_provider", "cpu")
+    )
+    if resident_policies:
+        if handoff != "sonic":
+            raise SystemExit(
+                "resident physical recovery requires a direct policy-to-SONIC handoff"
+            )
+        if execution_provider != "cuda":
+            raise SystemExit(
+                "resident physical recovery requires CUDAExecutionProvider"
+            )
+
+    worker = getattr(args, "physical_recovery_worker", None)
+    python = getattr(args, "physical_recovery_python", None)
+    model = getattr(args, "physical_recovery_model", None)
+    fallbacks = tuple(getattr(args, "physical_recovery_fallback_model", ()))
+    amp_config = getattr(args, "physical_recovery_amp_config", None)
+    amp_model = getattr(args, "physical_recovery_amp_model", None)
+    if not isinstance(worker, Path) or not worker.is_file():
+        raise SystemExit(f"physical recovery worker is missing: {worker}")
+    if not python or not Path(python).is_file():
+        raise SystemExit(f"physical recovery Python is missing: {python}")
+    if not isinstance(model, Path) or not model.is_file():
+        raise SystemExit(f"physical recovery model is missing: {model}")
+    for fallback in fallbacks:
+        if not isinstance(fallback, Path) or not fallback.is_file():
+            raise SystemExit(
+                f"physical recovery fallback model is missing: {fallback}"
+            )
+    for label, artifact in (
+        ("AMP hold config", amp_config),
+        ("AMP hold model", amp_model),
+    ):
+        if not isinstance(artifact, Path) or not artifact.is_file():
+            raise SystemExit(f"physical recovery {label} is missing: {artifact}")
+    for name in (
+        "physical_recovery_amp_config_sha256",
+        "physical_recovery_amp_model_sha256",
+    ):
+        digest = str(getattr(args, name, "") or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise SystemExit(f"--{name.replace('_', '-')} must be 64 lowercase hex")
+    if initial_controller == "kungfu":
+        kungfu_model = getattr(args, "physical_recovery_kungfu_model", None)
+        kungfu_motion = getattr(args, "physical_recovery_kungfu_motion", None)
+        for label, artifact in (
+            ("KungFu recovery model", kungfu_model),
+            ("KungFu recovery motion", kungfu_motion),
+        ):
+            if not isinstance(artifact, Path) or not artifact.is_file():
+                raise SystemExit(f"physical recovery {label} is missing: {artifact}")
+        assert isinstance(kungfu_model, Path)
+        kungfu_model_data = kungfu_model.with_name(f"{kungfu_model.name}.data")
+        if not kungfu_model_data.is_file():
+            raise SystemExit(
+                "physical recovery KungFu ONNX external data is missing: "
+                f"{kungfu_model_data}"
+            )
+        for name in (
+            "physical_recovery_kungfu_model_sha256",
+            "physical_recovery_kungfu_model_data_sha256",
+            "physical_recovery_kungfu_motion_sha256",
+        ):
+            digest = str(getattr(args, name, "") or "")
+            if len(digest) != 64 or any(
+                char not in "0123456789abcdef" for char in digest
+            ):
+                raise SystemExit(
+                    f"--{name.replace('_', '-')} must be 64 lowercase hex"
+                )
+        reference_frame = int(args.physical_recovery_kungfu_reference_frame)
+        if reference_frame < 0:
+            raise SystemExit(
+                "--physical-recovery-kungfu-reference-frame must be non-negative"
+            )
+        gain_scale = float(args.physical_recovery_kungfu_gain_scale)
+        if not math.isfinite(gain_scale) or gain_scale <= 0.0:
+            raise SystemExit(
+                "--physical-recovery-kungfu-gain-scale must be positive and finite"
+            )
+    control_sockets = (
+        getattr(args, "physical_recovery_control_socket", None),
+        getattr(args, "physical_recovery_sonic_control_socket", None),
+    )
+    for control_socket in control_sockets:
+        if not isinstance(control_socket, Path) or not control_socket.is_absolute():
+            raise SystemExit("physical recovery control sockets must be absolute")
+        if len(os.fsencode(control_socket)) >= 108:
+            raise SystemExit(f"physical recovery control socket is too long: {control_socket}")
+    if control_sockets[0] == control_sockets[1]:
+        raise SystemExit("physical recovery control sockets must be distinct")
+    for name in (
+        "physical_recovery_fallback_after_seconds",
+        "physical_recovery_stable_hold_seconds",
+        "physical_recovery_timeout_seconds",
+        "physical_recovery_sonic_prewarm_timeout_seconds",
+    ):
+        value = float(getattr(args, name, 0.0))
+        if not math.isfinite(value) or value <= 0.0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be positive and finite")
+    policy_exit_hold_s = float(
+        getattr(args, "physical_recovery_policy_exit_hold_seconds", 0.0)
+    )
+    if not math.isfinite(policy_exit_hold_s) or policy_exit_hold_s < 0.0:
+        raise SystemExit(
+            "--physical-recovery-policy-exit-hold-seconds must be finite and "
+            "non-negative"
+        )
+
+
 def _validate_qualified_game_control(args: argparse.Namespace) -> None:
     """Reject game-control qualification paths that bypass real camera input."""
 
@@ -1004,6 +1342,68 @@ def _root_up_z(qpos) -> float:
     """Diagnostic world-Z component of the floating base's local up axis."""
     _, x, y, _ = [float(value) for value in qpos[3:7]]
     return 1.0 - 2.0 * (x * x + y * y)
+
+
+def _physical_foot_contact(simulator: Any) -> bool:
+    """Read the same G1 foot-contact condition used by policy validation."""
+
+    model = simulator.sim_env.mj_model
+    data = simulator.sim_env.mj_data
+    foot_body_ids: set[int] = set()
+    for name in (
+        "left_ankle_roll_link",
+        "right_ankle_roll_link",
+        "left_foot",
+        "right_foot",
+    ):
+        try:
+            body_id = int(model.body(name).id)
+        except (KeyError, ValueError):
+            continue
+        if body_id > 0:
+            foot_body_ids.add(body_id)
+    if not foot_body_ids:
+        return False
+    robot_root_body_id = None
+    for name in ("pelvis", "base"):
+        try:
+            candidate = int(model.body(name).id)
+        except (KeyError, ValueError):
+            continue
+        if candidate > 0:
+            robot_root_body_id = candidate
+            break
+    if robot_root_body_id is None:
+        return False
+    return has_external_foot_support(
+        model,
+        data,
+        foot_body_ids=foot_body_ids,
+        robot_root_body_id=robot_root_body_id,
+    )
+
+
+def _physical_ground_contact(simulator: Any) -> bool:
+    """Return whether any robot link rests on an external support surface."""
+
+    model = simulator.sim_env.mj_model
+    data = simulator.sim_env.mj_data
+    robot_root_body_id = None
+    for name in ("pelvis", "base"):
+        try:
+            candidate = int(model.body(name).id)
+        except (KeyError, ValueError):
+            continue
+        if candidate > 0:
+            robot_root_body_id = candidate
+            break
+    if robot_root_body_id is None:
+        return False
+    return has_external_ground_support(
+        model,
+        data,
+        robot_root_body_id=robot_root_body_id,
+    )
 
 
 def _root_yaw_rad(qpos) -> float:
@@ -1333,6 +1733,202 @@ class _GameSonicReadinessGate:
         )
 
 
+class _GameFallRecoveryGate:
+    """Keep interactive control neutral while SONIC recovers its own policy.
+
+    SONIC's public fall flag is session-sticky, so it cannot identify the end
+    of one recovery or the beginning of a later fall.  The current fall level
+    therefore mirrors SONIC's own exact root-height condition (``z < 0.2``).
+    Interactive game runs additionally debounce a low, strongly tilted base
+    pose because a stable side fall can remain above SONIC's height threshold
+    and never set the sticky flag.  This pose trigger is local to this gate;
+    recovery never clears or rewrites SONIC's historical fall flag, and the
+    qualification/fail-fast path continues to use that flag unchanged.
+    """
+
+    FALL_HEIGHT_M = 0.2
+    POSE_TRIGGER_HEIGHT_M = 0.45
+    POSE_TRIGGER_UP_Z = 0.5
+    POSE_TRIGGER_HOLD_S = 0.35
+    UPRIGHT_HEIGHT_M = 0.65
+    UPRIGHT_UP_Z = 0.85
+    STABLE_HOLD_S = 1.0
+    KNEEL_TWO_LEGS_MODE = 5
+    KNEEL_HEIGHT_M = 0.4
+    KNEEL_STAGE_S = 2.0
+    RETRY_PERIOD_S = 6.0
+
+    def __init__(self, *, timeout_s: float = 15.0) -> None:
+        timeout = float(timeout_s)
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("fall recovery timeout must be positive and finite")
+        self.timeout_s = timeout
+        self.recovering = False
+        self.current_fallen = False
+        self.episodes = 0
+        self.recoveries = 0
+        self.started_at_s: float | None = None
+        self.pose_candidate_since_s: float | None = None
+        self.stable_since_s: float | None = None
+        self.last_duration_s: float | None = None
+        self.timed_out = False
+        self.pose_candidate = False
+        self.last_entry_source: str | None = None
+        self.native_mode = SONIC_IDLE_MODE
+        self.target_height = -1.0
+
+    def observe(self, snapshot: Any, *, now_s: float) -> str | None:
+        """Observe one control-frame snapshot and return a transition name."""
+
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("fall recovery time must be non-negative and finite")
+        try:
+            root_z = float(snapshot.qpos[2])
+            root_up_z = _root_up_z(snapshot.qpos)
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError("fall recovery requires a valid root pose") from exc
+        if not math.isfinite(root_z) or not math.isfinite(root_up_z):
+            raise ValueError("fall recovery root pose must be finite")
+
+        self.current_fallen = root_z < self.FALL_HEIGHT_M
+        self.pose_candidate = (
+            root_z < self.POSE_TRIGGER_HEIGHT_M
+            and root_up_z < self.POSE_TRIGGER_UP_Z
+        )
+        if self.pose_candidate:
+            if self.pose_candidate_since_s is None:
+                self.pose_candidate_since_s = now
+            elif now < self.pose_candidate_since_s:
+                raise ValueError("fall recovery pose-candidate time regressed")
+        else:
+            self.pose_candidate_since_s = None
+
+        native_trigger = self.current_fallen and bool(
+            getattr(snapshot, "fall_detected", False)
+        )
+        pose_trigger = (
+            self.pose_candidate_since_s is not None
+            and now - self.pose_candidate_since_s >= self.POSE_TRIGGER_HOLD_S
+        )
+        transition = None
+        if (
+            not self.recovering
+            and (native_trigger or pose_trigger)
+        ):
+            self.recovering = True
+            self.episodes += 1
+            self.started_at_s = now
+            self.pose_candidate_since_s = None
+            self.stable_since_s = None
+            self.timed_out = False
+            self.last_entry_source = (
+                "sonic_fall_detected" if native_trigger else "pose_debounce"
+            )
+            transition = "entered"
+
+        if not self.recovering:
+            return transition
+
+        assert self.started_at_s is not None
+        if now < self.started_at_s:
+            raise ValueError("fall recovery time regressed")
+        episode_elapsed_s = now - self.started_at_s
+        retry_phase_s = episode_elapsed_s % self.RETRY_PERIOD_S
+        if retry_phase_s < self.KNEEL_STAGE_S:
+            self.native_mode = self.KNEEL_TWO_LEGS_MODE
+            self.target_height = self.KNEEL_HEIGHT_M
+        else:
+            self.native_mode = SONIC_IDLE_MODE
+            self.target_height = -1.0
+        ready = _GameSonicReadinessGate.snapshot_ready(snapshot)
+        upright = (
+            not self.current_fallen
+            and root_z >= self.UPRIGHT_HEIGHT_M
+            and root_up_z >= self.UPRIGHT_UP_Z
+            and ready
+            and self.native_mode == SONIC_IDLE_MODE
+        )
+        if upright:
+            if self.stable_since_s is None:
+                self.stable_since_s = now
+            elif now < self.stable_since_s:
+                raise ValueError("fall recovery stable time regressed")
+            if now - self.stable_since_s >= self.STABLE_HOLD_S:
+                self.last_duration_s = now - self.started_at_s
+                self.recovering = False
+                self.recoveries += 1
+                self.started_at_s = None
+                self.stable_since_s = None
+                self.timed_out = False
+                self.native_mode = SONIC_IDLE_MODE
+                self.target_height = -1.0
+                return "recovered"
+        else:
+            self.stable_since_s = None
+
+        if now - self.started_at_s >= self.timeout_s:
+            self.timed_out = True
+        return transition
+
+    def status(self, *, now_s: float) -> dict[str, object]:
+        now = float(now_s)
+        active_elapsed_s = (
+            max(0.0, now - self.started_at_s)
+            if self.recovering and self.started_at_s is not None
+            else 0.0
+        )
+        stable_elapsed_s = (
+            max(0.0, now - self.stable_since_s)
+            if self.recovering and self.stable_since_s is not None
+            else 0.0
+        )
+        pose_candidate_elapsed_s = (
+            max(0.0, now - self.pose_candidate_since_s)
+            if self.pose_candidate_since_s is not None
+            else 0.0
+        )
+        state = (
+            "recovering_timeout"
+            if self.recovering and self.timed_out
+            else "recovering"
+            if self.recovering
+            else "monitoring"
+        )
+        return {
+            "mode": "sonic",
+            "state": state,
+            "policy_command": "KNEEL_TWO_LEGS_TO_IDLE",
+            "native_mode": self.native_mode,
+            "target_height": self.target_height,
+            "current_fall_detected": self.current_fallen,
+            "pose_recovery_candidate": self.pose_candidate,
+            "pose_candidate_elapsed_s": round(pose_candidate_elapsed_s, 3),
+            "last_entry_source": self.last_entry_source,
+            "episodes": self.episodes,
+            "recoveries": self.recoveries,
+            "active_elapsed_s": round(active_elapsed_s, 3),
+            "stable_elapsed_s": round(stable_elapsed_s, 3),
+            "last_duration_s": (
+                round(self.last_duration_s, 3)
+                if self.last_duration_s is not None
+                else None
+            ),
+            "timeout_s": self.timeout_s,
+            "timed_out": self.timed_out,
+            "fall_height_m": self.FALL_HEIGHT_M,
+            "pose_trigger_height_m": self.POSE_TRIGGER_HEIGHT_M,
+            "pose_trigger_up_z": self.POSE_TRIGGER_UP_Z,
+            "pose_trigger_hold_s": self.POSE_TRIGGER_HOLD_S,
+            "upright_height_m": self.UPRIGHT_HEIGHT_M,
+            "upright_up_z": self.UPRIGHT_UP_Z,
+            "stable_hold_s": self.STABLE_HOLD_S,
+            "kneel_stage_s": self.KNEEL_STAGE_S,
+            "retry_period_s": self.RETRY_PERIOD_S,
+            "recovered_requires_neutral": True,
+        }
+
+
 def _pace_absolute_deadline(deadline_s: float, period_s: float) -> float:
     """Wait for one absolute tick and return the following tick deadline.
 
@@ -1563,6 +2159,10 @@ def _game_control_status_fields(
         "maximum_turn_rate_rad_s": args.game_max_turn_rate,
         "stick_deadzone": args.game_stick_deadzone,
         "input_timeout_s": args.game_input_timeout,
+        "fall_recovery_mode": getattr(args, "game_fall_recovery", "off"),
+        "fall_recovery_timeout_s": getattr(
+            args, "game_fall_recovery_timeout", 15.0
+        ),
         "maximum_snapshot_age_s": args.game_max_snapshot_age,
         "maximum_future_skew_s": args.game_max_future_skew,
         "camera_yaw_source": source,
@@ -1742,14 +2342,19 @@ def _qualification_state(
 ) -> _QualificationState:
     """Classify a finalized run without treating operator stops as passes."""
     acceptance_failures = list(failures)
-    attempted = max_seconds > 0.0
+    scenario_completed = termination_reason == "scenario_complete"
+    # A bounded max-seconds exit is a formal runtime qualification.  An
+    # in-process scenario completion is instead a harness-owned acceptance
+    # boundary (recovery explicitly forbids --qualified-runtime), so it must not
+    # inherit the formal runtime-verification requirement.
+    attempted = max_seconds > 0.0 and not scenario_completed
     if attempted and not runtime_verified:
         acceptance_failures.append("runtime_not_verified_for_qualification")
     if attempted and termination_reason == "signal":
         acceptance_failures.append("run_interrupted")
     if termination_reason == "unknown":
         acceptance_failures.append("unknown_termination")
-    completed = termination_reason == "max_seconds"
+    completed = termination_reason in {"max_seconds", "scenario_complete"}
     return {
         "acceptance_failures": acceptance_failures,
         "qualification_attempted": attempted,
@@ -1917,6 +2522,12 @@ class NativePlannerClient:
             raise ValueError("locomotion_mode must be a native SONIC motion in [0, 26]")
         if moving and locomotion_mode == SONIC_IDLE_MODE:
             raise ValueError("moving planner command cannot use native IDLE")
+        turning = (
+            not moving
+            and locomotion_mode == SONIC_SLOW_WALK_MODE
+            and speed_value <= 1e-6
+            and math.hypot(movement_values[0], movement_values[1]) <= 1e-6
+        )
         self._socket.send(
             self._build_command_message(
                 start=start,
@@ -1927,10 +2538,10 @@ class NativePlannerClient:
         )
         self._socket.send(
             self._build_planner_message(
-                mode=locomotion_mode if moving else 0,
+                mode=locomotion_mode if moving or turning else 0,
                 movement=movement_values if moving else [0.0, 0.0, 0.0],
                 facing=facing_values,
-                speed=speed_value if moving else -1.0,
+                speed=(speed_value if moving else 0.0 if turning else -1.0),
                 height=-1.0,
             )
         )
@@ -1952,7 +2563,15 @@ class NativePlannerClient:
         if has_speed != has_direction:
             raise ValueError("game command speed and movement must become active together")
         moving = has_speed and has_direction
-        if not moving:
+        turning = command.mode == "turn"
+        if turning:
+            if has_speed or has_direction:
+                raise ValueError("turn-only game command must not translate")
+            if command.locomotion_mode != SONIC_SLOW_WALK_MODE:
+                raise ValueError("turn-only game command must use native SLOW_WALK")
+            if command.safe_stop:
+                raise ValueError("turn-only game command cannot be a safe stop")
+        elif not moving:
             if command.locomotion_mode != SONIC_IDLE_MODE:
                 raise ValueError("stationary game command must use native IDLE")
         else:
@@ -1974,21 +2593,70 @@ class NativePlannerClient:
             locomotion_mode=command.locomotion_mode,
         )
 
-    def close(self) -> None:
-        stop_error = None
-        try:
-            stop_message = self._build_command_message(
-                start=False,
-                stop=True,
+    def send_recovery_posture(
+        self,
+        *,
+        locomotion_mode: int,
+        height: float,
+        facing: tuple[float, float, float],
+    ) -> None:
+        """Send the native kneel/stand sequence used by SONIC's gamepad path."""
+
+        if locomotion_mode not in {0, 5}:
+            raise ValueError("fall recovery only permits native IDLE or KNEEL_TWO_LEGS")
+        facing_values = [float(value) for value in facing]
+        if len(facing_values) != 3 or not all(
+            math.isfinite(value) for value in facing_values
+        ):
+            raise ValueError("fall recovery facing must contain three finite values")
+        height_value = float(height)
+        if locomotion_mode == 0:
+            if height_value != -1.0:
+                raise ValueError("native IDLE recovery must use default height -1")
+        elif not 0.2 <= height_value <= 0.8:
+            raise ValueError("native KNEEL_TWO_LEGS height must be in [0.2, 0.8]")
+        self._socket.send(
+            self._build_command_message(
+                start=True,
+                stop=False,
                 planner=True,
                 delta_heading=None,
             )
-            # The native deploy binary exits through its ZMQ stop state and
-            # does not install SIGTERM handlers. Repeat the native stop frame
-            # briefly before the supervisor escalates to process-group signals.
-            for _ in range(3):
-                self._socket.send(stop_message)
-                time.sleep(0.02)
+        )
+        self._socket.send(
+            self._build_planner_message(
+                mode=locomotion_mode,
+                movement=[0.0, 0.0, 0.0],
+                facing=facing_values,
+                speed=-1.0,
+                height=height_value,
+            )
+        )
+
+    def request_deploy_stop(self) -> None:
+        """Stop only the current deploy while retaining this ZMQ client.
+
+        The physical-recovery handoff starts a new deploy on the same endpoint;
+        game input and UE therefore keep their original lifetimes and this
+        socket must remain available for the new receiver generation.
+        """
+
+        stop_message = self._build_command_message(
+            start=False,
+            stop=True,
+            planner=True,
+            delta_heading=None,
+        )
+        # The native deploy binary exits through its ZMQ stop state and does
+        # not install SIGTERM handlers. Repeat the native stop frame briefly.
+        for _ in range(3):
+            self._socket.send(stop_message)
+            time.sleep(0.02)
+
+    def close(self) -> None:
+        stop_error = None
+        try:
+            self.request_deploy_stop()
         except Exception as exc:
             stop_error = exc
         finally:
@@ -2452,6 +3120,10 @@ class NativeProcessGroup:
                 ) from exc
             self.pass_fds = (lock_fd,)
         self.children: list[tuple[str, subprocess.Popen[bytes]]] = []
+        self._expected_exit_pids: set[int] = set()
+        self._active_deploy: subprocess.Popen[bytes] | None = None
+        self._active_recovery_policy: subprocess.Popen[bytes] | None = None
+        self._deploy_generation = 0
         self._stopping = False
         self._boundary_failure: tuple[str, int] | None = None
         self._closed = False
@@ -2613,38 +3285,207 @@ class NativeProcessGroup:
             extra_pass_fds=extra_pass_fds,
         )
 
-    def start_deploy(self, *, interface: str, zmq_port: int) -> None:
+    @property
+    def deploy_generation(self) -> int:
+        return self._deploy_generation
+
+    @staticmethod
+    def _alive(process: subprocess.Popen[bytes] | None) -> bool:
+        return process is not None and _peek_child_returncode(process) is None
+
+    def deploy_alive(self) -> bool:
+        return self._alive(self._active_deploy)
+
+    def deploy_pid(self) -> int | None:
+        return self._active_deploy.pid if self._active_deploy is not None else None
+
+    def recovery_policy_alive(self) -> bool:
+        return self._alive(self._active_recovery_policy)
+
+    def begin_deploy_stop(self) -> None:
+        """Authorize only the active deploy's expected exit; send no signal."""
+
+        if self._active_deploy is not None:
+            self._expected_exit_pids.add(self._active_deploy.pid)
+
+    def begin_recovery_policy_stop(self) -> None:
+        """Authorize only the temporary policy worker's expected exit."""
+
+        if self._active_recovery_policy is not None:
+            self._expected_exit_pids.add(self._active_recovery_policy.pid)
+
+    def start_deploy(
+        self,
+        *,
+        interface: str,
+        zmq_port: int,
+        writer_control_socket: Path | None = None,
+        physical_reentry: bool = False,
+    ) -> int:
+        if self.deploy_alive():
+            raise RuntimeError("cannot start a second live SONIC deploy")
         deploy_root = self.sonic_root / "gear_sonic_deploy"
+        command = [
+            str(deploy_root / "target/release/g1_deploy_onnx_ref"),
+            interface,
+            "policy/release/model_decoder.onnx",
+            "reference/example",
+            "--obs-config",
+            "policy/release/observation_config.yaml",
+            "--encoder-file",
+            "policy/release/model_encoder.onnx",
+            "--planner-file",
+            "planner/target_vel/V2/planner_sonic.onnx",
+            # TensorRT 10.16 produces planner roots that diverge from the
+            # source ONNX graph, including upside-down IDLE and locomotion
+            # generations. Keep policy/encoder on TensorRT, but use the
+            # parity-verified native ONNX planner for every deploy generation.
+            "--planner-backend",
+            "onnx",
+            "--input-type",
+            "zmq_manager",
+            "--output-type",
+            "all",
+            "--zmq-host",
+            "localhost",
+            "--zmq-port",
+            str(zmq_port),
+            "--disable-crc-check",
+        ]
+        if writer_control_socket is not None:
+            command.extend(("--writer-control-socket", str(writer_control_socket)))
+        if physical_reentry:
+            if writer_control_socket is None:
+                raise RuntimeError("physical SONIC re-entry requires a writer gate")
+            command.extend(
+                (
+                    "--writer-reentry",
+                    "--writer-reentry-hold-seconds",
+                    "0.5",
+                    "--writer-reentry-align-seconds",
+                    "5.0",
+                    # Keep the predecessor's exact physical command during
+                    # warmup. Shadow admission and the later 6 s target blend
+                    # own the SONIC transition.  The longer window keeps the
+                    # joint-4 policy burst inside the existing 1.25 rad
+                    # controller envelope across the observed spread of
+                    # upright KungFu terminal poses, without relaxing that
+                    # safety gate; even a 1% stand bridge has destabilized
+                    # marginal but upright poses.
+                    "--writer-reentry-align-fraction",
+                    "0.0",
+                    "--writer-reentry-settle-seconds",
+                    "1.0",
+                    "--writer-reentry-blend-seconds",
+                    "6.0",
+                )
+            )
         self._start(
             "deploy",
-            [
-                str(deploy_root / "target/release/g1_deploy_onnx_ref"),
-                interface,
-                "policy/release/model_decoder.onnx",
-                "reference/example",
-                "--obs-config",
-                "policy/release/observation_config.yaml",
-                "--encoder-file",
-                "policy/release/model_encoder.onnx",
-                "--planner-file",
-                "planner/target_vel/V2/planner_sonic.onnx",
-                "--input-type",
-                "zmq_manager",
-                "--output-type",
-                "all",
-                "--zmq-host",
-                "localhost",
-                "--zmq-port",
-                str(zmq_port),
-                "--disable-crc-check",
-            ],
+            command,
             deploy_root,
+            exec_command=True,
         )
+        self._active_deploy = self.children[-1][1]
+        self._deploy_generation += 1
+        return self._deploy_generation
+
+    def start_recovery_policy(
+        self,
+        python: str,
+        worker: Path,
+        *,
+        interface: str,
+        control_socket: Path,
+        model: Path,
+        fallback_models: tuple[Path, ...],
+        fallback_after_s: float,
+        amp_config: Path,
+        amp_model: Path,
+        amp_config_sha256: str,
+        amp_model_sha256: str,
+        kungfu_model: Path | None = None,
+        kungfu_motion: Path | None = None,
+        kungfu_model_sha256: str | None = None,
+        kungfu_model_data_sha256: str | None = None,
+        kungfu_motion_sha256: str | None = None,
+        kungfu_reference_frame: int = 0,
+        kungfu_gain_scale: float = 1.0,
+        initial_controller: str = "host",
+        execution_provider: str = "cpu",
+    ) -> int:
+        if self.recovery_policy_alive():
+            raise RuntimeError("physical recovery policy is already alive")
+        command = [
+            python,
+            "-u",
+            str(worker),
+            "--model",
+            str(model),
+            "--interface",
+            interface,
+            "--control-socket",
+            str(control_socket),
+            "--initial-controller",
+            initial_controller,
+            "--fallback-after-seconds",
+            str(fallback_after_s),
+            "--execution-provider",
+            execution_provider,
+            "--amp-hold-config",
+            str(amp_config),
+            "--amp-hold-model",
+            str(amp_model),
+            "--amp-hold-config-sha256",
+            amp_config_sha256,
+            "--amp-hold-model-sha256",
+            amp_model_sha256,
+        ]
+        for fallback in fallback_models:
+            command.extend(("--fallback-model", str(fallback)))
+        kungfu_arguments = (
+            kungfu_model,
+            kungfu_motion,
+            kungfu_model_sha256,
+            kungfu_model_data_sha256,
+            kungfu_motion_sha256,
+        )
+        if any(value is not None for value in kungfu_arguments):
+            if not all(value is not None for value in kungfu_arguments):
+                raise RuntimeError("incomplete KungFu recovery worker arguments")
+            command.extend(
+                (
+                    "--kungfu-model",
+                    str(kungfu_model),
+                    "--kungfu-motion",
+                    str(kungfu_motion),
+                    "--kungfu-model-sha256",
+                    str(kungfu_model_sha256),
+                    "--kungfu-model-data-sha256",
+                    str(kungfu_model_data_sha256),
+                    "--kungfu-motion-sha256",
+                    str(kungfu_motion_sha256),
+                    "--kungfu-reference-frame",
+                    str(kungfu_reference_frame),
+                    "--kungfu-gain-scale",
+                    str(kungfu_gain_scale),
+                )
+            )
+        pid = self._start(
+            "recovery-policy",
+            command,
+            worker.parent.parent,
+            exec_command=True,
+        )
+        self._active_recovery_policy = self.children[-1][1]
+        return pid
 
     def failed_child(self) -> tuple[str, int] | None:
         if self._stopping:
             return None
         for name, process in self.children:
+            if process.pid in self._expected_exit_pids:
+                continue
             code = _peek_child_returncode(process)
             if code is not None:
                 return name, code
@@ -2726,6 +3567,2272 @@ class NativeProcessGroup:
             raise RuntimeError("; ".join(cleanup_errors))
 
 
+class _RecoveryWorkerControl:
+    """Own the local writer-gate socket; the worker owns only policy/DDS I/O."""
+
+    SCHEMAS = {
+        "matrix.sonic_host_worker.control.v1",
+        "matrix.sonic_amp_worker.control.v1",
+    }
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        require_resident_attestation: bool = False,
+    ) -> None:
+        self.path = path
+        self.require_resident_attestation = bool(require_resident_attestation)
+        self.listener: socket.socket | None = None
+        self.connection: socket.socket | None = None
+        self.ready = False
+        self.first_write = False
+        self.amp_hold_first_write = False
+        self.joint_hold_first_write = False
+        self.stopped = False
+        self.paused = False
+        self.pause_sent = False
+        self.execution_provider: str | None = None
+        self.resident_policies: list[dict[str, Any]] = []
+        self.registered_policy_ids: list[str] = []
+        self.initial_policy_id: str | None = None
+        self.models_loaded_once = False
+        self.models_warmed = False
+        self.last_event: str | None = None
+        self.last_status: dict[str, Any] | None = None
+        self.fallback_due = False
+        self.last_fallback_due: dict[str, Any] | None = None
+        self.last_policy_switch: dict[str, Any] | None = None
+        self.policy_switch_first_writes: list[dict[str, Any]] = []
+        self.error: str | None = None
+        self.events_received = 0
+        self.expected_peer_pid: int | None = None
+        self.peer_pid: int | None = None
+        self.peer_pid_mismatches = 0
+        self.last_packet_monotonic: float | None = None
+        self.completed_episodes: list[dict[str, Any]] = []
+        self.episode_counter = 0
+        self.episode_id: int | None = None
+        self.episode_started_monotonic: float | None = None
+        self.go_sent = False
+        self.stop_sent = False
+        self.amp_hold_sent = False
+        self.joint_hold_sent = False
+        self.hold_transition_counter = 0
+        self.hold_transition_id: str | None = None
+        self.hold_kind: str | None = None
+        self.superseded_fallback_due_events: list[dict[str, Any]] = []
+        self.advance_transition_counter = 0
+        self.advance_transition_id: str | None = None
+        self.policy_switch_accepted = False
+        self.command_history: list[dict[str, Any]] = []
+
+    def _episode_snapshot(self) -> dict[str, Any]:
+        return {
+            "ready_no_writer": self.ready,
+            "first_write": self.first_write,
+            "amp_hold_first_write": self.amp_hold_first_write,
+            "joint_hold_first_write": self.joint_hold_first_write,
+            "stopped": self.stopped,
+            "paused": self.paused,
+            "pause_sent": self.pause_sent,
+            "execution_provider": self.execution_provider,
+            "resident_policies": list(self.resident_policies),
+            "registered_policy_ids": list(self.registered_policy_ids),
+            "initial_policy_id": self.initial_policy_id,
+            "models_loaded_once": self.models_loaded_once,
+            "models_warmed": self.models_warmed,
+            "last_event": self.last_event,
+            "events_received": self.events_received,
+            "expected_peer_pid": self.expected_peer_pid,
+            "peer_pid": self.peer_pid,
+            "status": self.last_status,
+            "fallback_due": self.fallback_due,
+            "last_fallback_due": self.last_fallback_due,
+            "last_policy_switch": self.last_policy_switch,
+            "policy_switch_first_writes": list(self.policy_switch_first_writes),
+            "episode_id": self.episode_id,
+            "episode_started_monotonic": self.episode_started_monotonic,
+            "episode_finished_monotonic": time.monotonic(),
+            "go_sent": self.go_sent,
+            "stop_sent": self.stop_sent,
+            "amp_hold_sent": self.amp_hold_sent,
+            "joint_hold_sent": self.joint_hold_sent,
+            "hold_transition_id": self.hold_transition_id,
+            "hold_kind": self.hold_kind,
+            "superseded_fallback_due_events": list(
+                self.superseded_fallback_due_events
+            ),
+            "command_history": list(self.command_history),
+            "error": self.error,
+        }
+
+    def open(self) -> None:
+        if self.listener is not None:
+            return
+        socket_type = getattr(socket, "SOCK_SEQPACKET", None)
+        if socket_type is None:
+            raise RuntimeError("physical recovery requires AF_UNIX/SOCK_SEQPACKET")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists() or self.path.is_symlink():
+            if self.path.is_symlink() or not self.path.is_socket():
+                raise RuntimeError(
+                    f"refusing to replace non-socket recovery endpoint: {self.path}"
+                )
+            self.path.unlink()
+        listener = socket.socket(socket.AF_UNIX, socket_type)
+        try:
+            listener.bind(str(self.path))
+            os.chmod(self.path, 0o600)
+            listener.listen(1)
+            listener.setblocking(False)
+        except Exception:
+            listener.close()
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        self.listener = listener
+
+    def reset_for_start(self) -> None:
+        if self.episode_id is not None and self.events_received > 0:
+            self.completed_episodes.append(self._episode_snapshot())
+            self.completed_episodes[:] = self.completed_episodes[-8:]
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        self.ready = False
+        self.first_write = False
+        self.amp_hold_first_write = False
+        self.joint_hold_first_write = False
+        self.stopped = False
+        self.paused = False
+        self.pause_sent = False
+        self.execution_provider = None
+        self.resident_policies = []
+        self.registered_policy_ids = []
+        self.initial_policy_id = None
+        self.models_loaded_once = False
+        self.models_warmed = False
+        self.last_event = None
+        self.last_status = None
+        self.fallback_due = False
+        self.last_fallback_due = None
+        self.last_policy_switch = None
+        self.policy_switch_first_writes = []
+        self.error = None
+        self.events_received = 0
+        self.expected_peer_pid = None
+        self.peer_pid = None
+        self.last_packet_monotonic = None
+        self.episode_counter += 1
+        self.episode_id = self.episode_counter
+        self.episode_started_monotonic = time.monotonic()
+        self.go_sent = False
+        self.stop_sent = False
+        self.amp_hold_sent = False
+        self.joint_hold_sent = False
+        self.hold_transition_counter = 0
+        self.hold_transition_id = None
+        self.hold_kind = None
+        self.superseded_fallback_due_events = []
+        self.advance_transition_counter = 0
+        self.advance_transition_id = None
+        self.policy_switch_accepted = False
+        self.command_history = []
+
+    def begin_resident_episode(self) -> int:
+        """Start a new writer lease while preserving the loaded worker process."""
+
+        if not self.ready or self.connection is None or not self.paused:
+            raise RuntimeError("resident recovery worker is not ready and paused")
+        if self.episode_id is not None and self.go_sent:
+            self.completed_episodes.append(self._episode_snapshot())
+            self.completed_episodes[:] = self.completed_episodes[-8:]
+            self.episode_counter += 1
+            self.episode_id = self.episode_counter
+            self.episode_started_monotonic = time.monotonic()
+        elif self.episode_id is None:
+            self.episode_counter += 1
+            self.episode_id = self.episode_counter
+            self.episode_started_monotonic = time.monotonic()
+        self.first_write = False
+        self.amp_hold_first_write = False
+        self.joint_hold_first_write = False
+        self.stopped = False
+        self.fallback_due = False
+        self.last_fallback_due = None
+        self.last_policy_switch = None
+        self.policy_switch_first_writes = []
+        self.error = None
+        self.go_sent = False
+        self.stop_sent = False
+        self.pause_sent = False
+        self.amp_hold_sent = False
+        self.joint_hold_sent = False
+        self.hold_transition_counter = 0
+        self.hold_transition_id = None
+        self.hold_kind = None
+        self.superseded_fallback_due_events = []
+        self.advance_transition_counter = 0
+        self.advance_transition_id = None
+        self.policy_switch_accepted = False
+        return self.episode_id
+
+    def bind_expected_peer_pid(self, pid: int) -> None:
+        if type(pid) is not int or pid <= 1:
+            raise ValueError("recovery worker PID must be greater than one")
+        if self.connection is not None:
+            raise RuntimeError("cannot change recovery worker PID after accept")
+        if self.episode_id is None:
+            self.episode_counter += 1
+            self.episode_id = self.episode_counter
+            self.episode_started_monotonic = time.monotonic()
+        self.expected_peer_pid = pid
+
+    def _handle_packet(self, packet: bytes) -> None:
+        try:
+            payload = json.loads(packet.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid recovery worker packet: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("schema") not in self.SCHEMAS:
+            raise RuntimeError("recovery worker packet has an unsupported schema")
+        self.last_packet_monotonic = time.monotonic()
+        event = payload.get("event")
+        if not isinstance(event, str):
+            raise RuntimeError("recovery worker packet has no event")
+        self.events_received += 1
+        self.last_event = event
+        episode_bound_events = {
+            "FIRST_WRITE",
+            "AMP_HOLD_FIRST_WRITE",
+            "JOINT_HOLD_FIRST_WRITE",
+            "STOPPED",
+            "PAUSED_NO_WRITER",
+            "PAUSED_RESIDENT_WRITER",
+            "POLICY_FALLBACK_DUE",
+            "POLICY_SWITCH",
+            "POLICY_SWITCH_FIRST_WRITE",
+        }
+        if event in episode_bound_events and payload.get("episode_id") != self.episode_id:
+            raise RuntimeError(
+                "recovery worker event episode mismatch: "
+                f"event={event} expected={self.episode_id} "
+                f"actual={payload.get('episode_id')}"
+            )
+        if event == "READY_NO_WRITER":
+            if payload.get("writer_created") is not False:
+                raise RuntimeError("recovery worker READY already owns a writer")
+            provider = payload.get("execution_provider")
+            resident_policies = payload.get("resident_policies")
+            registered_policy_ids = payload.get("registered_policy_ids")
+            initial_policy_id = payload.get("initial_policy_id")
+            has_resident_attestation = any(
+                key in payload
+                for key in (
+                    "execution_provider",
+                    "resident_policies",
+                    "resident_policy_count",
+                    "models_loaded_once",
+                    "models_warmed",
+                )
+            )
+            if self.require_resident_attestation or has_resident_attestation:
+                if not isinstance(provider, str) or not provider:
+                    raise RuntimeError(
+                        "recovery worker READY has no provider attestation"
+                    )
+                if not isinstance(resident_policies, list) or not resident_policies:
+                    raise RuntimeError(
+                        "recovery worker READY has no resident policies"
+                    )
+                if payload.get("resident_policy_count") != len(resident_policies):
+                    raise RuntimeError(
+                        "recovery worker resident policy count mismatch"
+                    )
+                if payload.get("models_loaded_once") is not True:
+                    raise RuntimeError("recovery worker models were not loaded once")
+                if payload.get("models_warmed") is not True:
+                    raise RuntimeError("recovery worker models were not warmed")
+                if any(
+                    not isinstance(item, dict)
+                    or item.get("execution_provider") != provider
+                    or item.get("warmed") is not True
+                    for item in resident_policies
+                ):
+                    raise RuntimeError(
+                        "recovery worker resident policy attestation is invalid"
+                    )
+                if self.require_resident_attestation:
+                    if (
+                        not isinstance(registered_policy_ids, list)
+                        or not registered_policy_ids
+                        or any(
+                            not isinstance(policy_id, str) or not policy_id
+                            for policy_id in registered_policy_ids
+                        )
+                    ):
+                        raise RuntimeError(
+                            "recovery worker READY has no registered policy IDs"
+                        )
+                    if initial_policy_id not in registered_policy_ids:
+                        raise RuntimeError(
+                            "recovery worker initial policy is not registered"
+                        )
+                self.execution_provider = provider
+                self.resident_policies = [dict(item) for item in resident_policies]
+                self.registered_policy_ids = list(registered_policy_ids or [])
+                self.initial_policy_id = (
+                    str(initial_policy_id) if initial_policy_id is not None else None
+                )
+                self.models_loaded_once = True
+                self.models_warmed = True
+            self.ready = True
+            self.paused = True
+        elif event == "FIRST_WRITE":
+            if not self.ready:
+                raise RuntimeError("recovery worker wrote before READY")
+            if not self.go_sent:
+                raise RuntimeError("recovery worker wrote before supervisor GO")
+            self.first_write = True
+            self.paused = False
+        elif event == "AMP_HOLD_FIRST_WRITE":
+            if not self.first_write:
+                raise RuntimeError("AMP hold wrote before the HoST first write")
+            if not self.amp_hold_sent:
+                raise RuntimeError("AMP hold wrote before supervisor request")
+            if payload.get("transition_id") != self.hold_transition_id:
+                raise RuntimeError("AMP hold transition_id mismatch")
+            self.amp_hold_first_write = True
+        elif event == "JOINT_HOLD_FIRST_WRITE":
+            if not self.first_write:
+                raise RuntimeError("joint hold wrote before the HoST first write")
+            if not self.joint_hold_sent:
+                raise RuntimeError("joint hold wrote before supervisor request")
+            if payload.get("transition_id") != self.hold_transition_id:
+                raise RuntimeError("joint hold transition_id mismatch")
+            if payload.get("writer_reused") is not True:
+                raise RuntimeError("joint hold created an unexpected writer")
+            if payload.get("measured_joint_target") is not True:
+                raise RuntimeError("joint hold did not use measured joint targets")
+            if payload.get("measured_joint_count") != 29:
+                raise RuntimeError("joint hold did not capture all 29 joints")
+            if payload.get("capture_once") is not True:
+                raise RuntimeError("joint hold target was not captured once")
+            if payload.get("target_velocity_zero") is not True:
+                raise RuntimeError("joint hold retained a velocity target")
+            if payload.get("feedforward_torque_zero") is not True:
+                raise RuntimeError("joint hold retained feedforward torque")
+            capture_age = payload.get("lowstate_capture_age_s")
+            if (
+                not isinstance(capture_age, (int, float))
+                or not math.isfinite(float(capture_age))
+                or float(capture_age) < 0.0
+                or float(capture_age) > 0.05
+            ):
+                raise RuntimeError("joint hold captured a stale LowState")
+            self.joint_hold_first_write = True
+        elif event == "STOPPED":
+            if not self.stop_sent:
+                raise RuntimeError("recovery worker stopped before supervisor STOP")
+            self.stopped = True
+            self.paused = False
+        elif event == "PAUSED_NO_WRITER":
+            if not self.pause_sent:
+                raise RuntimeError("recovery worker paused before supervisor PAUSE")
+            if payload.get("writer_created") is not False:
+                raise RuntimeError("recovery worker PAUSE retained a writer")
+            self.paused = True
+        elif event == "PAUSED_RESIDENT_WRITER":
+            if not self.pause_sent:
+                raise RuntimeError("recovery worker paused before supervisor PAUSE")
+            if payload.get("writer_created") is not True:
+                raise RuntimeError("resident recovery PAUSE lost its writer")
+            if payload.get("write_authorized") is not False:
+                raise RuntimeError("resident recovery PAUSE retained write authority")
+            if payload.get("writer_reused") is not True:
+                raise RuntimeError("resident recovery PAUSE cannot reuse its writer")
+            self.paused = True
+        elif event == "STATUS":
+            controller = payload.get("controller")
+            if controller == "WRITER_FREE_STANDBY":
+                if payload.get("writer_created") is not False:
+                    raise RuntimeError("recovery standby STATUS reported a writer")
+            elif controller == "PAUSED_RESIDENT_WRITER":
+                if payload.get("writer_created") is not True:
+                    raise RuntimeError("resident standby STATUS lost its writer")
+                if payload.get("write_authorized") is not False:
+                    raise RuntimeError(
+                        "resident standby STATUS retained write authority"
+                    )
+            self.last_status = dict(payload)
+        elif event == "ERROR":
+            self.error = str(payload.get("message", "worker error"))
+        elif event == "POLICY_FALLBACK_DUE":
+            if not self.first_write:
+                raise RuntimeError("policy fallback became due before first write")
+            if payload.get("requires_supervisor_authorization") is not True:
+                raise RuntimeError("policy fallback bypassed supervisor authority")
+            if self.amp_hold_sent or self.joint_hold_sent or self.stop_sent:
+                # The worker may have queued this packet immediately before it
+                # consumed the hold/STOP command in the opposite socket
+                # direction.  Once that command is sent the old HoST epoch can
+                # never be advanced, so retain the packet as evidence and
+                # explicitly supersede it instead of failing the recovery.
+                superseded = dict(payload)
+                superseded["superseded_by"] = (
+                    "STOP" if self.stop_sent else self.hold_kind
+                )
+                self.superseded_fallback_due_events.append(superseded)
+                return
+            if (
+                not self.go_sent
+            ):
+                raise RuntimeError("policy fallback became due outside HoST ownership")
+            if self.advance_transition_id is not None:
+                raise RuntimeError("new policy fallback arrived before prior first write")
+            self.fallback_due = True
+            self.last_fallback_due = dict(payload)
+        elif event == "POLICY_SWITCH":
+            if not self.fallback_due or self.advance_transition_id is None:
+                raise RuntimeError("policy switched without an authorized fallback")
+            if payload.get("transition_id") != self.advance_transition_id:
+                raise RuntimeError("policy switch transition_id mismatch")
+            if payload.get("physical_continuation") is not True:
+                raise RuntimeError("policy switch was not a physical continuation")
+            due = self.last_fallback_due or {}
+            if (
+                payload.get("from_policy_index") != due.get("policy_index")
+                or payload.get("to_policy_index") != due.get("next_policy_index")
+            ):
+                raise RuntimeError("policy switch did not match the due fallback")
+            self.policy_switch_accepted = True
+            self.last_policy_switch = dict(payload)
+        elif event == "POLICY_SWITCH_FIRST_WRITE":
+            if not self.policy_switch_accepted or self.advance_transition_id is None:
+                raise RuntimeError("policy switch wrote before accepted authorization")
+            if payload.get("transition_id") != self.advance_transition_id:
+                raise RuntimeError("policy switch first-write transition_id mismatch")
+            if payload.get("writer_reused") is not True:
+                raise RuntimeError("policy switch created an unexpected writer")
+            if payload.get("physical_continuation") is not True:
+                raise RuntimeError("policy switch first write was not physical")
+            self.policy_switch_first_writes.append(dict(payload))
+            self.fallback_due = False
+            self.advance_transition_id = None
+            self.policy_switch_accepted = False
+        else:
+            raise RuntimeError(f"unsupported recovery worker event: {event}")
+
+    def poll(self) -> None:
+        if self.listener is None:
+            raise RuntimeError("recovery worker control endpoint is not open")
+        if self.connection is None:
+            if self.expected_peer_pid is None:
+                return
+            try:
+                connection, _address = self.listener.accept()
+            except BlockingIOError:
+                return
+            if not hasattr(socket, "SO_PEERCRED"):
+                connection.close()
+                raise RuntimeError("recovery worker peer credentials are unavailable")
+            credentials = connection.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_PEERCRED,
+                struct.calcsize("3i"),
+            )
+            peer_pid, _peer_uid, _peer_gid = struct.unpack("3i", credentials)
+            if peer_pid != self.expected_peer_pid:
+                self.peer_pid_mismatches += 1
+                connection.close()
+                raise RuntimeError(
+                    "recovery worker peer PID mismatch: "
+                    f"expected={self.expected_peer_pid} actual={peer_pid}"
+                )
+            connection.setblocking(False)
+            self.connection = connection
+            self.peer_pid = peer_pid
+        assert self.connection is not None
+        while True:
+            try:
+                packet = self.connection.recv(65536)
+            except BlockingIOError:
+                break
+            if not packet:
+                self.connection.close()
+                self.connection = None
+                self.peer_pid = None
+                if not self.stopped:
+                    self.error = "recovery worker control disconnected"
+                    raise RuntimeError(self.error)
+                break
+            self._handle_packet(packet)
+
+    def send(self, command: str) -> None:
+        command = command.upper()
+        if command not in {
+            "GO",
+            "PAUSE",
+            "STOP",
+            "ENTER_AMP_HOLD",
+            "ENTER_JOINT_HOLD",
+            "ADVANCE_POLICY",
+        }:
+            raise ValueError(f"unsupported recovery worker command: {command}")
+        if self.connection is None:
+            raise RuntimeError("recovery worker is not connected")
+        if self.episode_id is None:
+            raise RuntimeError("recovery worker command has no active episode")
+        payload: dict[str, Any] = {
+            "schema": "matrix.sonic_host_worker.control.v1",
+            "command": command,
+            "episode_id": self.episode_id,
+        }
+        if command == "GO":
+            if not self.ready:
+                raise RuntimeError("cannot authorize recovery worker before READY")
+            if self.go_sent:
+                raise RuntimeError("recovery worker GO was already sent")
+            if self.stop_sent:
+                raise RuntimeError("cannot authorize a stopped recovery worker")
+            if not self.paused:
+                raise RuntimeError("cannot authorize an unpaused recovery worker")
+        elif command == "PAUSE":
+            if not self.go_sent or not self.first_write or self.paused:
+                raise RuntimeError("cannot pause recovery worker before ownership")
+            if self.pause_sent or self.stop_sent:
+                raise RuntimeError("recovery worker PAUSE is not valid in current state")
+        elif command in {"ENTER_AMP_HOLD", "ENTER_JOINT_HOLD"}:
+            if not self.go_sent or not self.first_write:
+                raise RuntimeError("cannot request policy hold before HoST ownership")
+            if self.stop_sent or self.amp_hold_sent or self.joint_hold_sent:
+                raise RuntimeError("policy hold request is not valid in current state")
+            if self.advance_transition_id is not None:
+                raise RuntimeError("cannot enter policy hold during a policy switch")
+            self.hold_transition_counter += 1
+            hold_kind = (
+                "amp" if command == "ENTER_AMP_HOLD" else "joint_pose"
+            )
+            hold_transition_id = (
+                f"recovery-{self.episode_id}-hold-"
+                f"{self.hold_transition_counter}"
+            )
+            payload.update(
+                {
+                    "transition_id": hold_transition_id,
+                    "hold_kind": hold_kind,
+                }
+            )
+        elif command == "ADVANCE_POLICY":
+            if not self.go_sent or not self.first_write:
+                raise RuntimeError("cannot advance policy before HoST ownership")
+            if not self.fallback_due or self.last_fallback_due is None:
+                raise RuntimeError("cannot advance policy before fallback is due")
+            if self.stop_sent or self.amp_hold_sent or self.joint_hold_sent:
+                raise RuntimeError("cannot advance policy outside HoST ownership")
+            if self.advance_transition_id is not None:
+                raise RuntimeError("policy advance is already pending")
+            self.advance_transition_counter += 1
+            transition_id = (
+                f"recovery-{self.episode_id}-switch-"
+                f"{self.advance_transition_counter}"
+            )
+            payload.update(
+                {
+                    "transition_id": transition_id,
+                    "expected_from_policy_index": self.last_fallback_due.get(
+                        "policy_index"
+                    ),
+                    "expected_to_policy_index": self.last_fallback_due.get(
+                        "next_policy_index"
+                    ),
+                }
+            )
+        packet = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        written = self.connection.send(packet)
+        if written != len(packet):
+            raise RuntimeError("short recovery worker control packet")
+        self.command_history.append(
+            {
+                "command": command,
+                "episode_id": self.episode_id,
+                "transition_id": payload.get("transition_id"),
+                "sent_monotonic": time.monotonic(),
+            }
+        )
+        if command == "GO":
+            self.go_sent = True
+            self.paused = False
+        elif command == "PAUSE":
+            self.pause_sent = True
+        elif command == "STOP":
+            self.stop_sent = True
+        elif command == "ENTER_AMP_HOLD":
+            self.amp_hold_sent = True
+            self.hold_transition_id = str(payload["transition_id"])
+            self.hold_kind = "amp"
+            self.fallback_due = False
+        elif command == "ENTER_JOINT_HOLD":
+            self.joint_hold_sent = True
+            self.hold_transition_id = str(payload["transition_id"])
+            self.hold_kind = "joint_pose"
+            self.fallback_due = False
+        elif command == "ADVANCE_POLICY":
+            self.advance_transition_id = str(payload["transition_id"])
+            self.policy_switch_accepted = False
+
+    def ready_recent(self, *, max_age_s: float) -> bool:
+        if not math.isfinite(max_age_s) or max_age_s <= 0.0:
+            raise ValueError("max_age_s must be finite and positive")
+        if (
+            not self.ready
+            or self.connection is None
+            or self.last_packet_monotonic is None
+        ):
+            return False
+        age = time.monotonic() - self.last_packet_monotonic
+        return 0.0 <= age <= max_age_s
+
+    def telemetry(self) -> dict[str, object]:
+        resident_writer_created = bool(
+            isinstance(self.last_status, dict)
+            and self.last_status.get("writer_created") is True
+        )
+        return {
+            "connected": self.connection is not None,
+            "ready_no_writer": self.ready,
+            "first_write": self.first_write,
+            "amp_hold_first_write": self.amp_hold_first_write,
+            "joint_hold_first_write": self.joint_hold_first_write,
+            "stopped": self.stopped,
+            "paused_no_writer": self.paused and not resident_writer_created,
+            "resident_paused": self.paused,
+            "resident_writer_created": resident_writer_created,
+            "last_event": self.last_event,
+            "events_received": self.events_received,
+            "expected_peer_pid": self.expected_peer_pid,
+            "peer_pid": self.peer_pid,
+            "peer_pid_mismatches": self.peer_pid_mismatches,
+            "last_packet_age_s": (
+                round(max(0.0, time.monotonic() - self.last_packet_monotonic), 6)
+                if self.last_packet_monotonic is not None
+                else None
+            ),
+            "fallback_due": self.fallback_due,
+            "last_fallback_due": self.last_fallback_due,
+            "last_policy_switch": self.last_policy_switch,
+            "policy_switch_first_writes": list(self.policy_switch_first_writes),
+            "completed_episodes": list(self.completed_episodes),
+            "episode_id": self.episode_id,
+            "go_sent": self.go_sent,
+            "stop_sent": self.stop_sent,
+            "pause_sent": self.pause_sent,
+            "amp_hold_sent": self.amp_hold_sent,
+            "joint_hold_sent": self.joint_hold_sent,
+            "hold_transition_id": self.hold_transition_id,
+            "hold_kind": self.hold_kind,
+            "superseded_fallback_due_events": list(
+                self.superseded_fallback_due_events
+            ),
+            "advance_transition_id": self.advance_transition_id,
+            "command_history": list(self.command_history),
+            "error": self.error,
+            "status": self.last_status,
+            "execution_provider": self.execution_provider,
+            "resident_policies": list(self.resident_policies),
+            "registered_policy_ids": list(self.registered_policy_ids),
+            "initial_policy_id": self.initial_policy_id,
+            "models_loaded_once": self.models_loaded_once,
+            "models_warmed": self.models_warmed,
+            "resident_attestation_required": self.require_resident_attestation,
+            "socket": str(self.path),
+        }
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        if self.listener is not None:
+            self.listener.close()
+            self.listener = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+class _SonicWriterControl(_RecoveryWorkerControl):
+    """Authenticate and drive one native SONIC rt/lowcmd startup gate."""
+
+    SCHEMA = "matrix.sonic_deploy.control.v1"
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        require_authority_epoch: bool = False,
+    ) -> None:
+        super().__init__(path)
+        self.require_authority_epoch = bool(require_authority_epoch)
+        self.writer_created = False
+        self.writer_revoked = False
+        self.writer_failed_closed = False
+        self.paused = False
+        self.pause_pending = False
+        self.resume_pending = False
+        self.authority_epoch = 0
+        self.epoch_first_write = False
+        self.resume_count = 0
+        self.shadow_ready = False
+        self.reentry_alignment_complete = False
+        self.reentry_safe_idle_hold_active = False
+        self.reentry_policy_full_control = False
+
+    def reset_for_start(self) -> None:
+        super().reset_for_start()
+        self.writer_created = False
+        self.writer_revoked = False
+        self.writer_failed_closed = False
+        self.paused = False
+        self.pause_pending = False
+        self.resume_pending = False
+        self.authority_epoch = 0
+        self.epoch_first_write = False
+        self.resume_count = 0
+        self.shadow_ready = False
+        self.reentry_alignment_complete = False
+        self.reentry_safe_idle_hold_active = False
+        self.reentry_policy_full_control = False
+
+    @property
+    def current_first_write(self) -> bool:
+        """Whether this generation has written and still owns authority."""
+
+        return (
+            self.epoch_first_write
+            and self.writer_created
+            and not self.paused
+            and not self.writer_revoked
+        )
+
+    def _handle_packet(self, packet: bytes) -> None:
+        try:
+            payload = json.loads(packet.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid SONIC writer-gate packet: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("schema") != self.SCHEMA:
+            raise RuntimeError("SONIC writer-gate packet has an unsupported schema")
+        if payload.get("writer_scope") != "rt/lowcmd":
+            raise RuntimeError("SONIC writer-gate packet has an invalid writer scope")
+        event = payload.get("event")
+        if not isinstance(event, str):
+            raise RuntimeError("SONIC writer-gate packet has no event")
+        self.last_packet_monotonic = time.monotonic()
+        self.events_received += 1
+        self.last_event = event
+        writer_created = payload.get("lowcmd_writer_created")
+        write_authorized = payload.get("write_authorized")
+        authority_epoch = payload.get("authority_epoch")
+        if authority_epoch is None and not self.require_authority_epoch:
+            if event == "WRITER_CREATED" and self.authority_epoch == 0:
+                authority_epoch = 1
+            elif event == "WRITER_RESUMED":
+                authority_epoch = self.authority_epoch + 1
+            else:
+                authority_epoch = self.authority_epoch
+        if type(authority_epoch) is not int or authority_epoch < 0:
+            raise RuntimeError("SONIC writer event has an invalid authority epoch")
+        if event == "READY_NO_LOWCMD_WRITER":
+            if writer_created is not False:
+                raise RuntimeError("SONIC READY already owns an rt/lowcmd writer")
+            if write_authorized not in (None, False):
+                raise RuntimeError("SONIC READY reported write authorization")
+            if self.first_write:
+                raise RuntimeError("SONIC READY arrived after FIRST_WRITE")
+            self.ready = True
+        elif event == "SHADOW_READY_NO_LOWCMD_WRITER":
+            if not self.ready:
+                raise RuntimeError(
+                    "SONIC shadow READY arrived before process READY"
+                )
+            if writer_created is not False:
+                raise RuntimeError("SONIC shadow READY already owns rt/lowcmd")
+            if write_authorized not in (None, False):
+                raise RuntimeError("SONIC shadow READY reported write authority")
+            if self.first_write or self.go_sent:
+                raise RuntimeError("SONIC shadow READY arrived after activation")
+            if self.shadow_ready:
+                raise RuntimeError("duplicate SONIC shadow readiness attestation")
+            self.shadow_ready = True
+        elif event == "WRITER_CREATED":
+            if not self.ready:
+                raise RuntimeError("SONIC created writer before READY")
+            if not self.go_sent:
+                raise RuntimeError("SONIC created writer before supervisor GO")
+            if writer_created is not True:
+                raise RuntimeError("SONIC WRITER_CREATED event has no writer")
+            if write_authorized not in (None, True):
+                raise RuntimeError("SONIC writer was created without authorization")
+            if self.writer_revoked:
+                raise RuntimeError("SONIC recreated a writer after hard revocation")
+            self.writer_created = True
+            self.authority_epoch = authority_epoch
+        elif event == "FIRST_WRITE":
+            if not self.ready:
+                raise RuntimeError("SONIC wrote before READY")
+            if not self.go_sent:
+                raise RuntimeError("SONIC wrote before supervisor GO")
+            if writer_created is not True:
+                raise RuntimeError("SONIC FIRST_WRITE did not own rt/lowcmd")
+            if write_authorized not in (None, True):
+                raise RuntimeError("SONIC FIRST_WRITE lacked authorization")
+            if self.writer_revoked:
+                raise RuntimeError("SONIC wrote after hard revocation")
+            if self.paused or self.pause_pending:
+                raise RuntimeError("SONIC wrote after resident PAUSE")
+            if authority_epoch != self.authority_epoch:
+                raise RuntimeError("SONIC FIRST_WRITE authority epoch mismatch")
+            self.writer_created = True
+            self.first_write = True
+            self.epoch_first_write = True
+        elif event == "WRITER_PAUSED":
+            if not self.pause_pending:
+                raise RuntimeError("SONIC paused before supervisor PAUSE")
+            if writer_created is not True or write_authorized is not False:
+                raise RuntimeError("SONIC PAUSE did not retain a fenced writer")
+            if authority_epoch != self.authority_epoch:
+                raise RuntimeError("SONIC PAUSE authority epoch mismatch")
+            self.paused = True
+            self.pause_pending = False
+            self.epoch_first_write = False
+        elif event == "WRITER_RESUMED":
+            if not self.resume_pending or not self.paused:
+                raise RuntimeError("SONIC resumed before supervisor RESUME")
+            if writer_created is not True or write_authorized is not True:
+                raise RuntimeError("SONIC RESUME did not restore writer authority")
+            if authority_epoch != self.authority_epoch + 1:
+                raise RuntimeError("SONIC RESUME did not advance authority epoch")
+            self.authority_epoch = authority_epoch
+            self.paused = False
+            self.resume_pending = False
+            self.epoch_first_write = False
+            self.resume_count += 1
+        elif event == "REENTRY_ALIGNMENT_COMPLETE":
+            if not self.shadow_ready:
+                raise RuntimeError(
+                    "SONIC alignment arrived without shadow readiness"
+                )
+            if not self.first_write or not self.writer_created:
+                raise RuntimeError("SONIC alignment completed before first write")
+            if writer_created is not True:
+                raise RuntimeError("SONIC alignment event reported no writer")
+            if write_authorized is not True or self.writer_revoked:
+                raise RuntimeError("SONIC alignment lacked writer authority")
+            if self.reentry_alignment_complete:
+                raise RuntimeError("duplicate SONIC alignment attestation")
+            self.reentry_alignment_complete = True
+        elif event == "REENTRY_SAFE_IDLE_HOLD_ACTIVE":
+            if not self.shadow_ready:
+                raise RuntimeError(
+                    "SONIC safe-idle hold lacked shadow readiness"
+                )
+            if not self.reentry_alignment_complete:
+                raise RuntimeError("SONIC safe-idle hold started before alignment")
+            if not self.first_write or not self.writer_created:
+                raise RuntimeError("SONIC safe-idle hold started without a writer")
+            if writer_created is not True:
+                raise RuntimeError("SONIC safe-idle hold event reported no writer")
+            if write_authorized is not True or self.writer_revoked:
+                raise RuntimeError("SONIC safe-idle hold lacked authority")
+            if self.reentry_policy_full_control:
+                raise RuntimeError(
+                    "SONIC safe-idle hold regressed from policy full control"
+                )
+            if self.reentry_safe_idle_hold_active:
+                raise RuntimeError("duplicate SONIC safe-idle hold attestation")
+            self.reentry_safe_idle_hold_active = True
+        elif event == "REENTRY_POLICY_FULL_CONTROL":
+            if not self.shadow_ready:
+                raise RuntimeError(
+                    "SONIC policy activation lacked shadow readiness"
+                )
+            if not self.reentry_alignment_complete:
+                raise RuntimeError("SONIC policy activated before alignment")
+            if not self.first_write or not self.writer_created:
+                raise RuntimeError("SONIC policy activated without a writer")
+            if writer_created is not True:
+                raise RuntimeError("SONIC policy event reported no writer")
+            if write_authorized is not True or self.writer_revoked:
+                raise RuntimeError("SONIC policy activation lacked authority")
+            if self.reentry_policy_full_control:
+                raise RuntimeError("duplicate SONIC policy activation attestation")
+            self.reentry_policy_full_control = True
+        elif event == "WRITER_REVOKED":
+            if not self.stop_sent:
+                raise RuntimeError("SONIC revoked writer before supervisor STOP")
+            if write_authorized is not False:
+                raise RuntimeError("SONIC WRITER_REVOKED retained authorization")
+            if not self.ready:
+                raise RuntimeError("SONIC revoked before READY")
+            self.writer_created = bool(writer_created)
+            self.writer_revoked = True
+            self.paused = False
+        elif event == "WRITER_FAILED_CLOSED":
+            if not self.go_sent or not self.first_write:
+                raise RuntimeError("SONIC failed closed before first write")
+            if write_authorized is not False:
+                raise RuntimeError("SONIC failed-closed event retained authority")
+            self.writer_created = bool(writer_created)
+            self.writer_revoked = True
+            self.paused = False
+            self.writer_failed_closed = True
+            self.error = "native SONIC LowCmd producer failed closed"
+        elif event == "STOPPED":
+            if not self.stop_sent and not self.writer_failed_closed:
+                raise RuntimeError("SONIC stopped before supervisor STOP")
+            if writer_created is not False:
+                raise RuntimeError("SONIC STOPPED retained its rt/lowcmd writer")
+            if write_authorized not in (None, False):
+                raise RuntimeError("SONIC STOPPED retained write authorization")
+            self.writer_created = False
+            self.writer_revoked = True
+            self.paused = False
+            self.stopped = True
+        else:
+            raise RuntimeError(f"unsupported SONIC writer-gate event: {event}")
+
+    def send(self, command: str) -> None:
+        command = command.upper()
+        if command not in {"GO", "PAUSE", "RESUME", "STOP"}:
+            raise ValueError(f"unsupported SONIC writer-gate command: {command}")
+        if self.connection is None:
+            raise RuntimeError("SONIC writer gate is not connected")
+        if self.episode_id is None:
+            raise RuntimeError("SONIC writer gate has no active episode")
+        if command == "GO":
+            if not self.ready:
+                raise RuntimeError("cannot authorize SONIC before READY")
+            if self.go_sent or self.stop_sent:
+                raise RuntimeError("SONIC GO is not valid in current state")
+        elif command == "PAUSE":
+            if (
+                not self.current_first_write
+                or self.pause_pending
+                or self.paused
+                or self.resume_pending
+                or self.stop_sent
+            ):
+                raise RuntimeError("SONIC PAUSE is not valid in current state")
+        elif command == "RESUME":
+            if (
+                not self.paused
+                or self.pause_pending
+                or self.resume_pending
+                or self.stop_sent
+            ):
+                raise RuntimeError("SONIC RESUME is not valid in current state")
+        elif self.stop_sent:
+            raise RuntimeError("SONIC STOP was already sent")
+        packet = command.encode("ascii")
+        written = self.connection.send(packet)
+        if written != len(packet):
+            raise RuntimeError("short SONIC writer-gate command")
+        self.command_history.append(
+            {
+                "command": command,
+                "episode_id": self.episode_id,
+                "sent_monotonic": time.monotonic(),
+            }
+        )
+        if command == "GO":
+            self.go_sent = True
+        elif command == "PAUSE":
+            self.pause_pending = True
+        elif command == "RESUME":
+            self.resume_pending = True
+        else:
+            self.stop_sent = True
+
+    def telemetry(self) -> dict[str, object]:
+        result = super().telemetry()
+        result.update(
+            {
+                "schema": self.SCHEMA,
+                "ready_no_lowcmd_writer": self.ready,
+                "shadow_ready_no_lowcmd_writer": self.shadow_ready,
+                "lowcmd_writer_created": self.writer_created,
+                "write_authorized": (
+                    self.writer_created
+                    and not self.paused
+                    and not self.writer_revoked
+                ),
+                "resident_paused": self.paused,
+                "pause_pending": self.pause_pending,
+                "resume_pending": self.resume_pending,
+                "authority_epoch": self.authority_epoch,
+                "authority_epoch_first_write": self.epoch_first_write,
+                "authority_epoch_required": self.require_authority_epoch,
+                "resident_resume_count": self.resume_count,
+                "writer_revoked": self.writer_revoked,
+                "writer_failed_closed": self.writer_failed_closed,
+                "first_write": self.first_write,
+                "reentry_alignment_complete": (
+                    self.reentry_alignment_complete
+                ),
+                "reentry_safe_idle_hold_active": (
+                    self.reentry_safe_idle_hold_active
+                ),
+                "reentry_policy_full_control": (
+                    self.reentry_policy_full_control
+                ),
+                "writer_scope": "rt/lowcmd",
+            }
+        )
+        return result
+
+
+class _PhysicalRecoveryCoordinator:
+    """Translate snapshots/FSM actions without stopping input or rendering."""
+
+    # Some focused tests construct this class with __new__ to isolate one
+    # legacy method.  Keep that path on the non-resident state machine unless
+    # the normal constructor explicitly enables residency.
+    resident_policies = False
+    execution_provider = "cpu"
+
+    POSE_TRIGGER_HEIGHT_M = 0.45
+    POSE_TRIGGER_UP_Z = 0.5
+    POSE_TRIGGER_HOLD_S = 0.35
+    STANDBY_HEARTBEAT_TIMEOUT_S = 2.0
+    FALLBACK_NEAR_UPRIGHT_HEIGHT_M = 0.62
+    FALLBACK_NEAR_UPRIGHT_UP_Z = 0.85
+    FALLBACK_NEAR_UPRIGHT_GRACE_S = 2.0
+    FALLBACK_QUIET_HOLD_S = 0.25
+    FALLBACK_MAX_LINEAR_SPEED_M_S = 0.5
+    FALLBACK_MAX_ANGULAR_SPEED_RAD_S = 1.5
+    FALLBACK_MAX_JOINT_VELOCITY_RMS_RAD_S = 1.5
+    # Conservative first qualification after a replacement deploy.  At the
+    # 50 Hz game command rate this is 1 rad/s and prevents a frame transform
+    # from bypassing the core's own yaw slew limiter.
+    WIRE_MAX_TURN_RATE_RAD_S = 1.0
+    WIRE_MAX_HEADING_STEP_RAD = 0.02
+    # GameControlCore deliberately keeps its planner-facing target close to
+    # measured yaw.  That short lead is below SONIC's effective turning
+    # threshold after a deploy-frame re-anchor, so the recovery adapter may use
+    # more of the *true* camera-relative remaining turn carried as command
+    # metadata.  It never extrapolates past that true target, and every output
+    # frame remains subject to the 0.02 rad wire slew limit above.
+    WIRE_TURN_LEAD_WINDOW_RAD = 0.4
+    _PREWARM_POLICY_STATES = frozenset(
+        {
+            RecoveryState.POLICY_RECOVERING,
+            RecoveryState.POLICY_GETUP_STABLE,
+            RecoveryState.POLICY_AMP_HOLD_REQUESTED,
+            RecoveryState.POLICY_AMP_HOLDING,
+        }
+    )
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *,
+        initial_root_yaw_rad: float,
+    ) -> None:
+        timeout = float(args.physical_recovery_timeout_seconds)
+        self.resident_policies = bool(
+            getattr(args, "physical_recovery_resident_policies", False)
+        )
+        self.execution_provider = str(
+            getattr(args, "physical_recovery_execution_provider", "cpu")
+        )
+        recovery_config = RecoveryConfig(
+            stable_hold_s=float(args.physical_recovery_stable_hold_seconds),
+            policy_exit_hold_s=float(
+                getattr(args, "physical_recovery_policy_exit_hold_seconds", 0.0)
+            ),
+            stable_root_z_m=self.FALLBACK_NEAR_UPRIGHT_HEIGHT_M,
+            max_lowcmd_age_s=float(args.low_cmd_fresh_timeout_seconds),
+            policy_recovery_timeout_s=timeout,
+            use_amp_hold=(
+                not self.resident_policies
+                and str(getattr(args, "physical_recovery_handoff", "amp"))
+                == "amp"
+            ),
+            sonic_prewarm_timeout_s=float(
+                args.physical_recovery_sonic_prewarm_timeout_seconds
+            ),
+            sonic_full_control_timeout_s=float(
+                args.physical_recovery_sonic_full_control_timeout_seconds
+            ),
+            episode_timeout_s=max(120.0, timeout + 60.0),
+        )
+        self.fsm = (
+            ResidentPolicyRecoveryFSM(
+                recovery_config,
+                recovery_policy_id=str(
+                    getattr(args, "physical_recovery_initial_controller", "host")
+                ),
+            )
+            if self.resident_policies
+            else SingleWriterRecoveryFSM(recovery_config)
+        )
+        self.worker = _RecoveryWorkerControl(
+            args.physical_recovery_control_socket,
+            require_resident_attestation=self.resident_policies,
+        )
+        self.sonic_writer = _SonicWriterControl(
+            args.physical_recovery_sonic_control_socket,
+            require_authority_epoch=self.resident_policies,
+        )
+        self.worker_python = str(args.physical_recovery_python)
+        self.worker_script = args.physical_recovery_worker.resolve()
+        self.initial_controller = str(
+            getattr(args, "physical_recovery_initial_controller", "host")
+        )
+        self.handoff_mode = str(
+            getattr(args, "physical_recovery_handoff", "amp")
+        )
+        assert args.physical_recovery_model is not None
+        self.model = args.physical_recovery_model.resolve()
+        self.fallback_models = tuple(
+            path.resolve() for path in args.physical_recovery_fallback_model
+        )
+        self.fallback_after_s = float(
+            args.physical_recovery_fallback_after_seconds
+        )
+        assert args.physical_recovery_amp_config is not None
+        assert args.physical_recovery_amp_model is not None
+        self.amp_config = args.physical_recovery_amp_config.resolve()
+        self.amp_model = args.physical_recovery_amp_model.resolve()
+        self.amp_config_sha256 = str(args.physical_recovery_amp_config_sha256)
+        self.amp_model_sha256 = str(args.physical_recovery_amp_model_sha256)
+        kungfu_model_arg = getattr(args, "physical_recovery_kungfu_model", None)
+        kungfu_motion_arg = getattr(args, "physical_recovery_kungfu_motion", None)
+        self.kungfu_model = (
+            kungfu_model_arg.resolve()
+            if isinstance(kungfu_model_arg, Path)
+            else None
+        )
+        self.kungfu_motion = (
+            kungfu_motion_arg.resolve()
+            if isinstance(kungfu_motion_arg, Path)
+            else None
+        )
+        kungfu_model_sha256_arg = getattr(
+            args, "physical_recovery_kungfu_model_sha256", None
+        )
+        kungfu_model_data_sha256_arg = getattr(
+            args, "physical_recovery_kungfu_model_data_sha256", None
+        )
+        kungfu_motion_sha256_arg = getattr(
+            args, "physical_recovery_kungfu_motion_sha256", None
+        )
+        self.kungfu_model_sha256 = (
+            str(kungfu_model_sha256_arg)
+            if kungfu_model_sha256_arg
+            else None
+        )
+        self.kungfu_model_data_sha256 = (
+            str(kungfu_model_data_sha256_arg)
+            if kungfu_model_data_sha256_arg
+            else None
+        )
+        self.kungfu_motion_sha256 = (
+            str(kungfu_motion_sha256_arg)
+            if kungfu_motion_sha256_arg
+            else None
+        )
+        self.kungfu_reference_frame = int(
+            getattr(args, "physical_recovery_kungfu_reference_frame", 0)
+        )
+        self.kungfu_gain_scale = float(
+            getattr(args, "physical_recovery_kungfu_gain_scale", 1.0)
+        )
+        self.interface = args.dds_interface
+        self.zmq_port: int | None = None
+        self.pose_candidate_since_s: float | None = None
+        self.current_fall_detected = False
+        self.episodes = 0
+        self.recoveries = 0
+        self.last_output: RecoveryOutput | ResidentRecoveryOutput | None = None
+        self.last_transition_s: float | None = None
+        self.initial_root_yaw_rad = float(initial_root_yaw_rad)
+        self.restarted_root_yaw_rad: float | None = None
+        self.command_frame_rotation_rad = 0.0
+        self.command_frame_epoch = 0
+        self.last_wire_facing_heading_rad: float | None = None
+        self.reframe_limited_frames = 0
+        self.last_reframe_limited = False
+        self.last_reframe_heading_error_rad = 0.0
+        self.replacement_sonic_started_s: float | None = None
+        self.replacement_sonic_ready_s: float | None = None
+        self.replacement_sonic_first_fresh_s: float | None = None
+        self.initial_sonic_gate_pending = False
+        self.previous_sonic_writer_revoked = False
+        self.previous_sonic_stopped = False
+        self.policy_fallback_last_near_upright_s: float | None = None
+        self.policy_fallback_quiet_since_s: float | None = None
+        self.policy_advance_requested = False
+        self.policy_advances = 0
+        self.current_recovery_worker_episode_id: int | None = None
+        self.latest_completed_recovery_worker_episode_id: int | None = None
+
+    def _capture_restart_anchor(self, qpos: Any) -> None:
+        self.restarted_root_yaw_rad = _root_yaw_rad(qpos)
+        anchor_delta = wrap_angle_rad(
+            self.restarted_root_yaw_rad - self.initial_root_yaw_rad
+        )
+        self.command_frame_rotation_rad = -anchor_delta
+        self.command_frame_epoch += 1
+        # The replacement deploy normalizes its physical startup yaw to wire
+        # heading zero.  Seed the cross-frame limiter at that exact boundary so
+        # the first active command, and every command after it, can move by at
+        # most one wire slew step even if measured yaw changes abruptly.
+        self.last_wire_facing_heading_rad = 0.0
+        self.last_reframe_limited = False
+        self.last_reframe_heading_error_rad = 0.0
+
+    def open(self, *, zmq_port: int) -> None:
+        self.zmq_port = int(zmq_port)
+        self.worker.open()
+        self.sonic_writer.open()
+
+    def prepare_initial_sonic_gate(self) -> Path:
+        self.sonic_writer.reset_for_start()
+        self.initial_sonic_gate_pending = True
+        return self.sonic_writer.path
+
+    def bind_initial_sonic_gate(self, *, processes: NativeProcessGroup) -> None:
+        deploy_pid = processes.deploy_pid()
+        if deploy_pid is None:
+            raise RuntimeError("initial gated SONIC has no process PID")
+        self.sonic_writer.bind_expected_peer_pid(deploy_pid)
+
+    def _fall_level(self, snapshot: Any, now_s: float) -> bool:
+        root_z = float(snapshot.qpos[2])
+        root_up_z = _root_up_z(snapshot.qpos)
+        pose_candidate = (
+            root_z < self.POSE_TRIGGER_HEIGHT_M
+            and root_up_z < self.POSE_TRIGGER_UP_Z
+        )
+        if pose_candidate:
+            if self.pose_candidate_since_s is None:
+                self.pose_candidate_since_s = now_s
+        else:
+            self.pose_candidate_since_s = None
+        pose_trigger = (
+            self.pose_candidate_since_s is not None
+            and now_s - self.pose_candidate_since_s >= self.POSE_TRIGGER_HOLD_S
+        )
+        # SONIC's fall flag is sticky, so gate it with its live height test.
+        native_trigger = root_z < 0.2 and bool(snapshot.fall_detected)
+        self.current_fall_detected = native_trigger or pose_trigger
+        return self.current_fall_detected
+
+    def _maybe_authorize_policy_advance(
+        self,
+        *,
+        now_s: float,
+        root_z_m: float,
+        root_up_z: float,
+        root_linear_speed_m_s: float,
+        root_angular_speed_rad_s: float,
+        joint_velocity_rms_rad_s: float,
+        grounded_contact: bool,
+        recovery_state: RecoveryState,
+        policy_alive: bool,
+        worker_controller: str | None,
+    ) -> None:
+        """Use full simulator state to authorize a physical HoST fallback.
+
+        The worker deliberately cannot see root height or contacts.  A timeout
+        therefore only raises ``fallback_due``; this supervisor waits through
+        near-upright hysteresis and high dynamics, then sends ADVANCE_POLICY
+        after a continuous low-energy grounded window.
+        """
+
+        near_upright = (
+            root_z_m >= self.FALLBACK_NEAR_UPRIGHT_HEIGHT_M
+            and root_up_z >= self.FALLBACK_NEAR_UPRIGHT_UP_Z
+        )
+        if near_upright:
+            self.policy_fallback_last_near_upright_s = now_s
+
+        if not self.worker.fallback_due:
+            self.policy_fallback_quiet_since_s = None
+            if self.policy_advance_requested:
+                # POLICY_SWITCH_FIRST_WRITE was acknowledged; do not leak the
+                # old policy's grace window into the new controller.
+                self.policy_fallback_last_near_upright_s = None
+            self.policy_advance_requested = False
+            return
+
+        eligible_owner = (
+            recovery_state is RecoveryState.POLICY_RECOVERING
+            and policy_alive
+            and self.worker.connection is not None
+            and self.worker.go_sent
+            and not self.worker.stop_sent
+            and not self.worker.amp_hold_sent
+            and not self.worker.joint_hold_sent
+            and worker_controller == "HOST_GETUP"
+        )
+        if not eligible_owner:
+            self.policy_fallback_quiet_since_s = None
+            return
+        if self.policy_advance_requested:
+            return
+        if near_upright:
+            self.policy_fallback_quiet_since_s = None
+            return
+
+        if (
+            self.policy_fallback_last_near_upright_s is not None
+            and now_s - self.policy_fallback_last_near_upright_s
+            < self.FALLBACK_NEAR_UPRIGHT_GRACE_S
+        ):
+            self.policy_fallback_quiet_since_s = None
+            return
+
+        # Once the near-upright grace has expired, every non-upright grounded
+        # pose is eligible.  This deliberately avoids a height/orientation
+        # dead zone around the standing threshold.
+        low_posture = not near_upright
+        low_dynamics = (
+            root_linear_speed_m_s <= self.FALLBACK_MAX_LINEAR_SPEED_M_S
+            and root_angular_speed_rad_s
+            <= self.FALLBACK_MAX_ANGULAR_SPEED_RAD_S
+            and joint_velocity_rms_rad_s
+            <= self.FALLBACK_MAX_JOINT_VELOCITY_RMS_RAD_S
+        )
+        if not (low_posture and low_dynamics and grounded_contact):
+            self.policy_fallback_quiet_since_s = None
+            return
+        if self.policy_fallback_quiet_since_s is None:
+            self.policy_fallback_quiet_since_s = now_s
+            return
+        if (
+            now_s - self.policy_fallback_quiet_since_s
+            < self.FALLBACK_QUIET_HOLD_S
+        ):
+            return
+
+        self.worker.send("ADVANCE_POLICY")
+        self.policy_advance_requested = True
+        self.policy_advances += 1
+        self.policy_fallback_quiet_since_s = None
+        self.policy_fallback_last_near_upright_s = None
+
+    def _resident_worker_attested(self, *, policy_alive: bool) -> bool:
+        expected_provider = (
+            "CUDAExecutionProvider"
+            if self.execution_provider == "cuda"
+            else "CPUExecutionProvider"
+        )
+        names = {
+            str(item.get("name"))
+            for item in self.worker.resident_policies
+            if isinstance(item, dict)
+        }
+        required_loaded = (
+            "kungfu:1307_recovery" in names
+            and "amp:walk_run_getup" in names
+            and any(name.startswith("host:") for name in names)
+        )
+        return (
+            policy_alive
+            and self.worker.ready_recent(
+                max_age_s=self.STANDBY_HEARTBEAT_TIMEOUT_S
+            )
+            and self.worker.execution_provider == expected_provider
+            and self.worker.models_loaded_once
+            and self.worker.models_warmed
+            and required_loaded
+        )
+
+    def observe(
+        self,
+        snapshot: Any,
+        *,
+        now_s: float,
+        neutral_confirmed: bool,
+        foot_contact: bool,
+        grounded_contact: bool,
+        processes: NativeProcessGroup,
+    ) -> RecoveryOutput | ResidentRecoveryOutput:
+        self.worker.poll()
+        self.sonic_writer.poll()
+        if self.fsm.state not in {
+            RecoveryState.GAME_SONIC,
+            ResidentRecoveryState.GAME_SONIC,
+        }:
+            self.previous_sonic_writer_revoked |= bool(
+                self.sonic_writer.writer_revoked
+            )
+            self.previous_sonic_stopped |= bool(self.sonic_writer.stopped)
+        if self.worker.error is not None:
+            raise RuntimeError(f"physical recovery worker: {self.worker.error}")
+        if self.sonic_writer.error is not None:
+            raise RuntimeError(
+                f"replacement SONIC writer gate: {self.sonic_writer.error}"
+            )
+        if self.sonic_writer.ready and self.replacement_sonic_ready_s is None:
+            self.replacement_sonic_ready_s = now_s
+        qvel = tuple(float(value) for value in snapshot.qvel)
+        root_linear_speed = math.sqrt(sum(value * value for value in qvel[:3]))
+        root_angular_speed = math.sqrt(sum(value * value for value in qvel[3:6]))
+        joint_values = qvel[6:]
+        joint_rms = math.sqrt(
+            sum(value * value for value in joint_values) / len(joint_values)
+        )
+        root_z = float(snapshot.qpos[2])
+        root_up_z = _root_up_z(snapshot.qpos)
+        policy_alive = processes.recovery_policy_alive()
+        worker_controller = (
+            str(self.worker.last_status.get("controller"))
+            if isinstance(self.worker.last_status, dict)
+            and self.worker.last_status.get("controller") is not None
+            else None
+        )
+        if self.resident_policies:
+            policy_ready = self._resident_worker_attested(
+                policy_alive=policy_alive
+            )
+            resident_observation = ResidentRecoveryInput(
+                now_s=now_s,
+                fall_detected=self._fall_level(snapshot, now_s),
+                root_z_m=root_z,
+                root_up_z=root_up_z,
+                root_linear_speed_m_s=root_linear_speed,
+                root_angular_speed_rad_s=root_angular_speed,
+                joint_velocity_rms_rad_s=joint_rms,
+                lowcmd_fresh=bool(snapshot.low_cmd_fresh),
+                lowcmd_age_s=(
+                    float(snapshot.low_cmd_age_s)
+                    if snapshot.low_cmd_age_s is not None
+                    else None
+                ),
+                sonic_alive=processes.deploy_alive(),
+                sonic_generation=processes.deploy_generation,
+                sonic_resident_ready=(
+                    processes.deploy_alive()
+                    and self.sonic_writer.ready
+                    and not self.sonic_writer.writer_failed_closed
+                ),
+                sonic_writer_active=self.sonic_writer.current_first_write,
+                sonic_writer_paused=self.sonic_writer.paused,
+                sonic_resume_first_write=(
+                    self.sonic_writer.resume_count > 0
+                    and self.sonic_writer.epoch_first_write
+                ),
+                policy_alive=policy_alive,
+                policy_resident_ready=policy_ready,
+                policy_writer_active=(
+                    policy_alive
+                    and self.worker.go_sent
+                    and self.worker.first_write
+                    and not self.worker.paused
+                ),
+                policy_writer_paused=self.worker.paused,
+                policy_first_write=self.worker.first_write,
+                reset_count=int(snapshot.reset_count),
+                foot_contact=bool(foot_contact),
+                grounded_contact=bool(grounded_contact),
+                neutral_confirmed=bool(neutral_confirmed),
+            )
+            previous_resident = self.fsm.state
+            output_resident = self.fsm.step(resident_observation)
+            self.last_output = output_resident
+            if output_resident.state is not previous_resident:
+                self.last_transition_s = now_s
+                if (
+                    output_resident.state
+                    is ResidentRecoveryState.SONIC_PAUSE_REQUESTED
+                ):
+                    self.episodes += 1
+                    self.current_recovery_worker_episode_id = None
+                    self.policy_fallback_last_near_upright_s = None
+                    self.policy_fallback_quiet_since_s = None
+                    self.policy_advance_requested = False
+                elif output_resident.resume_game:
+                    self.recoveries += 1
+                    self.latest_completed_recovery_worker_episode_id = (
+                        self.current_recovery_worker_episode_id
+                    )
+            return output_resident
+        self._maybe_authorize_policy_advance(
+            now_s=now_s,
+            root_z_m=root_z,
+            root_up_z=root_up_z,
+            root_linear_speed_m_s=root_linear_speed,
+            root_angular_speed_rad_s=root_angular_speed,
+            joint_velocity_rms_rad_s=joint_rms,
+            grounded_contact=bool(grounded_contact),
+            recovery_state=self.fsm.state,
+            policy_alive=policy_alive,
+            worker_controller=worker_controller,
+        )
+        deploy_alive = processes.deploy_alive()
+        gated_deploy = self.sonic_writer.expected_peer_pid is not None
+        observation = RecoveryInput(
+            now_s=now_s,
+            fall_detected=self._fall_level(snapshot, now_s),
+            root_z_m=root_z,
+            root_up_z=root_up_z,
+            root_linear_speed_m_s=root_linear_speed,
+            root_angular_speed_rad_s=root_angular_speed,
+            joint_velocity_rms_rad_s=joint_rms,
+            lowcmd_fresh=bool(snapshot.low_cmd_fresh),
+            lowcmd_age_s=(
+                float(snapshot.low_cmd_age_s)
+                if snapshot.low_cmd_age_s is not None
+                else None
+            ),
+            deploy_alive=deploy_alive,
+            deploy_generation=processes.deploy_generation,
+            deploy_process_ready=(
+                gated_deploy and deploy_alive and self.sonic_writer.ready
+            ),
+            deploy_writer_ready=(
+                gated_deploy
+                and deploy_alive
+                and self.sonic_writer.shadow_ready
+            ),
+            deploy_writer_created=(
+                deploy_alive
+                and (
+                    self.sonic_writer.writer_created
+                    if gated_deploy
+                    else True
+                )
+            ),
+            deploy_writer_revoked=(
+                gated_deploy and self.sonic_writer.writer_revoked
+            ),
+            deploy_first_write=(
+                gated_deploy
+                and deploy_alive
+                and self.sonic_writer.current_first_write
+            ),
+            deploy_policy_full_control=(
+                gated_deploy
+                and deploy_alive
+                and self.sonic_writer.reentry_policy_full_control
+                and self.sonic_writer.current_first_write
+            ),
+            deploy_safe_idle_hold=(
+                gated_deploy
+                and deploy_alive
+                and self.sonic_writer.reentry_safe_idle_hold_active
+                and self.sonic_writer.current_first_write
+            ),
+            policy_alive=policy_alive,
+            policy_ready=(
+                policy_alive
+                and self.worker.ready_recent(
+                    max_age_s=self.STANDBY_HEARTBEAT_TIMEOUT_S
+                )
+            ),
+            policy_first_write=self.worker.first_write and policy_alive,
+            policy_hold_first_write=(
+                (
+                    self.worker.amp_hold_first_write
+                    if self.handoff_mode == "amp"
+                    else self.worker.joint_hold_first_write
+                )
+                and policy_alive
+            ),
+            reset_count=int(snapshot.reset_count),
+            foot_contact=bool(foot_contact),
+            grounded_contact=bool(grounded_contact),
+            neutral_confirmed=bool(neutral_confirmed),
+        )
+        previous = self.fsm.state
+        if (
+            previous
+            in {RecoveryState.SONIC_RESTARTING, RecoveryState.SONIC_STABILIZING}
+            and bool(snapshot.low_cmd_fresh)
+            and self.replacement_sonic_first_fresh_s is None
+        ):
+            self.replacement_sonic_first_fresh_s = now_s
+        output = self.fsm.step(observation)
+        self.last_output = output
+        if output.state is not previous:
+            self.last_transition_s = now_s
+            if output.state is RecoveryState.SONIC_STOP_REQUESTED:
+                self.episodes += 1
+                self.current_recovery_worker_episode_id = None
+                self.previous_sonic_writer_revoked = False
+                self.previous_sonic_stopped = False
+                self.policy_fallback_last_near_upright_s = None
+                self.policy_fallback_quiet_since_s = None
+                self.policy_advance_requested = False
+            elif output.resume_game:
+                self.recoveries += 1
+                self.latest_completed_recovery_worker_episode_id = (
+                    self.current_recovery_worker_episode_id
+                )
+        if (
+            previous is RecoveryState.SONIC_STABILIZING
+            and output.state is RecoveryState.WAIT_NEUTRAL
+        ):
+            # Each native deploy defines yaw zero from the physical pose it sees
+            # at startup. Keep camera/game math in the original world frame and
+            # rotate only its planner wire command into the new deploy frame.
+            self._capture_restart_anchor(snapshot.qpos)
+        return output
+
+    def reframe_game_command(
+        self,
+        command: RobotMotionCommand,
+        *,
+        measured_heading_rad: float | None = None,
+        dt_s: float | None = None,
+    ) -> RobotMotionCommand:
+        """Rotate a world command and bound it against physical deploy yaw.
+
+        The transform is downstream of :class:`GameControlCore`, so it is a
+        safety boundary of its own.  When physical yaw is supplied, the wire
+        target slews by at most ``WIRE_MAX_HEADING_STEP_RAD`` and
+        ``WIRE_MAX_TURN_RATE_RAD_S * dt_s`` per published frame.  Do not clamp
+        a turn back to the core's small single-tick planner lead: the command
+        also carries its true camera-relative final heading, and this boundary
+        uses up to a finite physical lead window without ever targeting beyond
+        that final heading.  Once the core requests movement, the boundary
+        slews back to the exact core target before allowing translation.
+        A clipped moving command is converted to native turn-only form;
+        translation never gets published in a direction this boundary did not
+        approve.  Neutral/safety commands keep both the core's one-shot
+        stopped-heading latch and this active-wire latch unchanged.
+        """
+
+        if not isinstance(command, RobotMotionCommand):
+            raise TypeError("command must be a RobotMotionCommand")
+        angle = self.command_frame_rotation_rad
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+
+        def rotate(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+            x, y, z = vector
+            return (
+                cosine * x - sine * y,
+                sine * x + cosine * y,
+                z,
+            )
+
+        rotated_movement = rotate(command.movement)
+        rotated_facing = rotate(command.facing)
+        rotated_desired_facing = (
+            rotate(command.desired_facing)
+            if command.desired_facing is not None
+            else None
+        )
+        finite_values = [
+            *rotated_movement,
+            *rotated_facing,
+            command.speed_mps,
+        ]
+        if rotated_desired_facing is not None:
+            finite_values.extend(rotated_desired_facing)
+        if not all(
+            math.isfinite(value) for value in finite_values
+        ):
+            raise ValueError("reframed game command must be finite")
+        locomotion_mode = command.locomotion_mode
+        mode = command.mode
+        speed_mps = command.speed_mps
+        reason = command.reason
+        limited = False
+        heading_error = 0.0
+        movement_norm = math.hypot(
+            rotated_movement[0], rotated_movement[1]
+        )
+        active_turn_intent = (
+            mode in {"move", "turn"}
+            or abs(speed_mps) > 1e-12
+            or movement_norm > 1e-12
+        )
+        step_seconds = 1.0 / 50.0 if dt_s is None else float(dt_s)
+        if not math.isfinite(step_seconds) or step_seconds < 0.0:
+            raise ValueError("reframe dt_s must be finite and nonnegative")
+        maximum_step = min(
+            self.WIRE_MAX_HEADING_STEP_RAD,
+            self.WIRE_MAX_TURN_RATE_RAD_S * step_seconds,
+        )
+        if measured_heading_rad is not None and active_turn_intent:
+            measured_wire_heading = wrap_angle_rad(
+                measured_heading_rad + angle
+            )
+            facing_norm = math.hypot(rotated_facing[0], rotated_facing[1])
+            if facing_norm <= 1e-12:
+                raise ValueError(
+                    "active reframed game command has zero horizontal facing"
+                )
+            else:
+                requested_wire_heading = math.atan2(
+                    rotated_facing[1], rotated_facing[0]
+                )
+                heading_error = wrap_angle_rad(
+                    requested_wire_heading - measured_wire_heading
+                )
+                wire_target_heading = requested_wire_heading
+                if mode == "turn" and rotated_desired_facing is not None:
+                    desired_norm = math.hypot(
+                        rotated_desired_facing[0],
+                        rotated_desired_facing[1],
+                    )
+                    if desired_norm <= 1e-12:
+                        raise ValueError(
+                            "active reframed game command has zero desired facing"
+                        )
+                    desired_wire_heading = math.atan2(
+                        rotated_desired_facing[1],
+                        rotated_desired_facing[0],
+                    )
+                    desired_error = wrap_angle_rad(
+                        desired_wire_heading - measured_wire_heading
+                    )
+                    bounded_desired_error = max(
+                        -self.WIRE_TURN_LEAD_WINDOW_RAD,
+                        min(self.WIRE_TURN_LEAD_WINDOW_RAD, desired_error),
+                    )
+                    wire_target_heading = wrap_angle_rad(
+                        measured_wire_heading
+                        + bounded_desired_error
+                    )
+                    heading_error = desired_error
+                previous_wire_heading = self.last_wire_facing_heading_rad
+                if previous_wire_heading is None:
+                    previous_wire_heading = measured_wire_heading
+                wire_slew = wrap_angle_rad(
+                    wire_target_heading - previous_wire_heading
+                )
+                bounded_wire_slew = max(
+                    -maximum_step,
+                    min(maximum_step, wire_slew),
+                )
+                wire_limited = not math.isclose(
+                    bounded_wire_slew,
+                    wire_slew,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                bounded_heading = wrap_angle_rad(
+                    previous_wire_heading + bounded_wire_slew
+                )
+                rotated_facing = (
+                    math.cos(bounded_heading),
+                    math.sin(bounded_heading),
+                    0.0,
+                )
+                self.last_wire_facing_heading_rad = bounded_heading
+                limited = wire_limited
+                if mode == "turn" or limited:
+                    rotated_movement = (0.0, 0.0, 0.0)
+                    speed_mps = 0.0
+                    locomotion_mode = SONIC_SLOW_WALK_MODE
+                    mode = "turn"
+                    if limited:
+                        reason = "recovery_heading_slew_limited"
+                if limited:
+                    self.reframe_limited_frames += 1
+            self.last_reframe_limited = limited
+            self.last_reframe_heading_error_rad = heading_error
+        else:
+            if not active_turn_intent:
+                # Key release, focus loss, and deadman already carry the one-
+                # shot physical heading latched by GameControlCore.  Unwind any
+                # larger recovery turn lead toward that fixed safe target
+                # without a discontinuity.  Translation is zero throughout;
+                # importantly, this does not keep chasing noisy measured yaw.
+                target_norm = math.hypot(
+                    rotated_facing[0], rotated_facing[1]
+                )
+                if target_norm <= 1e-12:
+                    raise ValueError(
+                        "stopped reframed game command has zero horizontal facing"
+                    )
+                stopped_target_heading = math.atan2(
+                    rotated_facing[1], rotated_facing[0]
+                )
+                previous_wire_heading = self.last_wire_facing_heading_rad
+                if previous_wire_heading is None:
+                    previous_wire_heading = stopped_target_heading
+                wire_slew = wrap_angle_rad(
+                    stopped_target_heading - previous_wire_heading
+                )
+                bounded_wire_slew = max(
+                    -maximum_step,
+                    min(maximum_step, wire_slew),
+                )
+                limited = not math.isclose(
+                    bounded_wire_slew,
+                    wire_slew,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                bounded_heading = wrap_angle_rad(
+                    previous_wire_heading + bounded_wire_slew
+                )
+                self.last_wire_facing_heading_rad = bounded_heading
+                rotated_facing = (
+                    math.cos(bounded_heading),
+                    math.sin(bounded_heading),
+                    0.0,
+                )
+                rotated_movement = (0.0, 0.0, 0.0)
+                speed_mps = 0.0
+                locomotion_mode = SONIC_IDLE_MODE
+                if limited:
+                    self.reframe_limited_frames += 1
+            self.last_reframe_limited = limited
+            self.last_reframe_heading_error_rad = 0.0
+
+        return RobotMotionCommand(
+            sequence=command.sequence,
+            movement=rotated_movement,
+            facing=rotated_facing,
+            speed_mps=speed_mps,
+            locomotion_mode=locomotion_mode,
+            mode=mode,
+            safe_stop=command.safe_stop,
+            reason=reason,
+            desired_facing=rotated_desired_facing,
+        )
+
+    @staticmethod
+    def sonic_bootstrap_command(command: RobotMotionCommand) -> RobotMotionCommand:
+        """Return a neutral start frame expressed in a new deploy's yaw frame."""
+
+        return RobotMotionCommand(
+            sequence=command.sequence,
+            movement=(0.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=SONIC_IDLE_MODE,
+            mode="deadman",
+            safe_stop=True,
+            reason="physical_recovery_sonic_bootstrap",
+            desired_facing=(1.0, 0.0, 0.0),
+        )
+
+    def resident_sonic_hold_command(
+        self,
+        command: RobotMotionCommand,
+        *,
+        measured_heading_rad: float,
+    ) -> RobotMotionCommand:
+        """Keep the resident SONIC planner neutral at the live body heading."""
+
+        wire_heading = wrap_angle_rad(
+            float(measured_heading_rad) + self.command_frame_rotation_rad
+        )
+        self.last_wire_facing_heading_rad = wire_heading
+        facing = (
+            math.cos(wire_heading),
+            math.sin(wire_heading),
+            0.0,
+        )
+        return RobotMotionCommand(
+            sequence=command.sequence,
+            movement=(0.0, 0.0, 0.0),
+            facing=facing,
+            speed_mps=0.0,
+            locomotion_mode=SONIC_IDLE_MODE,
+            mode="deadman",
+            safe_stop=True,
+            reason="physical_recovery_resident_sonic_hold",
+            desired_facing=facing,
+        )
+
+    def recovery_wire_command(
+        self,
+        command: RobotMotionCommand,
+        output: RecoveryOutput | ResidentRecoveryOutput | None,
+        *,
+        measured_heading_rad: float,
+        dt_s: float,
+    ) -> RobotMotionCommand:
+        """Apply recovery lifecycle gating at the final planner boundary."""
+
+        if (
+            output is not None
+            and isinstance(output.state, ResidentRecoveryState)
+            and output.state is not ResidentRecoveryState.GAME_SONIC
+        ):
+            # The resident deploy keeps consuming planner frames while KungFu
+            # owns LowCmd. Track the live body yaw so RESUME cannot inherit a
+            # stale camera-facing turn request during the fragile handoff.
+            return self.resident_sonic_hold_command(
+                command,
+                measured_heading_rad=measured_heading_rad,
+            )
+        if (
+            output is not None
+            and (
+                output.state
+                in {
+                    RecoveryState.SONIC_RESTARTING,
+                    RecoveryState.SONIC_STABILIZING,
+                }
+                or (
+                    output.state is RecoveryState.WAIT_NEUTRAL
+                    and not self.sonic_writer.reentry_policy_full_control
+                )
+            )
+        ):
+            # SONIC owns its writer-ACKed IDLE policy takeover.  Keep sending the
+            # exact deploy-frame bootstrap while that takeover is in progress;
+            # a non-IDLE planner frame would interrupt the protected transition.
+            return self.sonic_bootstrap_command(command)
+        return self.reframe_game_command(
+            command,
+            measured_heading_rad=measured_heading_rad,
+            dt_s=dt_s,
+        )
+
+    def execute(
+        self,
+        output: RecoveryOutput | ResidentRecoveryOutput,
+        *,
+        processes: NativeProcessGroup,
+        planner: NativePlannerClient,
+    ) -> None:
+        game_state = output.state in {
+            RecoveryState.GAME_SONIC,
+            ResidentRecoveryState.GAME_SONIC,
+        }
+        resident_worker_ready = (
+            not self.resident_policies
+            or self._resident_worker_attested(
+                policy_alive=processes.recovery_policy_alive()
+            )
+        )
+        if (
+            self.initial_sonic_gate_pending
+            and game_state
+            and self.sonic_writer.ready
+            and resident_worker_ready
+        ):
+            if self.sonic_writer.writer_created or self.sonic_writer.first_write:
+                raise RuntimeError("initial SONIC wrote before writer-gate GO")
+            self.sonic_writer.send("GO")
+            self.initial_sonic_gate_pending = False
+        if output.start_policy_process:
+            self.start_writer_free_policy(processes=processes)
+        if self.resident_policies:
+            if output.request_sonic_pause:
+                if not (
+                    self.sonic_writer.paused
+                    or self.sonic_writer.pause_pending
+                    or self.sonic_writer.stop_sent
+                ):
+                    self.sonic_writer.send("PAUSE")
+            if output.authorize_policy_writer:
+                episode_id = self.worker.begin_resident_episode()
+                self.current_recovery_worker_episode_id = episode_id
+                self.worker.send("GO")
+            if output.request_policy_pause:
+                if not self.worker.paused and not self.worker.pause_sent:
+                    self.worker.send("PAUSE")
+            if output.resume_sonic_writer:
+                if self.sonic_writer.paused and not self.sonic_writer.resume_pending:
+                    self.sonic_writer.send("RESUME")
+            return
+        if output.request_sonic_stop:
+            processes.begin_deploy_stop()
+            # Recovery outputs may keep requesting a stop after the original
+            # request has timed out.  Preserve strict duplicate detection in
+            # the writer protocol itself, but make this action dispatcher
+            # idempotent so a fail-closed retry cannot mask the real timeout.
+            if not self.sonic_writer.stop_sent:
+                if (
+                    self.sonic_writer.expected_peer_pid is not None
+                    and self.sonic_writer.connection is not None
+                    and not self.sonic_writer.stopped
+                ):
+                    self.sonic_writer.send("STOP")
+                else:
+                    planner.request_deploy_stop()
+        if output.authorize_policy_writer:
+            if self.worker.episode_id is None:
+                raise RuntimeError("physical recovery worker has no episode id")
+            self.current_recovery_worker_episode_id = self.worker.episode_id
+            self.worker.send("GO")
+        if output.request_policy_hold:
+            self.worker.send("ENTER_AMP_HOLD")
+        if output.request_policy_stop:
+            # Mark this PID as an expected protocol-driven exit before STOP is
+            # sent.  The worker can revoke its publisher, emit STOPPED, and
+            # exit(0) within one supervisor frame; without this boundary the
+            # generic child monitor can misclassify that successful exit as a
+            # crash before the FSM consumes STOPPED.  This method sends no
+            # signal, so the reliable control protocol remains the first and
+            # only normal writer-revocation path.
+            processes.begin_recovery_policy_stop()
+            if self.worker.connection is not None:
+                # STOP is the writer-revocation fence.  Sending SIGTERM to the
+                # process group first lets the worker observe EOF/signal and
+                # emit STOPPED before this control object has recorded that a
+                # supervisor STOP was authorized.  Let the reliable seqpacket
+                # command close the publisher and exit the worker normally;
+                # the FSM timeout/outer cleanup remains the hard-kill backup.
+                self.worker.send("STOP")
+        if output.start_sonic:
+            if self.zmq_port is None:
+                raise RuntimeError("physical recovery coordinator is not open")
+            self.sonic_writer.reset_for_start()
+            processes.start_deploy(
+                interface=self.interface,
+                zmq_port=self.zmq_port,
+                writer_control_socket=self.sonic_writer.path,
+                # Recovery must bypass SONIC's three-second default-angle
+                # InitControl ramp: live E2E shows that ramp pulls an already
+                # stable robot back to the floor before planner control begins.
+                # Writer re-entry captures the measured 29-DoF handoff pose,
+                # holds it for 0.5 s, then blends into SONIC over 5 s.
+                physical_reentry=True,
+            )
+            deploy_pid = processes.deploy_pid()
+            if deploy_pid is None:
+                raise RuntimeError("replacement SONIC has no process PID")
+            self.sonic_writer.bind_expected_peer_pid(deploy_pid)
+            self.replacement_sonic_started_s = time.perf_counter()
+            self.replacement_sonic_ready_s = None
+            self.replacement_sonic_first_fresh_s = None
+        if output.authorize_sonic_writer:
+            self.sonic_writer.send("GO")
+
+    def start_writer_free_policy(self, *, processes: NativeProcessGroup) -> int:
+        """Start a fully loaded HoST/AMP standby without a LowCmd writer."""
+
+        self.worker.reset_for_start()
+        worker_pid = processes.start_recovery_policy(
+            self.worker_python,
+            self.worker_script,
+            interface=self.interface,
+            control_socket=self.worker.path,
+            model=self.model,
+            fallback_models=self.fallback_models,
+            fallback_after_s=self.fallback_after_s,
+            amp_config=self.amp_config,
+            amp_model=self.amp_model,
+            amp_config_sha256=self.amp_config_sha256,
+            amp_model_sha256=self.amp_model_sha256,
+            kungfu_model=self.kungfu_model,
+            kungfu_motion=self.kungfu_motion,
+            kungfu_model_sha256=self.kungfu_model_sha256,
+            kungfu_model_data_sha256=self.kungfu_model_data_sha256,
+            kungfu_motion_sha256=self.kungfu_motion_sha256,
+            kungfu_reference_frame=self.kungfu_reference_frame,
+            kungfu_gain_scale=self.kungfu_gain_scale,
+            initial_controller=self.initial_controller,
+            execution_provider=self.execution_provider,
+        )
+        self.worker.bind_expected_peer_pid(worker_pid)
+        return worker_pid
+
+    def verify_writer_free_prewarm_start(
+        self,
+        output: RecoveryOutput,
+        *,
+        processes: NativeProcessGroup,
+        previous_generation: int,
+    ) -> None:
+        """Fail closed unless a new SONIC is alive and still writer-free.
+
+        Replacement SONIC now prewarms while HoST/AMP still owns LowCmd, so a
+        successful spawn must remain in a policy-owned state.  Entering
+        ``SONIC_STABILIZING`` here was the old, sequential hand-off semantic.
+        """
+
+        if processes.deploy_generation != previous_generation + 1:
+            raise RuntimeError(
+                "writer-free SONIC prewarm did not advance exactly one generation"
+            )
+        if not processes.deploy_alive():
+            raise RuntimeError("writer-free SONIC prewarm process is not alive")
+        if output.fail_closed or output.state not in self._PREWARM_POLICY_STATES:
+            raise RuntimeError(
+                "writer-free SONIC prewarm left the policy-owned recovery phase"
+            )
+        if self.sonic_writer.writer_created or self.sonic_writer.first_write:
+            raise RuntimeError("writer-free SONIC prewarm acquired LowCmd before GO")
+
+    def telemetry(
+        self, *, now_s: float, processes: NativeProcessGroup
+    ) -> dict[str, object]:
+        output = self.last_output
+        return {
+            "mode": "physical",
+            "policy_lifecycle": (
+                "resident_authority_switch"
+                if self.resident_policies
+                else "replacement_process"
+            ),
+            "resident_policies_enabled": self.resident_policies,
+            "execution_provider": self.execution_provider,
+            "state": self.fsm.state.value,
+            "authority_policy_id": (
+                output.authority_policy_id if output is not None else "sonic"
+            ),
+            "recovery_policy_id": (
+                output.recovery_policy_id
+                if output is not None
+                else self.initial_controller
+            ),
+            "failure_reason": self.fsm.failure_reason,
+            "fail_closed": self.fsm.failed,
+            "current_fall_detected": self.current_fall_detected,
+            "episodes": self.episodes,
+            "recoveries": self.recoveries,
+            "deploy_alive": processes.deploy_alive(),
+            "deploy_generation": processes.deploy_generation,
+            "sonic_pid": self.sonic_writer.expected_peer_pid,
+            "recovery_policy_pid": self.worker.expected_peer_pid,
+            "resident_process_identity_stable": (
+                self.resident_policies
+                and processes.deploy_alive()
+                and processes.recovery_policy_alive()
+                and not self.sonic_writer.stopped
+                and not self.worker.stopped
+            ),
+            "initial_root_yaw_rad": round(self.initial_root_yaw_rad, 6),
+            "restarted_root_yaw_rad": (
+                round(self.restarted_root_yaw_rad, 6)
+                if self.restarted_root_yaw_rad is not None
+                else None
+            ),
+            "command_frame_rotation_rad": round(
+                self.command_frame_rotation_rad, 6
+            ),
+            "command_frame_epoch": self.command_frame_epoch,
+            "last_wire_facing_heading_rad": (
+                round(self.last_wire_facing_heading_rad, 6)
+                if self.last_wire_facing_heading_rad is not None
+                else None
+            ),
+            "reframe_limited_frames": self.reframe_limited_frames,
+            "last_reframe_limited": self.last_reframe_limited,
+            "last_reframe_heading_error_rad": round(
+                self.last_reframe_heading_error_rad, 6
+            ),
+            "policy_alive": processes.recovery_policy_alive(),
+            "inhibit_game_input": (
+                output.inhibit_game_input if output is not None else False
+            ),
+            "last_transition_age_s": (
+                round(max(0.0, now_s - self.last_transition_s), 6)
+                if self.last_transition_s is not None
+                else None
+            ),
+            "worker": self.worker.telemetry(),
+            "sonic_writer_gate": self.sonic_writer.telemetry(),
+            "replacement_sonic_writer_gate": self.sonic_writer.telemetry(),
+            "initial_sonic_gate_pending": self.initial_sonic_gate_pending,
+            "previous_sonic_writer_revoked": (
+                self.previous_sonic_writer_revoked
+            ),
+            "previous_sonic_stopped": self.previous_sonic_stopped,
+            "physical_only": True,
+            "simulator_state_mutation": False,
+            "single_writer_scope": (
+                "authority_epoch_fence"
+                if self.resident_policies
+                else "managed_processes_and_host_lock"
+            ),
+            "external_dds_writer_identity_observable": False,
+            "takeover_settle_s": self.fsm.config.takeover_settle_s,
+            "stable_hold_s": self.fsm.config.stable_hold_s,
+            "policy_exit_hold_s": self.fsm.config.policy_exit_hold_s,
+            "policy_timeout_s": self.fsm.config.policy_recovery_timeout_s,
+            "sonic_prewarm_timeout_s": self.fsm.config.sonic_prewarm_timeout_s,
+            "sonic_stabilize_timeout_s": (
+                self.fsm.config.sonic_stabilize_timeout_s
+            ),
+            "episode_timeout_s": self.fsm.config.episode_timeout_s,
+            "fallback_after_s": self.fallback_after_s,
+            "fallback_authority": "matrix_full_physical_state",
+            "policy_advance_requested": self.policy_advance_requested,
+            "policy_advances": self.policy_advances,
+            "current_recovery_worker_episode_id": (
+                self.current_recovery_worker_episode_id
+            ),
+            "latest_completed_recovery_worker_episode_id": (
+                self.latest_completed_recovery_worker_episode_id
+            ),
+            "policy_fallback_quiet_since_s": self.policy_fallback_quiet_since_s,
+            "policy_fallback_last_near_upright_s": (
+                self.policy_fallback_last_near_upright_s
+            ),
+            "initial_controller": self.initial_controller,
+            "kungfu_reference_frame": (
+                self.kungfu_reference_frame
+                if self.initial_controller == "kungfu"
+                else None
+            ),
+            "kungfu_gain_scale": (
+                self.kungfu_gain_scale
+                if self.initial_controller == "kungfu"
+                else None
+            ),
+            "handoff_mode": self.handoff_mode,
+            "replacement_sonic_started_s": self.replacement_sonic_started_s,
+            "replacement_sonic_ready_s": self.replacement_sonic_ready_s,
+            "replacement_sonic_ready_latency_s": (
+                round(
+                    self.replacement_sonic_ready_s
+                    - self.replacement_sonic_started_s,
+                    6,
+                )
+                if self.replacement_sonic_started_s is not None
+                and self.replacement_sonic_ready_s is not None
+                else None
+            ),
+            "replacement_sonic_first_fresh_s": (
+                self.replacement_sonic_first_fresh_s
+            ),
+            "replacement_sonic_first_fresh_latency_s": (
+                round(
+                    self.replacement_sonic_first_fresh_s
+                    - self.replacement_sonic_started_s,
+                    6,
+                )
+                if self.replacement_sonic_started_s is not None
+                and self.replacement_sonic_first_fresh_s is not None
+                else None
+            ),
+        }
+
+    def close(self) -> None:
+        self.worker.close()
+        self.sonic_writer.close()
+
+
+def _reanchor_game_heading_after_recovery_transition(
+    output: RecoveryOutput,
+    core: GameControlCore,
+    *,
+    measured_heading_rad: float,
+) -> bool:
+    """Reseed the game heading exactly on the replacement-deploy handoff."""
+
+    if not (
+        output.previous_state is RecoveryState.SONIC_STABILIZING
+        and output.state is RecoveryState.WAIT_NEUTRAL
+    ):
+        return False
+    assert output.inhibit_game_input
+    core.reanchor_heading(measured_heading_rad)
+    return True
+
+
 def _close_runtime_resource(name: str, resource) -> str | None:
     if resource is None:
         return None
@@ -2763,10 +5870,10 @@ def _record_cleanup_failure(path: Path | None, errors: list[str]) -> None:
     _atomic_json(path, payload)
 
 
-def main() -> int:
+def main(*, completion_event: threading.Event | None = None) -> int:
     args = _parse_args()
     # Several focused tests and downstream embedders construct the historical
-    # argparse namespace directly.  New optional gameplay fields must remain
+    # argparse namespace directly. New optional gameplay fields remain
     # absent-safe for those callers.
     for name, default in (
         ("game_world_id", None),
@@ -2973,6 +6080,7 @@ def main() -> int:
         )
     ):
         raise SystemExit("qualification metadata requires --qualified-runtime")
+    _validate_game_fall_recovery(args)
     qualification_receipt = _validate_qualification_receipt(args)
     _validate_qualified_acceptance(args)
     _validate_qualified_game_control(args)
@@ -3019,6 +6127,8 @@ def main() -> int:
     game_world = None
     game_commands = None
     game_command_child_socket = None
+    game_fall_recovery = None
+    physical_recovery = None
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -3159,6 +6269,16 @@ def main() -> int:
                         socket.SOCK_SEQPACKET,
                     )
                     game_commands = GameCommandRuntime(command_parent, game_world)
+                if getattr(args, "game_fall_recovery", "off") == "sonic":
+                    game_fall_recovery = _GameFallRecoveryGate(
+                        timeout_s=args.game_fall_recovery_timeout
+                    )
+                elif getattr(args, "game_fall_recovery", "off") == "physical":
+                    physical_recovery = _PhysicalRecoveryCoordinator(
+                        args,
+                        initial_root_yaw_rad=initial_root_yaw_rad,
+                    )
+                    physical_recovery.open(zmq_port=planner_port)
                 try:
                     game_input.open()
                 except OSError as exc:
@@ -3223,9 +6343,18 @@ def main() -> int:
                 args.pico_python or sys.executable, port=planner_port
             )
         if running:
-            processes.start_deploy(
-                interface=args.dds_interface, zmq_port=planner_port
+            initial_writer_control_socket = (
+                physical_recovery.prepare_initial_sonic_gate()
+                if physical_recovery is not None
+                else None
             )
+            processes.start_deploy(
+                interface=args.dds_interface,
+                zmq_port=planner_port,
+                writer_control_socket=initial_writer_control_socket,
+            )
+            if physical_recovery is not None:
+                physical_recovery.bind_initial_sonic_gate(processes=processes)
 
         expected_packet_size = packet_size(
             nq=len(snapshot.qpos), nv=len(snapshot.qvel), nu=len(snapshot.ctrl)
@@ -3276,7 +6405,13 @@ def main() -> int:
             frame_wall = time.perf_counter()
             elapsed_wall = frame_wall - started_wall
             if args.max_seconds > 0.0 and elapsed_wall >= args.max_seconds:
-                termination_reason = "max_seconds"
+                if termination_reason is None:
+                    termination_reason = "max_seconds"
+                poll_failed_child()
+                break
+            if completion_event is not None and completion_event.is_set():
+                if termination_reason is None:
+                    termination_reason = "scenario_complete"
                 poll_failed_child()
                 break
 
@@ -3294,6 +6429,42 @@ def main() -> int:
                 if game_input is not None:
                     assert initial_root_yaw_rad is not None
                     assert game_readiness is not None
+                    recovery_transition = None
+                    if game_fall_recovery is not None:
+                        try:
+                            recovery_transition = game_fall_recovery.observe(
+                                snapshot,
+                                now_s=frame_wall,
+                            )
+                        except ValueError as exc:
+                            unstable = True
+                            running = False
+                            termination_reason = "numerical_instability"
+                            numerical_error = f"fall_recovery:{exc}"
+                            print(
+                                "matrix-sonic-runtime ERROR invalid fall "
+                                f"recovery state: {exc}",
+                                flush=True,
+                            )
+                            break
+                        if recovery_transition == "entered":
+                            print(
+                                "matrix-sonic-runtime fall recovery entered "
+                                f"episode={game_fall_recovery.episodes} "
+                                "source="
+                                f"{game_fall_recovery.last_entry_source}",
+                                flush=True,
+                            )
+                        elif recovery_transition == "recovered":
+                            game_input.core.invalidate_input(
+                                "fall_recovered_awaiting_neutral"
+                            )
+                            print(
+                                "matrix-sonic-runtime fall recovery completed "
+                                f"episode={game_fall_recovery.episodes} "
+                                f"duration_s={game_fall_recovery.last_duration_s:.3f}",
+                                flush=True,
+                            )
                     try:
                         measured_heading = wrap_angle_rad(
                             _root_yaw_rad(snapshot.qpos) - initial_root_yaw_rad
@@ -3315,15 +6486,181 @@ def main() -> int:
                         now_s=frame_wall,
                         dt_s=1.0 / args.control_hz,
                     )
-                    game_command = game_readiness.apply(
+                    ready_game_command = game_readiness.apply(
                         candidate_game_command,
                         game_input.core,
                     )
+                    physical_output = None
+                    if physical_recovery is not None:
+                        foot_contact = _physical_foot_contact(simulator)
+                        grounded_contact = _physical_ground_contact(simulator)
+                        neutral_confirmed = (
+                            candidate_game_command.mode == "idle"
+                            and not candidate_game_command.safe_stop
+                        )
+                        try:
+                            physical_output = physical_recovery.observe(
+                                snapshot,
+                                now_s=frame_wall,
+                                neutral_confirmed=neutral_confirmed,
+                                foot_contact=foot_contact,
+                                grounded_contact=grounded_contact,
+                                processes=processes,
+                            )
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            unstable = True
+                            running = False
+                            termination_reason = "physical_recovery_failed"
+                            numerical_error = f"physical_recovery:{exc}"
+                            print(
+                                "matrix-sonic-runtime ERROR physical recovery: "
+                                f"{exc}",
+                                flush=True,
+                            )
+                            break
+                        if _reanchor_game_heading_after_recovery_transition(
+                            physical_output,
+                            game_input.core,
+                            measured_heading_rad=measured_heading,
+                        ):
+                            # observe() has just crossed
+                            # SONIC_STABILIZING -> WAIT_NEUTRAL and captured the
+                            # replacement deploy's physical yaw zero.  The core
+                            # command was polled before that lifecycle event, so
+                            # reseed it once.  This transition inhibits game
+                            # input, and emergency_stop() below materializes the
+                            # reanchored neutral command exactly once.
+                            print(
+                                "matrix-sonic-runtime recovery heading "
+                                "reanchored "
+                                f"epoch={physical_recovery.command_frame_epoch} "
+                                f"world_heading_rad={measured_heading:.6f}",
+                                flush=True,
+                            )
+                    if (
+                        physical_output is not None
+                        and physical_output.inhibit_game_input
+                    ) or (
+                        game_fall_recovery is not None
+                        and game_fall_recovery.recovering
+                    ):
+                        game_command = game_input.emergency_stop(
+                            now_s=frame_wall,
+                            reason=(
+                                "physical_fall_recovery"
+                                if physical_output is not None
+                                else "fall_recovery"
+                            ),
+                        )
+                    else:
+                        game_command = ready_game_command
+                    if physical_recovery is not None:
+                        game_command = physical_recovery.recovery_wire_command(
+                            game_command,
+                            physical_output,
+                            measured_heading_rad=measured_heading,
+                            dt_s=1.0 / args.control_hz,
+                        )
                     # Telemetry must describe the command actually published,
                     # not the pre-readiness candidate returned by the core.
                     game_input.last_command = game_command
-                    planner.send_game_command(game_command)
-                    game_input.record_published_command(game_command)
+                    command_published = False
+                    if physical_output is not None:
+                        # On the trigger frame publish one final neutral command
+                        # before the deploy-only stop frame. Once the replacement
+                        # process exists, repeat neutral start frames to cross the
+                        # ZMQ subscriber handshake without forwarding user input.
+                        if (
+                            physical_recovery is not None
+                            and physical_recovery.resident_policies
+                        ):
+                            # The same SONIC process keeps consuming neutral
+                            # planner frames while KungFu owns LowCmd.
+                            planner.send_game_command(game_command)
+                            command_published = True
+                        elif physical_output.request_sonic_stop:
+                            planner.send_game_command(game_command)
+                            command_published = True
+                        elif (
+                            physical_output.state
+                            in {
+                                RecoveryState.SONIC_RESTARTING,
+                                RecoveryState.SONIC_STABILIZING,
+                                RecoveryState.WAIT_NEUTRAL,
+                            }
+                            and processes.deploy_alive()
+                        ):
+                            planner.send_game_command(game_command)
+                            command_published = True
+                        elif not physical_output.inhibit_game_input:
+                            planner.send_game_command(game_command)
+                            command_published = True
+                        if not running:
+                            break
+                        try:
+                            deploy_generation_before = processes.deploy_generation
+                            physical_recovery.execute(
+                                physical_output,
+                                processes=processes,
+                                planner=planner,
+                            )
+                            if physical_output.start_sonic:
+                                # Generation is incremented synchronously with
+                                # Popen. Re-observe the still-stale snapshot
+                                # before any physics tick so a very fast deploy
+                                # cannot hide the required new-generation stale
+                                # baseline before its first LowCmd.
+                                physical_output = physical_recovery.observe(
+                                    snapshot,
+                                    now_s=frame_wall,
+                                    neutral_confirmed=False,
+                                    foot_contact=foot_contact,
+                                    grounded_contact=grounded_contact,
+                                    processes=processes,
+                                )
+                                physical_recovery.verify_writer_free_prewarm_start(
+                                    physical_output,
+                                    processes=processes,
+                                    previous_generation=deploy_generation_before,
+                                )
+                                if processes.deploy_alive():
+                                    planner.send_game_command(game_command)
+                                    command_published = True
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            unstable = True
+                            running = False
+                            termination_reason = "physical_recovery_failed"
+                            numerical_error = f"physical_recovery_action:{exc}"
+                            print(
+                                "matrix-sonic-runtime ERROR physical recovery "
+                                f"action: {exc}",
+                                flush=True,
+                            )
+                            break
+                        if physical_output.fail_closed:
+                            unstable = True
+                            running = False
+                            termination_reason = "physical_recovery_failed"
+                            numerical_error = (
+                                "physical_recovery_fsm:"
+                                f"{physical_output.failure_reason}"
+                            )
+                            break
+                    elif (
+                        game_fall_recovery is not None
+                        and game_fall_recovery.recovering
+                    ):
+                        planner.send_recovery_posture(
+                            locomotion_mode=game_fall_recovery.native_mode,
+                            height=game_fall_recovery.target_height,
+                            facing=game_command.facing,
+                        )
+                        command_published = True
+                    else:
+                        planner.send_game_command(game_command)
+                        command_published = True
+                    if command_published:
+                        game_input.record_published_command(game_command)
                     walking = game_command.mode == "move"
                     if game_commands is not None:
                         command_allowed = bool(
@@ -3596,6 +6933,21 @@ def main() -> int:
                     status["game_auto_respawn"] = bool(args.game_auto_respawn)
                 if game_commands is not None:
                     status["game_commands"] = game_commands.telemetry()
+                    if game_fall_recovery is not None:
+                        recovery_status = game_fall_recovery.status(now_s=now)
+                        status["game_fall_recovery"] = recovery_status
+                        status["current_fall_detected"] = recovery_status[
+                            "current_fall_detected"
+                        ]
+                    elif physical_recovery is not None:
+                        recovery_status = physical_recovery.telemetry(
+                            now_s=now,
+                            processes=processes,
+                        )
+                        status["game_fall_recovery"] = recovery_status
+                        status["current_fall_detected"] = recovery_status[
+                            "current_fall_detected"
+                        ]
                 print(
                     f"matrix-sonic-runtime status={json.dumps(status, sort_keys=True)}",
                     flush=True,
@@ -3614,6 +6966,7 @@ def main() -> int:
         if game_input is not None:
             assert game_readiness is not None
             assert initial_root_yaw_rad is not None
+            boundary_measured_heading = None
             try:
                 boundary_measured_heading = wrap_angle_rad(
                     _root_yaw_rad(snapshot.qpos) - initial_root_yaw_rad
@@ -3653,6 +7006,12 @@ def main() -> int:
                 now_s=time.perf_counter(),
                 reason=game_stop_reason,
             )
+            if physical_recovery is not None:
+                game_command = physical_recovery.reframe_game_command(
+                    game_command,
+                    measured_heading_rad=boundary_measured_heading,
+                    dt_s=0.0,
+                )
             planner.send_game_command(game_command)
             walking = False
 
@@ -3885,6 +7244,21 @@ def main() -> int:
             final_status["game_world_state"] = game_world.telemetry()
         if game_commands is not None:
             final_status["game_commands"] = game_commands.telemetry()
+            if game_fall_recovery is not None:
+                recovery_status = game_fall_recovery.status(now_s=finished_wall)
+                final_status["game_fall_recovery"] = recovery_status
+                final_status["current_fall_detected"] = recovery_status[
+                    "current_fall_detected"
+                ]
+            elif physical_recovery is not None:
+                recovery_status = physical_recovery.telemetry(
+                    now_s=finished_wall,
+                    processes=processes,
+                )
+                final_status["game_fall_recovery"] = recovery_status
+                final_status["current_fall_detected"] = recovery_status[
+                    "current_fall_detected"
+                ]
         _atomic_json(args.status_file, final_status)
         print(
             "matrix-sonic-runtime stopped "
@@ -3904,6 +7278,7 @@ def main() -> int:
             proposed_exit_code = 0
         else:
             proposed_exit_code = 2
+        return 0 if passed else 2
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_errors = []
@@ -3932,6 +7307,7 @@ def main() -> int:
         if error is not None:
             cleanup_errors.append(error)
         for name, resource in (
+            ("physical recovery", physical_recovery),
             ("native processes", processes),
             ("renderer", renderer),
             ("simulator", simulator),

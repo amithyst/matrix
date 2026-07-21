@@ -343,6 +343,10 @@ KEYBOARD_GAIT_TARGETS_MPS = {
     SONIC_RUN_MODE: 2.50,
 }
 DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
+# A feedback-backed facing target may lead the measured body by at most one
+# normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
+# per-command cap even if a caller supplies a larger dt or tuning rate.
+MAX_MEASURED_FACING_LEAD_RAD = 0.05
 
 
 def native_locomotion_mode_for_speed(
@@ -483,6 +487,11 @@ class RobotMotionCommand:
     mode: str
     safe_stop: bool
     reason: str | None
+    # The physical-recovery frame adapter may need the camera-relative final
+    # heading, not just the deliberately short planner-facing lead.  Ordinary
+    # SONIC serialization ignores this metadata.  Keeping it optional preserves
+    # compatibility with external/test commands that only provide wire fields.
+    desired_facing: tuple[float, float, float] | None = None
 
 
 class GameControlCore:
@@ -529,6 +538,23 @@ class GameControlCore:
         """Update physical yaw feedback without overwriting the facing target."""
 
         self._measured_heading_rad = wrap_angle_rad(heading_rad)
+
+    def reanchor_heading(self, heading_rad: float) -> None:
+        """One-shot reset into a newly created SONIC deploy yaw frame.
+
+        A replacement native deploy defines its normalized yaw zero from the
+        physical pose present at startup.  Normal feedback must not chase body
+        drift while stopped, but this lifecycle boundary is different: both
+        the measured and commanded world headings must be reseeded to the same
+        physical yaw before the new frame transform is published.
+        """
+
+        heading = wrap_angle_rad(heading_rad)
+        self._measured_heading_rad = heading
+        self._command_heading_rad = heading
+        self._speed_mps = 0.0
+        self._gait_active = False
+        self._stopped_heading_latched = True
 
     def invalidate_input(self, reason: str = "input_invalidated") -> None:
         """Stop immediately and require neutral input before re-arming."""
@@ -642,6 +668,7 @@ class GameControlCore:
             mode="deadman" if deadman else "free_camera",
             safe_stop=True,
             reason=reason,
+            desired_facing=facing,
         )
 
     def _safety_reason(self, now_s: float) -> tuple[str, bool] | None:
@@ -745,6 +772,7 @@ class GameControlCore:
         alignment = 0.0
         requested_speed = 0.0
         requested_locomotion_mode = SONIC_IDLE_MODE
+        desired_heading = self._command_heading_rad
 
         if input_magnitude > 1e-12:
             self._stopped_heading_latched = False
@@ -754,9 +782,26 @@ class GameControlCore:
                 camera_yaw_rad=self._snapshot.camera_yaw_rad,
             )
             desired_heading = math.atan2(world_y, world_x)
-            heading_error = wrap_angle_rad(
-                desired_heading - self._command_heading_rad
+            # Keep the planner-facing setpoint close to the physical body.
+            # During a post-recovery handoff SONIC can remain in a writer-
+            # confirmed hold for longer than it takes an open-loop setpoint to
+            # traverse a large camera/body yaw error.  Advancing from the prior
+            # command in that interval lets the planner accumulate the entire
+            # turn before the robot has moved at all.  Once live control starts,
+            # blending toward that far-ahead trajectory can create an unsafe
+            # angular-velocity spike.
+            #
+            # With runtime feedback available, command at most one rate-limited
+            # step ahead of measured yaw.  The setpoint therefore pauses while
+            # the body is held, then advances only as physical yaw follows it.
+            # Keep the original command-relative fallback for startup/tests
+            # that legitimately have no measured heading yet.
+            heading_origin = (
+                self._measured_heading_rad
+                if self._measured_heading_rad is not None
+                else self._command_heading_rad
             )
+            heading_error = wrap_angle_rad(desired_heading - heading_origin)
             # At the antipode, tiny camera-yaw noise can represent the same
             # direction as either +pi or -pi.  Latch the prior turn side so an
             # exact reversal never chatters between left and right.
@@ -765,9 +810,13 @@ class GameControlCore:
             elif abs(heading_error) > 1e-6:
                 self._turn_sign = math.copysign(1.0, heading_error)
             max_heading_delta = self.config.max_turn_rate_rad_s * dt
+            if self._measured_heading_rad is not None:
+                max_heading_delta = min(
+                    max_heading_delta, MAX_MEASURED_FACING_LEAD_RAD
+                )
             heading_delta = max(-max_heading_delta, min(max_heading_delta, heading_error))
             self._command_heading_rad = wrap_angle_rad(
-                self._command_heading_rad + heading_delta
+                heading_origin + heading_delta
             )
 
             # Reduce translation while making a large turn.  This produces a
@@ -916,16 +965,31 @@ class GameControlCore:
             math.sin(self._command_heading_rad),
             0.0,
         )
+        desired_direction = (
+            math.cos(desired_heading),
+            math.sin(desired_heading),
+            0.0,
+        )
         moving = output_speed > 0.0
+        turning_to_heading = input_magnitude > 1e-12 and not moving
+        if turning_to_heading:
+            # Keep turn-before-translation semantics while selecting SONIC's
+            # locomotion manifold immediately.  A stationary SLOW_WALK request
+            # lets the native planner rotate toward ``facing`` without first
+            # driving the post-recovery IDLE policy into a saturated waist
+            # pose.  Translation remains exactly zero until both command and
+            # measured heading pass the existing alignment gate.
+            locomotion_mode = SONIC_SLOW_WALK_MODE
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=direction if moving else (0.0, 0.0, 0.0),
             facing=direction,
             speed_mps=output_speed,
             locomotion_mode=locomotion_mode,
-            mode="move" if moving else "idle",
+            mode=("move" if moving else "turn" if turning_to_heading else "idle"),
             safe_stop=False,
-            reason=None,
+            reason="aligning_heading" if turning_to_heading else None,
+            desired_facing=desired_direction,
         )
 
 
