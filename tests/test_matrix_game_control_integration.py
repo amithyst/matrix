@@ -1138,7 +1138,7 @@ else:
             mouse_settings = project / "home/.config/matrix/mouse-control.json"
             xset_log = project / "xset.log"
             xset_state = project / "xset.state"
-            material_fix = project / "libmatrix_ue_material_fix.so"
+            material_fix = project / "outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
             self.write(
                 mouse_settings,
                 json.dumps(
@@ -1173,7 +1173,6 @@ else:
                     "set Engine.SpringArmComponent bEnableCameraLag True,"
                     "viewclass OperatorCamera_C"
                 ),
-                "MATRIX_UE_MATERIAL_FIX_PRELOAD": os.fspath(material_fix),
                 "MATRIX_UE_STARTUP_SECONDS": "0",
                 "MATRIX_VERIFY_RUNTIME": "0",
                 "PATH": os.fspath(fixture["fake_bin"])
@@ -1660,6 +1659,7 @@ print(json.dumps(payload, sort_keys=True))
             environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
                 project / "launcher-missing-material-marker.lock"
             )
+            environment["MATRIX_UE_MATERIAL_FIX_PRELOAD"] = os.fspath(material_fix)
             missing_material_marker = subprocess.run(
                 [
                     "/bin/bash",

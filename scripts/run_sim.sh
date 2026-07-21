@@ -1189,13 +1189,29 @@ UE_COMMAND=(
     /usr/bin/env
     "LD_LIBRARY_PATH=$(ue_ld_library_path)"
 )
-UE_MATERIAL_FIX_PRELOAD="${MATRIX_UE_MATERIAL_FIX_PRELOAD:-}"
+UE_MATERIAL_FIX_PRELOAD="${MATRIX_UE_MATERIAL_FIX_PRELOAD:-auto}"
+UE_MATERIAL_FIX_DEFAULT="$PROJECT_ROOT/outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
 UE_MATERIAL_FIX_BINARY=""
 UE_G1_SKIN="${MATRIX_G1_SKIN:-}"
 UE_G1_MATERIAL_PALETTE="$MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT"
 UE_G1_MATERIAL_SCOPE_ALPHA="$MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT"
 UE_G1_PALETTE_PATTERN='^[-0-9eE+.,;]+$'
 UE_G1_COMPONENT_PATTERN='^[-0-9eE+.]+$'
+case "${UE_MATERIAL_FIX_PRELOAD,,}" in
+    ""|auto)
+        if [[ -f "$UE_MATERIAL_FIX_DEFAULT" && ! -L "$UE_MATERIAL_FIX_DEFAULT" ]]; then
+            UE_MATERIAL_FIX_PRELOAD="$UE_MATERIAL_FIX_DEFAULT"
+        else
+            UE_MATERIAL_FIX_PRELOAD=""
+            echo "[INFO] Matrix UE material fix default not found; continuing without skin bridge"
+        fi
+        ;;
+    off|none|disabled|0|false|no)
+        UE_MATERIAL_FIX_PRELOAD=""
+        echo "[INFO] Matrix UE material fix disabled by MATRIX_UE_MATERIAL_FIX_PRELOAD=$MATRIX_UE_MATERIAL_FIX_PRELOAD"
+        ;;
+    *) ;;
+esac
 if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
     if [[ ! "$UE_G1_SKIN" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]; then
         echo "[ERROR] MATRIX_G1_SKIN must name a registered skin" >&2
