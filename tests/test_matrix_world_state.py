@@ -80,6 +80,38 @@ class MatrixWorldStateTest(unittest.TestCase):
         )
         self.assertEqual(state.resume_source, "fallen_xy_last_safe_upright")
 
+    def test_fallen_outlier_checkpoint_preserves_last_safe_resume_pose(self) -> None:
+        safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
+        state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
+        outlier = MODULE.WorldPose(4_000.0, -3_000.0, 200.0, -2.2)
+
+        state = state.checkpoint(outlier, upright=False, now_unix_ns=2)
+
+        self.assertEqual(state.last_observed, outlier)
+        self.assertEqual(state.last_safe, safe)
+        self.assertEqual(state.last_exit, safe)
+        self.assertEqual(state.resume_source, "fallen_outlier_last_safe")
+        self.assertEqual(state.startup_pose(self.default), (safe, "last_exit"))
+        self.assertEqual(MODULE.MatrixWorldState.from_mapping(state.to_mapping()), state)
+
+    def test_startup_rejects_legacy_exit_outlier_from_last_safe(self) -> None:
+        safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
+        outlier = MODULE.WorldPose(4_000.0, -3_000.0, 0.81, 0.6)
+        state = MODULE.MatrixWorldState(
+            world_id="town10:scene_terrain_t10",
+            world_revision="a" * 64,
+            last_observed=outlier,
+            last_safe=safe,
+            last_exit=outlier,
+            resume_source="fallen_xy_last_safe_upright",
+            updated_at_unix_ns=2,
+        )
+
+        self.assertEqual(
+            state.startup_pose(self.default),
+            (safe, "last_safe_outlier_fallback"),
+        )
+
     def test_fall_without_known_safe_pose_does_not_invent_resume_height(self) -> None:
         fallen = MODULE.WorldPose(3.0, 4.0, 0.15, 1.0)
 

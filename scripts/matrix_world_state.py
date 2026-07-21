@@ -46,6 +46,7 @@ MAX_TELEPORT_POINTS = 1024
 MAX_HORIZONTAL_METRES = 100_000.0
 MIN_VERTICAL_METRES = -1_000.0
 MAX_VERTICAL_METRES = 10_000.0
+MAX_FALLEN_RESUME_DRIFT_METRES = 25.0
 
 _WORLD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}\Z")
 _TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}\Z")
@@ -239,6 +240,7 @@ class MatrixWorldState:
         if self.resume_source is not None and self.resume_source not in {
             "upright_checkpoint",
             "fallen_xy_last_safe_upright",
+            "fallen_outlier_last_safe",
             "teleport_command",
             "home",
         }:
@@ -372,6 +374,14 @@ class MatrixWorldState:
                 last_observed=pose,
                 updated_at_unix_ns=timestamp,
             )
+        if pose.distance_xy(self.last_safe) > MAX_FALLEN_RESUME_DRIFT_METRES:
+            return replace(
+                self,
+                last_observed=pose,
+                last_exit=self.last_safe,
+                resume_source="fallen_outlier_last_safe",
+                updated_at_unix_ns=timestamp,
+            )
         upright_exit = WorldPose(
             pose.x,
             pose.y,
@@ -463,6 +473,12 @@ class MatrixWorldState:
 
     def startup_pose(self, default: WorldPose) -> tuple[WorldPose, str]:
         if self.last_exit is not None:
+            if (
+                self.last_safe is not None
+                and self.last_exit.distance_xy(self.last_safe)
+                > MAX_FALLEN_RESUME_DRIFT_METRES
+            ):
+                return self.last_safe, "last_safe_outlier_fallback"
             return self.last_exit, "last_exit"
         if self.home is not None:
             return self.home, "home"
