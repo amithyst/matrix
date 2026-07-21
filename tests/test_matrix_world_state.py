@@ -590,6 +590,46 @@ class WorldStateStoreTest(unittest.TestCase):
             self.assertEqual([float(value) for value in lines[1:5]], [12.5, -3.0, 0.81, 0.25])
             self.assertEqual(lines[5:], ["last_exit", "loaded"])
 
+            safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
+            outlier = MODULE.WorldPose(4_000.0, -3_000.0, 0.81, 0.6)
+            store.save(
+                MODULE.MatrixWorldState(
+                    world_id="g1:town10",
+                    world_revision=revision,
+                    last_observed=outlier,
+                    last_safe=safe,
+                    last_exit=outlier,
+                    resume_source="fallen_xy_last_safe_upright",
+                    updated_at_unix_ns=2,
+                )
+            )
+            outlier_lines = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "resolve-start",
+                    "--file",
+                    str(path),
+                    "--world-id",
+                    "g1:town10",
+                    "--world-revision",
+                    revision,
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.splitlines()
+
+            self.assertEqual(outlier_lines[0], "pose")
+            self.assertEqual(
+                [float(value) for value in outlier_lines[1:5]],
+                [safe.x, safe.y, safe.z, safe.yaw_rad],
+            )
+            self.assertEqual(
+                outlier_lines[5:],
+                ["last_safe_outlier_fallback", "loaded"],
+            )
+
     def test_revision_covers_location_independent_physics_source_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

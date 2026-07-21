@@ -471,7 +471,7 @@ class MatrixWorldState:
         )
         return tuple(matches[:limit])
 
-    def startup_pose(self, default: WorldPose) -> tuple[WorldPose, str]:
+    def resume_pose(self) -> tuple[WorldPose | None, str]:
         if self.last_exit is not None:
             if (
                 self.last_safe is not None
@@ -482,6 +482,12 @@ class MatrixWorldState:
             return self.last_exit, "last_exit"
         if self.home is not None:
             return self.home, "home"
+        return None, "none"
+
+    def startup_pose(self, default: WorldPose) -> tuple[WorldPose, str]:
+        pose, source = self.resume_pose()
+        if pose is not None:
+            return pose, source
         return default, "default"
 
 
@@ -922,8 +928,7 @@ def main() -> int:
                 world_revision=args.world_revision,
             )
             state = store.load()
-            pose = state.last_exit or state.home
-            source = "last_exit" if state.last_exit is not None else "home"
+            pose, source = state.resume_pose()
             if pose is None:
                 print("none")
             else:
