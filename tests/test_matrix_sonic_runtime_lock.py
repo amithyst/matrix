@@ -65,6 +65,26 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.lock_path = REPO_ROOT / "config/runtime/matrix-sonic.lock.json"
         self.lock = MODULE.load_lock(self.lock_path)
 
+    def test_policy_slot_manifest_is_schema_checked_and_content_locked(self) -> None:
+        MODULE.validate_schema(self.lock)
+        MODULE.validate_policy_manifest_files(self.lock, REPO_ROOT)
+        entry = self.lock["policy_slots"]["manifests"][0]
+        manifest = REPO_ROOT / entry["path"]
+        self.assertEqual(
+            hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            entry["sha256"],
+        )
+
+        bad_hash = copy.deepcopy(self.lock)
+        bad_hash["policy_slots"]["manifests"][0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+            MODULE.validate_policy_manifest_files(bad_hash, REPO_ROOT)
+
+        unsafe = copy.deepcopy(self.lock)
+        unsafe["policy_slots"]["manifests"][0]["path"] = "../candidate.json"
+        with self.assertRaisesRegex(ValueError, "invalid or duplicate"):
+            MODULE.validate_schema(unsafe)
+
     def test_release_packages_match_urban_contract(self) -> None:
         urban = json.loads(
             (REPO_ROOT / "research/urban_v1/scene.json").read_text(encoding="utf-8")

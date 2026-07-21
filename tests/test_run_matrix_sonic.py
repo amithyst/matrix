@@ -2388,6 +2388,99 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.fsm = SimpleNamespace(state=MODULE.RecoveryState.GAME_SONIC)
+        coordinator.resident_policies = True
+        coordinator.worker = mock.Mock()
+        coordinator.worker.ready = True
+        coordinator.worker.models_loaded_once = True
+        coordinator.worker.models_warmed = True
+        coordinator.worker.selected_policy_id = "kungfu"
+        coordinator.worker.registered_policy_ids = ("kungfu", "host", "amp")
+        coordinator.initial_controller = "kungfu"
+        coordinator.kungfu_model = Path("kungfu.onnx")
+        coordinator.kungfu_motion = Path("motion.pkl")
+        coordinator._policy_selection_pending = None
+        reason = "artifact_sha256_unlocked:runtime_adapter"
+        coordinator.locomotion_policy_candidates = (
+            MODULE.PolicyCandidateState(
+                policy_id="bfm-sonic-teacher50k",
+                display_name="BFM SONIC Teacher50k",
+                slot="locomotion",
+                resident=False,
+                available=False,
+                provenance_verified=False,
+                unavailable_reasons=(reason, "runtime_adapter_not_registered"),
+                provenance={"source_commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25"},
+            ),
+        )
+
+        loadout = coordinator.strategy_loadout_mapping()
+        locomotion = next(
+            slot for slot in loadout["slots"] if slot["slot"] == "locomotion"
+        )
+        self.assertEqual(
+            [candidate["policy_id"] for candidate in locomotion["candidates"]],
+            ["sonic", "bfm-sonic-teacher50k"],
+        )
+        bfm = locomotion["candidates"][1]
+        self.assertFalse(bfm["available"])
+        self.assertFalse(bfm["resident"])
+        self.assertEqual(bfm["unavailable_reason"], reason)
+
+        coordinator.worker.reset_mock()
+        with mock.patch.object(MODULE.subprocess, "Popen") as popen:
+            with self.assertRaises(MODULE.CommandExecutionError) as raised:
+                coordinator.request_policy_slot_assignment(
+                    MODULE.PolicySlotAssignment(
+                        "locomotion", "bfm-sonic-teacher50k"
+                    ),
+                    transition_id="transition-bfm",
+                )
+        self.assertEqual(raised.exception.code, "E_POLICY_UNAVAILABLE")
+        self.assertIn(reason, raised.exception.message)
+        coordinator.worker.select_policy.assert_not_called()
+        coordinator.worker.send.assert_not_called()
+        popen.assert_not_called()
+
+        # Admission remains closed even if a future provenance change (or a
+        # malformed caller) presents BFM as resident and available.  A
+        # separately reviewed writer registration is required before this
+        # policy may ever reach the single-writer hand-off path.
+        coordinator.locomotion_policy_candidates = (
+            MODULE.PolicyCandidateState(
+                policy_id="bfm-sonic-teacher50k",
+                display_name="BFM SONIC Teacher50k",
+                slot="locomotion",
+                resident=True,
+                available=True,
+                provenance_verified=True,
+                unavailable_reasons=(),
+                provenance={
+                    "source_commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25"
+                },
+            ),
+        )
+        coordinator.worker.reset_mock()
+        with mock.patch.object(MODULE.subprocess, "Popen") as popen:
+            with self.assertRaises(MODULE.CommandExecutionError) as raised:
+                coordinator.request_policy_slot_assignment(
+                    MODULE.PolicySlotAssignment(
+                        "locomotion", "bfm-sonic-teacher50k"
+                    ),
+                    transition_id="transition-bfm-forged-available",
+                )
+        self.assertEqual(raised.exception.code, "E_POLICY_UNAVAILABLE")
+        self.assertIn("no registered Matrix writer adapter", raised.exception.message)
+        coordinator.worker.select_policy.assert_not_called()
+        coordinator.worker.send.assert_not_called()
+        popen.assert_not_called()
+
     def test_game_command_runtime_rejects_commands_until_panel_safe_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"
@@ -3666,6 +3759,82 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             coordinator.last_wire_facing_heading_rad,
             measured_heading,
         )
+
+    def test_resident_game_sonic_bypasses_replacement_deploy_turn_limiter(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.command_frame_rotation_rad = 0.0
+        coordinator.last_wire_facing_heading_rad = None
+        coordinator.last_reframe_limited = True
+        coordinator.last_reframe_heading_error_rad = 1.0
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=10,
+            movement=(0.0, 1.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=1.0,
+            locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.SONIC_STABILIZING,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            inhibit_game_input=False,
+        )
+
+        wire_command = coordinator.recovery_wire_command(
+            command,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+
+        self.assertIs(wire_command, command)
+        self.assertEqual(wire_command.mode, "move")
+        self.assertEqual(wire_command.speed_mps, 1.0)
+        self.assertEqual(wire_command.movement, (0.0, 1.0, 0.0))
+        self.assertFalse(coordinator.last_reframe_limited)
+        self.assertEqual(coordinator.last_reframe_heading_error_rad, 0.0)
+        self.assertAlmostEqual(
+            coordinator.last_wire_facing_heading_rad,
+            math.pi / 2.0,
+        )
+
+    def test_resident_game_sonic_rejects_impossible_rotated_command_frame(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.command_frame_rotation_rad = 0.25
+        coordinator.last_wire_facing_heading_rad = None
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=11,
+            movement=(1.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.8,
+            locomotion_mode=GAME_CONTROL.SONIC_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.SONIC_STABILIZING,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            inhibit_game_input=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unexpectedly rotated"):
+            coordinator.recovery_wire_command(
+                command,
+                output,
+                measured_heading_rad=0.0,
+                dt_s=0.02,
+            )
 
     def test_policy_fallback_uses_full_pose_grace_and_low_dynamics(self) -> None:
         coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(

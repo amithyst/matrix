@@ -1,6 +1,14 @@
 {
   "schema_version": 2,
   "runtime_id": "matrix-sonic-native-v2",
+  "policy_slots": {
+    "manifests": [
+      {
+        "path": "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
+        "sha256": "5b20d6fd9f9a90d8d01e8b9cec262b0e4fb0a44e2a02d5dff3ac69d0b2b1fe8e"
+      }
+    ]
+  },
   "source": {
     "repository": "https://github.com/amithyst/matrix",
     "base_commit": "6609ad59e65b8a360b0de288d126477ea6034c34"

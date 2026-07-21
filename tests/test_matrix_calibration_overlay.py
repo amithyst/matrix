@@ -161,19 +161,73 @@ class OverlayLayoutTest(unittest.TestCase):
     def test_strategy_targets_are_page_scoped_and_outside_crosshair(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
         layout = MODULE.overlay_layout(geometry)
-        for index in range(3):
-            name = f"recovery_policy_{index}"
-            x, y, width, height = layout[name]
-            self.assertEqual(
-                MODULE.panel_action_at(
-                    layout,
-                    x + width // 2,
-                    y + height // 2,
-                    page="loadout",
-                ),
-                name,
-            )
-            self.assertFalse(self.intersects(layout[name], layout["crosshair_safe"]))
+        for slot in ("locomotion", "recovery"):
+            rectangles = []
+            for index in range(3):
+                name = f"{slot}_policy_{index}"
+                x, y, width, height = layout[name]
+                rectangles.append(layout[name])
+                self.assertEqual(
+                    MODULE.panel_action_at(
+                        layout,
+                        x + width // 2,
+                        y + height // 2,
+                        page="loadout",
+                    ),
+                    name,
+                )
+                self.assertFalse(
+                    self.intersects(layout[name], layout["crosshair_safe"])
+                )
+            for index, rectangle in enumerate(rectangles):
+                for other in rectangles[index + 1 :]:
+                    self.assertFalse(self.intersects(rectangle, other))
+
+    def test_font_slider_is_bounded_page_scoped_and_maps_the_full_range(self) -> None:
+        for geometry in (
+            MODULE.WindowGeometry(1, 0, 0, 480, 360),
+            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
+        ):
+            with self.subTest(geometry=geometry):
+                layout = MODULE.overlay_layout(geometry)
+                panel = layout["panel"]
+                slider = layout["font_size_slider"]
+                track = MODULE.font_slider_track(slider)
+                self.assertTrue(MODULE.point_in_rectangle(slider[:2], panel))
+                self.assertTrue(
+                    MODULE.point_in_rectangle(
+                        (slider[0] + slider[2] - 1, slider[1] + slider[3] - 1),
+                        panel,
+                    )
+                )
+                self.assertTrue(MODULE.point_in_rectangle(track[:2], slider))
+                point = (track[0] + track[2] // 2, track[1] + track[3] // 2)
+                self.assertEqual(
+                    MODULE.panel_action_at(layout, *point, page="settings"),
+                    "font_size_slider",
+                )
+                self.assertIsNone(
+                    MODULE.panel_action_at(layout, *point, page="loadout")
+                )
+                self.assertEqual(
+                    MODULE.font_size_from_slider(slider, track[0] - 100),
+                    MODULE._MIN_OVERLAY_FONT_SIZE,
+                )
+                self.assertEqual(
+                    MODULE.font_size_from_slider(
+                        slider,
+                        track[0] + track[2] + 100,
+                    ),
+                    MODULE._MAX_OVERLAY_FONT_SIZE,
+                )
+                sizes = [
+                    MODULE.font_size_from_slider(
+                        slider,
+                        track[0] + offset,
+                    )
+                    for offset in range(track[2])
+                ]
+                self.assertEqual(sizes, sorted(sizes))
 
     def test_root_coordinate_hit_test_handles_offset_remote_desktop_client(self) -> None:
         geometry = MODULE.WindowGeometry(1, -640, 120, 1600, 900)
@@ -353,6 +407,23 @@ class OverlayStateTest(unittest.TestCase):
                         {
                             "slot": "locomotion",
                             "selected_policy_id": "sonic",
+                            "candidates": [
+                                {
+                                    "policy_id": "sonic",
+                                    "name": "SONIC",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                                {
+                                    "policy_id": "bfm-sonic-teacher50k",
+                                    "name": "BFM SONIC Teacher50k",
+                                    "resident": False,
+                                    "available": False,
+                                    "unavailable_reason": (
+                                        "artifact_sha256_unlocked:runtime_adapter"
+                                    ),
+                                },
+                            ],
                         },
                         {
                             "slot": "recovery",
@@ -378,10 +449,79 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(model.recovery_policy_id, "kungfu")
         self.assertEqual(model.pending_policy_id, "host")
         self.assertEqual(
+            [candidate.policy_id for candidate in model.locomotion_candidates],
+            ["sonic", "bfm-sonic-teacher50k"],
+        )
+        self.assertEqual(
+            model.locomotion_candidates[1].unavailable_reason,
+            "artifact_sha256_unlocked:runtime_adapter",
+        )
+        self.assertFalse(
+            model.policy_enabled("bfm-sonic-teacher50k", slot="locomotion")
+        )
+        self.assertEqual(
             [candidate.policy_id for candidate in model.recovery_candidates],
             ["kungfu", "host"],
         )
         self.assertFalse(model.policy_enabled("host"))
+
+    def test_disabled_locomotion_candidate_emits_no_selection_intent(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.StrategyLoadoutModel(
+            available=True,
+            status="ready",
+            active_slot="locomotion",
+            locomotion_policy_id="sonic",
+            recovery_policy_id="kungfu",
+            locomotion_candidates=(
+                MODULE.StrategyPolicyModel("sonic", True, True, "SONIC"),
+                MODULE.StrategyPolicyModel(
+                    "bfm-sonic-teacher50k",
+                    False,
+                    False,
+                    "BFM SONIC Teacher50k",
+                    "artifact_sha256_unlocked:runtime_adapter",
+                ),
+            ),
+            recovery_candidates=(),
+            pending_policy_id=None,
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._last_layout = layout
+        overlay._active_page = "loadout"
+        overlay._last_strategy_model = model
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        overlay._visible = True
+        overlay._font_slider_dragging = False
+        publisher = mock.Mock()
+        x, y, width, height = layout["locomotion_policy_1"]
+        events = []
+        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
+            event = MODULE.XEvent()
+            event.type = event_type
+            event.xbutton.button = 1
+            event.xbutton.window = 2
+            event.xbutton.x_root = x + width // 2
+            event.xbutton.y_root = y + height // 2
+            events.append(event)
+
+        overlay._x11.XPending.side_effect = lambda _display: len(events)
+
+        def next_event(_display, destination):
+            event = events.pop(0)
+            MODULE.ctypes.memmove(
+                destination,
+                MODULE.ctypes.byref(event),
+                MODULE.ctypes.sizeof(event),
+            )
+
+        overlay._x11.XNextEvent.side_effect = next_event
+
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
+        publisher.publish_strategy_select.assert_not_called()
 
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):
@@ -491,6 +631,87 @@ class OverlayStateTest(unittest.TestCase):
     def test_font_fallbacks_match_heyuan_xlsfonts_probe(self) -> None:
         self.assertEqual(MODULE._LARGE_FONT_CANDIDATES[0], b"12x24")
         self.assertEqual(MODULE._BODY_FONT_CANDIDATES[:2], (b"10x20", b"9x15"))
+        self.assertIn(b":size=13", MODULE._XFT_BODY_FONT_CANDIDATES[0])
+        self.assertIn(b":size=18", MODULE._XFT_LARGE_FONT_CANDIDATES[0])
+
+
+class HotFontSizeTest(unittest.TestCase):
+    @staticmethod
+    def overlay():
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._display = 1
+        overlay._screen = 0
+        overlay._xft = mock.Mock()
+        overlay._xft_draw = 2
+        overlay._xft_body_font = 11
+        overlay._xft_large_font = 12
+        overlay._xft_body_font_name = "old-body"
+        overlay._xft_large_font_name = "old-large"
+        overlay._body_font_name = "core-body"
+        overlay._large_font_name = "core-large"
+        overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
+        return overlay
+
+    def test_xft_body_and_large_fonts_swap_atomically_without_restart(self) -> None:
+        overlay = self.overlay()
+        overlay._load_xft_font = mock.Mock(
+            side_effect=[(21, "new-body"), (22, "new-large")]
+        )
+
+        self.assertTrue(overlay._set_font_size(20))
+
+        self.assertEqual(overlay._font_size, 20)
+        self.assertEqual(overlay._xft_body_font, 21)
+        self.assertEqual(overlay._xft_large_font, 22)
+        self.assertEqual(
+            overlay._load_xft_font.call_args_list,
+            [
+                mock.call(MODULE._xft_font_candidates(20, bold=False)),
+                mock.call(
+                    MODULE._xft_font_candidates(
+                        20 + MODULE._LARGE_FONT_SIZE_DELTA,
+                        bold=True,
+                    )
+                ),
+            ],
+        )
+        closed = [call.args[1].value for call in overlay._xft.XftFontClose.call_args_list]
+        self.assertEqual(closed, [11, 12])
+        self.assertEqual(overlay.font_diagnostics["size"], 20)
+        self.assertTrue(overlay.font_diagnostics["adjustable"])
+
+    def test_failed_large_font_load_keeps_the_live_pair_unchanged(self) -> None:
+        overlay = self.overlay()
+        overlay._load_xft_font = mock.Mock(
+            side_effect=[(21, "candidate-body"), RuntimeError("missing")]
+        )
+
+        self.assertFalse(overlay._set_font_size(20))
+
+        self.assertEqual(overlay._font_size, MODULE._DEFAULT_OVERLAY_FONT_SIZE)
+        self.assertEqual(overlay._xft_body_font, 11)
+        self.assertEqual(overlay._xft_large_font, 12)
+        closed = [call.args[1].value for call in overlay._xft.XftFontClose.call_args_list]
+        self.assertEqual(closed, [21])
+
+    def test_slider_position_is_local_and_page_scoped(self) -> None:
+        overlay = self.overlay()
+        overlay._last_layout = MODULE.overlay_layout(
+            MODULE.WindowGeometry(1, 0, 0, 1280, 800)
+        )
+        overlay._set_font_size = mock.Mock(return_value=True)
+        track = MODULE.font_slider_track(
+            overlay._last_layout["font_size_slider"]
+        )
+        overlay._active_page = "loadout"
+        self.assertFalse(overlay._set_font_size_from_root_x(track[0] + track[2]))
+        overlay._set_font_size.assert_not_called()
+
+        overlay._active_page = "settings"
+        self.assertTrue(overlay._set_font_size_from_root_x(track[0] + track[2]))
+        overlay._set_font_size.assert_called_once_with(
+            MODULE._MAX_OVERLAY_FONT_SIZE
+        )
 
 
 class PointerActionPublisherTest(unittest.TestCase):
@@ -739,12 +960,23 @@ class KeyboardGrabLifecycleTest(unittest.TestCase):
         closing._panel_gc = None
         closing._body_font = None
         closing._large_font = None
+        closing._x_error_handler_callback = mock.sentinel.x_error_handler
+        closing._previous_x_error_handler_address = None
+        closing._previous_x_error_handler = None
         closing.close()
         self.assertFalse(closing._keyboard_grabbed)
         self.assertIsNone(closing._deferred_ungrab_keycode)
         calls = closing._x11.method_calls
         self.assertLess(
             calls.index(mock.call.XUngrabKeyboard(1, MODULE._CURRENT_TIME)),
+            calls.index(mock.call.XCloseDisplay(1)),
+        )
+        self.assertLess(
+            calls.index(mock.call.XSync(1, 0)),
+            calls.index(mock.call.XSetErrorHandler(None)),
+        )
+        self.assertLess(
+            calls.index(mock.call.XSetErrorHandler(None)),
             calls.index(mock.call.XCloseDisplay(1)),
         )
 
@@ -877,6 +1109,9 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay._last_raise_s = None
         overlay._pressed_action = None
         overlay._pressed_window = None
+        overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
+        overlay._last_rendered_font_size = None
+        overlay._font_slider_dragging = False
         overlay._keyboard_grabbed = False
         overlay._draw_panel = mock.Mock()
         return overlay
@@ -915,6 +1150,216 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay.show(geometry, (301, 302), changed, now_s=11.2)
         self.assertEqual(overlay._draw_panel.call_count, 2)
         self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
+
+    def test_local_font_change_invalidates_the_static_panel_render_key(self) -> None:
+        overlay = self.make_overlay()
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        state = self.state()
+        overlay.show(geometry, (300, 300), state, now_s=10.0)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+
+        overlay._font_size = MODULE._MAX_OVERLAY_FONT_SIZE
+        overlay.show(geometry, (300, 300), state, now_s=10.02)
+        self.assertEqual(overlay._draw_panel.call_count, 2)
+
+
+class X11WindowProbeTest(unittest.TestCase):
+    @staticmethod
+    def trapped_overlay():
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._display = 1
+        overlay._window_error_trap = None
+        overlay._trapped_window_error = None
+        overlay._recoverable_window_error_count = 0
+        overlay._bad_window_count = 0
+        overlay._bad_drawable_count = 0
+        overlay._last_recoverable_window_error = None
+        overlay._last_bad_window = None
+        overlay._previous_x_error_handler = mock.Mock(return_value=17)
+        return overlay
+
+    @staticmethod
+    def x_error(
+        *,
+        resource_id: int,
+        error_code: int,
+        request_code: int,
+    ) -> MODULE.XErrorEvent:
+        event = MODULE.XErrorEvent()
+        event.resourceid = resource_id
+        event.serial = 123
+        event.error_code = error_code
+        event.request_code = request_code
+        event.minor_code = 0
+        return event
+
+    def test_precise_window_probe_swallows_only_its_bad_window(self) -> None:
+        overlay = self.trapped_overlay()
+        event = self.x_error(
+            resource_id=99,
+            error_code=MODULE._BAD_WINDOW,
+            request_code=MODULE._X_REQUEST_GET_PROPERTY,
+        )
+
+        def operation():
+            self.assertEqual(
+                overlay._handle_x_error(
+                    MODULE.ctypes.c_void_p(1),
+                    MODULE.ctypes.pointer(event),
+                ),
+                0,
+            )
+            return 42
+
+        with mock.patch("builtins.print") as warning:
+            result, bad_window = overlay._window_probe(
+                "XGetWindowProperty",
+                99,
+                MODULE._X_REQUEST_GET_PROPERTY,
+                operation,
+            )
+
+        self.assertEqual(result, 42)
+        self.assertTrue(bad_window)
+        overlay._previous_x_error_handler.assert_not_called()
+        warning.assert_called_once()
+        self.assertEqual(
+            overlay.x11_diagnostics,
+            {
+                "recoverable_window_error_count": 1,
+                "bad_window_count": 1,
+                "bad_drawable_count": 0,
+                "last_recoverable_window_error": {
+                    "operation": "XGetWindowProperty",
+                    "resource_id": 99,
+                    "serial": 123,
+                    "error_code": MODULE._BAD_WINDOW,
+                    "request_code": MODULE._X_REQUEST_GET_PROPERTY,
+                    "minor_code": 0,
+                },
+                "last_bad_window": {
+                    "operation": "XGetWindowProperty",
+                    "resource_id": 99,
+                    "serial": 123,
+                    "error_code": MODULE._BAD_WINDOW,
+                    "request_code": MODULE._X_REQUEST_GET_PROPERTY,
+                    "minor_code": 0,
+                },
+            },
+        )
+
+    def test_get_window_attributes_recovers_only_its_internal_geometry_race(
+        self,
+    ) -> None:
+        overlay = self.trapped_overlay()
+        event = self.x_error(
+            resource_id=99,
+            error_code=MODULE._BAD_DRAWABLE,
+            request_code=MODULE._X_REQUEST_GET_GEOMETRY,
+        )
+
+        def operation():
+            self.assertEqual(
+                overlay._handle_x_error(
+                    MODULE.ctypes.c_void_p(1),
+                    MODULE.ctypes.pointer(event),
+                ),
+                0,
+            )
+            return 0
+
+        with mock.patch("builtins.print") as warning:
+            result, stale_window = overlay._window_probe(
+                "XGetWindowAttributes",
+                99,
+                MODULE._X_REQUEST_GET_WINDOW_ATTRIBUTES,
+                operation,
+                additional_error_signatures=((
+                    MODULE._BAD_DRAWABLE,
+                    MODULE._X_REQUEST_GET_GEOMETRY,
+                ),),
+            )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(stale_window)
+        overlay._previous_x_error_handler.assert_not_called()
+        self.assertIn("ignored BadDrawable", warning.call_args.args[0])
+        self.assertEqual(
+            overlay.x11_diagnostics,
+            {
+                "recoverable_window_error_count": 1,
+                "bad_window_count": 0,
+                "bad_drawable_count": 1,
+                "last_recoverable_window_error": {
+                    "operation": "XGetWindowAttributes",
+                    "resource_id": 99,
+                    "serial": 123,
+                    "error_code": MODULE._BAD_DRAWABLE,
+                    "request_code": MODULE._X_REQUEST_GET_GEOMETRY,
+                    "minor_code": 0,
+                },
+                "last_bad_window": None,
+            },
+        )
+
+    def test_non_bad_window_and_mismatched_bad_window_delegate_to_xlib(self) -> None:
+        overlay = self.trapped_overlay()
+        trap = MODULE._RecoverableWindowErrorTrap(
+            operation="XGetWindowProperty",
+            resource_id=99,
+            error_signatures=((
+                MODULE._BAD_WINDOW,
+                MODULE._X_REQUEST_GET_PROPERTY,
+            ),),
+        )
+        overlay._window_error_trap = trap
+        events = (
+            self.x_error(
+                resource_id=99,
+                error_code=2,
+                request_code=MODULE._X_REQUEST_GET_PROPERTY,
+            ),
+            self.x_error(
+                resource_id=100,
+                error_code=MODULE._BAD_WINDOW,
+                request_code=MODULE._X_REQUEST_GET_PROPERTY,
+            ),
+            self.x_error(
+                resource_id=99,
+                error_code=MODULE._BAD_WINDOW,
+                request_code=MODULE._X_REQUEST_QUERY_TREE,
+            ),
+            self.x_error(
+                resource_id=99,
+                error_code=MODULE._BAD_DRAWABLE,
+                request_code=MODULE._X_REQUEST_GET_GEOMETRY,
+            ),
+        )
+
+        for event in events:
+            self.assertEqual(
+                overlay._handle_x_error(
+                    MODULE.ctypes.c_void_p(1),
+                    MODULE.ctypes.pointer(event),
+                ),
+                17,
+            )
+
+        same_request_other_display = self.x_error(
+            resource_id=99,
+            error_code=MODULE._BAD_WINDOW,
+            request_code=MODULE._X_REQUEST_GET_PROPERTY,
+        )
+        self.assertEqual(
+            overlay._handle_x_error(
+                MODULE.ctypes.c_void_p(2),
+                MODULE.ctypes.pointer(same_request_other_display),
+            ),
+            17,
+        )
+
+        self.assertEqual(overlay._previous_x_error_handler.call_count, 5)
+        self.assertIsNone(overlay._trapped_window_error)
 
 
 class TargetCacheTest(unittest.TestCase):
@@ -1321,6 +1766,40 @@ class X11IntegrationTest(unittest.TestCase):
                     "1",
                 )
                 time.sleep(0.08)
+
+                def assert_no_pointer_action() -> None:
+                    assert action_receiver is not None
+                    with self.assertRaises(BlockingIOError):
+                        action_receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES)
+
+                # Font sizing is overlay-local: a live Xft swap must not emit a
+                # game-control intent or disturb the focused UE window.
+                if font_backend == "xft-utf8":
+                    slider_track = MODULE.font_slider_track(
+                        layout["font_size_slider"]
+                    )
+                    self.run_x11(
+                        environment,
+                        "xdotool",
+                        "mousemove",
+                        "--sync",
+                        str(slider_track[0] + slider_track[2] - 1),
+                        str(slider_track[1] + slider_track[3] // 2),
+                        "click",
+                        "1",
+                    )
+                    time.sleep(0.08)
+                    self.assertIsNone(overlay.poll())
+                    assert_no_pointer_action()
+                    self.assertEqual(
+                        self.run_x11(
+                            environment,
+                            "xdotool",
+                            "getwindowfocus",
+                        ).strip(),
+                        focus_before,
+                    )
+
                 remote_button = layout["profile_remote"]
                 remote_point = (
                     remote_button[0] + remote_button[2] // 2,
@@ -1356,11 +1835,6 @@ class X11IntegrationTest(unittest.TestCase):
                 self.assertEqual(focus_after_click, focus_before)
                 time.sleep(0.08)
                 self.assertNotIn(b"ButtonPress event", read_target_events())
-
-                def assert_no_pointer_action() -> None:
-                    assert action_receiver is not None
-                    with self.assertRaises(BlockingIOError):
-                        action_receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES)
 
                 # Clicking the command line is the only keyboard-grab entry.
                 # Focus remains on UE, but all typed keys are delivered to the
@@ -1621,6 +2095,102 @@ class X11IntegrationTest(unittest.TestCase):
                     )
 
                 self.wait_until(moved_and_followed)
+
+                # Destroy the cached UE target between provider polls.  The next
+                # XGetWindowProperty sees BadWindow; the overlay must hide, keep
+                # running, and discover a replacement window with the same
+                # advertised UE PID.
+                expected_ue_pid = target.pid
+                destroyed_target_window = int(target_window)
+                target.terminate()
+                target.wait(timeout=2.0)
+                assert target.stdout is not None
+                target.stdout.close()
+                target = None
+
+                def target_loss_is_nonfatal():
+                    if overlay.poll() is not None:
+                        return None
+                    panel_info = self.run_x11(
+                        environment,
+                        "xwininfo",
+                        "-id",
+                        str(overlay_windows["panel"]),
+                    )
+                    return "Map State: IsUnMapped" in panel_info
+
+                self.wait_until(target_loss_is_nonfatal)
+                self.assertIsNone(overlay.poll())
+
+                target = subprocess.Popen(
+                    [
+                        "stdbuf",
+                        "-oL",
+                        "xev",
+                        "-name",
+                        "MatrixSmokeReplacement",
+                        "-geometry",
+                        "720x520+45+35",
+                        "-event",
+                        "button",
+                        "-event",
+                        "keyboard",
+                    ],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                assert target.stdout is not None
+                os.set_blocking(target.stdout.fileno(), False)
+                target_window = self.wait_until(
+                    lambda: self.run_x11(
+                        environment,
+                        "xdotool",
+                        "search",
+                        "--name",
+                        "^MatrixSmokeReplacement$",
+                    ).splitlines()[0]
+                )
+                self.run_x11(
+                    environment,
+                    "xprop",
+                    "-id",
+                    target_window,
+                    "-f",
+                    "_NET_WM_PID",
+                    "32c",
+                    "-set",
+                    "_NET_WM_PID",
+                    str(expected_ue_pid),
+                )
+                self.run_x11(environment, "xdotool", "windowfocus", target_window)
+                focus_before = self.run_x11(
+                    environment,
+                    "xdotool",
+                    "getwindowfocus",
+                ).strip()
+                target_geometry = self.client_geometry(environment, target_window)
+                target_events.clear()
+
+                def replacement_is_followed():
+                    replacement_cross = self.geometry(environment, horizontal)
+                    return (
+                        replacement_cross
+                        if (
+                            replacement_cross["X"]
+                            == target_geometry["X"]
+                            + target_geometry["WIDTH"] // 2
+                            - 32
+                            and replacement_cross["Y"]
+                            == target_geometry["Y"]
+                            + target_geometry["HEIGHT"] // 2
+                            - 1
+                        )
+                        else None
+                    )
+
+                self.wait_until(replacement_is_followed)
+                self.assertIsNone(overlay.poll())
                 MODULE.atomic_json(state, {"version": 1, "active": False})
 
                 def all_are_unmapped():
@@ -1647,6 +2217,52 @@ class X11IntegrationTest(unittest.TestCase):
                 )
                 self.wait_until(
                     lambda: b"ButtonPress event" in read_target_events()
+                )
+                overlay.terminate()
+                self.assertEqual(overlay.wait(timeout=2.0), 0)
+                final_status = self.wait_until(
+                    lambda: (
+                        value
+                        if (
+                            (value := json.loads(status.read_text(encoding="utf-8")))[
+                                "ready"
+                            ]
+                            is False
+                        )
+                        else None
+                    )
+                )
+                self.assertGreaterEqual(
+                    final_status["x11"]["bad_window_count"],
+                    1,
+                )
+                self.assertEqual(
+                    final_status["x11"]["last_bad_window"]["error_code"],
+                    MODULE._BAD_WINDOW,
+                )
+                self.assertEqual(
+                    final_status["x11"]["last_recoverable_window_error"],
+                    {
+                        "operation": "XGetWindowProperty",
+                        "resource_id": destroyed_target_window,
+                        "serial": mock.ANY,
+                        "error_code": MODULE._BAD_WINDOW,
+                        "request_code": MODULE._X_REQUEST_GET_PROPERTY,
+                        "minor_code": 0,
+                    },
+                )
+                self.assertEqual(
+                    final_status["fonts"]["size"],
+                    (
+                        MODULE._MAX_OVERLAY_FONT_SIZE
+                        if font_backend == "xft-utf8"
+                        else MODULE._DEFAULT_OVERLAY_FONT_SIZE
+                    ),
+                )
+                assert overlay.stderr is not None
+                self.assertIn(
+                    b"ignored BadWindow",
+                    overlay.stderr.read(),
                 )
         finally:
             for connection in (action_receiver, action_sender):

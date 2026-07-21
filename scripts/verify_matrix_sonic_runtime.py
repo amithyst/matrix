@@ -119,6 +119,35 @@ def load_lock(path: Path) -> dict[str, Any]:
     return payload
 
 
+def validate_policy_manifest_files(
+    lock: dict[str, Any], matrix_root: Path
+) -> None:
+    """Bind policy-candidate declarations to the Matrix runtime lock."""
+
+    root = matrix_root.resolve()
+    for entry in lock["policy_slots"]["manifests"]:
+        relative = str(entry["path"])
+        path = (root / relative).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:  # pragma: no cover - schema rejects traversal.
+            raise ValueError(
+                f"policy slot manifest escapes matrix root: {relative}"
+            ) from exc
+        if not path.is_file():
+            raise ValueError(f"policy slot manifest is missing: {relative}")
+        try:
+            actual = sha256_file(path)
+        except OSError as exc:
+            raise ValueError(
+                f"cannot hash policy slot manifest {relative}: {exc}"
+            ) from exc
+        if actual != entry["sha256"]:
+            raise ValueError(
+                f"policy slot manifest SHA256 mismatch: {relative}"
+            )
+
+
 def is_sha256(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
@@ -295,6 +324,29 @@ def validate_schema(lock: dict[str, Any]) -> None:
         raise ValueError(f"runtime lock is missing keys: {', '.join(missing)}")
     if lock["schema_version"] != 2:
         raise ValueError(f"unsupported runtime lock schema: {lock['schema_version']}")
+
+    policy_slots = lock.get("policy_slots")
+    if not isinstance(policy_slots, dict) or set(policy_slots) != {"manifests"}:
+        raise ValueError("policy_slots must contain exactly manifests")
+    policy_manifests = policy_slots["manifests"]
+    if not isinstance(policy_manifests, list) or not policy_manifests:
+        raise ValueError("policy_slots.manifests must be a non-empty list")
+    policy_manifest_paths: set[str] = set()
+    for entry in policy_manifests:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
+            raise ValueError("policy slot manifest locks must contain path/sha256")
+        path = entry.get("path")
+        if (
+            not isinstance(path, str)
+            or not is_safe_relative_path(path)
+            or not path.startswith("config/runtime/policy-slots/")
+            or not path.endswith(".json")
+            or path in policy_manifest_paths
+        ):
+            raise ValueError(f"invalid or duplicate policy slot manifest path: {path!r}")
+        policy_manifest_paths.add(path)
+        if not is_sha256(entry.get("sha256")):
+            raise ValueError(f"invalid policy slot manifest SHA256: {path}")
 
     matrix_release = lock.get("matrix_release", {})
     installed_files = matrix_release.get("installed_files")
@@ -1844,6 +1896,12 @@ def main() -> int:
         lock = load_lock(args.lock.resolve())
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"[FAIL] runtime lock: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        validate_policy_manifest_files(lock, args.matrix_root)
+    except (OSError, ValueError) as exc:
+        print(f"[FAIL] policy slot manifest: {exc}", file=sys.stderr)
         return 2
 
     if args.schema_only:

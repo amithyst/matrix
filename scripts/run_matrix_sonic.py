@@ -56,6 +56,11 @@ from matrix_mc_commands import (
     execute_command,
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
+from matrix_policy_slots import (
+    BFM_TEACHER50K_POLICY_ID,
+    PolicyCandidateState,
+    evaluate_policy_candidate,
+)
 from matrix_world_state import (
     WorldPose,
     WorldStateError,
@@ -175,6 +180,21 @@ def _parse_args() -> argparse.Namespace:
         ).strip().lower()
         in {"1", "true", "yes", "on"},
         help="Keep SONIC and every recovery policy loaded; switch writer authority only",
+    )
+    parser.add_argument(
+        "--locomotion-policy-manifest",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "MATRIX_BFM_SONIC_MANIFEST",
+                _SCRIPT_DIR.parent
+                / "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
+            )
+        ),
+        help=(
+            "Locked optional locomotion-policy declaration; incomplete or "
+            "unverified candidates remain visible but unavailable"
+        ),
     )
     parser.add_argument(
         "--physical-recovery-execution-provider",
@@ -4987,6 +5007,21 @@ class _PhysicalRecoveryCoordinator:
         self._policy_selection_results: dict[
             str, tuple[bool, str, str, dict[str, object]]
         ] = {}
+        manifest_path = Path(
+            getattr(
+                args,
+                "locomotion_policy_manifest",
+                _SCRIPT_DIR.parent
+                / "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
+            )
+        )
+        self.locomotion_policy_candidates: tuple[PolicyCandidateState, ...] = (
+            evaluate_policy_candidate(
+                manifest_path,
+                _SCRIPT_DIR.parent / "config/runtime/matrix-sonic.lock.json",
+                project_root=_SCRIPT_DIR.parent,
+            ),
+        )
 
     def _configured_recovery_policy_ids(self) -> tuple[str, ...]:
         configured = ["kungfu", "host", "amp"]
@@ -5031,6 +5066,20 @@ class _PhysicalRecoveryCoordinator:
             if getattr(worker, "selected_policy_id", None) in recovery_ids
             else str(getattr(self, "initial_controller", "host"))
         )
+        locomotion_candidates = [
+            {
+                "policy_id": "sonic",
+                "name": "SONIC",
+                "resident": True,
+                "available": True,
+                "provenance_verified": True,
+                "unavailable_reason": None,
+            },
+            *[
+                candidate.to_mapping()
+                for candidate in getattr(self, "locomotion_policy_candidates", ())
+            ],
+        ]
         return {
             "version": 1,
             "available": bool(self.resident_policies),
@@ -5049,14 +5098,12 @@ class _PhysicalRecoveryCoordinator:
                 {
                     "slot": "locomotion",
                     "selected_policy_id": "sonic",
-                    "locked": True,
-                    "candidates": [
-                        {
-                            "policy_id": "sonic",
-                            "resident": True,
-                            "available": True,
-                        }
-                    ],
+                    "locked": not any(
+                        candidate.get("available") is True
+                        and candidate.get("policy_id") != "sonic"
+                        for candidate in locomotion_candidates
+                    ),
+                    "candidates": locomotion_candidates,
                 },
                 {
                     "slot": "recovery",
@@ -5074,6 +5121,18 @@ class _PhysicalRecoveryCoordinator:
             ],
             "resident_models": [
                 {"policy_id": "sonic", "name": "sonic", "resident": True},
+                *[
+                    {
+                        "policy_id": candidate.policy_id,
+                        "name": candidate.display_name,
+                        "resident": candidate.resident,
+                        "available": candidate.available,
+                        "unavailable_reason": candidate.unavailable_reason,
+                    }
+                    for candidate in getattr(
+                        self, "locomotion_policy_candidates", ()
+                    )
+                ],
                 *[
                     {
                         "policy_id": policy_id,
@@ -5094,12 +5153,38 @@ class _PhysicalRecoveryCoordinator:
         """Begin one writer-free slot assignment, or return an idempotent result."""
 
         if command.slot == "locomotion":
-            if command.policy_id != "sonic":
+            if command.policy_id == "sonic":
+                return self.strategy_loadout_mapping()
+            candidate = next(
+                (
+                    item
+                    for item in getattr(self, "locomotion_policy_candidates", ())
+                    if item.policy_id == command.policy_id
+                ),
+                None,
+            )
+            if candidate is None:
                 raise CommandExecutionError(
                     "E_POLICY_NOT_REGISTERED",
-                    "The locomotion slot currently accepts only sonic",
+                    f"Locomotion policy is not registered: {command.policy_id}",
                 )
-            return self.strategy_loadout_mapping()
+            if not candidate.available or not candidate.resident:
+                reason = candidate.unavailable_reason or "runtime_adapter_not_registered"
+                raise CommandExecutionError(
+                    "E_POLICY_UNAVAILABLE",
+                    f"Locomotion policy is unavailable: {candidate.policy_id}: {reason}",
+                )
+            # No BFM writer implementation reaches this branch today.  Keep a
+            # fail-closed guard so a manifest edit alone cannot grant LowCmd.
+            if command.policy_id == BFM_TEACHER50K_POLICY_ID:
+                raise CommandExecutionError(
+                    "E_POLICY_UNAVAILABLE",
+                    "BFM Teacher50k has no registered Matrix writer adapter",
+                )
+            raise CommandExecutionError(
+                "E_POLICY_NOT_REGISTERED",
+                f"Locomotion policy is not switchable: {command.policy_id}",
+            )
         if not self.resident_policies:
             raise CommandExecutionError(
                 "E_POLICY_UNAVAILABLE",
@@ -5872,8 +5957,34 @@ class _PhysicalRecoveryCoordinator:
         if (
             output is not None
             and isinstance(output.state, ResidentRecoveryState)
-            and output.state is not ResidentRecoveryState.GAME_SONIC
         ):
+            if output.state is ResidentRecoveryState.GAME_SONIC:
+                # Resident recovery returns authority to the same SONIC
+                # process and therefore never creates a new deploy yaw frame.
+                # Applying the replacement-deploy 1 rad/s wire limiter here
+                # double-limits the core's already feedback-bounded 2.5 rad/s
+                # turn, forcing ordinary camera-relative running into long
+                # turn-only (zero-translation) intervals.
+                if not math.isclose(
+                    self.command_frame_rotation_rad,
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise RuntimeError(
+                        "resident SONIC command frame unexpectedly rotated"
+                    )
+                facing_norm = math.hypot(command.facing[0], command.facing[1])
+                if facing_norm <= 1e-12:
+                    raise ValueError(
+                        "resident SONIC command has zero horizontal facing"
+                    )
+                self.last_wire_facing_heading_rad = math.atan2(
+                    command.facing[1], command.facing[0]
+                )
+                self.last_reframe_limited = False
+                self.last_reframe_heading_error_rad = 0.0
+                return command
             # The resident deploy keeps consuming planner frames while KungFu
             # owns LowCmd. Track the live body yaw so RESUME cannot inherit a
             # stale camera-facing turn request during the fragile handoff.

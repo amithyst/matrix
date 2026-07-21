@@ -1,0 +1,51 @@
+{
+  "schema": "matrix.locomotion-policy-candidate.v1",
+  "policy_id": "bfm-sonic-teacher50k",
+  "display_name": "BFM SONIC Teacher50k",
+  "slot": "locomotion",
+  "backend": "bfm-sonic-teacher-v2",
+  "source": {
+    "repository": "ssh://git@gitlab.xvirobotics.com:2222/bfms/bfm-sonic.git",
+    "commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25",
+    "main_at_handoff": "86522b848d3a4c7bcd532d36a3974e77bf00cf81",
+    "root_env": "MATRIX_BFM_SONIC_SOURCE_ROOT",
+    "checkpoint_path_hint": "/vepfs/users/fuhuiqiao/runs/bfm-sonic-t2-activeedge-formal-8h20-50k-retry2-20260715_033852/sonic/model_step_050000.pt"
+  },
+  "artifacts": [
+    {
+      "name": "checkpoint",
+      "path_env": "MATRIX_BFM_SONIC_CHECKPOINT",
+      "sha256": "613274ee5956db59b8f2509c408619ee600e7b847c4609ad1643e6c7ffd410c1",
+      "executable": false
+    },
+    {
+      "name": "config",
+      "path_env": "MATRIX_BFM_SONIC_CONFIG",
+      "sha256": "e7bed95642a3627cc6f6cff416da784fe2d0841b697d0f34e7039fd73af10e3f",
+      "executable": false
+    },
+    {
+      "name": "runtime_adapter",
+      "path_env": "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
+      "sha256": null,
+      "executable": true
+    }
+  ],
+  "runtime_contract": {
+    "adapter_protocol": "matrix.locomotion-policy-writer.v1",
+    "decoder_input_dim": 1093,
+    "token_dim": 64,
+    "deployable_proprio_dim": 930,
+    "compatibility_zero_dim": 99,
+    "action_dim": 29,
+    "proxy99_exact_zero": true
+  },
+  "evidence": {
+    "first_core_document_id": "64413413-8f8f-4636-8d40-fd85b858cd65",
+    "second_core_mirror_id": "50b2254b-df5f-4f4b-8b26-4a649ec398f7",
+    "checkpoint_contract_commit": "ff3608c6e8b9af38a6116c7a41dd49a724c367d1",
+    "checkpoint_contract_path": "docs/autoresearch/student_full_scale_teacher50k_contract_20260720.md",
+    "runtime_contract_commit": "c3f607d161793037d5e8a73b89ee4286ef27780b",
+    "runtime_contract_path": "docs/manifests/student_v1_late_teacher_selection_20260717.json"
+  }
+}
