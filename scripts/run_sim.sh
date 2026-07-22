@@ -1372,6 +1372,20 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_SPAWN_ARGS=()
     SONIC_WORLD_ARGS=()
     SONIC_SCENE_TRANSFORM_ARGS=()
+    SONIC_INVENTORY_ARGS=()
+    if [[ -n "${MATRIX_CREATIVE_INVENTORY_CATALOG:-}" ]]; then
+        if [[ ! -f "$MATRIX_CREATIVE_INVENTORY_CATALOG" ]]; then
+            echo "[ERROR] Creative inventory catalog is missing: $MATRIX_CREATIVE_INVENTORY_CATALOG" >&2
+            exit 1
+        fi
+        if [[ ! -f "$PROJECT_ROOT/scripts/inject_creative_inventory.py" ]]; then
+            echo "[ERROR] Creative inventory injector is missing" >&2
+            exit 1
+        fi
+        SONIC_INVENTORY_ARGS+=(
+            --creative-inventory-catalog "$MATRIX_CREATIVE_INVENTORY_CATALOG"
+        )
+    fi
     if [[ "$SCENE" == "scene_terrain_t10.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
             --scene-transform town10-open-boundary-v1
@@ -1460,6 +1474,7 @@ if $MATRIX_SONIC_ENABLED; then
         --native-scene "$NATIVE_SONIC_SCENE" \
         --output-dir "$SONIC_PHYSICS_DIR" \
         "${SONIC_SPAWN_ARGS[@]}" \
+        "${SONIC_INVENTORY_ARGS[@]}" \
         "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"

@@ -1560,6 +1560,69 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 error = MODULE._snapshot_validation_error(self.snapshot(**kwargs))
                 self.assertEqual(error, f"snapshot_dimension:{expected}")
 
+    def test_snapshot_accepts_explicit_inventory_dimensions(self) -> None:
+        dimensions = {
+            "qpos": 92,
+            "qvel": 83,
+            "ctrl": 29,
+            "applied_torque": 29,
+        }
+        snapshot = self.snapshot(qpos_len=92, qvel_len=83)
+        self.assertIsNone(
+            MODULE._snapshot_validation_error(snapshot, expected_dims=dimensions)
+        )
+        invalid = dict(dimensions)
+        invalid["unexpected"] = 1
+        self.assertEqual(
+            MODULE._snapshot_validation_error(snapshot, expected_dims=invalid),
+            "snapshot_expected_dimensions_invalid",
+        )
+
+    def test_creative_inventory_extends_only_unactuated_freejoints(self) -> None:
+        body_joints = [f"body_joint_{index}" for index in range(29)]
+        actuators = [f"body_actuator_{index}" for index in range(29)]
+        inventory_joint = "creative_item__prop__0__freejoint"
+        joint_names = ["floating_base_joint", *body_joints, inventory_joint]
+
+        class ActuatorTransmission:
+            def __getitem__(self, key):
+                index, column = key
+                self.assert_column(column)
+                return index + 1
+
+            @staticmethod
+            def assert_column(column):
+                if column != 0:
+                    raise AssertionError(column)
+
+        model = SimpleNamespace(
+            nq=43,
+            nv=41,
+            nu=29,
+            njnt=len(joint_names),
+            jnt_type=[0, *([3] * 29), 0],
+            actuator_trnid=ActuatorTransmission(),
+            joint=lambda index: SimpleNamespace(name=joint_names[index]),
+            actuator=lambda index: SimpleNamespace(name=actuators[index]),
+        )
+        config = {
+            "BODY_JOINT_NAMES": body_joints,
+            "BODY_ACTUATOR_NAMES": actuators,
+        }
+        MODULE._validate_creative_inventory_sonic_contract(
+            model,
+            config,
+            (inventory_joint,),
+        )
+
+        model.jnt_type[-1] = 3
+        with self.assertRaisesRegex(ValueError, "must all be freejoints"):
+            MODULE._validate_creative_inventory_sonic_contract(
+                model,
+                config,
+                (inventory_joint,),
+            )
+
     def test_snapshot_step_must_advance_once_and_time_must_increase(self) -> None:
         previous = self.snapshot(step_index=10, sim_time=1.0)
         self.assertIsNone(

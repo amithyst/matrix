@@ -379,6 +379,22 @@ class GameCommandClientTest(unittest.TestCase):
             "resident_models": [],
         }
 
+    @staticmethod
+    def creative_inventory(remaining=8, spawn_count=0):
+        return {
+            "version": 1,
+            "available": True,
+            "spawn_count": spawn_count,
+            "items": [
+                {
+                    "item_id": "training_blaster",
+                    "label": "Training Blaster",
+                    "pool_size": 8,
+                    "remaining": remaining,
+                }
+            ],
+        }
+
     def make_client(self):
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         client = MODULE.GameCommandClient(provider.detach())
@@ -509,6 +525,58 @@ class GameCommandClientTest(unittest.TestCase):
             client.strategy_loadout_mapping()["slots"][1]["selected_policy_id"],
             "host",
         )
+
+    def test_creative_spawn_skips_editor_and_tracks_remaining_inventory(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            initial_creative_inventory=self.creative_inventory(),
+        )
+        runtime.settimeout(1.0)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertTrue(
+            client.spawn_creative_item(
+                "training_blaster",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            request.command,
+            MC_COMMANDS.CreativeSpawnItem("training_blaster"),
+        )
+        self.assertFalse(client.editing)
+        changed = self.creative_inventory(remaining=7, spawn_count=1)
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_INVENTORY_SPAWNED",
+                    message="placed",
+                    data={
+                        "creative_inventory": changed,
+                        "spawned_item": {
+                            "item_id": "training_blaster",
+                            "instance_name": "creative_item__training_blaster__0",
+                            "position": [0.9, 0.0, 1.0],
+                            "quaternion": [1.0, 0.0, 0.0, 0.0],
+                        },
+                    },
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        inventory = client.creative_inventory_mapping()
+        self.assertEqual(inventory["spawn_count"], 1)
+        self.assertEqual(inventory["items"][0]["remaining"], 7)
 
     def test_only_one_request_is_in_flight_and_restart_response_is_terminal(self) -> None:
         client, runtime = self.make_client()

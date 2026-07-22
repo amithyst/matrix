@@ -216,7 +216,13 @@ def palette(items: tuple[InventoryItem, ...]) -> str:
     return ";".join(result)
 
 
-def inject_catalog(mjcf_path: Path, assets_dir: Path, catalog_path: Path) -> dict[str, object]:
+def inject_catalog(
+    mjcf_path: Path,
+    assets_dir: Path,
+    catalog_path: Path,
+    *,
+    use_default_classes: bool = True,
+) -> dict[str, object]:
     mjcf_path = mjcf_path.resolve()
     assets_dir = assets_dir.resolve()
     items = load_catalog(catalog_path)
@@ -282,32 +288,36 @@ def inject_catalog(mjcf_path: Path, assets_dir: Path, catalog_path: Path) -> dic
             for visual_index, (mesh_name, material_name) in enumerate(
                 zip(mesh_names, material_names, strict=True)
             ):
+                visual_attributes = {
+                    "name": f"{body_name}__visual_{visual_index}",
+                    "type": "mesh",
+                    "mesh": mesh_name,
+                    "material": material_name,
+                    "contype": "0",
+                    "conaffinity": "0",
+                    "density": "0",
+                    "group": "2",
+                }
+                if use_default_classes:
+                    visual_attributes["class"] = "visual"
                 ET.SubElement(
                     body,
                     "geom",
-                    {
-                        "name": f"{body_name}__visual_{visual_index}",
-                        "type": "mesh",
-                        "mesh": mesh_name,
-                        "material": material_name,
-                        "class": "visual",
-                        "contype": "0",
-                        "conaffinity": "0",
-                        "density": "0",
-                        "group": "2",
-                    },
+                    visual_attributes,
                 )
+            collision_attributes = {
+                "name": f"{body_name}__collision",
+                "type": "box",
+                "size": _format_vector(item.collision_half_size),
+                "mass": f"{item.mass_kg:.9g}",
+                "rgba": "0 0 0 0",
+            }
+            if use_default_classes:
+                collision_attributes["class"] = "collision"
             ET.SubElement(
                 body,
                 "geom",
-                {
-                    "name": f"{body_name}__collision",
-                    "type": "box",
-                    "size": _format_vector(item.collision_half_size),
-                    "mass": f"{item.mass_kg:.9g}",
-                    "class": "collision",
-                    "rgba": "0 0 0 0",
-                },
+                collision_attributes,
             )
             ET.SubElement(
                 equality,

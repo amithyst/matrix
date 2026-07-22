@@ -478,6 +478,7 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         inner = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(
             encoding="utf-8"
         )
+        self.assertIn("--creative-inventory-catalog", inner)
         self.assertLess(
             inner.index(
                 "unset MATRIX_G1_MATERIAL_PALETTE "

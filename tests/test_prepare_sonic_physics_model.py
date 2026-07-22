@@ -172,6 +172,105 @@ material="demo_ground_material" /></worldbody>
             )
             self.assertEqual((output / "height.png").read_bytes(), b"height")
 
+    def test_injects_creative_inventory_into_canonical_sonic_robot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            canonical = root / "canonical.xml"
+            meshes = root / "canonical_meshes"
+            native = root / "xgb"
+            output = root / "output"
+            inventory = root / "inventory"
+            catalog = inventory / "catalog.json"
+            meshes.mkdir()
+            inventory.mkdir()
+            (meshes / "body.stl").write_bytes(b"body")
+            (inventory / "prop.stl").write_bytes(b"prop")
+            (native / "assets").mkdir(parents=True)
+            canonical.write_text(
+                """<mujoco><compiler meshdir="meshes" /><asset>
+<mesh name="body" file="body.stl" /></asset>
+<worldbody><body name="pelvis"><freejoint name="floating" />
+<joint name="joint_a" /><geom mesh="body" /></body>
+<body name="demo_body"><geom type="box" size="1 1 1" /></body>
+<light name="demo_light" /></worldbody>
+<actuator><motor name="a" joint="joint_a" /></actuator></mujoco>""",
+                encoding="utf-8",
+            )
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "schema": "matrix-creative-inventory/v1",
+                        "items": [
+                            {
+                                "item_id": "prop",
+                                "label": "Prop",
+                                "pool_size": 1,
+                                "mass_kg": 1.0,
+                                "collision_half_size": [0.1, 0.1, 0.1],
+                                "spawn_distance_m": 0.9,
+                                "spawn_height_m": 1.0,
+                                "spawn_quat": [1.0, 0.0, 0.0, 0.0],
+                                "visuals": [
+                                    {
+                                        "mesh": "prop.stl",
+                                        "rgba": [0.2, 0.4, 0.8, 1.0],
+                                        "scale": [1.0, 1.0, 1.0],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            scene = native / "scene.xml"
+            scene.write_text(
+                """<mujoco><include file="xgb.xml" />
+<worldbody><geom name="floor" type="plane" /></worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+
+            MODULE.prepare_sonic_physics_model(
+                canonical,
+                meshes,
+                scene,
+                output,
+                body_joint_names=("joint_a",),
+                creative_inventory_catalog=catalog,
+            )
+
+            robot = ET.parse(output / "robot.xml").getroot()
+            worldbody_names = [
+                child.get("name") for child in robot.find("worldbody")
+            ]
+            self.assertEqual(
+                worldbody_names,
+                ["pelvis", "creative_item__prop__0"],
+            )
+            self.assertIsNotNone(
+                robot.find(
+                    ".//weld[@name='creative_item__prop__0__storage_weld']"
+                )
+            )
+            retained_assets = {
+                item.get("name") for item in robot.find("asset")
+            }
+            self.assertIn("creative_prop_0", retained_assets)
+            self.assertIn("matrix_source_creative_prop_0", retained_assets)
+            self.assertTrue((output / "meshes" / "creative_prop_0.stl").is_file())
+            inventory_geoms = robot.findall(
+                ".//body[@name='creative_item__prop__0']/geom"
+            )
+            self.assertTrue(inventory_geoms)
+            self.assertTrue(
+                all("class" not in geom.attrib for geom in inventory_geoms)
+            )
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(
+                manifest["creative_inventory"]["catalog_sha256"],
+                MODULE._file_sha256(catalog),
+            )
+
     def test_town10_open_boundary_removes_four_walls_and_retains_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
@@ -222,7 +321,7 @@ material="demo_ground_material" /></worldbody>
             for wall in MODULE.TOWN10_PERIMETER_WALL_NAMES:
                 self.assertNotIn(wall, names)
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(manifest["pipeline_version"], 4)
+            self.assertEqual(manifest["pipeline_version"], 6)
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,

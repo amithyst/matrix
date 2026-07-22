@@ -175,6 +175,27 @@ class OverlayLayoutTest(unittest.TestCase):
             )
             self.assertFalse(self.intersects(layout[name], layout["crosshair_safe"]))
 
+    def test_inventory_targets_are_page_scoped_and_bounded(self) -> None:
+        geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
+        layout = MODULE.overlay_layout(geometry)
+        panel = layout["panel"]
+        for index in range(4):
+            name = f"creative_item_{index}"
+            x, y, width, height = layout[name]
+            point = (x + width // 2, y + height // 2)
+            self.assertEqual(
+                MODULE.panel_action_at(layout, *point, page="inventory"),
+                name,
+            )
+            self.assertNotEqual(
+                MODULE.panel_action_at(layout, *point, page="settings"),
+                name,
+            )
+            self.assertTrue(MODULE.point_in_rectangle((x, y), panel))
+            self.assertTrue(
+                MODULE.point_in_rectangle((x + width - 1, y + height - 1), panel)
+            )
+
     def test_root_coordinate_hit_test_handles_offset_remote_desktop_client(self) -> None:
         geometry = MODULE.WindowGeometry(1, -640, 120, 1600, 900)
         layout = MODULE.overlay_layout(geometry)
@@ -566,6 +587,31 @@ class PointerActionPublisherTest(unittest.TestCase):
                 publisher.publish_command_submit("x" * (MODULE.MAX_COMMAND_CHARS + 1))
             with self.assertRaisesRegex(ValueError, "boolean"):
                 publisher.publish_command_edit(1)
+        finally:
+            publisher.close()
+            receiver.close()
+
+    def test_creative_spawn_is_a_strict_typed_intent(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_creative_spawn("training_blaster")
+            packet = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(
+                packet,
+                {
+                    "version": 1,
+                    "session": "known-session",
+                    "sequence": 1,
+                    "kind": "creative_spawn",
+                    "item_id": "training_blaster",
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                publisher.publish_creative_spawn("../../bad")
         finally:
             publisher.close()
             receiver.close()

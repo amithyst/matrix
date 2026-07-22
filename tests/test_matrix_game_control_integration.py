@@ -382,6 +382,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "matrix_world_state.py",
             "compose_custom_scene.py",
             "prepare_sonic_physics_model.py",
+            "inject_creative_inventory.py",
         ):
             shutil.copy2(SCRIPTS / name, scripts / name)
         self.write(

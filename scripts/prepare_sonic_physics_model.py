@@ -18,9 +18,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from compose_custom_scene import compose_custom_scene  # noqa: E402
+from inject_creative_inventory import (  # noqa: E402
+    InventoryCatalogError,
+    inject_catalog,
+    load_catalog,
+)
 
 
-PIPELINE_VERSION = 4
+PIPELINE_VERSION = 6
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 TOWN10_SOURCE_SCENE_SHA256 = (
@@ -356,6 +361,7 @@ def _source_contract(
     spawn_yaw: float | None,
     scene_transform: str,
     removed_environment_geoms: tuple[str, ...],
+    creative_inventory_catalog: Path | None,
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
     return {
@@ -376,6 +382,36 @@ def _source_contract(
         "spawn_yaw_rad": spawn_yaw,
         "scene_transform": scene_transform,
         "removed_environment_geoms": list(removed_environment_geoms),
+        "creative_inventory": _creative_inventory_source_contract(
+            creative_inventory_catalog
+        ),
+    }
+
+
+def _creative_inventory_source_contract(
+    catalog: Path | None,
+) -> dict[str, object] | None:
+    if catalog is None:
+        return None
+    try:
+        items = load_catalog(catalog)
+    except InventoryCatalogError as exc:
+        raise SonicPhysicsModelError(f"invalid creative inventory catalog: {exc}") from exc
+    meshes = sorted(
+        {visual.mesh.resolve() for item in items for visual in item.visuals},
+        key=lambda path: path.as_posix(),
+    )
+    return {
+        "catalog": str(catalog.resolve()),
+        "catalog_sha256": _file_sha256(catalog),
+        "meshes": [
+            {
+                "path": str(mesh),
+                "size": mesh.stat().st_size,
+                "sha256": _file_sha256(mesh),
+            }
+            for mesh in meshes
+        ],
     }
 
 
@@ -409,6 +445,7 @@ def physics_revision_payload(
         spawn_yaw=None,
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
+        creative_inventory_catalog=None,
     )
     native_scene_assets = []
     for asset in contract["native_scene_assets"]:
@@ -584,17 +621,27 @@ def prepare_sonic_physics_model(
     spawn_xyz: tuple[float, float, float] | None = None,
     spawn_yaw: float | None = None,
     scene_transform: str | None = None,
+    creative_inventory_catalog: Path | None = None,
 ) -> Path:
     canonical_model = canonical_model.resolve()
     canonical_meshes = canonical_meshes.resolve()
     native_scene = native_scene.resolve()
     output_dir = output_dir.resolve()
+    creative_inventory_catalog = (
+        creative_inventory_catalog.resolve()
+        if creative_inventory_catalog is not None
+        else None
+    )
     if not canonical_model.is_file():
         raise SonicPhysicsModelError(f"canonical SONIC model is missing: {canonical_model}")
     if not canonical_meshes.is_dir():
         raise SonicPhysicsModelError(f"canonical SONIC meshes are missing: {canonical_meshes}")
     if not native_scene.is_file():
         raise SonicPhysicsModelError(f"Matrix native scene is missing: {native_scene}")
+    if creative_inventory_catalog is not None and not creative_inventory_catalog.is_file():
+        raise SonicPhysicsModelError(
+            f"creative inventory catalog is missing: {creative_inventory_catalog}"
+        )
     if not body_joint_names:
         raise SonicPhysicsModelError("body joint contract must not be empty")
     if spawn_xyz is not None and (
@@ -623,6 +670,7 @@ def prepare_sonic_physics_model(
         spawn_yaw=normalized_spawn_yaw,
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
+        creative_inventory_catalog=creative_inventory_catalog,
     )
     manifest_path = output_dir / "manifest.json"
     scene_path = output_dir / native_scene.name
@@ -670,6 +718,18 @@ def prepare_sonic_physics_model(
             spawn_xyz=normalized_spawn_xyz,
             spawn_yaw=normalized_spawn_yaw,
         )
+        if creative_inventory_catalog is not None:
+            try:
+                inject_catalog(
+                    temporary_dir / "robot.xml",
+                    temporary_dir / "meshes",
+                    creative_inventory_catalog,
+                    use_default_classes=False,
+                )
+            except InventoryCatalogError as exc:
+                raise SonicPhysicsModelError(
+                    f"cannot inject creative inventory: {exc}"
+                ) from exc
         compose_custom_scene(
             native_scene,
             temporary_dir / native_scene.name,
@@ -704,6 +764,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--canonical-meshes", type=Path, required=True)
     parser.add_argument("--native-scene", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--creative-inventory-catalog", type=Path)
     parser.add_argument("--spawn-x", type=float)
     parser.add_argument("--spawn-y", type=float)
     parser.add_argument("--spawn-z", type=float)
@@ -737,6 +798,7 @@ def main() -> int:
             spawn_xyz=spawn_xyz,
             spawn_yaw=args.spawn_yaw,
             scene_transform=args.scene_transform,
+            creative_inventory_catalog=args.creative_inventory_catalog,
         )
     except SonicPhysicsModelError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc

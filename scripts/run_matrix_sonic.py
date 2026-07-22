@@ -60,6 +60,7 @@ from matrix_creative_inventory import (
     CreativeInventoryError,
     CreativeInventoryRuntime,
 )
+from inject_creative_inventory import InventoryCatalogError, load_catalog
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_world_state import (
     WorldPose,
@@ -2429,6 +2430,108 @@ def _native_config_kwargs(args: argparse.Namespace, model_path: Path) -> dict[st
         "with_hands": False,
         "reset_on_fall": False,
     }
+
+
+def _creative_inventory_joint_names(items: object) -> tuple[str, ...]:
+    return tuple(
+        f"creative_item__{item.item_id}__{index}__freejoint"
+        for item in items
+        for index in range(item.pool_size)
+    )
+
+
+def _validate_creative_inventory_sonic_contract(
+    model: Any,
+    config: Any,
+    inventory_joint_names: tuple[str, ...],
+) -> None:
+    """Extend SONIC's body-only contract with named, unactuated freejoints."""
+
+    expected_shape = (
+        36 + 7 * len(inventory_joint_names),
+        35 + 6 * len(inventory_joint_names),
+        29,
+    )
+    actual_shape = (int(model.nq), int(model.nv), int(model.nu))
+    if actual_shape != expected_shape:
+        raise ValueError(
+            "Creative inventory MuJoCo model must have (nq, nv, nu)="
+            f"{expected_shape}, got {actual_shape}"
+        )
+
+    expected_body_joints = list(config["BODY_JOINT_NAMES"])
+    actual_joints = [
+        model.joint(index).name
+        for index in range(model.njnt)
+        if model.joint(index).name != "floating_base_joint"
+    ]
+    expected_joints = expected_body_joints + list(inventory_joint_names)
+    if actual_joints != expected_joints:
+        raise ValueError(
+            "Creative inventory joint order differs from the canonical body-plus-pool "
+            f"contract: expected {expected_joints}, got {actual_joints}"
+        )
+
+    import mujoco
+
+    joint_id_by_name = {
+        model.joint(index).name: index for index in range(model.njnt)
+    }
+    non_free_inventory_joints = [
+        name
+        for name in inventory_joint_names
+        if int(model.jnt_type[joint_id_by_name[name]])
+        != int(mujoco.mjtJoint.mjJNT_FREE)
+    ]
+    if non_free_inventory_joints:
+        raise ValueError(
+            "Creative inventory pool joints must all be freejoints: "
+            f"{non_free_inventory_joints}"
+        )
+
+    expected_actuators = list(config["BODY_ACTUATOR_NAMES"])
+    actual_actuators = [
+        model.actuator(index).name for index in range(model.nu)
+    ]
+    if actual_actuators != expected_actuators:
+        raise ValueError(
+            "Creative inventory changed the canonical 29-actuator order: "
+            f"expected {expected_actuators}, got {actual_actuators}"
+        )
+    actuated_joints = [
+        model.joint(int(model.actuator_trnid[index, 0])).name
+        for index in range(model.nu)
+    ]
+    if actuated_joints != expected_body_joints:
+        raise ValueError(
+            "Creative inventory actuators must target only canonical body joints: "
+            f"expected {expected_body_joints}, got {actuated_joints}"
+        )
+
+
+def _create_simulator_with_creative_inventory_contract(
+    create_simulator: Callable[[Any], Any],
+    config: Any,
+    inventory_joint_names: tuple[str, ...],
+) -> Any:
+    """Narrowly replace SONIC's shape-only validator during construction."""
+
+    from gear_sonic.utils.mujoco_sim.base_sim import DefaultEnv
+
+    original = DefaultEnv._validate_body_only_model_contract
+
+    def validate(instance: Any) -> None:
+        _validate_creative_inventory_sonic_contract(
+            instance.mj_model,
+            instance.config,
+            inventory_joint_names,
+        )
+
+    DefaultEnv._validate_body_only_model_contract = validate
+    try:
+        return create_simulator(config)
+    finally:
+        DefaultEnv._validate_body_only_model_contract = original
 
 
 def _loopback_zmq_port(endpoint: str) -> int:
@@ -6598,11 +6701,25 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "Use the SONIC commit pinned by config/runtime/matrix-sonic.lock.json."
         ) from exc
 
-    config = SimLoopConfig(**_native_config_kwargs(args, model_path))
-    simulator = create_simulator(config)
-    creative_inventory = None
     creative_catalog_value = os.environ.get("MATRIX_CREATIVE_INVENTORY_CATALOG", "")
+    creative_items = None
     if creative_catalog_value:
+        try:
+            creative_items = load_catalog(Path(creative_catalog_value))
+        except (InventoryCatalogError, OSError) as exc:
+            raise SystemExit(f"cannot load creative inventory catalog: {exc}") from exc
+
+    config = SimLoopConfig(**_native_config_kwargs(args, model_path))
+    if creative_items is None:
+        simulator = create_simulator(config)
+    else:
+        simulator = _create_simulator_with_creative_inventory_contract(
+            create_simulator,
+            config,
+            _creative_inventory_joint_names(creative_items),
+        )
+    creative_inventory = None
+    if creative_items is not None:
         try:
             creative_inventory = CreativeInventoryRuntime(
                 simulator,
