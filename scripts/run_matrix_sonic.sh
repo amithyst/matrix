@@ -2008,7 +2008,8 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
     && "$RESTART_EXPECTED_EXIT_CODE" == "143" \
     && "$exit_code" == "143" \
     && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
-    if /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+    if VERIFIED_RESTART_CHECKPOINT_KIND="$(
+        /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
 import json
 from pathlib import Path
 import re
@@ -2045,30 +2046,130 @@ run_id = status.get("run_id")
 if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
     raise SystemExit(1)
 final_checkpoint = status.get("final_checkpoint")
-if not isinstance(final_checkpoint, dict) or set(final_checkpoint) != {
+
+def checkpoint_identity(value, *, schema):
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "run_id",
+        "checkpoint_id",
+        "generation",
+    }:
+        return None
+    checkpoint_id = value.get("checkpoint_id")
+    generation = value.get("generation")
+    if (
+        value.get("schema") != schema
+        or value.get("run_id") != run_id
+        or not isinstance(checkpoint_id, str)
+        or re.fullmatch(r"cp-[0-9a-f]{32}", checkpoint_id) is None
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        return None
+    return checkpoint_id, generation
+
+final_identity = checkpoint_identity(
+    final_checkpoint,
+    schema="matrix-final-world-checkpoint/v1",
+)
+if final_identity is not None:
+    checkpoint_id, generation = final_identity
+    if (
+        world.get("active_resume_checkpoint_id") != checkpoint_id
+        or world.get("generation") != generation
+    ):
+        raise SystemExit(1)
+    print("final")
+    raise SystemExit(0)
+
+# A selected checkpoint stays read-only after startup until a genuine user
+# move/turn.  In that narrow state the runtime may prove that the exact durable
+# selected checkpoint can be reused, without writing SONIC's settling pose.
+if final_checkpoint is not None:
+    raise SystemExit(1)
+reuse = status.get("reused_resume_checkpoint")
+if not isinstance(reuse, dict) or set(reuse) != {
     "schema",
     "run_id",
     "checkpoint_id",
     "generation",
+    "disposition",
 }:
     raise SystemExit(1)
-checkpoint_id = final_checkpoint.get("checkpoint_id")
-generation = final_checkpoint.get("generation")
+reuse_identity = checkpoint_identity(
+    {key: value for key, value in reuse.items() if key != "disposition"},
+    schema="matrix-reused-selected-world-checkpoint/v1",
+)
+if reuse_identity is None or reuse.get("disposition") != "reused_selected_resume":
+    raise SystemExit(1)
+checkpoint_id, generation = reuse_identity
 if (
-    final_checkpoint.get("schema") != "matrix-final-world-checkpoint/v1"
-    or final_checkpoint.get("run_id") != run_id
-    or not isinstance(checkpoint_id, str)
-    or re.fullmatch(r"cp-[0-9a-f]{32}", checkpoint_id) is None
-    or isinstance(generation, bool)
-    or not isinstance(generation, int)
-    or generation < 0
+    status.get("fall_detected") is not False
+    or status.get("numerical_error") is not None
+    or status.get("current_fall_detected", False) is not False
     or world.get("active_resume_checkpoint_id") != checkpoint_id
     or world.get("generation") != generation
+    or world.get("selected_resume_checkpoint_id") != checkpoint_id
+    or world.get("selected_resume_generation") != generation
+    or world.get("load_error") is not None
+    or world.get("checkpoint_count") != 0
+    or world.get("last_checkpoint_monotonic_s") is not None
 ):
     raise SystemExit(1)
+rollback = world.get("resume_rollback")
+if (
+    not isinstance(rollback, dict)
+    or rollback.get("requested") is not False
+    or rollback.get("applied") is not False
+):
+    raise SystemExit(1)
+probation = status.get("resume_probation")
+if (
+    not isinstance(probation, dict)
+    or probation.get("enabled") is not True
+    or probation.get("selected_checkpoint_id") != checkpoint_id
+    or probation.get("active") is not False
+    or probation.get("completed") is not True
+    or probation.get("failed") is not False
+    or probation.get("phase") != "completed"
+    or probation.get("checkpoint_writes_blocked") is not True
+    or not isinstance(probation.get("audit_count"), int)
+    or isinstance(probation.get("audit_count"), bool)
+    or probation.get("audit_count") <= 0
+):
+    raise SystemExit(1)
+audit = probation.get("last_clearance_audit")
+arming = probation.get("checkpoint_write_arming")
+if (
+    not isinstance(audit, dict)
+    or audit.get("safe") is not True
+    or not isinstance(arming, dict)
+    or arming.get("required") is not True
+    or arming.get("armed") is not False
+    or arming.get("phase") != "waiting_user_motion"
+    or arming.get("waiting_for_user_motion") is not True
+    or arming.get("armed_by_mode") is not None
+    or arming.get("armed_by_sequence") is not None
+):
+    raise SystemExit(1)
+failures = status.get("acceptance_failures")
+if (
+    not isinstance(failures, list)
+    or "world_state_checkpoint_failed" in failures
+):
+    raise SystemExit(1)
+print("reused_selected_resume")
 PY
-    then
-        echo "[INFO] Verified final Matrix world checkpoint for requested restart"
+    )"; then
+        if [[ "$VERIFIED_RESTART_CHECKPOINT_KIND" == "final" ]]; then
+            echo "[INFO] Verified final Matrix world checkpoint for requested restart"
+        elif [[ "$VERIFIED_RESTART_CHECKPOINT_KIND" == "reused_selected_resume" ]]; then
+            echo "[INFO] Verified unchanged selected Matrix world checkpoint for requested restart"
+        else
+            RESTART_REQUEST_VALID=0
+            echo "[ERROR] Refusing Matrix restart with an unknown checkpoint proof" >&2
+        fi
     else
         RESTART_REQUEST_VALID=0
         echo "[ERROR] Refusing Matrix restart without a verified final world checkpoint" >&2

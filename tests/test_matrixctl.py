@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ if os.fspath(SCRIPTS) not in sys.path:
     sys.path.insert(0, os.fspath(SCRIPTS))
 
 import matrix_external_control as EXTERNAL  # noqa: E402
+import matrix_game_control as CONTROL  # noqa: E402
 import matrix_game_control_input as PROVIDER  # noqa: E402
 import matrixctl as MODULE  # noqa: E402
 
@@ -84,6 +86,13 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         gamepad = MODULE._state_with_gamepad(Args())
         self.assertTrue(gamepad.gamepad_connected)
         self.assertEqual(gamepad.gamepad_axes["forward"], 0.75)
+
+        connected_neutral = MODULE._connected_neutral_gamepad_state()
+        self.assertTrue(connected_neutral.gamepad_connected)
+        self.assertFalse(any(connected_neutral.gamepad_buttons.values()))
+        self.assertTrue(
+            all(value == 0.0 for value in connected_neutral.gamepad_axes.values())
+        )
 
     def test_modifier_only_gap_preserves_double_tap_speed_tier(self) -> None:
         for modifier in ("alt", "ctrl", "shift"):
@@ -329,6 +338,169 @@ class MatrixCtlHelpersTest(unittest.TestCase):
             EXTERNAL.ExternalInputState.neutral(),
         )
         client.release.assert_called_once_with("lease")
+
+    @mock.patch.object(MODULE, "_hold_state")
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_main_gamepad_connects_centered_before_action_then_disconnects(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        hold_state,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "gamepad",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "forward": 0.75,
+                "right": -0.25,
+                "look_yaw": 0.5,
+                "look_pitch": -0.5,
+                "seconds": 1.0,
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.012)
+
+        self.assertEqual(MODULE.main(), 0)
+
+        self.assertEqual(hold_state.call_count, 2)
+        warmup, action = hold_state.call_args_list
+        connected_neutral = MODULE._connected_neutral_gamepad_state()
+        requested = MODULE._state_with_gamepad(parse_args.return_value)
+        self.assertEqual(warmup.args, (client, "lease", connected_neutral))
+        self.assertEqual(
+            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
+        )
+        self.assertEqual(action.args, (client, "lease", requested))
+        self.assertEqual(action.kwargs["seconds"], 1.0)
+        for call in (warmup, action):
+            self.assertEqual(call.kwargs["refresh_seconds"], 0.004)
+
+        full_neutral = EXTERNAL.ExternalInputState.neutral()
+        self.assertFalse(full_neutral.gamepad_connected)
+        client.replace.assert_called_once_with("lease", full_neutral)
+        client.release.assert_called_once_with("lease")
+
+    def test_connected_gamepad_warmup_crosses_provider_and_core_rearm(
+        self,
+    ) -> None:
+        class Args:
+            forward = 0.75
+            right = 0.0
+            look_yaw = 0.0
+            look_pitch = 0.0
+
+        physical_focus = PROVIDER.KeyboardMouseSample(
+            focused=True,
+            focus_title="Matrix",
+            focus_pid=42,
+        )
+        disconnected_neutral = EXTERNAL.ExternalInputState.neutral()
+        connected_neutral = MODULE._connected_neutral_gamepad_state()
+        active_stick = MODULE._state_with_gamepad(Args())
+
+        def exercise(
+            warmup: EXTERNAL.ExternalInputState,
+        ) -> tuple[
+            list[tuple[bool, CONTROL.RobotMotionCommand]],
+            Callable[
+                [EXTERNAL.ExternalInputState],
+                tuple[bool, CONTROL.RobotMotionCommand],
+            ],
+        ]:
+            core = CONTROL.GameControlCore()
+            previous_connected = False
+            sequence = 0
+            now_s = 10.0
+
+            def provider_frame(
+                state: EXTERNAL.ExternalInputState,
+            ) -> tuple[bool, CONTROL.RobotMotionCommand]:
+                nonlocal previous_connected, sequence, now_s
+                sequence += 1
+                now_s += 0.02
+                keyboard, gamepad = PROVIDER.external_input_samples(
+                    state,
+                    focus=physical_focus,
+                    look_button="left",
+                )
+                frame_source = PROVIDER.external_frame_input_source(
+                    state,
+                    configured_source="auto",
+                )
+                input_available = PROVIDER.gamepad_input_available(
+                    frame_source,
+                    connected=gamepad.connected,
+                    previous_connected=previous_connected,
+                )
+                previous_connected = gamepad.connected
+                snapshot = PROVIDER.build_snapshot(
+                    sequence=sequence,
+                    timestamp_monotonic_s=now_s,
+                    keyboard=keyboard,
+                    gamepad=gamepad,
+                    input_source=frame_source,
+                    camera_yaw_rad=0.0,
+                    camera_available=True,
+                    input_available=input_available,
+                )
+                core.accept_snapshot(snapshot, received_at_s=now_s)
+                return input_available, core.command(now_s=now_s, dt_s=0.02)
+
+            # Model the preceding physical/provider frame, then enough warmup
+            # frames to span both the hotplug edge and neutral rearm.
+            provider_frame(disconnected_neutral)
+            observations = [provider_frame(warmup), provider_frame(warmup)]
+            observations.extend(
+                (provider_frame(active_stick), provider_frame(active_stick))
+            )
+            return observations, provider_frame
+
+        old, _ = exercise(disconnected_neutral)
+        self.assertTrue(old[2][1].safe_stop)
+        self.assertEqual(old[2][1].reason, "focus_lost")
+        self.assertTrue(old[3][1].safe_stop)
+        self.assertEqual(old[3][1].reason, "awaiting_neutral")
+
+        current, provider_frame = exercise(connected_neutral)
+        # The provider rejects exactly the connected edge, then a second
+        # connected-and-centered frame safely rearms the core.
+        self.assertFalse(current[0][0])
+        self.assertEqual(current[0][1].reason, "focus_lost")
+        self.assertTrue(current[1][0])
+        self.assertEqual(current[1][1].mode, "idle")
+        for input_available, command in current[2:]:
+            self.assertTrue(input_available)
+            self.assertFalse(command.safe_stop)
+            self.assertIn(command.mode, {"move", "turn"})
+
+        # Full-neutral cleanup disconnects the virtual controller.  That edge
+        # deadmans immediately, and reconnecting with a displaced stick cannot
+        # bypass the centered-stick requirement.
+        cleanup_available, cleanup = provider_frame(disconnected_neutral)
+        self.assertFalse(cleanup_available)
+        self.assertTrue(cleanup.safe_stop)
+        self.assertEqual(cleanup.reason, "focus_lost")
+        reconnect_available, reconnect = provider_frame(active_stick)
+        self.assertFalse(reconnect_available)
+        self.assertTrue(reconnect.safe_stop)
+        self.assertEqual(reconnect.reason, "focus_lost")
+        available_again, still_blocked = provider_frame(active_stick)
+        self.assertTrue(available_again)
+        self.assertTrue(still_blocked.safe_stop)
+        self.assertEqual(still_blocked.reason, "awaiting_neutral")
 
     def test_main_double_tap_activates_detector_after_external_source_rearm(
         self,

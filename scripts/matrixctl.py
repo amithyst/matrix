@@ -325,10 +325,17 @@ def _state_with_mouse(dx: float, dy: float, button: str | None) -> ExternalInput
 
 
 def _state_with_gamepad(args: argparse.Namespace) -> ExternalInputState:
-    mapping = ExternalInputState.neutral().to_mapping()
-    mapping["gamepad"]["connected"] = True
+    mapping = _connected_neutral_gamepad_state().to_mapping()
     for name in GAMEPAD_AXIS_FIELDS:
         mapping["gamepad"]["axes"][name] = getattr(args, name)
+    return ExternalInputState.from_mapping(mapping)
+
+
+def _connected_neutral_gamepad_state() -> ExternalInputState:
+    """Keep a virtual gamepad present while all of its controls are neutral."""
+
+    mapping = ExternalInputState.neutral().to_mapping()
+    mapping["gamepad"]["connected"] = True
     return ExternalInputState.from_mapping(mapping)
 
 
@@ -560,11 +567,20 @@ def main() -> int:
         response: dict[str, object] | None = None
         lease_available = True
         try:
-            warmup_state = (
-                _state_with_keyboard(None, tuple(args.modifier))
-                if args.action == "key"
-                else neutral
-            )
+            if args.action == "key":
+                warmup_state = _state_with_keyboard(
+                    None,
+                    tuple(args.modifier),
+                )
+            elif args.action == "gamepad":
+                # A disconnected -> connected gamepad edge deliberately
+                # produces one provider-side unfocused frame.  Keep the
+                # virtual controller connected and centered throughout the
+                # warmup so the following provider frames can satisfy the
+                # core's neutral-rearm interlock before any stick moves.
+                warmup_state = _connected_neutral_gamepad_state()
+            else:
+                warmup_state = neutral
             _hold_state(
                 client,
                 lease_id,

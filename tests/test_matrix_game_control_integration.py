@@ -976,45 +976,109 @@ elif script == "matrix_game_control_input.py":
         sonic_status_file = os.environ.get("FAKE_SONIC_STATUS_FILE")
         if sonic_status_file:
             checkpoint_error = os.environ.get("FAKE_FINAL_CHECKPOINT_ERROR")
+            reuse_selected = (
+                os.environ.get("FAKE_REUSED_SELECTED_CHECKPOINT") == "1"
+            )
+            reuse_corruption = os.environ.get(
+                "FAKE_REUSED_SELECTED_CHECKPOINT_CORRUPTION"
+            )
             run_id = "1" * 32
             checkpoint_id = "cp-" + ("2" * 32)
-            Path(sonic_status_file).write_text(
-                json.dumps(
-                    {
-                        "acceptance_failures": (
-                            ["world_state_checkpoint_failed"]
-                            if checkpoint_error
-                            else []
-                        ),
-                        "completed": False,
-                        "failed_child_exit_code": None,
-                        "failed_child_name": None,
-                        "final_checkpoint": (
-                            None
-                            if checkpoint_error
-                            else {
-                                "schema": "matrix-final-world-checkpoint/v1",
-                                "run_id": run_id,
-                                "checkpoint_id": checkpoint_id,
-                                "generation": 1,
-                            }
-                        ),
-                        "game_world_state": {
-                            "active_resume_checkpoint_id": checkpoint_id,
-                            "generation": 1,
-                            "has_last_exit": True,
-                            "last_error": checkpoint_error,
-                        },
-                        "internal_restart": {
-                            "requested": False,
-                            "reason": None,
-                        },
-                        "passed": False,
+            status = {
+                "acceptance_failures": (
+                    ["world_state_checkpoint_failed"]
+                    if checkpoint_error
+                    else []
+                ),
+                "completed": False,
+                "failed_child_exit_code": None,
+                "failed_child_name": None,
+                "fall_detected": False,
+                "final_checkpoint": (
+                    None
+                    if checkpoint_error or reuse_selected
+                    else {
+                        "schema": "matrix-final-world-checkpoint/v1",
                         "run_id": run_id,
-                        "termination_reason": "signal",
-                        "termination_signal": signal.SIGTERM,
+                        "checkpoint_id": checkpoint_id,
+                        "generation": 1,
                     }
                 ),
+                "game_world_state": {
+                    "active_resume_checkpoint_id": checkpoint_id,
+                    "generation": 1,
+                    "has_last_exit": True,
+                    "last_error": checkpoint_error,
+                },
+                "internal_restart": {
+                    "requested": False,
+                    "reason": None,
+                },
+                "numerical_error": None,
+                "passed": False,
+                "run_id": run_id,
+                "termination_reason": "signal",
+                "termination_signal": signal.SIGTERM,
+            }
+            if reuse_selected:
+                status["current_fall_detected"] = False
+                status["reused_resume_checkpoint"] = {
+                    "schema": "matrix-reused-selected-world-checkpoint/v1",
+                    "run_id": run_id,
+                    "checkpoint_id": checkpoint_id,
+                    "generation": 1,
+                    "disposition": "reused_selected_resume",
+                }
+                status["game_world_state"].update(
+                    {
+                        "selected_resume_checkpoint_id": checkpoint_id,
+                        "selected_resume_generation": 1,
+                        "load_error": None,
+                        "checkpoint_count": 0,
+                        "last_checkpoint_monotonic_s": None,
+                        "resume_rollback": {
+                            "requested": False,
+                            "applied": False,
+                        },
+                    }
+                )
+                status["resume_probation"] = {
+                    "enabled": True,
+                    "selected_checkpoint_id": checkpoint_id,
+                    "active": False,
+                    "completed": True,
+                    "failed": False,
+                    "phase": "completed",
+                    "checkpoint_writes_blocked": True,
+                    "checkpoint_write_arming": {
+                        "required": True,
+                        "armed": False,
+                        "phase": "waiting_user_motion",
+                        "waiting_for_user_motion": True,
+                        "armed_by_mode": None,
+                        "armed_by_sequence": None,
+                    },
+                    "audit_count": 1,
+                    "last_clearance_audit": {"safe": True},
+                }
+                if reuse_corruption == "identity":
+                    status["reused_resume_checkpoint"]["checkpoint_id"] = (
+                        "cp-" + ("3" * 32)
+                    )
+                elif reuse_corruption == "generation":
+                    status["reused_resume_checkpoint"]["generation"] = 2
+                elif reuse_corruption == "probation_failed":
+                    status["resume_probation"]["failed"] = True
+                    status["resume_probation"]["phase"] = "failed"
+                elif reuse_corruption == "fall":
+                    status["fall_detected"] = True
+                elif reuse_corruption == "child_failure":
+                    status["failed_child_name"] = "ue"
+                    status["failed_child_exit_code"] = 2
+                elif reuse_corruption == "checkpoint_count":
+                    status["game_world_state"]["checkpoint_count"] = 1
+            Path(sonic_status_file).write_text(
+                json.dumps(status),
                 encoding="utf-8",
             )
         raise SystemExit(0)
@@ -3887,6 +3951,154 @@ esac
             )
             for path, expected in originals.items():
                 self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
+
+    def test_private_request_reuses_unchanged_selected_resume_checkpoint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            marker = project / "restart-once.marker"
+            generations = project / "generations.txt"
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_REUSED_SELECTED_CHECKPOINT": "1",
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TRIGGER_RESTART_MARKER": os.fspath(marker),
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
+            self.assertIn(
+                "Verified unchanged selected Matrix world checkpoint",
+                result.stdout,
+            )
+            self.assertNotIn(
+                "Verified final Matrix world checkpoint",
+                result.stdout,
+            )
+
+    def test_private_request_rejects_ambiguous_selected_resume_reuse(self) -> None:
+        corruptions = (
+            "identity",
+            "generation",
+            "probation_failed",
+            "fall",
+            "child_failure",
+            "checkpoint_count",
+        )
+        for corruption in corruptions:
+            with self.subTest(corruption=corruption):
+                with tempfile.TemporaryDirectory() as temporary:
+                    project = Path(temporary) / "matrix"
+                    fixture = self.make_project(project)
+                    runtime_dir = project / "runtime"
+                    runtime_dir.mkdir()
+                    temporary_dir = project / "tmp"
+                    temporary_dir.mkdir()
+                    marker = project / "restart-once.marker"
+                    generations = project / "generations.txt"
+                    environment = {
+                        "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                        "FAKE_REUSED_SELECTED_CHECKPOINT": "1",
+                        "FAKE_REUSED_SELECTED_CHECKPOINT_CORRUPTION": corruption,
+                        "GENERATION_FILE": os.fspath(generations),
+                        "HOME": os.fspath(project / "home"),
+                        "LANG": "C.UTF-8",
+                        "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                        "MATRIX_SKIP_ENV_CHECK": "1",
+                        "MATRIX_SONIC_HOST_LOCK": os.fspath(
+                            project / "launcher.lock"
+                        ),
+                        "MATRIX_SONIC_PYTHON": os.fspath(
+                            fixture["fake_python"]
+                        ),
+                        "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                        "MATRIX_UE_STARTUP_SECONDS": "0",
+                        "MATRIX_VERIFY_RUNTIME": "0",
+                        "PATH": os.fspath(fixture["fake_bin"])
+                        + os.pathsep
+                        + os.environ.get("PATH", "/usr/bin:/bin"),
+                        "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                        "TRIGGER_RESTART_MARKER": os.fspath(marker),
+                        "TMPDIR": os.fspath(temporary_dir),
+                        "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                        "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+                    }
+
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                            "--scene",
+                            "21",
+                            "--control-source",
+                            "game",
+                        ],
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        timeout=30.0,
+                        check=False,
+                    )
+
+                    self.assertEqual(
+                        result.returncode,
+                        143,
+                        msg=(
+                            f"corruption={corruption}\nstdout:\n{result.stdout}"
+                            f"\nstderr:\n{result.stderr}"
+                        ),
+                    )
+                    self.assertEqual(
+                        generations.read_text(encoding="utf-8"),
+                        "1",
+                    )
+                    self.assertIn(
+                        "Refusing Matrix restart without a verified final "
+                        "world checkpoint",
+                        result.stderr,
+                    )
 
     def test_private_request_refuses_restart_when_final_checkpoint_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

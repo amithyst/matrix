@@ -88,6 +88,12 @@ _GAME_RESUME_ROLLBACK_EXIT_CODE = 76
 _GAME_INTERNAL_RESTART_REASONS = frozenset(
     {"game_fall_respawn", "game_teleport"}
 )
+_GAME_TURN_COMMAND_REASONS = frozenset(
+    {
+        "aligning_heading",
+        "recovery_heading_slew_limited",
+    }
+)
 _GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
     {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
 )
@@ -2534,6 +2540,15 @@ class _GameWorldResumeProbation:
         self.completed = False
         self.failed = False
         self.failure_reason: str | None = None
+        # A selected checkpoint remains the durable resume target after the
+        # native startup probation has completed.  SONIC can move the body a
+        # small amount while settling even though Matrix publishes only IDLE;
+        # persisting that pose would accumulate the same startup displacement
+        # on every restart.  Only a subsequently published user move/turn may
+        # arm checkpoint writes for the rest of this run.
+        self._checkpoint_writes_armed = False
+        self.checkpoint_write_armed_by_mode: str | None = None
+        self.checkpoint_write_armed_by_sequence: int | None = None
         self.first_fresh_lowcmd_s: float | None = None
         self.band_released_s: float | None = None
         self.stable_idle_started_sim_s: float | None = None
@@ -2563,6 +2578,88 @@ class _GameWorldResumeProbation:
     @property
     def active(self) -> bool:
         return self.enabled and not self.completed
+
+    @property
+    def checkpoint_writes_armed(self) -> bool:
+        """Return whether ordinary game-world checkpoints may be persisted."""
+
+        return not self.enabled or self._checkpoint_writes_armed
+
+    @property
+    def checkpoint_writes_blocked(self) -> bool:
+        return not self.checkpoint_writes_armed
+
+    @staticmethod
+    def _user_motion_command(command: RobotMotionCommand | None) -> bool:
+        """Recognize user move/turn forms admitted by the wire pipeline."""
+
+        if not isinstance(command, RobotMotionCommand) or command.safe_stop:
+            return False
+        sequence = command.sequence
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 0
+        ):
+            return False
+        try:
+            movement = tuple(float(component) for component in command.movement)
+            facing = tuple(float(component) for component in command.facing)
+            speed_mps = float(command.speed_mps)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            len(movement) != 3
+            or len(facing) != 3
+            or not all(math.isfinite(value) for value in (*movement, *facing))
+            or not math.isfinite(speed_mps)
+        ):
+            return False
+        movement_zero = all(
+            math.isclose(value, 0.0, rel_tol=0.0, abs_tol=1e-9)
+            for value in movement
+        )
+        if command.mode == "move":
+            return bool(
+                speed_mps > 0.0
+                and not movement_zero
+                and command.locomotion_mode != SONIC_IDLE_MODE
+            )
+        if command.mode == "turn":
+            return bool(
+                math.isclose(speed_mps, 0.0, rel_tol=0.0, abs_tol=1e-9)
+                and movement_zero
+                and command.locomotion_mode == SONIC_IDLE_MODE
+                and command.reason in _GAME_TURN_COMMAND_REASONS
+            )
+        return False
+
+    def observe_published_user_command(
+        self,
+        command: RobotMotionCommand | None,
+    ) -> bool:
+        """Latch writes after one real post-probation user motion publish.
+
+        The caller supplies only commands that actually crossed the planner
+        publication boundary from the interactive-input path.  Recovery,
+        startup, command-panel, and policy/config actions never call this
+        method, and the wire contract is checked again here before arming.
+        """
+
+        if (
+            not self.enabled
+            or not self.completed
+            or self.failed
+            or self._checkpoint_writes_armed
+            or not self._user_motion_command(command)
+        ):
+            return False
+        assert isinstance(command, RobotMotionCommand)
+        assert isinstance(command.sequence, int)
+        self._checkpoint_writes_armed = True
+        self.checkpoint_write_armed_by_mode = command.mode
+        self.checkpoint_write_armed_by_sequence = command.sequence
+        return True
 
     @staticmethod
     def _idle_command(command: RobotMotionCommand | None) -> bool:
@@ -2812,6 +2909,14 @@ class _GameWorldResumeProbation:
             phase = "waiting_idle"
         else:
             phase = "stable_idle"
+        if not self.enabled:
+            checkpoint_write_phase = "disabled"
+        elif self.checkpoint_writes_armed:
+            checkpoint_write_phase = "armed"
+        elif self.active:
+            checkpoint_write_phase = "resume_probation"
+        else:
+            checkpoint_write_phase = "waiting_user_motion"
         return {
             "enabled": self.enabled,
             "selected_checkpoint_id": self.selected_checkpoint_id,
@@ -2819,7 +2924,19 @@ class _GameWorldResumeProbation:
             "completed": self.completed,
             "failed": self.failed,
             "phase": phase,
-            "checkpoint_writes_blocked": self.active,
+            "checkpoint_writes_blocked": self.checkpoint_writes_blocked,
+            "checkpoint_write_arming": {
+                "required": self.enabled,
+                "armed": self.checkpoint_writes_armed,
+                "phase": checkpoint_write_phase,
+                "waiting_for_user_motion": bool(
+                    self.enabled
+                    and self.completed
+                    and not self.checkpoint_writes_armed
+                ),
+                "armed_by_mode": self.checkpoint_write_armed_by_mode,
+                "armed_by_sequence": self.checkpoint_write_armed_by_sequence,
+            },
             "stable_idle_required_s": self.stable_idle_seconds,
             "stable_idle_elapsed_s": round(stable_elapsed, 3),
             "stable_idle_clock": "sim_time",
@@ -2885,23 +3002,120 @@ class _GameWorldResumeProbation:
         }
 
 
+def _reused_selected_resume_checkpoint(
+    *,
+    run_id: str,
+    selected_checkpoint_id: str | None,
+    selected_generation: int | None,
+    game_world: _GameWorldStateRuntime | None,
+    resume_probation: _GameWorldResumeProbation,
+    termination_reason: str | None,
+    termination_signal: int | None,
+    child_failure: tuple[str, int] | None,
+    unstable: bool,
+    fall_detected: bool,
+    current_fall_detected: bool,
+    world_checkpoint_failed: bool,
+) -> dict[str, object] | None:
+    """Prove that a requested restart may reuse the selected checkpoint.
+
+    A selected resume remains read-only after startup probation until one real
+    user move/turn is published.  A UI/F9 restart in that interval must not
+    save SONIC's startup settling pose.  It may, however, reuse the exact
+    checkpoint that was durably loaded for this generation.  Re-read the
+    world-state file and bind the evidence to both the selected and active
+    identity; every ambiguous or failure state returns no authority.
+    """
+
+    if (
+        termination_reason != "signal"
+        or termination_signal != signal.SIGTERM
+        or child_failure is not None
+        or unstable
+        or fall_detected
+        or current_fall_detected
+        or world_checkpoint_failed
+        or game_world is None
+        or not resume_probation.enabled
+        or resume_probation.active
+        or not resume_probation.completed
+        or resume_probation.failed
+        or resume_probation.checkpoint_writes_armed
+    ):
+        return None
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", run_id) is None
+        or not isinstance(selected_checkpoint_id, str)
+        or re.fullmatch(r"cp-[0-9a-f]{32}", selected_checkpoint_id) is None
+        or isinstance(selected_generation, bool)
+        or not isinstance(selected_generation, int)
+        or selected_generation < 0
+    ):
+        return None
+    last_audit = resume_probation.last_clearance_audit
+    if (
+        resume_probation.audit_count <= 0
+        or not isinstance(last_audit, dict)
+        or last_audit.get("safe") is not True
+    ):
+        return None
+    world = game_world.telemetry()
+    rollback = world.get("resume_rollback")
+    if (
+        world.get("selected_resume_checkpoint_id") != selected_checkpoint_id
+        or world.get("selected_resume_generation") != selected_generation
+        or world.get("active_resume_checkpoint_id") != selected_checkpoint_id
+        or world.get("generation") != selected_generation
+        or world.get("has_last_exit") is not True
+        or world.get("last_error") is not None
+        or world.get("load_error") is not None
+        or world.get("checkpoint_count") != 0
+        or world.get("last_checkpoint_monotonic_s") is not None
+        or not isinstance(rollback, dict)
+        or rollback.get("requested") is not False
+        or rollback.get("applied") is not False
+    ):
+        return None
+    try:
+        durable_state = game_world.store.load()
+        durable = durable_state.resolve_start()
+    except (OSError, RuntimeError, ValueError, WorldStateError):
+        return None
+    if (
+        game_world.store.load_error is not None
+        or game_world.store.load_status not in {"loaded", "backup"}
+        or durable_state != game_world.state
+        or durable.checkpoint_id != selected_checkpoint_id
+        or durable.generation != selected_generation
+    ):
+        return None
+    return {
+        "schema": "matrix-reused-selected-world-checkpoint/v1",
+        "run_id": run_id,
+        "checkpoint_id": selected_checkpoint_id,
+        "generation": selected_generation,
+        "disposition": "reused_selected_resume",
+    }
+
+
 def _handle_game_auto_respawn_fall(
     *,
     game_world: _GameWorldStateRuntime,
     game_input: GameInputRuntime,
     planner: NativePlannerClient,
     snapshot: Any,
-    resume_probation_active: bool,
+    checkpoint_writes_blocked: bool,
     now_s: float,
 ) -> tuple[str, RobotMotionCommand]:
-    """Stop every fall, but persist/reload only after resume probation."""
+    """Stop every fall, but persist/reload only after writes are armed."""
 
     game_command = game_input.emergency_stop(
         now_s=now_s,
         reason="fall_respawn_reload",
     )
     planner.send_game_command(game_command)
-    if resume_probation_active:
+    if checkpoint_writes_blocked:
         return "fall_detected", game_command
     game_world.checkpoint(
         snapshot,
@@ -3746,7 +3960,33 @@ class NativePlannerClient:
         locomotion_mode: int = 2,
         start: bool = True,
     ) -> None:
-        """Send an absolute planner direction in SONIC's normalized XY frame."""
+        """Send an absolute planner direction in SONIC's normalized XY frame.
+
+        Generic stationary directions deliberately serialize as native IDLE.
+        The game-command adapter is the only path allowed to request SONIC's
+        WALK-backed in-place turn contract.
+        """
+
+        self._send_direction(
+            movement=movement,
+            facing=facing,
+            speed=speed,
+            locomotion_mode=locomotion_mode,
+            start=start,
+            in_place_turn=False,
+        )
+
+    def _send_direction(
+        self,
+        *,
+        movement,
+        facing,
+        speed: float,
+        locomotion_mode: int,
+        start: bool,
+        in_place_turn: bool,
+    ) -> None:
+        """Validate and serialize one native planner direction frame."""
 
         movement_values = [float(value) for value in movement]
         facing_values = [float(value) for value in facing]
@@ -3764,6 +4004,18 @@ class NativePlannerClient:
             raise ValueError("locomotion_mode must be a native SONIC motion in [0, 26]")
         if moving and locomotion_mode == SONIC_IDLE_MODE:
             raise ValueError("moving planner command cannot use native IDLE")
+        if in_place_turn:
+            if locomotion_mode != SONIC_IDLE_MODE:
+                raise ValueError("in-place turn must use semantic native IDLE")
+            if speed_value > 1e-6 or any(
+                abs(value) > 1e-6 for value in movement_values
+            ):
+                raise ValueError("in-place turn must have zero speed and movement")
+        planner_mode = (
+            SONIC_WALK_MODE
+            if in_place_turn
+            else locomotion_mode if moving else SONIC_IDLE_MODE
+        )
         self._socket.send(
             self._build_command_message(
                 start=start,
@@ -3774,7 +4026,7 @@ class NativePlannerClient:
         )
         self._socket.send(
             self._build_planner_message(
-                mode=locomotion_mode if moving else SONIC_IDLE_MODE,
+                mode=planner_mode,
                 movement=movement_values if moving else [0.0, 0.0, 0.0],
                 facing=facing_values,
                 speed=(speed_value if moving else -1.0),
@@ -3807,6 +4059,10 @@ class NativePlannerClient:
                 raise ValueError("turn-only game command must use native IDLE")
             if command.safe_stop:
                 raise ValueError("turn-only game command cannot be a safe stop")
+            if command.reason not in _GAME_TURN_COMMAND_REASONS:
+                raise ValueError(
+                    "turn-only game command must use an approved turn reason"
+                )
         elif not moving:
             if command.locomotion_mode != SONIC_IDLE_MODE:
                 raise ValueError("stationary game command must use native IDLE")
@@ -3822,11 +4078,13 @@ class NativePlannerClient:
                     f"game command speed is outside native {gait_name} "
                     f"range {minimum:.1f}-{maximum:.1f} m/s"
                 )
-        self.send_direction(
+        self._send_direction(
             movement=command.movement,
             facing=command.facing,
             speed=command.speed_mps,
             locomotion_mode=command.locomotion_mode,
+            start=True,
+            in_place_turn=turning,
         )
 
     def send_recovery_posture(
@@ -8216,7 +8474,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     resume_probation_selected = resume_probation.enabled
     resume_rollback_ineligibility: str | None = None
     resume_rollback_requested = False
-    resume_probation_fall_stop = False
+    resume_checkpoint_read_only_fall_stop = False
     previous_signal_handlers: dict[int, Any] = {}
     running = True
     termination_reason: str | None = None
@@ -8228,6 +8486,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     final_status: dict[str, Any] | None = None
     spawn_clearance_audit: dict[str, object] | None = None
     final_checkpoint_identity: dict[str, object] | None = None
+    reused_resume_checkpoint_identity: dict[str, object] | None = None
     termination_boundary_previous_mask: set[signal.Signals] | None = None
     termination_boundary_safe = False
     # Keep every cleanup/status time calculation bound even if simulator
@@ -8294,7 +8553,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 )
                 if (
                     running
-                    and not resume_probation.active
+                    and resume_probation.checkpoint_writes_armed
                     and _snapshot_world_upright(snapshot)
                 ):
                     game_world.checkpoint(
@@ -8739,6 +8998,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         game_fall_recovery is not None
                         and game_fall_recovery.recovering
                     ):
+                        user_command_selected = False
                         game_command = game_input.emergency_stop(
                             now_s=frame_wall,
                             reason=(
@@ -8753,11 +9013,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         # remains neutral-gated after probation completes, so
                         # a key held through startup cannot move immediately on
                         # the release frame.
+                        user_command_selected = False
                         game_command = game_input.emergency_stop(
                             now_s=frame_wall,
                             reason="resume_checkpoint_probation",
                         )
                     else:
+                        user_command_selected = True
                         game_command = ready_game_command
                     if physical_recovery is not None:
                         game_command = physical_recovery.recovery_wire_command(
@@ -8861,6 +9123,20 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         command_published = True
                     if command_published:
                         game_input.record_published_command(game_command)
+                        if user_command_selected:
+                            writes_newly_armed = (
+                                resume_probation.observe_published_user_command(
+                                    game_command
+                                )
+                            )
+                            if writes_newly_armed:
+                                print(
+                                    "matrix-sonic-runtime resume checkpoint "
+                                    "writes armed by published user "
+                                    f"{game_command.mode} command "
+                                    f"sequence={game_command.sequence}",
+                                    flush=True,
+                                )
                     walking = game_command.mode == "move"
                     if game_commands is not None:
                         command_allowed = _game_command_poll_allowed(
@@ -8965,8 +9241,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     game_input=game_input,
                                     planner=planner,
                                     snapshot=snapshot,
-                                    resume_probation_active=(
-                                        resume_probation.active
+                                    checkpoint_writes_blocked=(
+                                        resume_probation.checkpoint_writes_blocked
                                     ),
                                     now_s=fall_wall,
                                 )
@@ -8984,10 +9260,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         walking = False
                         running = False
                         if termination_reason == "fall_detected":
-                            resume_probation_fall_stop = True
+                            resume_checkpoint_read_only_fall_stop = True
                             print(
-                                "matrix-sonic-runtime fall detected during "
-                                "resume probation; stopped without checkpoint",
+                                "matrix-sonic-runtime fall detected before "
+                                "resume checkpoint writes were armed; stopped "
+                                "without checkpoint",
                                 flush=True,
                             )
                         else:
@@ -9053,7 +9330,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             active_lowcmd = bool(snapshot.low_cmd_fresh)
             low_cmd_age_s = snapshot.low_cmd_age_s
             freshness_sample_wall = time.perf_counter()
-            if game_world is not None and not resume_probation.active:
+            if (
+                game_world is not None
+                and resume_probation.checkpoint_writes_armed
+            ):
                 game_world.checkpoint(
                     snapshot,
                     now_s=freshness_sample_wall,
@@ -9286,8 +9566,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         if (
             game_world is not None
             and termination_reason not in _GAME_INTERNAL_RESTART_REASONS
-            and not resume_probation_fall_stop
-            and not resume_probation.active
+            and not resume_checkpoint_read_only_fall_stop
+            and resume_probation.checkpoint_writes_armed
         ):
             try:
                 game_world.checkpoint(
@@ -9340,6 +9620,32 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         # channel after committing the native boundary so neither child class
         # can hide in the handoff between loop completion and acceptance.
         poll_failed_child()
+
+        if final_checkpoint_identity is None:
+            reused_resume_checkpoint_identity = (
+                _reused_selected_resume_checkpoint(
+                    run_id=run_id,
+                    selected_checkpoint_id=(
+                        args.game_world_resume_checkpoint_id
+                    ),
+                    selected_generation=args.game_world_resume_generation,
+                    game_world=game_world,
+                    resume_probation=resume_probation,
+                    termination_reason=termination_reason,
+                    termination_signal=termination_signal,
+                    child_failure=child_failure,
+                    unstable=unstable,
+                    fall_detected=fall_detected,
+                    current_fall_detected=(
+                        _game_world_current_fall_detected(
+                            snapshot,
+                            game_fall_recovery=game_fall_recovery,
+                            physical_recovery=physical_recovery,
+                        )
+                    ),
+                    world_checkpoint_failed=world_checkpoint_failed,
+                )
+            )
 
         # The runtime never deletes a durable checkpoint. After both child
         # failure boundaries are closed, it may publish one exact proposal for
@@ -9505,6 +9811,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "failed_child_name": failed_child_name,
             "fall_detected": fall_detected,
             "final_checkpoint": final_checkpoint_identity,
+            "reused_resume_checkpoint": reused_resume_checkpoint_identity,
             "instability_resets": instability_resets,
             "interrupted": interrupted,
             "last_reset_reason": snapshot.last_reset_reason,

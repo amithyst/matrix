@@ -192,6 +192,32 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
 
     @staticmethod
+    def user_move_command(*, sequence: int = 1):
+        return GAME_CONTROL.RobotMotionCommand(
+            sequence=sequence,
+            movement=(1.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.3,
+            locomotion_mode=GAME_CONTROL.SONIC_SLOW_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+
+    @staticmethod
+    def user_turn_command(*, sequence: int = 2):
+        return GAME_CONTROL.RobotMotionCommand(
+            sequence=sequence,
+            movement=(0.0, 0.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+            mode="turn",
+            safe_stop=False,
+            reason="aligning_heading",
+        )
+
+    @staticmethod
     def safe_clearance_audit() -> dict[str, object]:
         return {
             "schema": "matrix-spawn-clearance-audit/v1",
@@ -261,15 +287,233 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         probation.observe(ready, idle, now_s=29.5)
         self.assertFalse(probation.active)
         self.assertTrue(probation.completed)
-        self.assertFalse(probation.telemetry()["checkpoint_writes_blocked"])
+        telemetry = probation.telemetry()
+        self.assertTrue(telemetry["checkpoint_writes_blocked"])
+        self.assertEqual(
+            telemetry["checkpoint_write_arming"],
+            {
+                "required": True,
+                "armed": False,
+                "phase": "waiting_user_motion",
+                "waiting_for_user_motion": True,
+                "armed_by_mode": None,
+                "armed_by_sequence": None,
+            },
+        )
 
         disabled = MODULE._GameWorldResumeProbation(
             selected_checkpoint_id=None,
             clearance_auditor=auditor,
         )
         self.assertFalse(disabled.active)
+        self.assertTrue(disabled.checkpoint_writes_armed)
         self.assertIsNone(disabled.telemetry()["selected_checkpoint_id"])
+        self.assertEqual(
+            disabled.telemetry()["checkpoint_write_arming"]["phase"],
+            "disabled",
+        )
         disabled.observe(stale, idle, now_s=0.0)
+
+    def test_resume_checkpoint_writes_arm_only_on_post_completion_user_motion(
+        self,
+    ) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+            stable_idle_seconds=0.1,
+            max_sim_sample_gap_seconds=2.0,
+        )
+        turn = self.user_turn_command(sequence=11)
+        move = self.user_move_command(sequence=12)
+        self.assertFalse(probation.observe_published_user_command(turn))
+        self.assertTrue(probation.checkpoint_writes_blocked)
+
+        ready = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+            elastic_band_scale=0.0,
+            sim_time=1.0,
+        )
+        idle = self.resume_idle_command()
+        probation.observe(ready, idle, now_s=1.0)
+        ready.sim_time = 1.1
+        probation.observe(ready, idle, now_s=1.1)
+        self.assertTrue(probation.completed)
+
+        rejected = (
+            idle,
+            replace(
+                turn,
+                mode="idle",
+                reason=None,
+            ),
+            replace(
+                turn,
+                safe_stop=True,
+                reason="physical_fall_recovery",
+            ),
+            replace(turn, reason="untrusted_turn_reason"),
+            replace(turn, sequence=None),
+            replace(move, speed_mps=0.0),
+            replace(move, locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE),
+        )
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(
+                    probation.observe_published_user_command(command)
+                )
+                self.assertTrue(probation.checkpoint_writes_blocked)
+
+        self.assertTrue(probation.observe_published_user_command(turn))
+        self.assertTrue(probation.checkpoint_writes_armed)
+        self.assertFalse(probation.checkpoint_writes_blocked)
+        telemetry = probation.telemetry()["checkpoint_write_arming"]
+        self.assertEqual(telemetry["phase"], "armed")
+        self.assertEqual(telemetry["armed_by_mode"], "turn")
+        self.assertEqual(telemetry["armed_by_sequence"], 11)
+        # The first genuine command latches authority for the rest of the run.
+        self.assertFalse(probation.observe_published_user_command(move))
+        self.assertTrue(probation.checkpoint_writes_armed)
+
+        move_probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-2",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        move_probation.completed = True
+        self.assertTrue(move_probation.observe_published_user_command(move))
+        self.assertEqual(
+            move_probation.telemetry()["checkpoint_write_arming"][
+                "armed_by_mode"
+            ],
+            "move",
+        )
+
+        recovery_turn_probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-3",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        recovery_turn_probation.completed = True
+        recovery_turn = replace(
+            turn,
+            reason="recovery_heading_slew_limited",
+        )
+        self.assertTrue(
+            recovery_turn_probation.observe_published_user_command(
+                recovery_turn
+            )
+        )
+        self.assertEqual(
+            recovery_turn_probation.telemetry()["checkpoint_write_arming"][
+                "armed_by_mode"
+            ],
+            "turn",
+        )
+
+    def test_requested_restart_reuses_only_exact_durable_unarmed_resume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            store = WORLD_STATE.WorldStateStore(
+                state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+            )
+            selected_state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.25),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(selected_state)
+            selected = selected_state.resolve_start()
+            self.assertIsNotNone(selected.checkpoint_id)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id=selected.checkpoint_id,
+                selected_resume_generation=selected.generation,
+            )
+            probation = MODULE._GameWorldResumeProbation(
+                selected_checkpoint_id=selected.checkpoint_id,
+                clearance_auditor=self.safe_clearance_audit,
+            )
+            probation.completed = True
+            probation.audit_count = 1
+            probation.last_clearance_audit = self.safe_clearance_audit()
+            arguments = {
+                "run_id": "1" * 32,
+                "selected_checkpoint_id": selected.checkpoint_id,
+                "selected_generation": selected.generation,
+                "game_world": world,
+                "resume_probation": probation,
+                "termination_reason": "signal",
+                "termination_signal": signal.SIGTERM,
+                "child_failure": None,
+                "unstable": False,
+                "fall_detected": False,
+                "current_fall_detected": False,
+                "world_checkpoint_failed": False,
+            }
+
+            self.assertEqual(
+                MODULE._reused_selected_resume_checkpoint(**arguments),
+                {
+                    "schema": "matrix-reused-selected-world-checkpoint/v1",
+                    "run_id": "1" * 32,
+                    "checkpoint_id": selected.checkpoint_id,
+                    "generation": selected.generation,
+                    "disposition": "reused_selected_resume",
+                },
+            )
+            blockers = {
+                "checkpoint_id_mismatch": {
+                    "selected_checkpoint_id": "cp-" + "2" * 32,
+                },
+                "generation_mismatch": {
+                    "selected_generation": selected.generation + 1,
+                },
+                "wrong_signal": {"termination_signal": signal.SIGINT},
+                "child_failure": {"child_failure": ("ue", 2)},
+                "unstable": {"unstable": True},
+                "fall": {"fall_detected": True},
+                "recovery_fall": {"current_fall_detected": True},
+                "checkpoint_failure": {"world_checkpoint_failed": True},
+            }
+            for label, changes in blockers.items():
+                with self.subTest(label=label):
+                    self.assertIsNone(
+                        MODULE._reused_selected_resume_checkpoint(
+                            **{**arguments, **changes}
+                        )
+                    )
+
+            probation.failed = True
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            probation.failed = False
+            probation._checkpoint_writes_armed = True
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            probation._checkpoint_writes_armed = False
+            probation.completed = False
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            probation.completed = True
+
+            world.checkpoint_count = 1
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            world.checkpoint_count = 0
+            state_path.unlink()
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
 
     def test_resume_probation_audits_at_ten_hz_and_forces_completion_audit(
         self,
@@ -887,7 +1131,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertFalse(result["safe"])
                 self.assertEqual(result["reason"], "audit_error")
 
-    def test_auto_respawn_fall_is_read_only_during_resume_probation(self) -> None:
+    def test_auto_respawn_fall_is_read_only_until_checkpoint_writes_arm(
+        self,
+    ) -> None:
         world = mock.Mock()
         game_input = mock.Mock()
         planner = mock.Mock()
@@ -900,7 +1146,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             game_input=game_input,
             planner=planner,
             snapshot=snapshot,
-            resume_probation_active=True,
+            checkpoint_writes_blocked=True,
             now_s=10.0,
         )
 
@@ -944,7 +1190,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "fall_detected",
         )
 
-    def test_auto_respawn_fall_after_dynamic_probation_keeps_checkpoint_reload(
+    def test_auto_respawn_fall_after_checkpoint_write_arming_keeps_reload(
         self,
     ) -> None:
         world = mock.Mock()
@@ -959,7 +1205,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             game_input=game_input,
             planner=planner,
             snapshot=snapshot,
-            resume_probation_active=False,
+            checkpoint_writes_blocked=False,
             now_s=10.0,
         )
 
@@ -1308,6 +1554,37 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertIn(
             "if resume_probation.active and not snapshot_fall_detected:",
+            source,
+        )
+
+    def test_main_arms_resume_checkpoint_writes_only_after_user_publish(
+        self,
+    ) -> None:
+        source = inspect.getsource(MODULE.main)
+        publication = source.index("if command_published:")
+        record = source.index(
+            "game_input.record_published_command(game_command)",
+            publication,
+        )
+        provenance_gate = source.index("if user_command_selected:", record)
+        arming = source.index(
+            "resume_probation.observe_published_user_command(",
+            provenance_gate,
+        )
+        periodic_checkpoint = source.index(
+            "game_world.checkpoint(",
+            arming,
+        )
+        self.assertLess(publication, record)
+        self.assertLess(record, provenance_gate)
+        self.assertLess(provenance_gate, arming)
+        self.assertLess(arming, periodic_checkpoint)
+        self.assertIn(
+            "and resume_probation.checkpoint_writes_armed",
+            source,
+        )
+        self.assertIn(
+            "resume_probation.checkpoint_writes_blocked",
             source,
         )
 
@@ -3314,22 +3591,59 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[4]["movement"], [0.0, 0.0, 0.0])
         self.assertEqual(planners[4]["speed"], -1.0)
 
-        client.send_game_command(
-            MODULE.RobotMotionCommand(
-                sequence=121,
-                movement=(0.0, 0.0, 0.0),
-                facing=(0.0, 1.0, 0.0),
-                speed_mps=0.0,
-                locomotion_mode=MODULE.SONIC_IDLE_MODE,
-                mode="turn",
-                safe_stop=False,
-                reason="aligning_heading",
-            )
+        turn_command = MODULE.RobotMotionCommand(
+            sequence=121,
+            movement=(0.0, 0.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=MODULE.SONIC_IDLE_MODE,
+            mode="turn",
+            safe_stop=False,
+            reason="aligning_heading",
         )
-        self.assertEqual(planners[5]["mode"], MODULE.SONIC_IDLE_MODE)
+        client.send_game_command(turn_command)
+        self.assertEqual(planners[5]["mode"], MODULE.SONIC_WALK_MODE)
         self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
         self.assertEqual(planners[5]["facing"], [0.0, 1.0, 0.0])
         self.assertEqual(planners[5]["speed"], -1.0)
+
+        invalid_turns = (
+            (
+                replace(turn_command, reason="untrusted_turn_reason"),
+                "approved turn reason",
+            ),
+            (
+                replace(turn_command, safe_stop=True),
+                "cannot be a safe stop",
+            ),
+            (
+                replace(turn_command, movement=(0.0, 0.0, 0.01)),
+                "zero speed and movement",
+            ),
+            (
+                replace(
+                    turn_command,
+                    locomotion_mode=MODULE.SONIC_WALK_MODE,
+                ),
+                "must use native IDLE",
+            ),
+            (
+                replace(
+                    turn_command,
+                    movement=(1.0, 0.0, 0.0),
+                    speed_mps=0.8,
+                ),
+                "must not translate",
+            ),
+        )
+        for invalid_turn, message in invalid_turns:
+            with self.subTest(invalid_turn=invalid_turn), self.assertRaisesRegex(
+                ValueError,
+                message,
+            ):
+                client.send_game_command(invalid_turn)
+            self.assertEqual(len(planners), 6)
+            self.assertEqual(len(socket.sent), 15)
 
         client.send_recovery_posture(
             locomotion_mode=5,
