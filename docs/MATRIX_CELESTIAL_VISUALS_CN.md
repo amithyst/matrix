@@ -40,9 +40,13 @@ ZsiBot 组织当前公开仓库中没有 `.uproject`、`.uplugin` 或 Matrix UE 
 Matrix README 引用的
 [MuJoCo-Unreal-Engine-Plugin](https://github.com/oneclicklabs/MuJoCo-Unreal-Engine-Plugin)
 确实含 UE 工程和 C++ 插件源码，但 GitHub 当前未识别到许可证文件；在取得明确授权前，
-不能直接复制其代码作为我们的可维护实现。可控路径只有两条：优先向 Matrix 维护方取得
-与 v0.1.2 cooked 资产匹配的 UE 工程/构建说明；否则基于有明确许可证的 CARLA、Cesium
-和我们自己的干净 UDP bridge 建一个 source-built renderer。
+不能直接复制其代码作为我们的可维护实现。
+
+这不意味着所有新资产都要等待 Matrix 原工程。当前采用三层方案：官方 MoonWorld 直接
+作为不可变 PAK 使用；火星和自有天空/材质由我们自己的 UE 5.5.4 content-only 兼容工程
+从 NASA/PDS 等有来源的原始资产 cook 成独立 PAK；只有 Cesium C++、动态 renderer bridge、
+修改 Matrix 现有 Blueprint 或无缝跨星体 travel 才要求 source-built executable。完整选择
+边界和验收门禁见 [ADR 0002](adr/0002-planetary-pak-source-boundary.md)。
 
 ## 开源选型
 
