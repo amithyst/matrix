@@ -92,6 +92,55 @@ def _profile_mjcf() -> str:
 
 
 class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
+    def test_profile_preserves_explicit_source_material_for_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            urdf = root / "g1_29dof.urdf"
+            mjcf = root / "g1_29dof.xml"
+            accessory_urdf = """<link name="training_blaster_link"><visual>
+            <geometry><mesh filename="assets/training_blaster.stl" /></geometry>
+            <material name="matrix_source_training_orange">
+            <color rgba="0.95 0.19 0.035 1" /></material></visual></link>"""
+            accessory_mjcf_mesh = (
+                '<mesh name="training_blaster" file="training_blaster.stl" />'
+            )
+            accessory_mjcf_body = """<body name="training_blaster_link">
+            <geom name="training_blaster_link_visual" type="mesh"
+            mesh="training_blaster" class="visual" /></body>"""
+            urdf.write_text(
+                _profile_urdf().replace("</robot>", accessory_urdf + "</robot>"),
+                encoding="utf-8",
+            )
+            mjcf.write_text(
+                _profile_mjcf()
+                .replace("</asset>", accessory_mjcf_mesh + "</asset>")
+                .replace("</worldbody>", accessory_mjcf_body + "</worldbody>"),
+                encoding="utf-8",
+            )
+
+            summary = MODULE.apply_urdf_visual_materials(
+                urdf,
+                mjcf,
+                profile_scope_alpha=0.99609375,
+            )
+
+            self.assertEqual(summary.profile_id, "matrix_g1_stock_v1")
+            parsed = ET.parse(mjcf).getroot()
+            accessory_geom = next(
+                geom
+                for geom in parsed.iter("geom")
+                if geom.get("name") == "training_blaster_link_visual"
+            )
+            self.assertEqual(
+                accessory_geom.get("rgba"),
+                "0.95 0.19 0.035 0.99609375",
+            )
+            self.assertTrue(
+                accessory_geom.get("material", "").startswith(
+                    MODULE.GENERATED_PREFIX + "matrix_source_training_orange_"
+                )
+            )
+
     def test_preserves_named_inline_and_mesh_fallback_colors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

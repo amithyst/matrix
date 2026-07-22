@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 
 DEFAULT_RGBA = "0.75294 0.75294 0.75294 1"
 GENERATED_PREFIX = "urdf_visual_"
+SOURCE_MATERIAL_PREFIX = "matrix_source_"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MATERIALS_ROOT = REPO_ROOT / "config" / "materials"
 DEFAULT_SKIN_REGISTRY_PATH = MATERIALS_ROOT / "g1_skins.json"
@@ -492,6 +493,24 @@ def _visual_style(visual: ET.Element, global_materials: dict[str, str]) -> Visua
     return _style(source_name, rgba)
 
 
+def _preserves_source_material(visual: ET.Element) -> bool:
+    material = visual.find("material")
+    return (
+        material is not None
+        and material.get("name", "").startswith(SOURCE_MATERIAL_PREFIX)
+    )
+
+
+def _style_with_alpha(style: VisualStyle, alpha: float) -> VisualStyle:
+    rgba = style.rgba.split()
+    return _style(
+        style.source_name,
+        " ".join([*rgba[:3], f"{alpha:.9g}"]),
+        roughness=style.roughness,
+        metallic=style.metallic,
+    )
+
+
 def _source_styles(
     urdf_root: ET.Element,
     profile: dict[str, object] | None,
@@ -522,17 +541,20 @@ def _source_styles(
                 continue
             source_visuals += 1
             mesh_name = Path(filename).stem
-            style = (
-                _profile_visual_style(
+            if _preserves_source_material(visual):
+                style = _visual_style(visual, global_materials)
+                if profile_scope_alpha is not None:
+                    style = _style_with_alpha(style, profile_scope_alpha)
+            elif profile is not None and profile_materials is not None:
+                style = _profile_visual_style(
                     profile,
                     profile_materials,
                     link_name=link_name,
                     mesh_name=mesh_name,
                     filename=filename,
                 )
-                if profile is not None and profile_materials is not None
-                else _visual_style(visual, global_materials)
-            )
+            else:
+                style = _visual_style(visual, global_materials)
             key = (link_name, mesh_name)
             previous = by_link_mesh.get(key)
             if previous is not None and previous != style:

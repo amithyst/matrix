@@ -158,7 +158,11 @@ def build_weapon_urdf(
         "mesh",
         {"filename": f"assets/{WEAPON_MESH}", "scale": weapon_scale},
     )
-    material = ET.SubElement(visual, "material", {"name": "training_orange"})
+    material = ET.SubElement(
+        visual,
+        "material",
+        {"name": "matrix_source_training_orange"},
+    )
     ET.SubElement(material, "color", {"rgba": WEAPON_RGBA})
 
     joint = ET.SubElement(root, "joint", {"name": WEAPON_JOINT, "type": "fixed"})

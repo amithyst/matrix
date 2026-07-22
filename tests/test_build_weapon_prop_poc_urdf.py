@@ -81,6 +81,10 @@ class BuildWeaponPropPocUrdfTest(unittest.TestCase):
                 weapon_link.find("visual/material/color").get("rgba"),
                 MODULE.WEAPON_RGBA,
             )
+            self.assertEqual(
+                weapon_link.find("visual/material").get("name"),
+                "matrix_source_training_orange",
+            )
             joint = parsed.find(f"joint[@name='{MODULE.WEAPON_JOINT}']")
             self.assertEqual(joint.get("type"), "fixed")
             self.assertEqual(joint.find("parent").get("link"), "right_rubber_hand")

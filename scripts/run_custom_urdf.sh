@@ -103,6 +103,50 @@ resolve_g1_skin() {
 
 resolve_g1_skin
 
+append_source_material_palette() {
+    local urdf_path="$1"
+    local base_palette="$2"
+    "$MATRIX_PYTHON" - "$urdf_path" "$base_palette" <<'PY'
+import math
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
+
+urdf_path = Path(sys.argv[1])
+base_palette = sys.argv[2]
+existing = {entry for entry in base_palette.split(";") if entry}
+additional = []
+root = ET.parse(urdf_path).getroot()
+for material in root.iter("material"):
+    if not material.get("name", "").startswith("matrix_source_"):
+        continue
+    color = material.find("color")
+    if color is None or not color.get("rgba"):
+        continue
+    parts = color.get("rgba", "").split()
+    if len(parts) not in {3, 4}:
+        raise SystemExit("matrix_source_ material must have RGB or RGBA")
+    values = [float(value) for value in parts[:3]]
+    if any(not math.isfinite(value) or value < 0 or value > 1 for value in values):
+        raise SystemExit("matrix_source_ RGB values must be within [0, 1]")
+    entry = ",".join(f"{value:.9g}" for value in values)
+    if entry not in existing:
+        existing.add(entry)
+        additional.append(entry)
+print(";".join(additional))
+PY
+}
+
+if [[ "${MATRIX_CUSTOM_MATERIAL_PROFILE:-auto}" != "urdf" ]]; then
+    SOURCE_MATERIAL_PALETTE="$(
+        append_source_material_palette "$CUSTOM_URDF" "$G1_MATERIAL_PALETTE"
+    )"
+    if [[ -n "$SOURCE_MATERIAL_PALETTE" ]]; then
+        G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE;$SOURCE_MATERIAL_PALETTE"
+        echo "[INFO] Added source attachment colors to UE material palette: $SOURCE_MATERIAL_PALETTE"
+    fi
+fi
+
 MODEL_DIR="$MATRIX_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model"
 UE_CUSTOM_ROOT="$MODEL_DIR/custom"
 UE_CACHE_ROOT="$UE_CUSTOM_ROOT/_cache"
