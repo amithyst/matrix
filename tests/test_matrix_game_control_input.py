@@ -1740,6 +1740,29 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             self.assertFalse(keyboard_step(slower=True))
             self.assertFalse(panel.apply_panel_action("speed_down", active=True))
 
+    def test_ui_font_scale_click_persists_and_restores(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config/matrix/ui-settings.json"
+            controller = MODULE.UiSettingsController(
+                path=path,
+                desired=MODULE.UiSettings(),
+                load_status="missing",
+                load_error=None,
+            )
+            self.assertFalse(
+                controller.apply_panel_action("font_up", active=False)
+            )
+            self.assertTrue(controller.apply_panel_action("font_up", active=True))
+            self.assertEqual(controller.desired.font_scale, 1.1)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"font_scale": 1.1, "version": 1},
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            restored = MODULE.load_ui_settings(path)
+            self.assertEqual(restored.status, "loaded")
+            self.assertEqual(restored.settings.font_scale, 1.1)
+
     @staticmethod
     def requester(*, available: bool = True, succeeds: bool = True):
         class Requester:

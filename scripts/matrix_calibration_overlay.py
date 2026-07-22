@@ -40,6 +40,12 @@ from matrix_mouse_settings import (
     canonical_remote_speed_scale,
 )
 from matrix_mc_commands import MAX_COMMAND_CHARS
+from matrix_ui_settings import (
+    DEFAULT_FONT_SCALE,
+    MAX_FONT_SCALE,
+    MIN_FONT_SCALE,
+    canonical_font_scale,
+)
 
 
 _IS_VIEWABLE = 2
@@ -68,16 +74,36 @@ _MAX_COMMAND_HISTORY = 24
 _MAX_INTENT_PACKET_BYTES = 2048
 _BODY_FONT_CANDIDATES = (b"10x20", b"9x15", b"fixed")
 _LARGE_FONT_CANDIDATES = (b"12x24", b"10x20", b"fixed")
-_XFT_BODY_FONT_CANDIDATES = (
-    b"Noto Sans CJK SC:size=13",
-    b"WenQuanYi Micro Hei:size=13",
-    b"sans:size=13",
-)
-_XFT_LARGE_FONT_CANDIDATES = (
-    b"Noto Sans CJK SC:size=18:weight=bold",
-    b"WenQuanYi Micro Hei:size=18:weight=bold",
-    b"sans:size=18:weight=bold",
-)
+
+
+def xft_font_candidates(scale: object, *, large: bool) -> tuple[bytes, ...]:
+    canonical = canonical_font_scale(scale)
+    base_size = 18 if large else 13
+    size = max(8, int(round(base_size * canonical)))
+    weight = ":weight=bold" if large else ""
+    return tuple(
+        f"{family}:size={size}{weight}".encode("ascii")
+        for family in ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "sans")
+    )
+
+
+def core_font_candidates(scale: object, *, large: bool) -> tuple[bytes, ...]:
+    canonical = canonical_font_scale(scale)
+    if large:
+        return (
+            (b"10x20", b"9x15", b"fixed")
+            if canonical < 1.0
+            else _LARGE_FONT_CANDIDATES
+        )
+    if canonical < 1.0:
+        return (b"9x15", b"fixed")
+    if canonical > 1.1:
+        return (b"12x24", b"10x20", b"fixed")
+    return _BODY_FONT_CANDIDATES
+
+
+_XFT_BODY_FONT_CANDIDATES = xft_font_candidates(1.0, large=False)
+_XFT_LARGE_FONT_CANDIDATES = xft_font_candidates(1.0, large=True)
 
 _XK_BACK_SPACE = 0xFF08
 _XK_RETURN = 0xFF0D
@@ -328,7 +354,9 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
-    speed_width = max(48, min(132, (panel_width - 2 * margin) // 4))
+    settings_content_width = panel_width - 2 * margin
+    settings_group_width = max(1, (settings_content_width - gap) // 2)
+    speed_width = max(42, min(112, settings_group_width // 4))
     apply_height = max(42, min(80, button_height + 6))
     footer_space = 8 if compact else 42
     apply_y = panel_y + panel_height - footer_space - apply_height
@@ -346,7 +374,14 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     speed_value = (
         panel_x + margin + speed_width,
         speed_y,
-        panel_width - 2 * margin - 2 * speed_width,
+        settings_group_width - 2 * speed_width,
+        button_height,
+    )
+    font_left = panel_x + margin + settings_group_width + gap
+    font_value = (
+        font_left + speed_width,
+        speed_y,
+        settings_group_width - 2 * speed_width,
         button_height,
     )
     recovery_top = centre_panel_y + safe_half_size + gap
@@ -414,7 +449,15 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         "speed_down": (panel_x + margin, speed_y, speed_width, button_height),
         "speed_value": speed_value,
         "speed_up": (
-            panel_x + panel_width - margin - speed_width,
+            panel_x + margin + settings_group_width - speed_width,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "font_down": (font_left, speed_y, speed_width, button_height),
+        "font_value": font_value,
+        "font_up": (
+            font_left + settings_group_width - speed_width,
             speed_y,
             speed_width,
             button_height,
@@ -489,6 +532,8 @@ _PANEL_ACTIONS = (
     "profile_remote",
     "speed_down",
     "speed_up",
+    "font_down",
+    "font_up",
     "apply_return",
 )
 
@@ -717,6 +762,7 @@ class SettingsPanelModel:
     effective_mirror_gain: float
     status: str
     error: str | None
+    font_scale: float
 
     @property
     def apply_label(self) -> str:
@@ -744,6 +790,10 @@ class SettingsPanelModel:
                 and self.next_profile == "Remote"
                 and self.next_scale < MAX_REMOTE_SPEED_SCALE
             )
+        if action == "font_down":
+            return bool(not controls_disabled and self.font_scale > MIN_FONT_SCALE)
+        if action == "font_up":
+            return bool(not controls_disabled and self.font_scale < MAX_FONT_SCALE)
         if action == "apply_return":
             return bool(
                 not controls_disabled
@@ -1079,6 +1129,8 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
     mirror = mirror if isinstance(mirror, dict) else {}
     apply_return = state.get("apply_return")
     apply_return = apply_return if isinstance(apply_return, dict) else {}
+    ui_settings = state.get("ui_settings")
+    ui_settings = ui_settings if isinstance(ui_settings, dict) else {}
 
     def profile(value: object) -> str:
         return "Remote" if value == "remote" else "Local"
@@ -1103,10 +1155,11 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
     persistence_error = settings.get("persistence_error")
     restart_error = restart.get("error")
     action_error = apply_return.get("error")
+    ui_error = ui_settings.get("persistence_error")
     error_value = next(
         (
             value
-            for value in (persistence_error, restart_error, action_error)
+            for value in (persistence_error, ui_error, restart_error, action_error)
             if isinstance(value, str) and value
         ),
         None,
@@ -1121,6 +1174,10 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         status = "error"
     elif status not in {"waiting_neutral", "returning", "restarting", "error"}:
         status = "pending" if pending else "ready"
+    try:
+        font_scale = canonical_font_scale(ui_settings.get("font_scale", 1.0))
+    except ValueError:
+        font_scale = 1.0
     return SettingsPanelModel(
         current_profile=profile(current.get("profile")),
         current_scale=current_scale,
@@ -1142,6 +1199,7 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         ),
         status=status,
         error=error_value,
+        font_scale=font_scale,
     )
 
 
@@ -1329,6 +1387,7 @@ class X11CalibrationOverlay:
         *,
         display_name: str | None,
         expected_ue_pid: int,
+        font_scale: float = 1.0,
         x11: Any | None = None,
         xfixes: Any | None = None,
         xft: Any | None = None,
@@ -1382,6 +1441,7 @@ class X11CalibrationOverlay:
             self.close()
             raise RuntimeError("XFixes extension is unavailable")
         self.expected_ue_pid = expected_ue_pid
+        self._font_scale = canonical_font_scale(font_scale)
         self._windows: dict[str, int] = {}
         self._panel_gc: int | None = None
         self._body_font: ctypes.POINTER(XFontStruct) | None = None
@@ -1986,10 +2046,10 @@ class X11CalibrationOverlay:
             self._panel_gc = int(gc)
             self._x11.XSetForeground(self._display, gc, white)
             self._body_font, self._body_font_name = self._load_font(
-                _BODY_FONT_CANDIDATES
+                core_font_candidates(self._font_scale, large=False)
             )
             self._large_font, self._large_font_name = self._load_font(
-                _LARGE_FONT_CANDIDATES
+                core_font_candidates(self._font_scale, large=True)
             )
             if self._xft is not None:
                 self._initialize_xft(panel, colour_names)
@@ -2033,10 +2093,10 @@ class X11CalibrationOverlay:
             raise RuntimeError("cannot create the UTF-8 Xft drawing context")
         self._xft_draw = int(draw)
         self._xft_body_font, self._xft_body_font_name = self._load_xft_font(
-            _XFT_BODY_FONT_CANDIDATES
+            xft_font_candidates(self._font_scale, large=False)
         )
         self._xft_large_font, self._xft_large_font_name = self._load_xft_font(
-            _XFT_LARGE_FONT_CANDIDATES
+            xft_font_candidates(self._font_scale, large=True)
         )
         for key, pixel in self._colours.items():
             colour = XftColor()
@@ -2052,12 +2112,78 @@ class X11CalibrationOverlay:
             self._xft_colours[pixel] = colour
 
     @property
-    def font_diagnostics(self) -> dict[str, str | None]:
+    def font_diagnostics(self) -> dict[str, str | float | None]:
         return {
             "backend": "xft-utf8" if self._xft_draw is not None else "xlib-core",
             "body": self._xft_body_font_name or self._body_font_name,
             "large": self._xft_large_font_name or self._large_font_name,
+            "scale": self._font_scale,
         }
+
+    def _set_font_scale(self, value: object) -> bool:
+        scale = canonical_font_scale(value)
+        current_scale = getattr(self, "_font_scale", DEFAULT_FONT_SCALE)
+        if math.isclose(scale, current_scale, rel_tol=0.0, abs_tol=1e-9):
+            return False
+
+        new_body, new_body_name = self._load_font(
+            core_font_candidates(scale, large=False)
+        )
+        try:
+            new_large, new_large_name = self._load_font(
+                core_font_candidates(scale, large=True)
+            )
+        except Exception:
+            self._x11.XFreeFont(self._display, new_body)
+            raise
+
+        new_xft_body: int | None = None
+        new_xft_large: int | None = None
+        new_xft_body_name: str | None = None
+        new_xft_large_name: str | None = None
+        try:
+            if self._xft_draw is not None:
+                new_xft_body, new_xft_body_name = self._load_xft_font(
+                    xft_font_candidates(scale, large=False)
+                )
+                new_xft_large, new_xft_large_name = self._load_xft_font(
+                    xft_font_candidates(scale, large=True)
+                )
+        except Exception:
+            if self._xft is not None:
+                for font in (new_xft_body, new_xft_large):
+                    if font is not None:
+                        self._xft.XftFontClose(
+                            self._display, ctypes.c_void_p(font)
+                        )
+            self._x11.XFreeFont(self._display, new_body)
+            self._x11.XFreeFont(self._display, new_large)
+            raise
+
+        old_body = self._body_font
+        old_large = self._large_font
+        old_xft_body = self._xft_body_font
+        old_xft_large = self._xft_large_font
+        self._body_font = new_body
+        self._large_font = new_large
+        self._body_font_name = new_body_name
+        self._large_font_name = new_large_name
+        self._xft_body_font = new_xft_body
+        self._xft_large_font = new_xft_large
+        self._xft_body_font_name = new_xft_body_name
+        self._xft_large_font_name = new_xft_large_name
+        self._font_scale = scale
+
+        for font in (old_body, old_large):
+            if font is not None:
+                self._x11.XFreeFont(self._display, font)
+        if self._xft is not None:
+            for font in (old_xft_body, old_xft_large):
+                if font is not None:
+                    self._xft.XftFontClose(
+                        self._display, ctypes.c_void_p(font)
+                    )
+        return True
 
     def _window_pid(self, window: int) -> int | None:
         if not self._pid_atom:
@@ -2735,6 +2861,22 @@ class X11CalibrationOverlay:
             fill=self._colours["disabled" if up_disabled else "button"],
             disabled=up_disabled,
         )
+        font_down_disabled = not model.action_enabled("font_down")
+        font_up_disabled = not model.action_enabled("font_up")
+        self._draw_button(
+            layout,
+            "font_down",
+            "-",
+            fill=self._colours["disabled" if font_down_disabled else "button"],
+            disabled=font_down_disabled,
+        )
+        self._draw_button(
+            layout,
+            "font_up",
+            "+",
+            fill=self._colours["disabled" if font_up_disabled else "button"],
+            disabled=font_up_disabled,
+        )
         speed_value = self._panel_rectangle(layout, "speed_value")
         self._draw_text(
             "远程鼠标速度",
@@ -2761,14 +2903,44 @@ class X11CalibrationOverlay:
                 speed_value[3],
             ),
         )
+        font_value = self._panel_rectangle(layout, "font_value")
+        self._draw_text(
+            "界面字体",
+            x=0,
+            y=0,
+            colour=self._colours["muted"],
+            centred_in=(
+                font_value[0],
+                font_value[1] - 10,
+                font_value[2],
+                font_value[3],
+            ),
+        )
+        self._draw_text(
+            f"{round(model.font_scale * 100):d}%",
+            x=0,
+            y=0,
+            colour=self._colours["white"],
+            large=True,
+            centred_in=(
+                font_value[0],
+                font_value[1] + 10,
+                font_value[2],
+                font_value[3],
+            ),
+        )
         if layout["panel"][3] >= 500:
             status = (
                 "正在重载 Matrix"
                 if model.status == "restarting"
                 else (
-                    "设置已保存，返回后生效"
-                    if model.pending_restart
-                    else "当前设置已生效"
+                    "设置保存失败"
+                    if model.error is not None
+                    else (
+                        "设置已保存，返回后生效"
+                        if model.pending_restart
+                        else "当前设置已生效"
+                    )
                 )
             )
             self._draw_text(
@@ -2776,7 +2948,9 @@ class X11CalibrationOverlay:
                 x=self._panel_rectangle(layout, "profile_local")[0],
                 y=max(92, self._panel_rectangle(layout, "profile_local")[1] - 18),
                 colour=self._colours[
-                    "pending" if model.pending_restart else "muted"
+                    "error"
+                    if model.error is not None
+                    else ("pending" if model.pending_restart else "muted")
                 ],
             )
             self._draw_text(
@@ -3097,12 +3271,14 @@ class X11CalibrationOverlay:
         first_show = not self._visible
         geometry_changed = geometry != self._last_geometry
         model = settings_panel_model(state)
+        font_changed = self._set_font_scale(model.font_scale)
         strategy_model = strategy_loadout_model(state)
         inventory_model = creative_inventory_model(state)
         command_status = command_console_status(state)
         self._command_editor.reconcile(command_status)
         model_changed = bool(
-            model != self._last_panel_model
+            font_changed
+            or model != self._last_panel_model
             or strategy_model != getattr(self, "_last_strategy_model", None)
             or inventory_model != getattr(self, "_last_inventory_model", None)
             or getattr(self, "_active_page", "loadout")
@@ -3264,6 +3440,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-fd", type=int, required=True)
     parser.add_argument("--action-session", required=True)
     parser.add_argument("--display", default=os.environ.get("DISPLAY"))
+    parser.add_argument("--font-scale", type=float, default=1.0)
     parser.add_argument("--poll-hz", type=float, default=30.0)
     return parser.parse_args()
 
@@ -3287,6 +3464,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--action-session must be non-empty and bounded")
     if not math.isfinite(args.poll_hz) or not 1.0 <= args.poll_hz <= 120.0:
         raise SystemExit("--poll-hz must be finite and in [1, 120]")
+    try:
+        canonical_font_scale(args.font_scale)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def main() -> int:
@@ -3304,7 +3485,7 @@ def main() -> int:
     }
     overlay: X11CalibrationOverlay | None = None
     action_publisher: PointerActionPublisher | None = None
-    font_diagnostics: dict[str, str | None] | None = None
+    font_diagnostics: dict[str, str | float | None] | None = None
     return_code = 0
     exit_reason = "signal"
     try:
@@ -3316,6 +3497,7 @@ def main() -> int:
         overlay = X11CalibrationOverlay(
             display_name=args.display,
             expected_ue_pid=args.expected_ue_pid,
+            font_scale=args.font_scale,
         )
         font_diagnostics = overlay.font_diagnostics
         atomic_json(

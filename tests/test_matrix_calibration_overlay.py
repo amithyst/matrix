@@ -91,6 +91,9 @@ class OverlayLayoutTest(unittest.TestCase):
             "speed_down",
             "speed_value",
             "speed_up",
+            "font_down",
+            "font_value",
+            "font_up",
             "command_input",
             "apply_return",
         ):
@@ -115,7 +118,11 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertTrue(MODULE.overlay_supported(geometry))
         layout = MODULE.overlay_layout(geometry)
         panel = layout["panel"]
-        for name in MODULE._PANEL_ACTIONS + ("speed_value", "crosshair_safe"):
+        for name in MODULE._PANEL_ACTIONS + (
+            "speed_value",
+            "font_value",
+            "crosshair_safe",
+        ):
             rectangle = layout[name]
             self.assertTrue(MODULE.point_in_rectangle(rectangle[:2], panel))
             self.assertTrue(
@@ -133,6 +140,9 @@ class OverlayLayoutTest(unittest.TestCase):
             "speed_down",
             "speed_value",
             "speed_up",
+            "font_down",
+            "font_value",
+            "font_up",
             "command_input",
             "apply_return",
         ):
@@ -512,6 +522,26 @@ class OverlayStateTest(unittest.TestCase):
     def test_font_fallbacks_match_heyuan_xlsfonts_probe(self) -> None:
         self.assertEqual(MODULE._LARGE_FONT_CANDIDATES[0], b"12x24")
         self.assertEqual(MODULE._BODY_FONT_CANDIDATES[:2], (b"10x20", b"9x15"))
+        self.assertIn(b"size=13", MODULE.xft_font_candidates(1.0, large=False)[0])
+        self.assertIn(b"size=27", MODULE.xft_font_candidates(1.5, large=True)[0])
+
+    def test_persisted_font_scale_controls_are_bounded(self) -> None:
+        def model(scale: object):
+            return MODULE.settings_panel_model(
+                {
+                    "ui_settings": {"font_scale": scale},
+                    "restart": {"available": True, "requested": False},
+                }
+            )
+
+        minimum = model(0.8)
+        self.assertEqual(minimum.font_scale, 0.8)
+        self.assertFalse(minimum.action_enabled("font_down"))
+        self.assertTrue(minimum.action_enabled("font_up"))
+        maximum = model(1.5)
+        self.assertTrue(maximum.action_enabled("font_down"))
+        self.assertFalse(maximum.action_enabled("font_up"))
+        self.assertEqual(model(1.05).font_scale, 1.0)
 
 
 class PointerActionPublisherTest(unittest.TestCase):

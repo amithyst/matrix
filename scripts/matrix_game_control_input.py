@@ -47,6 +47,13 @@ from matrix_mouse_settings import (
     load_settings,
     step_remote_speed_scale,
 )
+from matrix_ui_settings import (
+    UiSettings,
+    atomic_save_settings as atomic_save_ui_settings,
+    default_settings_file as default_ui_settings_file,
+    load_settings as load_ui_settings,
+    step_font_scale,
+)
 from matrix_restart_request import (
     RestartRequest,
     atomic_write_request,
@@ -349,6 +356,52 @@ class MouseSettingsController:
                 "effective_scale": self.desired.effective_scale,
             },
             "pending_restart": self.pending_restart(applied),
+            "load_status": self.load_status,
+            "persistence_error": self.persistence_error,
+            "change_count": self.change_count,
+        }
+
+
+class UiSettingsController:
+    """Persist operator-interface choices and apply them live to the overlay."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        desired: UiSettings,
+        load_status: str,
+        load_error: str | None,
+    ) -> None:
+        self.path = path
+        self.desired = desired
+        self.load_status = load_status
+        self.persistence_error = load_error
+        self.change_count = 0
+
+    def apply_panel_action(self, action: str, *, active: bool) -> bool:
+        if not active or action not in {"font_down", "font_up"}:
+            return False
+        direction = -1 if action == "font_down" else 1
+        replacement = UiSettings(
+            font_scale=step_font_scale(self.desired.font_scale, direction)
+        )
+        if replacement == self.desired:
+            return False
+        self.desired = replacement
+        self.change_count += 1
+        try:
+            atomic_save_ui_settings(self.path, replacement)
+            self.persistence_error = None
+            self.load_status = "saved"
+        except (OSError, ValueError) as exc:
+            self.persistence_error = str(exc)
+        return True
+
+    def live_mapping(self) -> dict[str, object]:
+        return {
+            "settings_file": os.fspath(self.path),
+            "font_scale": self.desired.font_scale,
             "load_status": self.load_status,
             "persistence_error": self.persistence_error,
             "change_count": self.change_count,
@@ -3621,6 +3674,8 @@ class CalibrationOverlaySupervisor:
             "profile_remote",
             "speed_down",
             "speed_up",
+            "font_down",
+            "font_up",
             "apply_return",
         }
     )
@@ -3631,6 +3686,7 @@ class CalibrationOverlaySupervisor:
         state_file: Path,
         display_name: str | None,
         expected_ue_pid: int,
+        font_scale: float = 1.0,
         script: Path | None = None,
         python: str = sys.executable,
         startup_timeout_s: float = 3.0,
@@ -3639,6 +3695,7 @@ class CalibrationOverlaySupervisor:
         self.ready_file = state_file.with_name(f".{state_file.name}.overlay-status.json")
         self.display_name = display_name
         self.expected_ue_pid = expected_ue_pid
+        self.font_scale = UiSettings(font_scale=font_scale).font_scale
         self.script = script or Path(__file__).with_name(
             "matrix_calibration_overlay.py"
         )
@@ -3691,6 +3748,8 @@ class CalibrationOverlaySupervisor:
             str(child_socket.fileno()),
             "--action-session",
             self._action_session,
+            "--font-scale",
+            f"{self.font_scale:.2f}",
         ]
         if self.display_name:
             command.extend(("--display", self.display_name))
@@ -4157,6 +4216,14 @@ def main() -> int:
         load_status=loaded_mouse.status,
         load_error=loaded_mouse.error,
     )
+    ui_settings_path = default_ui_settings_file()
+    loaded_ui = load_ui_settings(ui_settings_path)
+    ui_settings = UiSettingsController(
+        path=ui_settings_path,
+        desired=loaded_ui.settings,
+        load_status=loaded_ui.status,
+        load_error=loaded_ui.error,
+    )
     restart_requester = RuntimeRestartRequester(
         request_file=args.restart_request_file,
         capability_file=args.restart_capability_file,
@@ -4198,6 +4265,7 @@ def main() -> int:
             state_file=calibration_state_file,
             display_name=args.display,
             expected_ue_pid=args.expected_ue_pid,
+            font_scale=ui_settings.desired.font_scale,
         )
     gamepad = LinuxJoystick(
         args.gamepad,
@@ -4320,6 +4388,7 @@ def main() -> int:
                 {
                     **source_claim,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
+                    "ui_settings": ui_settings.live_mapping(),
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "command_console": game_command_client.mapping(),
@@ -4473,6 +4542,7 @@ def main() -> int:
                 slower_pressed=raw_keyboard.mouse_speed_down,
                 faster_pressed=raw_keyboard.mouse_speed_up,
             )
+            ui_settings_changed = False
             for panel_action in panel_actions:
                 mouse_settings_changed = bool(
                     mouse_settings.apply_panel_action(
@@ -4484,6 +4554,17 @@ def main() -> int:
                         ),
                     )
                     or mouse_settings_changed
+                )
+                ui_settings_changed = bool(
+                    ui_settings.apply_panel_action(
+                        panel_action,
+                        active=(
+                            calibration.active
+                            and not restart_requester.requested
+                            and not command_controls_blocked
+                        ),
+                    )
+                    or ui_settings_changed
                 )
             restart_requested = apply_restart_key.update(
                 pressed=raw_keyboard.apply_restart,
@@ -4592,6 +4673,7 @@ def main() -> int:
                     or bool(panel_intents)
                     or command_state_changed
                     or mouse_settings_changed
+                    or ui_settings_changed
                     or restart_requested
                     or teleport_rejections != last_teleport_rejections
                     or now >= next_overlay_heartbeat
@@ -4610,6 +4692,7 @@ def main() -> int:
                             "mouse_settings": mouse_settings.live_mapping(
                                 applied_mouse
                             ),
+                            "ui_settings": ui_settings.live_mapping(),
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
                             "command_console": game_command_client.mapping(),
@@ -4693,6 +4776,7 @@ def main() -> int:
                 "requested_input_source": args.input_source,
                 "effective_input_source": input_source,
                 "mouse_settings": mouse_settings.live_mapping(applied_mouse),
+                "ui_settings": ui_settings.live_mapping(),
                 "mirror_sensitivity": sensitivity_telemetry,
                 "camera_yaw": camera_yaw_telemetry(
                     args.camera_yaw_source,

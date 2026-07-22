@@ -375,6 +375,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "run_matrix_sonic.sh",
             "run_sim.sh",
             "matrix_mouse_settings.py",
+            "matrix_ui_settings.py",
             "matrix_restart_request.py",
             "matrix_ue_overlay.py",
             "matrix_calibration_overlay.py",
