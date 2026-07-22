@@ -10,13 +10,47 @@
 `config/universe/celestial-visual-profiles-v1.json`。每个 profile 都会计算 SHA256，并随
 ESC 星体状态发布。它不修改 MuJoCo 物理、SONIC 50 Hz 控制、碰撞、相机位姿或分辨率。
 
+## Matrix 原生月球/火星资产核对
+
+截至 2026-07-22，Matrix 官方资产与当前 SOL-2080 运行状态必须分开理解：
+
+| 星体 | Matrix 官方资产 | Heyuan 当前安装 | SOL-2080 当前状态 |
+|---|---|---|---|
+| 月球 | **有**。官方地图 ID `15`、UE 地图 `/Game/Maps/MoonWorld`、MuJoCo 场景 `scene_terrain_moon_dynamic.xml`；v0.1.2 正式包 `MoonWorld-0.1.2.tar.gz` 为 `633678813` bytes，SHA256 `c4e3dee47ffa434712b0238d08b0b68067f1b1c9820e2ddb455f996f04e364b1`，对应 chunk `26` | **未完整安装**。已有 `dynamicmaps/moonworld.bin` 和官方月球 XML，但 `Content/Paks` 没有 `pakchunk26-Linux.*`；当前 runtime lock 只锁定 Town10 地图包 | `moon-tranquility-outpost` 仍为 `planned/disabled`，尚未把原生 MoonWorld、G1/SONIC 物理、月球重力、出生点和传送恢复接成一条可验收链路 |
+| 火星 | **没有找到**。官方地图文档、启动菜单、v0.1.0-v0.1.2 release/manifest 和 ZsiBot 公开源码均无 `MarsWorld` | 无 | `mars-utopia-outpost` 是我们自己的规划目录项，不是 Matrix 原生地图，仍为 `planned/disabled` |
+
+官方证据：
+
+- [Matrix 地图文档（固定 revision）](https://github.com/zsibot/matrix/blob/5b5559476ef963cccc39411cd2eb3b836df08343/docs/Robots_and_Maps.md)
+- [Matrix v0.1.2 manifest](https://github.com/zsibot/matrix/releases/download/v0.1.2/manifest-0.1.2.json)
+- [MoonWorld v0.1.2 官方包](https://github.com/zsibot/matrix/releases/download/v0.1.2/MoonWorld-0.1.2.tar.gz)
+- [Matrix v0.1.2 release](https://github.com/zsibot/matrix/releases/tag/v0.1.2)
+
+因此“Matrix 有月球地图”和“当前 ESC 可以传送到月球”不是同一件事。第一阶段应复用
+官方 MoonWorld，不重做月面；但要先把 chunk 26 加入 runtime lock 并在隔离 profile 安装，
+再完成 SONIC 物理、低重力、相机和持久化验收。火星则需要另选有来源和许可证的地形资产。
+
+## Matrix 公开 UE 源码核对
+
+ZsiBot 组织当前公开仓库中没有 `.uproject`、`.uplugin` 或 Matrix UE 游戏模块源码；
+`zsibot/matrix` 发布的是启动脚本和 cooked UE PAK，`MATRiX_Python_SDK` 只公开 MuJoCo
+加载及 UDP 状态同步协议，并不能编辑 MoonWorld、天空、灯光或材质。公开 fork 也不能替代
+原始可编辑工程。
+
+Matrix README 引用的
+[MuJoCo-Unreal-Engine-Plugin](https://github.com/oneclicklabs/MuJoCo-Unreal-Engine-Plugin)
+确实含 UE 工程和 C++ 插件源码，但 GitHub 当前未识别到许可证文件；在取得明确授权前，
+不能直接复制其代码作为我们的可维护实现。可控路径只有两条：优先向 Matrix 维护方取得
+与 v0.1.2 cooked 资产匹配的 UE 工程/构建说明；否则基于有明确许可证的 CARLA、Cesium
+和我们自己的干净 UDP bridge 建一个 source-built renderer。
+
 ## 开源选型
 
 | 方案 | 许可证 | 当前用途 | 接入结论 |
 |---|---|---|---|
 | CARLA 0.9.15 WeatherParameters | MIT | 云雾、降雨、湿地、散射、尘暴与太阳角 RPC | 已接入；完整字段写入后逐项 readback |
 | Bruneton atmospheric scattering | BSD-3-Clause | Earth/Mars 物理大气散射 | 等可构建 UE 工程后做 renderer 插件 |
-| Cesium for Unreal / Cesium Native | Apache-2.0 | 行星坐标、georeference、origin shifting | 作为大世界地形层，不进入当前 cooked 包 |
+| Cesium for Unreal / Cesium Native | Apache-2.0 | 行星坐标、georeference、origin shifting | v2.28.0 已支持非 WGS84 椭球并自带 IAU2015 Moon/Mars ellipsoid；作为 source-built 大世界地形层，不进入当前 cooked 包 |
 | NASA/USGS、Natural Earth、Poly Haven、ambientCG | 逐资产公共领域或 CC0 | 行星贴图、DEM、HDRI、PBR 材质候选 | 只有明确挂载点、来源、许可证和 SHA256 后才入资产锁 |
 
 没有采用静态 HDRI 充当太阳真值。HDRI 内烘焙的太阳容易与 DirectionalLight、阴影和
