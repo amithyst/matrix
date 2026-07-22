@@ -1339,6 +1339,7 @@ if $MATRIX_SONIC_ENABLED; then
         for required in \
             "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
+            "$PROJECT_ROOT/scripts/matrix_ui_settings.py" \
             "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
             "$PROJECT_ROOT/scripts/matrix_world_state.py" \
             "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
