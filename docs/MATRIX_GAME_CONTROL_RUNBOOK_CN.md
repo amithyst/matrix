@@ -7,6 +7,52 @@
 是第三顺位备份；无论普通改动还是大版本，都只有在项目负责人明确要求时才向对应备份机
 同步源码或私有运行资产。
 
+## TRNA 当前开发版验收入口（2026-07-22）
+
+当前运控、面板、续玩安全和外置控制 API 在
+`feature/trna-control-font-tuning-20260721` 上联调。负责人完成 TRNA 实测并明确通过前，
+继续在该 feature 分支修正，不合入 `main`。`trna` profile 已保存固定选择和六档速度默认值，
+正常启动只需：
+
+```bash
+cd /home/trna/matrix
+bash scripts/run_matrix_sonic.sh --profile trna --scene 2
+```
+
+当前键盘语义：Ctrl 或 Alt 为 slow，无修饰为 walk，Shift 为 run；同一个 WASD 键在
+0.30 s 内完成“按下、松开、再次按下”会进入该档 boost，松键立即退出 boost。切换
+slow/walk/run 档位会清除双击候选和已激活 boost，避免 Alt+W 首击被 Shift+W 误判。
+六个 base/boost 速度均可在 ESC 运控面板用 -/+ 调整，持久化到
+`~/.config/matrix/hosts/trna/motion-control.json`，仓库 profile 只保存跨机器共享默认值。
+
+外置调试使用同 UID、0600 权限的 `AF_UNIX/SOCK_SEQPACKET`，每个 profile 只有一个
+租约，150 ms 内没有刷新就自动归零。失焦、本地键鼠/手柄输入、实体 ESC 或面板点击会
+立即撤销外部租约。示例：
+
+```bash
+python3 scripts/matrixctl.py --profile trna status
+python3 scripts/matrixctl.py --profile trna key w --modifier alt --seconds 1
+python3 scripts/matrixctl.py --profile trna key w --modifier shift --double --seconds 1
+python3 scripts/matrixctl.py --profile trna gamepad --forward 0.5 --seconds 1
+python3 scripts/matrixctl.py --profile trna command \
+  '/data modify entity @s control.input.keyboard.w set value true'
+```
+
+`matrixctl` 自定义 endpoint 时优先读取与 launcher 相同的
+`MATRIX_GAME_EXTERNAL_CONTROL_SOCKET` 和
+`MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE`；旧的
+`MATRIX_EXTERNAL_CONTROL_SOCKET` / `MATRIX_EXTERNAL_CONTROL_CAPABILITY_FILE`
+仍作为兼容回退。
+
+`control.input.*` 的 `data modify` 只修改 provider 的虚拟输入状态；`/tp`、策略切换和
+运控参数修改仍要求先打开 ESC 面板并完成一帧 neutral。`/tp` 支持 Minecraft 的世界
+相对 `~` 和以当前 yaw 为基准的局部 `^` 坐标。
+
+非限时 game 运行把上次安全退出点作为第一候选。加载前会用新 `MjData` 对机器人全身
+（含手掌和手指）做 robot-vs-scene 接触验收；穿墙、手掌卡墙、膝盖嵌入路沿等候选会被
+精确隔离并回退到更早 checkpoint，最多检查 16 个，再回退 home 和地图默认点。审计器
+自身报错不会删除存档。
+
 ## 范围与验收边界
 
 已经实现的行为：
@@ -14,8 +60,8 @@
 - WASD 按相机水平朝向映射到世界坐标；
 - W/A/S/D 四个方向都让机器人自动面向运动方向；
 - 斜向输入归一化，并限制速度、加速度、减速度和转向速度；
-- 键盘 WASD 使用按住修饰键的原生静走/普通走/跑步：Ctrl、无修饰键、Shift 分别映射
-  SONIC mode 1、2、3；
+- 键盘 WASD 使用原生静走/普通走/跑步：Ctrl 或 Alt、无修饰键、Shift 分别映射
+  SONIC mode 1、2、3；同档同方向双击选择该档 boost；
 - Q/E 不再参与机器人 yaw；
 - 精确 UE PID 失焦、观察到的 V 安全状态切换、鼠标拖相机、输入过期、断连和
   provider 故障都会停机；
@@ -42,11 +88,11 @@ Matrix 0.1.2 cooked 运行包目前**没有完成**以下能力：
 | 项目 | 默认值 / 不变量 |
 |---|---|
 | 输入采样 | 50 Hz |
-| 本地输入协议 | 严格 `matrix-game-input/v2`（`ctrl`、`shift` 为必填字段） |
+| 本地输入协议 | 严格 `matrix-game-input/v3`（`ctrl`、`alt`、`shift` 和 `keyboard_boost` 为必填字段） |
 | SONIC 控制 | 50 Hz；原生物理保持 200 Hz |
-| 键盘最高目标 | 2.50 m/s（`RUN` 下边界） |
+| 键盘最高目标 | 默认 2.75 m/s（RUN boost，可在面板调节） |
 | 模拟量最高速度 | 默认 0.30 m/s；最高可配置 0.80 m/s，保持在 `SLOW_WALK` |
-| 键盘步态档 | Ctrl mode 1 / 0.10；无修饰 mode 2 / 0.80；Shift mode 3 / 2.50 m/s；冲突时 Ctrl 优先 |
+| 键盘步态档 | Ctrl/Alt slow 0.10/0.20；无修饰 walk 0.80/1.00；Shift run 2.50/2.75 m/s；前者为 base、后者为双击 boost，slow 优先 |
 | 原生步态区间 | mode 1：0.10-0.80；mode 2：0.80-2.50；mode 3：2.50-7.50 m/s |
 | 加速度 / 减速度 | 1.20 / 2.40 m/s² |
 | 最大朝向变化率 | 2.50 rad/s |
@@ -155,8 +201,10 @@ MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE= \
     --control-source game
 ```
 
-TRNA profile 已固定为 `game + keyboard + ue-final-pov`，并包含居中 overlay、相机符号和
-灵敏度默认值；它还会清理 tmux/Conda 继承的 `LD_LIBRARY_PATH`、`PYTHONPATH`。日常测试
+TRNA profile 已固定为 `game + auto + ue-final-pov`，并包含居中 overlay、相机符号和
+灵敏度默认值。`ue-final-pov` 提供最终相机 yaw 回读，因此 `auto` 同时保留本地键盘和
+物理/外置虚拟 gamepad；WASD 仍有数字输入优先级。显式覆盖为 `keyboard` 时会将 gamepad
+移动轴归零。profile 还会清理 tmux/Conda 继承的 `LD_LIBRARY_PATH`、`PYTHONPATH`。日常测试
 只需：
 
 ```bash
@@ -207,11 +255,12 @@ watch -n 0.5 'jq "{control_source, physics_step_hz, rtf, fall_detected, instabil
 另外确认：
 
 1. W+A、W+D 的速度不高于单独 W；
-2. Ctrl+W、W、Shift+W 分别稳定在原生 mode/速度 1/0.10、2/0.80、3/2.50 m/s；
-   Ctrl+Shift 冲突时使用 1/0.10；切档中每一帧 mode/速度仍落在原生合法区间；
+2. Ctrl/Alt+W、W、Shift+W 分别稳定在原生 mode/基础速度 1/0.10、2/0.80、3/2.50 m/s；
+   同档双击 W 分别提升到 0.20、1.00、2.75 m/s，切档会清除 boost；slow 与 Shift 冲突时
+   使用 slow；切档中每一帧 mode/速度仍落在原生合法区间；
 3. A、D、S 都会让机器人朝运动方向转身；180 度反向时先转身，再逐渐建立平移；
 4. 单独按 Q 或 E 不改变 root，也不改变 game-control heading；
-5. 松开全部方向键、失焦或超时都当帧发布 mode 0；单独按 Ctrl/Shift 仍为 mode 0。
+5. 松开全部方向键、失焦或超时都当帧发布 mode 0；单独按 Ctrl/Alt/Shift 仍为 mode 0。
 
 `fixed` 下画面相机可能和上表不一致，这是预期限制，所以这一阶段不算“相机相对控制
 验收通过”。
@@ -471,6 +520,11 @@ tail -n 200 outputs/logs/matrix_sonic_runtime.log
 当相机来源为 `fixed` 或任一 X11 来源时，`auto` 有意降级为仅键盘，显式
 `--game-input-source gamepad` 会失败。这是安全设计，不是环境配置错误。不能在可见相机
 完全没动时，仅把右摇杆数值累加到内部 yaw 来绕过门禁。
+
+TRNA 的 `ue-final-pov` 会读取最终相机 yaw，因此其默认 `auto` 可接受键盘、物理 gamepad
+和持有有效外部租约的虚拟 gamepad。若显式设置 `MATRIX_GAME_INPUT_SOURCE=keyboard`，
+`matrixctl gamepad` 的状态写入仍受协议认证，但 provider 会按配置门禁屏蔽移动轴；排查时
+以 provider 状态中的 `effective_input_source` 和最终快照为准。
 
 完整右摇杆实现至少需要 UE runtime bridge 提供等价能力：
 

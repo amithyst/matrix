@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -47,6 +48,8 @@ from matrix_game_control import (
 from matrix_mc_commands import (
     CommandExecutionError,
     CommandProtocolError,
+    DataModifyInput,
+    DataModifyNumber,
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
@@ -55,13 +58,25 @@ from matrix_mc_commands import (
     encode_command_response,
     execute_command,
 )
+from matrix_motion_settings import (
+    MotionSettings,
+    MotionSettingsError,
+    MotionSettingsPersistenceError,
+    MotionSettingsStore,
+)
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_policy_slots import (
     BFM_TEACHER50K_POLICY_ID,
     PolicyCandidateState,
     evaluate_policy_candidate,
 )
+from matrix_spawn_clearance import (
+    AUDIT_SCHEMA as SPAWN_CLEARANCE_AUDIT_SCHEMA,
+    apply_root_pose_and_audit,
+    audit_spawn_clearance,
+)
 from matrix_world_state import (
+    MAX_RESUME_CHECKPOINTS,
     WorldPose,
     WorldStateError,
     WorldStateStore,
@@ -77,9 +92,13 @@ _GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
     {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
 )
 _GAME_WORLD_RESUME_PROBATION_SECONDS = 5.0
+_GAME_MAX_RESUME_ROLLBACKS = MAX_RESUME_CHECKPOINTS
 _GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES = (
     "snapshot_non_finite:",
     "snapshot_sim_time_not_increasing:",
+)
+_GAME_WORLD_ROLLBACK_CLEARANCE_REASONS = frozenset(
+    {"scene_penetration", "unsafe_foot_contact"}
 )
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
@@ -110,6 +129,65 @@ def _remote_speed_scale_argument(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _validate_game_external_control(
+    *,
+    input_socket: Path,
+    external_socket: Path | None,
+    external_capability_file: Path | None,
+    external_deadman_seconds: float,
+    restart_request_file: Path | None,
+    restart_capability_file: Path | None,
+    require_external_parents: bool = False,
+) -> None:
+    """Validate the provider-facing external API without opening its endpoints."""
+
+    external_values = (external_socket, external_capability_file)
+    if any(value is not None for value in external_values) and not all(
+        value is not None for value in external_values
+    ):
+        raise ValueError("game external-control socket/capability are all-or-none")
+    if (
+        isinstance(external_deadman_seconds, bool)
+        or not math.isfinite(external_deadman_seconds)
+        or not 0.01 <= external_deadman_seconds <= 0.15
+    ):
+        raise ValueError("game external-control deadman must be in [0.01, 0.15]")
+    if external_socket is None or external_capability_file is None:
+        return
+    for label, path in (
+        ("--game-external-control-socket", external_socket),
+        ("--game-external-control-capability-file", external_capability_file),
+    ):
+        if not path.is_absolute():
+            raise ValueError(f"{label} must be absolute")
+        if require_external_parents and not path.parent.is_dir():
+            raise ValueError(f"{label} parent does not exist: {path.parent}")
+
+    # Resolve existing parent symlinks as well as lexical aliases.  The
+    # provider must never be able to replace its input/restart IPC objects by
+    # opening the externally addressable endpoint or capability path.
+    paths = [
+        ("--game-input-socket", input_socket),
+        ("--game-external-control-socket", external_socket),
+        ("--game-external-control-capability-file", external_capability_file),
+    ]
+    if restart_request_file is not None:
+        paths.append(("--game-restart-request-file", restart_request_file))
+    if restart_capability_file is not None:
+        paths.append(
+            ("--game-restart-capability-file", restart_capability_file)
+        )
+    seen: dict[Path, str] = {}
+    for label, path in paths:
+        canonical = path.resolve(strict=False)
+        previous = seen.get(canonical)
+        if previous is not None:
+            raise ValueError(
+                f"game IPC paths must be strictly distinct: {label} aliases {previous}"
+            )
+        seen[canonical] = label
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -127,15 +205,38 @@ def _parse_args() -> argparse.Namespace:
         / f"matrix-game-control-{os.getuid()}-{os.getpid()}.sock",
         help="User-local Unix socket for camera-relative input snapshots",
     )
+    parser.add_argument("--game-external-control-socket", type=Path)
+    parser.add_argument("--game-external-control-capability-file", type=Path)
+    parser.add_argument(
+        "--game-external-control-deadman-seconds",
+        type=float,
+        default=0.15,
+        help="Provider-side external-input lease deadline (maximum 0.15 seconds)",
+    )
     parser.add_argument(
         "--game-max-speed",
         type=float,
         default=0.30,
-        help="Analog SLOW_WALK cap (default 0.30, maximum 0.80); keyboard targets are fixed",
+        help="Analog SLOW_WALK cap (default 0.30, maximum 0.80)",
     )
     parser.add_argument("--game-max-acceleration", type=float, default=1.20)
     parser.add_argument("--game-max-deceleration", type=float, default=2.40)
     parser.add_argument("--game-max-turn-rate", type=float, default=2.50)
+    parser.add_argument("--game-keyboard-slow-speed", type=float, default=0.10)
+    parser.add_argument(
+        "--game-keyboard-slow-boost-speed", type=float, default=0.20
+    )
+    parser.add_argument("--game-keyboard-walk-speed", type=float, default=0.80)
+    parser.add_argument(
+        "--game-keyboard-walk-boost-speed", type=float, default=1.00
+    )
+    parser.add_argument("--game-keyboard-run-speed", type=float, default=2.50)
+    parser.add_argument(
+        "--game-keyboard-run-boost-speed", type=float, default=2.75
+    )
+    parser.add_argument(
+        "--game-keyboard-double-tap-window", type=float, default=0.30
+    )
     parser.add_argument("--game-stick-deadzone", type=float, default=0.15)
     parser.add_argument("--game-input-timeout", type=float, default=0.15)
     parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
@@ -369,6 +470,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--game-mouse-sensitivity-deg", type=float, default=0.12)
     parser.add_argument("--game-mouse-settings-file", type=Path)
+    parser.add_argument("--game-motion-settings-file", type=Path)
     parser.add_argument(
         "--game-applied-mouse-profile",
         choices=("local", "remote"),
@@ -1501,6 +1603,7 @@ class _GameWorldStateRuntime:
         checkpoint_seconds: float,
         selected_resume_checkpoint_id: str | None = None,
         selected_resume_generation: int | None = None,
+        clearance_auditor: Callable[[], dict[str, object]] | None = None,
     ) -> None:
         interval = float(checkpoint_seconds)
         if not math.isfinite(interval) or not 0.1 <= interval <= 60.0:
@@ -1544,6 +1647,9 @@ class _GameWorldStateRuntime:
         self.checkpoint_count = 0
         self.last_error: str | None = self.store.load_error
         self.last_checkpoint_monotonic_s: float | None = None
+        self.clearance_auditor = clearance_auditor
+        self.last_clearance_audit: dict[str, object] | None = None
+        self.clearance_rejection_count = 0
 
     def checkpoint(
         self,
@@ -1560,9 +1666,46 @@ class _GameWorldStateRuntime:
             return False
         try:
             pose = _snapshot_world_pose(snapshot)
+            clearance_safe = True
+            if self.clearance_auditor is not None:
+                try:
+                    clearance = self.clearance_auditor()
+                except Exception as exc:
+                    clearance = {
+                        "schema": "matrix-spawn-clearance-audit/v1",
+                        "safe": False,
+                        "reason": "audit_error",
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc) or type(exc).__name__,
+                        },
+                    }
+                if not isinstance(clearance, dict):
+                    clearance = {
+                        "schema": "matrix-spawn-clearance-audit/v1",
+                        "safe": False,
+                        "reason": "audit_error",
+                        "error": {
+                            "type": "TypeError",
+                            "message": "clearance auditor returned a non-object",
+                        },
+                    }
+                self.last_clearance_audit = clearance
+                clearance_safe = clearance.get("safe") is True
+                if not clearance_safe:
+                    self.clearance_rejection_count += 1
+                    if required:
+                        reason = clearance.get("reason")
+                        if not isinstance(reason, str) or not reason:
+                            reason = "audit_error"
+                        raise WorldStateError(
+                            "required checkpoint spawn-clearance audit failed: "
+                            f"{reason}"
+                        )
             state = self.state.checkpoint(
                 pose,
                 upright=_snapshot_world_upright(snapshot),
+                clearance_safe=clearance_safe,
             )
             self.store.save(state)
         except WorldStateError as exc:
@@ -1709,6 +1852,8 @@ class _GameWorldStateRuntime:
             "resume_rollback_ineligibility": self.resume_rollback_ineligibility,
             "checkpoint_count": self.checkpoint_count,
             "checkpoint_seconds": self.checkpoint_seconds,
+            "clearance_rejection_count": self.clearance_rejection_count,
+            "last_clearance_audit": self.last_clearance_audit,
             "last_checkpoint_monotonic_s": self.last_checkpoint_monotonic_s,
             "last_error": self.last_error,
             "resume_source": self.state.resume_source,
@@ -2190,9 +2335,12 @@ def _validate_game_world_resume_metadata(
     if (
         isinstance(rollback_count, bool)
         or not isinstance(rollback_count, int)
-        or rollback_count not in {0, 1}
+        or not 0 <= rollback_count <= _GAME_MAX_RESUME_ROLLBACKS
     ):
-        raise ValueError("game resume rollback count must be 0 or 1")
+        raise ValueError(
+            "game resume rollback count must be in "
+            f"[0, {_GAME_MAX_RESUME_ROLLBACKS}]"
+        )
     if rollback_count != 0 and not world_state_configured:
         raise ValueError("game resume rollback count requires world-state persistence")
     if selected_generation is not None and selected_generation < 0:
@@ -2273,13 +2421,14 @@ def _game_world_rollback_ineligibility(
     initial_reset_count: int,
     final_reset_count: int,
     reset_observed: bool = False,
+    spawn_clearance_audit: dict[str, object] | None = None,
 ) -> str | None:
-    """Return why a failed resume cannot authorize one automatic rollback."""
+    """Return why a failed resume cannot authorize another bounded rollback."""
 
     if selected_checkpoint_id is None or selected_generation is None:
         return "no_selected_checkpoint"
-    if rollback_count != 0:
-        return "rollback_already_attempted"
+    if rollback_count >= _GAME_MAX_RESUME_ROLLBACKS:
+        return "rollback_limit_reached"
     elapsed = float(elapsed_s)
     if (
         not math.isfinite(elapsed)
@@ -2302,6 +2451,15 @@ def _game_world_rollback_ineligibility(
         return "reset_detected"
     if low_cmd_received or active_lowcmd or active_frames != 0 or active_elapsed_s > 0.0:
         return "lowcmd_observed"
+    if termination_reason == "spawn_clearance_failed":
+        clearance_reason = _spawn_clearance_rollback_reason(
+            spawn_clearance_audit
+        )
+        if clearance_reason is None or numerical_error != (
+            f"spawn_clearance:{clearance_reason}"
+        ):
+            return "spawn_clearance_evidence_missing"
+        return None
     if termination_reason != "numerical_instability":
         return "not_numerical_instability"
     if not isinstance(numerical_error, str) or not numerical_error.startswith(
@@ -2309,6 +2467,46 @@ def _game_world_rollback_ineligibility(
     ):
         return "numerical_error_not_allowlisted"
     return None
+
+
+def _spawn_clearance_rollback_reason(
+    audit: dict[str, object] | None,
+) -> str | None:
+    """Return the typed rollback reason for a trusted collision audit.
+
+    Parser/model failures deliberately stay outside the rollback allowlist:
+    only an actual classified scene collision may quarantine a checkpoint.
+    """
+
+    if not isinstance(audit, dict):
+        return None
+    reason = audit.get("reason")
+    if (
+        audit.get("schema") != SPAWN_CLEARANCE_AUDIT_SCHEMA
+        or audit.get("safe") is not False
+        or audit.get("error") is not None
+        or reason not in _GAME_WORLD_ROLLBACK_CLEARANCE_REASONS
+    ):
+        return None
+    rejected_count = audit.get("rejected_contact_count")
+    worst = audit.get("worst")
+    if (
+        isinstance(rejected_count, bool)
+        or not isinstance(rejected_count, int)
+        or rejected_count <= 0
+        or not isinstance(worst, dict)
+        or worst.get("allowed") is not False
+    ):
+        return None
+    classification = worst.get("classification")
+    expected_classifications = (
+        {"scene_penetration"}
+        if reason == "scene_penetration"
+        else {"unsafe_foot_contact_normal", "unsafe_foot_penetration"}
+    )
+    if classification not in expected_classifications:
+        return None
+    return str(reason)
 
 
 def _runtime_exit_code(
@@ -2525,19 +2723,46 @@ def _game_control_status_fields(
         "native_gait_modes": {
             SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
         },
-        "keyboard_slow_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
-            SONIC_SLOW_WALK_MODE
-        ],
-        "keyboard_walk_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE],
-        "keyboard_run_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE],
+        "keyboard_slow_speed_mps": getattr(
+            args, "game_keyboard_slow_speed", 0.10
+        ),
+        "keyboard_slow_boost_speed_mps": (
+            getattr(args, "game_keyboard_slow_boost_speed", 0.20)
+        ),
+        "keyboard_walk_speed_mps": getattr(
+            args, "game_keyboard_walk_speed", 0.80
+        ),
+        "keyboard_walk_boost_speed_mps": (
+            getattr(args, "game_keyboard_walk_boost_speed", 1.00)
+        ),
+        "keyboard_run_speed_mps": getattr(
+            args, "game_keyboard_run_speed", 2.50
+        ),
+        "keyboard_run_boost_speed_mps": getattr(
+            args, "game_keyboard_run_boost_speed", 2.75
+        ),
+        "keyboard_double_tap_window_s": getattr(
+            args, "game_keyboard_double_tap_window", 0.30
+        ),
+        "motion_settings_file": (
+            os.fspath(args.game_motion_settings_file)
+            if getattr(args, "game_motion_settings_file", None) is not None
+            else None
+        ),
+        "motion_settings_load_status": getattr(
+            args, "game_motion_settings_load_status", "disabled"
+        ),
+        "motion_settings_revision": getattr(
+            args, "game_motion_settings_revision", None
+        ),
         # Preserve the historical status contract: maximum_speed_mps is the
         # configurable analog SLOW_WALK ceiling.  Keyboard tiers now have a
         # separate native RUN target and must not silently change that field.
         "maximum_speed_mps": args.game_max_speed,
         "analog_maximum_speed_mps": args.game_max_speed,
-        "keyboard_maximum_target_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
-            SONIC_RUN_MODE
-        ],
+        "keyboard_maximum_target_speed_mps": (
+            getattr(args, "game_keyboard_run_boost_speed", 2.75)
+        ),
         "maximum_acceleration_mps2": args.game_max_acceleration,
         "maximum_deceleration_mps2": args.game_max_deceleration,
         "maximum_turn_rate_rad_s": args.game_max_turn_rate,
@@ -2603,6 +2828,23 @@ def _game_control_status_fields(
         "visible_follow_camera_verified": False,
         "external_visual_evidence_required": True,
     }
+
+
+def _control_config_with_motion_settings(
+    config: ControlConfig,
+    settings: MotionSettings,
+) -> ControlConfig:
+    """Return one validated config with all six keyboard gear values replaced."""
+
+    return replace(
+        config,
+        keyboard_slow_speed_mps=settings.slow_speed_mps,
+        keyboard_slow_boost_speed_mps=settings.slow_double_tap_speed_mps,
+        keyboard_walk_speed_mps=settings.walk_speed_mps,
+        keyboard_walk_boost_speed_mps=settings.walk_double_tap_speed_mps,
+        keyboard_run_speed_mps=settings.run_speed_mps,
+        keyboard_run_boost_speed_mps=settings.run_double_tap_speed_mps,
+    )
 
 
 _EXPECTED_SNAPSHOT_DIMS = {
@@ -3269,6 +3511,9 @@ class GameCommandRuntime:
         world: _GameWorldStateRuntime | None,
         *,
         policy_slots: Any | None = None,
+        motion_settings: MotionSettingsStore | None = None,
+        control_core: GameControlCore | None = None,
+        pose_clearance_auditor: Callable[[WorldPose], dict[str, object]] | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -3284,8 +3529,12 @@ class GameCommandRuntime:
         self.restart_requested = False
         self.last_response: dict[str, object] | None = None
         self.policy_slots = policy_slots
+        self.motion_settings = motion_settings
+        self.control_core = control_core
+        self.pose_clearance_auditor = pose_clearance_auditor
         self.pending_policy_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
+        self.motion_settings_changes_executed = 0
 
     def _send(self, response: GameCommandResponse) -> None:
         payload = encode_command_response(response)
@@ -3403,6 +3652,20 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, DataModifyInput):
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_EXTERNAL_API_REQUIRED",
+                        message=(
+                            "control.input mutations require the provider-side "
+                            "external control API"
+                        ),
+                    )
+                )
+                continue
             if not command_allowed:
                 self.rejected_commands += 1
                 self._send(
@@ -3465,6 +3728,70 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, DataModifyNumber):
+                if self.motion_settings is None or self.control_core is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_DATA_UNAVAILABLE",
+                            message="Motion settings are unavailable for this run",
+                        )
+                    )
+                    continue
+                try:
+                    modification = self.motion_settings.modify(
+                        request.command.path,
+                        request.command.value,
+                    )
+                    self.control_core.config = _control_config_with_motion_settings(
+                        self.control_core.config,
+                        modification.settings,
+                    )
+                except MotionSettingsError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={"motion_settings": self.motion_settings.mapping()},
+                        )
+                    )
+                    continue
+                except MotionSettingsPersistenceError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={"motion_settings": self.motion_settings.mapping()},
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                if modification.changed:
+                    self.motion_settings_changes_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=(
+                            "OK_DATA_MODIFIED"
+                            if modification.changed
+                            else "OK_DATA_UNCHANGED"
+                        ),
+                        message=(
+                            f"Set {modification.path} to {modification.value:.6g}"
+                        ),
+                        data={"motion_settings": self.motion_settings.mapping()},
+                    )
+                )
+                continue
             if self.world is None:
                 self.rejected_commands += 1
                 self._send(
@@ -3483,6 +3810,28 @@ class GameCommandRuntime:
                     current_pose=current_pose,
                     now_unix_ns=time.time_ns(),
                 )
+                if effect.restart_required and self.pose_clearance_auditor is not None:
+                    target = effect.state.resolve_start().pose
+                    if target is None:
+                        raise CommandExecutionError(
+                            "E_SPAWN_CLEARANCE",
+                            "Teleport did not produce a resumable target",
+                        )
+                    clearance = self.pose_clearance_auditor(target)
+                    if clearance.get("safe") is not True:
+                        self.rejected_commands += 1
+                        self._send(
+                            self._response(
+                                request,
+                                ok=False,
+                                code="E_SPAWN_CLEARANCE",
+                                message=(
+                                    "Teleport target intersects scene geometry"
+                                ),
+                                data={"spawn_clearance": clearance},
+                            )
+                        )
+                        continue
                 self.world.store.save(effect.state)
             except CommandExecutionError as exc:
                 self.rejected_commands += 1
@@ -3533,6 +3882,14 @@ class GameCommandRuntime:
             "requests_received": self.requests_received,
             "commands_executed": self.commands_executed,
             "policy_changes_executed": self.policy_changes_executed,
+            "motion_settings_changes_executed": (
+                self.motion_settings_changes_executed
+            ),
+            "motion_settings": (
+                self.motion_settings.mapping()
+                if self.motion_settings is not None
+                else None
+            ),
             "policy_change_pending": self.pending_policy_request is not None,
             "protocol_errors": self.protocol_errors,
             "rejected_commands": self.rejected_commands,
@@ -3674,11 +4031,13 @@ class NativeProcessGroup:
         gamepad_look_yaw_rate_deg_s: float,
         gamepad_look_pitch_rate_deg_s: float,
         gamepad_look_deadzone: float,
+        gamepad_move_deadzone: float,
         gamepad_look_min_pitch_deg: float,
         gamepad_look_max_pitch_deg: float,
         focus_title: str,
         expected_ue_pid: int,
         status_file: Path | None,
+        keyboard_double_tap_window_s: float = 0.30,
         ue_camera_state_file: Path | None = None,
         mouse_settings_file: Path | None = None,
         applied_mouse_profile: str = "local",
@@ -3686,8 +4045,12 @@ class NativeProcessGroup:
         restart_request_file: Path | None = None,
         restart_capability_file: Path | None = None,
         restart_launcher_pid: int | None = None,
+        external_control_socket: Path | None = None,
+        external_control_capability_file: Path | None = None,
+        external_control_deadman_seconds: float = 0.15,
         command_fd: int | None = None,
         strategy_loadout_json: str | None = None,
+        motion_settings_json: str | None = None,
     ) -> int:
         command = [
             python,
@@ -3705,6 +4068,8 @@ class NativeProcessGroup:
             str(initial_camera_yaw_deg),
             "--mouse-sensitivity-deg",
             str(mouse_sensitivity_deg),
+            "--keyboard-double-tap-window-s",
+            str(keyboard_double_tap_window_s),
             "--applied-mouse-profile",
             applied_mouse_profile,
             "--applied-mouse-speed-scale",
@@ -3723,6 +4088,8 @@ class NativeProcessGroup:
             str(gamepad_look_pitch_rate_deg_s),
             "--gamepad-look-deadzone",
             str(gamepad_look_deadzone),
+            "--gamepad-move-deadzone",
+            str(gamepad_move_deadzone),
             "--gamepad-look-min-pitch-deg",
             str(gamepad_look_min_pitch_deg),
             "--gamepad-look-max-pitch-deg",
@@ -3732,6 +4099,28 @@ class NativeProcessGroup:
             "--expected-ue-pid",
             str(expected_ue_pid),
         ]
+        _validate_game_external_control(
+            input_socket=input_socket,
+            external_socket=external_control_socket,
+            external_capability_file=external_control_capability_file,
+            external_deadman_seconds=external_control_deadman_seconds,
+            restart_request_file=restart_request_file,
+            restart_capability_file=restart_capability_file,
+        )
+        if (
+            external_control_socket is not None
+            and external_control_capability_file is not None
+        ):
+            command.extend(
+                (
+                    "--external-control-socket",
+                    str(external_control_socket),
+                    "--external-control-capability-file",
+                    str(external_control_capability_file),
+                    "--external-control-deadman-seconds",
+                    str(external_control_deadman_seconds),
+                )
+            )
         if mouse_settings_file is not None:
             command.extend(("--mouse-settings-file", str(mouse_settings_file)))
         if ue_camera_state_file is not None:
@@ -3756,6 +4145,8 @@ class NativeProcessGroup:
             command.extend(("--status-file", str(status_file)))
         if strategy_loadout_json is not None:
             command.extend(("--strategy-loadout-json", strategy_loadout_json))
+        if motion_settings_json is not None:
+            command.extend(("--motion-settings-json", motion_settings_json))
         extra_pass_fds: tuple[int, ...] = ()
         if command_fd is not None:
             if isinstance(command_fd, bool) or not isinstance(command_fd, int):
@@ -6795,15 +7186,83 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     if args.ue_pid is not None and args.ue_pid <= 1:
         raise SystemExit("--ue-pid must identify a live UE process")
     game_config = None
+    motion_settings_store: MotionSettingsStore | None = None
     if args.control_source == "game":
+        motion_settings_path = getattr(args, "game_motion_settings_file", None)
+        if motion_settings_path is not None:
+            if not motion_settings_path.is_absolute():
+                raise SystemExit("--game-motion-settings-file must be absolute")
+            try:
+                configured_motion_defaults = MotionSettings(
+                    revision=0,
+                    slow_speed_mps=args.game_keyboard_slow_speed,
+                    slow_double_tap_speed_mps=(
+                        args.game_keyboard_slow_boost_speed
+                    ),
+                    walk_speed_mps=args.game_keyboard_walk_speed,
+                    walk_double_tap_speed_mps=(
+                        args.game_keyboard_walk_boost_speed
+                    ),
+                    run_speed_mps=args.game_keyboard_run_speed,
+                    run_double_tap_speed_mps=(
+                        args.game_keyboard_run_boost_speed
+                    ),
+                )
+            except MotionSettingsError as exc:
+                raise SystemExit(
+                    f"invalid configured keyboard motion defaults: {exc.message}"
+                ) from exc
+            motion_settings_store = MotionSettingsStore(
+                motion_settings_path,
+                fallback=configured_motion_defaults,
+            )
+            motion = motion_settings_store.settings
+            args.game_keyboard_slow_speed = motion.slow_speed_mps
+            args.game_keyboard_slow_boost_speed = (
+                motion.slow_double_tap_speed_mps
+            )
+            args.game_keyboard_walk_speed = motion.walk_speed_mps
+            args.game_keyboard_walk_boost_speed = (
+                motion.walk_double_tap_speed_mps
+            )
+            args.game_keyboard_run_speed = motion.run_speed_mps
+            args.game_keyboard_run_boost_speed = (
+                motion.run_double_tap_speed_mps
+            )
+            args.game_motion_settings_load_status = (
+                motion_settings_store.load_status
+            )
+            args.game_motion_settings_revision = motion.revision
+        else:
+            args.game_motion_settings_load_status = "disabled"
+            args.game_motion_settings_revision = None
         if args.game_max_speed > 0.8:
             raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
+        if (
+            not math.isfinite(args.game_keyboard_double_tap_window)
+            or not 0.15 <= args.game_keyboard_double_tap_window <= 0.50
+        ):
+            raise SystemExit(
+                "--game-keyboard-double-tap-window must be in [0.15, 0.50]"
+            )
         try:
             game_config = ControlConfig(
                 max_speed_mps=args.game_max_speed,
                 max_acceleration_mps2=args.game_max_acceleration,
                 max_deceleration_mps2=args.game_max_deceleration,
                 max_turn_rate_rad_s=args.game_max_turn_rate,
+                keyboard_slow_speed_mps=args.game_keyboard_slow_speed,
+                keyboard_slow_boost_speed_mps=(
+                    args.game_keyboard_slow_boost_speed
+                ),
+                keyboard_walk_speed_mps=args.game_keyboard_walk_speed,
+                keyboard_walk_boost_speed_mps=(
+                    args.game_keyboard_walk_boost_speed
+                ),
+                keyboard_run_speed_mps=args.game_keyboard_run_speed,
+                keyboard_run_boost_speed_mps=(
+                    args.game_keyboard_run_boost_speed
+                ),
                 stick_deadzone=args.game_stick_deadzone,
                 input_timeout_s=args.game_input_timeout,
                 max_snapshot_age_s=args.game_max_snapshot_age,
@@ -6887,6 +7346,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             and args.game_restart_launcher_pid <= 1
         ):
             raise SystemExit("--game-restart-launcher-pid must be greater than one")
+        try:
+            _validate_game_external_control(
+                input_socket=args.game_input_socket,
+                external_socket=args.game_external_control_socket,
+                external_capability_file=(
+                    args.game_external_control_capability_file
+                ),
+                external_deadman_seconds=(
+                    args.game_external_control_deadman_seconds
+                ),
+                restart_request_file=args.game_restart_request_file,
+                restart_capability_file=args.game_restart_capability_file,
+                require_external_parents=True,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         if not args.no_game_input_provider:
             if args.ue_pid is None:
                 raise SystemExit(
@@ -7014,7 +7489,20 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ) from exc
 
     config = SimLoopConfig(**_native_config_kwargs(args, model_path))
-    simulator = create_simulator(config)
+    simulator = None
+    mujoco_module = sys.modules.get("mujoco")
+
+    def pose_clearance_audit(pose: WorldPose) -> dict[str, object]:
+        model = getattr(getattr(simulator, "sim_env", None), "mj_model", None)
+        return apply_root_pose_and_audit(mujoco_module, model, pose)
+
+    def live_clearance_audit() -> dict[str, object]:
+        environment = getattr(simulator, "sim_env", None)
+        return audit_spawn_clearance(
+            getattr(environment, "mj_model", None),
+            getattr(environment, "mj_data", None),
+        )
+
     renderer = None
     planner = None
     game_input = None
@@ -7040,8 +7528,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     world_checkpoint_failed = False
     proposed_exit_code = 2
     final_status: dict[str, Any] | None = None
+    spawn_clearance_audit: dict[str, object] | None = None
+    final_checkpoint_identity: dict[str, object] | None = None
     termination_boundary_previous_mask: set[signal.Signals] | None = None
     termination_boundary_safe = False
+    # Keep every cleanup/status time calculation bound even if simulator
+    # construction or the first snapshot fails.  A successful startup resets
+    # this baseline immediately before entering the runtime loop below.
+    started_wall = time.perf_counter()
 
     def request_stop(signum, _frame) -> None:
         nonlocal running, termination_reason, termination_signal
@@ -7051,18 +7545,41 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             termination_reason = "signal"
 
     try:
-        # Install handlers before any child is started. Everything after the
-        # simulator construction is inside this cleanup boundary.
+        # Install handlers before constructing any runtime resource.  A
+        # simulator that is successfully returned, including one constructed
+        # while a termination signal is handled, is therefore owned by the
+        # same finally/cleanup boundary as every child process.
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handler = signal.getsignal(signum)
             signal.signal(signum, request_stop)
             previous_signal_handlers[int(signum)] = previous_handler
 
+        simulator = create_simulator(config)
         snapshot = simulator.get_state_snapshot()
         initial_snapshot_error = _snapshot_validation_error(snapshot)
         if initial_snapshot_error is not None:
             raise SystemExit(
                 f"invalid native SONIC initial snapshot: {initial_snapshot_error}"
+            )
+        if args.control_source == "game":
+            spawn_clearance_audit = pose_clearance_audit(
+                _snapshot_world_pose(snapshot)
+            )
+        if (
+            spawn_clearance_audit is not None
+            and spawn_clearance_audit.get("safe") is not True
+        ):
+            running = False
+            termination_reason = "spawn_clearance_failed"
+            numerical_error = (
+                "spawn_clearance:"
+                f"{spawn_clearance_audit.get('reason', 'audit_error')}"
+            )
+            worst = spawn_clearance_audit.get("worst")
+            print(
+                "matrix-sonic-runtime ERROR unsafe spawn clearance: "
+                f"reason={spawn_clearance_audit.get('reason')} worst={worst}",
+                flush=True,
             )
         if args.game_world_state_file is not None:
             try:
@@ -7075,9 +7592,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         args.game_world_resume_checkpoint_id
                     ),
                     selected_resume_generation=args.game_world_resume_generation,
+                    clearance_auditor=live_clearance_audit,
                 )
                 if (
-                    not resume_probation_selected
+                    running
+                    and not resume_probation_selected
                     and _snapshot_world_upright(snapshot)
                 ):
                     game_world.checkpoint(
@@ -7165,9 +7684,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             )
             if args.control_source == "game":
                 assert game_config is not None
+                game_control_core = GameControlCore(game_config)
                 game_input = GameInputRuntime(
                     args.game_input_socket,
-                    GameControlCore(game_config),
+                    game_control_core,
                 )
                 game_readiness = _GameSonicReadinessGate(snapshot)
                 if getattr(args, "game_fall_recovery", "off") == "sonic":
@@ -7191,6 +7711,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         command_parent,
                         game_world,
                         policy_slots=physical_recovery,
+                        motion_settings=motion_settings_store,
+                        control_core=game_control_core,
+                        pose_clearance_auditor=pose_clearance_audit,
                     )
                 try:
                     game_input.open()
@@ -7208,6 +7731,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         look_button=args.game_look_button,
                         initial_camera_yaw_deg=args.game_initial_camera_yaw_deg,
                         mouse_sensitivity_deg=args.game_mouse_sensitivity_deg,
+                        keyboard_double_tap_window_s=(
+                            args.game_keyboard_double_tap_window
+                        ),
                         mouse_settings_file=args.game_mouse_settings_file,
                         applied_mouse_profile=args.game_applied_mouse_profile,
                         applied_mouse_speed_scale=(
@@ -7218,6 +7744,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             args.game_restart_capability_file
                         ),
                         restart_launcher_pid=args.game_restart_launcher_pid,
+                        external_control_socket=(
+                            args.game_external_control_socket
+                        ),
+                        external_control_capability_file=(
+                            args.game_external_control_capability_file
+                        ),
+                        external_control_deadman_seconds=(
+                            args.game_external_control_deadman_seconds
+                        ),
                         camera_yaw_sign=args.game_camera_yaw_sign,
                         camera_yaw_offset_deg=(
                             applied_game_camera_yaw_offset_deg
@@ -7231,6 +7766,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             args.gamepad_look_pitch_rate_deg_s
                         ),
                         gamepad_look_deadzone=args.gamepad_look_deadzone,
+                        gamepad_move_deadzone=args.game_stick_deadzone,
                         gamepad_look_min_pitch_deg=(
                             args.gamepad_look_min_pitch_deg
                         ),
@@ -7253,6 +7789,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 sort_keys=True,
                             )
                             if physical_recovery is not None
+                            else None
+                        ),
+                        motion_settings_json=(
+                            json.dumps(
+                                motion_settings_store.mapping(),
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            if motion_settings_store is not None
                             else None
                         ),
                     )
@@ -7990,6 +8535,27 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     force=True,
                     required=True,
                 )
+                final_world = game_world.telemetry()
+                final_checkpoint_id = final_world.get(
+                    "active_resume_checkpoint_id"
+                )
+                final_generation = final_world.get("generation")
+                if (
+                    not isinstance(final_checkpoint_id, str)
+                    or not final_checkpoint_id.startswith("cp-")
+                    or isinstance(final_generation, bool)
+                    or not isinstance(final_generation, int)
+                    or final_generation < 0
+                ):
+                    raise WorldStateError(
+                        "required checkpoint has no resumable identity"
+                    )
+                final_checkpoint_identity = {
+                    "schema": "matrix-final-world-checkpoint/v1",
+                    "run_id": run_id,
+                    "checkpoint_id": final_checkpoint_id,
+                    "generation": final_generation,
+                }
             except WorldStateError as exc:
                 world_checkpoint_failed = True
                 numerical_error = f"final_checkpoint:{exc}"
@@ -8046,12 +8612,18 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     resume_rollback_evidence.max_reset_count,
                 ),
                 reset_observed=resume_rollback_evidence.reset_observed,
+                spawn_clearance_audit=spawn_clearance_audit,
             )
             game_world.resume_rollback_ineligibility = resume_rollback_ineligibility
             if resume_rollback_ineligibility is None:
                 try:
                     proposal = game_world.propose_selected_resume_rollback(
-                        reason="startup_numerical_instability",
+                        reason=(
+                            "spawn_clearance:"
+                            f"{_spawn_clearance_rollback_reason(spawn_clearance_audit)}"
+                            if termination_reason == "spawn_clearance_failed"
+                            else "startup_numerical_instability"
+                        ),
                         run_id=run_id,
                     )
                 except WorldStateError as exc:
@@ -8165,6 +8737,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "failed_child_exit_code": failed_child_code,
             "failed_child_name": failed_child_name,
             "fall_detected": fall_detected,
+            "final_checkpoint": final_checkpoint_identity,
             "instability_resets": instability_resets,
             "interrupted": interrupted,
             "last_reset_reason": snapshot.last_reset_reason,
@@ -8221,6 +8794,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "sim_time_s": round(float(snapshot.sim_time), 4),
             "sonic_commit": sonic_commit,
             "sonic_step_index": int(snapshot.step_index),
+            "spawn_clearance": spawn_clearance_audit,
             "startup_band_enabled": bool(args.startup_band),
             "startup_band_fade_s": args.startup_band_fade,
             "startup_band_hold_s": args.startup_band_hold,

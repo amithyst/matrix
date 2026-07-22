@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -82,6 +83,26 @@ class MatrixWorldStateTest(unittest.TestCase):
             MODULE.WorldPose(fallen.x, fallen.y, safe.z, safe.yaw_rad),
         )
         self.assertEqual(state.resume_source, "fallen_xy_last_safe_upright")
+
+    def test_scene_penetrating_observation_never_replaces_or_rebases_resume(self) -> None:
+        safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
+        state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
+        checkpoint = state.resolve_start()
+        penetrating = MODULE.WorldPose(10.8, 19.7, 0.66, -2.2)
+
+        observed = state.checkpoint(
+            penetrating,
+            upright=True,
+            clearance_safe=False,
+            now_unix_ns=2,
+        )
+
+        self.assertEqual(observed.last_observed, penetrating)
+        self.assertEqual(observed.last_safe, safe)
+        self.assertEqual(observed.last_exit, safe)
+        self.assertEqual(observed.resolve_start().checkpoint_id, checkpoint.checkpoint_id)
+        self.assertEqual(observed.resolve_start().pose, safe)
+        self.assertEqual(observed.resume_checkpoints, state.resume_checkpoints)
 
     def test_fallen_outlier_checkpoint_preserves_last_safe_resume_pose(self) -> None:
         safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
@@ -1668,6 +1689,174 @@ class RejectCheckpointCommitGateTest(unittest.TestCase):
             self.assertEqual(
                 persisted.invalid_checkpoints[-1].run_id,
                 "first-run",
+            )
+
+    def _gate_line(self, marker: str) -> int:
+        source, first_line = inspect.getsourcelines(
+            MODULE._RejectCheckpointCommitGate.await_authorization
+        )
+        matches = [
+            first_line + index
+            for index, line in enumerate(source)
+            if marker in line
+        ]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
+    def test_signal_immediately_before_commit_mask_cancels_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            backup = path.with_name(f"{path.name}.bak")
+            before = (path.read_bytes(), backup.read_bytes())
+            ready, authorize, cancel = self._gate_paths(root)
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            gate = MODULE._RejectCheckpointCommitGate(
+                state_path=store.path,
+                backup_path=store.backup_path,
+                ready_path=ready,
+                authorize_path=authorize,
+                cancel_path=cancel,
+                timeout_seconds=2.0,
+            )
+            publisher_errors: list[BaseException] = []
+
+            def publish_authorize() -> None:
+                try:
+                    deadline = time.monotonic() + 1.0
+                    while not ready.exists():
+                        if time.monotonic() >= deadline:
+                            raise AssertionError("ready marker was not published")
+                        time.sleep(0.005)
+                    self._publish_marker(
+                        authorize,
+                        MODULE.REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+                    )
+                except BaseException as exc:
+                    publisher_errors.append(exc)
+
+            publisher = threading.Thread(target=publish_authorize)
+            publisher.start()
+            mask_line = self._gate_line("previous_mask = signal.pthread_sigmask(")
+            injected = False
+
+            def inject_before_mask(frame, event, _argument):
+                nonlocal injected
+                if (
+                    not injected
+                    and event == "line"
+                    and frame.f_code
+                    is MODULE._RejectCheckpointCommitGate.await_authorization.__code__
+                    and frame.f_lineno == mask_line
+                ):
+                    injected = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return inject_before_mask
+
+            try:
+                with gate.signal_handlers(), self.assertRaisesRegex(
+                    MODULE.WorldStateError,
+                    "canceled by signal",
+                ):
+                    sys.settrace(inject_before_mask)
+                    try:
+                        store.reject_active_checkpoint(
+                            expected_id=state.resume_checkpoints[-1].checkpoint_id,
+                            expected_generation=state.generation,
+                            reason="startup_numerical_instability",
+                            run_id="pre-mask-signal",
+                            precommit=gate.await_authorization,
+                        )
+                    finally:
+                        sys.settrace(None)
+            finally:
+                publisher.join(1.0)
+
+            self.assertTrue(injected)
+            self.assertEqual(publisher_errors, [])
+            self.assertFalse(gate._commit_started)
+            self.assertEqual((path.read_bytes(), backup.read_bytes()), before)
+
+    def test_signal_after_commit_mask_finishes_both_replicas(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            ready, authorize, cancel = self._gate_paths(root)
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            gate = MODULE._RejectCheckpointCommitGate(
+                state_path=store.path,
+                backup_path=store.backup_path,
+                ready_path=ready,
+                authorize_path=authorize,
+                cancel_path=cancel,
+                timeout_seconds=2.0,
+            )
+            publisher_errors: list[BaseException] = []
+
+            def publish_authorize() -> None:
+                try:
+                    deadline = time.monotonic() + 1.0
+                    while not ready.exists():
+                        if time.monotonic() >= deadline:
+                            raise AssertionError("ready marker was not published")
+                        time.sleep(0.005)
+                    self._publish_marker(
+                        authorize,
+                        MODULE.REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+                    )
+                except BaseException as exc:
+                    publisher_errors.append(exc)
+
+            publisher = threading.Thread(target=publish_authorize)
+            publisher.start()
+            commit_line = self._gate_line("self._commit_started = True")
+            injected = False
+
+            def inject_after_mask(frame, event, _argument):
+                nonlocal injected
+                if (
+                    not injected
+                    and event == "line"
+                    and frame.f_code
+                    is MODULE._RejectCheckpointCommitGate.await_authorization.__code__
+                    and frame.f_lineno == commit_line
+                ):
+                    injected = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return inject_after_mask
+
+            with gate.signal_handlers():
+                sys.settrace(inject_after_mask)
+                try:
+                    result = store.reject_active_checkpoint(
+                        expected_id=state.resume_checkpoints[-1].checkpoint_id,
+                        expected_generation=state.generation,
+                        reason="startup_numerical_instability",
+                        run_id="post-mask-signal",
+                        precommit=gate.await_authorization,
+                    )
+                finally:
+                    sys.settrace(None)
+            publisher.join(1.0)
+
+            self.assertTrue(injected)
+            self.assertEqual(publisher_errors, [])
+            self.assertTrue(gate._commit_started)
+            self.assertEqual(
+                path.read_bytes(),
+                path.with_name(f"{path.name}.bak").read_bytes(),
+            )
+            self.assertEqual(
+                result.state.invalid_checkpoints[-1].run_id,
+                "post-mask-signal",
             )
 
     def test_signal_after_helper_commit_point_cannot_interrupt_replication(self) -> None:

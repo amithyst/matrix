@@ -158,6 +158,61 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertFalse(self.intersects(layout["title"], layout["profile_local"]))
         self.assertFalse(self.intersects(layout["title"], layout["profile_remote"]))
 
+    def test_motion_speed_grid_is_bounded_page_scoped_and_avoids_crosshair(self) -> None:
+        for geometry in (
+            MODULE.WindowGeometry(1, 0, 0, 480, 360),
+            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
+        ):
+            with self.subTest(geometry=geometry):
+                layout = MODULE.overlay_layout(geometry)
+                panel = layout["panel"]
+                for action in MODULE._MOTION_STEP_ACTIONS:
+                    rectangle = layout[action]
+                    point = (
+                        rectangle[0] + rectangle[2] // 2,
+                        rectangle[1] + rectangle[3] // 2,
+                    )
+                    self.assertTrue(MODULE.point_in_rectangle(rectangle[:2], panel))
+                    self.assertTrue(
+                        MODULE.point_in_rectangle(
+                            (
+                                rectangle[0] + rectangle[2] - 1,
+                                rectangle[1] + rectangle[3] - 1,
+                            ),
+                            panel,
+                        )
+                    )
+                    self.assertFalse(
+                        self.intersects(rectangle, layout["crosshair_safe"])
+                    )
+                    self.assertEqual(
+                        MODULE.panel_action_at(
+                            layout,
+                            *point,
+                            page="settings",
+                        ),
+                        action,
+                    )
+                    self.assertNotEqual(
+                        MODULE.panel_action_at(layout, *point, page="loadout"),
+                        action,
+                    )
+                for gear, field in MODULE._MOTION_CONTROL_SPECS:
+                    value = layout[f"motion_{gear}_{field}_value"]
+                    self.assertTrue(MODULE.point_in_rectangle(value[:2], panel))
+                    self.assertFalse(
+                        self.intersects(value, layout["crosshair_safe"])
+                    )
+                    for reserved in (
+                        "profile_local",
+                        "profile_remote",
+                        "speed_down",
+                        "speed_value",
+                        "speed_up",
+                        "apply_return",
+                    ):
+                        self.assertFalse(self.intersects(value, layout[reserved]))
+
     def test_strategy_targets_are_page_scoped_and_outside_crosshair(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
         layout = MODULE.overlay_layout(geometry)
@@ -362,6 +417,114 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(unavailable.apply_label, "APPLY UNAVAILABLE")
         self.assertIn("unavailable", unavailable.error)
         self.assertFalse(unavailable.action_enabled("apply_return"))
+
+    def test_motion_panel_model_reads_strict_telemetry_and_builds_set_commands(
+        self,
+    ) -> None:
+        settings = MODULE.MotionSettings(
+            revision=7,
+            slow_speed_mps=0.15,
+            slow_double_tap_speed_mps=0.25,
+            walk_speed_mps=1.10,
+            walk_double_tap_speed_mps=1.30,
+            run_speed_mps=3.00,
+            run_double_tap_speed_mps=3.50,
+        )
+        model = MODULE.motion_settings_panel_model(
+            {
+                "motion_settings": {
+                    "settings_file": "/host/motion-control.json",
+                    "load_status": "loaded",
+                    "load_error": None,
+                    "settings": settings.to_mapping(),
+                }
+            }
+        )
+
+        self.assertTrue(model.available)
+        self.assertEqual(model.settings.revision, 7)
+        self.assertEqual(model.value("walk", "double_tap_speed_mps"), 1.30)
+        self.assertEqual(
+            MODULE.motion_step_command(model, "motion_slow_speed_mps_up"),
+            (
+                "/data modify entity @s control.motion.gears.slow.speed_mps "
+                "set value 0.20"
+            ),
+        )
+        self.assertEqual(
+            MODULE.motion_step_command(
+                model,
+                "motion_run_double_tap_speed_mps_down",
+            ),
+            (
+                "/data modify entity @s "
+                "control.motion.gears.run.double_tap_speed_mps set value 3.25"
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported motion panel action"):
+            MODULE.motion_step_command(model, "motion_walk_speed_mps_step")
+
+    def test_motion_panel_uses_command_ack_fallback_and_fails_closed(self) -> None:
+        settings = MODULE.MotionSettings(revision=4, walk_speed_mps=0.90)
+        ack_model = MODULE.motion_settings_panel_model(
+            {
+                "command_console": {
+                    "data": {
+                        "motion_settings": {
+                            "settings_file": "/host/motion-control.json",
+                            "load_status": "saved",
+                            "load_error": None,
+                            "settings": settings.to_mapping(),
+                        }
+                    }
+                }
+            }
+        )
+        self.assertTrue(ack_model.available)
+        self.assertEqual(ack_model.load_status, "saved")
+        self.assertEqual(ack_model.value("walk", "speed_mps"), 0.90)
+
+        missing = MODULE.motion_settings_panel_model({})
+        malformed = MODULE.motion_settings_panel_model(
+            {
+                "motion_settings": {
+                    "version": 1,
+                    "revision": 0,
+                    "gears": {"slow": {}},
+                }
+            }
+        )
+        for model in (missing, malformed):
+            with self.subTest(error=model.error):
+                self.assertFalse(model.available)
+                self.assertIsNone(
+                    MODULE.motion_step_command(model, "motion_walk_speed_mps_up")
+                )
+                self.assertFalse(model.action_enabled("motion_walk_speed_mps_up"))
+
+    def test_motion_panel_disables_native_and_pair_order_boundaries(self) -> None:
+        settings = MODULE.MotionSettings(
+            slow_speed_mps=0.75,
+            slow_double_tap_speed_mps=0.80,
+            walk_speed_mps=0.80,
+            walk_double_tap_speed_mps=0.90,
+            run_speed_mps=7.25,
+            run_double_tap_speed_mps=7.50,
+        )
+        model = MODULE.motion_settings_panel_model(
+            {"motion_settings": settings.to_mapping()}
+        )
+        for action in (
+            "motion_slow_speed_mps_up",
+            "motion_slow_double_tap_speed_mps_up",
+            "motion_walk_speed_mps_down",
+            "motion_walk_double_tap_speed_mps_down",
+            "motion_run_speed_mps_up",
+            "motion_run_double_tap_speed_mps_up",
+        ):
+            with self.subTest(action=action):
+                self.assertFalse(model.action_enabled(action))
+                self.assertIsNone(MODULE.motion_step_command(model, action))
 
     def test_command_state_is_strict_and_alias_warning_is_ascii_readable(self) -> None:
         status = MODULE.command_console_status(
@@ -629,6 +792,89 @@ class OverlayStateTest(unittest.TestCase):
         self.assertNotIn("0.01-0.10", " | ".join(compact_labels))
         self.assertNotIn("0.20-1.00", " | ".join(compact_labels))
 
+    def test_all_six_motion_values_and_step_buttons_are_drawn(self) -> None:
+        layout = MODULE.overlay_layout(
+            MODULE.WindowGeometry(1, 0, 0, 1280, 800)
+        )
+        panel_model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+        motion_model = MODULE.motion_settings_panel_model(
+            {
+                "motion_settings": MODULE.MotionSettings(
+                    revision=3,
+                    slow_speed_mps=0.15,
+                    slow_double_tap_speed_mps=0.25,
+                    walk_speed_mps=1.10,
+                    walk_double_tap_speed_mps=1.30,
+                    run_speed_mps=3.00,
+                    run_double_tap_speed_mps=3.50,
+                ).to_mapping()
+            }
+        )
+        command_status = MODULE.command_console_status(
+            {
+                "command_console": {
+                    "available": True,
+                    "editing": False,
+                    "in_flight": False,
+                    "status": "idle",
+                }
+            }
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._windows = {"panel": 2}
+        overlay._panel_gc = 3
+        overlay._xft = None
+        overlay._xft_draw = None
+        overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
+        overlay._active_page = "settings"
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "selected",
+                    "button",
+                    "disabled",
+                    "pending",
+                    "error",
+                    "apply",
+                    "outline",
+                    "cyan",
+                ),
+                10,
+            )
+        }
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._last_command_status = command_status
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+
+        overlay._draw_panel(
+            layout,
+            panel_model,
+            command_status,
+            motion_model=motion_model,
+        )
+
+        labels = {call.args[0] for call in overlay._draw_text.call_args_list}
+        self.assertTrue(
+            {
+                "慢速基础 0.15 m/s",
+                "慢速双击 0.25 m/s",
+                "行走基础 1.10 m/s",
+                "行走双击 1.30 m/s",
+                "奔跑基础 3.00 m/s",
+                "奔跑双击 3.50 m/s",
+            }.issubset(labels)
+        )
+        drawn_buttons = {call.args[1] for call in overlay._draw_button.call_args_list}
+        self.assertTrue(set(MODULE._MOTION_STEP_ACTIONS).issubset(drawn_buttons))
+
     def test_font_fallbacks_match_heyuan_xlsfonts_probe(self) -> None:
         self.assertEqual(MODULE._LARGE_FONT_CANDIDATES[0], b"12x24")
         self.assertEqual(MODULE._BODY_FONT_CANDIDATES[:2], (b"10x20", b"9x15"))
@@ -820,6 +1066,122 @@ class PointerActionPublisherTest(unittest.TestCase):
         finally:
             publisher.close()
             receiver.close()
+
+    def test_motion_step_reuses_the_strict_command_submit_packet(self) -> None:
+        model = MODULE.motion_settings_panel_model(
+            {"motion_settings": MODULE.MotionSettings().to_mapping()}
+        )
+        command = MODULE.motion_step_command(model, "motion_walk_speed_mps_up")
+        self.assertIsNotNone(command)
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_command_submit(command)
+            packet = json.loads(
+                receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES).decode("ascii")
+            )
+            self.assertEqual(
+                packet,
+                {
+                    "version": 1,
+                    "session": "known-session",
+                    "sequence": 1,
+                    "kind": "command_submit",
+                    "command": (
+                        "/data modify entity @s "
+                        "control.motion.gears.walk.speed_mps set value 0.90"
+                    ),
+                },
+            )
+        finally:
+            publisher.close()
+            receiver.close()
+
+
+class MotionPanelActionTest(unittest.TestCase):
+    @staticmethod
+    def command_status(*, in_flight: bool = False):
+        return MODULE.command_console_status(
+            {
+                "command_console": {
+                    "available": True,
+                    "editing": False,
+                    "in_flight": in_flight,
+                    "status": "pending" if in_flight else "idle",
+                }
+            }
+        )
+
+    @staticmethod
+    def overlay(action: str, *, in_flight: bool = False):
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 480, 360))
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._last_layout = layout
+        overlay._active_page = "settings"
+        overlay._last_panel_model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+        overlay._last_motion_model = MODULE.motion_settings_panel_model(
+            {"motion_settings": MODULE.MotionSettings().to_mapping()}
+        )
+        overlay._last_command_status = MotionPanelActionTest.command_status(
+            in_flight=in_flight
+        )
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        overlay._visible = True
+        overlay._font_slider_dragging = False
+        rectangle = layout[action]
+        events = []
+        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
+            event = MODULE.XEvent()
+            event.type = event_type
+            event.xbutton.button = 1
+            event.xbutton.window = 2
+            event.xbutton.x_root = rectangle[0] + rectangle[2] // 2
+            event.xbutton.y_root = rectangle[1] + rectangle[3] // 2
+            events.append(event)
+        overlay._x11.XPending.side_effect = lambda _display: len(events)
+
+        def next_event(_display, destination):
+            event = events.pop(0)
+            MODULE.ctypes.memmove(
+                destination,
+                MODULE.ctypes.byref(event),
+                MODULE.ctypes.sizeof(event),
+            )
+
+        overlay._x11.XNextEvent.side_effect = next_event
+        return overlay
+
+    def test_click_publishes_adjacent_set_value_command(self) -> None:
+        overlay = self.overlay("motion_walk_speed_mps_up")
+        publisher = mock.Mock()
+
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
+
+        publisher.publish_command_submit.assert_called_once_with(
+            "/data modify entity @s "
+            "control.motion.gears.walk.speed_mps set value 0.90"
+        )
+        publisher.publish.assert_not_called()
+
+    def test_boundary_and_in_flight_clicks_publish_nothing(self) -> None:
+        for action, in_flight in (
+            ("motion_slow_speed_mps_down", False),
+            ("motion_walk_speed_mps_up", True),
+        ):
+            with self.subTest(action=action, in_flight=in_flight):
+                overlay = self.overlay(action, in_flight=in_flight)
+                publisher = mock.Mock()
+                self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
+                publisher.publish_command_submit.assert_not_called()
 
 
 class CommandLineEditorTest(unittest.TestCase):
@@ -1190,6 +1552,24 @@ class OverlayRenderCacheTest(unittest.TestCase):
 
         overlay._font_size = MODULE._MAX_OVERLAY_FONT_SIZE
         overlay.show(geometry, (300, 300), state, now_s=10.02)
+        self.assertEqual(overlay._draw_panel.call_count, 2)
+
+    def test_motion_telemetry_change_invalidates_the_static_panel_render_key(
+        self,
+    ) -> None:
+        overlay = self.make_overlay()
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        state = self.state()
+        state["motion_settings"] = MODULE.MotionSettings().to_mapping()
+        overlay.show(geometry, (300, 300), state, now_s=10.0)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+
+        changed = dict(state)
+        changed["motion_settings"] = MODULE.MotionSettings(
+            revision=1,
+            walk_speed_mps=0.90,
+        ).to_mapping()
+        overlay.show(geometry, (300, 300), changed, now_s=10.02)
         self.assertEqual(overlay._draw_panel.call_count, 2)
 
 

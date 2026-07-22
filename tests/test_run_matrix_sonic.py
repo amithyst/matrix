@@ -27,6 +27,7 @@ SPEC.loader.exec_module(MODULE)
 GAME_CONTROL = sys.modules["matrix_game_control"]
 MC_COMMANDS = sys.modules["matrix_mc_commands"]
 WORLD_STATE = sys.modules["matrix_world_state"]
+MOTION_SETTINGS = sys.modules["matrix_motion_settings"]
 
 
 class MatrixSonicRuntimeTest(unittest.TestCase):
@@ -85,6 +86,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 "timestamp_monotonic_s": timestamp_monotonic_s,
                 "focused": True,
                 "camera_yaw_rad": camera_yaw_rad,
+                "keyboard_boost": False,
                 "keys": {
                     "w": w,
                     "a": False,
@@ -95,6 +97,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "v": False,
                     "ctrl": False,
                     "shift": False,
+                    "alt": False,
                 },
                 "move_stick": {"right": 0.0, "forward": 0.0},
             }
@@ -294,13 +297,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             75,
         )
 
-    def test_second_generation_map_default_may_carry_rollback_count_one(self) -> None:
-        MODULE._validate_game_world_resume_metadata(
-            selected_checkpoint_id=None,
-            selected_generation=None,
-            rollback_count=1,
-            world_state_configured=True,
-        )
+    def test_resume_metadata_accepts_rollback_counts_through_limit(self) -> None:
+        for rollback_count in (1, 16):
+            with self.subTest(rollback_count=rollback_count):
+                MODULE._validate_game_world_resume_metadata(
+                    selected_checkpoint_id=None,
+                    selected_generation=None,
+                    rollback_count=rollback_count,
+                    world_state_configured=True,
+                )
         with self.assertRaisesRegex(ValueError, "world-state persistence"):
             MODULE._validate_game_world_resume_metadata(
                 selected_checkpoint_id=None,
@@ -308,6 +313,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 rollback_count=1,
                 world_state_configured=False,
             )
+        for rollback_count in (-1, 17):
+            with self.subTest(invalid_rollback_count=rollback_count):
+                with self.assertRaisesRegex(ValueError, r"\[0, 16\]"):
+                    MODULE._validate_game_world_resume_metadata(
+                        selected_checkpoint_id=None,
+                        selected_generation=None,
+                        rollback_count=rollback_count,
+                        world_state_configured=True,
+                    )
 
     def test_resume_rollback_eligibility_is_narrow_and_allowlisted(self) -> None:
         baseline = {
@@ -342,9 +356,86 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 }
             )
         )
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **baseline,
+                    "termination_reason": "spawn_clearance_failed",
+                    "numerical_error": "spawn_clearance:scene_penetration",
+                    "spawn_clearance_audit": {
+                        "schema": "matrix-spawn-clearance-audit/v1",
+                        "safe": False,
+                        "reason": "scene_penetration",
+                        "error": None,
+                        "rejected_contact_count": 1,
+                        "worst": {
+                            "allowed": False,
+                            "classification": "scene_penetration",
+                        },
+                    },
+                }
+            )
+        )
+        for invalid_audit in (
+            {
+                "schema": "matrix-spawn-clearance-audit/v1",
+                "safe": False,
+                "reason": "audit_error",
+                "error": {"type": "RuntimeError", "message": "no model"},
+                "rejected_contact_count": 0,
+                "worst": None,
+            },
+            {
+                "schema": "matrix-spawn-clearance-audit/v1",
+                "safe": False,
+                "reason": "scene_penetration",
+                "error": None,
+                "rejected_contact_count": 1,
+                "worst": {
+                    "allowed": False,
+                    "classification": "unsafe_foot_penetration",
+                },
+            },
+        ):
+            with self.subTest(invalid_audit=invalid_audit):
+                self.assertEqual(
+                    MODULE._game_world_rollback_ineligibility(
+                        **{
+                            **baseline,
+                            "termination_reason": "spawn_clearance_failed",
+                            "numerical_error": (
+                                f"spawn_clearance:{invalid_audit['reason']}"
+                            ),
+                            "spawn_clearance_audit": invalid_audit,
+                        }
+                    ),
+                    "spawn_clearance_evidence_missing",
+                )
+        self.assertEqual(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **baseline,
+                    "termination_reason": "spawn_clearance_failed",
+                    "numerical_error": None,
+                }
+            ),
+            "spawn_clearance_evidence_missing",
+        )
+        for rollback_count in (1, 15):
+            with self.subTest(eligible_rollback_count=rollback_count):
+                self.assertIsNone(
+                    MODULE._game_world_rollback_ineligibility(
+                        **{**coincident_fall, "rollback_count": rollback_count}
+                    )
+                )
+        self.assertEqual(
+            MODULE._game_world_rollback_ineligibility(
+                **{**coincident_fall, "rollback_count": 16}
+            ),
+            "rollback_limit_reached",
+        )
 
         disqualifiers = {
-            "second_rollback": {"rollback_count": 1},
             "late": {"elapsed_s": 5.000001},
             "signal": {"termination_signal": signal.SIGTERM},
             "child": {"child_failure": ("deploy", 7)},
@@ -522,6 +613,19 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             source.index("propose_selected_resume_rollback("),
         )
 
+    def test_main_installs_signal_cleanup_boundary_before_simulator_creation(
+        self,
+    ) -> None:
+        source = inspect.getsource(MODULE.main)
+        self.assertLess(
+            source.index("signal.signal(signum, request_stop)"),
+            source.index("simulator = create_simulator(config)"),
+        )
+        self.assertLess(
+            source.index("started_wall = time.perf_counter()"),
+            source.index("simulator = create_simulator(config)"),
+        )
+
     def test_root_yaw_uses_normalized_mujoco_wxyz_quaternion(self) -> None:
         half = math.pi / 4.0
         qpos = [
@@ -654,6 +758,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "timestamp_monotonic_s": timestamp,
                     "focused": True,
                     "camera_yaw_rad": 0.4,
+                    "keyboard_boost": False,
                     "keys": {
                         "w": w,
                         "a": False,
@@ -664,6 +769,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                         "v": False,
                         "ctrl": False,
                         "shift": False,
+                        "alt": False,
                     },
                     "move_stick": {"right": 0.0, "forward": 0.0},
                 }
@@ -1272,6 +1378,93 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             Path("/run/user/1000/camera-state.bin"),
         )
 
+    def test_parse_args_exposes_external_control_endpoint_and_deadman(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--game-external-control-socket",
+                "/run/user/1000/matrix-external/trna.sock",
+                "--game-external-control-capability-file",
+                "/run/user/1000/matrix-external/trna.cap",
+                "--game-external-control-deadman-seconds",
+                "0.12",
+            ],
+        ):
+            parsed = MODULE._parse_args()
+
+        self.assertEqual(
+            parsed.game_external_control_socket,
+            Path("/run/user/1000/matrix-external/trna.sock"),
+        )
+        self.assertEqual(
+            parsed.game_external_control_capability_file,
+            Path("/run/user/1000/matrix-external/trna.cap"),
+        )
+        self.assertEqual(parsed.game_external_control_deadman_seconds, 0.12)
+
+    def test_external_control_validation_is_all_or_none_bounded_and_disjoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = {
+                "input_socket": root / "input.sock",
+                "external_socket": root / "external.sock",
+                "external_capability_file": root / "external.cap",
+                "external_deadman_seconds": 0.15,
+                "restart_request_file": root / "restart.json",
+                "restart_capability_file": root / "restart.cap",
+                "require_external_parents": True,
+            }
+            MODULE._validate_game_external_control(**values)
+
+            incomplete = dict(values)
+            incomplete["external_capability_file"] = None
+            with self.assertRaisesRegex(ValueError, "all-or-none"):
+                MODULE._validate_game_external_control(**incomplete)
+
+            slow = dict(values)
+            slow["external_deadman_seconds"] = 0.151
+            with self.assertRaisesRegex(ValueError, r"\[0.01, 0.15\]"):
+                MODULE._validate_game_external_control(**slow)
+
+            aliased = dict(values)
+            aliased["external_socket"] = values["input_socket"]
+            with self.assertRaisesRegex(ValueError, "strictly distinct"):
+                MODULE._validate_game_external_control(**aliased)
+
+            relative = dict(values)
+            relative["external_socket"] = Path("external.sock")
+            with self.assertRaisesRegex(ValueError, "must be absolute"):
+                MODULE._validate_game_external_control(**relative)
+
+    def test_game_cli_rejects_external_endpoint_aliased_to_input_socket(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--control-source",
+                "game",
+                "--game-input-socket",
+                "/tmp/matrix-shared.sock",
+                "--game-external-control-socket",
+                "/tmp/matrix-shared.sock",
+                "--game-external-control-capability-file",
+                "/tmp/matrix-external.cap",
+                "--no-game-input-provider",
+            ],
+        ), self.assertRaisesRegex(SystemExit, "strictly distinct"):
+            MODULE.main()
+
     def test_parse_args_exposes_exact_world_resume_rollback_metadata(self) -> None:
         with mock.patch.object(
             sys,
@@ -1417,7 +1610,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         status = MODULE._game_control_status_fields(args)
 
         self.assertEqual(status["input_source_requested"], "auto")
-        self.assertEqual(status["input_protocol"], "matrix-game-input/v2")
+        self.assertEqual(status["input_protocol"], "matrix-game-input/v3")
         self.assertEqual(status["input_source_effective"], "keyboard")
         self.assertEqual(status["camera_yaw_source"], "x11-mirror")
         self.assertEqual(status["camera_look_button"], "right")
@@ -1439,11 +1632,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             {"IDLE": 0, "SLOW_WALK": 1, "WALK": 2, "RUN": 3},
         )
         self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
+        self.assertEqual(status["keyboard_slow_boost_speed_mps"], 0.20)
         self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
+        self.assertEqual(status["keyboard_walk_boost_speed_mps"], 1.00)
         self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
+        self.assertEqual(status["keyboard_run_boost_speed_mps"], 2.75)
+        self.assertEqual(status["keyboard_double_tap_window_s"], 0.30)
         self.assertEqual(status["maximum_speed_mps"], 0.30)
         self.assertEqual(status["analog_maximum_speed_mps"], 0.30)
-        self.assertEqual(status["keyboard_maximum_target_speed_mps"], 2.50)
+        self.assertEqual(status["keyboard_maximum_target_speed_mps"], 2.75)
         self.assertEqual(status["maximum_acceleration_mps2"], 1.20)
         self.assertEqual(status["maximum_deceleration_mps2"], 2.40)
         self.assertEqual(status["maximum_turn_rate_rad_s"], 2.50)
@@ -2517,6 +2714,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                         "timestamp_monotonic_s": 10.0,
                         "focused": True,
                         "camera_yaw_rad": math.pi / 2.0,
+                        "keyboard_boost": False,
                         "keys": {
                             "w": False,
                             "a": False,
@@ -2527,6 +2725,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                             "v": False,
                             "ctrl": False,
                             "shift": False,
+                            "alt": False,
                         },
                         "move_stick": {"right": 0.0, "forward": 0.0},
                     }
@@ -2578,6 +2777,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 client.close()
                 runtime.close()
             self.assertFalse(path.exists())
+
+    def test_game_command_runtime_routes_input_mutation_to_external_api_first(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        runtime = MODULE.GameCommandRuntime(runtime_socket, None)
+        request = self.game_command_request(
+            "/data modify entity @s control.input.keyboard.w set value true",
+            sequence=1,
+            request_character="e",
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(0.0, 0.0, 0.8, 0.0),
+                    command_allowed=False,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertFalse(response.ok)
+            self.assertEqual(response.code, "E_EXTERNAL_API_REQUIRED")
+            self.assertIn("provider-side external control API", response.message)
+            self.assertEqual(runtime.rejected_commands, 1)
+            self.assertEqual(runtime.commands_executed, 0)
+        finally:
+            provider_socket.close()
+            runtime.close()
 
     def test_game_command_runtime_persists_summon_and_teleport_response(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2659,6 +2890,64 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_game_command_runtime_rejects_teleport_target_that_fails_clearance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            audited: list[WORLD_STATE.WorldPose] = []
+
+            def reject_target(pose):
+                audited.append(pose)
+                return {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": "scene_penetration",
+                    "worst": {"robot_body": {"name": "left_hand_link"}},
+                }
+
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                world,
+                pose_clearance_auditor=reject_target,
+            )
+            current = WORLD_STATE.WorldPose(10.0, 20.0, 0.8, 0.5)
+            request = self.game_command_request(
+                "/tp @s ~1 ~2 ~",
+                sequence=1,
+                request_character="9",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(current_pose=current, command_allowed=True)
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertFalse(response.ok)
+                self.assertEqual(response.code, "E_SPAWN_CLEARANCE")
+                self.assertFalse(response.restart_required)
+                self.assertEqual(
+                    audited,
+                    [WORLD_STATE.WorldPose(11.0, 22.0, 0.8, 0.5)],
+                )
+                self.assertFalse(state_path.exists())
+                self.assertIsNone(world.state.last_exit)
+                self.assertFalse(runtime.restart_requested)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_required_world_checkpoint_surfaces_durable_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             world = MODULE._GameWorldStateRuntime(
@@ -2687,6 +2976,151 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(world.last_error, "simulated fsync failure")
             self.assertEqual(world.checkpoint_count, 0)
             self.assertIsNone(world.state.last_exit)
+
+    def test_required_world_checkpoint_rejects_clearance_audit_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            world = MODULE._GameWorldStateRuntime(
+                path=Path(temporary) / "world-state.json",
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": "audit_error",
+                    "error": {"type": "RuntimeError", "message": "no model"},
+                },
+            )
+            snapshot = self.snapshot()
+            snapshot.qpos[2] = 0.8
+            snapshot.qpos[3] = 1.0
+
+            with self.assertRaisesRegex(
+                WORLD_STATE.WorldStateError,
+                "required checkpoint spawn-clearance audit failed: audit_error",
+            ):
+                world.checkpoint(
+                    snapshot,
+                    now_s=1.0,
+                    force=True,
+                    required=True,
+                )
+
+            self.assertFalse(world.store.path.exists())
+            self.assertEqual(world.checkpoint_count, 0)
+            self.assertIsNone(world.state.last_exit)
+            self.assertIn("audit_error", world.last_error)
+
+    def test_world_checkpoint_filters_scene_penetration_without_rebasing_xy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            safe_snapshot = self.snapshot()
+            safe_snapshot.qpos[:7] = [1.0, 2.0, 0.8, 1.0, 0.0, 0.0, 0.0]
+            clearance = {"safe": True, "reason": "clear"}
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: dict(clearance),
+            )
+            self.assertTrue(
+                world.checkpoint(safe_snapshot, now_s=1.0, force=True)
+            )
+            selected = world.state.resolve_start()
+
+            penetrating = self.snapshot()
+            penetrating.qpos[:7] = [
+                1.8,
+                2.2,
+                0.66,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            ]
+            clearance.update(
+                {
+                    "safe": False,
+                    "reason": "scene_penetration",
+                    "worst": {"robot_body": {"name": "left_hand_link"}},
+                }
+            )
+            self.assertTrue(
+                world.checkpoint(penetrating, now_s=2.0, force=True)
+            )
+
+            self.assertEqual(world.state.resolve_start().checkpoint_id, selected.checkpoint_id)
+            self.assertEqual(world.state.resolve_start().pose, selected.pose)
+            self.assertEqual(world.state.last_observed.x, 1.8)
+            self.assertEqual(world.clearance_rejection_count, 1)
+            self.assertEqual(
+                world.telemetry()["last_clearance_audit"]["reason"],
+                "scene_penetration",
+            )
+
+    def test_game_command_runtime_atomically_updates_live_motion_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "motion-control.json"
+            store = MOTION_SETTINGS.MotionSettingsStore(settings_path)
+            core = GAME_CONTROL.GameControlCore(GAME_CONTROL.ControlConfig())
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                None,
+                motion_settings=store,
+                control_core=core,
+            )
+            pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+            try:
+                update = self.game_command_request(
+                    "/data modify entity @s "
+                    "control.motion.gears.walk.double_tap_speed_mps "
+                    "set value 1.2",
+                    sequence=1,
+                    request_character="d",
+                )
+                provider_socket.send(MC_COMMANDS.encode_command_request(update))
+
+                self.assertFalse(
+                    runtime.poll(current_pose=pose, command_allowed=True)
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_DATA_MODIFIED")
+                self.assertEqual(core.config.keyboard_walk_boost_speed_mps, 1.2)
+                self.assertEqual(store.settings.revision, 1)
+                self.assertEqual(
+                    MOTION_SETTINGS.load_settings(settings_path).settings,
+                    store.settings,
+                )
+
+                invalid = self.game_command_request(
+                    "/data modify entity @s "
+                    "control.motion.gears.walk.speed_mps set value 1.3",
+                    sequence=2,
+                    request_character="e",
+                )
+                provider_socket.send(MC_COMMANDS.encode_command_request(invalid))
+                self.assertFalse(
+                    runtime.poll(current_pose=pose, command_allowed=True)
+                )
+                rejected = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertFalse(rejected.ok)
+                self.assertEqual(rejected.code, "E_DATA_CONSTRAINT")
+                self.assertEqual(core.config.keyboard_walk_speed_mps, 0.8)
+                self.assertEqual(store.settings.revision, 1)
+            finally:
+                provider_socket.close()
+                runtime.close()
 
     def test_world_runtime_rejects_exact_selected_checkpoint_with_tombstone_evidence(self) -> None:
         selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
@@ -4796,6 +5230,13 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 restart_request_file=Path("/run/user/1000/matrix/restart.json"),
                 restart_capability_file=Path("/run/user/1000/matrix/capability"),
                 restart_launcher_pid=4000,
+                external_control_socket=Path(
+                    "/run/user/1000/matrix-external/trna.sock"
+                ),
+                external_control_capability_file=Path(
+                    "/run/user/1000/matrix-external/trna.cap"
+                ),
+                external_control_deadman_seconds=0.12,
                 camera_yaw_sign=-1,
                 camera_yaw_offset_deg=90.0,
                 carla_host="127.0.0.2",
@@ -4803,12 +5244,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 gamepad_look_yaw_rate_deg_s=140.0,
                 gamepad_look_pitch_rate_deg_s=95.0,
                 gamepad_look_deadzone=0.13,
+                gamepad_move_deadzone=0.17,
                 gamepad_look_min_pitch_deg=-70.0,
                 gamepad_look_max_pitch_deg=50.0,
                 focus_title="matrix",
                 expected_ue_pid=4242,
                 status_file=Path("/matrix/outputs/game-input.json"),
                 command_fd=command_fd,
+                motion_settings_json='{"settings":"runtime-owned"}',
             )
         finally:
             command_parent.close()
@@ -4839,6 +5282,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             command[command.index("--game-command-fd") + 1],
             str(command_fd),
         )
+        self.assertEqual(
+            command[command.index("--motion-settings-json") + 1],
+            '{"settings":"runtime-owned"}',
+        )
         self.assertNotIn("--ue-camera-state-file", command)
         self.assertEqual(
             command[command.index("--mouse-settings-file") + 1],
@@ -4853,6 +5300,18 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--restart-launcher-pid") + 1], "4000"
         )
+        self.assertEqual(
+            command[command.index("--external-control-socket") + 1],
+            "/run/user/1000/matrix-external/trna.sock",
+        )
+        self.assertEqual(
+            command[command.index("--external-control-capability-file") + 1],
+            "/run/user/1000/matrix-external/trna.cap",
+        )
+        self.assertEqual(
+            command[command.index("--external-control-deadman-seconds") + 1],
+            "0.12",
+        )
         self.assertEqual(command[command.index("--carla-host") + 1], "127.0.0.2")
         self.assertEqual(command[command.index("--carla-port") + 1], "2100")
         self.assertEqual(
@@ -4865,6 +5324,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(
             command[command.index("--gamepad-look-deadzone") + 1], "0.13"
+        )
+        self.assertEqual(
+            command[command.index("--gamepad-move-deadzone") + 1], "0.17"
         )
         self.assertEqual(
             command[command.index("--gamepad-look-min-pitch-deg") + 1],
@@ -4900,6 +5362,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             gamepad_look_yaw_rate_deg_s=120.0,
             gamepad_look_pitch_rate_deg_s=90.0,
             gamepad_look_deadzone=0.12,
+            gamepad_move_deadzone=0.15,
             gamepad_look_min_pitch_deg=-80.0,
             gamepad_look_max_pitch_deg=60.0,
             focus_title="matrix",

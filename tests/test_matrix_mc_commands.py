@@ -18,6 +18,125 @@ REQUEST_ID = "cmd-" + "b" * 32
 
 
 class McCommandParserTest(unittest.TestCase):
+    def test_parses_whitelisted_data_modify_inputs(self) -> None:
+        boolean_paths = (
+            *(f"control.input.keyboard.{key}" for key in (
+                "w", "a", "s", "d", "q", "e", "v", "ctrl", "alt", "shift"
+            )),
+            "control.input.mouse.left",
+            "control.input.mouse.right",
+            "control.input.mouse.middle",
+        )
+        for path in boolean_paths:
+            with self.subTest(path=path):
+                parsed = MODULE.parse_mc_command(
+                    f"/data modify entity @s {path} set value true"
+                )
+                self.assertEqual(parsed.command, MODULE.DataModifyInput(path, True))
+
+        numeric_cases = {
+            "control.input.gamepad.forward": -1.0,
+            "control.input.gamepad.right": 1.0,
+            "control.input.gamepad.look_yaw": -0.25,
+            "control.input.gamepad.look_pitch": 0.25,
+            "control.input.mouse.dx": -4096.0,
+            "control.input.mouse.dy": 4096.0,
+        }
+        for path, value in numeric_cases.items():
+            with self.subTest(path=path):
+                parsed = MODULE.parse_mc_command(
+                    f"/data modify entity @s {path} set value {value}"
+                )
+                self.assertEqual(parsed.command, MODULE.DataModifyInput(path, value))
+
+    def test_data_modify_input_rejects_unknown_type_nonfinite_and_range(self) -> None:
+        invalid = (
+            (
+                "/data modify entity @s control.input.keyboard.space set value true",
+                "E_DATA_PATH_UNKNOWN",
+            ),
+            (
+                "/data modify entity @s control.input.gamepad.throttle set value 0",
+                "E_DATA_PATH_UNKNOWN",
+            ),
+            (
+                "/data modify entity @s control.input.mouse.wheel set value 0",
+                "E_DATA_PATH_UNKNOWN",
+            ),
+            (
+                "/data modify entity @s control.input.keyboard.w set value 1",
+                "E_DATA_INPUT_TYPE",
+            ),
+            (
+                "/data modify entity @s control.input.gamepad.forward set value true",
+                "E_DATA_INPUT_TYPE",
+            ),
+            (
+                "/data modify entity @s control.input.mouse.left set value falsey",
+                "E_DATA_INPUT_TYPE",
+            ),
+            (
+                "/data modify entity @s control.input.gamepad.forward set value NaN",
+                "E_DATA_INPUT_NONFINITE",
+            ),
+            (
+                "/data modify entity @s control.input.gamepad.forward set value 1e999",
+                "E_DATA_INPUT_NONFINITE",
+            ),
+            (
+                "/data modify entity @s control.input.gamepad.look_yaw set value 1.01",
+                "E_DATA_INPUT_RANGE",
+            ),
+            (
+                "/data modify entity @s control.input.mouse.dx set value -4096.01",
+                "E_DATA_INPUT_RANGE",
+            ),
+        )
+        for text, code in invalid:
+            with self.subTest(text=text), self.assertRaises(
+                MODULE.CommandParseError
+            ) as context:
+                MODULE.parse_mc_command(text)
+            self.assertEqual(context.exception.code, code)
+
+    def test_data_modify_input_rejects_noncanonical_syntax(self) -> None:
+        invalid = (
+            "/data modify entity @e control.input.keyboard.w set value true",
+            "/data modify entity @s control.input.keyboard.w merge value true",
+            "/data modify entity @s control.input.keyboard.w set true",
+        )
+        for text in invalid:
+            with self.subTest(text=text), self.assertRaises(
+                MODULE.CommandParseError
+            ) as context:
+                MODULE.parse_mc_command(text)
+            self.assertEqual(context.exception.code, "E_DATA_SYNTAX")
+
+    def test_parses_whitelisted_data_modify_number(self) -> None:
+        parsed = MODULE.parse_mc_command(
+            "/data modify entity @s "
+            "control.motion.gears.walk.double_tap_speed_mps set value 1.2"
+        )
+
+        self.assertEqual(
+            parsed.command,
+            MODULE.DataModifyNumber(
+                "control.motion.gears.walk.double_tap_speed_mps", 1.2
+            ),
+        )
+
+    def test_data_modify_rejects_unknown_path_operation_and_nonfinite_value(self) -> None:
+        invalid = (
+            "/data modify entity @s control.motion.unknown set value 1",
+            "/data modify entity @e control.motion.gears.walk.speed_mps set value 1",
+            "/data modify entity @s control.motion.gears.walk.speed_mps merge value 1",
+            "/data modify entity @s control.motion.gears.walk.speed_mps set value NaN",
+            "/data modify entity @s control.motion.gears.walk.speed_mps set value 1e999",
+        )
+        for text in invalid:
+            with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
+                MODULE.parse_mc_command(text)
+
     def test_parses_policy_slot_assignment(self) -> None:
         parsed = MODULE.parse_mc_command("/policy recovery KungFu")
 
@@ -71,6 +190,14 @@ class McCommandParserTest(unittest.TestCase):
         self.assertIsInstance(selector, MODULE.TeleportSelector)
         self.assertEqual(selector.tag, "XX")
 
+    def test_parses_minecraft_local_tp_coordinates(self) -> None:
+        command = MODULE.parse_mc_command("/tp @s ^-1.5 ^ ^2").command
+
+        self.assertEqual(
+            command,
+            MODULE.TeleportLocalCoordinates(left=-1.5, up=0.0, forward=2.0),
+        )
+
     def test_selector_order_is_irrelevant_but_contract_is_strict(self) -> None:
         selector = MODULE.parse_mc_command(
             "/tp @s @e[tag=XX,sort=nearest,limit=1,type=matrix:teleport_point]"
@@ -88,9 +215,11 @@ class McCommandParserTest(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
                 MODULE.parse_mc_command(text)
 
-    def test_rejects_local_nonfinite_control_and_oversized_input(self) -> None:
+    def test_rejects_mixed_nonfinite_control_and_oversized_input(self) -> None:
         invalid = (
             "/tp @s ^1 2 3",
+            "/tp @s ^1 ^2 ~3",
+            "/tp @s ^1e999 ^ ^",
             "/tp @s 1e999 2 3",
             "/tp @s 1 2\n3",
             "/tp @s 1 2",
@@ -104,6 +233,68 @@ class McCommandParserTest(unittest.TestCase):
 
 
 class McCommandProtocolTest(unittest.TestCase):
+    def test_data_modify_input_round_trip_is_typed(self) -> None:
+        commands = (
+            MODULE.DataModifyInput("control.input.keyboard.ctrl", True),
+            MODULE.DataModifyInput("control.input.gamepad.look_pitch", -0.5),
+            MODULE.DataModifyInput("control.input.mouse.dy", 12.5),
+            MODULE.DataModifyInput("control.input.mouse.middle", False),
+        )
+        for sequence, command in enumerate(commands, start=10):
+            with self.subTest(command=command):
+                request = MODULE.GameCommandRequest(
+                    session=SESSION,
+                    sequence=sequence,
+                    request_id=REQUEST_ID,
+                    command=command,
+                )
+                payload = MODULE.encode_command_request(request)
+
+                self.assertNotIn(b"/data", payload)
+                self.assertIn(b'"name":"data_modify_input"', payload)
+                self.assertEqual(MODULE.decode_command_request(payload), request)
+
+    def test_data_modify_input_mapping_schema_is_strict(self) -> None:
+        valid = {
+            "name": "data_modify_input",
+            "path": "control.input.gamepad.forward",
+            "value": 0.5,
+        }
+        invalid = (
+            {**valid, "unknown": True},
+            {"name": "data_modify_input", "path": valid["path"]},
+            {**valid, "path": "control.input.gamepad.unknown"},
+            {**valid, "value": True},
+            {**valid, "value": math.inf},
+            {**valid, "value": 1.001},
+            {
+                **valid,
+                "path": "control.input.keyboard.w",
+                "value": 1,
+            },
+        )
+        for mapping in invalid:
+            with self.subTest(mapping=mapping), self.assertRaises(
+                MODULE.CommandProtocolError
+            ):
+                MODULE.command_from_mapping(mapping)
+
+    def test_data_modify_round_trip_is_typed(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=5,
+            request_id=REQUEST_ID,
+            command=MODULE.parse_mc_command(
+                "/data modify entity @s "
+                "control.motion.gears.slow.speed_mps set value 0.15"
+            ).command,
+        )
+
+        payload = MODULE.encode_command_request(request)
+
+        self.assertNotIn(b"/data", payload)
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+
     def test_policy_slot_assignment_round_trip_is_typed(self) -> None:
         request = MODULE.GameCommandRequest(
             session=SESSION,
@@ -123,6 +314,20 @@ class McCommandProtocolTest(unittest.TestCase):
         request = MODULE.GameCommandRequest(
             session=SESSION,
             sequence=7,
+            request_id=REQUEST_ID,
+            command=command,
+        )
+
+        payload = MODULE.encode_command_request(request)
+
+        self.assertNotIn(b"/tp", payload)
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+
+    def test_local_coordinate_request_round_trip_is_typed(self) -> None:
+        command = MODULE.parse_mc_command("/tp @s ^ ^1 ^2").command
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=8,
             request_id=REQUEST_ID,
             command=command,
         )
@@ -219,6 +424,24 @@ class McCommandExecutionTest(unittest.TestCase):
         )
 
         self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, 0.5))
+        self.assertTrue(effect.restart_required)
+
+    def test_local_coordinate_tp_uses_yaw_left_up_forward_basis(self) -> None:
+        origin = WorldPose(10.0, 20.0, 0.8, math.pi / 2.0)
+        command = MODULE.parse_mc_command("/tp @s ^1 ^2 ^3").command
+
+        effect = MODULE.execute_command(
+            command,
+            state=self.state,
+            current_pose=origin,
+            now_unix_ns=2,
+        )
+
+        assert effect.state.last_exit is not None
+        self.assertAlmostEqual(effect.state.last_exit.x, 9.0)
+        self.assertAlmostEqual(effect.state.last_exit.y, 23.0)
+        self.assertAlmostEqual(effect.state.last_exit.z, 2.8)
+        self.assertAlmostEqual(effect.state.last_exit.yaw_rad, math.pi / 2.0)
         self.assertTrue(effect.restart_required)
 
     def test_missing_selector_target_does_not_mutate_state(self) -> None:

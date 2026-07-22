@@ -358,6 +358,7 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
 class LauncherArgumentChainIntegrationTest(unittest.TestCase):
     GAME_CONTROL_DEPENDENCIES = (
         "matrix_game_control_input.py",
+        "matrix_external_control.py",
         "matrix_calibration_overlay.py",
         "matrix_mc_commands.py",
         "matrix_world_state.py",
@@ -383,9 +384,14 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         source: str,
         run_id: str,
         fall_detected: bool = False,
+        spawn_clearance_reason: str | None = None,
     ) -> dict[str, object]:
-        return {
-            "acceptance_failures": ["numerical_instability"],
+        status: dict[str, object] = {
+            "acceptance_failures": [
+                "spawn_clearance_failed"
+                if spawn_clearance_reason is not None
+                else "numerical_instability"
+            ],
             "active_elapsed_s": 0.0,
             "active_frames": 0,
             "active_lowcmd": False,
@@ -413,7 +419,11 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
                     "applied": False,
                     "rejected_checkpoint_id": checkpoint_id,
                     "rejected_generation": generation,
-                    "reason": "startup_numerical_instability",
+                    "reason": (
+                        f"spawn_clearance:{spawn_clearance_reason}"
+                        if spawn_clearance_reason is not None
+                        else "startup_numerical_instability"
+                    ),
                     "run_id": run_id,
                 },
             },
@@ -422,12 +432,38 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "interrupted": False,
             "last_reset_reason": None,
             "low_cmd_received": False,
-            "numerical_error": "snapshot_sim_time_not_increasing:0.0<=0.0",
+            "numerical_error": (
+                f"spawn_clearance:{spawn_clearance_reason}"
+                if spawn_clearance_reason is not None
+                else "snapshot_sim_time_not_increasing:0.0<=0.0"
+            ),
             "passed": False,
             "run_id": run_id,
-            "termination_reason": "numerical_instability",
+            "termination_reason": (
+                "spawn_clearance_failed"
+                if spawn_clearance_reason is not None
+                else "numerical_instability"
+            ),
             "termination_signal": None,
         }
+        if spawn_clearance_reason is not None:
+            classification = (
+                "scene_penetration"
+                if spawn_clearance_reason == "scene_penetration"
+                else "unsafe_foot_penetration"
+            )
+            status["spawn_clearance"] = {
+                "schema": "matrix-spawn-clearance-audit/v1",
+                "safe": False,
+                "reason": spawn_clearance_reason,
+                "error": None,
+                "rejected_contact_count": 1,
+                "worst": {
+                    "allowed": False,
+                    "classification": classification,
+                },
+            }
+        return status
 
     def make_project(self, project: Path) -> dict[str, Path]:
         scripts = project / "scripts"
@@ -436,6 +472,9 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "run_matrix_sonic.sh",
             "run_sim.sh",
             "matrix_mouse_settings.py",
+            "matrix_external_control.py",
+            "matrix_motion_settings.py",
+            "matrix_spawn_clearance.py",
             "matrix_restart_request.py",
             "matrix_ue_overlay.py",
             "matrix_calibration_overlay.py",
@@ -744,6 +783,11 @@ elif script == "supervise_matrix_ue.py":
         raise SystemExit(int(late_ue_exit))
 elif script == "run_matrix_sonic.py":
     socket_path = Path(args[args.index("--game-input-socket") + 1])
+    external_socket_path = (
+        Path(args[args.index("--game-external-control-socket") + 1])
+        if "--game-external-control-socket" in args
+        else None
+    )
     status_path = Path(os.environ["MATRIX_GAME_INPUT_STATUS_FILE"])
     capture = {
         "argv": args,
@@ -751,9 +795,23 @@ elif script == "run_matrix_sonic.py":
         "input_source_env": os.environ.get("MATRIX_GAME_INPUT_SOURCE"),
         "yaw_source_env": os.environ.get("MATRIX_GAME_CAMERA_YAW_SOURCE"),
         "socket_env": os.environ.get("MATRIX_GAME_INPUT_SOCKET"),
+        "external_socket_env": os.environ.get(
+            "MATRIX_GAME_EXTERNAL_CONTROL_SOCKET"
+        ),
+        "external_capability_env": os.environ.get(
+            "MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE"
+        ),
+        "external_deadman_env": os.environ.get(
+            "MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS"
+        ),
         "world_persistence_env": os.environ.get("MATRIX_GAME_WORLD_PERSISTENCE"),
         "auto_respawn_env": os.environ.get("MATRIX_GAME_AUTO_RESPAWN"),
         "socket_parent_mode": oct(socket_path.parent.stat().st_mode & 0o777),
+        "external_parent_mode": (
+            oct(external_socket_path.parent.stat().st_mode & 0o777)
+            if external_socket_path is not None
+            else None
+        ),
         "stale_status_existed": status_path.exists(),
     }
     Path(os.environ["CAPTURE_PATH"]).write_text(
@@ -882,6 +940,8 @@ elif script == "matrix_game_control_input.py":
         sonic_status_file = os.environ.get("FAKE_SONIC_STATUS_FILE")
         if sonic_status_file:
             checkpoint_error = os.environ.get("FAKE_FINAL_CHECKPOINT_ERROR")
+            run_id = "1" * 32
+            checkpoint_id = "cp-" + ("2" * 32)
             Path(sonic_status_file).write_text(
                 json.dumps(
                     {
@@ -893,7 +953,19 @@ elif script == "matrix_game_control_input.py":
                         "completed": False,
                         "failed_child_exit_code": None,
                         "failed_child_name": None,
+                        "final_checkpoint": (
+                            None
+                            if checkpoint_error
+                            else {
+                                "schema": "matrix-final-world-checkpoint/v1",
+                                "run_id": run_id,
+                                "checkpoint_id": checkpoint_id,
+                                "generation": 1,
+                            }
+                        ),
                         "game_world_state": {
+                            "active_resume_checkpoint_id": checkpoint_id,
+                            "generation": 1,
                             "has_last_exit": True,
                             "last_error": checkpoint_error,
                         },
@@ -902,6 +974,7 @@ elif script == "matrix_game_control_input.py":
                             "reason": None,
                         },
                         "passed": False,
+                        "run_id": run_id,
                         "termination_reason": "signal",
                         "termination_signal": signal.SIGTERM,
                     }
@@ -994,6 +1067,80 @@ else:
                         result.stderr,
                     )
                     self.assertFalse(fixture["capture"].exists())
+
+    def test_outer_launcher_preserves_custom_external_control_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            custom_root = runtime_dir / "operator-api"
+            custom_root.mkdir(mode=0o700)
+            custom_socket = custom_root / "control.sock"
+            custom_capability = custom_root / "control.cap"
+            external_capture = project / "external-paths.txt"
+            self.write(
+                project / "scripts/run_sim.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n%s\n%s\n' \
+    "${MATRIX_GAME_EXTERNAL_CONTROL_SOCKET:?}" \
+    "${MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE:?}" \
+    "${MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS:?}" \
+    > "${EXTERNAL_CAPTURE:?}"
+""",
+                executable=True,
+            )
+            environment = {
+                "EXTERNAL_CAPTURE": os.fspath(external_capture),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_GAME_CENTERED_CAMERA": "off",
+                "MATRIX_GAME_EXTERNAL_CONTROL_SOCKET": os.fspath(custom_socket),
+                "MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE": os.fspath(
+                    custom_capability
+                ),
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                    "--game-world-persistence",
+                    "off",
+                    "--game-auto-respawn",
+                    "off",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(
+                external_capture.read_text(encoding="utf-8").splitlines(),
+                [os.fspath(custom_socket), os.fspath(custom_capability), "0.15"],
+            )
 
     def test_run_sim_game_dependency_preflight_applies_with_persistence_off(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1345,6 +1492,7 @@ else:
             self.assertEqual(capture["world_persistence_env"], "1")
             self.assertEqual(capture["auto_respawn_env"], "1")
             self.assertEqual(capture["socket_parent_mode"], "0o700")
+            self.assertEqual(capture["external_parent_mode"], "0o700")
             self.assertFalse(capture["stale_status_existed"])
             ue_capture = json.loads(
                 fixture["ue_capture"].read_text(encoding="utf-8")
@@ -1457,7 +1605,36 @@ else:
             )
             self.assertEqual(parsed.game_input_status_file, fixture["stale_status"])
             self.assertEqual(os.fspath(parsed.game_input_socket), capture["socket_env"])
+            self.assertEqual(
+                os.fspath(parsed.game_external_control_socket),
+                capture["external_socket_env"],
+            )
+            self.assertEqual(
+                os.fspath(parsed.game_external_control_capability_file),
+                capture["external_capability_env"],
+            )
+            self.assertEqual(
+                parsed.game_external_control_deadman_seconds,
+                float(capture["external_deadman_env"]),
+            )
+            self.assertEqual(parsed.game_external_control_socket.name, "local.sock")
+            self.assertEqual(
+                parsed.game_external_control_capability_file.name,
+                "local.cap",
+            )
+            ipc_paths = {
+                path.resolve(strict=False)
+                for path in (
+                    parsed.game_input_socket,
+                    parsed.game_external_control_socket,
+                    parsed.game_external_control_capability_file,
+                    parsed.game_restart_request_file,
+                    parsed.game_restart_capability_file,
+                )
+            }
+            self.assertEqual(len(ipc_paths), 5)
             self.assertFalse(parsed.game_input_socket.parent.exists())
+            self.assertTrue(parsed.game_external_control_socket.parent.is_dir())
 
             # A populated slot must carry the exact selected checkpoint ID and
             # generation through run_sim into the runtime. Coordinates alone
@@ -2651,9 +2828,11 @@ exit 0
             self.assertRegex(window, r"^[0-9]+$")
             self.assertGreater(int(window), 0)
             self.assertIn("Validated Matrix world reload", result.stdout)
-            self.assertIn("count=1/6", result.stdout)
+            self.assertIn("count=1/16", result.stdout)
 
-    def test_outer_launcher_accepts_exact_resume_rollback_once(self) -> None:
+    def test_outer_launcher_quarantines_two_consecutive_candidates_then_succeeds(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
             fixture = self.make_project(project)
@@ -2675,26 +2854,43 @@ exit 0
                 now_unix_ns=1,
             )
             store.save(older_state)
-            latest_state = older_state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+            middle_state = older_state.checkpoint(
+                WORLD_STATE.WorldPose(2.0, 2.0, 0.81, 0.0),
                 upright=True,
                 now_unix_ns=2,
             )
+            store.save(middle_state)
+            latest_state = middle_state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=3,
+            )
             store.save(latest_state)
-            selected = latest_state.resolve_start()
-            self.assertIsNotNone(selected.checkpoint_id)
-            rejected_id = selected.checkpoint_id
-            assert rejected_id is not None
-            run_id = "a" * 32
-            status = self.rollback_proposal_status(
+            latest = latest_state.resolve_start()
+            middle = middle_state.resolve_start()
+            older = older_state.resolve_start()
+            assert latest.checkpoint_id is not None
+            assert middle.checkpoint_id is not None
+            assert older.checkpoint_id is not None
+            first_status = self.rollback_proposal_status(
                 state_file=state_file,
                 world_id=world_id,
                 world_revision=world_revision,
-                checkpoint_id=rejected_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id=run_id,
+                checkpoint_id=latest.checkpoint_id,
+                generation=latest.generation,
+                source=latest.source,
+                run_id="a" * 32,
                 fall_detected=True,
+                spawn_clearance_reason="scene_penetration",
+            )
+            second_status = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=middle.checkpoint_id,
+                generation=latest.generation + 1,
+                source=middle.source,
+                run_id="b" * 32,
             )
             self.write(
                 project / "scripts/run_sim.sh",
@@ -2706,12 +2902,20 @@ if [[ -f "${{GENERATION_FILE:?}}" ]]; then
 fi
 printf '%s' "$generation" > "$GENERATION_FILE"
 printf '%s\n' "${{MATRIX_GAME_RESUME_ROLLBACK_COUNT:-missing}}" >> "${{ROLLBACK_TRACE_FILE:?}}"
-if [[ "$generation" == "1" ]]; then
-    mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
-    printf '%s\n' {shlex.quote(json.dumps(status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-    exit 76
-fi
-exit 0
+mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
+case "$generation" in
+    1)
+        printf '%s\n' {shlex.quote(json.dumps(first_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+        exit 76
+        ;;
+    2)
+        printf '%s\n' {shlex.quote(json.dumps(second_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+        exit 76
+        ;;
+    *)
+        exit 0
+        ;;
+esac
 """,
                 executable=True,
             )
@@ -2728,6 +2932,12 @@ exit 0
                     project / "outputs/matrix-sonic-status.json"
                 ),
                 "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
+                # A saturated ordinary restart budget must not consume the
+                # separately bounded checkpoint-rollback chain.
+                "MATRIX_GAME_INTERNAL_RESTART_COUNT": "16",
+                "MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH": str(
+                    int(time.time())
+                ),
                 "MATRIX_VERIFY_RUNTIME": "0",
                 "PATH": os.fspath(fixture["fake_bin"])
                 + os.pathsep
@@ -2758,19 +2968,35 @@ exit 0
                 0,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
+            self.assertEqual(generations.read_text(encoding="utf-8"), "3")
             self.assertEqual(
                 rollback_trace.read_text(encoding="utf-8").splitlines(),
-                ["missing", "1"],
+                ["missing", "1", "2"],
             )
             committed = store.load()
-            self.assertEqual(committed.generation, selected.generation + 1)
-            self.assertEqual(committed.resolve_start().checkpoint_id, older_state.resolve_start().checkpoint_id)
+            self.assertEqual(committed.generation, latest.generation + 2)
+            self.assertEqual(
+                committed.resolve_start().checkpoint_id,
+                older.checkpoint_id,
+            )
             self.assertEqual(
                 [item.checkpoint_id for item in committed.invalid_checkpoints],
-                [rejected_id],
+                [latest.checkpoint_id, middle.checkpoint_id],
             )
-            self.assertIn("Quarantined failed Matrix resume checkpoint", result.stdout)
+            self.assertEqual(
+                result.stdout.count(
+                    "Quarantined failed Matrix resume checkpoint"
+                ),
+                2,
+            )
+            self.assertIn(
+                f"id={latest.checkpoint_id} generation={latest.generation}",
+                result.stdout,
+            )
+            self.assertIn(
+                f"id={middle.checkpoint_id} generation={latest.generation + 1}",
+                result.stdout,
+            )
 
     def test_outer_launcher_rejects_non_boolean_resume_rollback_fall_status(
         self,
@@ -2843,9 +3069,39 @@ exit 76
                 "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
             }
 
-            for invalid_fall in (None, 0, 1, "true"):
-                with self.subTest(fall_detected=invalid_fall):
-                    malformed = {**status, "fall_detected": invalid_fall}
+            malformed_statuses = [
+                (
+                    f"fall_detected={invalid_fall!r}",
+                    {**status, "fall_detected": invalid_fall},
+                )
+                for invalid_fall in (None, 0, 1, "true")
+            ]
+            audit_error = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="e" * 32,
+                spawn_clearance_reason="scene_penetration",
+            )
+            audit_error["numerical_error"] = "spawn_clearance:audit_error"
+            audit_error["spawn_clearance"] = {
+                "schema": "matrix-spawn-clearance-audit/v1",
+                "safe": False,
+                "reason": "audit_error",
+                "error": {"type": "RuntimeError", "message": "no model"},
+                "rejected_contact_count": 0,
+                "worst": None,
+            }
+            audit_error["game_world_state"]["resume_rollback"][
+                "reason"
+            ] = "spawn_clearance:audit_error"
+            malformed_statuses.append(("spawn_clearance_audit_error", audit_error))
+
+            for label, malformed in malformed_statuses:
+                with self.subTest(case=label):
                     proposal_file.write_text(
                         json.dumps(malformed, separators=(",", ":")) + "\n",
                         encoding="utf-8",
@@ -2868,7 +3124,7 @@ exit 76
 
                     self.assertEqual(
                         result.returncode,
-                        76,
+                        2,
                         msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
                     )
                     self.assertIn(
@@ -2881,7 +3137,7 @@ exit 76
                     else:
                         self.assertEqual(store.backup_path.read_bytes(), backup_before)
 
-    def test_outer_launcher_never_chains_a_second_resume_rollback(self) -> None:
+    def test_outer_launcher_stops_at_resume_rollback_limit_sixteen(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
             fixture = self.make_project(project)
@@ -2943,7 +3199,7 @@ exit 76
                 "MATRIX_SONIC_STATUS_FILE": os.fspath(
                     project / "outputs/matrix-sonic-status.json"
                 ),
-                "MATRIX_GAME_RESUME_ROLLBACK_COUNT": "1",
+                "MATRIX_GAME_RESUME_ROLLBACK_COUNT": "16",
                 "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
                 "MATRIX_VERIFY_RUNTIME": "0",
                 "PATH": os.fspath(fixture["fake_bin"])
@@ -2971,7 +3227,7 @@ exit 76
 
             self.assertEqual(
                 result.returncode,
-                76,
+                2,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertEqual(generations.read_text(encoding="utf-8"), "1")
@@ -2979,7 +3235,7 @@ exit 76
             self.assertEqual(unchanged.generation, selected.generation)
             self.assertEqual(unchanged.resolve_start().checkpoint_id, rejected_id)
             self.assertEqual(unchanged.invalid_checkpoints, ())
-            self.assertIn("resume rollback already attempted once", result.stderr)
+            self.assertIn("Matrix resume rollback limit reached", result.stderr)
 
     def test_signal_during_authorizer_window_keeps_state_byte_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3137,7 +3393,7 @@ exit 76
             self.assertEqual(unchanged.invalid_checkpoints, ())
             self.assertNotIn("Quarantined failed", stdout)
 
-    def test_resume_rollback_one_shot_survives_exit_75_reload_chain(self) -> None:
+    def test_resume_rollback_count_survives_exit_75_reload_chain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
             fixture = self.make_project(project)
@@ -3159,15 +3415,23 @@ exit 76
                 now_unix_ns=1,
             )
             store.save(older_state)
-            latest_state = older_state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+            middle_state = older_state.checkpoint(
+                WORLD_STATE.WorldPose(2.0, 2.0, 0.81, 0.0),
                 upright=True,
                 now_unix_ns=2,
             )
+            store.save(middle_state)
+            latest_state = middle_state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=3,
+            )
             store.save(latest_state)
             latest = latest_state.resolve_start()
+            middle = middle_state.resolve_start()
             older = older_state.resolve_start()
             assert latest.checkpoint_id is not None
+            assert middle.checkpoint_id is not None
             assert older.checkpoint_id is not None
             first_status = self.rollback_proposal_status(
                 state_file=state_file,
@@ -3194,9 +3458,9 @@ exit 76
                 state_file=state_file,
                 world_id=world_id,
                 world_revision=world_revision,
-                checkpoint_id=older.checkpoint_id,
+                checkpoint_id=middle.checkpoint_id,
                 generation=latest.generation + 1,
-                source="last_exit",
+                source=middle.source,
                 run_id="d" * 32,
             )
             self.write(
@@ -3224,7 +3488,7 @@ case "$generation" in
         exit 76
         ;;
     *)
-        exit 99
+        exit 0
         ;;
 esac
 """,
@@ -3270,23 +3534,40 @@ esac
 
             self.assertEqual(
                 result.returncode,
-                76,
+                0,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "3")
+            self.assertEqual(generations.read_text(encoding="utf-8"), "4")
             self.assertEqual(
                 rollback_trace.read_text(encoding="utf-8").splitlines(),
-                ["missing", "1", "1"],
+                ["missing", "1", "1", "2"],
             )
             committed = store.load()
-            self.assertEqual(committed.resolve_start().checkpoint_id, older.checkpoint_id)
+            self.assertEqual(committed.generation, latest.generation + 2)
+            self.assertEqual(
+                committed.resolve_start().checkpoint_id,
+                older.checkpoint_id,
+            )
             self.assertEqual(
                 [item.checkpoint_id for item in committed.invalid_checkpoints],
-                [latest.checkpoint_id],
+                [latest.checkpoint_id, middle.checkpoint_id],
             )
-            self.assertIn("resume rollback already attempted once", result.stderr)
+            self.assertEqual(
+                result.stdout.count(
+                    "Quarantined failed Matrix resume checkpoint"
+                ),
+                2,
+            )
+            self.assertIn(
+                f"id={latest.checkpoint_id} generation={latest.generation}",
+                result.stdout,
+            )
+            self.assertIn(
+                f"id={middle.checkpoint_id} generation={latest.generation + 1}",
+                result.stdout,
+            )
 
-    def test_resume_rollback_one_shot_survives_f9_reload_chain(self) -> None:
+    def test_resume_rollback_count_survives_f9_reload_chain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
             fixture = self.make_project(project)
@@ -3310,15 +3591,23 @@ esac
                 now_unix_ns=1,
             )
             store.save(older_state)
-            latest_state = older_state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+            middle_state = older_state.checkpoint(
+                WORLD_STATE.WorldPose(2.0, 2.0, 0.81, 0.0),
                 upright=True,
                 now_unix_ns=2,
             )
+            store.save(middle_state)
+            latest_state = middle_state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=3,
+            )
             store.save(latest_state)
             latest = latest_state.resolve_start()
+            middle = middle_state.resolve_start()
             older = older_state.resolve_start()
             assert latest.checkpoint_id is not None
+            assert middle.checkpoint_id is not None
             assert older.checkpoint_id is not None
             status_map_file.write_text(
                 json.dumps(
@@ -3336,9 +3625,9 @@ esac
                             state_file=state_file,
                             world_id=world_id,
                             world_revision=world_revision,
-                            checkpoint_id=older.checkpoint_id,
+                            checkpoint_id=middle.checkpoint_id,
                             generation=latest.generation + 1,
-                            source="last_exit",
+                            source=middle.source,
                             run_id="f" * 32,
                         ),
                     }
@@ -3395,21 +3684,38 @@ esac
 
             self.assertEqual(
                 result.returncode,
-                76,
+                0,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "3")
+            self.assertEqual(generations.read_text(encoding="utf-8"), "4")
             self.assertEqual(
                 rollback_trace.read_text(encoding="utf-8").splitlines(),
-                ["missing", "1", "1"],
+                ["missing", "1", "1", "2"],
             )
             committed = store.load()
-            self.assertEqual(committed.resolve_start().checkpoint_id, older.checkpoint_id)
+            self.assertEqual(committed.generation, latest.generation + 2)
+            self.assertEqual(
+                committed.resolve_start().checkpoint_id,
+                older.checkpoint_id,
+            )
             self.assertEqual(
                 [item.checkpoint_id for item in committed.invalid_checkpoints],
-                [latest.checkpoint_id],
+                [latest.checkpoint_id, middle.checkpoint_id],
             )
-            self.assertIn("resume rollback already attempted once", result.stderr)
+            self.assertEqual(
+                result.stdout.count(
+                    "Quarantined failed Matrix resume checkpoint"
+                ),
+                2,
+            )
+            self.assertIn(
+                f"id={latest.checkpoint_id} generation={latest.generation}",
+                result.stdout,
+            )
+            self.assertIn(
+                f"id={middle.checkpoint_id} generation={latest.generation + 1}",
+                result.stdout,
+            )
 
     def test_private_request_restarts_whole_runtime_after_clean_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

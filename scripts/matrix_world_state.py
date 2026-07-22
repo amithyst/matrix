@@ -712,12 +712,29 @@ class MatrixWorldState:
         pose: WorldPose,
         *,
         upright: bool,
+        clearance_safe: bool = True,
         now_unix_ns: int | None = None,
     ) -> "MatrixWorldState":
-        if not isinstance(pose, WorldPose) or type(upright) is not bool:
-            raise WorldStateError("checkpoint requires a pose and boolean upright flag")
+        if (
+            not isinstance(pose, WorldPose)
+            or type(upright) is not bool
+            or type(clearance_safe) is not bool
+        ):
+            raise WorldStateError(
+                "checkpoint requires a pose, upright flag, and clearance flag"
+            )
         timestamp = time.time_ns() if now_unix_ns is None else now_unix_ns
         timestamp = _validate_timestamp(timestamp, label="checkpoint timestamp")
+        if not clearance_safe:
+            # Preserve every previously validated resume checkpoint.  A pose
+            # intersecting scene geometry is useful as last-observed evidence,
+            # but its XY must never be combined with an older upright Z/yaw.
+            return replace(
+                self,
+                last_observed=pose,
+                generation=self._next_generation(),
+                updated_at_unix_ns=timestamp,
+            )
         if upright:
             checkpoints = self._new_checkpoint(
                 pose=pose,
@@ -1568,8 +1585,11 @@ class _RejectCheckpointCommitGate:
                 label="commit-authorize",
             ):
                 # Close the outer launcher's cancel-vs-authorize race with one
-                # final cancel observation.  Assigning _commit_started after
-                # this check is the irreversible helper-side commit point.
+                # final cancel observation.  The signal-mask operation below is
+                # the irreversible helper-side commit point: a signal delivered
+                # before it must set _signal_number and cancel, while a signal
+                # generated after it remains pending until _commit_started is
+                # true and therefore cannot interrupt the two-replica write.
                 if _read_private_commit_marker(
                     self.cancel_path,
                     expected_payload=REJECT_COMMIT_CANCEL_PAYLOAD,
@@ -1581,7 +1601,48 @@ class _RejectCheckpointCommitGate:
                         "checkpoint rejection canceled by signal "
                         f"{self._signal_number}"
                     )
-                self._commit_started = True
+                commit_signals = {
+                    signal.SIGINT,
+                    signal.SIGTERM,
+                    signal.SIGHUP,
+                }
+                try:
+                    previous_mask = signal.pthread_sigmask(
+                        signal.SIG_BLOCK,
+                        commit_signals,
+                    )
+                except (AttributeError, OSError, ValueError) as exc:
+                    raise WorldStateError(
+                        "cannot establish checkpoint rejection signal boundary"
+                    ) from exc
+                commit_started = False
+                try:
+                    if commit_signals.intersection(previous_mask):
+                        raise WorldStateError(
+                            "checkpoint rejection commit signals were already blocked"
+                        )
+                    # A signal generated before pthread_sigmask's atomic boundary
+                    # is delivered through _handle_signal before Python resumes.
+                    # Recheck while new deliveries are blocked, then publish the
+                    # commit state without another interruptible bytecode window.
+                    if self._signal_number is not None:
+                        raise WorldStateError(
+                            "checkpoint rejection canceled by signal "
+                            f"{self._signal_number}"
+                        )
+                    self._commit_started = True
+                    commit_started = True
+                finally:
+                    try:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    except (AttributeError, OSError, ValueError) as exc:
+                        if not commit_started:
+                            raise WorldStateError(
+                                "cannot restore checkpoint rejection signal mask"
+                            ) from exc
+                        # The transaction has crossed its irreversible boundary.
+                        # Keeping these signals blocked for this short-lived
+                        # helper is safer than aborting between replica writes.
                 return
             if self._signal_number is not None:
                 raise WorldStateError(

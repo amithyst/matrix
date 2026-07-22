@@ -511,7 +511,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         profile_text = profile.read_text(encoding="utf-8")
         expected_profile_defaults = (
             'MATRIX_SONIC_CONTROL_SOURCE:-game',
-            'MATRIX_GAME_INPUT_SOURCE:-keyboard',
+            'MATRIX_GAME_INPUT_SOURCE:-auto',
             'MATRIX_GAME_CAMERA_YAW_SOURCE:-ue-final-pov',
             'MATRIX_GAME_LOOK_BUTTON:-left',
             'MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12',
@@ -588,7 +588,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             load_profile({}),
             [
                 "game",
-                "keyboard",
+                "auto",
                 "ue-final-pov",
                 "left",
                 "0.12",
@@ -603,7 +603,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         )
         overrides = {
             "MATRIX_SONIC_CONTROL_SOURCE": "planner",
-            "MATRIX_GAME_INPUT_SOURCE": "auto",
+            "MATRIX_GAME_INPUT_SOURCE": "keyboard",
             "MATRIX_GAME_CAMERA_YAW_SOURCE": "fixed",
             "MATRIX_GAME_LOOK_BUTTON": "right",
             "MATRIX_GAME_MOUSE_SENSITIVITY_DEG": "0.25",

@@ -30,10 +30,12 @@ def snapshot(
     pressed: tuple[str, ...] = (),
     stick: tuple[float, float] = (0.0, 0.0),
     speed_modifiers: tuple[str, ...] = (),
+    boost: bool = False,
 ):
     keys = {name: name in pressed for name in ("w", "a", "s", "d", "q", "e", "v")}
     keys.update(
         ctrl="ctrl" in speed_modifiers,
+        alt="alt" in speed_modifiers,
         shift="shift" in speed_modifiers,
     )
     return MODULE.InputSnapshot.from_mapping(
@@ -43,6 +45,7 @@ def snapshot(
             "timestamp_monotonic_s": timestamp,
             "focused": focused,
             "camera_yaw_rad": yaw,
+            "keyboard_boost": boost,
             "keys": keys,
             "move_stick": {"right": stick[0], "forward": stick[1]},
         }
@@ -77,16 +80,35 @@ class InputProtocolTest(unittest.TestCase):
         self.assertEqual(decoded, original)
         self.assertLessEqual(len(payload), MODULE.MAX_PACKET_BYTES)
 
-    def test_v2_requires_both_keyboard_speed_modifiers(self) -> None:
+    def test_v3_requires_keyboard_modifiers_and_boost_intent(self) -> None:
         value = snapshot().to_mapping()
-        self.assertEqual(value["protocol"], "matrix-game-input/v2")
+        self.assertEqual(value["protocol"], "matrix-game-input/v3")
         del value["keys"]["ctrl"]
         with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: ctrl"):
             MODULE.InputSnapshot.from_mapping(value)
 
         value = snapshot().to_mapping()
-        value["protocol"] = "matrix-game-input/v1"
-        with self.assertRaisesRegex(MODULE.InputProtocolError, "v2"):
+        del value["keys"]["alt"]
+        with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: alt"):
+            MODULE.InputSnapshot.from_mapping(value)
+
+        value = snapshot().to_mapping()
+        del value["keyboard_boost"]
+        with self.assertRaisesRegex(
+            MODULE.InputProtocolError, "missing fields: keyboard_boost"
+        ):
+            MODULE.InputSnapshot.from_mapping(value)
+
+        value = snapshot().to_mapping()
+        value["protocol"] = "matrix-game-input/v2"
+        with self.assertRaisesRegex(MODULE.InputProtocolError, "v3"):
+            MODULE.InputSnapshot.from_mapping(value)
+
+        value = snapshot().to_mapping()
+        value["keyboard_boost"] = True
+        with self.assertRaisesRegex(
+            MODULE.InputProtocolError, "requires at least one pressed WASD"
+        ):
             MODULE.InputSnapshot.from_mapping(value)
 
     def test_schema_is_an_exact_whitelist(self) -> None:
@@ -207,6 +229,12 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(config.max_acceleration_mps2, 1.20)
         self.assertEqual(config.max_deceleration_mps2, 2.40)
         self.assertEqual(config.max_turn_rate_rad_s, 2.50)
+        self.assertEqual(config.keyboard_slow_speed_mps, 0.10)
+        self.assertEqual(config.keyboard_slow_boost_speed_mps, 0.20)
+        self.assertEqual(config.keyboard_walk_speed_mps, 0.80)
+        self.assertEqual(config.keyboard_walk_boost_speed_mps, 1.00)
+        self.assertEqual(config.keyboard_run_speed_mps, 2.50)
+        self.assertEqual(config.keyboard_run_boost_speed_mps, 2.75)
 
     def test_gait_configuration_cannot_make_slow_tier_unreachable(self) -> None:
         with self.assertRaisesRegex(ValueError, "minimum == start"):
@@ -227,6 +255,12 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(MODULE.ControlConfig(max_speed_mps=0.8).max_speed_mps, 0.8)
         with self.assertRaisesRegex(ValueError, "SLOW_WALK maximum"):
             MODULE.ControlConfig(max_speed_mps=0.81)
+        with self.assertRaisesRegex(ValueError, "keyboard slow speeds"):
+            MODULE.ControlConfig(keyboard_slow_boost_speed_mps=0.10)
+        with self.assertRaisesRegex(ValueError, "keyboard walk speeds"):
+            MODULE.ControlConfig(keyboard_walk_speed_mps=0.79)
+        with self.assertRaisesRegex(ValueError, "keyboard run speeds"):
+            MODULE.ControlConfig(keyboard_run_boost_speed_mps=7.51)
 
     def test_w_follows_camera_and_orients_to_movement(self) -> None:
         core = armed_core(immediate_config())
@@ -280,10 +314,14 @@ class GameControlCoreTest(unittest.TestCase):
     def test_keyboard_uses_native_hold_to_walk_and_run_gaits(self) -> None:
         config = immediate_config(max_speed_mps=0.3)
 
-        def command_for(modifiers: tuple[str, ...]):
+        def command_for(modifiers: tuple[str, ...], *, boost: bool = False):
             core = armed_core(config)
             core.accept_snapshot(
-                snapshot(pressed=("w",), speed_modifiers=modifiers),
+                snapshot(
+                    pressed=("w",),
+                    speed_modifiers=modifiers,
+                    boost=boost,
+                ),
                 received_at_s=10.0,
             )
             core.command(now_s=10.0, dt_s=0.1)
@@ -295,12 +333,35 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual((slow.locomotion_mode, slow.speed_mps), (1, 0.10))
         self.assertEqual((walk.locomotion_mode, walk.speed_mps), (2, 0.80))
         self.assertEqual((run.locomotion_mode, run.speed_mps), (3, 2.50))
+        alt_slow = command_for(("alt",))
+        self.assertEqual((alt_slow.locomotion_mode, alt_slow.speed_mps), (1, 0.10))
+        self.assertEqual(
+            (command_for(("ctrl",), boost=True).locomotion_mode,
+             command_for(("ctrl",), boost=True).speed_mps),
+            (1, 0.20),
+        )
+        self.assertEqual(
+            (command_for((), boost=True).locomotion_mode,
+             command_for((), boost=True).speed_mps),
+            (2, 1.00),
+        )
+        self.assertEqual(
+            (command_for(("shift",), boost=True).locomotion_mode,
+             command_for(("shift",), boost=True).speed_mps),
+            (3, 2.75),
+        )
         # The slower modifier wins an accidental overlap.
         conflict = command_for(("ctrl", "shift"))
         self.assertEqual((conflict.locomotion_mode, conflict.speed_mps), (1, 0.10))
 
     def test_modifiers_without_direction_are_native_idle(self) -> None:
-        for modifiers in (("ctrl",), ("shift",), ("ctrl", "shift")):
+        for modifiers in (
+            ("ctrl",),
+            ("alt",),
+            ("shift",),
+            ("ctrl", "shift"),
+            ("alt", "shift"),
+        ):
             core = armed_core(immediate_config(max_speed_mps=0.3))
             core.accept_snapshot(
                 snapshot(speed_modifiers=modifiers), received_at_s=10.0

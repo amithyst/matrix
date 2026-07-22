@@ -39,6 +39,14 @@ from matrix_mouse_settings import (
     canonical_remote_speed_scale,
 )
 from matrix_mc_commands import MAX_COMMAND_CHARS
+from matrix_motion_settings import (
+    DOUBLE_TAP_SPEED_FIELD,
+    GEARS,
+    MotionSettings,
+    MotionSettingsError,
+    SPEED_FIELD,
+    step_motion_speed,
+)
 
 
 _IS_VIEWABLE = 2
@@ -466,6 +474,27 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         locomotion_top,
         locomotion_bottom - locomotion_candidate_height,
     )
+    motion_outer_gap = 6 if compact else 12
+    motion_row_gap = 4 if compact else 8
+    motion_top = max(
+        tab_y + tab_height + motion_outer_gap,
+        profile_y + button_height + motion_outer_gap,
+    )
+    motion_bottom = speed_y - motion_outer_gap
+    motion_row_height = max(
+        1,
+        (motion_bottom - motion_top - 2 * motion_row_gap) // 3,
+    )
+    motion_left_x = panel_x + margin
+    motion_left_width = max(
+        1,
+        centre_x - safe_half_size - gap - motion_left_x,
+    )
+    motion_right_x = centre_x + safe_half_size + gap
+    motion_right_width = max(
+        1,
+        panel_x + panel_width - margin - motion_right_x,
+    )
     font_slider_width = max(190, min(340, panel_width // 3))
     result = {
         "shield": (geometry.x, geometry.y, geometry.width, geometry.height),
@@ -584,6 +613,33 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             locomotion_candidate_width,
             max(1, locomotion_bottom - locomotion_candidate_y),
         )
+    for row, gear in enumerate(GEARS):
+        row_y = motion_top + row * (motion_row_height + motion_row_gap)
+        for field, cell_x, cell_width in (
+            (SPEED_FIELD, motion_left_x, motion_left_width),
+            (DOUBLE_TAP_SPEED_FIELD, motion_right_x, motion_right_width),
+        ):
+            button_width = 24 if compact else max(32, min(52, cell_width // 4))
+            value_width = max(1, cell_width - 2 * button_width)
+            stem = f"motion_{gear}_{field}"
+            result[f"{stem}_down"] = (
+                cell_x,
+                row_y,
+                button_width,
+                motion_row_height,
+            )
+            result[f"{stem}_value"] = (
+                cell_x + button_width,
+                row_y,
+                value_width,
+                motion_row_height,
+            )
+            result[f"{stem}_up"] = (
+                cell_x + button_width + value_width,
+                row_y,
+                button_width,
+                motion_row_height,
+            )
     return result
 
 
@@ -622,6 +678,27 @@ _PANEL_ACTIONS = (
     "apply_return",
 )
 
+_MOTION_GEAR_LABELS = {
+    "slow": ("慢速", "S"),
+    "walk": ("行走", "W"),
+    "run": ("奔跑", "R"),
+}
+_MOTION_FIELD_LABELS = {
+    SPEED_FIELD: ("基础", "基"),
+    DOUBLE_TAP_SPEED_FIELD: ("双击", "双"),
+}
+_MOTION_CONTROL_SPECS = tuple(
+    (gear, field)
+    for gear in GEARS
+    for field in (SPEED_FIELD, DOUBLE_TAP_SPEED_FIELD)
+)
+_MOTION_STEP_ACTION_DETAILS = {
+    f"motion_{gear}_{field}_{suffix}": (gear, field, direction)
+    for gear, field in _MOTION_CONTROL_SPECS
+    for suffix, direction in (("down", -1), ("up", 1))
+}
+_MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
+
 _PANEL_TABS = ("tab_loadout", "tab_settings", "tab_console")
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
@@ -631,6 +708,7 @@ _POLICY_HIT_TARGETS = tuple(f"recovery_policy_{index}" for index in range(3))
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
+    + _MOTION_STEP_ACTIONS
     + ("command_input",)
     + _OVERLAY_LOCAL_HIT_TARGETS
     + _LOCOMOTION_POLICY_HIT_TARGETS
@@ -664,7 +742,12 @@ def panel_action_at(
             + _POLICY_HIT_TARGETS
         )
     elif page == "settings":
-        targets = _PANEL_TABS + _PANEL_ACTIONS + _OVERLAY_LOCAL_HIT_TARGETS
+        targets = (
+            _PANEL_TABS
+            + _PANEL_ACTIONS
+            + _MOTION_STEP_ACTIONS
+            + _OVERLAY_LOCAL_HIT_TARGETS
+        )
     elif page == "console":
         targets = _PANEL_TABS + ("apply_return", "command_input")
     for action in targets:
@@ -893,6 +976,133 @@ class SettingsPanelModel:
                 and (not self.pending_restart or self.restart_available)
             )
         return False
+
+
+@dataclass(frozen=True)
+class MotionSettingsPanelModel:
+    settings: MotionSettings
+    available: bool
+    load_status: str
+    error: str | None
+
+    def value(self, gear: str, field: str) -> float:
+        return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
+
+    def action_enabled(self, action: str) -> bool:
+        return motion_step_target(self, action) is not None
+
+
+def _motion_settings_candidate(state: dict[str, object]) -> object:
+    direct = state.get("motion_settings")
+    if direct is not None:
+        return direct
+    game_commands = state.get("game_commands")
+    if (
+        isinstance(game_commands, dict)
+        and game_commands.get("motion_settings") is not None
+    ):
+        return game_commands.get("motion_settings")
+    console = state.get("command_console")
+    console = console if isinstance(console, dict) else {}
+    data = console.get("data")
+    data = data if isinstance(data, dict) else {}
+    return data.get("motion_settings")
+
+
+def motion_settings_panel_model(state: dict[str, object]) -> MotionSettingsPanelModel:
+    """Validate the six runtime-owned motion values used by panel step buttons."""
+
+    raw = _motion_settings_candidate(state)
+    load_status = "unavailable"
+    load_error: str | None = None
+    snapshot = raw
+    if isinstance(raw, dict) and "settings" in raw:
+        snapshot = raw.get("settings")
+        if isinstance(raw.get("load_status"), str):
+            load_status = raw["load_status"]
+        if isinstance(raw.get("load_error"), str) and raw.get("load_error"):
+            load_error = str(raw["load_error"])
+    try:
+        settings = MotionSettings.from_mapping(snapshot)
+    except (MotionSettingsError, TypeError, ValueError) as exc:
+        return MotionSettingsPanelModel(
+            settings=MotionSettings(),
+            available=False,
+            load_status="unavailable",
+            error=(
+                "motion settings unavailable"
+                if raw is None
+                else f"invalid motion settings telemetry: {exc}"
+            ),
+        )
+    return MotionSettingsPanelModel(
+        settings=settings,
+        available=True,
+        load_status=load_status if load_status != "unavailable" else "loaded",
+        error=load_error,
+    )
+
+
+def motion_step_target(
+    model: MotionSettingsPanelModel,
+    action: str,
+) -> float | None:
+    """Return the adjacent validated preset for one strict panel action."""
+
+    if not isinstance(model, MotionSettingsPanelModel):
+        raise TypeError("motion panel model is required")
+    details = _MOTION_STEP_ACTION_DETAILS.get(action)
+    if details is None:
+        raise ValueError(f"unsupported motion panel action: {action}")
+    if not model.available:
+        return None
+    gear, field, direction = details
+    path = f"control.motion.gears.{gear}.{field}"
+    current = model.settings.value_for_path(path)
+    target = step_motion_speed(model.settings, path, direction)
+    return None if math.isclose(target, current, rel_tol=0.0, abs_tol=1e-12) else target
+
+
+def motion_step_command(
+    model: MotionSettingsPanelModel,
+    action: str,
+) -> str | None:
+    """Build one standard MC data command without mutating any local config."""
+
+    target = motion_step_target(model, action)
+    if target is None:
+        return None
+    gear, field, _direction = _MOTION_STEP_ACTION_DETAILS[action]
+    return (
+        f"/data modify entity @s control.motion.gears.{gear}.{field} "
+        f"set value {target:.2f}"
+    )
+
+
+def motion_value_label(
+    model: MotionSettingsPanelModel,
+    gear: str,
+    field: str,
+    *,
+    compact: bool,
+) -> str:
+    """Return a bounded label for one of the six visible motion values."""
+
+    if (gear, field) not in _MOTION_CONTROL_SPECS:
+        raise ValueError("unsupported motion value label")
+    value = model.value(gear, field)
+    if compact:
+        compact_value = f"{value:.2f}".rstrip("0").rstrip(".")
+        if compact_value.startswith("0."):
+            compact_value = compact_value[1:]
+        return (
+            f"{_MOTION_GEAR_LABELS[gear][1]}"
+            f"{_MOTION_FIELD_LABELS[field][1]}{compact_value}"
+        )
+    return (
+        f"{_MOTION_GEAR_LABELS[gear][0]}{_MOTION_FIELD_LABELS[field][0]} "
+        f"{value:.2f} m/s"
+    )
 
 
 _COMMAND_STATUSES = frozenset(
@@ -1549,6 +1759,7 @@ class X11CalibrationOverlay:
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
         self._last_geometry: WindowGeometry | None = None
         self._last_panel_model: SettingsPanelModel | None = None
+        self._last_motion_model: MotionSettingsPanelModel | None = None
         self._last_strategy_model: StrategyLoadoutModel | None = None
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
@@ -3181,6 +3392,8 @@ class X11CalibrationOverlay:
         self,
         layout: dict[str, tuple[int, int, int, int]],
         model: SettingsPanelModel,
+        motion_model: MotionSettingsPanelModel,
+        command_status: CommandConsoleStatus,
     ) -> None:
         local_selected = model.next_profile == "Local"
         controls_disabled = model.restart_requested or model.status == "restarting"
@@ -3240,6 +3453,47 @@ class X11CalibrationOverlay:
                 speed_value[3],
             ),
         )
+        command_blocked = bool(
+            command_status.in_flight
+            or command_status.restart_required
+            or command_status.outcome_unknown
+            or command_status.status in {"pending", "restarting"}
+            or self._command_editor.editing
+            or self._command_editor.pending
+        )
+        compact_motion_labels = bool(
+            layout["panel"][2] < 800 or layout["panel"][3] < 600
+        )
+        for gear, field in _MOTION_CONTROL_SPECS:
+            stem = f"motion_{gear}_{field}"
+            for suffix in ("down", "up"):
+                action = f"{stem}_{suffix}"
+                disabled = bool(
+                    controls_disabled
+                    or command_blocked
+                    or not motion_model.action_enabled(action)
+                )
+                self._draw_button(
+                    layout,
+                    action,
+                    "-" if suffix == "down" else "+",
+                    fill=self._colours["disabled" if disabled else "button"],
+                    disabled=disabled,
+                )
+            self._draw_text(
+                motion_value_label(
+                    motion_model,
+                    gear,
+                    field,
+                    compact=compact_motion_labels,
+                ),
+                x=0,
+                y=0,
+                colour=self._colours[
+                    "white" if motion_model.available else "muted"
+                ],
+                centred_in=self._panel_rectangle(layout, f"{stem}_value"),
+            )
         if layout["panel"][3] >= 500:
             status = (
                 "正在重载 Matrix"
@@ -3281,6 +3535,7 @@ class X11CalibrationOverlay:
         model: SettingsPanelModel,
         command_status: CommandConsoleStatus | None = None,
         strategy_model: StrategyLoadoutModel | None = None,
+        motion_model: MotionSettingsPanelModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -3305,7 +3560,13 @@ class X11CalibrationOverlay:
                 strategy_model or strategy_loadout_model({}),
             )
         elif page == "settings":
-            self._draw_control_settings_page(layout, model)
+            self._draw_control_settings_page(
+                layout,
+                model,
+                motion_model or motion_settings_panel_model({}),
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+            )
         else:
             self._draw_command_console(
                 layout,
@@ -3546,6 +3807,30 @@ class X11CalibrationOverlay:
                                 candidate.policy_id,
                             )
                             emitted += 1
+                elif action in _MOTION_STEP_ACTIONS:
+                    motion_model = getattr(self, "_last_motion_model", None)
+                    panel_model = self._last_panel_model
+                    command = (
+                        motion_step_command(motion_model, action)
+                        if motion_model is not None
+                        else None
+                    )
+                    if (
+                        command is not None
+                        and panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and self._last_command_status.available
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting"}
+                    ):
+                        publisher.publish_command_submit(command)
+                        emitted += 1
                 elif (
                     self._last_panel_model is not None
                     and self._last_panel_model.action_enabled(action)
@@ -3573,11 +3858,13 @@ class X11CalibrationOverlay:
         first_show = not self._visible
         geometry_changed = geometry != self._last_geometry
         model = settings_panel_model(state)
+        motion_model = motion_settings_panel_model(state)
         strategy_model = strategy_loadout_model(state)
         command_status = command_console_status(state)
         self._command_editor.reconcile(command_status)
         model_changed = bool(
             model != self._last_panel_model
+            or motion_model != getattr(self, "_last_motion_model", None)
             or strategy_model != getattr(self, "_last_strategy_model", None)
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
             != getattr(self, "_last_rendered_font_size", None)
@@ -3611,7 +3898,13 @@ class X11CalibrationOverlay:
             for name in static_order:
                 self._x11.XRaiseWindow(self._display, self._windows[name])
         if first_show or geometry_changed or model_changed:
-            self._draw_panel(layout, model, command_status, strategy_model)
+            self._draw_panel(
+                layout,
+                model,
+                command_status,
+                strategy_model,
+                motion_model,
+            )
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
         if not self._cursor_visible or pointer_changed:
@@ -3644,6 +3937,7 @@ class X11CalibrationOverlay:
         self._last_layout = layout
         self._last_geometry = geometry
         self._last_panel_model = model
+        self._last_motion_model = motion_model
         self._last_strategy_model = strategy_model
         self._last_rendered_font_size = getattr(
             self,
@@ -3671,6 +3965,7 @@ class X11CalibrationOverlay:
         self._last_layout = None
         self._last_geometry = None
         self._last_panel_model = None
+        self._last_motion_model = None
         self._last_strategy_model = None
         self._last_page = None
         self._last_command_status = command_console_status({})
