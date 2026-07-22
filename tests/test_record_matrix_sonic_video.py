@@ -139,6 +139,11 @@ class MatrixSonicVideoTest(unittest.TestCase):
         self.assertEqual(parsed["duration_s"], 4.0)
         self.assertEqual(parsed["decoded_frames"], 120)
 
+    def test_signalstats_uses_middle_frame_not_startup_black_frame(self) -> None:
+        self.assertEqual(MODULE.signalstats_sample_offset_s(12.0), 6.0)
+        self.assertEqual(MODULE.signalstats_sample_offset_s(0.08), 0.03)
+        self.assertEqual(MODULE.signalstats_sample_offset_s(float("inf")), 0.0)
+
     def test_accepts_native_dynamic_video(self) -> None:
         probe = MODULE.VideoProbe(
             codec="h264",

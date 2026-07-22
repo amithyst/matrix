@@ -556,6 +556,12 @@ def _parse_signal_stats(text: str) -> dict[str, float]:
     return values
 
 
+def signalstats_sample_offset_s(duration_s: float) -> float:
+    if duration_s <= 0.0 or not math.isfinite(duration_s):
+        return 0.0
+    return min(duration_s * 0.5, max(duration_s - 0.05, 0.0))
+
+
 def inspect_video(
     ffmpeg: Path, path: Path, *, sample_fps: float
 ) -> VideoProbe:
@@ -576,12 +582,15 @@ def inspect_video(
         ]
     )
     parsed = parse_ffmpeg_probe(decode.stderr, decode.stdout)
+    signal_offset_s = signalstats_sample_offset_s(float(parsed["duration_s"]))
     signal_result = _run_text(
         [
             str(ffmpeg),
             "-hide_banner",
             "-i",
             str(path),
+            "-ss",
+            f"{signal_offset_s:g}",
             "-map",
             "0:v:0",
             "-frames:v",
