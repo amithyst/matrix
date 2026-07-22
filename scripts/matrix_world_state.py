@@ -1059,7 +1059,10 @@ def _legacy_checkpoint_id(
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
-    return f"cp-{hashlib.sha256(b'matrix-world-state-v1-migration\0' + payload).hexdigest()[:32]}"
+    digest = hashlib.sha256(
+        b"matrix-world-state-v1-migration\0" + payload
+    ).hexdigest()
+    return f"cp-{digest[:32]}"
 
 
 def _strict_json_object(
