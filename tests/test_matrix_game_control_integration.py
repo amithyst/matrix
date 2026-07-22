@@ -382,6 +382,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         generation: int,
         source: str,
         run_id: str,
+        fall_detected: bool = False,
     ) -> dict[str, object]:
         return {
             "acceptance_failures": ["numerical_instability"],
@@ -393,7 +394,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "elapsed_wall_s": 0.5,
             "failed_child_exit_code": None,
             "failed_child_name": None,
-            "fall_detected": False,
+            "fall_detected": fall_detected,
             "game_auto_respawn": False,
             "game_world_state": {
                 "has_last_exit": True,
@@ -2693,6 +2694,7 @@ exit 0
                 generation=selected.generation,
                 source=selected.source,
                 run_id=run_id,
+                fall_detected=True,
             )
             self.write(
                 project / "scripts/run_sim.sh",
@@ -2769,6 +2771,115 @@ exit 0
                 [rejected_id],
             )
             self.assertIn("Quarantined failed Matrix resume checkpoint", result.stdout)
+
+    def test_outer_launcher_rejects_non_boolean_resume_rollback_fall_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            proposal_file = project / "proposal.json"
+            state_file = project / "state/world.json"
+            world_id = "g1_29dof:rollback-fall-type"
+            world_revision = "rollback-fall-type-revision-v1"
+            store = WORLD_STATE.WorldStateStore(
+                state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+            )
+            state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(state)
+            selected = state.resolve_start()
+            assert selected.checkpoint_id is not None
+            status = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="d" * 32,
+            )
+            primary_before = state_file.read_bytes()
+            backup_before = (
+                store.backup_path.read_bytes()
+                if store.backup_path.exists()
+                else None
+            )
+            self.write(
+                project / "scripts/run_sim.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
+cp "${ROLLBACK_PROPOSAL_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
+exit 76
+""",
+                executable=True,
+            )
+            environment = {
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(
+                    project / "outputs/matrix-sonic-status.json"
+                ),
+                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "ROLLBACK_PROPOSAL_FILE": os.fspath(proposal_file),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            for invalid_fall in (None, 0, 1, "true"):
+                with self.subTest(fall_detected=invalid_fall):
+                    malformed = {**status, "fall_detected": invalid_fall}
+                    proposal_file.write_text(
+                        json.dumps(malformed, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                            "--scene",
+                            "21",
+                            "--control-source",
+                            "game",
+                        ],
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        timeout=20.0,
+                        check=False,
+                    )
+
+                    self.assertEqual(
+                        result.returncode,
+                        76,
+                        msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    self.assertIn(
+                        "Refusing unverified Matrix resume rollback proposal",
+                        result.stderr,
+                    )
+                    self.assertEqual(state_file.read_bytes(), primary_before)
+                    if backup_before is None:
+                        self.assertFalse(store.backup_path.exists())
+                    else:
+                        self.assertEqual(store.backup_path.read_bytes(), backup_before)
 
     def test_outer_launcher_never_chains_a_second_resume_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

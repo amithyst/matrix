@@ -151,7 +151,7 @@
   "source_revisions": {
     "gr00t_whole_body_control": {
       "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/GR00T-WholeBodyControl.git",
-      "commit": "de083d71af8346b0124ab1ae79fd3623b52c3c9b",
+      "commit": "a38e57630e679f25c527f50db907050077e8d5d6",
       "critical_source_paths": [
         "gear_sonic/scripts/run_sim_loop.py",
         "gear_sonic/utils/mujoco_sim/configs.py",
@@ -191,7 +191,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic/utils/mujoco_sim/base_sim.py",
-      "sha256": "675772ddf30f1e63dc69d5c02cbefaccb77013114422b057245054f5f6a5dfaf"
+      "sha256": "31b5518c4636bac7f62757ace09e211c9667d7f057aad055698c59787574a402"
     },
     {
       "root": "sonic",
@@ -201,7 +201,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic/utils/mujoco_sim/unitree_sdk2py_bridge.py",
-      "sha256": "b1f38bbaa584c4754a7d04384e08c469e1c2d167990ea920ad4e5384f7046359"
+      "sha256": "b577fa0b5f9f7229a740f657c9d778c17309a8340fe4964be75d437255f84ca0"
     },
     {
       "root": "sonic",

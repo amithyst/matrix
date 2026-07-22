@@ -328,10 +328,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "final_reset_count": 0,
         }
         self.assertIsNone(MODULE._game_world_rollback_ineligibility(**baseline))
+        coincident_fall = {**baseline, "fall_detected": True}
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(**coincident_fall)
+        )
         self.assertIsNone(
             MODULE._game_world_rollback_ineligibility(
                 **{
-                    **baseline,
+                    **coincident_fall,
                     "numerical_error": (
                         "snapshot_sim_time_not_increasing:0.0,previous=0.0"
                     ),
@@ -344,11 +348,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "late": {"elapsed_s": 5.000001},
             "signal": {"termination_signal": signal.SIGTERM},
             "child": {"child_failure": ("deploy", 7)},
-            "fall": {"fall_detected": True},
             "reset": {"final_reset_count": 1},
             "received_lowcmd": {"low_cmd_received": True},
             "fresh_lowcmd": {"active_lowcmd": True},
             "active_frame": {"active_frames": 1},
+            "ordinary_fall": {
+                "termination_reason": "fall_detected",
+                "numerical_error": None,
+            },
             "wrong_termination": {"termination_reason": "child_exit"},
             "abi_error": {
                 "numerical_error": "snapshot_dimension:qpos=35,expected=36"
@@ -358,7 +365,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIsNotNone(
                     MODULE._game_world_rollback_ineligibility(
-                        **{**baseline, **changes}
+                        **{**coincident_fall, **changes}
                     )
                 )
 
@@ -387,14 +394,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             76,
         )
 
-    def test_failure_frame_evidence_blocks_resume_rollback(self) -> None:
+    def test_failure_frame_lowcmd_and_reset_evidence_blocks_resume_rollback(
+        self,
+    ) -> None:
         previous = self.snapshot(step_index=0, sim_time=0.0)
         cases = {
             "lowcmd": (
                 {"low_cmd_received": True, "low_cmd_fresh": True},
                 "lowcmd_observed",
             ),
-            "fall": ({"fall_detected": True}, "fall_detected"),
             "reset": ({"reset_count": 1}, "reset_detected"),
         }
         for name, (changes, expected_reason) in cases.items():
@@ -428,6 +436,44 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     reset_observed=evidence.reset_observed,
                 )
                 self.assertEqual(ineligibility, expected_reason)
+
+    def test_failure_frame_fall_allows_exact_startup_numerical_rollback(
+        self,
+    ) -> None:
+        previous = self.snapshot(step_index=0, sim_time=0.0)
+        failed = self.snapshot(
+            step_index=1,
+            sim_time=0.005,
+            fall_detected=True,
+        )
+        failed.qpos[2] = math.nan
+        evidence = MODULE._ResumeRollbackEvidence(initial_reset_count=0)
+        evidence.observe(previous)
+        evidence.observe(failed)
+        validation_error = MODULE._snapshot_validation_error(failed, previous)
+
+        self.assertTrue(validation_error.startswith("snapshot_non_finite:"))
+        self.assertTrue(evidence.fall_detected)
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                selected_checkpoint_id="cp-1",
+                selected_generation=7,
+                rollback_count=0,
+                elapsed_s=1.0,
+                termination_reason="numerical_instability",
+                numerical_error=validation_error,
+                low_cmd_received=evidence.low_cmd_received,
+                active_lowcmd=evidence.active_lowcmd,
+                active_frames=evidence.active_frames,
+                active_elapsed_s=0.0,
+                termination_signal=None,
+                child_failure=None,
+                fall_detected=evidence.fall_detected,
+                initial_reset_count=0,
+                final_reset_count=evidence.max_reset_count,
+                reset_observed=evidence.reset_observed,
+            )
+        )
 
     def test_late_signal_or_child_boundary_cancels_rollback_proposal(self) -> None:
         baseline = {

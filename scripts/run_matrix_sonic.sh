@@ -1516,13 +1516,14 @@ if not isinstance(numerical_error, str) or not numerical_error.startswith(
 for field in (
     "active_lowcmd",
     "completed",
-    "fall_detected",
     "interrupted",
     "low_cmd_received",
     "passed",
 ):
     if status.get(field) is not False:
         raise SystemExit(1)
+if type(status.get("fall_detected")) is not bool:
+    raise SystemExit(1)
 for field in ("active_elapsed_s", "active_lowcmd_longest_s"):
     value = status.get(field)
     if (

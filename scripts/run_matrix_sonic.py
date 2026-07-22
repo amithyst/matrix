@@ -2291,7 +2291,12 @@ def _game_world_rollback_ineligibility(
         return "termination_signal"
     if child_failure is not None:
         return "child_failure"
-    if fall_detected:
+    # A restored pose can already be marked fallen when its first native step
+    # exposes the allowlisted numerical failure below.  That aggregate flag is
+    # therefore not sufficient to distinguish a bad resume from an ordinary
+    # fall.  A validated ordinary fall is stopped earlier with this explicit
+    # termination reason and must never authorize checkpoint rollback.
+    if termination_reason == "fall_detected":
         return "fall_detected"
     if reset_observed or final_reset_count != initial_reset_count:
         return "reset_detected"
@@ -7636,8 +7641,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
                 # Accumulate fail-closed evidence before validation. An invalid
-                # frame remains unavailable for physics/rendering, but its
-                # LowCmd/fall/reset flags must still veto checkpoint rollback.
+                # frame remains unavailable for physics/rendering. LowCmd and
+                # reset evidence still veto rollback; a coincident fall flag is
+                # resolved by the explicit termination-reason gate because a
+                # bad restored pose can already be reported as fallen.
                 resume_rollback_evidence.observe(next_snapshot)
                 step_error = _snapshot_validation_error(next_snapshot, snapshot)
                 if step_error is not None:
