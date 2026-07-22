@@ -421,6 +421,7 @@ class ExternalControlBroker:
         self.accepted_connections = 0
         self.rejected_peers = 0
         self.protocol_errors = 0
+        self.stale_lease_rejections = 0
         self.auth_failures = 0
         self.lease_acquisitions = 0
         self.lease_conflicts = 0
@@ -908,7 +909,10 @@ class ExternalControlBroker:
                         sequence = candidate
                     response = self._handle(client_fd, client, request, current)
                 except ExternalControlError as exc:
-                    self.protocol_errors += 1
+                    if exc.code == "E_LEASE":
+                        self.stale_lease_rejections += 1
+                    else:
+                        self.protocol_errors += 1
                     response = self._response(
                         sequence,
                         ok=False,
@@ -1050,6 +1054,7 @@ class ExternalControlBroker:
             "accepted_connections": self.accepted_connections,
             "rejected_peers": self.rejected_peers,
             "protocol_errors": self.protocol_errors,
+            "stale_lease_rejections": self.stale_lease_rejections,
             "auth_failures": self.auth_failures,
             "lease_acquisitions": self.lease_acquisitions,
             "lease_conflicts": self.lease_conflicts,

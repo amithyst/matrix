@@ -27,6 +27,25 @@ from matrix_external_control import (
 _CAPABILITY_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
+class MatrixControlResponseError(RuntimeError):
+    """Typed negative response from the authenticated control endpoint."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
+class MatrixCommandOutcomeUnknownError(RuntimeError):
+    """Admitted command lacks a terminal receipt and may have lost authority."""
+
+    def __init__(self, message: str, *, lease_available: bool) -> None:
+        if type(lease_available) is not bool:
+            raise TypeError("lease availability must be boolean")
+        self.lease_available = lease_available
+        super().__init__(message)
+
+
 def default_endpoint(profile: str) -> tuple[Path, Path]:
     if not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", profile):
         raise ValueError("profile must contain only letters, digits, dot, underscore, or dash")
@@ -129,7 +148,10 @@ class MatrixControlClient:
         ):
             raise RuntimeError("external-control response schema is invalid")
         if not response["ok"]:
-            raise RuntimeError(f"{response['code']}: {response['message']}")
+            raise MatrixControlResponseError(
+                response["code"],
+                response["message"],
+            )
         return response
 
     def acquire(self) -> tuple[str, float]:
@@ -279,14 +301,28 @@ def _hold_state(
     *,
     seconds: float,
     refresh_seconds: float,
+    clock=time.monotonic,
+    sleeper=time.sleep,
 ) -> None:
-    deadline = time.monotonic() + seconds
+    deadline = clock() + seconds
+    # A held input is immutable until the next explicit segment.  Replacing the
+    # full state every refresh needlessly amplifies provider/UI telemetry I/O;
+    # renew the lease instead and keep the broker's 150 ms deadman authoritative.
+    client.replace(lease_id, state)
+    next_refresh = clock() + refresh_seconds
     while True:
-        client.replace(lease_id, state)
-        remaining = deadline - time.monotonic()
+        now = clock()
+        remaining = deadline - now
         if remaining <= 0.0:
             return
-        time.sleep(min(refresh_seconds, remaining))
+        sleeper(max(0.0, min(next_refresh - now, remaining)))
+        now = clock()
+        if now >= deadline:
+            return
+        client.refresh(lease_id)
+        next_refresh += refresh_seconds
+        if next_refresh <= now:
+            next_refresh = now + refresh_seconds
 
 
 def _parse_args() -> argparse.Namespace:
@@ -421,13 +457,19 @@ def _wait_for_command_terminal(
                 poll_failure = exc
                 refresh_lease = False
 
-    persistent = _persistent_command_result_until(
-        client,
-        command_id,
-        wait_seconds=0.50 if poll_failure is not None else 0.0,
-        clock=clock,
-        sleeper=sleeper,
-    )
+    try:
+        persistent = _persistent_command_result_until(
+            client,
+            command_id,
+            wait_seconds=0.50 if poll_failure is not None else 0.0,
+            clock=clock,
+            sleeper=sleeper,
+        )
+    except (OSError, RuntimeError) as exc:
+        persistent = None
+        if poll_failure is None:
+            poll_failure = exc
+        refresh_lease = False
     if persistent is not None and persistent["terminal"]:
         lease_available = bool(
             poll_failure is None
@@ -441,8 +483,9 @@ def _wait_for_command_terminal(
         if poll_failure is not None
         else "no terminal receipt"
     )
-    raise RuntimeError(
-        f"E_COMMAND_OUTCOME_UNKNOWN: {detail} for {command_id}"
+    raise MatrixCommandOutcomeUnknownError(
+        f"E_COMMAND_OUTCOME_UNKNOWN: {detail} for {command_id}",
+        lease_available=bool(poll_failure is None and refresh_lease),
     ) from poll_failure
 
 
@@ -566,12 +609,27 @@ def main() -> int:
                     # the provider endpoint after publishing its terminal
                     # receipt.  Cleanup failure cannot overwrite that outcome.
                     pass
-        except BaseException:
-            try:
-                client.replace(lease_id, neutral)
-                client.release(lease_id)
-            except Exception:
-                pass
+        except BaseException as exc:
+            # A deadman/local override has already zeroed state and revoked the
+            # lease.  Sending neutral/release with that stale identity merely
+            # creates a second E_LEASE and cannot improve safety.
+            lease_lost = bool(
+                not lease_available
+                or (
+                    isinstance(exc, MatrixCommandOutcomeUnknownError)
+                    and not exc.lease_available
+                )
+                or (
+                    isinstance(exc, MatrixControlResponseError)
+                    and exc.code == "E_LEASE"
+                )
+            )
+            if not lease_lost:
+                try:
+                    client.replace(lease_id, neutral)
+                    client.release(lease_id)
+                except Exception:
+                    pass
             raise
         if response is not None:
             print(json.dumps(response, indent=2, sort_keys=True))

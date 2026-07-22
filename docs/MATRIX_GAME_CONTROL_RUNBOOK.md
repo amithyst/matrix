@@ -60,6 +60,7 @@ be claimed from this implementation.
 | Acceleration / deceleration | 1.20 / 2.40 m/s² |
 | Maximum heading rate | 2.50 rad/s |
 | Translation heading gate | start within 15 degrees; stop beyond 30 degrees |
+| Turn before translation | native `IDLE + facing`; never `SLOW_WALK + speed=0` |
 | Left-stick radial deadzone | 0.15 |
 | Input timeout | 0.15 s |
 | Maximum snapshot age | 0.15 s |

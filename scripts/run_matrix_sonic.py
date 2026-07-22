@@ -1570,14 +1570,25 @@ def _snapshot_world_pose(snapshot: Any) -> WorldPose:
         raise WorldStateError(f"snapshot does not contain a valid root pose: {exc}") from exc
 
 
-def _snapshot_world_upright(snapshot: Any) -> bool:
+def _snapshot_world_upright(
+    snapshot: Any,
+    *,
+    current_fall_detected: bool | None = None,
+) -> bool:
     try:
+        if current_fall_detected is not None and type(current_fall_detected) is not bool:
+            raise TypeError("current fall flag must be boolean")
+        current_fall = (
+            bool(snapshot.fall_detected)
+            if current_fall_detected is None
+            else current_fall_detected
+        )
         qvel = snapshot.qvel
         vertical_speed = float(qvel[2])
         roll_rate = float(qvel[3])
         pitch_rate = float(qvel[4])
         return bool(
-            not bool(snapshot.fall_detected)
+            not current_fall
             and float(snapshot.qpos[2]) >= _WORLD_SAFE_MIN_ROOT_Z
             and _root_up_z(snapshot.qpos) >= _WORLD_SAFE_MIN_ROOT_UP_Z
             and math.isfinite(vertical_speed)
@@ -1589,6 +1600,31 @@ def _snapshot_world_upright(snapshot: Any) -> bool:
         )
     except (AttributeError, IndexError, TypeError, ValueError):
         return False
+
+
+def _game_world_current_fall_detected(
+    snapshot: Any,
+    *,
+    game_fall_recovery: Any | None,
+    physical_recovery: Any | None,
+) -> bool:
+    """Separate SONIC's historical fall latch from the live recovery state."""
+
+    if physical_recovery is not None:
+        state = getattr(getattr(physical_recovery, "fsm", None), "state", None)
+        output = getattr(physical_recovery, "last_output", None)
+        return bool(
+            getattr(physical_recovery, "current_fall_detected", False)
+            or state
+            not in {RecoveryState.GAME_SONIC, ResidentRecoveryState.GAME_SONIC}
+            or getattr(output, "inhibit_game_input", False)
+        )
+    if game_fall_recovery is not None:
+        return bool(
+            getattr(game_fall_recovery, "current_fallen", False)
+            or getattr(game_fall_recovery, "recovering", False)
+        )
+    return bool(getattr(snapshot, "fall_detected", False))
 
 
 class _GameWorldStateRuntime:
@@ -1658,6 +1694,7 @@ class _GameWorldStateRuntime:
         now_s: float,
         force: bool = False,
         required: bool = False,
+        current_fall_detected: bool | None = None,
     ) -> bool:
         now = float(now_s)
         if not math.isfinite(now) or now < 0.0:
@@ -1704,7 +1741,10 @@ class _GameWorldStateRuntime:
                         )
             state = self.state.checkpoint(
                 pose,
-                upright=_snapshot_world_upright(snapshot),
+                upright=_snapshot_world_upright(
+                    snapshot,
+                    current_fall_detected=current_fall_detected,
+                ),
                 clearance_safe=clearance_safe,
             )
             self.store.save(state)
@@ -3148,12 +3188,6 @@ class NativePlannerClient:
             raise ValueError("locomotion_mode must be a native SONIC motion in [0, 26]")
         if moving and locomotion_mode == SONIC_IDLE_MODE:
             raise ValueError("moving planner command cannot use native IDLE")
-        turning = (
-            not moving
-            and locomotion_mode == SONIC_SLOW_WALK_MODE
-            and speed_value <= 1e-6
-            and math.hypot(movement_values[0], movement_values[1]) <= 1e-6
-        )
         self._socket.send(
             self._build_command_message(
                 start=start,
@@ -3164,10 +3198,10 @@ class NativePlannerClient:
         )
         self._socket.send(
             self._build_planner_message(
-                mode=locomotion_mode if moving or turning else 0,
+                mode=locomotion_mode if moving else SONIC_IDLE_MODE,
                 movement=movement_values if moving else [0.0, 0.0, 0.0],
                 facing=facing_values,
-                speed=(speed_value if moving else 0.0 if turning else -1.0),
+                speed=(speed_value if moving else -1.0),
                 height=-1.0,
             )
         )
@@ -3193,8 +3227,8 @@ class NativePlannerClient:
         if turning:
             if has_speed or has_direction:
                 raise ValueError("turn-only game command must not translate")
-            if command.locomotion_mode != SONIC_SLOW_WALK_MODE:
-                raise ValueError("turn-only game command must use native SLOW_WALK")
+            if command.locomotion_mode != SONIC_IDLE_MODE:
+                raise ValueError("turn-only game command must use native IDLE")
             if command.safe_stop:
                 raise ValueError("turn-only game command cannot be a safe stop")
         elif not moving:
@@ -6583,7 +6617,7 @@ class _PhysicalRecoveryCoordinator:
                 if mode == "turn" or limited:
                     rotated_movement = (0.0, 0.0, 0.0)
                     speed_mps = 0.0
-                    locomotion_mode = SONIC_SLOW_WALK_MODE
+                    locomotion_mode = SONIC_IDLE_MODE
                     mode = "turn"
                     if limited:
                         reason = "recovery_heading_slew_limited"
@@ -8302,7 +8336,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 ),
             )
             if game_world is not None and not resume_probation_active:
-                game_world.checkpoint(snapshot, now_s=freshness_sample_wall)
+                game_world.checkpoint(
+                    snapshot,
+                    now_s=freshness_sample_wall,
+                    current_fall_detected=_game_world_current_fall_detected(
+                        snapshot,
+                        game_fall_recovery=game_fall_recovery,
+                        physical_recovery=physical_recovery,
+                    ),
+                )
             if active_lowcmd:
                 if active_started_wall is None:
                     active_started_wall = freshness_sample_wall
@@ -8534,6 +8576,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     now_s=time.perf_counter(),
                     force=True,
                     required=True,
+                    current_fall_detected=_game_world_current_fall_detected(
+                        snapshot,
+                        game_fall_recovery=game_fall_recovery,
+                        physical_recovery=physical_recovery,
+                    ),
                 )
                 final_world = game_world.telemetry()
                 final_checkpoint_id = final_world.get(

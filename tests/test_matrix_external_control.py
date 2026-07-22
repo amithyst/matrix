@@ -266,6 +266,8 @@ class BrokerTest(unittest.TestCase):
         self.assertFalse(expired["ok"])
         self.assertEqual(expired["code"], "E_LEASE")
         self.assertFalse(self.broker.lease_active)
+        self.assertEqual(self.broker.stale_lease_rejections, 1)
+        self.assertEqual(self.broker.protocol_errors, 0)
         reacquired = self.request(client, 4, "lease.acquire", {})
         self.assertTrue(reacquired["ok"])
         self.assertNotEqual(reacquired["data"]["lease_id"], lease)

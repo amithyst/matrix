@@ -641,6 +641,40 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "zero"):
             MODULE._root_yaw_rad([0.0] * 7)
 
+    def test_world_checkpoint_uses_live_recovery_state_not_sticky_fall_latch(
+        self,
+    ) -> None:
+        recovered = self.snapshot_with_yaw(0.25, fall_detected=True)
+        recovered.qpos[2] = 0.8
+        self.assertFalse(MODULE._snapshot_world_upright(recovered))
+        self.assertTrue(
+            MODULE._snapshot_world_upright(
+                recovered,
+                current_fall_detected=False,
+            )
+        )
+
+        physical = SimpleNamespace(
+            current_fall_detected=False,
+            fsm=SimpleNamespace(state=MODULE.ResidentRecoveryState.GAME_SONIC),
+            last_output=SimpleNamespace(inhibit_game_input=False),
+        )
+        self.assertFalse(
+            MODULE._game_world_current_fall_detected(
+                recovered,
+                game_fall_recovery=None,
+                physical_recovery=physical,
+            )
+        )
+        physical.fsm.state = MODULE.ResidentRecoveryState.KUNGFU_RECOVERING
+        self.assertTrue(
+            MODULE._game_world_current_fall_detected(
+                recovered,
+                game_fall_recovery=None,
+                physical_recovery=physical,
+            )
+        )
+
     def test_heading_anchor_captures_only_first_fresh_lowcmd_edge(self) -> None:
         initial = self.snapshot_with_yaw(
             0.25,
@@ -2582,24 +2616,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[4]["movement"], [0.0, 0.0, 0.0])
         self.assertEqual(planners[4]["speed"], -1.0)
 
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=121,
+                movement=(0.0, 0.0, 0.0),
+                facing=(0.0, 1.0, 0.0),
+                speed_mps=0.0,
+                locomotion_mode=MODULE.SONIC_IDLE_MODE,
+                mode="turn",
+                safe_stop=False,
+                reason="aligning_heading",
+            )
+        )
+        self.assertEqual(planners[5]["mode"], MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[5]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[5]["speed"], -1.0)
+
         client.send_recovery_posture(
             locomotion_mode=5,
             height=0.4,
             facing=(0.0, 1.0, 0.0),
         )
-        self.assertEqual(planners[5]["mode"], 5)
-        self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
-        self.assertEqual(planners[5]["facing"], [0.0, 1.0, 0.0])
-        self.assertEqual(planners[5]["speed"], -1.0)
-        self.assertEqual(planners[5]["height"], 0.4)
+        self.assertEqual(planners[6]["mode"], 5)
+        self.assertEqual(planners[6]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[6]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[6]["speed"], -1.0)
+        self.assertEqual(planners[6]["height"], 0.4)
 
         client.send_recovery_posture(
             locomotion_mode=0,
             height=-1.0,
             facing=(1.0, 0.0, 0.0),
         )
-        self.assertEqual(planners[6]["mode"], 0)
-        self.assertEqual(planners[6]["height"], -1.0)
+        self.assertEqual(planners[7]["mode"], 0)
+        self.assertEqual(planners[7]["height"], -1.0)
         with self.assertRaisesRegex(ValueError, "IDLE or KNEEL"):
             client.send_recovery_posture(
                 locomotion_mode=7,

@@ -72,6 +72,211 @@ class MatrixCtlHelpersTest(unittest.TestCase):
                     detector.update(sample(pressed), now_s=1.16, enabled=True)
                 )
 
+    def test_held_state_is_replaced_once_then_renewed_on_absolute_cadence(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        client = mock.Mock()
+        state = MODULE._state_with_keyboard("w", ("alt",))
+        clock = Clock()
+
+        MODULE._hold_state(
+            client,
+            "lease",
+            state,
+            seconds=0.16,
+            refresh_seconds=0.05,
+            clock=clock.read,
+            sleeper=clock.sleep,
+        )
+
+        client.replace.assert_called_once_with("lease", state)
+        self.assertEqual(client.refresh.call_count, 3)
+        client.refresh.assert_has_calls([mock.call("lease")] * 3)
+        self.assertAlmostEqual(clock.now, 0.16)
+
+    def test_typed_negative_response_preserves_error_code(self) -> None:
+        client = MODULE.MatrixControlClient(
+            Path("/tmp/control.sock"),
+            Path("/tmp/control.cap"),
+        )
+        client._socket = mock.Mock()
+        client._capability = "a" * 64
+        client._socket.send.return_value = mock.ANY
+        response = {
+            "protocol": EXTERNAL.PROTOCOL,
+            "kind": "response",
+            "sequence": 1,
+            "ok": False,
+            "code": "E_LEASE",
+            "message": "client does not own the active lease",
+            "data": None,
+        }
+        encoded = json.dumps(response).encode("utf-8")
+        client._socket.send.return_value = len(
+            json.dumps(
+                {
+                    "protocol": EXTERNAL.PROTOCOL,
+                    "kind": "request",
+                    "sequence": 1,
+                    "capability": "a" * 64,
+                    "operation": "lease.renew",
+                    "payload": {"lease_id": "lease"},
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        client._socket.recv.return_value = encoded
+
+        with self.assertRaises(MODULE.MatrixControlResponseError) as raised:
+            client.request("lease.renew", {"lease_id": "lease"})
+        self.assertEqual(raised.exception.code, "E_LEASE")
+
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_main_does_not_cleanup_with_a_revoked_lease(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "key",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "seconds": 1.0,
+                "key": "w",
+                "modifier": ["alt"],
+                "double": False,
+                "tap_gap": 0.08,
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.15)
+        client.replace.side_effect = MODULE.MatrixControlResponseError(
+            "E_LEASE",
+            "client does not own the active lease",
+        )
+
+        with self.assertRaises(MODULE.MatrixControlResponseError):
+            MODULE.main()
+
+        client.replace.assert_called_once()
+        client.release.assert_not_called()
+
+    @mock.patch.object(MODULE, "_wait_for_command_terminal")
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_rejected_command_with_revoked_authority_skips_stale_cleanup(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        wait_terminal,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "command",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "hold_seconds": 1.0,
+                "command": "/tp @s ~ ~ ~",
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        command_id = "a" * 32
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.15)
+        client.command.return_value = {"data": {"command_id": command_id}}
+        wait_terminal.return_value = (
+            {
+                "command_id": command_id,
+                "terminal": True,
+                "state": "rejected",
+                "authority_revoked": True,
+                "result": {
+                    "ok": False,
+                    "code": "E_COMMAND_REJECTED",
+                    "message": "rejected after authority revocation",
+                },
+            },
+            False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "E_COMMAND_REJECTED"):
+            MODULE.main()
+
+        client.replace.assert_not_called()
+        client.release.assert_not_called()
+
+    @mock.patch.object(MODULE, "_wait_for_command_terminal")
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_unknown_command_outcome_after_lease_loss_skips_stale_cleanup(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        wait_terminal,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "command",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "hold_seconds": 1.0,
+                "command": "/tp @s ~ ~ ~",
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        command_id = "b" * 32
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.15)
+        client.command.return_value = {"data": {"command_id": command_id}}
+        wait_terminal.side_effect = MODULE.MatrixCommandOutcomeUnknownError(
+            f"E_COMMAND_OUTCOME_UNKNOWN: no terminal receipt for {command_id}",
+            lease_available=False,
+        )
+
+        with self.assertRaises(MODULE.MatrixCommandOutcomeUnknownError):
+            MODULE.main()
+
+        client.replace.assert_not_called()
+        client.release.assert_not_called()
+
     def test_resolved_paths_prefer_game_env_and_accept_legacy_env(self) -> None:
         class Args:
             profile = "trna"
@@ -212,6 +417,72 @@ class MatrixCtlHelpersTest(unittest.TestCase):
                 sleeper=clock.sleep,
             )
         self.assertGreaterEqual(clock.now, 0.50)
+
+    def test_unknown_command_outcome_carries_revoked_lease_state(self) -> None:
+        command_id = "c" * 32
+
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        class Client:
+            def __init__(self, *, authority_revoked: bool, renew_fails: bool) -> None:
+                self.authority_revoked = authority_revoked
+                self.renew_fails = renew_fails
+
+            def command_result(self, _command_id: str) -> dict[str, object]:
+                return {
+                    "command_id": command_id,
+                    "terminal": False,
+                    "state": "admitted",
+                    "authority_revoked": self.authority_revoked,
+                }
+
+            def refresh(self, _lease_id: str) -> None:
+                if self.renew_fails:
+                    raise MODULE.MatrixControlResponseError(
+                        "E_LEASE",
+                        "client does not own the active lease",
+                    )
+
+            @staticmethod
+            def persistent_command_result(
+                _command_id: str,
+            ) -> dict[str, object] | None:
+                return None
+
+        for authority_revoked, renew_fails in ((False, True), (True, False)):
+            with self.subTest(
+                authority_revoked=authority_revoked,
+                renew_fails=renew_fails,
+            ):
+                clock = Clock()
+                with self.assertRaises(
+                    MODULE.MatrixCommandOutcomeUnknownError
+                ) as raised:
+                    MODULE._wait_for_command_terminal(
+                        Client(
+                            authority_revoked=authority_revoked,
+                            renew_fails=renew_fails,
+                        ),
+                        "lease",
+                        command_id,
+                        hold_seconds=0.02,
+                        refresh_seconds=0.01,
+                        clock=clock.read,
+                        sleeper=clock.sleep,
+                    )
+                self.assertFalse(raised.exception.lease_available)
+                if renew_fails:
+                    self.assertIsInstance(
+                        raised.exception.__cause__,
+                        MODULE.MatrixControlResponseError,
+                    )
 
 
 @unittest.skipUnless(

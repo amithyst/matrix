@@ -118,6 +118,130 @@ class MatrixWorldStateTest(unittest.TestCase):
         self.assertEqual(state.startup_pose(self.default), (safe, "last_exit"))
         self.assertEqual(MODULE.MatrixWorldState.from_mapping(state.to_mapping()), state)
 
+    def test_fallen_outlier_replaces_stale_speculative_slot_with_last_safe(self) -> None:
+        safe = MODULE.WorldPose(0.0, 0.0, 0.8, 0.0)
+        state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
+        state = state.checkpoint(
+            MODULE.WorldPose(10.0, 0.0, 0.2, 1.0),
+            upright=False,
+            now_unix_ns=2,
+        )
+        speculative_id = state.resume_checkpoints[-1].checkpoint_id
+
+        state = state.checkpoint(
+            MODULE.WorldPose(30.0, 0.0, 0.2, 1.0),
+            upright=False,
+            now_unix_ns=3,
+        )
+
+        active = state.resume_checkpoints[-1]
+        self.assertEqual(active.checkpoint_id, speculative_id)
+        self.assertEqual(active.source, "fallen_outlier_last_safe")
+        self.assertEqual(active.pose, safe)
+        self.assertEqual(state.last_exit, safe)
+        self.assertEqual(state.resume_source, "fallen_outlier_last_safe")
+        resolved = state.resolve_start(self.default)
+        self.assertEqual(resolved.pose, safe)
+        self.assertEqual(resolved.checkpoint_id, speculative_id)
+
+    def test_fall_cascade_uses_one_speculative_slot_without_evicting_safe_chain(
+        self,
+    ) -> None:
+        state = self.state
+        for index in range(MODULE.MAX_RESUME_CHECKPOINTS):
+            state = state.checkpoint(
+                MODULE.WorldPose(float(index * 2), 0.0, 0.8, 0.0),
+                upright=True,
+                now_unix_ns=index + 1,
+            )
+        original_safe_ids = {
+            checkpoint.checkpoint_id for checkpoint in state.resume_checkpoints
+        }
+        speculative_id = None
+        for index in range(40):
+            state = state.checkpoint(
+                MODULE.WorldPose(30.0 + (0.5 * index), 1.0, 0.2, 1.5),
+                upright=False,
+                now_unix_ns=100 + index,
+            )
+            current = state.resume_checkpoints[-1]
+            if speculative_id is None:
+                speculative_id = current.checkpoint_id
+            self.assertEqual(current.checkpoint_id, speculative_id)
+            self.assertEqual(
+                current.source,
+                "fallen_xy_last_safe_upright",
+            )
+
+        trusted = [
+            checkpoint
+            for checkpoint in state.resume_checkpoints
+            if checkpoint.source not in MODULE._SPECULATIVE_RESUME_SOURCES
+        ]
+        speculative = [
+            checkpoint
+            for checkpoint in state.resume_checkpoints
+            if checkpoint.source in MODULE._SPECULATIVE_RESUME_SOURCES
+        ]
+        self.assertEqual(len(state.resume_checkpoints), MODULE.MAX_RESUME_CHECKPOINTS)
+        self.assertEqual(len(trusted), MODULE.MAX_RESUME_CHECKPOINTS - 1)
+        self.assertEqual(len(speculative), 1)
+        self.assertTrue(
+            {checkpoint.checkpoint_id for checkpoint in trusted}.issubset(
+                original_safe_ids
+            )
+        )
+        self.assertEqual(state.last_safe, MODULE.WorldPose(30.0, 0.0, 0.8, 0.0))
+
+    def test_legacy_all_fallen_ring_restores_trusted_anchor_and_tombstones_old(
+        self,
+    ) -> None:
+        safe = MODULE.WorldPose(17.98, 80.62, 0.784, -1.15)
+        fallen = tuple(
+            MODULE.ResumeCheckpoint(
+                checkpoint_id=f"cp-{index:032x}",
+                pose=MODULE.WorldPose(float(index), 60.0, 0.784, -1.15),
+                source="fallen_xy_last_safe_upright",
+                created_at_unix_ns=index + 1,
+            )
+            for index in range(MODULE.MAX_RESUME_CHECKPOINTS)
+        )
+        legacy = MODULE.MatrixWorldState(
+            world_id=self.state.world_id,
+            world_revision=self.state.world_revision,
+            last_observed=fallen[-1].pose,
+            last_safe=safe,
+            last_exit=fallen[-1].pose,
+            resume_source="fallen_xy_last_safe_upright",
+            generation=99,
+            resume_checkpoints=fallen,
+            updated_at_unix_ns=100,
+        )
+
+        migrated = MODULE.MatrixWorldState.from_mapping(legacy.to_mapping())
+
+        self.assertEqual(len(migrated.resume_checkpoints), 2)
+        self.assertEqual(
+            [checkpoint.source for checkpoint in migrated.resume_checkpoints],
+            ["upright_checkpoint", "fallen_xy_last_safe_upright"],
+        )
+        self.assertEqual(migrated.resume_checkpoints[0].pose, safe)
+        self.assertEqual(migrated.resume_checkpoints[-1], fallen[-1])
+        self.assertEqual(len(migrated.invalid_checkpoints), 15)
+        self.assertEqual(migrated.generation, 99)
+
+        rejected = migrated.reject_active_checkpoint(
+            expected_id=fallen[-1].checkpoint_id,
+            expected_generation=migrated.generation,
+            reason="recovery_drift",
+            run_id="run-4663c84e",
+            now_unix_ns=101,
+        )
+        self.assertEqual(rejected.replacement_checkpoint.pose, safe)
+        self.assertEqual(rejected.state.last_safe, safe)
+        self.assertEqual(rejected.state.last_exit, safe)
+        self.assertEqual(rejected.state.resolve_start().pose, safe)
+
     def test_startup_rejects_legacy_exit_outlier_from_last_safe(self) -> None:
         safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
         outlier = MODULE.WorldPose(4_000.0, -3_000.0, 0.81, 0.6)

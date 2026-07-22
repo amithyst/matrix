@@ -1054,14 +1054,11 @@ class GameControlCore:
         )
         moving = output_speed > 0.0
         turning_to_heading = input_magnitude > 1e-12 and not moving
-        if turning_to_heading:
-            # Keep turn-before-translation semantics while selecting SONIC's
-            # locomotion manifold immediately.  A stationary SLOW_WALK request
-            # lets the native planner rotate toward ``facing`` without first
-            # driving the post-recovery IDLE policy into a saturated waist
-            # pose.  Translation remains exactly zero until both command and
-            # measured heading pass the existing alignment gate.
-            locomotion_mode = SONIC_SLOW_WALK_MODE
+        # SONIC's own controller sends IDLE whenever translational stick input
+        # is inside the deadzone, while continuing to update ``facing`` from
+        # the look stick.  Keep turn-before-translation on that native
+        # contract: SLOW_WALK has a non-zero 0.10 m/s floor and must never be
+        # paired with zero speed/movement.
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=direction if moving else (0.0, 0.0, 0.0),

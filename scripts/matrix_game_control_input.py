@@ -5169,7 +5169,6 @@ def main() -> int:
                     external_telemetry["command_queue_depth"],
                     external_telemetry["deadman_stops"],
                     external_telemetry["local_overrides"],
-                    external_telemetry["input_replacements"],
                     external_telemetry["commands_queued"],
                     external_telemetry["last_override_reason"],
                 )

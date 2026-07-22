@@ -78,6 +78,12 @@ _RESUME_SOURCE_VALUES = frozenset(
         "home",
     }
 )
+_SPECULATIVE_RESUME_SOURCES = frozenset(
+    {
+        "fallen_xy_last_safe_upright",
+        "fallen_outlier_last_safe",
+    }
+)
 
 
 class WorldStateError(ValueError):
@@ -656,7 +662,130 @@ class MatrixWorldState:
                     created_at_unix_ns=state.updated_at_unix_ns,
                 )
                 state = replace(state, resume_checkpoints=(checkpoint,))
-        return state
+        return state._normalize_speculative_checkpoint_ring()
+
+    def _normalize_speculative_checkpoint_ring(self) -> "MatrixWorldState":
+        """Migrate legacy fall cascades into one quarantinable candidate.
+
+        Older v2 writers appended a new synthesized upright pose while SONIC's
+        session-sticky fall flag remained set.  A long recovery could therefore
+        evict all sixteen trusted checkpoints.  Retain only the newest fallen
+        candidate, restore a deterministic trusted anchor from ``last_safe``
+        when needed, and tombstone the superseded speculative entries.
+        """
+
+        trusted = [
+            checkpoint
+            for checkpoint in self.resume_checkpoints
+            if checkpoint.source not in _SPECULATIVE_RESUME_SOURCES
+        ]
+        speculative = [
+            checkpoint
+            for checkpoint in self.resume_checkpoints
+            if checkpoint.source in _SPECULATIVE_RESUME_SOURCES
+        ]
+        newest_speculative = speculative[-1] if speculative else None
+        if not trusted and self.last_safe is not None:
+            used_ids = {
+                checkpoint.checkpoint_id for checkpoint in self.resume_checkpoints
+            } | {
+                checkpoint.checkpoint_id for checkpoint in self.invalid_checkpoints
+            }
+            candidate = _legacy_checkpoint_id(
+                world_id=self.world_id,
+                world_revision=self.world_revision,
+                pose=self.last_safe,
+                source="upright_checkpoint",
+                updated_at_unix_ns=self.updated_at_unix_ns,
+            )
+            if candidate in used_ids:
+                for nonce in range(1, 17):
+                    digest = hashlib.sha256(
+                        f"{candidate}:{nonce}".encode("ascii")
+                    ).hexdigest()
+                    candidate = f"cp-{digest[:32]}"
+                    if candidate not in used_ids:
+                        break
+                else:
+                    raise WorldStateError(
+                        "cannot allocate migrated trusted checkpoint ID"
+                    )
+            trusted.append(
+                ResumeCheckpoint(
+                    checkpoint_id=candidate,
+                    pose=self.last_safe,
+                    source="upright_checkpoint",
+                    created_at_unix_ns=self.updated_at_unix_ns,
+                )
+            )
+        if newest_speculative is not None and not trusted:
+            # A fallen-derived pose without a trusted upright anchor cannot be
+            # reconstructed safely.  Preserve it only as audit evidence.
+            newest_speculative = None
+
+        capacity = MAX_RESUME_CHECKPOINTS - (
+            1 if newest_speculative is not None else 0
+        )
+        normalized = tuple(trusted[-capacity:])
+        if newest_speculative is not None:
+            normalized = (*normalized, newest_speculative)
+
+        superseded = [
+            checkpoint
+            for checkpoint in speculative
+            if newest_speculative is None
+            or checkpoint.checkpoint_id != newest_speculative.checkpoint_id
+        ]
+        invalid = self.invalid_checkpoints
+        if superseded:
+            invalid = (
+                *invalid,
+                *(
+                    InvalidCheckpoint(
+                        checkpoint=checkpoint,
+                        invalidated_at_unix_ns=self.updated_at_unix_ns,
+                        reason="speculative_checkpoint_superseded",
+                        run_id="world-state-load-migration",
+                    )
+                    for checkpoint in superseded
+                ),
+            )[-MAX_INVALID_CHECKPOINTS:]
+
+        if (
+            normalized == self.resume_checkpoints
+            and invalid == self.invalid_checkpoints
+        ):
+            return self
+        active = normalized[-1] if normalized else None
+        trusted_active = next(
+            (
+                checkpoint
+                for checkpoint in reversed(normalized)
+                if checkpoint.source not in _SPECULATIVE_RESUME_SOURCES
+            ),
+            None,
+        )
+        last_safe = (
+            self.last_safe
+            if self.last_safe is not None
+            else trusted_active.pose
+            if trusted_active is not None
+            else None
+        )
+        return replace(
+            self,
+            last_safe=last_safe,
+            last_exit=active.pose if active is not None else last_safe,
+            resume_source=(
+                active.source
+                if active is not None and active.source in _RESUME_SOURCE_VALUES
+                else "upright_checkpoint"
+                if active is not None
+                else None
+            ),
+            resume_checkpoints=normalized,
+            invalid_checkpoints=invalid,
+        )
 
     def _next_generation(self) -> int:
         return self.generation + 1
@@ -669,7 +798,53 @@ class MatrixWorldState:
         timestamp: int,
         force_new: bool,
     ) -> tuple[ResumeCheckpoint, ...]:
-        checkpoints = self.resume_checkpoints
+        speculative = tuple(
+            checkpoint
+            for checkpoint in self.resume_checkpoints
+            if checkpoint.source in _SPECULATIVE_RESUME_SOURCES
+        )
+        trusted = tuple(
+            checkpoint
+            for checkpoint in self.resume_checkpoints
+            if checkpoint.source not in _SPECULATIVE_RESUME_SOURCES
+        )
+        if source in _SPECULATIVE_RESUME_SOURCES:
+            if speculative:
+                candidate = replace(
+                    speculative[-1],
+                    pose=pose,
+                    source=source,
+                    created_at_unix_ns=timestamp,
+                )
+            else:
+                used_ids = {
+                    checkpoint.checkpoint_id
+                    for checkpoint in self.resume_checkpoints
+                } | {
+                    checkpoint.checkpoint_id
+                    for checkpoint in self.invalid_checkpoints
+                }
+                checkpoint_id = ""
+                for _attempt in range(16):
+                    proposed = f"cp-{uuid.uuid4().hex}"
+                    if proposed not in used_ids:
+                        checkpoint_id = proposed
+                        break
+                if not checkpoint_id:
+                    raise WorldStateError(
+                        "cannot allocate a unique speculative checkpoint ID"
+                    )
+                candidate = ResumeCheckpoint(
+                    checkpoint_id=checkpoint_id,
+                    pose=pose,
+                    source=source,
+                    created_at_unix_ns=timestamp,
+                )
+            return (*trusted[-(MAX_RESUME_CHECKPOINTS - 1):], candidate)
+
+        # A newly verified upright/teleport point supersedes the prior fallen
+        # candidate.  The full trusted quota becomes available again.
+        checkpoints = trusted
         if checkpoints and not force_new:
             latest = checkpoints[-1]
             if (
@@ -1000,8 +1175,13 @@ class MatrixWorldState:
         checkpoints = self.resume_checkpoints[:-1]
         invalid = (*self.invalid_checkpoints, tombstone)[-MAX_INVALID_CHECKPOINTS:]
         replacement_checkpoint = checkpoints[-1] if checkpoints else None
+        rejected_speculative = rejected.source in _SPECULATIVE_RESUME_SOURCES
         replacement_pose = (
-            replacement_checkpoint.pose if replacement_checkpoint is not None else None
+            replacement_checkpoint.pose
+            if replacement_checkpoint is not None
+            else self.last_safe
+            if rejected_speculative
+            else None
         )
         checkpoint_source = (
             replacement_checkpoint.source
@@ -1016,7 +1196,7 @@ class MatrixWorldState:
         state = replace(
             self,
             last_observed=replacement_pose,
-            last_safe=replacement_pose,
+            last_safe=(self.last_safe if rejected_speculative else replacement_pose),
             last_exit=replacement_pose,
             resume_source=replacement_source,
             generation=self._next_generation(),
