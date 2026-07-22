@@ -80,6 +80,7 @@ To keep this README concise, detailed guides have been organized into the `docs/
 - [🌍 Custom Scene Guide](docs/Custom_Scene_Tutorial.md) - Building custom JSON-based environments
 - [🐕 Custom Robot Tutorial](docs/Custom_Robot_Tutorial.md) - Importing your own MuJoCo URDF models
 - [Matrix Overworld Adjacent V1](docs/OVERWORLD_ADJACENT_V1_CN.md) - Six-scene SONIC physics composition and its explicit UE visual gate
+- [Matrix MoonWorld Box V1](docs/MOON_V1_CN.md) - Official MoonWorld cooked map launcher, locked assets, and screenshot/video acceptance
 - [Matrix SONIC Video Capture](docs/MATRIX_VIDEO_CAPTURE_CN.md) - Native-resolution main-launcher recording with provenance and quality gates
 - [Matrix Urban V1](docs/URBAN_V1_CN.md) - Native Town10 city baseline and URDF-preserved G1 materials
 - [Matrix + SONIC Multi-Host Runbook](docs/runbook.md) - Git sync, locked artifacts, bootstrap, and host profiles

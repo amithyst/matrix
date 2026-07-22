@@ -118,6 +118,45 @@ def _remove_named_geoms(
     return tuple(name for name in remove_geoms if name in removed)
 
 
+def freejoint_body_names(root: ET.Element) -> tuple[str, ...]:
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise SceneCompositionError("native scene has no worldbody")
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for body in worldbody.iter("body"):
+        has_freejoint = any(
+            child.tag == "freejoint"
+            or (child.tag == "joint" and child.get("type") == "free")
+            for child in list(body)
+        )
+        if not has_freejoint:
+            continue
+        name = body.get("name")
+        if not name:
+            raise SceneCompositionError("freejoint body must have a name")
+        if name in seen:
+            raise SceneCompositionError(f"duplicate freejoint body name: {name}")
+        seen.add(name)
+        names.append(name)
+    return tuple(names)
+
+
+def _staticize_freejoint_bodies(root: ET.Element) -> tuple[str, ...]:
+    names = freejoint_body_names(root)
+    if not names:
+        return ()
+
+    for body in root.find("worldbody").iter("body"):  # type: ignore[union-attr]
+        for child in list(body):
+            if child.tag == "freejoint" or (
+                child.tag == "joint" and child.get("type") == "free"
+            ):
+                body.remove(child)
+    return names
+
+
 def compose_custom_scene(
     source_scene: Path,
     output_scene: Path,
@@ -126,6 +165,7 @@ def compose_custom_scene(
     source_asset_root: Path | None = None,
     target_asset_root: Path | None = None,
     remove_geoms: tuple[str, ...] = (),
+    staticize_freejoint_bodies: bool = False,
 ) -> list[Path]:
     source_scene = source_scene.resolve()
     output_scene = output_scene.resolve()
@@ -152,11 +192,23 @@ def compose_custom_scene(
             f"native scene must have exactly one top-level robot include, got {len(includes)}"
         )
     includes[0].set("file", robot_include)
+    staticized = (
+        _staticize_freejoint_bodies(root) if staticize_freejoint_bodies else ()
+    )
     removed = _remove_named_geoms(root, remove_geoms=remove_geoms)
     if removed:
         root.insert(
             0,
             ET.Comment(f" removed environment geoms: {','.join(removed)} "),
+        )
+    if staticized:
+        root.insert(
+            0,
+            ET.Comment(
+                " staticized freejoint bodies: "
+                f"{len(staticized)} ({','.join(staticized[:8])}"
+                f"{'...' if len(staticized) > 8 else ''}) "
+            ),
         )
     root.set("model", f"custom::{source_scene.stem}")
     root.insert(
@@ -206,6 +258,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--source-asset-root", type=Path)
     parser.add_argument("--target-asset-root", type=Path)
     parser.add_argument("--remove-geom", action="append", default=[])
+    parser.add_argument("--staticize-freejoint-bodies", action="store_true")
     return parser.parse_args()
 
 
@@ -219,6 +272,7 @@ def main() -> int:
             source_asset_root=args.source_asset_root,
             target_asset_root=args.target_asset_root,
             remove_geoms=tuple(args.remove_geom),
+            staticize_freejoint_bodies=args.staticize_freejoint_bodies,
         )
     except SceneCompositionError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc

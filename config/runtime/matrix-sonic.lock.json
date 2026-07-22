@@ -32,6 +32,12 @@
         "file": "Town10World-0.1.2.tar.gz",
         "size": 1159597956,
         "sha256": "246cc4f96571022f19f7e5cf35aa2788c3c8420a2bf2535b56a6aa2e33a05801"
+      },
+      {
+        "name": "MoonWorld",
+        "file": "MoonWorld-0.1.2.tar.gz",
+        "size": 633678813,
+        "sha256": "c4e3dee47ffa434712b0238d08b0b68067f1b1c9820e2ddb455f996f04e364b1"
       }
     ],
     "installed_files": [
@@ -86,6 +92,11 @@
         "sha256": "17a2370eacfaefd4fe682a040d8543c4a34c46c0d1aa81652704af469486e494"
       },
       {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_moon_dynamic.xml",
+        "size": 61584,
+        "sha256": "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
+      },
+      {
         "path": "src/robot_mujoco/zsibot_robots/xgb/height_field.png",
         "size": 4865,
         "sha256": "996b940ec9fcbe5551d436f76040f6b3690e90fb056ff8f2ba8c650c91f39e10"
@@ -94,6 +105,11 @@
         "path": "src/robot_mujoco/zsibot_robots/xgb/unitree_hfield.png",
         "size": 14273,
         "sha256": "8a3f9777e096c5e8b6a5f8b2ca9382d5b25e2cacc15be7b5ac41f1e432e61a6c"
+      },
+      {
+        "path": "dynamicmaps/moonworld.bin",
+        "size": 144000000,
+        "sha256": "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
       }
     ],
     "installed_trees": [
@@ -103,7 +119,7 @@
       },
       {
         "path": "src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks",
-        "sha256": "cacda21aee5cccc24dd940d1220be5ab804daa1971c391c03ce813ffc26b920c"
+        "sha256": "504d56c3e971d116949ffbcb9fb0dad668b62ed12939f5bb00654175706b9063"
       },
       {
         "path": "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",

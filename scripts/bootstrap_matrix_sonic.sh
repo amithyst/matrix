@@ -400,6 +400,11 @@ import sys
 lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 release = lock["matrix_release"]
 packages = {item["name"]: dict(item) for item in release["packages"]}
+map_packages = [
+    item
+    for item in release["packages"]
+    if item["name"] not in {"assets", "base", "shared"}
+]
 
 def package(name: str, *, required: bool) -> dict[str, object]:
     item = packages[name]
@@ -421,9 +426,13 @@ payload = {
         },
         "maps": [
             {
-                "name": "Town10World",
-                **package("Town10World", required=False),
+                "name": item["name"],
+                "file": item["file"],
+                "required": False,
+                "size": item["size"],
+                "sha256": item["sha256"],
             }
+            for item in map_packages
         ],
     },
 }
@@ -435,7 +444,20 @@ PY
     fi
 
     if [[ "$SKIP_ASSETS" != "1" ]]; then
-        INSTALL_ENV=(MATRIX_MAPS=Town10World MATRIX_ASSUME_YES=1)
+        LOCKED_MATRIX_MAPS="$(python3 - "$LOCK_FILE" <<'PY'
+import json
+import sys
+
+release = json.load(open(sys.argv[1], encoding="utf-8"))["matrix_release"]
+maps = [
+    item["name"]
+    for item in release["packages"]
+    if item["name"] not in {"assets", "base", "shared"}
+]
+print(" ".join(maps))
+PY
+        )"
+        INSTALL_ENV=(MATRIX_MAPS="$LOCKED_MATRIX_MAPS" MATRIX_ASSUME_YES=1)
         if [[ -n "$RELEASE_CACHE" ]]; then
             INSTALL_ENV+=(MATRIX_OFFLINE=1)
         fi

@@ -88,6 +88,55 @@ class ComposeCustomSceneTest(unittest.TestCase):
                     remove_geoms=("perimeter", "perimeter"),
                 )
 
+    def test_staticizes_freejoint_bodies_without_removing_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            native = root / "xgb"
+            native.mkdir()
+            source = native / "scene.xml"
+            source.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<body name="dynamic_tile" pos="1 2 0">
+  <joint name="tile_free" type="free" />
+  <geom name="tile_collision" type="box" size="1 1 0.1" />
+</body>
+<body name="legacy_tile" pos="3 4 0">
+  <freejoint name="legacy_free" />
+  <geom name="legacy_collision" type="box" size="1 1 0.1" />
+</body>
+<body name="hinged_prop">
+  <joint name="hinge" type="hinge" />
+  <geom name="hinged_collision" type="box" size="1 1 1" />
+</body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+            output = root / "custom" / "scene.xml"
+
+            MODULE.compose_custom_scene(
+                source,
+                output,
+                staticize_freejoint_bodies=True,
+            )
+
+            scene = ET.parse(output).getroot()
+            self.assertEqual(
+                [body.get("name") for body in scene.iter("body")],
+                ["dynamic_tile", "legacy_tile", "hinged_prop"],
+            )
+            self.assertEqual(
+                [geom.get("name") for geom in scene.iter("geom")],
+                ["tile_collision", "legacy_collision", "hinged_collision"],
+            )
+            self.assertEqual(
+                [(joint.get("name"), joint.get("type")) for joint in scene.iter("joint")],
+                [("hinge", "hinge")],
+            )
+            self.assertEqual(
+                MODULE.freejoint_body_names(ET.parse(source).getroot()),
+                ("dynamic_tile", "legacy_tile"),
+            )
+
     def test_rejects_asset_collision_with_custom_robot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

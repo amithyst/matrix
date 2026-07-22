@@ -1073,6 +1073,7 @@ def _validate_qualified_model(
             "pipeline_version",
             "scene_transform",
             "removed_environment_geoms",
+            "staticized_freejoint_bodies",
         ):
             if manifest.get(field) != expected_manifest.get(field):
                 raise SystemExit(

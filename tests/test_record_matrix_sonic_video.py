@@ -61,6 +61,20 @@ def window() -> object:
     )
 
 
+def odd_height_window() -> object:
+    return MODULE.WindowInfo(
+        id_hex="0x380002e",
+        id_decimal=int("0x380002e", 16),
+        title="zsibot_mujoco_ue (64-bit Development SF_VULKAN_SM6) ",
+        instance="zsibot_mujoco_ue",
+        class_name="zsibot_mujoco_ue",
+        x=0,
+        y=71,
+        width=1920,
+        height=1009,
+    )
+
+
 class MatrixSonicVideoTest(unittest.TestCase):
     def test_parses_exact_matrix_window(self) -> None:
         matches = MODULE.parse_window_tree(
@@ -97,6 +111,23 @@ class MatrixSonicVideoTest(unittest.TestCase):
         self.assertNotIn("-vf", command)
         self.assertFalse(any("scale=" in value for value in command))
 
+    def test_capture_command_crops_odd_window_dimensions_for_yuv420p(self) -> None:
+        command = MODULE.build_capture_command(
+            Path("/opt/ffmpeg"),
+            Path("/tmp/video.mp4"),
+            window=odd_height_window(),
+            display=":1",
+            duration_s=12.0,
+            fps=30.0,
+            draw_mouse=False,
+            encoder_args=["-c:v", "libx264", "-crf", "20"],
+        )
+        self.assertEqual(
+            command[command.index("-vf") + 1],
+            "crop=1920:1008:0:0",
+        )
+        self.assertFalse(any("scale=" in value for value in command))
+
     def test_parses_ffmpeg_video_and_progress(self) -> None:
         parsed = MODULE.parse_ffmpeg_probe(
             FFMPEG_PROBE, "frame=1\nprogress=continue\nframe=120\nprogress=end\n"
@@ -107,6 +138,52 @@ class MatrixSonicVideoTest(unittest.TestCase):
         self.assertEqual(parsed["fps"], 30.0)
         self.assertEqual(parsed["duration_s"], 4.0)
         self.assertEqual(parsed["decoded_frames"], 120)
+
+    def test_signalstats_uses_middle_frame_not_startup_black_frame(self) -> None:
+        self.assertEqual(MODULE.signalstats_sample_offset_s(12.0), 6.0)
+        self.assertEqual(MODULE.signalstats_sample_offset_s(0.08), 0.03)
+        self.assertEqual(MODULE.signalstats_sample_offset_s(float("inf")), 0.0)
+
+    def test_inspect_video_seeks_before_input_for_signalstats_sample(self) -> None:
+        video = Path("/tmp/capture.mp4")
+
+        def fake_run(command: object, **_: object) -> subprocess.CompletedProcess[str]:
+            values = [str(value) for value in command]
+            if "-progress" in values:
+                return subprocess.CompletedProcess(
+                    values,
+                    0,
+                    "frame=120\nprogress=end\n",
+                    FFMPEG_PROBE,
+                )
+            if "signalstats,metadata=print" in values:
+                self.assertLess(values.index("-ss"), values.index("-i"))
+                self.assertEqual(values[values.index("-ss") + 1], "2")
+                return subprocess.CompletedProcess(
+                    values,
+                    0,
+                    "",
+                    "\n".join(
+                        [
+                            "lavfi.signalstats.YMIN=18",
+                            "lavfi.signalstats.YAVG=89.5",
+                            "lavfi.signalstats.YMAX=228",
+                            "lavfi.signalstats.SATAVG=0.8",
+                        ]
+                    ),
+                )
+            return subprocess.CompletedProcess(
+                values,
+                0,
+                "0,0,0,0,0,abc\n0,0,0,0,0,def\n",
+                "",
+            )
+
+        with mock.patch.object(MODULE, "_run_text", side_effect=fake_run):
+            probe = MODULE.inspect_video(Path("/opt/ffmpeg"), video, sample_fps=5.0)
+
+        self.assertEqual(probe.y_avg, 89.5)
+        self.assertEqual(probe.unique_sample_hashes, 2)
 
     def test_accepts_native_dynamic_video(self) -> None:
         probe = MODULE.VideoProbe(
@@ -136,6 +213,35 @@ class MatrixSonicVideoTest(unittest.TestCase):
         self.assertTrue(quality["passed"])
         self.assertEqual(quality["failures"], [])
         self.assertEqual(quality["decoded_frame_ratio"], 1.0)
+
+    def test_accepts_even_crop_from_odd_window(self) -> None:
+        probe = MODULE.VideoProbe(
+            codec="h264",
+            pixel_format="yuv420p",
+            width=1920,
+            height=1008,
+            fps=30.0,
+            duration_s=12.0,
+            decoded_frames=360,
+            y_min=18.0,
+            y_avg=132.0,
+            y_max=230.0,
+            saturation_avg=9.0,
+            sampled_frames=60,
+            unique_sample_hashes=60,
+        )
+        quality = MODULE.evaluate_video_quality(
+            probe,
+            requested_duration_s=12.0,
+            requested_fps=30.0,
+            window=odd_height_window(),
+            file_size=1_000_000,
+            allow_static=False,
+            allow_short=False,
+        )
+        self.assertTrue(quality["passed"])
+        self.assertFalse(quality["resolution_matches_window"])
+        self.assertTrue(quality["resolution_matches_capture"])
 
     def test_rejects_compounded_duration_and_fps_frame_loss(self) -> None:
         probe = MODULE.VideoProbe(
