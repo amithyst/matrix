@@ -20,6 +20,7 @@ SCRIPTS = REPO_ROOT / "scripts"
 if os.fspath(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, os.fspath(SCRIPTS))
 CORE = importlib.import_module("matrix_game_control")
+EXTERNAL = importlib.import_module("matrix_external_control")
 MC_COMMANDS = importlib.import_module("matrix_mc_commands")
 MOTION_SETTINGS = importlib.import_module("matrix_motion_settings")
 RESTART = importlib.import_module("matrix_restart_request")
@@ -641,6 +642,7 @@ class GameCommandClientTest(unittest.TestCase):
     def test_external_data_modify_stays_provider_side_without_panel(self) -> None:
         client, runtime = self.make_client()
         modified = []
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
 
         self.assertTrue(
             client.submit_external(
@@ -648,17 +650,150 @@ class GameCommandClientTest(unittest.TestCase):
                 calibration_active=False,
                 neutral_frame_ready=False,
                 restart_requested=False,
-                input_modifier=lambda command: modified.append(command) or {"ok": True},
+                input_modifier=lambda command: (
+                    modified.append(command) or token,
+                    {"ok": True},
+                ),
             )
         )
         self.assertEqual(
             modified,
             [MC_COMMANDS.DataModifyInput("control.input.keyboard.w", True)],
         )
-        self.assertEqual(client.code, "OK_DATA_INPUT_MODIFIED")
+        self.assertTrue(client.in_flight)
+        self.assertEqual(client.status, "pending")
+        self.assertIsNone(client.code)
         self.assertEqual(client.data, {"ok": True})
+        stale = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        self.assertFalse(
+            client.resolve_external_input_publish(
+                sampled_token=stale,
+                current_token=token,
+                authority_active=True,
+                published=True,
+                locomotion_admitted=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertTrue(client.in_flight)
+        self.assertTrue(
+            client.resolve_external_input_publish(
+                sampled_token=token,
+                current_token=token,
+                authority_active=True,
+                published=True,
+                locomotion_admitted=True,
+                interlock_reason=None,
+                data={"published": True},
+            )
+        )
+        self.assertFalse(client.in_flight)
+        self.assertEqual(client.code, "OK_DATA_INPUT_MODIFIED")
+        self.assertEqual(client.data, {"published": True})
         with self.assertRaises(BlockingIOError):
             runtime.recv(4096)
+
+    def test_external_input_publish_failures_are_typed_and_terminal(self) -> None:
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
+        cases = {
+            "input_source_rejects_keyboard": (True, "E_INPUT_INTERLOCK"),
+            "physical_focus_lost": (True, "E_INPUT_INTERLOCK"),
+            "camera_unavailable": (True, "E_INPUT_INTERLOCK"),
+            "calibration_interlock": (True, "E_INPUT_INTERLOCK"),
+            "gamepad_connected_edge": (True, "E_INPUT_INTERLOCK"),
+            None: (False, "E_INPUT_PUBLISH_FAILED"),
+        }
+        for reason, (published, expected_code) in cases.items():
+            with self.subTest(reason=reason):
+                client, _runtime = self.make_client()
+                self.assertTrue(
+                    client.submit_external(
+                        "/data modify entity @s "
+                        "control.input.keyboard.w set value true",
+                        calibration_active=False,
+                        neutral_frame_ready=False,
+                        restart_requested=False,
+                        input_modifier=lambda _command: (token, None),
+                    )
+                )
+                self.assertTrue(
+                    client.resolve_external_input_publish(
+                        sampled_token=token,
+                        current_token=token,
+                        authority_active=True,
+                        published=published,
+                        locomotion_admitted=True,
+                        interlock_reason=reason,
+                    )
+                )
+                self.assertFalse(client.in_flight)
+                self.assertFalse(client.ok)
+                self.assertEqual(client.code, expected_code)
+                if reason is not None:
+                    self.assertIn(reason, client.message)
+
+    def test_external_input_publish_supersede_revoke_and_shutdown(self) -> None:
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
+        successor = EXTERNAL.ExternalInputToken("a" * 32, 1, 3)
+
+        client, _runtime = self.make_client()
+        self.assertTrue(
+            client.submit_external(
+                "/data modify entity @s control.input.keyboard.w set value true",
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=lambda _command: (token, None),
+            )
+        )
+        self.assertTrue(
+            client.resolve_external_input_publish(
+                sampled_token=token,
+                current_token=successor,
+                authority_active=True,
+                published=True,
+                locomotion_admitted=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertEqual(client.code, "E_INPUT_SUPERSEDED")
+
+        client, _runtime = self.make_client()
+        self.assertTrue(
+            client.submit_external(
+                "/data modify entity @s control.input.keyboard.w set value true",
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=lambda _command: (token, None),
+            )
+        )
+        self.assertTrue(
+            client.resolve_external_input_publish(
+                sampled_token=None,
+                current_token=None,
+                authority_active=False,
+                published=False,
+                locomotion_admitted=False,
+                interlock_reason=None,
+            )
+        )
+        self.assertEqual(client.code, "E_AUTHORITY_REVOKED")
+
+        client, _runtime = self.make_client()
+        self.assertTrue(
+            client.submit_external(
+                "/data modify entity @s control.input.keyboard.w set value true",
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=lambda _command: (token, None),
+            )
+        )
+        client.close()
+        self.assertFalse(client.in_flight)
+        self.assertTrue(client.outcome_unknown)
+        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
 
     def test_external_world_command_keeps_pause_gate_but_skips_editor_gate(self) -> None:
         client, runtime = self.make_client()
@@ -1297,9 +1432,10 @@ class ExternalControlArbitrationTest(unittest.TestCase):
         self.assertEqual((keyboard.focus_title, keyboard.focus_pid), ("Matrix", 42))
         self.assertTrue(gamepad.connected)
         self.assertEqual(gamepad.right, -0.25)
+        self.assertEqual(MODULE.external_active_input_device(state), "mixed")
         self.assertEqual(
             MODULE.external_frame_input_source(state, configured_source="auto"),
-            "keyboard",
+            "auto",
         )
 
     def test_virtual_gamepad_is_selected_only_when_keyboard_mouse_are_neutral(self) -> None:
@@ -1404,6 +1540,1246 @@ class ExternalControlArbitrationTest(unittest.TestCase):
                     look_yaw=0.10,
                 ),
             )
+        )
+
+
+class ExternalProviderGateTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.clock_value = 10.0
+
+        def clock() -> float:
+            return self.clock_value
+
+        self.broker = EXTERNAL.ExternalControlBroker(
+            root / "control.sock",
+            root / "control.cap",
+            clock=clock,
+        )
+        self.broker.open()
+        self.client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.client.settimeout(1.0)
+        self.client.connect(os.fspath(self.broker.path))
+        self.broker.poll()
+        self.request_sequence = 0
+        self.provider_sequence = 100
+        acquired = self.request("lease.acquire", {})
+        self.lease_id = acquired["data"]["lease_id"]
+        self.gate = MODULE.ExternalLocomotionProviderGate(self.broker)
+
+    def tearDown(self) -> None:
+        self.client.close()
+        self.broker.close()
+        self.temporary.cleanup()
+
+    def request(
+        self,
+        operation: str,
+        payload: dict[str, object],
+        *,
+        expect_ok: bool = True,
+    ) -> dict[str, object]:
+        self.request_sequence += 1
+        packet = {
+            "protocol": EXTERNAL.PROTOCOL,
+            "kind": "request",
+            "sequence": self.request_sequence,
+            "capability": self.broker.capability,
+            "operation": operation,
+            "payload": payload,
+        }
+        self.client.send(json.dumps(packet, separators=(",", ":")).encode())
+        self.broker.poll()
+        response = json.loads(self.client.recv(EXTERNAL.MAX_PACKET_BYTES))
+        if expect_ok:
+            self.assertTrue(response["ok"], response)
+        return response
+
+    def replace_neutral(
+        self,
+        *,
+        connected: bool = False,
+    ) -> EXTERNAL.ExternalInputToken:
+        mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
+        mapping["gamepad"]["connected"] = connected
+        response = self.request(
+            "input.replace",
+            {"lease_id": self.lease_id, "state": mapping},
+        )
+        return EXTERNAL.ExternalInputToken.from_mapping(
+            response["data"]["input_token"]
+        )
+
+    def observe(
+        self,
+        *,
+        published: bool = True,
+        interlock_reason: str | None = None,
+    ) -> bool:
+        state, token = self.broker.sample_with_token()
+        effective, frame = self.gate.prepare(state, token)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.provider_sequence += 1
+        updated = self.gate.observe_published(
+            frame,
+            sequence=self.provider_sequence,
+            published=published,
+            interlock_reason=interlock_reason,
+        )
+        self.last_effective_state = effective
+        return updated
+
+    def qualify(self) -> EXTERNAL.ExternalInputToken:
+        self.assertTrue(self.observe())
+        self.assertTrue(self.observe())
+        token = self.broker.input_token
+        self.assertIsNotNone(token)
+        self.assertTrue(self.broker.provider_gate.ready)
+        assert token is not None
+        return token
+
+    def snapshot_for_external_state(
+        self,
+        state: EXTERNAL.ExternalInputState,
+        *,
+        sequence: int,
+    ) -> CORE.InputSnapshot:
+        keyboard, gamepad = MODULE.external_input_samples(
+            state,
+            focus=MODULE.KeyboardMouseSample(
+                focused=True,
+                focus_title="Matrix",
+                focus_pid=42,
+            ),
+            look_button="left",
+        )
+        return MODULE.build_snapshot(
+            sequence=sequence,
+            timestamp_monotonic_s=self.clock_value,
+            keyboard=keyboard,
+            gamepad=gamepad,
+            input_source=MODULE.external_frame_input_source(
+                state,
+                configured_source="auto",
+            ),
+            camera_yaw_rad=0.0,
+            camera_available=True,
+        )
+
+    def exercise_source_interlocked_publish(
+        self,
+        mapping: dict[str, object],
+        *,
+        configured_source: str,
+        command: str,
+    ) -> dict[str, object]:
+        state = EXTERNAL.ExternalInputState.from_mapping(mapping)
+        current_token = self.broker.input_token
+        self.assertIsNotNone(current_token)
+        effective, frame = self.gate.prepare(state, current_token)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        gated, early_reason = MODULE.apply_external_source_gate(
+            effective,
+            frame,
+            configured_source=configured_source,
+        )
+        self.assertIsNotNone(early_reason)
+        self.assertEqual(gated, EXTERNAL.ExternalInputState.neutral())
+
+        keyboard, gamepad = MODULE.external_input_samples(
+            gated,
+            focus=MODULE.KeyboardMouseSample(
+                focused=True,
+                focus_title="Matrix",
+                focus_pid=42,
+            ),
+            look_button="left",
+        )
+        initial_yaw = 0.625
+        tracker = MODULE.CameraYawTracker(
+            initial_yaw,
+            mouse_radians_per_pixel=0.1,
+            gamepad_radians_per_second=2.0,
+        )
+        heading = tracker.update(
+            dt=0.5,
+            mouse_dx=keyboard.mouse_dx,
+            gamepad_look_yaw=gamepad.look_yaw,
+        )
+        self.assertEqual(heading, initial_yaw)
+        snapshot = MODULE.build_snapshot(
+            sequence=self.provider_sequence + 1,
+            timestamp_monotonic_s=self.clock_value,
+            keyboard=keyboard,
+            gamepad=gamepad,
+            input_source=MODULE.external_frame_input_source(
+                gated,
+                configured_source=configured_source,
+            ),
+            camera_yaw_rad=heading,
+            camera_available=True,
+        )
+        final_reason = MODULE.external_provider_publish_interlock_reason(
+            frame,
+            configured_source=configured_source,
+            physical_focused=True,
+            camera_dragging=False,
+            camera_available=True,
+            input_available=True,
+            gamepad_connected_edge=False,
+            calibration_interlock_active=False,
+        )
+        self.assertEqual(final_reason, early_reason)
+        publish_snapshot = MODULE.apply_external_publish_interlock(
+            snapshot,
+            frame,
+            final_reason,
+        )
+
+        socket_path = Path(self.temporary.name) / "interlocked-publish.sock"
+        with CORE.UnixSeqpacketInputServer(socket_path) as server:
+            publisher = MODULE.UnixSeqpacketPublisher(socket_path)
+            try:
+                self.assertTrue(
+                    publisher.send(publish_snapshot, now=self.clock_value)
+                )
+                with server.accept(timeout_s=1.0) as connection:
+                    received = connection.receive(timeout_s=1.0)
+            finally:
+                publisher.close()
+        self.assertFalse(received.focused)
+        self.assertFalse(any(received.keys.to_mapping().values()))
+        self.assertEqual(
+            (received.move_stick.right, received.move_stick.forward),
+            (0.0, 0.0),
+        )
+        self.assertEqual(received.camera_yaw_rad, initial_yaw)
+
+        command_client = MODULE.GameCommandClient(None)
+        self.addCleanup(command_client.close)
+        self.assertTrue(
+            command_client.submit_external(
+                command,
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=lambda _command: (frame.token, None),
+            )
+        )
+        self.assertTrue(
+            command_client.resolve_external_input_publish(
+                sampled_token=frame.token,
+                current_token=frame.token,
+                authority_active=True,
+                published=True,
+                locomotion_admitted=frame.locomotion_admitted,
+                interlock_reason=final_reason,
+            )
+        )
+        self.assertFalse(command_client.ok)
+        self.assertEqual(command_client.code, "E_INPUT_INTERLOCK")
+        return {
+            "state": state,
+            "effective": effective,
+            "frame": frame,
+            "keyboard": keyboard,
+            "gamepad": gamepad,
+            "heading": heading,
+            "received": received,
+            "reason": final_reason,
+        }
+
+    def test_connected_edge_then_two_successful_neutral_frames_are_required(self) -> None:
+        token = self.replace_neutral(connected=True)
+        self.assertTrue(
+            self.observe(interlock_reason="gamepad_connected_edge")
+        )
+        self.assertEqual(self.broker.provider_gate.input_token, token)
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 0)
+        self.assertFalse(self.broker.provider_gate.ready)
+        self.assertTrue(self.observe())
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
+        self.assertFalse(self.broker.provider_gate.ready)
+        self.assertTrue(self.observe())
+        self.assertTrue(self.broker.provider_gate.ready)
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 2)
+        self.assertIsNone(self.broker.provider_gate.last_interlock_reason)
+
+    def test_final_snapshot_interlocks_are_typed_and_sticky(self) -> None:
+        for reason in (
+            "camera_unavailable",
+            "calibration_interlock",
+        ):
+            with self.subTest(reason=reason):
+                self.replace_neutral()
+                self.assertTrue(self.observe(interlock_reason=reason))
+                self.assertEqual(self.broker.provider_gate.phase, "interlocked")
+                self.assertEqual(
+                    self.broker.provider_gate.last_interlock_reason,
+                    reason,
+                )
+                self.assertTrue(self.observe())
+                self.assertEqual(self.broker.provider_gate.phase, "interlocked")
+
+    def test_physical_focus_loss_latches_authority_but_calibration_does_not(self) -> None:
+        self.replace_neutral()
+        self.assertTrue(self.observe(interlock_reason="calibration_interlock"))
+        self.assertIsNone(
+            self.broker.telemetry()["fatal_authority_reason"]
+        )
+        renewed = self.request(
+            "lease.renew",
+            {"lease_id": self.lease_id},
+        )
+        self.assertTrue(renewed["ok"])
+        queued = self.request(
+            "command.submit",
+            {"lease_id": self.lease_id, "command": "/tp @s ~ ~ ~"},
+        )
+        self.assertTrue(queued["ok"])
+        noninput = self.broker.drain_commands(limit=1)[0]
+        self.broker.complete_command(
+            noninput,
+            {
+                "ok": True,
+                "outcome_unknown": False,
+                "code": "OK_TELEPORT_RESTART",
+                "message": "saved",
+            },
+        )
+        completed = self.request(
+            "command.result",
+            {"command_id": queued["data"]["command_id"]},
+        )["data"]
+        self.assertTrue(completed["terminal"])
+        self.assertEqual(completed["state"], "completed")
+
+        # A fresh authority demonstrates the fatal focus path independently
+        # from the intentionally sticky calibration gate above.
+        self.request("lease.release", {"lease_id": self.lease_id})
+        acquired = self.request("lease.acquire", {})
+        self.lease_id = acquired["data"]["lease_id"]
+        self.replace_neutral()
+        self.assertTrue(self.observe(interlock_reason="physical_focus_lost"))
+        self.assertEqual(
+            self.broker.telemetry()["fatal_authority_reason"],
+            "physical_focus_lost",
+        )
+        self.assertEqual(
+            self.broker.sample(),
+            EXTERNAL.ExternalInputState.neutral(),
+        )
+
+    def test_failed_send_resets_count_without_counting_as_a_frame(self) -> None:
+        self.replace_neutral()
+        self.assertTrue(self.observe())
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
+        self.assertTrue(self.observe(published=False))
+        self.assertEqual(self.broker.provider_gate.phase, "awaiting_neutral")
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 0)
+        self.assertEqual(
+            self.broker.provider_gate.last_interlock_reason,
+            "publisher_send_failed",
+        )
+        self.assertTrue(self.observe())
+        self.assertFalse(self.broker.provider_gate.ready)
+        self.assertTrue(self.observe())
+        self.assertTrue(self.broker.provider_gate.ready)
+        self.assertIsNone(self.broker.provider_gate.last_interlock_reason)
+
+    def test_duplicate_or_regressed_sequence_cannot_count_as_two_frames(self) -> None:
+        self.replace_neutral()
+        state, token = self.broker.sample_with_token()
+        _effective, frame = self.gate.prepare(state, token)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.provider_sequence += 1
+        sequence = self.provider_sequence
+        self.assertTrue(
+            self.gate.observe_published(
+                frame,
+                sequence=sequence,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
+        self.assertFalse(
+            self.gate.observe_published(
+                frame,
+                sequence=sequence,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertFalse(
+            self.gate.observe_published(
+                frame,
+                sequence=sequence - 1,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
+        self.provider_sequence += 1
+        self.assertTrue(
+            self.gate.observe_published(
+                frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertTrue(self.broker.provider_gate.ready)
+
+    def test_stale_sample_cannot_ack_revision_bumped_by_data_modify(self) -> None:
+        self.replace_neutral()
+        _state, sampled_token = self.broker.sample_with_token()
+        self.assertIsNotNone(sampled_token)
+        _effective, stale_frame = self.gate.prepare(_state, sampled_token)
+        self.assertIsNotNone(stale_frame)
+        current = self.broker.apply_data_modify(
+            "control.input.keyboard.ctrl",
+            True,
+        )
+        assert stale_frame is not None
+        self.provider_sequence += 1
+        self.assertFalse(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertEqual(self.broker.provider_gate.input_token, current)
+        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 0)
+        self.assertFalse(self.broker.provider_gate.ready)
+
+    def test_stale_failed_send_invalidates_ready_successor_revision(self) -> None:
+        self.qualify()
+        state, sampled_token = self.broker.sample_with_token()
+        _effective, stale_frame = self.gate.prepare(state, sampled_token)
+        self.assertIsNotNone(stale_frame)
+        successor = self.broker.apply_data_modify(
+            "control.input.keyboard.w",
+            True,
+        )
+        self.assertTrue(self.broker.provider_gate.ready)
+        assert stale_frame is not None
+        self.provider_sequence += 1
+        self.assertTrue(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                published=False,
+                interlock_reason=None,
+            )
+        )
+        gate = self.broker.provider_gate
+        self.assertEqual(gate.input_token, successor)
+        self.assertEqual(gate.phase, "awaiting_neutral")
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.neutral_sent_count, 0)
+        self.assertIsNone(gate.qualified_from_revision)
+        self.assertEqual(gate.last_interlock_reason, "publisher_send_failed")
+        current_state, current_token = self.broker.sample_with_token()
+        effective, _frame = self.gate.prepare(current_state, current_token)
+        self.assertFalse(current_state.locomotion_neutral)
+        self.assertTrue(effective.locomotion_neutral)
+
+    def test_stale_failure_then_exact_clamped_frame_cannot_complete_input(self) -> None:
+        self.qualify()
+        stale_state, stale_token = self.broker.sample_with_token()
+        _effective, stale_frame = self.gate.prepare(stale_state, stale_token)
+        self.assertIsNotNone(stale_frame)
+        successor = self.broker.apply_data_modify(
+            "control.input.keyboard.w",
+            True,
+        )
+        command_client = MODULE.GameCommandClient(None)
+        self.addCleanup(command_client.close)
+        self.assertTrue(
+            command_client.submit_external(
+                "/data modify entity @s "
+                "control.input.keyboard.w set value true",
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=lambda _command: (successor, None),
+            )
+        )
+        assert stale_frame is not None
+        self.provider_sequence += 1
+        self.assertTrue(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                published=False,
+                interlock_reason=None,
+            )
+        )
+        current_state, current_token = self.broker.sample_with_token()
+        _clamped, exact_frame = self.gate.prepare(current_state, current_token)
+        self.assertIsNotNone(exact_frame)
+        assert exact_frame is not None
+        self.assertFalse(exact_frame.locomotion_admitted)
+        self.assertTrue(
+            command_client.resolve_external_input_publish(
+                sampled_token=exact_frame.token,
+                current_token=current_token,
+                authority_active=True,
+                published=True,
+                locomotion_admitted=exact_frame.locomotion_admitted,
+                interlock_reason=None,
+            )
+        )
+        self.assertEqual(command_client.code, "E_INPUT_INTERLOCK")
+        self.assertFalse(command_client.ok)
+
+    def test_data_modify_receipt_stays_nonterminal_until_exact_publish(self) -> None:
+        self.qualify()
+        queued = self.request(
+            "command.submit",
+            {
+                "lease_id": self.lease_id,
+                "command": (
+                    "/data modify entity @s "
+                    "control.input.keyboard.w set value true"
+                ),
+            },
+        )
+        external_command = self.broker.drain_commands(limit=1)[0]
+        stale_state, stale_token = self.broker.sample_with_token()
+        _effective, stale_frame = self.gate.prepare(stale_state, stale_token)
+        self.assertIsNotNone(stale_frame)
+        command_client = MODULE.GameCommandClient(None)
+        self.addCleanup(command_client.close)
+
+        def modify(command: MC_COMMANDS.DataModifyInput):
+            token = self.broker.apply_data_modify(command.path, command.value)
+            return token, None
+
+        self.assertTrue(
+            command_client.submit_external(
+                external_command.command,
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=modify,
+            )
+        )
+        pending_token = self.broker.input_token
+        self.assertIsNotNone(pending_token)
+        before = self.request(
+            "command.result",
+            {"command_id": queued["data"]["command_id"]},
+        )["data"]
+        self.assertEqual(before["state"], "admitted")
+        self.assertFalse(before["terminal"])
+
+        assert stale_frame is not None
+        self.assertFalse(
+            command_client.resolve_external_input_publish(
+                sampled_token=stale_frame.token,
+                current_token=pending_token,
+                authority_active=True,
+                published=True,
+                locomotion_admitted=stale_frame.locomotion_admitted,
+                interlock_reason=None,
+            )
+        )
+        still_pending = self.request(
+            "command.result",
+            {"command_id": queued["data"]["command_id"]},
+        )["data"]
+        self.assertFalse(still_pending["terminal"])
+
+        exact_state, exact_token = self.broker.sample_with_token()
+        _effective, exact_frame = self.gate.prepare(exact_state, exact_token)
+        self.assertIsNotNone(exact_frame)
+        assert exact_frame is not None
+        self.assertTrue(exact_frame.locomotion_admitted)
+        self.assertTrue(
+            command_client.resolve_external_input_publish(
+                sampled_token=exact_frame.token,
+                current_token=exact_token,
+                authority_active=True,
+                published=True,
+                locomotion_admitted=exact_frame.locomotion_admitted,
+                interlock_reason=None,
+            )
+        )
+        self.broker.complete_command(
+            external_command,
+            command_client.mapping(),
+        )
+        terminal = self.request(
+            "command.result",
+            {"command_id": queued["data"]["command_id"]},
+        )["data"]
+        self.assertTrue(terminal["terminal"])
+        self.assertEqual(terminal["state"], "completed")
+        self.assertEqual(
+            terminal["result"]["code"],
+            "OK_DATA_INPUT_MODIFIED",
+        )
+
+    def test_stale_success_does_not_clear_ready_successor_revision(self) -> None:
+        self.qualify()
+        state, sampled_token = self.broker.sample_with_token()
+        _effective, stale_frame = self.gate.prepare(state, sampled_token)
+        self.assertIsNotNone(stale_frame)
+        successor = self.broker.apply_data_modify(
+            "control.input.keyboard.w",
+            True,
+        )
+        before = self.broker.provider_gate
+        assert stale_frame is not None
+        self.provider_sequence += 1
+        self.assertFalse(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertEqual(self.broker.provider_gate, before)
+        self.assertEqual(self.broker.provider_gate.input_token, successor)
+        self.assertTrue(self.broker.provider_gate.ready)
+
+    def test_expired_publish_boundary_replaces_stale_motion_and_revokes_pending(self) -> None:
+        self.qualify()
+        self.broker.apply_data_modify(
+            "control.input.keyboard.w",
+            True,
+            now=self.clock_value,
+        )
+        stale_state, stale_token = self.broker.sample_with_token(
+            now=self.clock_value
+        )
+        effective, stale_frame = self.gate.prepare(stale_state, stale_token)
+        self.assertIsNotNone(stale_frame)
+        assert stale_frame is not None
+        self.assertTrue(effective.keyboard["w"])
+
+        command_client = MODULE.GameCommandClient(None)
+        self.addCleanup(command_client.close)
+        self.assertTrue(
+            command_client.submit_external(
+                "/data modify entity @s "
+                "control.input.keyboard.d set value true",
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=lambda command: (
+                    self.broker.apply_data_modify(
+                        command.path,
+                        command.value,
+                        now=self.clock_value,
+                    ),
+                    None,
+                ),
+            )
+        )
+        stale_snapshot = self.snapshot_for_external_state(
+            effective,
+            sequence=self.provider_sequence + 1,
+        )
+        self.assertTrue(stale_snapshot.keys.w)
+
+        self.clock_value += 0.151
+        boundary = MODULE.external_publish_boundary(
+            self.broker,
+            stale_frame,
+            stale_snapshot,
+            now=self.clock_value,
+        )
+        self.assertIsNone(boundary.current_token)
+        self.assertFalse(boundary.exact_revision)
+        self.assertFalse(boundary.snapshot.focused)
+        self.assertFalse(any(boundary.snapshot.keys.to_mapping().values()))
+        self.assertEqual(
+            (
+                boundary.snapshot.move_stick.right,
+                boundary.snapshot.move_stick.forward,
+            ),
+            (0.0, 0.0),
+        )
+
+        # Model a successful send of the replacement safety-neutral packet.
+        # It is not exact proof for the pending revision.
+        self.provider_sequence += 1
+        self.assertFalse(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertTrue(
+            command_client.resolve_external_input_publish(
+                sampled_token=stale_frame.token,
+                current_token=boundary.current_token,
+                authority_active=False,
+                published=False,
+                locomotion_admitted=stale_frame.locomotion_admitted,
+                interlock_reason=None,
+            )
+        )
+        self.assertFalse(command_client.ok)
+        self.assertEqual(command_client.code, "E_AUTHORITY_REVOKED")
+
+    def test_same_frame_revision_bump_sends_neutral_then_exact_publish_is_ok(self) -> None:
+        self.qualify()
+        self.broker.apply_data_modify(
+            "control.input.keyboard.w",
+            True,
+            now=self.clock_value,
+        )
+        stale_state, stale_token = self.broker.sample_with_token(
+            now=self.clock_value
+        )
+        stale_effective, stale_frame = self.gate.prepare(
+            stale_state,
+            stale_token,
+        )
+        self.assertIsNotNone(stale_frame)
+        assert stale_frame is not None
+
+        command_client = MODULE.GameCommandClient(None)
+        self.addCleanup(command_client.close)
+        self.assertTrue(
+            command_client.submit_external(
+                "/data modify entity @s "
+                "control.input.keyboard.d set value true",
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                input_modifier=lambda command: (
+                    self.broker.apply_data_modify(
+                        command.path,
+                        command.value,
+                        now=self.clock_value,
+                    ),
+                    None,
+                ),
+            )
+        )
+        pending_token = self.broker.input_token
+        self.assertIsNotNone(pending_token)
+        self.assertNotEqual(stale_frame.token, pending_token)
+
+        stale_boundary = MODULE.external_publish_boundary(
+            self.broker,
+            stale_frame,
+            self.snapshot_for_external_state(
+                stale_effective,
+                sequence=self.provider_sequence + 1,
+            ),
+            now=self.clock_value,
+        )
+        self.assertFalse(stale_boundary.exact_revision)
+        self.assertFalse(stale_boundary.snapshot.focused)
+        self.provider_sequence += 1
+        self.assertFalse(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                # The safety-neutral socket write succeeded, so the stale R1
+                # callback must not erase R2's inherited ready proof.
+                published=True,
+                interlock_reason=None,
+            )
+        )
+        self.assertTrue(self.broker.provider_gate.ready)
+        self.assertFalse(
+            command_client.resolve_external_input_publish(
+                sampled_token=stale_frame.token,
+                current_token=stale_boundary.current_token,
+                authority_active=True,
+                published=False,
+                locomotion_admitted=stale_frame.locomotion_admitted,
+                interlock_reason=None,
+            )
+        )
+
+        exact_state, exact_token = self.broker.sample_with_token(
+            now=self.clock_value
+        )
+        exact_effective, exact_frame = self.gate.prepare(exact_state, exact_token)
+        self.assertIsNotNone(exact_frame)
+        assert exact_frame is not None
+        self.clock_value += 0.05
+        exact_boundary = MODULE.external_publish_boundary(
+            self.broker,
+            exact_frame,
+            self.snapshot_for_external_state(
+                exact_effective,
+                sequence=self.provider_sequence + 1,
+            ),
+            now=self.clock_value,
+        )
+        self.assertTrue(exact_boundary.exact_revision)
+        self.assertTrue(exact_boundary.snapshot.focused)
+        self.provider_sequence += 1
+        self.assertTrue(
+            self.gate.observe_published(
+                exact_frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason=None,
+            )
+        )
+
+        # Freeze the send-boundary decision.  Even if scheduling advances the
+        # clock past deadman immediately after send, receipt outcome cannot
+        # flip to revoked by a second post-send authority read.
+        self.clock_value += 0.20
+        self.assertTrue(
+            command_client.resolve_external_input_publish(
+                sampled_token=exact_frame.token,
+                current_token=exact_boundary.current_token,
+                authority_active=exact_boundary.current_token is not None,
+                published=True,
+                locomotion_admitted=exact_frame.locomotion_admitted,
+                interlock_reason=None,
+            )
+        )
+        self.assertTrue(command_client.ok)
+        self.assertEqual(command_client.code, "OK_DATA_INPUT_MODIFIED")
+        self.assertIsNone(
+            self.broker.publish_boundary_token(now=self.clock_value)
+        )
+        self.assertTrue(command_client.ok)
+
+    def test_stale_sticky_interlock_invalidates_ready_successor_revision(self) -> None:
+        self.qualify()
+        state, sampled_token = self.broker.sample_with_token()
+        _effective, stale_frame = self.gate.prepare(state, sampled_token)
+        self.assertIsNotNone(stale_frame)
+        successor = self.broker.apply_data_modify(
+            "control.input.keyboard.w",
+            True,
+        )
+        assert stale_frame is not None
+        self.provider_sequence += 1
+        self.assertTrue(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason="camera_unavailable",
+            )
+        )
+        gate = self.broker.provider_gate
+        self.assertEqual(gate.input_token, successor)
+        self.assertEqual(gate.phase, "interlocked")
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.last_interlock_reason, "camera_unavailable")
+
+    def test_stale_connect_edge_rearms_ready_successor_revision(self) -> None:
+        self.qualify()
+        state, sampled_token = self.broker.sample_with_token()
+        _effective, stale_frame = self.gate.prepare(state, sampled_token)
+        self.assertIsNotNone(stale_frame)
+        successor = self.broker.apply_data_modify(
+            "control.input.keyboard.w",
+            True,
+        )
+        assert stale_frame is not None
+        self.provider_sequence += 1
+        self.assertTrue(
+            self.gate.observe_published(
+                stale_frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason="gamepad_connected_edge",
+            )
+        )
+        gate = self.broker.provider_gate
+        self.assertEqual(gate.input_token, successor)
+        self.assertEqual(gate.phase, "awaiting_neutral")
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.last_interlock_reason, "gamepad_connected_edge")
+
+    def test_stale_failure_is_isolated_by_authority_and_revision(self) -> None:
+        current = self.replace_neutral()
+        before = self.broker.provider_gate
+        cases = {
+            "different_lease": EXTERNAL.ExternalInputToken(
+                lease_id=(
+                    "0" * 32
+                    if current.lease_id != "0" * 32
+                    else "1" * 32
+                ),
+                authority_epoch=current.authority_epoch,
+                input_revision=current.input_revision - 1,
+            ),
+            "different_epoch": EXTERNAL.ExternalInputToken(
+                lease_id=current.lease_id,
+                authority_epoch=current.authority_epoch + 1,
+                input_revision=current.input_revision - 1,
+            ),
+            "non_successor_revision": EXTERNAL.ExternalInputToken(
+                lease_id=current.lease_id,
+                authority_epoch=current.authority_epoch,
+                input_revision=current.input_revision + 1,
+            ),
+        }
+        for label, token in cases.items():
+            with self.subTest(label=label):
+                frame = MODULE.ExternalProviderGateFrame(
+                    token=token,
+                    requested_neutral=True,
+                    requested_device=None,
+                    locomotion_admitted=True,
+                )
+                self.provider_sequence += 1
+                self.assertFalse(
+                    self.gate.observe_published(
+                        frame,
+                        sequence=self.provider_sequence,
+                        published=False,
+                        interlock_reason="camera_unavailable",
+                    )
+                )
+                self.assertEqual(self.broker.provider_gate, before)
+
+    def test_ready_motion_is_clamped_after_midhold_camera_interlock(self) -> None:
+        proof = self.qualify()
+        moving = EXTERNAL.ExternalInputState.neutral().to_mapping()
+        moving["keyboard"]["w"] = True
+        response = self.request(
+            "input.replace",
+            {
+                "lease_id": self.lease_id,
+                "state": moving,
+                "qualified_token": proof.to_mapping(),
+            },
+        )
+        active = EXTERNAL.ExternalInputToken.from_mapping(
+            response["data"]["input_token"]
+        )
+        self.assertEqual(self.broker.provider_gate.input_token, active)
+        self.assertTrue(self.observe(interlock_reason="camera_unavailable"))
+        self.assertEqual(self.broker.provider_gate.phase, "interlocked")
+        state, token = self.broker.sample_with_token()
+        effective, frame = self.gate.prepare(state, token)
+        self.assertIsNotNone(frame)
+        self.assertFalse(state.locomotion_neutral)
+        self.assertTrue(effective.locomotion_neutral)
+
+    def test_configured_source_rejects_the_other_virtual_device(self) -> None:
+        self.replace_neutral(connected=True)
+        state, token = self.broker.sample_with_token()
+        _effective, gamepad_frame = self.gate.prepare(state, token)
+        self.assertIsNotNone(gamepad_frame)
+        assert gamepad_frame is not None
+        self.assertEqual(gamepad_frame.requested_device, "gamepad")
+        self.assertEqual(
+            MODULE.external_provider_source_interlock_reason(
+                gamepad_frame,
+                configured_source="keyboard",
+            ),
+            "input_source_rejects_gamepad",
+        )
+        self.assertIsNone(
+            MODULE.external_provider_source_interlock_reason(
+                gamepad_frame,
+                configured_source="auto",
+            )
+        )
+        self.assertTrue(
+            self.observe(interlock_reason="input_source_rejects_gamepad")
+        )
+        self.assertEqual(self.broker.provider_gate.phase, "interlocked")
+
+        self.replace_neutral()
+        proof = self.qualify()
+        moving = EXTERNAL.ExternalInputState.neutral().to_mapping()
+        moving["keyboard"]["w"] = True
+        self.request(
+            "input.replace",
+            {
+                "lease_id": self.lease_id,
+                "state": moving,
+                "qualified_token": proof.to_mapping(),
+            },
+        )
+        state, token = self.broker.sample_with_token()
+        _effective, keyboard_frame = self.gate.prepare(state, token)
+        self.assertIsNotNone(keyboard_frame)
+        assert keyboard_frame is not None
+        self.assertEqual(keyboard_frame.requested_device, "keyboard")
+        self.assertEqual(
+            MODULE.external_provider_source_interlock_reason(
+                keyboard_frame,
+                configured_source="gamepad",
+            ),
+            "input_source_rejects_keyboard",
+        )
+        self.assertIsNone(
+            MODULE.external_provider_source_interlock_reason(
+                keyboard_frame,
+                configured_source="auto",
+            )
+        )
+        self.assertTrue(
+            self.observe(interlock_reason="input_source_rejects_keyboard")
+        )
+        self.assertEqual(self.broker.provider_gate.phase, "interlocked")
+
+    def test_source_gate_covers_nonlocomotion_keyboard_and_mouse_input(self) -> None:
+        cases = {
+            "q": ("keyboard", "q", True),
+            "mouse_button": ("mouse", "left", True),
+            "mouse_delta": ("mouse", "dx", 12.0),
+        }
+        for label, (family, name, value) in cases.items():
+            with self.subTest(label=label):
+                mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
+                if family == "keyboard":
+                    mapping["keyboard"][name] = value
+                elif name == "dx":
+                    mapping["mouse"]["dx"] = value
+                else:
+                    mapping["mouse"]["buttons"][name] = value
+                response = self.request(
+                    "input.replace",
+                    {"lease_id": self.lease_id, "state": mapping},
+                )
+                token = EXTERNAL.ExternalInputToken.from_mapping(
+                    response["data"]["input_token"]
+                )
+                state, sampled_token = self.broker.sample_with_token()
+                self.assertEqual(sampled_token, token)
+                _effective, frame = self.gate.prepare(state, sampled_token)
+                self.assertIsNotNone(frame)
+                assert frame is not None
+                self.assertEqual(frame.requested_device, "keyboard")
+                self.assertEqual(
+                    MODULE.external_provider_source_interlock_reason(
+                        frame,
+                        configured_source="gamepad",
+                    ),
+                    "input_source_rejects_keyboard",
+                )
+
+    def test_device_claim_is_shared_for_warmup_keyboard_and_mixed_input(self) -> None:
+        current_token = self.broker.input_token
+        self.assertIsNotNone(current_token)
+
+        connected_neutral = EXTERNAL.ExternalInputState.neutral().to_mapping()
+        connected_neutral["gamepad"]["connected"] = True
+        neutral_state = EXTERNAL.ExternalInputState.from_mapping(connected_neutral)
+        self.assertEqual(
+            MODULE.external_active_input_device(neutral_state),
+            "gamepad",
+        )
+        self.assertEqual(
+            MODULE.external_frame_input_source(
+                neutral_state,
+                configured_source="auto",
+            ),
+            "gamepad",
+        )
+        _effective, neutral_frame = self.gate.prepare(
+            neutral_state,
+            current_token,
+        )
+        self.assertIsNotNone(neutral_frame)
+        assert neutral_frame is not None
+        self.assertEqual(neutral_frame.requested_device, "gamepad")
+
+        keyboard_mapping = connected_neutral
+        keyboard_mapping["keyboard"]["q"] = True
+        keyboard_state = EXTERNAL.ExternalInputState.from_mapping(keyboard_mapping)
+        self.assertEqual(
+            MODULE.external_active_input_device(keyboard_state),
+            "keyboard",
+        )
+        _effective, keyboard_frame = self.gate.prepare(
+            keyboard_state,
+            current_token,
+        )
+        self.assertIsNotNone(keyboard_frame)
+        assert keyboard_frame is not None
+        self.assertEqual(keyboard_frame.requested_device, "keyboard")
+
+        mixed_mapping = keyboard_state.to_mapping()
+        mixed_mapping["gamepad"]["axes"]["look_yaw"] = 0.5
+        mixed_state = EXTERNAL.ExternalInputState.from_mapping(mixed_mapping)
+        self.assertEqual(MODULE.external_active_input_device(mixed_state), "mixed")
+        _effective, mixed_frame = self.gate.prepare(mixed_state, current_token)
+        self.assertIsNotNone(mixed_frame)
+        assert mixed_frame is not None
+        self.assertEqual(mixed_frame.requested_device, "mixed")
+        self.assertFalse(mixed_frame.locomotion_admitted)
+        for configured_source in ("auto", "keyboard", "gamepad"):
+            with self.subTest(configured_source=configured_source):
+                self.assertEqual(
+                    MODULE.external_provider_source_interlock_reason(
+                        mixed_frame,
+                        configured_source=configured_source,
+                    ),
+                    "input_source_mixed",
+                )
+
+    def test_mixed_q_v_and_gamepad_look_are_neutral_before_publish(self) -> None:
+        mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
+        mapping["keyboard"]["q"] = True
+        mapping["keyboard"]["v"] = True
+        mapping["gamepad"]["connected"] = True
+        mapping["gamepad"]["axes"]["look_yaw"] = 0.75
+        result = self.exercise_source_interlocked_publish(
+            mapping,
+            configured_source="auto",
+            command=(
+                "/data modify entity @s "
+                "control.input.keyboard.q set value true"
+            ),
+        )
+        frame = result["frame"]
+        assert isinstance(frame, MODULE.ExternalProviderGateFrame)
+        self.assertEqual(frame.requested_device, "mixed")
+        self.assertEqual(result["reason"], "input_source_mixed")
+        effective = result["effective"]
+        assert isinstance(effective, EXTERNAL.ExternalInputState)
+        self.assertTrue(effective.keyboard["q"])
+        self.assertTrue(effective.keyboard["v"])
+        self.assertEqual(effective.gamepad_axes["look_yaw"], 0.75)
+        keyboard = result["keyboard"]
+        gamepad = result["gamepad"]
+        assert isinstance(keyboard, MODULE.KeyboardMouseSample)
+        assert isinstance(gamepad, MODULE.GamepadSample)
+        self.assertFalse(keyboard.q)
+        self.assertFalse(keyboard.v)
+        self.assertEqual(gamepad.look_yaw, 0.0)
+
+    def test_configured_mismatch_mouse_delta_and_button_are_neutral(self) -> None:
+        mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
+        mapping["mouse"]["buttons"]["left"] = True
+        mapping["mouse"]["dx"] = 18.0
+        result = self.exercise_source_interlocked_publish(
+            mapping,
+            configured_source="gamepad",
+            command=(
+                "/data modify entity @s "
+                "control.input.mouse.left set value true"
+            ),
+        )
+        frame = result["frame"]
+        assert isinstance(frame, MODULE.ExternalProviderGateFrame)
+        self.assertEqual(frame.requested_device, "keyboard")
+        self.assertEqual(result["reason"], "input_source_rejects_keyboard")
+        effective = result["effective"]
+        assert isinstance(effective, EXTERNAL.ExternalInputState)
+        self.assertTrue(effective.mouse_buttons["left"])
+        self.assertEqual(effective.mouse_dx, 18.0)
+        keyboard = result["keyboard"]
+        assert isinstance(keyboard, MODULE.KeyboardMouseSample)
+        self.assertFalse(keyboard.camera_dragging)
+        self.assertEqual(keyboard.mouse_dx, 0.0)
+
+    def test_focus_loss_outranks_source_and_calibration_and_latches_deadman(self) -> None:
+        connected_neutral = EXTERNAL.ExternalInputState.neutral().to_mapping()
+        connected_neutral["gamepad"]["connected"] = True
+        response = self.request(
+            "input.replace",
+            {"lease_id": self.lease_id, "state": connected_neutral},
+        )
+        token = EXTERNAL.ExternalInputToken.from_mapping(
+            response["data"]["input_token"]
+        )
+        state, sampled_token = self.broker.sample_with_token()
+        self.assertEqual(sampled_token, token)
+        _effective, frame = self.gate.prepare(state, sampled_token)
+        self.assertIsNotNone(frame)
+        assert frame is not None
+        self.assertEqual(frame.requested_device, "gamepad")
+
+        for calibration_active in (False, True):
+            with self.subTest(calibration_active=calibration_active):
+                self.assertEqual(
+                    MODULE.external_provider_publish_interlock_reason(
+                        frame,
+                        configured_source="keyboard",
+                        physical_focused=False,
+                        camera_dragging=False,
+                        camera_available=True,
+                        input_available=True,
+                        gamepad_connected_edge=False,
+                        calibration_interlock_active=calibration_active,
+                    ),
+                    "physical_focus_lost",
+                )
+
+        self.provider_sequence += 1
+        self.assertTrue(
+            self.gate.observe_published(
+                frame,
+                sequence=self.provider_sequence,
+                published=True,
+                interlock_reason="physical_focus_lost",
+            )
+        )
+        blocked = self.request(
+            "command.submit",
+            {"lease_id": self.lease_id, "command": "/tp @s ~ ~ ~"},
+            expect_ok=False,
+        )
+        self.assertFalse(blocked["ok"])
+        self.assertEqual(blocked["code"], "E_AUTHORITY_REVOKED")
+
+        self.clock_value += 0.10
+        self.assertTrue(
+            self.request(
+                "lease.renew",
+                {"lease_id": self.lease_id},
+            )["ok"]
+        )
+        self.clock_value += 0.051
+        self.assertIsNone(
+            self.broker.publish_boundary_token(now=self.clock_value)
+        )
+        self.assertEqual(self.broker.deadman_stops, 1)
+
+    def test_interlock_reason_uses_final_publish_preconditions(self) -> None:
+        base = {
+            "physical_focused": True,
+            "camera_dragging": False,
+            "camera_available": True,
+            "input_available": True,
+            "gamepad_connected_edge": False,
+            "calibration_interlock_active": False,
+        }
+        cases = {
+            "physical_focused": "physical_focus_lost",
+            "camera_available": "camera_unavailable",
+            "input_available": "input_unavailable",
+            "gamepad_connected_edge": "gamepad_connected_edge",
+            "calibration_interlock_active": "calibration_interlock",
+        }
+        for field, reason in cases.items():
+            with self.subTest(field=field):
+                values = dict(base)
+                values[field] = not values[field]
+                self.assertEqual(
+                    MODULE.external_provider_interlock_reason(**values),
+                    reason,
+                )
+        focus_and_calibration = dict(base)
+        focus_and_calibration["physical_focused"] = False
+        focus_and_calibration["calibration_interlock_active"] = True
+        self.assertEqual(
+            MODULE.external_provider_interlock_reason(**focus_and_calibration),
+            "physical_focus_lost",
         )
 
 

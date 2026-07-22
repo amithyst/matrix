@@ -216,6 +216,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         client.refresh.assert_has_calls([mock.call("lease")] * 2)
         self.assertAlmostEqual(clock.now, MODULE._NEUTRAL_WARMUP_SECONDS)
 
+    @mock.patch.object(MODULE, "_wait_for_provider_gate")
     @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
@@ -226,6 +227,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         resolved_paths,
         client_type,
         hold_state,
+        wait_for_gate,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -249,35 +251,40 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         )
         client = client_type.return_value.__enter__.return_value
         client.acquire.return_value = ("lease", 0.15)
+        proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        wait_for_gate.return_value = proof
 
         self.assertEqual(MODULE.main(), 0)
 
-        self.assertEqual(hold_state.call_count, 2)
-        warmup, action = hold_state.call_args_list
+        wait_for_gate.assert_called_once()
         self.assertEqual(
-            warmup.args,
+            wait_for_gate.call_args.args,
             (
                 client,
                 "lease",
                 MODULE._state_with_keyboard(None, ("alt",)),
             ),
         )
-        self.assertEqual(
-            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
+        self.assertAlmostEqual(
+            wait_for_gate.call_args.kwargs["refresh_seconds"],
+            0.05,
         )
+        self.assertEqual(hold_state.call_count, 1)
+        action = hold_state.call_args
         self.assertEqual(
             action.args,
             (client, "lease", MODULE._state_with_keyboard("w", ("alt",))),
         )
         self.assertEqual(action.kwargs["seconds"], 1.0)
-        for call in (warmup, action):
-            self.assertLessEqual(call.kwargs["refresh_seconds"], 0.05)
+        self.assertLessEqual(action.kwargs["refresh_seconds"], 0.05)
+        self.assertEqual(action.kwargs["qualified_token"], proof)
         client.replace.assert_called_once_with(
             "lease",
             EXTERNAL.ExternalInputState.neutral(),
         )
         client.release.assert_called_once_with("lease")
 
+    @mock.patch.object(MODULE, "_wait_for_provider_gate")
     @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
@@ -288,6 +295,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         resolved_paths,
         client_type,
         hold_state,
+        wait_for_gate,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -311,26 +319,28 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         )
         client = client_type.return_value.__enter__.return_value
         client.acquire.return_value = ("lease", 0.15)
+        first_proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        second_proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 3)
+        wait_for_gate.side_effect = (first_proof, second_proof)
 
         self.assertEqual(MODULE.main(), 0)
 
         pressed = MODULE._state_with_keyboard("w", ("alt",))
         modifier_only = MODULE._state_with_keyboard(None, ("alt",))
-        self.assertEqual(hold_state.call_count, 4)
-        warmup, first_tap, gap, second_tap = hold_state.call_args_list
-        self.assertEqual(
-            warmup.args,
-            (client, "lease", modifier_only),
-        )
-        self.assertEqual(
-            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
-        )
+        self.assertEqual(wait_for_gate.call_count, 2)
+        initial_gate, gap_gate = wait_for_gate.call_args_list
+        self.assertEqual(initial_gate.args, (client, "lease", modifier_only))
+        self.assertNotIn("minimum_seconds", initial_gate.kwargs)
+        self.assertEqual(gap_gate.args, (client, "lease", modifier_only))
+        self.assertEqual(gap_gate.kwargs["minimum_seconds"], 0.08)
+        self.assertEqual(hold_state.call_count, 2)
+        first_tap, second_tap = hold_state.call_args_list
         self.assertEqual(first_tap.args, (client, "lease", pressed))
         self.assertEqual(first_tap.kwargs["seconds"], 0.04)
-        self.assertEqual(gap.args, (client, "lease", modifier_only))
-        self.assertEqual(gap.kwargs["seconds"], 0.08)
         self.assertEqual(second_tap.args, (client, "lease", pressed))
         self.assertEqual(second_tap.kwargs["seconds"], 0.25)
+        self.assertEqual(first_tap.kwargs["qualified_token"], first_proof)
+        self.assertEqual(second_tap.kwargs["qualified_token"], second_proof)
         for call in hold_state.call_args_list:
             self.assertLessEqual(call.kwargs["refresh_seconds"], 0.05)
         client.replace.assert_called_once_with(
@@ -339,6 +349,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         )
         client.release.assert_called_once_with("lease")
 
+    @mock.patch.object(MODULE, "_wait_for_provider_gate")
     @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
@@ -349,6 +360,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         resolved_paths,
         client_type,
         hold_state,
+        wait_for_gate,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -372,21 +384,25 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         )
         client = client_type.return_value.__enter__.return_value
         client.acquire.return_value = ("lease", 0.012)
+        proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        wait_for_gate.return_value = proof
 
         self.assertEqual(MODULE.main(), 0)
 
-        self.assertEqual(hold_state.call_count, 2)
-        warmup, action = hold_state.call_args_list
+        self.assertEqual(hold_state.call_count, 1)
+        action = hold_state.call_args
         connected_neutral = MODULE._connected_neutral_gamepad_state()
         requested = MODULE._state_with_gamepad(parse_args.return_value)
-        self.assertEqual(warmup.args, (client, "lease", connected_neutral))
-        self.assertEqual(
-            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
+        wait_for_gate.assert_called_once_with(
+            client,
+            "lease",
+            connected_neutral,
+            refresh_seconds=0.004,
         )
         self.assertEqual(action.args, (client, "lease", requested))
         self.assertEqual(action.kwargs["seconds"], 1.0)
-        for call in (warmup, action):
-            self.assertEqual(call.kwargs["refresh_seconds"], 0.004)
+        self.assertEqual(action.kwargs["refresh_seconds"], 0.004)
+        self.assertEqual(action.kwargs["qualified_token"], proof)
 
         full_neutral = EXTERNAL.ExternalInputState.neutral()
         self.assertFalse(full_neutral.gamepad_connected)
@@ -502,6 +518,210 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         self.assertTrue(still_blocked.safe_stop)
         self.assertEqual(still_blocked.reason, "awaiting_neutral")
 
+    def test_provider_gate_wait_handles_a_late_first_provider_poll(self) -> None:
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+
+        def telemetry(*, ready: bool) -> EXTERNAL.ProviderGateTelemetry:
+            return EXTERNAL.ProviderGateTelemetry(
+                authority_epoch=token.authority_epoch,
+                lease_id=token.lease_id,
+                input_revision=token.input_revision,
+                phase="ready" if ready else "awaiting_neutral",
+                ready=ready,
+                neutral_sent_count=2 if ready else 0,
+                qualified_from_revision=token.input_revision if ready else None,
+                last_sequence=3 if ready else None,
+            )
+
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        client = mock.Mock()
+        client.replace.return_value = (token, telemetry(ready=False))
+        client.refresh.side_effect = lambda _lease: (
+            token,
+            telemetry(ready=clock.now >= 0.24),
+        )
+
+        proof = MODULE._wait_for_provider_gate(
+            client,
+            token.lease_id,
+            MODULE._connected_neutral_gamepad_state(),
+            refresh_seconds=0.02,
+            timeout_seconds=0.50,
+            clock=clock.read,
+            sleeper=clock.sleep,
+        )
+        self.assertEqual(proof, token)
+        self.assertGreaterEqual(clock.now, 0.24)
+        self.assertLess(clock.now, 0.50)
+
+    def test_provider_gate_wait_times_out_when_provider_never_polls(self) -> None:
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        awaiting = EXTERNAL.ProviderGateTelemetry(
+            authority_epoch=token.authority_epoch,
+            lease_id=token.lease_id,
+            input_revision=token.input_revision,
+            phase="awaiting_neutral",
+            ready=False,
+            neutral_sent_count=0,
+        )
+
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        client = mock.Mock()
+        client.replace.return_value = (token, awaiting)
+        client.refresh.return_value = (token, awaiting)
+        with self.assertRaises(MODULE.MatrixControlResponseError) as raised:
+            MODULE._wait_for_provider_gate(
+                client,
+                token.lease_id,
+                EXTERNAL.ExternalInputState.neutral(),
+                refresh_seconds=0.02,
+                timeout_seconds=0.06,
+                clock=clock.read,
+                sleeper=clock.sleep,
+            )
+        self.assertEqual(raised.exception.code, "E_PROVIDER_GATE_TIMEOUT")
+
+    def test_midhold_renew_surfaces_typed_provider_interlock(self) -> None:
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
+        interlocked = EXTERNAL.ProviderGateTelemetry(
+            authority_epoch=token.authority_epoch,
+            lease_id=token.lease_id,
+            input_revision=token.input_revision,
+            phase="interlocked",
+            ready=False,
+            neutral_sent_count=0,
+            last_interlock_reason="camera_unavailable",
+            last_sequence=9,
+        )
+
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        client = mock.Mock()
+        client.refresh.return_value = (token, interlocked)
+        with self.assertRaises(MODULE.MatrixControlResponseError) as raised:
+            MODULE._wait_with_lease_refresh(
+                client,
+                token.lease_id,
+                seconds=0.10,
+                refresh_seconds=0.02,
+                expected_token=token,
+                clock=clock.read,
+                sleeper=clock.sleep,
+            )
+        self.assertEqual(raised.exception.code, "E_INPUT_INTERLOCK")
+        self.assertIn("camera_unavailable", raised.exception.message)
+
+    def test_short_proof_bound_hold_still_performs_a_final_exact_refresh(self) -> None:
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
+        ready = EXTERNAL.ProviderGateTelemetry(
+            authority_epoch=token.authority_epoch,
+            lease_id=token.lease_id,
+            input_revision=token.input_revision,
+            phase="ready",
+            ready=True,
+            neutral_sent_count=2,
+            qualified_from_revision=1,
+            last_sequence=9,
+        )
+
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        client = mock.Mock()
+        client.refresh.return_value = (token, ready)
+        MODULE._wait_with_lease_refresh(
+            client,
+            token.lease_id,
+            seconds=0.04,
+            refresh_seconds=0.05,
+            expected_token=token,
+            clock=clock.read,
+            sleeper=clock.sleep,
+        )
+        client.refresh.assert_called_once_with(token.lease_id)
+
+    def test_final_refresh_catches_a_tail_window_interlock(self) -> None:
+        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
+        ready = EXTERNAL.ProviderGateTelemetry(
+            authority_epoch=token.authority_epoch,
+            lease_id=token.lease_id,
+            input_revision=token.input_revision,
+            phase="ready",
+            ready=True,
+            neutral_sent_count=2,
+            qualified_from_revision=1,
+            last_sequence=9,
+        )
+        interlocked = EXTERNAL.ProviderGateTelemetry(
+            authority_epoch=token.authority_epoch,
+            lease_id=token.lease_id,
+            input_revision=token.input_revision,
+            phase="interlocked",
+            ready=False,
+            neutral_sent_count=0,
+            last_interlock_reason="physical_focus_lost",
+            last_sequence=10,
+        )
+
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        client = mock.Mock()
+        client.refresh.side_effect = ((token, ready), (token, interlocked))
+        with self.assertRaises(MODULE.MatrixControlResponseError) as raised:
+            MODULE._wait_with_lease_refresh(
+                client,
+                token.lease_id,
+                seconds=0.04,
+                refresh_seconds=0.02,
+                expected_token=token,
+                clock=clock.read,
+                sleeper=clock.sleep,
+            )
+        self.assertEqual(raised.exception.code, "E_INPUT_INTERLOCK")
+        self.assertIn("physical_focus_lost", raised.exception.message)
+        self.assertEqual(client.refresh.call_count, 2)
+
     def test_main_double_tap_activates_detector_after_external_source_rearm(
         self,
     ) -> None:
@@ -522,15 +742,12 @@ class MatrixCtlHelpersTest(unittest.TestCase):
                     )
                 )
 
-                def observe_hold(
-                    _client,
-                    _lease_id,
-                    state,
-                    *,
-                    seconds,
-                    refresh_seconds,
+                proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+
+                def observe_state(
+                    state: EXTERNAL.ExternalInputState,
+                    seconds: float,
                 ) -> None:
-                    del refresh_seconds
                     nonlocal now_s
                     keyboard, _gamepad = PROVIDER.external_input_samples(
                         state,
@@ -544,6 +761,32 @@ class MatrixCtlHelpersTest(unittest.TestCase):
                         source_id="external",
                     )
                     now_s += seconds
+
+                def observe_hold(
+                    _client,
+                    _lease_id,
+                    state,
+                    *,
+                    seconds,
+                    refresh_seconds,
+                    qualified_token=None,
+                ) -> EXTERNAL.ExternalInputToken:
+                    del refresh_seconds
+                    del qualified_token
+                    observe_state(state, seconds)
+                    return proof
+
+                def observe_gate(
+                    _client,
+                    _lease_id,
+                    state,
+                    *,
+                    refresh_seconds,
+                    minimum_seconds=0.0,
+                ) -> EXTERNAL.ExternalInputToken:
+                    del refresh_seconds
+                    observe_state(state, max(0.04, minimum_seconds))
+                    return proof
 
                 args = type(
                     "Args",
@@ -578,6 +821,10 @@ class MatrixCtlHelpersTest(unittest.TestCase):
                     MODULE,
                     "_hold_state",
                     side_effect=observe_hold,
+                ), mock.patch.object(
+                    MODULE,
+                    "_wait_for_provider_gate",
+                    side_effect=observe_gate,
                 ):
                     client = client_type.return_value.__enter__.return_value
                     client.acquire.return_value = ("lease", 0.15)
@@ -649,11 +896,8 @@ class MatrixCtlHelpersTest(unittest.TestCase):
             self.assertEqual(call.kwargs["refresh_seconds"], refresh_seconds)
         client.release.assert_called_once_with("lease")
 
-    @mock.patch.object(
-        MODULE,
-        "_hold_state",
-        side_effect=(None, KeyboardInterrupt),
-    )
+    @mock.patch.object(MODULE, "_wait_for_provider_gate")
+    @mock.patch.object(MODULE, "_hold_state", side_effect=KeyboardInterrupt)
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
     @mock.patch.object(MODULE, "_parse_args")
@@ -663,6 +907,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         resolved_paths,
         client_type,
         _hold_state,
+        wait_for_gate,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -686,23 +931,19 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         )
         client = client_type.return_value.__enter__.return_value
         client.acquire.return_value = ("lease", 0.15)
+        proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        wait_for_gate.return_value = proof
 
         with self.assertRaises(KeyboardInterrupt):
             MODULE.main()
 
-        self.assertEqual(_hold_state.call_count, 2)
-        warmup, interrupted_action = _hold_state.call_args_list
-        self.assertEqual(
-            warmup.args,
-            (client, "lease", EXTERNAL.ExternalInputState.neutral()),
-        )
-        self.assertEqual(
-            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
-        )
+        self.assertEqual(_hold_state.call_count, 1)
+        interrupted_action = _hold_state.call_args
         self.assertEqual(
             interrupted_action.args,
             (client, "lease", MODULE._state_with_keyboard("w", ())),
         )
+        self.assertEqual(interrupted_action.kwargs["qualified_token"], proof)
         client.replace.assert_called_once_with(
             "lease",
             EXTERNAL.ExternalInputState.neutral(),
@@ -789,6 +1030,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         client.replace.assert_called_once()
         client.release.assert_not_called()
 
+    @mock.patch.object(MODULE, "_wait_for_provider_gate")
     @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "_wait_for_command_terminal")
     @mock.patch.object(MODULE, "MatrixControlClient")
@@ -801,6 +1043,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         client_type,
         wait_terminal,
         hold_state,
+        wait_for_gate,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -822,7 +1065,19 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         command_id = "a" * 32
         client = client_type.return_value.__enter__.return_value
         client.acquire.return_value = ("lease", 0.15)
-        client.command.return_value = {"data": {"command_id": command_id}}
+        proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        order: list[str] = []
+
+        def acknowledge(*_args, **_kwargs):
+            order.append("provider_ack")
+            return proof
+
+        def submit(*_args, **_kwargs):
+            order.append("command_submit")
+            return {"data": {"command_id": command_id}}
+
+        wait_for_gate.side_effect = acknowledge
+        client.command.side_effect = submit
         wait_terminal.return_value = (
             {
                 "command_id": command_id,
@@ -848,10 +1103,13 @@ class MatrixCtlHelpersTest(unittest.TestCase):
             seconds=MODULE._NEUTRAL_WARMUP_SECONDS,
             refresh_seconds=mock.ANY,
         )
+        wait_for_gate.assert_not_called()
+        self.assertEqual(order, ["command_submit"])
         client.command.assert_called_once_with("lease", "/tp @s ~ ~ ~")
         client.replace.assert_not_called()
         client.release.assert_not_called()
 
+    @mock.patch.object(MODULE, "_wait_for_provider_gate")
     @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "_wait_for_command_terminal")
     @mock.patch.object(MODULE, "MatrixControlClient")
@@ -864,6 +1122,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         client_type,
         wait_terminal,
         hold_state,
+        wait_for_gate,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -885,6 +1144,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         command_id = "b" * 32
         client = client_type.return_value.__enter__.return_value
         client.acquire.return_value = ("lease", 0.15)
+        wait_for_gate.return_value = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
         client.command.return_value = {"data": {"command_id": command_id}}
         wait_terminal.side_effect = MODULE.MatrixCommandOutcomeUnknownError(
             f"E_COMMAND_OUTCOME_UNKNOWN: no terminal receipt for {command_id}",
@@ -901,9 +1161,111 @@ class MatrixCtlHelpersTest(unittest.TestCase):
             seconds=MODULE._NEUTRAL_WARMUP_SECONDS,
             refresh_seconds=mock.ANY,
         )
+        wait_for_gate.assert_not_called()
         client.command.assert_called_once_with("lease", "/tp @s ~ ~ ~")
         client.replace.assert_not_called()
         client.release.assert_not_called()
+
+    @mock.patch.object(MODULE, "_wait_for_provider_gate")
+    @mock.patch.object(MODULE, "_hold_state")
+    @mock.patch.object(MODULE, "_wait_for_command_terminal")
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_only_valid_input_commands_wait_for_exact_provider_ack(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        wait_terminal,
+        hold_state,
+        wait_for_gate,
+    ) -> None:
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.15)
+        proof = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
+        wait_for_gate.return_value = proof
+        command_id = "c" * 32
+        client.command.return_value = {"data": {"command_id": command_id}}
+        wait_terminal.return_value = (
+            {
+                "command_id": command_id,
+                "terminal": True,
+                "state": "completed",
+                "authority_revoked": False,
+                "result": {
+                    "ok": True,
+                    "outcome_unknown": False,
+                    "code": "OK_TEST",
+                    "message": "done",
+                },
+            },
+            True,
+        )
+        cases = (
+            (
+                "/data modify entity @s "
+                "control.input.keyboard.w set value true",
+                True,
+                False,
+            ),
+            (
+                "/data modify entity @s "
+                "control.input.gamepad.forward set value 0.5",
+                True,
+                True,
+            ),
+            ("/tp @s ~ ~ ~", False, False),
+            (
+                "/data modify entity @s "
+                "control.motion.gears.slow.speed_mps set value 0.15",
+                False,
+                False,
+            ),
+            ("definitely invalid", False, False),
+        )
+        for command, exact_ack, gamepad_connected in cases:
+            with self.subTest(command=command):
+                parse_args.return_value = type(
+                    "Args",
+                    (),
+                    {
+                        "action": "command",
+                        "profile": "trna",
+                        "socket": None,
+                        "capability_file": None,
+                        "timeout": 1.0,
+                        "hold_seconds": 1.0,
+                        "command": command,
+                    },
+                )()
+                hold_state.reset_mock()
+                wait_for_gate.reset_mock()
+                client.command.reset_mock()
+                client.replace.reset_mock()
+                client.release.reset_mock()
+                self.assertEqual(MODULE.main(), 0)
+                if exact_ack:
+                    hold_state.assert_not_called()
+                    wait_for_gate.assert_called_once()
+                    warmup = wait_for_gate.call_args.args[2]
+                    self.assertEqual(
+                        warmup.gamepad_connected,
+                        gamepad_connected,
+                    )
+                else:
+                    wait_for_gate.assert_not_called()
+                    hold_state.assert_called_once_with(
+                        client,
+                        "lease",
+                        EXTERNAL.ExternalInputState.neutral(),
+                        seconds=MODULE._NEUTRAL_WARMUP_SECONDS,
+                        refresh_seconds=mock.ANY,
+                    )
 
     def test_resolved_paths_prefer_game_env_and_accept_legacy_env(self) -> None:
         class Args:
@@ -1149,8 +1511,29 @@ class MatrixCtlBrokerIntegrationTest(unittest.TestCase):
                     lease_id, deadman = client.acquire()
                     self.assertLessEqual(deadman, 0.15)
                     client.refresh(lease_id)
+                    proof = client.input_token
+                    self.assertIsNotNone(proof)
+                    assert proof is not None
+                    self.assertTrue(
+                        broker.update_provider_gate(
+                            EXTERNAL.ProviderGateTelemetry(
+                                authority_epoch=proof.authority_epoch,
+                                lease_id=proof.lease_id,
+                                input_revision=proof.input_revision,
+                                phase="ready",
+                                ready=True,
+                                neutral_sent_count=2,
+                                qualified_from_revision=proof.input_revision,
+                                last_sequence=1,
+                            )
+                        )
+                    )
                     state = MODULE._state_with_keyboard("w", ("shift",))
-                    client.replace(lease_id, state)
+                    client.replace(
+                        lease_id,
+                        state,
+                        qualified_token=proof,
+                    )
                     self.assertTrue(broker.sample().keyboard["w"])
                     queued = client.command(
                         lease_id,

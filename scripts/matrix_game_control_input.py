@@ -66,6 +66,8 @@ from matrix_external_control import (
     ExternalCommand,
     ExternalControlBroker,
     ExternalInputState,
+    ExternalInputToken,
+    ProviderGateTelemetry,
 )
 from matrix_mc_commands import (
     CommandParseError,
@@ -287,6 +289,35 @@ def external_input_samples(
     return keyboard, gamepad
 
 
+def external_active_input_device(state: ExternalInputState) -> str | None:
+    """Classify the virtual device claim used by gate and final arbitration."""
+
+    if not isinstance(state, ExternalInputState):
+        raise TypeError("external input state is invalid")
+    keyboard_active = bool(
+        any(state.keyboard.values())
+        or any(state.mouse_buttons.values())
+        or abs(state.mouse_dx) > 1e-12
+        or abs(state.mouse_dy) > 1e-12
+    )
+    gamepad_active = bool(
+        state.gamepad_connected
+        and (
+            any(abs(value) > 1e-12 for value in state.gamepad_axes.values())
+            or any(state.gamepad_buttons.values())
+        )
+    )
+    if keyboard_active and gamepad_active:
+        return "mixed"
+    if keyboard_active:
+        # A merely connected, neutral pad is warmup intent only when the
+        # keyboard/mouse side is also neutral.
+        return "keyboard"
+    if gamepad_active or state.gamepad_connected:
+        return "gamepad"
+    return None
+
+
 def external_frame_input_source(
     state: ExternalInputState,
     *,
@@ -299,18 +330,376 @@ def external_frame_input_source(
     if configured_source != "auto":
         return configured_source
 
-    keyboard_active = any(state.keyboard.values()) or any(
-        state.mouse_buttons.values()
-    ) or abs(state.mouse_dx) > 1e-12 or abs(state.mouse_dy) > 1e-12
-    gamepad_active = state.gamepad_connected and (
-        any(abs(value) > 1e-12 for value in state.gamepad_axes.values())
-        or any(state.gamepad_buttons.values())
-    )
-    if keyboard_active:
-        return "keyboard"
-    if gamepad_active:
-        return "gamepad"
+    device = external_active_input_device(state)
+    if device in {"keyboard", "gamepad"}:
+        return device
+    # Mixed input is rejected by the provider source gate before publish.  Do
+    # not pick a winner here and accidentally hide one half of the request.
     return configured_source
+
+
+@dataclass(frozen=True)
+class ExternalProviderGateFrame:
+    token: ExternalInputToken
+    requested_neutral: bool
+    requested_device: str | None
+    locomotion_admitted: bool
+
+
+class ExternalLocomotionProviderGate:
+    """Qualify exact external revisions before exposing locomotion intent."""
+
+    def __init__(self, broker: ExternalControlBroker) -> None:
+        if not isinstance(broker, ExternalControlBroker):
+            raise TypeError("external provider gate requires its broker")
+        self.broker = broker
+
+    def prepare(
+        self,
+        state: ExternalInputState,
+        token: ExternalInputToken | None,
+    ) -> tuple[ExternalInputState, ExternalProviderGateFrame | None]:
+        if token is None:
+            return state.without_locomotion(), None
+        telemetry = self.broker.provider_gate
+        exact_ready = bool(
+            telemetry.ready and telemetry.input_token == token
+        )
+        requested_neutral = state.locomotion_neutral
+        requested_device = external_active_input_device(state)
+        source_admitted = requested_device != "mixed"
+        effective = (
+            state
+            if source_admitted and (requested_neutral or exact_ready)
+            else state.without_locomotion()
+        )
+        return effective, ExternalProviderGateFrame(
+            token=token,
+            requested_neutral=requested_neutral,
+            requested_device=requested_device,
+            locomotion_admitted=bool(
+                source_admitted and (requested_neutral or exact_ready)
+            ),
+        )
+
+    def observe_published(
+        self,
+        frame: ExternalProviderGateFrame,
+        *,
+        sequence: int,
+        published: bool,
+        interlock_reason: str | None,
+    ) -> bool:
+        if not isinstance(frame, ExternalProviderGateFrame):
+            raise TypeError("provider gate frame is invalid")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise ValueError("provider gate sequence is invalid")
+        if type(published) is not bool:
+            raise ValueError("provider gate publish result must be boolean")
+        if interlock_reason is not None and (
+            not isinstance(interlock_reason, str) or not interlock_reason
+        ):
+            raise ValueError("provider gate interlock reason is invalid")
+
+        current_token = self.broker.input_token
+        current = self.broker.provider_gate
+        same_authority_current_or_predecessor = bool(
+            current_token is not None
+            and frame.token.lease_id == current_token.lease_id
+            and frame.token.authority_epoch == current_token.authority_epoch
+            and frame.token.input_revision <= current_token.input_revision
+        )
+        if (
+            interlock_reason == "physical_focus_lost"
+            and same_authority_current_or_predecessor
+        ):
+            self.broker.latch_fatal_authority(interlock_reason)
+            current_token = self.broker.input_token
+            current = self.broker.provider_gate
+        # A command/data-modify request may bump the revision after this frame
+        # was sampled but before its socket write completed.  Never let that
+        # stale success qualify the replacement revision.  A stale failure or
+        # final-publish interlock from the same authority is different: the
+        # successor may have inherited the old proof, so it must be invalidated
+        # fail-closed even though the callback names the predecessor revision.
+        if frame.token != current_token or current.input_token != frame.token:
+            strict_same_authority_successor = bool(
+                current_token is not None
+                and current.input_token == current_token
+                and frame.token.lease_id == current_token.lease_id
+                and frame.token.authority_epoch == current_token.authority_epoch
+                and frame.token.input_revision < current_token.input_revision
+            )
+            stale_frame_invalidates_successor = bool(
+                strict_same_authority_successor
+                and (not published or interlock_reason is not None)
+            )
+            if stale_frame_invalidates_successor:
+                # Never weaken an already-sticky gate because an older frame
+                # completed later.  It is already in the required fail-closed
+                # state and its newer diagnostic remains authoritative.
+                if current.phase == "interlocked":
+                    return False
+                sticky_interlock = bool(
+                    interlock_reason is not None
+                    and interlock_reason != "gamepad_connected_edge"
+                )
+                reason = (
+                    interlock_reason
+                    if interlock_reason is not None
+                    else "publisher_send_failed"
+                )
+                last_sequence = current.last_sequence
+                if published and (
+                    last_sequence is None or sequence > last_sequence
+                ):
+                    last_sequence = sequence
+                assert current_token is not None
+                return self.broker.update_provider_gate(
+                    ProviderGateTelemetry(
+                        authority_epoch=current_token.authority_epoch,
+                        lease_id=current_token.lease_id,
+                        input_revision=current_token.input_revision,
+                        phase=(
+                            "interlocked"
+                            if sticky_interlock
+                            else "awaiting_neutral"
+                        ),
+                        ready=False,
+                        neutral_sent_count=0,
+                        last_interlock_reason=reason,
+                        last_sequence=last_sequence,
+                    )
+                )
+            return False
+        # Consecutive means distinct, monotonically published provider frames.
+        # A duplicate callback or regressed sequence must not increment the
+        # neutral proof counter a second time.
+        if current.last_sequence is not None and sequence <= current.last_sequence:
+            return False
+
+        last_sequence = sequence if published else current.last_sequence
+        if current.phase == "interlocked":
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="interlocked",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason=(
+                        current.last_interlock_reason or "input_interlock"
+                    ),
+                    last_sequence=last_sequence,
+                )
+            )
+
+        if not published:
+            # A failed socket write proves nothing about what the core saw.
+            # Drop the consecutive-frame count and require a fresh neutral
+            # sequence, while allowing a later neutral frame to rearm.
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="awaiting_neutral",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason="publisher_send_failed",
+                    last_sequence=current.last_sequence,
+                )
+            )
+
+        if interlock_reason is not None:
+            expected_connect_edge = interlock_reason == "gamepad_connected_edge"
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase=(
+                        "awaiting_neutral"
+                        if expected_connect_edge
+                        else "interlocked"
+                    ),
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason=interlock_reason,
+                    last_sequence=last_sequence,
+                )
+            )
+
+        if current.ready:
+            assert current.qualified_from_revision is not None
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="ready",
+                    ready=True,
+                    neutral_sent_count=current.neutral_sent_count,
+                    qualified_from_revision=current.qualified_from_revision,
+                    last_interlock_reason=None,
+                    last_sequence=last_sequence,
+                )
+            )
+
+        if not frame.requested_neutral:
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="awaiting_neutral",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason="locomotion_requested_before_ready",
+                    last_sequence=last_sequence,
+                )
+            )
+
+        neutral_count = current.neutral_sent_count + 1
+        ready = neutral_count >= current.required_neutral_frames
+        return self.broker.update_provider_gate(
+            ProviderGateTelemetry(
+                authority_epoch=frame.token.authority_epoch,
+                lease_id=frame.token.lease_id,
+                input_revision=frame.token.input_revision,
+                phase="ready" if ready else "awaiting_neutral",
+                ready=ready,
+                neutral_sent_count=neutral_count,
+                qualified_from_revision=(
+                    frame.token.input_revision if ready else None
+                ),
+                last_interlock_reason=(
+                    None if ready else current.last_interlock_reason
+                ),
+                last_sequence=last_sequence,
+            )
+        )
+
+
+def external_provider_source_interlock_reason(
+    frame: ExternalProviderGateFrame,
+    *,
+    configured_source: str,
+) -> str | None:
+    """Reject a virtual device that final source arbitration would discard."""
+
+    if not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if configured_source not in {"auto", "keyboard", "gamepad"}:
+        raise ValueError("configured external input source is invalid")
+    if frame.requested_device == "mixed":
+        return "input_source_mixed"
+    if configured_source == "auto" or frame.requested_device is None:
+        return None
+    if configured_source == "keyboard" and frame.requested_device in {
+        "gamepad",
+        "mixed",
+    }:
+        return "input_source_rejects_gamepad"
+    if configured_source == "gamepad" and frame.requested_device in {
+        "keyboard",
+        "mixed",
+    }:
+        return "input_source_rejects_keyboard"
+    return None
+
+
+def apply_external_source_gate(
+    state: ExternalInputState,
+    frame: ExternalProviderGateFrame,
+    *,
+    configured_source: str,
+) -> tuple[ExternalInputState, str | None]:
+    """Remove all virtual side effects before a rejected source is sampled."""
+
+    if not isinstance(state, ExternalInputState):
+        raise TypeError("external input state is invalid")
+    reason = external_provider_source_interlock_reason(
+        frame,
+        configured_source=configured_source,
+    )
+    return (
+        ExternalInputState.neutral() if reason is not None else state,
+        reason,
+    )
+
+
+def external_provider_interlock_reason(
+    *,
+    physical_focused: bool,
+    camera_dragging: bool,
+    camera_available: bool,
+    input_available: bool,
+    gamepad_connected_edge: bool,
+    calibration_interlock_active: bool,
+) -> str | None:
+    """Name the final publish precondition that invalidates provider proof."""
+
+    flags = (
+        physical_focused,
+        camera_dragging,
+        camera_available,
+        input_available,
+        gamepad_connected_edge,
+        calibration_interlock_active,
+    )
+    if any(type(value) is not bool for value in flags):
+        raise TypeError("provider interlock flags must be boolean")
+    if not physical_focused:
+        return "physical_focus_lost"
+    if calibration_interlock_active:
+        return "calibration_interlock"
+    if camera_dragging:
+        return "camera_dragging"
+    if not camera_available:
+        return "camera_unavailable"
+    if gamepad_connected_edge:
+        return "gamepad_connected_edge"
+    if not input_available:
+        return "input_unavailable"
+    return None
+
+
+def external_provider_publish_interlock_reason(
+    frame: ExternalProviderGateFrame,
+    *,
+    configured_source: str,
+    physical_focused: bool,
+    camera_dragging: bool,
+    camera_available: bool,
+    input_available: bool,
+    gamepad_connected_edge: bool,
+    calibration_interlock_active: bool,
+) -> str | None:
+    """Combine source and final-snapshot gates without hiding fatal focus."""
+
+    if not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if configured_source not in {"auto", "keyboard", "gamepad"}:
+        raise ValueError("configured external input source is invalid")
+    final_reason = external_provider_interlock_reason(
+        physical_focused=physical_focused,
+        camera_dragging=camera_dragging,
+        camera_available=camera_available,
+        input_available=input_available,
+        gamepad_connected_edge=gamepad_connected_edge,
+        calibration_interlock_active=calibration_interlock_active,
+    )
+    if final_reason == "physical_focus_lost":
+        return final_reason
+    return (
+        external_provider_source_interlock_reason(
+            frame,
+            configured_source=configured_source,
+        )
+        or final_reason
+    )
 
 
 class KeyboardDoubleTapDetector:
@@ -3259,6 +3648,89 @@ def build_snapshot(
     )
 
 
+def fail_closed_external_snapshot(snapshot: InputSnapshot) -> InputSnapshot:
+    """Preserve frame identity while removing every externally authored input."""
+
+    if not isinstance(snapshot, InputSnapshot):
+        raise TypeError("external publish snapshot is invalid")
+    return InputSnapshot(
+        sequence=snapshot.sequence,
+        timestamp_monotonic_s=snapshot.timestamp_monotonic_s,
+        focused=False,
+        camera_yaw_rad=snapshot.camera_yaw_rad,
+        keyboard_boost=False,
+        keys=KeySnapshot(
+            w=False,
+            a=False,
+            s=False,
+            d=False,
+            q=False,
+            e=False,
+            v=False,
+            ctrl=False,
+            alt=False,
+            shift=False,
+        ),
+        move_stick=MoveStickSnapshot(right=0.0, forward=0.0),
+        protocol=snapshot.protocol,
+    )
+
+
+def apply_external_publish_interlock(
+    snapshot: InputSnapshot,
+    frame: ExternalProviderGateFrame | None,
+    interlock_reason: str | None,
+) -> InputSnapshot:
+    """Guarantee that an interlocked external frame writes no side effects."""
+
+    if not isinstance(snapshot, InputSnapshot):
+        raise TypeError("external publish snapshot is invalid")
+    if frame is not None and not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if interlock_reason is not None and (
+        not isinstance(interlock_reason, str) or not interlock_reason
+    ):
+        raise ValueError("external input interlock reason is invalid")
+    if frame is None or interlock_reason is None:
+        return snapshot
+    return fail_closed_external_snapshot(snapshot)
+
+
+@dataclass(frozen=True)
+class ExternalPublishBoundary:
+    snapshot: InputSnapshot
+    current_token: ExternalInputToken | None
+    exact_revision: bool
+
+
+def external_publish_boundary(
+    broker: ExternalControlBroker,
+    frame: ExternalProviderGateFrame | None,
+    snapshot: InputSnapshot,
+    *,
+    now: float,
+) -> ExternalPublishBoundary:
+    """Freeze the final authority decision immediately before socket send."""
+
+    if not isinstance(broker, ExternalControlBroker):
+        raise TypeError("external publish boundary requires its broker")
+    if frame is not None and not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if not isinstance(snapshot, InputSnapshot):
+        raise TypeError("external publish snapshot is invalid")
+    current_token = broker.publish_boundary_token(now=now)
+    exact_revision = bool(frame is not None and frame.token == current_token)
+    return ExternalPublishBoundary(
+        snapshot=(
+            snapshot
+            if frame is None or exact_revision
+            else fail_closed_external_snapshot(snapshot)
+        ),
+        current_token=current_token,
+        exact_revision=exact_revision,
+    )
+
+
 class _CleanupCoordinator:
     """Run every provider cleanup step even when earlier steps fail."""
 
@@ -3374,6 +3846,16 @@ class OverlayIntent:
     policy_id: str | None = None
 
 
+@dataclass(frozen=True)
+class PendingExternalInputPublish:
+    """One data-modify mutation waiting for its exact provider-frame write."""
+
+    token: ExternalInputToken
+    path: str
+    warning: str | None
+    data: dict[str, object] | None
+
+
 class GameCommandClient:
     """Send one typed MC command at a time over an inherited socketpair.
 
@@ -3395,6 +3877,7 @@ class GameCommandClient:
         self._sequence = 0
         self._result_revision = 0
         self._pending: GameCommandRequest | None = None
+        self._pending_external_input: PendingExternalInputPublish | None = None
         self._pending_warning: str | None = None
         self._outcome_unknown = False
         self.editing = False
@@ -3534,7 +4017,7 @@ class GameCommandClient:
 
     @property
     def in_flight(self) -> bool:
-        return self._pending is not None
+        return self._pending is not None or self._pending_external_input is not None
 
     @property
     def outcome_unknown(self) -> bool:
@@ -3717,7 +4200,10 @@ class GameCommandClient:
         calibration_active: bool,
         neutral_frame_ready: bool,
         restart_requested: bool,
-        input_modifier: Callable[[DataModifyInput], dict[str, object] | None],
+        input_modifier: Callable[
+            [DataModifyInput],
+            tuple[ExternalInputToken, dict[str, object] | None],
+        ],
     ) -> bool:
         """Submit one capability-authenticated API command.
 
@@ -3744,18 +4230,38 @@ class GameCommandClient:
             return False
         if isinstance(parsed.command, DataModifyInput):
             try:
-                data = input_modifier(parsed.command)
+                modified = input_modifier(parsed.command)
             except Exception as exc:
                 code = getattr(exc, "code", "E_EXTERNAL_INPUT")
                 message = getattr(exc, "message", str(exc) or type(exc).__name__)
                 self._local_error(str(code), str(message))
                 return False
+            if (
+                not isinstance(modified, tuple)
+                or len(modified) != 2
+                or not isinstance(modified[0], ExternalInputToken)
+                or (modified[1] is not None and not isinstance(modified[1], dict))
+            ):
+                self._local_error(
+                    "E_EXTERNAL_INPUT",
+                    "input modifier did not return an exact input token",
+                )
+                return False
+            token, data = modified
+            self._pending_external_input = PendingExternalInputPublish(
+                token=token,
+                path=parsed.command.path,
+                warning=parsed.warning,
+                data=data,
+            )
             self._result_revision += 1
             self._outcome_unknown = False
-            self.status = "success"
-            self.ok = True
-            self.code = "OK_DATA_INPUT_MODIFIED"
-            self.message = f"Set {parsed.command.path}"
+            self.status = "pending"
+            self.ok = None
+            self.code = None
+            self.message = (
+                "Input modified; waiting for its exact provider-frame publish"
+            )
             self.warning = parsed.warning
             self.restart_required = False
             self.data = data
@@ -3775,6 +4281,114 @@ class GameCommandClient:
             warning=parsed.warning,
             pending_message="External command submitted; waiting for the runtime",
         )
+
+    def resolve_external_input_publish(
+        self,
+        *,
+        sampled_token: ExternalInputToken | None,
+        current_token: ExternalInputToken | None,
+        authority_active: bool,
+        published: bool,
+        locomotion_admitted: bool,
+        interlock_reason: str | None,
+        data: dict[str, object] | None = None,
+    ) -> bool:
+        """Resolve a provider-side input command from one final frame outcome."""
+
+        pending = self._pending_external_input
+        if pending is None:
+            return False
+        if (
+            type(authority_active) is not bool
+            or type(published) is not bool
+            or type(locomotion_admitted) is not bool
+        ):
+            raise TypeError("external input publish outcome flags must be boolean")
+        if sampled_token is not None and not isinstance(
+            sampled_token, ExternalInputToken
+        ):
+            raise TypeError("sampled external input token is invalid")
+        if current_token is not None and not isinstance(
+            current_token, ExternalInputToken
+        ):
+            raise TypeError("current external input token is invalid")
+        if interlock_reason is not None and (
+            not isinstance(interlock_reason, str) or not interlock_reason
+        ):
+            raise ValueError("external input interlock reason is invalid")
+        if data is not None and not isinstance(data, dict):
+            raise TypeError("external input result data must be a mapping")
+
+        if not authority_active or current_token is None:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_AUTHORITY_REVOKED",
+                message="External input authority was revoked before publish",
+                data=data,
+            )
+        if current_token != pending.token:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_SUPERSEDED",
+                message="External input revision changed before publish",
+                data=data,
+            )
+        # The provider may have sampled the predecessor immediately before the
+        # command was admitted in this same loop iteration.  That frame cannot
+        # prove or reject the pending mutation; wait for the exact revision.
+        if sampled_token != pending.token:
+            return False
+        if interlock_reason is not None:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_INTERLOCK",
+                message=f"External input publish interlocked: {interlock_reason}",
+                data=data,
+            )
+        if not published:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_PUBLISH_FAILED",
+                message="External input provider frame was not published",
+                data=data,
+            )
+        if not locomotion_admitted:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_INTERLOCK",
+                message="External input provider gate did not admit locomotion",
+                data=data,
+            )
+        return self._finish_external_input_publish(
+            ok=True,
+            code="OK_DATA_INPUT_MODIFIED",
+            message=f"Set {pending.path}",
+            data=data,
+        )
+
+    def _finish_external_input_publish(
+        self,
+        *,
+        ok: bool,
+        code: str,
+        message: str,
+        data: dict[str, object] | None,
+    ) -> bool:
+        pending = self._pending_external_input
+        if pending is None:
+            return False
+        self._pending_external_input = None
+        self._result_revision += 1
+        self._outcome_unknown = False
+        self.status = "success" if ok else "error"
+        self.ok = ok
+        self.code = code
+        self.message = message
+        self.warning = pending.warning
+        self.restart_required = False
+        self.data = pending.data if data is None else data
+        self.last_request_id = None
+        return True
 
     def _send_typed_command(
         self,
@@ -3978,6 +4592,21 @@ class GameCommandClient:
                 "Game command provider stopped before the runtime response"
             )
             return
+        pending_external = self._pending_external_input
+        if pending_external is not None:
+            self._pending_external_input = None
+            self._result_revision += 1
+            self._outcome_unknown = True
+            self.status = "error"
+            self.ok = None
+            self.code = "E_COMMAND_OUTCOME_UNKNOWN"
+            self.message = (
+                "External input publish outcome unknown; do not retry blindly"
+            )
+            self.warning = pending_external.warning
+            self.restart_required = False
+            self.data = pending_external.data
+            self.last_request_id = None
         self._pending_warning = None
         self._close_channel()
 
@@ -4747,6 +5376,7 @@ def main() -> int:
     shortcut_arming = StartupShortcutArming()
     double_tap = KeyboardDoubleTapDetector(args.keyboard_double_tap_window_s)
     external_control: ExternalControlBroker | None = None
+    external_provider_gate: ExternalLocomotionProviderGate | None = None
     external_inflight_command: ExternalCommand | None = None
     if args.external_control_socket is not None:
         assert args.external_control_capability_file is not None
@@ -4755,6 +5385,7 @@ def main() -> int:
             args.external_control_capability_file,
             deadman_seconds=args.external_control_deadman_seconds,
         )
+        external_provider_gate = ExternalLocomotionProviderGate(external_control)
 
     running = True
 
@@ -4857,6 +5488,7 @@ def main() -> int:
             input_source_id = "physical"
             raw_keyboard = physical_keyboard
             raw_pad = physical_pad
+            external_gate_frame: ExternalProviderGateFrame | None = None
             if external_control is not None:
                 external_control.poll(now=now)
                 override_reason = physical_external_override_reason(
@@ -4867,11 +5499,36 @@ def main() -> int:
                 )
                 if override_reason is None and panel_intents:
                     override_reason = "physical_panel"
-                if override_reason is not None and external_control.lease_active:
+                # Focus is one of the provider's final snapshot interlocks.  It
+                # keeps the lease alive just long enough for the client to read
+                # typed gate telemetry; actual physical key/mouse/gamepad input
+                # still revokes external authority immediately.
+                if (
+                    override_reason is not None
+                    and override_reason != "focus_lost"
+                    and external_control.lease_active
+                ):
                     external_control.local_override(override_reason)
                     external_control_changed = True
                 if external_control.lease_active:
-                    external_state = external_control.sample(now=now)
+                    external_state, external_token = (
+                        external_control.sample_with_token(now=now)
+                    )
+                    assert external_provider_gate is not None
+                    external_state, external_gate_frame = (
+                        external_provider_gate.prepare(
+                            external_state,
+                            external_token,
+                        )
+                    )
+                    if external_gate_frame is not None:
+                        external_state, _source_interlock = (
+                            apply_external_source_gate(
+                                external_state,
+                                external_gate_frame,
+                                configured_source=input_source,
+                            )
+                        )
                     raw_keyboard, raw_pad = external_input_samples(
                         external_state,
                         focus=physical_keyboard,
@@ -4981,18 +5638,21 @@ def main() -> int:
 
                     def modify_external_input(
                         command: DataModifyInput,
-                    ) -> dict[str, object] | None:
+                    ) -> tuple[ExternalInputToken, dict[str, object] | None]:
                         assert external_control is not None
-                        external_control.apply_data_modify(
+                        modified_token = external_control.apply_data_modify(
                             command.path,
                             command.value,
                             now=now,
                         )
-                        return {
-                            "request_sequence": external_command.request_sequence,
-                            "peer_pid": external_command.peer_pid,
-                            "external_control": external_control.telemetry(now=now),
-                        }
+                        return (
+                            modified_token,
+                            {
+                                "request_sequence": external_command.request_sequence,
+                                "peer_pid": external_command.peer_pid,
+                                "external_control": external_control.telemetry(now=now),
+                            },
+                        )
 
                     external_submitted = game_command_client.submit_external(
                         external_command.command,
@@ -5097,6 +5757,10 @@ def main() -> int:
             )
             pointer_telemetry = x11.pointer_telemetry
             teleport_rejections = int(pointer_telemetry["teleport_rejections"])
+            gamepad_connected_edge = bool(
+                previous_gamepad_connected is not None
+                and pad.connected != previous_gamepad_connected
+            )
             input_available = gamepad_input_available(
                 frame_input_source,
                 connected=pad.connected,
@@ -5131,6 +5795,21 @@ def main() -> int:
                 args.camera_yaw_source not in {"carla", "ue-final-pov"}
                 or observed_yaw is not None
             )
+            if external_gate_frame is not None:
+                external_gate_interlock_reason = (
+                    external_provider_publish_interlock_reason(
+                        external_gate_frame,
+                        configured_source=input_source,
+                        physical_focused=physical_keyboard.focused,
+                        camera_dragging=keyboard.camera_dragging,
+                        camera_available=camera_available,
+                        input_available=input_available,
+                        gamepad_connected_edge=gamepad_connected_edge,
+                        calibration_interlock_active=calibration_interlock_active,
+                    )
+                )
+            else:
+                external_gate_interlock_reason = None
             keyboard_boost = double_tap.update(
                 keyboard,
                 now_s=now,
@@ -5171,6 +5850,14 @@ def main() -> int:
                     external_telemetry["local_overrides"],
                     external_telemetry["commands_queued"],
                     external_telemetry["last_override_reason"],
+                    json.dumps(
+                        external_telemetry["input_token"],
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        external_telemetry["provider_gate"],
+                        sort_keys=True,
+                    ),
                 )
                 if next_external_signature != external_telemetry_signature:
                     external_control_changed = True
@@ -5241,15 +5928,97 @@ def main() -> int:
                 input_available=input_available,
                 keyboard_boost=keyboard_boost,
             )
+            snapshot = apply_external_publish_interlock(
+                snapshot,
+                external_gate_frame,
+                external_gate_interlock_reason,
+            )
+            publish_now = time.monotonic()
+            publish_boundary_token: ExternalInputToken | None = None
+            publish_boundary_exact = False
+            if external_control is not None:
+                boundary = external_publish_boundary(
+                    external_control,
+                    external_gate_frame,
+                    snapshot,
+                    now=publish_now,
+                )
+                snapshot = boundary.snapshot
+                publish_boundary_token = boundary.current_token
+                publish_boundary_exact = boundary.exact_revision
             last_snapshot = snapshot
             neutral_delivered = False
             if publisher is None:
                 print(encode_input_packet(snapshot).decode("ascii"), flush=True)
                 sent_frames += 1
                 neutral_delivered = True
-            elif publisher.send(snapshot, now=now):
+            elif publisher.send(snapshot, now=publish_now):
                 sent_frames += 1
                 neutral_delivered = True
+            provider_packet_published = bool(
+                publisher is not None and neutral_delivered
+            )
+            exact_external_published = bool(
+                provider_packet_published and publish_boundary_exact
+            )
+            if external_gate_frame is not None:
+                assert external_provider_gate is not None
+                external_provider_gate.observe_published(
+                    external_gate_frame,
+                    sequence=snapshot.sequence,
+                    # Printing a dry-run packet is useful diagnostics, but it
+                    # is not proof that the core accepted a provider frame.
+                    # A successfully sent boundary-neutral packet also counts
+                    # as a stale-frame send success here, so same-loop R1->R2
+                    # cannot invalidate R2's inherited proof.  It still cannot
+                    # resolve the pending R2 command below.
+                    published=provider_packet_published,
+                    interlock_reason=external_gate_interlock_reason,
+                )
+            if (
+                external_control is not None
+                and external_inflight_command is not None
+            ):
+                persistent_gate_interlock = (
+                    external_control.provider_gate.last_interlock_reason
+                    if external_control.provider_gate.phase == "interlocked"
+                    else None
+                )
+                publish_resolved = game_command_client.resolve_external_input_publish(
+                    sampled_token=(
+                        external_gate_frame.token
+                        if external_gate_frame is not None
+                        else None
+                    ),
+                    current_token=publish_boundary_token,
+                    authority_active=publish_boundary_token is not None,
+                    published=exact_external_published,
+                    locomotion_admitted=bool(
+                        external_gate_frame is not None
+                        and external_gate_frame.locomotion_admitted
+                    ),
+                    interlock_reason=(
+                        external_gate_interlock_reason
+                        or persistent_gate_interlock
+                    ),
+                    data={
+                        "request_sequence": (
+                            external_inflight_command.request_sequence
+                        ),
+                        "peer_pid": external_inflight_command.peer_pid,
+                        "external_control": external_control.telemetry(
+                            now=publish_now
+                        ),
+                    },
+                )
+                if publish_resolved:
+                    external_control.complete_command(
+                        external_inflight_command,
+                        game_command_client.mapping(),
+                    )
+                    external_inflight_command = None
+                    command_state_changed = True
+                    external_control_changed = True
             if calibration.active:
                 calibration_neutral_frames = (
                     calibration_neutral_frames + 1 if neutral_delivered else 0

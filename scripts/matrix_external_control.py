@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import stat
@@ -25,7 +26,9 @@ import time
 from typing import Callable
 
 
-PROTOCOL = "matrix-external-control/v1"
+PROTOCOL = "matrix-external-control/v2"
+PROVIDER_GATE_SCHEMA = "matrix-external-provider-gate/v1"
+PROVIDER_GATE_REQUIRED_NEUTRAL_FRAMES = 2
 COMMAND_RECEIPT_SCHEMA = "matrix-external-command-receipt/v1"
 MAX_PACKET_BYTES = 16_384
 MAX_COMMAND_CHARS = 512
@@ -209,6 +212,14 @@ class ExternalInputState:
         gamepad_buttons = _bool_mapping(
             gamepad["buttons"], GAMEPAD_BUTTON_FIELDS, label="gamepad.buttons"
         )
+        if not gamepad["connected"] and (
+            any(abs(axis) > 1e-12 for axis in gamepad_axes.values())
+            or any(gamepad_buttons.values())
+        ):
+            raise ExternalControlError(
+                "E_INPUT_STATE",
+                "disconnected gamepad must have neutral axes and buttons",
+            )
         return cls(
             keyboard=keyboard,
             mouse_buttons=mouse_buttons,
@@ -260,6 +271,211 @@ class ExternalInputState:
             axes[name] = number
             return replace(self, gamepad_axes=axes, gamepad_connected=True)
         raise ExternalControlError("E_DATA_PATH_UNKNOWN", "unsupported input path")
+
+    @property
+    def locomotion_neutral(self) -> bool:
+        return bool(
+            not any(self.keyboard[name] for name in ("w", "a", "s", "d"))
+            and abs(self.gamepad_axes["forward"]) <= 1e-12
+            and abs(self.gamepad_axes["right"]) <= 1e-12
+        )
+
+    def without_locomotion(self) -> "ExternalInputState":
+        keyboard = dict(self.keyboard)
+        for name in ("w", "a", "s", "d"):
+            keyboard[name] = False
+        axes = dict(self.gamepad_axes)
+        axes["forward"] = 0.0
+        axes["right"] = 0.0
+        return replace(self, keyboard=keyboard, gamepad_axes=axes)
+
+
+@dataclass(frozen=True)
+class ExternalInputToken:
+    """Exact identity of one client-authored external input revision."""
+
+    lease_id: str
+    authority_epoch: int
+    input_revision: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lease_id, str) or re.fullmatch(
+            r"[0-9a-f]{32}", self.lease_id
+        ) is None:
+            raise ValueError("external input token lease id is invalid")
+        if (
+            isinstance(self.authority_epoch, bool)
+            or not isinstance(self.authority_epoch, int)
+            or self.authority_epoch <= 0
+        ):
+            raise ValueError("external input token authority epoch is invalid")
+        if (
+            isinstance(self.input_revision, bool)
+            or not isinstance(self.input_revision, int)
+            or self.input_revision < 0
+        ):
+            raise ValueError("external input token revision is invalid")
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "lease_id": self.lease_id,
+            "authority_epoch": self.authority_epoch,
+            "input_revision": self.input_revision,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ExternalInputToken":
+        if not isinstance(value, dict) or set(value) != {
+            "lease_id",
+            "authority_epoch",
+            "input_revision",
+        }:
+            raise ValueError("external input token schema is invalid")
+        return cls(
+            lease_id=value["lease_id"],
+            authority_epoch=value["authority_epoch"],
+            input_revision=value["input_revision"],
+        )
+
+
+@dataclass(frozen=True)
+class ProviderGateTelemetry:
+    """Typed provider-to-client proof that external locomotion is rearmed."""
+
+    authority_epoch: int
+    lease_id: str | None
+    input_revision: int | None
+    phase: str
+    ready: bool
+    neutral_sent_count: int
+    qualified_from_revision: int | None = None
+    last_interlock_reason: str | None = None
+    last_sequence: int | None = None
+    schema: str = PROVIDER_GATE_SCHEMA
+    required_neutral_frames: int = PROVIDER_GATE_REQUIRED_NEUTRAL_FRAMES
+
+    def __post_init__(self) -> None:
+        if self.schema != PROVIDER_GATE_SCHEMA:
+            raise ValueError("provider gate schema is invalid")
+        if (
+            isinstance(self.authority_epoch, bool)
+            or not isinstance(self.authority_epoch, int)
+            or self.authority_epoch < 0
+        ):
+            raise ValueError("provider gate authority epoch is invalid")
+        if self.phase not in {
+            "inactive",
+            "awaiting_neutral",
+            "ready",
+            "interlocked",
+        }:
+            raise ValueError("provider gate phase is invalid")
+        active_identity = self.lease_id is not None or self.input_revision is not None
+        if self.phase == "inactive":
+            if active_identity:
+                raise ValueError("inactive provider gate cannot carry an input token")
+        else:
+            try:
+                ExternalInputToken(
+                    lease_id=self.lease_id,
+                    authority_epoch=self.authority_epoch,
+                    input_revision=self.input_revision,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("active provider gate input token is invalid") from exc
+        if type(self.ready) is not bool:
+            raise ValueError("provider gate ready flag must be boolean")
+        if (
+            isinstance(self.neutral_sent_count, bool)
+            or not isinstance(self.neutral_sent_count, int)
+            or self.neutral_sent_count < 0
+        ):
+            raise ValueError("provider gate neutral count is invalid")
+        if self.required_neutral_frames != PROVIDER_GATE_REQUIRED_NEUTRAL_FRAMES:
+            raise ValueError("provider gate neutral-frame contract is invalid")
+        if self.last_interlock_reason is not None and (
+            not isinstance(self.last_interlock_reason, str)
+            or not self.last_interlock_reason
+        ):
+            raise ValueError("provider gate interlock reason is invalid")
+        if self.last_sequence is not None and (
+            isinstance(self.last_sequence, bool)
+            or not isinstance(self.last_sequence, int)
+            or self.last_sequence <= 0
+        ):
+            raise ValueError("provider gate sequence is invalid")
+        if self.ready != (self.phase == "ready"):
+            raise ValueError("provider gate ready flag disagrees with phase")
+        if self.ready and self.neutral_sent_count < self.required_neutral_frames:
+            raise ValueError("ready provider gate lacks neutral-frame proof")
+        if self.phase in {"inactive", "interlocked"} and self.neutral_sent_count != 0:
+            raise ValueError("inactive/interlocked provider gate must have zero count")
+        if self.ready:
+            if (
+                isinstance(self.qualified_from_revision, bool)
+                or not isinstance(self.qualified_from_revision, int)
+                or self.qualified_from_revision < 0
+                or self.input_revision is None
+                or self.qualified_from_revision > self.input_revision
+            ):
+                raise ValueError("ready provider gate qualification is invalid")
+        elif self.qualified_from_revision is not None:
+            raise ValueError("unready provider gate cannot carry a qualification")
+
+    @property
+    def input_token(self) -> ExternalInputToken | None:
+        if self.lease_id is None or self.input_revision is None:
+            return None
+        return ExternalInputToken(
+            lease_id=self.lease_id,
+            authority_epoch=self.authority_epoch,
+            input_revision=self.input_revision,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "authority_epoch": self.authority_epoch,
+            "lease_id": self.lease_id,
+            "input_revision": self.input_revision,
+            "phase": self.phase,
+            "ready": self.ready,
+            "neutral_sent_count": self.neutral_sent_count,
+            "qualified_from_revision": self.qualified_from_revision,
+            "required_neutral_frames": self.required_neutral_frames,
+            "last_interlock_reason": self.last_interlock_reason,
+            "last_sequence": self.last_sequence,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "ProviderGateTelemetry":
+        if not isinstance(value, dict) or set(value) != {
+            "schema",
+            "authority_epoch",
+            "lease_id",
+            "input_revision",
+            "phase",
+            "ready",
+            "neutral_sent_count",
+            "qualified_from_revision",
+            "required_neutral_frames",
+            "last_interlock_reason",
+            "last_sequence",
+        }:
+            raise ValueError("provider gate telemetry schema is invalid")
+        return cls(
+            schema=value["schema"],
+            authority_epoch=value["authority_epoch"],
+            lease_id=value["lease_id"],
+            input_revision=value["input_revision"],
+            phase=value["phase"],
+            ready=value["ready"],
+            neutral_sent_count=value["neutral_sent_count"],
+            qualified_from_revision=value["qualified_from_revision"],
+            required_neutral_frames=value["required_neutral_frames"],
+            last_interlock_reason=value["last_interlock_reason"],
+            last_sequence=value["last_sequence"],
+        )
 
 
 @dataclass(frozen=True)
@@ -413,7 +629,17 @@ class ExternalControlBroker:
         self._lease_client_fd: int | None = None
         self._lease_id: str | None = None
         self._lease_last_refresh: float | None = None
+        self._fatal_authority_reason: str | None = None
         self._authority_epoch = 0
+        self._input_revision: int | None = None
+        self._provider_gate = ProviderGateTelemetry(
+            authority_epoch=0,
+            lease_id=None,
+            input_revision=None,
+            phase="inactive",
+            ready=False,
+            neutral_sent_count=0,
+        )
         self._state = ExternalInputState.neutral()
         self._commands: deque[ExternalCommand] = deque(maxlen=MAX_COMMAND_QUEUE)
         self._command_receipts: dict[str, _CommandReceipt] = {}
@@ -439,6 +665,76 @@ class ExternalControlBroker:
     @property
     def capability(self) -> str:
         return self._token
+
+    @property
+    def authority_epoch(self) -> int:
+        return self._authority_epoch
+
+    @property
+    def provider_gate(self) -> ProviderGateTelemetry:
+        return self._provider_gate
+
+    @property
+    def input_token(self) -> ExternalInputToken | None:
+        if self._lease_id is None or self._input_revision is None:
+            return None
+        return ExternalInputToken(
+            lease_id=self._lease_id,
+            authority_epoch=self._authority_epoch,
+            input_revision=self._input_revision,
+        )
+
+    def update_provider_gate(self, value: ProviderGateTelemetry | dict[str, object]) -> bool:
+        """Publish an epoch-bound provider proof without reviving stale authority."""
+
+        telemetry = (
+            value
+            if isinstance(value, ProviderGateTelemetry)
+            else ProviderGateTelemetry.from_mapping(value)
+        )
+        if telemetry.authority_epoch != self._authority_epoch:
+            return False
+        if self._lease_id is None:
+            if telemetry.phase != "inactive":
+                return False
+        else:
+            current = self.input_token
+            if telemetry.phase == "inactive" or telemetry.input_token != current:
+                return False
+            if self._fatal_authority_reason is not None and (
+                telemetry.phase != "interlocked"
+                or telemetry.last_interlock_reason
+                != self._fatal_authority_reason
+            ):
+                return False
+        self._provider_gate = telemetry
+        return True
+
+    def latch_fatal_authority(self, reason: str) -> bool:
+        """Zero input and freeze authority until its original deadman expiry."""
+
+        if reason != "physical_focus_lost":
+            raise ValueError("unsupported fatal external-authority reason")
+        if self._lease_id is None:
+            return False
+        if self._fatal_authority_reason is not None:
+            return False
+        token = self.input_token
+        assert token is not None
+        self._fatal_authority_reason = reason
+        self._state = ExternalInputState.neutral()
+        self._last_override_reason = reason
+        self._provider_gate = ProviderGateTelemetry(
+            authority_epoch=token.authority_epoch,
+            lease_id=token.lease_id,
+            input_revision=token.input_revision,
+            phase="interlocked",
+            ready=False,
+            neutral_sent_count=0,
+            last_interlock_reason=reason,
+            last_sequence=self._provider_gate.last_sequence,
+        )
+        return True
 
     @staticmethod
     def _identity(path: Path) -> tuple[int, int]:
@@ -577,8 +873,20 @@ class ExternalControlBroker:
         self._lease_client_fd = None
         self._lease_id = None
         self._lease_last_refresh = None
+        self._fatal_authority_reason = None
+        self._input_revision = None
         self._state = ExternalInputState.neutral()
         self._last_override_reason = reason
+        self._provider_gate = ProviderGateTelemetry(
+            authority_epoch=self._authority_epoch,
+            lease_id=None,
+            input_revision=None,
+            phase="inactive",
+            ready=False,
+            neutral_sent_count=0,
+            last_interlock_reason=reason,
+            last_sequence=self._provider_gate.last_sequence,
+        )
 
     def _prune_receipts(self) -> None:
         if len(self._command_receipts) <= MAX_COMMAND_RECEIPTS:
@@ -734,11 +1042,26 @@ class ExternalControlBroker:
             if self._lease_id is not None and self._lease_client_fd != client_fd:
                 self.lease_conflicts += 1
                 raise ExternalControlError("E_LEASE_BUSY", "another client owns the lease")
+            if self._fatal_authority_reason is not None:
+                raise ExternalControlError(
+                    "E_AUTHORITY_REVOKED",
+                    "external authority is latched until its deadman deadline",
+                )
             if self._lease_id is None:
                 self._lease_client_fd = client_fd
                 self._lease_id = secrets.token_hex(16)
                 self._authority_epoch += 1
+                self._input_revision = 0
                 self.lease_acquisitions += 1
+                self._fatal_authority_reason = None
+                self._provider_gate = ProviderGateTelemetry(
+                    authority_epoch=self._authority_epoch,
+                    lease_id=self._lease_id,
+                    input_revision=self._input_revision,
+                    phase="awaiting_neutral",
+                    ready=False,
+                    neutral_sent_count=0,
+                )
             self._lease_last_refresh = now
             self._last_override_reason = None
             return self._response(
@@ -750,6 +1073,8 @@ class ExternalControlBroker:
                     "lease_id": self._lease_id,
                     "deadman_seconds": self.deadman_seconds,
                     "authority_epoch": self._authority_epoch,
+                    "input_token": self.input_token.to_mapping(),
+                    "provider_gate": self._provider_gate.to_mapping(),
                 },
             )
 
@@ -757,15 +1082,22 @@ class ExternalControlBroker:
             if set(payload) != {"lease_id"}:
                 raise ExternalControlError("E_SCHEMA", "lease.renew payload is invalid")
             self._require_lease(client_fd, payload)
-            self._lease_last_refresh = now
+            if self._fatal_authority_reason is None:
+                self._lease_last_refresh = now
             return self._response(
                 sequence,
                 ok=True,
                 code="OK_RENEWED",
-                message="external control lease renewed",
+                message=(
+                    "external control lease renewed"
+                    if self._fatal_authority_reason is None
+                    else "fatal authority latch observed; deadline unchanged"
+                ),
                 data={
                     "lease_id": self._lease_id,
                     "authority_epoch": self._authority_epoch,
+                    "input_token": self.input_token.to_mapping(),
+                    "provider_gate": self._provider_gate.to_mapping(),
                 },
             )
 
@@ -782,24 +1114,133 @@ class ExternalControlBroker:
             )
 
         if operation == "input.replace":
-            if set(payload) != {"lease_id", "state"}:
+            if set(payload) not in (
+                {"lease_id", "state"},
+                {"lease_id", "state", "qualified_token"},
+            ):
                 raise ExternalControlError("E_SCHEMA", "input.replace payload is invalid")
             self._require_lease(client_fd, payload)
             state = ExternalInputState.from_mapping(payload["state"])
+            if self._fatal_authority_reason is not None:
+                if state != ExternalInputState.neutral():
+                    raise ExternalControlError(
+                        "E_AUTHORITY_REVOKED",
+                        "fatal authority latch only permits full-neutral cleanup",
+                    )
+                assert self._input_revision is not None
+                self._input_revision += 1
+                self._state = state
+                self.input_replacements += 1
+                cleanup_token = self.input_token
+                assert cleanup_token is not None
+                self._provider_gate = ProviderGateTelemetry(
+                    authority_epoch=cleanup_token.authority_epoch,
+                    lease_id=cleanup_token.lease_id,
+                    input_revision=cleanup_token.input_revision,
+                    phase="interlocked",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason=self._fatal_authority_reason,
+                    last_sequence=self._provider_gate.last_sequence,
+                )
+                return self._response(
+                    sequence,
+                    ok=True,
+                    code="OK_INPUT_REPLACED",
+                    message="fatal authority input cleared; deadline unchanged",
+                    data={
+                        "input_token": cleanup_token.to_mapping(),
+                        "provider_gate": self._provider_gate.to_mapping(),
+                    },
+                )
+            current_token = self.input_token
+            assert current_token is not None
+            qualified_from_revision: int | None = None
+            if not state.locomotion_neutral:
+                raw_proof = payload.get("qualified_token")
+                if raw_proof is None:
+                    raise ExternalControlError(
+                        "E_INPUT_NOT_READY",
+                        "non-neutral locomotion requires a provider gate proof",
+                    )
+                try:
+                    proof = ExternalInputToken.from_mapping(raw_proof)
+                except ValueError as exc:
+                    raise ExternalControlError(
+                        "E_INPUT_SUPERSEDED",
+                        "provider gate proof token is malformed or stale",
+                    ) from exc
+                if proof != current_token:
+                    raise ExternalControlError(
+                        "E_INPUT_SUPERSEDED",
+                        "provider gate proof no longer names the current input",
+                    )
+                if (
+                    not self._provider_gate.ready
+                    or self._provider_gate.input_token != current_token
+                ):
+                    raise ExternalControlError(
+                        "E_INPUT_NOT_READY",
+                        "provider has not qualified the current neutral input",
+                    )
+                qualified_from_revision = (
+                    self._provider_gate.qualified_from_revision
+                )
+                assert qualified_from_revision is not None
+            assert self._input_revision is not None
+            self._input_revision += 1
             self._state = state
             self._lease_last_refresh = now
             self.input_replacements += 1
+            next_token = self.input_token
+            assert next_token is not None
+            if state.locomotion_neutral:
+                self._provider_gate = ProviderGateTelemetry(
+                    authority_epoch=self._authority_epoch,
+                    lease_id=next_token.lease_id,
+                    input_revision=next_token.input_revision,
+                    phase="awaiting_neutral",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason="input_revision_changed",
+                    last_sequence=self._provider_gate.last_sequence,
+                )
+            else:
+                self._provider_gate = ProviderGateTelemetry(
+                    authority_epoch=self._authority_epoch,
+                    lease_id=next_token.lease_id,
+                    input_revision=next_token.input_revision,
+                    phase="ready",
+                    ready=True,
+                    neutral_sent_count=self._provider_gate.neutral_sent_count,
+                    qualified_from_revision=qualified_from_revision,
+                    # A successful exact-token transfer is the current gate
+                    # state.  Do not carry a historical rearm diagnostic into
+                    # a ready revision where clients could mistake it for a
+                    # live interlock.
+                    last_interlock_reason=None,
+                    last_sequence=self._provider_gate.last_sequence,
+                )
             return self._response(
                 sequence,
                 ok=True,
                 code="OK_INPUT_REPLACED",
                 message="virtual input state replaced",
+                data={
+                    "input_token": next_token.to_mapping(),
+                    "provider_gate": self._provider_gate.to_mapping(),
+                },
             )
 
         if operation == "command.submit":
             if set(payload) != {"lease_id", "command"}:
                 raise ExternalControlError("E_SCHEMA", "command.submit payload is invalid")
             self._require_lease(client_fd, payload)
+            if self._fatal_authority_reason is not None:
+                raise ExternalControlError(
+                    "E_AUTHORITY_REVOKED",
+                    "fatal authority latch rejects new commands",
+                )
             command = payload.get("command")
             if (
                 not isinstance(command, str)
@@ -911,7 +1352,11 @@ class ExternalControlBroker:
                 except ExternalControlError as exc:
                     if exc.code == "E_LEASE":
                         self.stale_lease_rejections += 1
-                    else:
+                    elif exc.code not in {
+                        "E_AUTHORITY_REVOKED",
+                        "E_INPUT_NOT_READY",
+                        "E_INPUT_SUPERSEDED",
+                    }:
                         self.protocol_errors += 1
                     response = self._response(
                         sequence,
@@ -933,14 +1378,44 @@ class ExternalControlBroker:
         return self._lease_id is not None
 
     def sample(self, *, now: float | None = None) -> ExternalInputState:
+        state, _token = self.sample_with_token(now=now)
+        return state
+
+    def publish_boundary_token(
+        self,
+        *,
+        now: float | None = None,
+    ) -> ExternalInputToken | None:
+        """Revalidate authority immediately before a provider socket write.
+
+        This deliberately does not sample or consume one-shot mouse deltas.  A
+        caller can therefore compare its earlier sampled token against this
+        boundary token using one frozen monotonic timestamp.
+        """
+
+        current = self._clock() if now is None else float(now)
+        if not math.isfinite(current) or current < 0.0:
+            raise ValueError("external control time must be finite and nonnegative")
+        self._expire(current)
+        return self.input_token
+
+    def sample_with_token(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[ExternalInputState, ExternalInputToken | None]:
+        """Atomically sample state and the exact client revision that authored it."""
+
         current = self._clock() if now is None else float(now)
         self._expire(current)
         if self._lease_id is None:
-            return ExternalInputState.neutral()
+            return ExternalInputState.neutral(), None
         state = self._state
+        token = self.input_token
+        assert token is not None
         if state.mouse_dx != 0.0 or state.mouse_dy != 0.0:
             self._state = replace(state, mouse_dx=0.0, mouse_dy=0.0)
-        return state
+        return state, token
 
     def apply_data_modify(
         self,
@@ -948,14 +1423,62 @@ class ExternalControlBroker:
         value: bool | float,
         *,
         now: float | None = None,
-    ) -> None:
+    ) -> ExternalInputToken:
         current = self._clock() if now is None else float(now)
         self._expire(current)
         if self._lease_id is None:
             raise ExternalControlError("E_LEASE", "an active external lease is required")
-        self._state = self._state.with_data_modify(path, value)
+        if self._fatal_authority_reason is not None:
+            raise ExternalControlError(
+                "E_AUTHORITY_REVOKED",
+                "fatal authority latch rejects input modification",
+            )
+        replacement = self._state.with_data_modify(path, value)
+        current_token = self.input_token
+        assert current_token is not None
+        qualified_from_revision: int | None = None
+        if not replacement.locomotion_neutral:
+            if (
+                not self._provider_gate.ready
+                or self._provider_gate.input_token != current_token
+            ):
+                raise ExternalControlError(
+                    "E_INPUT_NOT_READY",
+                    "data modify cannot create locomotion before provider rearm",
+                )
+            qualified_from_revision = self._provider_gate.qualified_from_revision
+            assert qualified_from_revision is not None
+        assert self._input_revision is not None
+        self._input_revision += 1
+        self._state = replacement
         self._lease_last_refresh = current
         self.input_replacements += 1
+        next_token = self.input_token
+        assert next_token is not None
+        if replacement.locomotion_neutral:
+            self._provider_gate = ProviderGateTelemetry(
+                authority_epoch=self._authority_epoch,
+                lease_id=next_token.lease_id,
+                input_revision=next_token.input_revision,
+                phase="awaiting_neutral",
+                ready=False,
+                neutral_sent_count=0,
+                last_interlock_reason="input_revision_changed",
+                last_sequence=self._provider_gate.last_sequence,
+            )
+        else:
+            self._provider_gate = ProviderGateTelemetry(
+                authority_epoch=self._authority_epoch,
+                lease_id=next_token.lease_id,
+                input_revision=next_token.input_revision,
+                phase="ready",
+                ready=True,
+                neutral_sent_count=self._provider_gate.neutral_sent_count,
+                qualified_from_revision=qualified_from_revision,
+                last_interlock_reason=None,
+                last_sequence=self._provider_gate.last_sequence,
+            )
+        return next_token
 
     def local_override(self, reason: str) -> None:
         if not isinstance(reason, str) or not reason:
@@ -967,6 +1490,8 @@ class ExternalControlBroker:
     def drain_commands(self, *, limit: int = 16) -> tuple[ExternalCommand, ...]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 64:
             raise ValueError("command drain limit must be in [1, 64]")
+        if self._fatal_authority_reason is not None:
+            return ()
         result = []
         while self._commands and len(result) < limit:
             command = self._commands.popleft()
@@ -1049,7 +1574,14 @@ class ExternalControlBroker:
             "lease_active": self._lease_id is not None,
             "lease_owner_pid": owner.pid if owner is not None else None,
             "authority_epoch": self._authority_epoch,
+            "input_token": (
+                self.input_token.to_mapping()
+                if self.input_token is not None
+                else None
+            ),
+            "provider_gate": self._provider_gate.to_mapping(),
             "lease_age_seconds": age,
+            "fatal_authority_reason": self._fatal_authority_reason,
             "command_queue_depth": len(self._commands),
             "accepted_connections": self.accepted_connections,
             "rejected_peers": self.rejected_peers,
@@ -1095,6 +1627,7 @@ __all__ = [
     "ExternalCommand",
     "ExternalControlBroker",
     "ExternalControlError",
+    "ExternalInputToken",
     "ExternalInputState",
     "GAMEPAD_AXIS_FIELDS",
     "GAMEPAD_BUTTON_FIELDS",
@@ -1102,4 +1635,7 @@ __all__ = [
     "MAX_PACKET_BYTES",
     "MOUSE_BUTTON_FIELDS",
     "PROTOCOL",
+    "PROVIDER_GATE_REQUIRED_NEUTRAL_FRAMES",
+    "PROVIDER_GATE_SCHEMA",
+    "ProviderGateTelemetry",
 ]

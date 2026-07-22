@@ -17,12 +17,15 @@ import time
 
 from matrix_external_control import (
     COMMAND_RECEIPT_SCHEMA,
+    ExternalInputToken,
     ExternalInputState,
     GAMEPAD_AXIS_FIELDS,
     KEYBOARD_FIELDS,
     MAX_PACKET_BYTES,
     PROTOCOL,
+    ProviderGateTelemetry,
 )
+from matrix_mc_commands import CommandParseError, DataModifyInput, parse_mc_command
 
 
 _CAPABILITY_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -33,6 +36,9 @@ _CAPABILITY_RE = re.compile(r"[0-9a-f]{64}\Z")
 # their modifiers during this interval so the double-tap detector establishes
 # the requested speed tier before it sees the first WASD edge.
 _NEUTRAL_WARMUP_SECONDS = 0.12
+# This is a bounded failure deadline, not a guessed provider warmup.  Readiness
+# comes only from the provider's exact-token two-frame acknowledgement.
+_PROVIDER_GATE_TIMEOUT_SECONDS = 1.0
 
 
 def _read_capability(path: Path) -> str:
@@ -129,6 +135,8 @@ class MatrixControlClient:
         self._sequence = 0
         self._capability: str | None = None
         self._authority_epoch: int | None = None
+        self._input_token: ExternalInputToken | None = None
+        self._provider_gate: ProviderGateTelemetry | None = None
 
     def connect(self) -> None:
         if self._socket is not None:
@@ -211,9 +219,44 @@ class MatrixControlClient:
         ):
             raise RuntimeError("lease response authority epoch is malformed")
         self._authority_epoch = authority_epoch
+        self._update_authority_state(data, lease_id=data["lease_id"])
         return data["lease_id"], deadman
 
-    def refresh(self, lease_id: str) -> None:
+    def _update_authority_state(
+        self,
+        data: object,
+        *,
+        lease_id: str,
+    ) -> tuple[ExternalInputToken, ProviderGateTelemetry]:
+        if not isinstance(data, dict):
+            raise RuntimeError("external authority state is malformed")
+        try:
+            token = ExternalInputToken.from_mapping(data.get("input_token"))
+            gate = ProviderGateTelemetry.from_mapping(data.get("provider_gate"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("external authority state is malformed") from exc
+        if (
+            token.lease_id != lease_id
+            or token.authority_epoch != self._authority_epoch
+            or gate.input_token != token
+        ):
+            raise RuntimeError("external authority identity changed")
+        self._input_token = token
+        self._provider_gate = gate
+        return token, gate
+
+    @property
+    def input_token(self) -> ExternalInputToken | None:
+        return self._input_token
+
+    @property
+    def provider_gate(self) -> ProviderGateTelemetry | None:
+        return self._provider_gate
+
+    def refresh(
+        self,
+        lease_id: str,
+    ) -> tuple[ExternalInputToken, ProviderGateTelemetry]:
         response = self.request("lease.renew", {"lease_id": lease_id})
         data = response.get("data")
         if (
@@ -222,12 +265,46 @@ class MatrixControlClient:
             or data.get("authority_epoch") != self._authority_epoch
         ):
             raise RuntimeError("lease renewal changed external authority")
+        return self._update_authority_state(data, lease_id=lease_id)
 
-    def replace(self, lease_id: str, state: ExternalInputState) -> None:
-        self.request(
+    def replace(
+        self,
+        lease_id: str,
+        state: ExternalInputState,
+        *,
+        qualified_token: ExternalInputToken | None = None,
+    ) -> tuple[ExternalInputToken, ProviderGateTelemetry]:
+        if not isinstance(state, ExternalInputState):
+            raise TypeError("replacement state must be ExternalInputState")
+        payload: dict[str, object] = {
+            "lease_id": lease_id,
+            "state": state.to_mapping(),
+        }
+        if qualified_token is not None:
+            if not isinstance(qualified_token, ExternalInputToken):
+                raise TypeError("qualified input token is invalid")
+            if qualified_token != self._input_token:
+                raise MatrixControlResponseError(
+                    "E_INPUT_SUPERSEDED",
+                    "qualified input token is no longer current",
+                )
+            payload["qualified_token"] = qualified_token.to_mapping()
+        response = self.request(
             "input.replace",
-            {"lease_id": lease_id, "state": state.to_mapping()},
+            payload,
         )
+        token, gate = self._update_authority_state(
+            response.get("data"),
+            lease_id=lease_id,
+        )
+        if qualified_token is not None and (
+            token.input_revision != qualified_token.input_revision + 1
+        ):
+            raise MatrixControlResponseError(
+                "E_INPUT_SUPERSEDED",
+                "non-neutral replacement did not follow its qualified revision",
+            )
+        return token, gate
 
     def command(self, lease_id: str, command: str) -> dict[str, object]:
         return self.request(
@@ -294,6 +371,8 @@ class MatrixControlClient:
             self._socket = None
         self._capability = None
         self._authority_epoch = None
+        self._input_token = None
+        self._provider_gate = None
 
     def __enter__(self) -> "MatrixControlClient":
         self.connect()
@@ -339,30 +418,148 @@ def _connected_neutral_gamepad_state() -> ExternalInputState:
     return ExternalInputState.from_mapping(mapping)
 
 
+def _validate_exact_provider_gate(
+    token: ExternalInputToken,
+    gate: ProviderGateTelemetry,
+    *,
+    require_ready: bool,
+) -> None:
+    if not isinstance(token, ExternalInputToken) or not isinstance(
+        gate, ProviderGateTelemetry
+    ):
+        raise RuntimeError("provider gate response is malformed")
+    if gate.input_token != token:
+        raise MatrixControlResponseError(
+            "E_INPUT_SUPERSEDED",
+            "provider gate no longer names the held input revision",
+        )
+    if require_ready and not gate.ready:
+        reason = gate.last_interlock_reason or gate.phase
+        raise MatrixControlResponseError(
+            "E_INPUT_INTERLOCK",
+            f"provider gate left ready state: {reason}",
+        )
+
+
+def _wait_for_provider_gate(
+    client: MatrixControlClient,
+    lease_id: str,
+    neutral_state: ExternalInputState,
+    *,
+    refresh_seconds: float,
+    timeout_seconds: float = _PROVIDER_GATE_TIMEOUT_SECONDS,
+    minimum_seconds: float = 0.0,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+) -> ExternalInputToken:
+    """Publish neutral and wait for an exact provider-frame acknowledgement."""
+
+    if not isinstance(neutral_state, ExternalInputState):
+        raise TypeError("provider gate neutral state is invalid")
+    if not neutral_state.locomotion_neutral:
+        raise ValueError("provider gate can only qualify locomotion-neutral input")
+    timeout = _finite(
+        timeout_seconds,
+        name="provider_gate_timeout_seconds",
+        minimum=0.05,
+        maximum=10.0,
+    )
+    minimum = _finite(
+        minimum_seconds,
+        name="provider_gate_minimum_seconds",
+        minimum=0.0,
+        maximum=10.0,
+    )
+    started = clock()
+    deadline = started + timeout
+    token, gate = client.replace(lease_id, neutral_state)
+    while True:
+        _validate_exact_provider_gate(token, gate, require_ready=False)
+        if gate.phase == "interlocked":
+            reason = gate.last_interlock_reason or "input_interlock"
+            raise MatrixControlResponseError(
+                "E_INPUT_INTERLOCK",
+                f"provider rejected neutral rearm: {reason}",
+            )
+        now = clock()
+        if gate.ready:
+            remaining_minimum = started + minimum - now
+            if remaining_minimum > 0.0:
+                _wait_with_lease_refresh(
+                    client,
+                    lease_id,
+                    seconds=remaining_minimum,
+                    refresh_seconds=refresh_seconds,
+                    expected_token=token,
+                    clock=clock,
+                    sleeper=sleeper,
+                )
+            return token
+        remaining = deadline - now
+        if remaining <= 0.0:
+            reason = gate.last_interlock_reason or gate.phase
+            raise MatrixControlResponseError(
+                "E_PROVIDER_GATE_TIMEOUT",
+                f"provider did not acknowledge neutral input: {reason}",
+            )
+        sleeper(min(refresh_seconds, remaining))
+        refreshed_token, gate = client.refresh(lease_id)
+        if refreshed_token != token:
+            raise MatrixControlResponseError(
+                "E_INPUT_SUPERSEDED",
+                "input revision changed while waiting for provider acknowledgement",
+            )
+
+
 def _wait_with_lease_refresh(
     client: MatrixControlClient,
     lease_id: str,
     *,
     seconds: float,
     refresh_seconds: float,
+    expected_token: ExternalInputToken | None = None,
     clock=time.monotonic,
     sleeper=time.sleep,
 ) -> None:
+    def refresh_and_validate() -> None:
+        refreshed = client.refresh(lease_id)
+        if expected_token is None:
+            return
+        if not isinstance(refreshed, tuple) or len(refreshed) != 2:
+            raise RuntimeError("lease renewal omitted provider gate telemetry")
+        refreshed_token, gate = refreshed
+        if refreshed_token != expected_token:
+            raise MatrixControlResponseError(
+                "E_INPUT_SUPERSEDED",
+                "held input revision changed during lease renewal",
+            )
+        _validate_exact_provider_gate(
+            refreshed_token,
+            gate,
+            require_ready=True,
+        )
+
     deadline = clock() + seconds
     next_refresh = clock() + refresh_seconds
     while True:
         now = clock()
         remaining = deadline - now
         if remaining <= 0.0:
-            return
+            break
         sleeper(max(0.0, min(next_refresh - now, remaining)))
         now = clock()
         if now >= deadline:
-            return
-        client.refresh(lease_id)
+            break
+        refresh_and_validate()
         next_refresh += refresh_seconds
         if next_refresh <= now:
             next_refresh = now + refresh_seconds
+    # Proof-bound holds need one exact check at their end even when the whole
+    # segment is shorter than the normal renew cadence.  This closes the tail
+    # window where a final focus/camera/send interlock could otherwise be
+    # overwritten immediately by the caller's cleanup-neutral revision.
+    if expected_token is not None:
+        refresh_and_validate()
 
 
 def _hold_state(
@@ -372,21 +569,37 @@ def _hold_state(
     *,
     seconds: float,
     refresh_seconds: float,
+    qualified_token: ExternalInputToken | None = None,
     clock=time.monotonic,
     sleeper=time.sleep,
-) -> None:
+) -> ExternalInputToken | None:
     # A held input is immutable until the next explicit segment.  Replacing the
     # full state every refresh needlessly amplifies provider/UI telemetry I/O;
     # renew the lease instead and keep the configured deadman authoritative.
-    client.replace(lease_id, state)
+    if qualified_token is None:
+        client.replace(lease_id, state)
+        held_token = None
+    else:
+        held_token, gate = client.replace(
+            lease_id,
+            state,
+            qualified_token=qualified_token,
+        )
+        _validate_exact_provider_gate(
+            held_token,
+            gate,
+            require_ready=True,
+        )
     _wait_with_lease_refresh(
         client,
         lease_id,
         seconds=seconds,
         refresh_seconds=refresh_seconds,
+        expected_token=held_token,
         clock=clock,
         sleeper=sleeper,
     )
+    return held_token
 
 
 def _parse_args() -> argparse.Namespace:
@@ -567,30 +780,72 @@ def main() -> int:
         response: dict[str, object] | None = None
         lease_available = True
         try:
+            qualified_token: ExternalInputToken | None = None
+            command_input: DataModifyInput | None = None
             if args.action == "key":
                 warmup_state = _state_with_keyboard(
                     None,
                     tuple(args.modifier),
                 )
+                requested_state = _state_with_keyboard(
+                    args.key,
+                    tuple(args.modifier),
+                )
+                locomotion_action = not requested_state.locomotion_neutral
             elif args.action == "gamepad":
                 # A disconnected -> connected gamepad edge deliberately
-                # produces one provider-side unfocused frame.  Keep the
-                # virtual controller connected and centered throughout the
-                # warmup so the following provider frames can satisfy the
-                # core's neutral-rearm interlock before any stick moves.
+                # produces one provider-side unfocused frame.  The explicit
+                # provider ACK below proves that this edge plus two centered
+                # published frames completed before any stick moves.
                 warmup_state = _connected_neutral_gamepad_state()
+                requested_state = _state_with_gamepad(args)
+                locomotion_action = not requested_state.locomotion_neutral
+            elif args.action == "command":
+                # Preparse only to select the provider-ACK handshake.  Invalid
+                # text and every non-input command still travel through the
+                # ordinary ESC/runtime command path and retain its typed error.
+                try:
+                    parsed_command = parse_mc_command(args.command)
+                except CommandParseError:
+                    parsed_command = None
+                if parsed_command is not None and isinstance(
+                    parsed_command.command, DataModifyInput
+                ):
+                    command_input = parsed_command.command
+                warmup_state = (
+                    _connected_neutral_gamepad_state()
+                    if command_input is not None
+                    and command_input.path.startswith("control.input.gamepad.")
+                    else neutral
+                )
+                requested_state = None
+                locomotion_action = False
             else:
                 warmup_state = neutral
-            _hold_state(
-                client,
-                lease_id,
-                warmup_state,
-                seconds=_NEUTRAL_WARMUP_SECONDS,
-                refresh_seconds=refresh_seconds,
-            )
+                requested_state = None
+                locomotion_action = False
+            # Only a validated input mutation shares the provider's exact
+            # revision boundary.  World/policy/settings commands do not depend
+            # on locomotion readiness and retain the bounded neutral warmup.
+            if locomotion_action or command_input is not None:
+                qualified_token = _wait_for_provider_gate(
+                    client,
+                    lease_id,
+                    warmup_state,
+                    refresh_seconds=refresh_seconds,
+                )
+            else:
+                _hold_state(
+                    client,
+                    lease_id,
+                    warmup_state,
+                    seconds=_NEUTRAL_WARMUP_SECONDS,
+                    refresh_seconds=refresh_seconds,
+                )
             if args.action == "key":
                 seconds = _finite(args.seconds, name="seconds", minimum=0.01, maximum=3600.0)
-                state = _state_with_keyboard(args.key, tuple(args.modifier))
+                assert requested_state is not None
+                state = requested_state
                 if args.double:
                     gap = _finite(args.tap_gap, name="tap_gap", minimum=0.04, maximum=0.10)
                     _hold_state(
@@ -599,24 +854,35 @@ def main() -> int:
                         state,
                         seconds=0.04,
                         refresh_seconds=refresh_seconds,
+                        qualified_token=qualified_token,
                     )
                     modifier_only = _state_with_keyboard(
                         None,
                         tuple(args.modifier),
                     )
-                    _hold_state(
-                        client,
-                        lease_id,
-                        modifier_only,
-                        seconds=gap,
-                        refresh_seconds=refresh_seconds,
-                    )
+                    if locomotion_action:
+                        qualified_token = _wait_for_provider_gate(
+                            client,
+                            lease_id,
+                            modifier_only,
+                            refresh_seconds=refresh_seconds,
+                            minimum_seconds=gap,
+                        )
+                    else:
+                        _hold_state(
+                            client,
+                            lease_id,
+                            modifier_only,
+                            seconds=gap,
+                            refresh_seconds=refresh_seconds,
+                        )
                 _hold_state(
                     client,
                     lease_id,
                     state,
                     seconds=seconds,
                     refresh_seconds=refresh_seconds,
+                    qualified_token=qualified_token,
                 )
             elif args.action == "mouse":
                 dx = _finite(args.dx, name="dx", minimum=-4096.0, maximum=4096.0)
@@ -644,13 +910,15 @@ def main() -> int:
                 )
             elif args.action == "gamepad":
                 seconds = _finite(args.seconds, name="seconds", minimum=0.01, maximum=3600.0)
-                state = _state_with_gamepad(args)
+                assert requested_state is not None
+                state = requested_state
                 _hold_state(
                     client,
                     lease_id,
                     state,
                     seconds=seconds,
                     refresh_seconds=refresh_seconds,
+                    qualified_token=qualified_token,
                 )
             else:
                 assert args.action == "command"
