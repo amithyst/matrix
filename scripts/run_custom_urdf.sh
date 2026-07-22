@@ -10,11 +10,12 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 FORCE_REIMPORT="${SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF:-0}"
 MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
-PIPELINE_VERSION=18
+PIPELINE_VERSION=19
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
 G1_MATERIAL_PALETTE=""
 G1_MATERIAL_SCOPE_ALPHA=""
+CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_LAUNCHER_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -33,6 +34,11 @@ fi
 
 if [[ ! -f "$CUSTOM_URDF" ]]; then
     echo "[ERROR] Custom URDF file not found: $CUSTOM_URDF" >&2
+    exit 1
+fi
+
+if [[ -n "$CREATIVE_INVENTORY_CATALOG" && ! -f "$CREATIVE_INVENTORY_CATALOG" ]]; then
+    echo "[ERROR] Creative inventory catalog not found: $CREATIVE_INVENTORY_CATALOG" >&2
     exit 1
 fi
 
@@ -145,7 +151,29 @@ if [[ "${MATRIX_CUSTOM_MATERIAL_PROFILE:-auto}" != "urdf" ]]; then
         G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE;$SOURCE_MATERIAL_PALETTE"
         echo "[INFO] Added source attachment colors to UE material palette: $SOURCE_MATERIAL_PALETTE"
     fi
+    if [[ -n "$CREATIVE_INVENTORY_CATALOG" ]]; then
+        INVENTORY_MATERIAL_PALETTE="$(
+            "$MATRIX_PYTHON" "$SCRIPT_DIR/inject_creative_inventory.py" \
+                --catalog "$CREATIVE_INVENTORY_CATALOG" --print-palette
+        )"
+        if [[ -n "$INVENTORY_MATERIAL_PALETTE" ]]; then
+            G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE;$INVENTORY_MATERIAL_PALETTE"
+            echo "[INFO] Added creative inventory colors to UE material palette: $INVENTORY_MATERIAL_PALETTE"
+        fi
+    fi
 fi
+
+inject_creative_inventory() {
+    local target_xml="$1"
+    local target_assets="$2"
+    if [[ -z "$CREATIVE_INVENTORY_CATALOG" ]]; then
+        return 0
+    fi
+    "$MATRIX_PYTHON" "$SCRIPT_DIR/inject_creative_inventory.py" \
+        --catalog "$CREATIVE_INVENTORY_CATALOG" \
+        --mjcf "$target_xml" \
+        --assets-dir "$target_assets"
+}
 
 MODEL_DIR="$MATRIX_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model"
 UE_CUSTOM_ROOT="$MODEL_DIR/custom"
@@ -1577,7 +1605,8 @@ for body in root.iter("body"):
         if geom_type == "mesh":
             if is_visual_geom(geom):
                 geom.set("class", "visual")
-                geom.set("material", "default_material")
+                if not geom.get("material", "").startswith("matrix_source_"):
+                    geom.set("material", "default_material")
                 if "name" not in geom.attrib and geom.get("mesh"):
                     geom.set("name", f"{geom.get('mesh')}_visual")
                 strip_geom_attrs(geom, {"name", "pos", "quat", "type", "mesh", "class", "material"})
@@ -2185,6 +2214,8 @@ PY
         restore_urdf_fixed_links "$UE_TARGET_URDF" "$UE_TARGET_XML"
         echo "[INFO] restoring generic runtime layout in: $UE_TARGET_XML"
         restore_generic_runtime_layout "$UE_TARGET_XML" "$UE_TARGET_URDF"
+        inject_creative_inventory "$TARGET_XML" "$TMP_ASSET_DIR"
+        inject_creative_inventory "$UE_TARGET_XML" "$UE_ASSET_DIR"
         echo "[INFO] copied xml to UE side: $UE_TARGET_XML"
     fi
 

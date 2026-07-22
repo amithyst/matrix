@@ -92,6 +92,42 @@ def _profile_mjcf() -> str:
 
 
 class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
+    def test_preserves_explicit_mjcf_source_material_for_inventory_mesh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            urdf = root / "g1.urdf"
+            urdf.write_text(
+                """<robot name="g1"><link name="pelvis"><visual><geometry><mesh filename="pelvis.STL" /></geometry></visual></link></robot>""",
+                encoding="utf-8",
+            )
+            mjcf = root / "g1.xml"
+            mjcf.write_text(
+                """<mujoco><asset>
+  <mesh name="pelvis" file="pelvis.STL" />
+  <mesh name="creative_prop" file="creative_prop.stl" />
+  <material name="matrix_source_creative_prop" rgba="0.2 0.4 0.8 1" />
+</asset><worldbody>
+  <body name="pelvis"><geom type="mesh" mesh="pelvis" class="visual" /></body>
+  <body name="creative_item__prop__0">
+    <geom name="creative_item__prop__0__visual" type="mesh" mesh="creative_prop" class="visual" material="matrix_source_creative_prop" />
+  </body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+
+            summary = MODULE.apply_urdf_visual_materials(
+                urdf,
+                mjcf,
+                profile="urdf",
+                profile_scope_alpha=0.99609375,
+            )
+
+            parsed = ET.parse(mjcf).getroot()
+            geom = parsed.find(".//geom[@name='creative_item__prop__0__visual']")
+            self.assertIsNotNone(geom)
+            self.assertTrue(geom.get("material", "").startswith("urdf_visual_"))
+            self.assertEqual(geom.get("rgba"), "0.2 0.4 0.8 0.99609375")
+            self.assertEqual(summary.unmatched_visual_geoms, 0)
     def test_profile_preserves_explicit_source_material_for_attachment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -419,7 +455,7 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("PIPELINE_VERSION=18", launcher)
+        self.assertIn("PIPELINE_VERSION=19", launcher)
         self.assertIn("--describe-skin", launcher)
         self.assertIn("--ue-scope-tag", launcher)
         self.assertIn(

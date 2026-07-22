@@ -47,6 +47,7 @@ from matrix_game_control import (
 from matrix_mc_commands import (
     CommandExecutionError,
     CommandProtocolError,
+    CreativeSpawnItem,
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
@@ -54,6 +55,10 @@ from matrix_mc_commands import (
     decode_command_request,
     encode_command_response,
     execute_command,
+)
+from matrix_creative_inventory import (
+    CreativeInventoryError,
+    CreativeInventoryRuntime,
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_world_state import (
@@ -2230,9 +2235,17 @@ _EXPECTED_SNAPSHOT_DIMS = {
 }
 
 
-def _snapshot_validation_error(snapshot, previous_snapshot=None) -> str | None:
+def _snapshot_validation_error(
+    snapshot,
+    previous_snapshot=None,
+    *,
+    expected_dims: dict[str, int] | None = None,
+) -> str | None:
     """Return a precise native snapshot invariant violation, if any."""
-    for field, expected in _EXPECTED_SNAPSHOT_DIMS.items():
+    dimensions = expected_dims or _EXPECTED_SNAPSHOT_DIMS
+    if set(dimensions) != set(_EXPECTED_SNAPSHOT_DIMS):
+        return "snapshot_expected_dimensions_invalid"
+    for field, expected in dimensions.items():
         values = getattr(snapshot, field, None)
         if values is None:
             return f"snapshot_missing_field:{field}"
@@ -2296,7 +2309,7 @@ def _snapshot_validation_error(snapshot, previous_snapshot=None) -> str | None:
     if last_reset_reason is not None and not isinstance(last_reset_reason, str):
         return f"snapshot_invalid_last_reset_reason:{last_reset_reason!r}"
 
-    for field in _EXPECTED_SNAPSHOT_DIMS:
+    for field in dimensions:
         for index, value in enumerate(getattr(snapshot, field)):
             try:
                 finite = math.isfinite(float(value))
@@ -2886,6 +2899,7 @@ class GameCommandRuntime:
         world: _GameWorldStateRuntime | None,
         *,
         policy_slots: Any | None = None,
+        creative_inventory: CreativeInventoryRuntime | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -2901,8 +2915,10 @@ class GameCommandRuntime:
         self.restart_requested = False
         self.last_response: dict[str, object] | None = None
         self.policy_slots = policy_slots
+        self.creative_inventory = creative_inventory
         self.pending_policy_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
+        self.inventory_spawns_executed = 0
 
     def _send(self, response: GameCommandResponse) -> None:
         payload = encode_command_response(response)
@@ -3082,6 +3098,57 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, CreativeSpawnItem):
+                if self.creative_inventory is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_INVENTORY_UNAVAILABLE",
+                            message="Creative inventory is unavailable for this run",
+                        )
+                    )
+                    continue
+                try:
+                    spawned = self.creative_inventory.spawn(
+                        request.command.item_id,
+                        current_pose,
+                    )
+                except CreativeInventoryError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={
+                                "creative_inventory": self.creative_inventory.mapping()
+                            },
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self.inventory_spawns_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code="OK_INVENTORY_SPAWNED",
+                        message=f"Placed {request.command.item_id} in front of the robot",
+                        data={
+                            "creative_inventory": self.creative_inventory.mapping(),
+                            "spawned_item": {
+                                "item_id": spawned.item_id,
+                                "instance_name": spawned.instance_name,
+                                "position": list(spawned.position),
+                                "quaternion": list(spawned.quaternion),
+                            },
+                        },
+                    )
+                )
+                continue
             if self.world is None:
                 self.rejected_commands += 1
                 self._send(
@@ -3150,6 +3217,7 @@ class GameCommandRuntime:
             "requests_received": self.requests_received,
             "commands_executed": self.commands_executed,
             "policy_changes_executed": self.policy_changes_executed,
+            "inventory_spawns_executed": self.inventory_spawns_executed,
             "policy_change_pending": self.pending_policy_request is not None,
             "protocol_errors": self.protocol_errors,
             "rejected_commands": self.rejected_commands,
@@ -3305,6 +3373,7 @@ class NativeProcessGroup:
         restart_launcher_pid: int | None = None,
         command_fd: int | None = None,
         strategy_loadout_json: str | None = None,
+        creative_inventory_json: str | None = None,
     ) -> int:
         command = [
             python,
@@ -3373,6 +3442,8 @@ class NativeProcessGroup:
             command.extend(("--status-file", str(status_file)))
         if strategy_loadout_json is not None:
             command.extend(("--strategy-loadout-json", strategy_loadout_json))
+        if creative_inventory_json is not None:
+            command.extend(("--creative-inventory-json", creative_inventory_json))
         extra_pass_fds: tuple[int, ...] = ()
         if command_fd is not None:
             if isinstance(command_fd, bool) or not isinstance(command_fd, int):
@@ -6529,6 +6600,21 @@ def main(*, completion_event: threading.Event | None = None) -> int:
 
     config = SimLoopConfig(**_native_config_kwargs(args, model_path))
     simulator = create_simulator(config)
+    creative_inventory = None
+    creative_catalog_value = os.environ.get("MATRIX_CREATIVE_INVENTORY_CATALOG", "")
+    if creative_catalog_value:
+        try:
+            creative_inventory = CreativeInventoryRuntime(
+                simulator,
+                Path(creative_catalog_value),
+            )
+        except (CreativeInventoryError, OSError, ValueError) as exc:
+            raise SystemExit(f"cannot initialize creative inventory: {exc}") from exc
+    expected_snapshot_dims = (
+        creative_inventory.expected_snapshot_dimensions
+        if creative_inventory is not None
+        else _EXPECTED_SNAPSHOT_DIMS
+    )
     renderer = None
     planner = None
     game_input = None
@@ -6568,7 +6654,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             previous_signal_handlers[int(signum)] = previous_handler
 
         snapshot = simulator.get_state_snapshot()
-        initial_snapshot_error = _snapshot_validation_error(snapshot)
+        initial_snapshot_error = _snapshot_validation_error(
+            snapshot,
+            expected_dims=expected_snapshot_dims,
+        )
         if initial_snapshot_error is not None:
             raise SystemExit(
                 f"invalid native SONIC initial snapshot: {initial_snapshot_error}"
@@ -6683,7 +6772,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     )
                     physical_recovery.open(zmq_port=planner_port)
                 if not args.no_game_input_provider and (
-                    game_world is not None or physical_recovery is not None
+                    game_world is not None
+                    or physical_recovery is not None
+                    or creative_inventory is not None
                 ):
                     command_parent, game_command_child_socket = socket.socketpair(
                         socket.AF_UNIX,
@@ -6693,6 +6784,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         command_parent,
                         game_world,
                         policy_slots=physical_recovery,
+                        creative_inventory=creative_inventory,
                     )
                 try:
                     game_input.open()
@@ -6755,6 +6847,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 sort_keys=True,
                             )
                             if physical_recovery is not None
+                            else None
+                        ),
+                        creative_inventory_json=(
+                            json.dumps(
+                                creative_inventory.mapping(),
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            if creative_inventory is not None
                             else None
                         ),
                     )
@@ -7136,7 +7237,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 # per-step sleep otherwise accumulates scheduler overshoot.
                 next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
-                step_error = _snapshot_validation_error(next_snapshot, snapshot)
+                step_error = _snapshot_validation_error(
+                    next_snapshot,
+                    snapshot,
+                    expected_dims=expected_snapshot_dims,
+                )
                 if step_error is not None:
                     unstable = True
                     running = False

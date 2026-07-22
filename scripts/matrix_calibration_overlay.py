@@ -22,6 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sys
@@ -323,7 +324,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_height = 32 if compact else 46
     tab_y = panel_y + (30 if compact else 76)
     tab_gap = 4 if compact else 8
-    tab_width = max(1, (panel_width - 2 * margin - 2 * tab_gap) // 3)
+    tab_width = max(1, (panel_width - 2 * margin - 3 * tab_gap) // 4)
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
@@ -384,6 +385,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         ),
         "tab_console": (
             panel_x + margin + 2 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_inventory": (
+            panel_x + margin + 3 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
@@ -462,6 +469,18 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             candidate_width,
             candidate_height,
         )
+    inventory_top = console_top + (18 if compact else 36)
+    inventory_gap = 8 if compact else 16
+    inventory_width = max(1, (console_width - inventory_gap) // 2)
+    inventory_height = max(42, min(button_height + 12, 84))
+    for index in range(4):
+        row, column = divmod(index, 2)
+        result[f"creative_item_{index}"] = (
+            console_left + column * (inventory_width + inventory_gap),
+            inventory_top + row * (inventory_height + inventory_gap),
+            inventory_width,
+            inventory_height,
+        )
     return result
 
 
@@ -473,13 +492,15 @@ _PANEL_ACTIONS = (
     "apply_return",
 )
 
-_PANEL_TABS = ("tab_loadout", "tab_settings", "tab_console")
+_PANEL_TABS = ("tab_loadout", "tab_settings", "tab_console", "tab_inventory")
 _POLICY_HIT_TARGETS = tuple(f"recovery_policy_{index}" for index in range(3))
+_INVENTORY_HIT_TARGETS = tuple(f"creative_item_{index}" for index in range(4))
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
     + ("command_input",)
     + _POLICY_HIT_TARGETS
+    + _INVENTORY_HIT_TARGETS
 )
 
 
@@ -507,6 +528,8 @@ def panel_action_at(
         targets = _PANEL_TABS + _PANEL_ACTIONS
     elif page == "console":
         targets = _PANEL_TABS + ("apply_return", "command_input")
+    elif page == "inventory":
+        targets = _PANEL_TABS + ("apply_return",) + _INVENTORY_HIT_TARGETS
     for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
@@ -540,6 +563,63 @@ class StrategyLoadoutModel:
             candidate.policy_id == policy_id and candidate.available
             for candidate in self.recovery_candidates
         )
+
+
+@dataclass(frozen=True)
+class CreativeItemModel:
+    item_id: str
+    label: str
+    pool_size: int
+    remaining: int
+
+
+@dataclass(frozen=True)
+class CreativeInventoryModel:
+    available: bool
+    spawn_count: int
+    items: tuple[CreativeItemModel, ...]
+
+    def item_enabled(self, index: int) -> bool:
+        return bool(
+            self.available
+            and 0 <= index < len(self.items)
+            and self.items[index].remaining > 0
+        )
+
+
+def creative_inventory_model(state: dict[str, object]) -> CreativeInventoryModel:
+    raw = state.get("creative_inventory")
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return CreativeInventoryModel(False, 0, ())
+    spawn_count = raw.get("spawn_count")
+    if type(spawn_count) is not int or spawn_count < 0:
+        spawn_count = 0
+    items: list[CreativeItemModel] = []
+    raw_items = raw.get("items")
+    if isinstance(raw_items, list):
+        for raw_item in raw_items[:4]:
+            if not isinstance(raw_item, dict):
+                continue
+            item_id = raw_item.get("item_id")
+            label = raw_item.get("label")
+            pool_size = raw_item.get("pool_size")
+            remaining = raw_item.get("remaining")
+            if (
+                not isinstance(item_id, str)
+                or not item_id
+                or not isinstance(label, str)
+                or not label
+                or type(pool_size) is not int
+                or type(remaining) is not int
+                or not 0 <= remaining <= pool_size <= 32
+            ):
+                continue
+            items.append(CreativeItemModel(item_id, label, pool_size, remaining))
+    return CreativeInventoryModel(
+        available=raw.get("available") is True,
+        spawn_count=spawn_count,
+        items=tuple(items),
+    )
 
 
 def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
@@ -975,7 +1055,7 @@ class CommandLineEditor:
 
         maximum = max(1, int(maximum_characters))
         if not self.editing and not self.text:
-            return "点击输入 /summon、/tp 或 /policy"[:maximum]
+            return "点击输入 /summon、/tp、/policy 或 /item spawn"[:maximum]
         content_width = max(1, maximum - 1)
         start = max(0, self.cursor - content_width // 2)
         start = min(start, max(0, len(self.text) - content_width))
@@ -1191,6 +1271,14 @@ class PointerActionPublisher:
             {"slot": slot, "policy_id": policy_id.lower()},
         )
 
+    def publish_creative_spawn(self, item_id: str) -> None:
+        if (
+            not isinstance(item_id, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", item_id) is None
+        ):
+            raise ValueError("creative item id is invalid")
+        self._publish("creative_spawn", {"item_id": item_id})
+
     def close(self) -> None:
         self._socket.close()
 
@@ -1313,6 +1401,7 @@ class X11CalibrationOverlay:
         self._last_geometry: WindowGeometry | None = None
         self._last_panel_model: SettingsPanelModel | None = None
         self._last_strategy_model: StrategyLoadoutModel | None = None
+        self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = -1
@@ -2502,6 +2591,7 @@ class X11CalibrationOverlay:
             ("tab_loadout", "策略装配", "loadout"),
             ("tab_settings", "控制设置", "settings"),
             ("tab_console", "命令台", "console"),
+            ("tab_inventory", "创造物品", "inventory"),
         ):
             self._draw_button(
                 layout,
@@ -2696,6 +2786,38 @@ class X11CalibrationOverlay:
                 colour=self._colours["muted"],
             )
 
+    def _draw_inventory_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: CreativeInventoryModel,
+    ) -> None:
+        first_slot = self._panel_rectangle(layout, "creative_item_0")
+        self._draw_text(
+            "点击物品会在机器人前方放置独立刚体",
+            x=first_slot[0],
+            y=max(18, first_slot[1] - 18),
+            colour=self._colours["muted"],
+        )
+        if not model.available or not model.items:
+            self._draw_text(
+                "本次运行未加载创造物品目录",
+                x=0,
+                y=0,
+                colour=self._colours["pending"],
+                centred_in=self._panel_rectangle(layout, "creative_item_0"),
+            )
+            return
+        for index, item in enumerate(model.items[:4]):
+            enabled = model.item_enabled(index)
+            label = f"{item.label}  {item.remaining}/{item.pool_size}"
+            self._draw_button(
+                layout,
+                f"creative_item_{index}",
+                label,
+                fill=self._colours["button" if enabled else "disabled"],
+                disabled=not enabled,
+            )
+
     @staticmethod
     def _apply_label_chinese(model: SettingsPanelModel) -> str:
         if model.restart_requested or model.status == "restarting":
@@ -2712,6 +2834,7 @@ class X11CalibrationOverlay:
         model: SettingsPanelModel,
         command_status: CommandConsoleStatus | None = None,
         strategy_model: StrategyLoadoutModel | None = None,
+        inventory_model: CreativeInventoryModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -2735,11 +2858,16 @@ class X11CalibrationOverlay:
             )
         elif page == "settings":
             self._draw_control_settings_page(layout, model)
-        else:
+        elif page == "console":
             self._draw_command_console(
                 layout,
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
+            )
+        else:
+            self._draw_inventory_page(
+                layout,
+                inventory_model or creative_inventory_model({}),
             )
         apply_disabled = not model.action_enabled("apply_return")
         self._draw_button(
@@ -2928,6 +3056,20 @@ class X11CalibrationOverlay:
                                 candidate.policy_id,
                             )
                             emitted += 1
+                elif action.startswith("creative_item_"):
+                    inventory = getattr(self, "_last_inventory_model", None)
+                    try:
+                        item_index = int(action.rsplit("_", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    if (
+                        inventory is not None
+                        and inventory.item_enabled(item_index)
+                    ):
+                        publisher.publish_creative_spawn(
+                            inventory.items[item_index].item_id
+                        )
+                        emitted += 1
                 elif (
                     self._last_panel_model is not None
                     and self._last_panel_model.action_enabled(action)
@@ -2956,11 +3098,13 @@ class X11CalibrationOverlay:
         geometry_changed = geometry != self._last_geometry
         model = settings_panel_model(state)
         strategy_model = strategy_loadout_model(state)
+        inventory_model = creative_inventory_model(state)
         command_status = command_console_status(state)
         self._command_editor.reconcile(command_status)
         model_changed = bool(
             model != self._last_panel_model
             or strategy_model != getattr(self, "_last_strategy_model", None)
+            or inventory_model != getattr(self, "_last_inventory_model", None)
             or getattr(self, "_active_page", "loadout")
             != getattr(self, "_last_page", None)
             or command_status != self._last_command_status
@@ -2991,7 +3135,13 @@ class X11CalibrationOverlay:
             for name in static_order:
                 self._x11.XRaiseWindow(self._display, self._windows[name])
         if first_show or geometry_changed or model_changed:
-            self._draw_panel(layout, model, command_status, strategy_model)
+            self._draw_panel(
+                layout,
+                model,
+                command_status,
+                strategy_model,
+                inventory_model,
+            )
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
         if not self._cursor_visible or pointer_changed:
@@ -3025,6 +3175,7 @@ class X11CalibrationOverlay:
         self._last_geometry = geometry
         self._last_panel_model = model
         self._last_strategy_model = strategy_model
+        self._last_inventory_model = inventory_model
         self._last_page = getattr(self, "_active_page", "loadout")
         self._last_command_status = command_status
         self._last_command_revision = self._command_editor.revision
@@ -3047,6 +3198,7 @@ class X11CalibrationOverlay:
         self._last_geometry = None
         self._last_panel_model = None
         self._last_strategy_model = None
+        self._last_inventory_model = None
         self._last_page = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision

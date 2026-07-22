@@ -18,6 +18,14 @@ REQUEST_ID = "cmd-" + "b" * 32
 
 
 class McCommandParserTest(unittest.TestCase):
+    def test_parses_creative_inventory_spawn(self) -> None:
+        parsed = MODULE.parse_mc_command("/item spawn Training_Blaster")
+
+        self.assertEqual(
+            parsed.command,
+            MODULE.CreativeSpawnItem(item_id="training_blaster"),
+        )
+
     def test_parses_policy_slot_assignment(self) -> None:
         parsed = MODULE.parse_mc_command("/policy recovery KungFu")
 
@@ -104,6 +112,19 @@ class McCommandParserTest(unittest.TestCase):
 
 
 class McCommandProtocolTest(unittest.TestCase):
+    def test_creative_spawn_round_trip_is_typed(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=5,
+            request_id=REQUEST_ID,
+            command=MODULE.CreativeSpawnItem("training_blaster"),
+        )
+
+        payload = MODULE.encode_command_request(request)
+
+        self.assertNotIn(b"/item", payload)
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+
     def test_policy_slot_assignment_round_trip_is_typed(self) -> None:
         request = MODULE.GameCommandRequest(
             session=SESSION,

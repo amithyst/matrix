@@ -605,6 +605,24 @@ def _ensure_materials(asset: ET.Element, styles: set[VisualStyle]) -> int:
     return len(styles)
 
 
+def _mjcf_source_material_styles(
+    asset: ET.Element,
+    *,
+    profile_scope_alpha: float | None,
+) -> dict[str, VisualStyle]:
+    result: dict[str, VisualStyle] = {}
+    for material in asset.findall("material"):
+        name = material.get("name", "")
+        rgba = material.get("rgba")
+        if not name.startswith(SOURCE_MATERIAL_PREFIX) or not rgba:
+            continue
+        style = _style(name, rgba)
+        if profile_scope_alpha is not None:
+            style = _style_with_alpha(style, profile_scope_alpha)
+        result[name] = style
+    return result
+
+
 def _write_atomic(tree: ET.ElementTree, path: Path) -> None:
     temporary = path.with_name(f".{path.name}.materials.tmp")
     mode = stat.S_IMODE(path.stat().st_mode)
@@ -645,7 +663,11 @@ def apply_urdf_visual_materials(
         asset = ET.Element("asset")
         root.insert(0, asset)
 
-    styles = set(by_link_mesh.values())
+    mjcf_source_styles = _mjcf_source_material_styles(
+        asset,
+        profile_scope_alpha=profile_scope_alpha,
+    )
+    styles = set(by_link_mesh.values()) | set(mjcf_source_styles.values())
     generated_materials = _ensure_materials(asset, styles)
     styled_geoms = 0
     styled_collision_geoms = 0
@@ -660,6 +682,8 @@ def apply_urdf_visual_materials(
             style = by_link_mesh.get((link_name, mesh_name))
             if style is None:
                 style = by_unique_mesh.get(mesh_name)
+            if style is None:
+                style = mjcf_source_styles.get(geom.get("material", ""))
             if style is None:
                 if is_visual:
                     unmatched_visual_geoms += 1
