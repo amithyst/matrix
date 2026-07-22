@@ -77,7 +77,12 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             packages["Town10World"]["sha256"],
             urban["visual_source"]["release_sha256"],
         )
-        self.assertEqual(sum(item["size"] for item in packages.values()), 7757662559)
+        self.assertEqual(
+            packages["MoonWorld"]["sha256"],
+            "c4e3dee47ffa434712b0238d08b0b68067f1b1c9820e2ddb455f996f04e364b1",
+        )
+        self.assertEqual(packages["MoonWorld"]["size"], 633678813)
+        self.assertEqual(sum(item["size"] for item in packages.values()), 8391341372)
         installed = {
             entry["path"]: entry
             for entry in self.lock["matrix_release"]["installed_files"]
@@ -93,8 +98,22 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6",
         )
         self.assertEqual(
+            installed[
+                "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_moon_dynamic.xml"
+            ]["sha256"],
+            "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5",
+        )
+        self.assertEqual(
+            installed["dynamicmaps/moonworld.bin"]["sha256"],
+            "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df",
+        )
+        self.assertEqual(
             self.lock["matrix_release"]["installed_trees"][0]["sha256"],
             "9ebc024fa07ddf2deb6a9939bb276dea03b1c6d9e5dfee932b181800b7811232",
+        )
+        self.assertEqual(
+            self.lock["matrix_release"]["installed_trees"][1]["sha256"],
+            "504d56c3e971d116949ffbcb9fb0dad668b62ed12939f5bb00654175706b9063",
         )
         for required in (
             "src/UeSim/Linux/Engine/Binaries/Linux/libEOSSDK-Linux-Shipping.so",
@@ -1674,8 +1693,21 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertNotIn('ln -sfn "$source_path"', bootstrap)
         self.assertIn("MATRIX_OFFLINE=1", bootstrap)
         self.assertIn('/usr/bin/env "${INSTALL_ENV[@]}"', bootstrap)
+        self.assertIn('if item["name"] not in {"assets", "base", "shared"}', bootstrap)
+        self.assertIn('MATRIX_MAPS="$LOCKED_MATRIX_MAPS"', bootstrap)
+        self.assertNotIn("MATRIX_MAPS=Town10World", bootstrap)
         self.assertIn('MATRIX_OFFLINE="${MATRIX_OFFLINE:-0}"', installer)
         self.assertIn("离线模式下禁止下载", installer)
+
+    def test_moon_launcher_is_a_thin_primary_launcher_wrapper(self) -> None:
+        moon = (
+            REPO_ROOT / "scripts/run_matrix_sonic_moon_v1.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("MoonWorld (scene 15)", moon)
+        self.assertIn('exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"', moon)
+        self.assertIn("visual MoonWorld does not by itself prove", moon)
+        self.assertNotIn("run_sim.sh", moon)
+        self.assertNotIn("androidtwin", moon.lower())
 
     def test_local_runtime_override_precedes_profile_derived_paths(self) -> None:
         for script_name in ("bootstrap_matrix_sonic.sh", "run_matrix_sonic.sh"):
@@ -1706,6 +1738,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         for relative in (
             "scripts/run_matrix_sonic.py",
             "scripts/run_matrix_sonic.sh",
+            "scripts/run_matrix_sonic_moon_v1.sh",
             "scripts/run_matrix_sonic_overworld_v1.sh",
             "scripts/run_sim.sh",
             "scripts/bootstrap_matrix_sonic.sh",
