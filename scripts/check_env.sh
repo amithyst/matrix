@@ -218,7 +218,8 @@ require_executable_file() {
 python_require_module() {
     local module="$1"
     local hint="$2"
-    if python3 - "$module" <<'PY' >/dev/null 2>&1
+    local python_bin="${MATRIX_SONIC_PYTHON:-python3}"
+    if "$python_bin" - "$module" <<'PY' >/dev/null 2>&1
 import importlib.util
 import sys
 

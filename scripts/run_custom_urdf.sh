@@ -2139,6 +2139,13 @@ PY
     echo "[INFO] wrote metadata: $UE_TARGET_METADATA"
 fi
 
+if [[ "${MATRIX_CUSTOM_URDF_IMPORT_ONLY:-0}" == "1" ]]; then
+    echo "[INFO] Custom URDF import-only mode completed: $CUSTOM_NAME"
+    echo "[INFO] MuJoCo active XML: $MUJOCO_ACTIVE_XML"
+    echo "[INFO] UE active XML: $UE_ACTIVE_XML"
+    exit 0
+fi
+
 CUSTOM_URDF_RELATIVE="custom/scene_terrain_custom.xml"
 if [[ -f "$MATRIX_ROOT/config/config.json" ]]; then
     jq ".robot.robot_type = \"custom\" | .robot.weapon = \"\" | .robot.use_custom_urdf = true | .robot.custom_urdf = \"$CUSTOM_URDF_RELATIVE\" | .robot.custom_name = \"$CUSTOM_NAME\" | .robot.map_key = \"$MAP_KEY\" | .robot.map_asset = \"$MAP_ASSET\"" \
