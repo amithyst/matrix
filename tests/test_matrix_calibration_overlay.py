@@ -228,6 +228,7 @@ class OverlayLayoutTest(unittest.TestCase):
                     for offset in range(track[2])
                 ]
                 self.assertEqual(sizes, sorted(sizes))
+                self.assertEqual(set(sizes), set(range(1, 23)))
 
     def test_root_coordinate_hit_test_handles_offset_remote_desktop_client(self) -> None:
         geometry = MODULE.WindowGeometry(1, -640, 120, 1600, 900)
@@ -679,6 +680,35 @@ class HotFontSizeTest(unittest.TestCase):
         self.assertEqual(closed, [11, 12])
         self.assertEqual(overlay.font_diagnostics["size"], 20)
         self.assertTrue(overlay.font_diagnostics["adjustable"])
+
+    def test_single_pixel_body_font_is_supported(self) -> None:
+        overlay = self.overlay()
+        overlay._load_xft_font = mock.Mock(
+            side_effect=[(31, "tiny-body"), (32, "tiny-large")]
+        )
+
+        self.assertTrue(overlay._set_font_size(1))
+
+        self.assertEqual(overlay._font_size, 1)
+        self.assertEqual(
+            overlay._load_xft_font.call_args_list,
+            [
+                mock.call(MODULE._xft_font_candidates(1, bold=False)),
+                mock.call(
+                    MODULE._xft_font_candidates(
+                        1 + MODULE._LARGE_FONT_SIZE_DELTA,
+                        bold=True,
+                    )
+                ),
+            ],
+        )
+
+    def test_font_size_range_rejects_values_outside_one_to_twenty_two(self) -> None:
+        overlay = self.overlay()
+
+        for font_size in (0, 23):
+            with self.subTest(font_size=font_size), self.assertRaises(ValueError):
+                overlay._set_font_size(font_size)
 
     def test_failed_large_font_load_keeps_the_live_pair_unchanged(self) -> None:
         overlay = self.overlay()
