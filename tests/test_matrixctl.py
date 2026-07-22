@@ -22,6 +22,43 @@ import matrixctl as MODULE  # noqa: E402
 
 
 class MatrixCtlHelpersTest(unittest.TestCase):
+    def test_capability_reader_requires_a_private_owned_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capability = root / "control.cap"
+            token = "a" * 64
+            capability.write_text(token + "\n", encoding="ascii")
+            capability.chmod(0o600)
+            self.assertEqual(MODULE._read_capability(capability), token)
+
+            capability.chmod(0o640)
+            with self.assertRaisesRegex(PermissionError, "private owned regular"):
+                MODULE._read_capability(capability)
+
+            capability.chmod(0o600)
+            with mock.patch.object(
+                MODULE.os,
+                "getuid",
+                return_value=os.getuid() + 1,
+            ), self.assertRaisesRegex(PermissionError, "private owned regular"):
+                MODULE._read_capability(capability)
+
+            link = root / "linked.cap"
+            link.symlink_to(capability)
+            with self.assertRaises(OSError):
+                MODULE._read_capability(link)
+
+            with self.assertRaisesRegex(PermissionError, "private owned regular"):
+                MODULE._read_capability(root)
+
+    def test_capability_reader_rejects_malformed_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            capability = Path(temporary) / "control.cap"
+            capability.write_bytes(b"not-a-capability\n")
+            capability.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "malformed"):
+                MODULE._read_capability(capability)
+
     def test_profile_endpoint_is_stable_and_rejects_path_traversal(self) -> None:
         endpoint, capability = MODULE.default_endpoint("trna")
         self.assertTrue(endpoint.is_absolute())
@@ -100,6 +137,92 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         self.assertEqual(client.refresh.call_count, 3)
         client.refresh.assert_has_calls([mock.call("lease")] * 3)
         self.assertAlmostEqual(clock.now, 0.16)
+
+    @mock.patch.object(MODULE, "_hold_state")
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_main_renews_no_slower_than_50ms_then_neutralizes_and_releases(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        hold_state,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "key",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "seconds": 1.0,
+                "key": "w",
+                "modifier": ["alt"],
+                "double": False,
+                "tap_gap": 0.08,
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.15)
+
+        self.assertEqual(MODULE.main(), 0)
+
+        self.assertLessEqual(hold_state.call_args.kwargs["refresh_seconds"], 0.05)
+        client.replace.assert_called_once_with(
+            "lease",
+            EXTERNAL.ExternalInputState.neutral(),
+        )
+        client.release.assert_called_once_with("lease")
+
+    @mock.patch.object(MODULE, "_hold_state", side_effect=KeyboardInterrupt)
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_main_neutralizes_and_releases_after_interrupt(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        _hold_state,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "key",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "seconds": 1.0,
+                "key": "w",
+                "modifier": [],
+                "double": False,
+                "tap_gap": 0.08,
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.15)
+
+        with self.assertRaises(KeyboardInterrupt):
+            MODULE.main()
+
+        client.replace.assert_called_once_with(
+            "lease",
+            EXTERNAL.ExternalInputState.neutral(),
+        )
+        client.release.assert_called_once_with("lease")
 
     def test_typed_negative_response_preserves_error_code(self) -> None:
         client = MODULE.MatrixControlClient(

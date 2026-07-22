@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import sys
 import tempfile
 import time
@@ -25,6 +26,38 @@ from matrix_external_control import (
 
 
 _CAPABILITY_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _read_capability(path: Path) -> str:
+    """Read one private capability without following the final path component."""
+
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+            or not 1 <= metadata.st_size <= 128
+        ):
+            raise PermissionError(
+                "external-control capability must be a private owned regular file"
+            )
+        raw = os.read(descriptor, 129)
+    finally:
+        os.close(descriptor)
+    if not raw or len(raw) > 128:
+        raise RuntimeError("external-control capability file size is invalid")
+    try:
+        capability = raw.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            "external-control capability file is malformed"
+        ) from exc
+    if _CAPABILITY_RE.fullmatch(capability) is None:
+        raise RuntimeError("external-control capability file is malformed")
+    return capability
 
 
 class MatrixControlResponseError(RuntimeError):
@@ -93,9 +126,7 @@ class MatrixControlClient:
     def connect(self) -> None:
         if self._socket is not None:
             return
-        capability = self.capability_file.read_text(encoding="ascii").strip()
-        if _CAPABILITY_RE.fullmatch(capability) is None:
-            raise RuntimeError("external-control capability file is malformed")
+        capability = _read_capability(self.capability_file)
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         connection.settimeout(self.timeout_seconds)
         try:
