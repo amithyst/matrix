@@ -202,7 +202,9 @@ MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE= \
 ```
 
 TRNA profile 已固定为 `game + auto + ue-final-pov`，并包含居中 overlay、相机符号和
-灵敏度默认值。`ue-final-pov` 提供最终相机 yaw 回读，因此 `auto` 同时保留本地键盘和
+灵敏度默认值。TRNA 上 final POV 与 MuJoCo world yaw 同向，因此 profile 默认
+`MATRIX_GAME_CAMERA_YAW_SIGN=1`；不要沿用 `x11-mirror` 校准路径的 `-1`。
+`ue-final-pov` 提供最终相机 yaw 回读，因此 `auto` 同时保留本地键盘和
 物理/外置虚拟 gamepad；WASD 仍有数字输入优先级。显式覆盖为 `keyboard` 时会将 gamepad
 移动轴归零。profile 还会清理 tmux/Conda 继承的 `LD_LIBRARY_PATH`、`PYTHONPATH`。日常测试
 只需：

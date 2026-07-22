@@ -515,7 +515,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             'MATRIX_GAME_CAMERA_YAW_SOURCE:-ue-final-pov',
             'MATRIX_GAME_LOOK_BUTTON:-left',
             'MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12',
-            'MATRIX_GAME_CAMERA_YAW_SIGN:--1',
+            'MATRIX_GAME_CAMERA_YAW_SIGN:-1',
             'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0',
             "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE-$HOME/"
             "matrix-artifacts/matrix-centered-camera-custom-v1",
@@ -592,7 +592,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 "ue-final-pov",
                 "left",
                 "0.12",
-                "-1",
+                "1",
                 "0.0",
                 "/home/trna/matrix-artifacts/"
                 "matrix-centered-camera-custom-v1",
@@ -607,7 +607,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "MATRIX_GAME_CAMERA_YAW_SOURCE": "fixed",
             "MATRIX_GAME_LOOK_BUTTON": "right",
             "MATRIX_GAME_MOUSE_SENSITIVITY_DEG": "0.25",
-            "MATRIX_GAME_CAMERA_YAW_SIGN": "1",
+            "MATRIX_GAME_CAMERA_YAW_SIGN": "-1",
             "MATRIX_GAME_CAMERA_YAW_OFFSET_DEG": "90.0",
             "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE": "",
             "MATRIX_VERIFY_RUNTIME": "0",
