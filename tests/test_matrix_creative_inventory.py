@@ -9,8 +9,12 @@ import sys
 import tempfile
 from threading import RLock
 import unittest
+from unittest import mock
 
-import mujoco
+try:
+    import mujoco
+except ModuleNotFoundError:
+    mujoco = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,6 +118,13 @@ class CreativeInventoryTest(unittest.TestCase):
         )
         return mjcf, assets, catalog
 
+    def test_runtime_fails_closed_without_mujoco_bindings(self) -> None:
+        with mock.patch.object(RUNTIME, "mujoco", None):
+            with self.assertRaises(RUNTIME.CreativeInventoryError) as context:
+                RUNTIME.CreativeInventoryRuntime(None, Path("unused.json"))
+        self.assertEqual(context.exception.code, "E_INVENTORY_DEPENDENCY")
+
+    @unittest.skipIf(mujoco is None, "MuJoCo Python bindings are unavailable")
     def test_injects_bounded_pool_and_runtime_spawns_once_into_physics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -152,6 +163,7 @@ class CreativeInventoryTest(unittest.TestCase):
             self.assertLess(float(data.qpos[qpos_address + 2]), before_z)
             self.assertTrue(math.isfinite(float(data.qpos[qpos_address + 2])))
 
+    @unittest.skipIf(mujoco is None, "MuJoCo Python bindings are unavailable")
     def test_pool_exhaustion_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

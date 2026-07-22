@@ -9,8 +9,12 @@ from pathlib import Path
 import re
 from typing import Any
 
-import mujoco
 import numpy as np
+
+try:
+    import mujoco
+except ModuleNotFoundError:  # Optional in source-only CI and control-plane tools.
+    mujoco = None
 
 from inject_creative_inventory import InventoryItem, load_catalog
 
@@ -64,6 +68,11 @@ class CreativeInventoryRuntime:
     """One-shot freejoint placement followed exclusively by MuJoCo physics."""
 
     def __init__(self, simulator: Any, catalog_path: Path) -> None:
+        if mujoco is None:
+            raise CreativeInventoryError(
+                "E_INVENTORY_DEPENDENCY",
+                "MuJoCo Python bindings are required for creative inventory runtime",
+            )
         self.simulator = simulator
         self.items = load_catalog(catalog_path)
         self.items_by_id: dict[str, InventoryItem] = {
