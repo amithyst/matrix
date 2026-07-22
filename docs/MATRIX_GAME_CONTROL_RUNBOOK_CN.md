@@ -60,7 +60,7 @@ Matrix 0.1.2 cooked 运行包目前**没有完成**以下能力：
 河源首轮标定不要提高超时或 0.30 m/s 模拟量上限，并保留启动弹性带。非限时的
 `game` 交互启动默认使用世界存档和摔倒后的完整冷重启；带 `--max-seconds` 的 bounded
 qualification 会自动关闭这两项，继续执行跌倒即失败、零数值重置等原门禁。ESC 命令、
-`last_exit → home → 地图默认点` 恢复链、坐标系和传送安全边界见
+`最新 checkpoint → 更早 checkpoint → home → 地图默认点` 恢复链、坐标系和传送安全边界见
 `docs/Controller_Guide_CN.md` 的“ESC 命令行、续玩与传送”。键盘目标更高是因为它会真正
 选择原生 `WALK`/`RUN`。限幅爬升阶段在 0.80 m/s 前发布 mode 1，0.80-2.50 m/s 发布
 mode 2，只有达到 2.50 m/s 才发布 mode 3；需要记录实际步态切换距离。
@@ -154,6 +154,20 @@ MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE= \
   bash scripts/run_matrix_sonic.sh --profile heyuan --scene 2 \
     --control-source game
 ```
+
+TRNA profile 已固定为 `game + keyboard + ue-final-pov`，并包含居中 overlay、相机符号和
+灵敏度默认值；它还会清理 tmux/Conda 继承的 `LD_LIBRARY_PATH`、`PYTHONPATH`。日常测试
+只需：
+
+```bash
+cd /home/trna/matrix
+bash scripts/run_matrix_sonic.sh --profile trna --scene 2
+```
+
+这条短命令保留默认 runtime verifier。`MATRIX_VERIFY_RUNTIME=0` 只用于明确的低层调试，
+不写入共享 TRNA profile，也不能作为 qualified 验收证据。各机器的行为默认统一写在
+`config/hosts/<profile>.env`；Git 忽略的 `.matrix/local.env` 只接受 allowlist 中的私有
+runtime 路径，一次性行为用 CLI 覆盖。
 
 ## 阶段一：固定坐标系功能测试
 

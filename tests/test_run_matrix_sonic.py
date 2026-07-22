@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -173,6 +174,307 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         tilted.qpos[3] = math.cos(tilt_radians / 2.0)
         tilted.qpos[4] = math.sin(tilt_radians / 2.0)
         self.assertFalse(MODULE._snapshot_world_upright(tilted))
+
+    def test_selected_resume_checkpoint_suppresses_checkpoints_for_five_seconds(self) -> None:
+        for elapsed in (0.0, 0.001, 4.999, 5.0):
+            with self.subTest(elapsed=elapsed):
+                self.assertTrue(
+                    MODULE._game_world_resume_probation_active(
+                        selected_checkpoint_id="cp-1",
+                        elapsed_s=elapsed,
+                    )
+                )
+        self.assertFalse(
+            MODULE._game_world_resume_probation_active(
+                selected_checkpoint_id="cp-1",
+                elapsed_s=5.000001,
+            )
+        )
+        self.assertFalse(
+            MODULE._game_world_resume_probation_active(
+                selected_checkpoint_id=None,
+                elapsed_s=0.0,
+            )
+        )
+
+    def test_auto_respawn_fall_is_read_only_during_resume_probation(self) -> None:
+        world = mock.Mock()
+        game_input = mock.Mock()
+        planner = mock.Mock()
+        emergency_command = SimpleNamespace(mode="idle", safe_stop=True)
+        game_input.emergency_stop.return_value = emergency_command
+        snapshot = self.snapshot(fall_detected=True)
+
+        termination_reason, command = MODULE._handle_game_auto_respawn_fall(
+            game_world=world,
+            game_input=game_input,
+            planner=planner,
+            snapshot=snapshot,
+            selected_checkpoint_id="cp-selected",
+            resume_elapsed_s=5.0,
+            now_s=10.0,
+        )
+
+        self.assertEqual(termination_reason, "fall_detected")
+        self.assertIs(command, emergency_command)
+        game_input.emergency_stop.assert_called_once_with(
+            now_s=10.0,
+            reason="fall_respawn_reload",
+        )
+        planner.send_game_command.assert_called_once_with(emergency_command)
+        world.checkpoint.assert_not_called()
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=False,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=[],
+                resume_rollback_requested=False,
+            ),
+            2,
+        )
+        self.assertEqual(
+            MODULE._game_world_rollback_ineligibility(
+                selected_checkpoint_id="cp-selected",
+                selected_generation=7,
+                rollback_count=0,
+                elapsed_s=5.0,
+                termination_reason=termination_reason,
+                numerical_error=None,
+                low_cmd_received=False,
+                active_lowcmd=False,
+                active_frames=0,
+                active_elapsed_s=0.0,
+                termination_signal=None,
+                child_failure=None,
+                fall_detected=True,
+                initial_reset_count=0,
+                final_reset_count=0,
+            ),
+            "fall_detected",
+        )
+
+    def test_auto_respawn_fall_after_probation_keeps_checkpoint_reload(self) -> None:
+        world = mock.Mock()
+        game_input = mock.Mock()
+        planner = mock.Mock()
+        emergency_command = SimpleNamespace(mode="idle", safe_stop=True)
+        game_input.emergency_stop.return_value = emergency_command
+        snapshot = self.snapshot(fall_detected=True)
+
+        termination_reason, command = MODULE._handle_game_auto_respawn_fall(
+            game_world=world,
+            game_input=game_input,
+            planner=planner,
+            snapshot=snapshot,
+            selected_checkpoint_id="cp-selected",
+            resume_elapsed_s=5.000001,
+            now_s=10.0,
+        )
+
+        self.assertEqual(termination_reason, "game_fall_respawn")
+        self.assertIs(command, emergency_command)
+        planner.send_game_command.assert_called_once_with(emergency_command)
+        world.checkpoint.assert_called_once_with(
+            snapshot,
+            now_s=10.0,
+            force=True,
+            required=True,
+        )
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=True,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=[],
+                resume_rollback_requested=False,
+            ),
+            75,
+        )
+
+    def test_second_generation_map_default_may_carry_rollback_count_one(self) -> None:
+        MODULE._validate_game_world_resume_metadata(
+            selected_checkpoint_id=None,
+            selected_generation=None,
+            rollback_count=1,
+            world_state_configured=True,
+        )
+        with self.assertRaisesRegex(ValueError, "world-state persistence"):
+            MODULE._validate_game_world_resume_metadata(
+                selected_checkpoint_id=None,
+                selected_generation=None,
+                rollback_count=1,
+                world_state_configured=False,
+            )
+
+    def test_resume_rollback_eligibility_is_narrow_and_allowlisted(self) -> None:
+        baseline = {
+            "selected_checkpoint_id": "cp-1",
+            "selected_generation": 7,
+            "rollback_count": 0,
+            "elapsed_s": 5.0,
+            "termination_reason": "numerical_instability",
+            "numerical_error": "snapshot_non_finite:qpos[2]=nan",
+            "low_cmd_received": False,
+            "active_lowcmd": False,
+            "active_frames": 0,
+            "active_elapsed_s": 0.0,
+            "termination_signal": None,
+            "child_failure": None,
+            "fall_detected": False,
+            "initial_reset_count": 0,
+            "final_reset_count": 0,
+        }
+        self.assertIsNone(MODULE._game_world_rollback_ineligibility(**baseline))
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **baseline,
+                    "numerical_error": (
+                        "snapshot_sim_time_not_increasing:0.0,previous=0.0"
+                    ),
+                }
+            )
+        )
+
+        disqualifiers = {
+            "second_rollback": {"rollback_count": 1},
+            "late": {"elapsed_s": 5.000001},
+            "signal": {"termination_signal": signal.SIGTERM},
+            "child": {"child_failure": ("deploy", 7)},
+            "fall": {"fall_detected": True},
+            "reset": {"final_reset_count": 1},
+            "received_lowcmd": {"low_cmd_received": True},
+            "fresh_lowcmd": {"active_lowcmd": True},
+            "active_frame": {"active_frames": 1},
+            "wrong_termination": {"termination_reason": "child_exit"},
+            "abi_error": {
+                "numerical_error": "snapshot_dimension:qpos=35,expected=36"
+            },
+        }
+        for name, changes in disqualifiers.items():
+            with self.subTest(name=name):
+                self.assertIsNotNone(
+                    MODULE._game_world_rollback_ineligibility(
+                        **{**baseline, **changes}
+                    )
+                )
+
+    def test_internal_restart_exit_is_75_even_with_acceptance_failure(self) -> None:
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=True,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=["numerical_instability"],
+            ),
+            75,
+        )
+
+    def test_resume_rollback_proposal_uses_dedicated_exit_76(self) -> None:
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=False,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=["numerical_instability"],
+                resume_rollback_requested=True,
+            ),
+            76,
+        )
+
+    def test_failure_frame_evidence_blocks_resume_rollback(self) -> None:
+        previous = self.snapshot(step_index=0, sim_time=0.0)
+        cases = {
+            "lowcmd": (
+                {"low_cmd_received": True, "low_cmd_fresh": True},
+                "lowcmd_observed",
+            ),
+            "fall": ({"fall_detected": True}, "fall_detected"),
+            "reset": ({"reset_count": 1}, "reset_detected"),
+        }
+        for name, (changes, expected_reason) in cases.items():
+            with self.subTest(name=name):
+                failed = self.snapshot(step_index=1, sim_time=0.005, **changes)
+                failed.qpos[2] = math.nan
+                evidence = MODULE._ResumeRollbackEvidence(initial_reset_count=0)
+                evidence.observe(previous)
+                # Production samples this evidence before rejecting the frame.
+                evidence.observe(failed)
+                validation_error = MODULE._snapshot_validation_error(
+                    failed, previous
+                )
+                self.assertTrue(validation_error.startswith("snapshot_non_finite:"))
+                ineligibility = MODULE._game_world_rollback_ineligibility(
+                    selected_checkpoint_id="cp-1",
+                    selected_generation=7,
+                    rollback_count=0,
+                    elapsed_s=1.0,
+                    termination_reason="numerical_instability",
+                    numerical_error=validation_error,
+                    low_cmd_received=evidence.low_cmd_received,
+                    active_lowcmd=evidence.active_lowcmd,
+                    active_frames=evidence.active_frames,
+                    active_elapsed_s=0.0,
+                    termination_signal=None,
+                    child_failure=None,
+                    fall_detected=evidence.fall_detected,
+                    initial_reset_count=0,
+                    final_reset_count=evidence.max_reset_count,
+                    reset_observed=evidence.reset_observed,
+                )
+                self.assertEqual(ineligibility, expected_reason)
+
+    def test_late_signal_or_child_boundary_cancels_rollback_proposal(self) -> None:
+        baseline = {
+            "selected_checkpoint_id": "cp-1",
+            "selected_generation": 7,
+            "rollback_count": 0,
+            "elapsed_s": 1.0,
+            "termination_reason": "numerical_instability",
+            "numerical_error": "snapshot_non_finite:qpos[2]=nan",
+            "low_cmd_received": False,
+            "active_lowcmd": False,
+            "active_frames": 0,
+            "active_elapsed_s": 0.0,
+            "termination_signal": None,
+            "child_failure": None,
+            "fall_detected": False,
+            "initial_reset_count": 0,
+            "final_reset_count": 0,
+        }
+        for name, changes in (
+            ("signal", {"termination_signal": signal.SIGTERM}),
+            ("child", {"child_failure": ("deploy", 0)}),
+        ):
+            with self.subTest(name=name):
+                ineligibility = MODULE._game_world_rollback_ineligibility(
+                    **{**baseline, **changes}
+                )
+                self.assertIsNotNone(ineligibility)
+                self.assertEqual(
+                    MODULE._runtime_exit_code(
+                        internal_restart_requested=False,
+                        passed=False,
+                        qualification_attempted=False,
+                        interrupted=False,
+                        acceptance_failures=["numerical_instability"],
+                        resume_rollback_requested=False,
+                    ),
+                    2,
+                )
+
+    def test_main_proposes_only_after_expected_stop_and_never_rejects(self) -> None:
+        source = inspect.getsource(MODULE.main)
+        self.assertNotIn("reject_selected_resume_checkpoint(", source)
+        self.assertLess(
+            source.index("processes.begin_expected_stop()"),
+            source.index("propose_selected_resume_rollback("),
+        )
 
     def test_root_yaw_uses_normalized_mujoco_wxyz_quaternion(self) -> None:
         half = math.pi / 4.0
@@ -923,6 +1225,30 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             parsed.game_ue_camera_state_file,
             Path("/run/user/1000/camera-state.bin"),
         )
+
+    def test_parse_args_exposes_exact_world_resume_rollback_metadata(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--game-world-resume-checkpoint-id",
+                "cp-123",
+                "--game-world-resume-generation",
+                "17",
+                "--game-resume-rollback-count",
+                "1",
+            ],
+        ):
+            parsed = MODULE._parse_args()
+
+        self.assertEqual(parsed.game_world_resume_checkpoint_id, "cp-123")
+        self.assertEqual(parsed.game_world_resume_generation, 17)
+        self.assertEqual(parsed.game_resume_rollback_count, 1)
 
     def test_qualified_acceptance_rejects_weaker_lock_gates(self) -> None:
         lock = json.loads(
@@ -2315,6 +2641,229 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(world.last_error, "simulated fsync failure")
             self.assertEqual(world.checkpoint_count, 0)
             self.assertIsNone(world.state.last_exit)
+
+    def test_world_runtime_rejects_exact_selected_checkpoint_with_tombstone_evidence(self) -> None:
+        selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
+        replacement_pose = WORLD_STATE.WorldPose(0.5, 1.5, 0.8, 0.0)
+
+        def state(*, checkpoint_id: str, generation: int, source: str):
+            return SimpleNamespace(
+                generation=generation,
+                last_exit=selected_pose,
+                home=None,
+                resume_source=source,
+                teleport_points=(),
+                resolve_start=lambda: SimpleNamespace(
+                    checkpoint_id=checkpoint_id,
+                    generation=generation,
+                    source=source,
+                    pose=(
+                        selected_pose
+                        if checkpoint_id == "cp-selected"
+                        else replacement_pose
+                    ),
+                ),
+            )
+
+        initial_state = state(
+            checkpoint_id="cp-selected", generation=7, source="last_exit"
+        )
+        committed_state = state(
+            checkpoint_id="cp-previous", generation=8, source="resume_history"
+        )
+        store = mock.Mock(
+            path=Path("/tmp/world-state.json"),
+            world_id="town10:test",
+            world_revision="a" * 64,
+            load_status="loaded",
+            load_error=None,
+        )
+        store.load.return_value = initial_state
+        tombstone = mock.Mock()
+        tombstone.to_mapping.return_value = {
+            "checkpoint": {"checkpoint_id": "cp-selected"},
+            "reason": "startup_numerical_instability",
+            "run_id": "run-1",
+        }
+        store.reject_active_checkpoint.return_value = SimpleNamespace(
+            state=committed_state,
+            tombstone=tombstone,
+            rejected_checkpoint=SimpleNamespace(checkpoint_id="cp-selected"),
+            replacement_checkpoint=SimpleNamespace(
+                checkpoint_id="cp-previous", source="resume_history"
+            ),
+            idempotent=False,
+        )
+
+        with mock.patch.object(MODULE, "WorldStateStore", return_value=store):
+            world = MODULE._GameWorldStateRuntime(
+                path=Path("/tmp/world-state.json"),
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id="cp-selected",
+                selected_resume_generation=7,
+            )
+            rollback = world.reject_selected_resume_checkpoint(
+                reason="startup_numerical_instability",
+                run_id="run-1",
+            )
+
+        store.reject_active_checkpoint.assert_called_once_with(
+            expected_id="cp-selected",
+            expected_generation=7,
+            reason="startup_numerical_instability",
+            run_id="run-1",
+        )
+        self.assertTrue(rollback["applied"])
+        self.assertEqual(rollback["rejected_checkpoint_id"], "cp-selected")
+        self.assertEqual(rollback["rejected_generation"], 7)
+        self.assertEqual(rollback["replacement_checkpoint_id"], "cp-previous")
+        self.assertEqual(rollback["replacement_source"], "resume_history")
+        self.assertEqual(rollback["committed_generation"], 8)
+        self.assertEqual(
+            rollback["tombstone"]["reason"], "startup_numerical_instability"
+        )
+        telemetry = world.telemetry()
+        self.assertEqual(
+            telemetry["selected_resume_checkpoint_id"], "cp-selected"
+        )
+        self.assertEqual(telemetry["selected_resume_generation"], 7)
+        self.assertEqual(telemetry["resume_rollback"], rollback)
+
+    def test_world_runtime_proposal_preserves_active_checkpoint_and_never_writes(self) -> None:
+        selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
+        initial_state = SimpleNamespace(
+            generation=7,
+            last_exit=selected_pose,
+            home=None,
+            resume_source="last_exit",
+            resume_checkpoints=(SimpleNamespace(checkpoint_id="cp-selected"),),
+            invalid_checkpoints=(),
+            teleport_points=(),
+            resolve_start=lambda: SimpleNamespace(
+                checkpoint_id="cp-selected",
+                generation=7,
+                source="last_exit",
+                pose=selected_pose,
+            ),
+        )
+        store = mock.Mock(
+            path=Path("/tmp/world-state.json"),
+            world_id="town10:test",
+            world_revision="a" * 64,
+            load_status="loaded",
+            load_error=None,
+        )
+        store.load.return_value = initial_state
+
+        with mock.patch.object(MODULE, "WorldStateStore", return_value=store):
+            world = MODULE._GameWorldStateRuntime(
+                path=Path("/tmp/world-state.json"),
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id="cp-selected",
+                selected_resume_generation=7,
+            )
+            proposal = world.propose_selected_resume_rollback(
+                reason="startup_numerical_instability",
+                run_id="run-1",
+            )
+
+        store.save.assert_not_called()
+        store.reject_active_checkpoint.assert_not_called()
+        self.assertIs(world.state, initial_state)
+        self.assertTrue(proposal["requested"])
+        self.assertFalse(proposal["applied"])
+        self.assertEqual(proposal["rejected_checkpoint_id"], "cp-selected")
+        self.assertEqual(proposal["rejected_generation"], 7)
+        self.assertEqual(proposal["reason"], "startup_numerical_instability")
+        self.assertEqual(proposal["run_id"], "run-1")
+        telemetry = world.telemetry()
+        self.assertEqual(telemetry["active_resume_checkpoint_id"], "cp-selected")
+        self.assertEqual(telemetry["generation"], 7)
+        self.assertEqual(telemetry["resume_rollback"], proposal)
+        world.cancel_resume_rollback_proposal("termination_signal")
+        cancelled = world.telemetry()
+        self.assertFalse(cancelled["resume_rollback"]["requested"])
+        self.assertFalse(cancelled["resume_rollback"]["applied"])
+        self.assertEqual(
+            cancelled["resume_rollback_ineligibility"], "termination_signal"
+        )
+        self.assertEqual(cancelled["active_resume_checkpoint_id"], "cp-selected")
+        self.assertEqual(cancelled["generation"], 7)
+        store.save.assert_not_called()
+        store.reject_active_checkpoint.assert_not_called()
+
+    def test_world_runtime_allows_rollback_to_map_default(self) -> None:
+        selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
+        initial_state = SimpleNamespace(
+            generation=3,
+            last_exit=selected_pose,
+            home=None,
+            resume_source="last_exit",
+            teleport_points=(),
+            resolve_start=lambda: SimpleNamespace(
+                checkpoint_id="cp-selected",
+                generation=3,
+                source="last_exit",
+                pose=selected_pose,
+            ),
+        )
+        committed_state = SimpleNamespace(
+            generation=4,
+            last_exit=None,
+            home=None,
+            resume_source=None,
+            teleport_points=(),
+            resolve_start=lambda: SimpleNamespace(
+                checkpoint_id=None,
+                generation=4,
+                source="none",
+                pose=None,
+            ),
+        )
+        store = mock.Mock(
+            path=Path("/tmp/world-state.json"),
+            world_id="town10:test",
+            world_revision="a" * 64,
+            load_status="loaded",
+            load_error=None,
+        )
+        store.load.return_value = initial_state
+        tombstone = mock.Mock()
+        tombstone.to_mapping.return_value = {
+            "checkpoint": {"checkpoint_id": "cp-selected"},
+            "reason": "startup_numerical_instability",
+            "run_id": "run-2",
+        }
+        store.reject_active_checkpoint.return_value = SimpleNamespace(
+            state=committed_state,
+            tombstone=tombstone,
+            rejected_checkpoint=SimpleNamespace(checkpoint_id="cp-selected"),
+            replacement_checkpoint=None,
+            idempotent=False,
+        )
+
+        with mock.patch.object(MODULE, "WorldStateStore", return_value=store):
+            world = MODULE._GameWorldStateRuntime(
+                path=Path("/tmp/world-state.json"),
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id="cp-selected",
+                selected_resume_generation=3,
+            )
+            rollback = world.reject_selected_resume_checkpoint(
+                reason="startup_numerical_instability",
+                run_id="run-2",
+            )
+
+        self.assertTrue(rollback["applied"])
+        self.assertIsNone(rollback["replacement_checkpoint_id"])
+        self.assertEqual(rollback["replacement_source"], "none")
+        self.assertEqual(rollback["committed_generation"], 4)
 
     def test_game_command_runtime_waits_for_policy_writer_ack(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(

@@ -10,17 +10,20 @@ SONIC policy process.  Dynamic simulator state is never deserialized here.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import sys
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 import uuid
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -35,7 +38,8 @@ from prepare_sonic_physics_model import (
 )
 
 
-WORLD_STATE_SCHEMA = "matrix-world-state/v1"
+WORLD_STATE_SCHEMA_V1 = "matrix-world-state/v1"
+WORLD_STATE_SCHEMA = "matrix-world-state/v2"
 WORLD_FRAME = "matrix_mj_world"
 WORLD_UNITS = "m"
 TELEPORT_POINT_TYPE = "matrix:teleport_point"
@@ -43,14 +47,37 @@ MAX_WORLD_ID_CHARS = 160
 MAX_TAG_CHARS = 64
 MAX_TAGS_PER_POINT = 16
 MAX_TELEPORT_POINTS = 1024
+MAX_RESUME_CHECKPOINTS = 16
+MAX_INVALID_CHECKPOINTS = 64
+RESUME_CHECKPOINT_DEDUP_METRES = 1.0
+RESUME_CHECKPOINT_DEDUP_YAW_RAD = math.radians(30.0)
 MAX_HORIZONTAL_METRES = 100_000.0
 MIN_VERTICAL_METRES = -1_000.0
 MAX_VERTICAL_METRES = 10_000.0
 MAX_FALLEN_RESUME_DRIFT_METRES = 25.0
+REJECT_COMMIT_GATE_DEFAULT_TIMEOUT_SECONDS = 15.0
+REJECT_COMMIT_GATE_MIN_TIMEOUT_SECONDS = 0.1
+REJECT_COMMIT_GATE_MAX_TIMEOUT_SECONDS = 60.0
+REJECT_COMMIT_GATE_POLL_SECONDS = 0.01
+REJECT_COMMIT_READY_PAYLOAD = b"matrix-world-state-reject-ready/v1\n"
+REJECT_COMMIT_AUTHORIZE_PAYLOAD = b"matrix-world-state-reject-authorize/v1\n"
+REJECT_COMMIT_CANCEL_PAYLOAD = b"matrix-world-state-reject-cancel/v1\n"
+MAX_COMMIT_MARKER_PATH_BYTES = 4096
 
 _WORLD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}\Z")
 _TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}\Z")
 _ENTITY_ID_RE = re.compile(r"tp-[0-9a-f]{32}\Z")
+_CHECKPOINT_ID_RE = re.compile(r"cp-[0-9a-f]{32}\Z")
+_AUDIT_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,127}\Z")
+_RESUME_SOURCE_VALUES = frozenset(
+    {
+        "upright_checkpoint",
+        "fallen_xy_last_safe_upright",
+        "fallen_outlier_last_safe",
+        "teleport_command",
+        "home",
+    }
+)
 
 
 class WorldStateError(ValueError):
@@ -94,6 +121,30 @@ def validate_tag(value: object) -> str:
         raise WorldStateError(
             "teleport tag must be 1-64 safe ASCII characters"
         )
+    return value
+
+
+def validate_checkpoint_id(value: object) -> str:
+    if not isinstance(value, str) or _CHECKPOINT_ID_RE.fullmatch(value) is None:
+        raise WorldStateError("checkpoint_id must use cp- followed by 32 lowercase hex digits")
+    return value
+
+
+def _validate_audit_value(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or _AUDIT_VALUE_RE.fullmatch(value) is None:
+        raise WorldStateError(f"{label} must be 1-128 safe ASCII characters")
+    return value
+
+
+def _validate_timestamp(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WorldStateError(f"{label} is invalid")
+    return value
+
+
+def _validate_generation(value: object, *, label: str = "generation") -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WorldStateError(f"{label} must be a non-negative integer")
     return value
 
 
@@ -150,6 +201,166 @@ class WorldPose:
 
     def distance_xy(self, other: "WorldPose") -> float:
         return math.hypot(self.x - other.x, self.y - other.y)
+
+
+def _pose_distance_metres(left: WorldPose, right: WorldPose) -> float:
+    return math.sqrt(
+        ((left.x - right.x) ** 2)
+        + ((left.y - right.y) ** 2)
+        + ((left.z - right.z) ** 2)
+    )
+
+
+def _yaw_distance_rad(left: float, right: float) -> float:
+    return abs(math.atan2(math.sin(left - right), math.cos(left - right)))
+
+
+@dataclass(frozen=True)
+class ResumeCheckpoint:
+    checkpoint_id: str
+    pose: WorldPose
+    source: str
+    created_at_unix_ns: int
+    anchor_pose: WorldPose | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "checkpoint_id", validate_checkpoint_id(self.checkpoint_id)
+        )
+        if not isinstance(self.pose, WorldPose):
+            raise WorldStateError("resume checkpoint pose is invalid")
+        anchor_pose = self.pose if self.anchor_pose is None else self.anchor_pose
+        if not isinstance(anchor_pose, WorldPose):
+            raise WorldStateError("resume checkpoint anchor pose is invalid")
+        object.__setattr__(self, "anchor_pose", anchor_pose)
+        object.__setattr__(
+            self,
+            "source",
+            _validate_audit_value(self.source, label="resume checkpoint source"),
+        )
+        object.__setattr__(
+            self,
+            "created_at_unix_ns",
+            _validate_timestamp(
+                self.created_at_unix_ns,
+                label="resume checkpoint timestamp",
+            ),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "checkpoint_id": self.checkpoint_id,
+            "pose": self.pose.to_mapping(),
+            "source": self.source,
+            "created_at_unix_ns": self.created_at_unix_ns,
+            "anchor_pose": self.anchor_pose.to_mapping(),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object, *, index: int) -> "ResumeCheckpoint":
+        legacy_required = {"checkpoint_id", "pose", "source", "created_at_unix_ns"}
+        current_required = legacy_required | {"anchor_pose"}
+        if not isinstance(value, dict) or frozenset(value) not in {
+            frozenset(legacy_required),
+            frozenset(current_required),
+        }:
+            raise WorldStateError(
+                f"resume_checkpoints[{index}] has an invalid schema"
+            )
+        pose = WorldPose.from_mapping(
+            value.get("pose"), label=f"resume_checkpoints[{index}].pose"
+        )
+        anchor_value = value.get("anchor_pose", value.get("pose"))
+        return cls(
+            checkpoint_id=value.get("checkpoint_id"),
+            pose=pose,
+            source=value.get("source"),
+            created_at_unix_ns=value.get("created_at_unix_ns"),
+            anchor_pose=WorldPose.from_mapping(
+                anchor_value,
+                label=f"resume_checkpoints[{index}].anchor_pose",
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class InvalidCheckpoint:
+    checkpoint: ResumeCheckpoint
+    invalidated_at_unix_ns: int
+    reason: str
+    run_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.checkpoint, ResumeCheckpoint):
+            raise WorldStateError("invalid checkpoint tombstone payload is invalid")
+        object.__setattr__(
+            self,
+            "invalidated_at_unix_ns",
+            _validate_timestamp(
+                self.invalidated_at_unix_ns,
+                label="invalid checkpoint timestamp",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "reason",
+            _validate_audit_value(self.reason, label="invalid checkpoint reason"),
+        )
+        object.__setattr__(
+            self,
+            "run_id",
+            _validate_audit_value(self.run_id, label="invalid checkpoint run_id"),
+        )
+
+    @property
+    def checkpoint_id(self) -> str:
+        return self.checkpoint.checkpoint_id
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "checkpoint": self.checkpoint.to_mapping(),
+            "invalidated_at_unix_ns": self.invalidated_at_unix_ns,
+            "reason": self.reason,
+            "run_id": self.run_id,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object, *, index: int) -> "InvalidCheckpoint":
+        required = {"checkpoint", "invalidated_at_unix_ns", "reason", "run_id"}
+        if not isinstance(value, dict) or set(value) != required:
+            raise WorldStateError(
+                f"invalid_checkpoints[{index}] has an invalid schema"
+            )
+        return cls(
+            checkpoint=ResumeCheckpoint.from_mapping(
+                value.get("checkpoint"), index=index
+            ),
+            invalidated_at_unix_ns=value.get("invalidated_at_unix_ns"),
+            reason=value.get("reason"),
+            run_id=value.get("run_id"),
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedStart:
+    pose: WorldPose | None
+    source: str
+    checkpoint_id: str | None
+    generation: int
+
+    def __post_init__(self) -> None:
+        if self.pose is not None and not isinstance(self.pose, WorldPose):
+            raise WorldStateError("resolved start pose is invalid")
+        object.__setattr__(
+            self, "source", _validate_audit_value(self.source, label="start source")
+        )
+        if self.checkpoint_id is not None:
+            object.__setattr__(
+                self,
+                "checkpoint_id",
+                validate_checkpoint_id(self.checkpoint_id),
+            )
+        object.__setattr__(self, "generation", _validate_generation(self.generation))
 
 
 @dataclass(frozen=True)
@@ -225,6 +436,9 @@ class MatrixWorldState:
     last_exit: WorldPose | None = None
     home: WorldPose | None = None
     resume_source: str | None = None
+    generation: int = 0
+    resume_checkpoints: tuple[ResumeCheckpoint, ...] = ()
+    invalid_checkpoints: tuple[InvalidCheckpoint, ...] = ()
     teleport_points: tuple[TeleportPoint, ...] = ()
     updated_at_unix_ns: int = 0
 
@@ -237,14 +451,50 @@ class MatrixWorldState:
             value = getattr(self, name)
             if value is not None and not isinstance(value, WorldPose):
                 raise WorldStateError(f"{name} must be a WorldPose or null")
-        if self.resume_source is not None and self.resume_source not in {
-            "upright_checkpoint",
-            "fallen_xy_last_safe_upright",
-            "fallen_outlier_last_safe",
-            "teleport_command",
-            "home",
-        }:
+        if (
+            self.resume_source is not None
+            and self.resume_source not in _RESUME_SOURCE_VALUES
+        ):
             raise WorldStateError("resume_source is invalid")
+        object.__setattr__(self, "generation", _validate_generation(self.generation))
+        if not isinstance(self.resume_checkpoints, tuple) or len(
+            self.resume_checkpoints
+        ) > MAX_RESUME_CHECKPOINTS:
+            raise WorldStateError(
+                "resume_checkpoints exceeds the "
+                f"{MAX_RESUME_CHECKPOINTS} checkpoint limit"
+            )
+        if any(
+            not isinstance(checkpoint, ResumeCheckpoint)
+            for checkpoint in self.resume_checkpoints
+        ):
+            raise WorldStateError("resume_checkpoints contains an invalid checkpoint")
+        if not isinstance(self.invalid_checkpoints, tuple) or len(
+            self.invalid_checkpoints
+        ) > MAX_INVALID_CHECKPOINTS:
+            raise WorldStateError(
+                "invalid_checkpoints exceeds the "
+                f"{MAX_INVALID_CHECKPOINTS} tombstone limit"
+            )
+        if any(
+            not isinstance(checkpoint, InvalidCheckpoint)
+            for checkpoint in self.invalid_checkpoints
+        ):
+            raise WorldStateError("invalid_checkpoints contains an invalid tombstone")
+        active_ids = [
+            checkpoint.checkpoint_id for checkpoint in self.resume_checkpoints
+        ]
+        invalid_ids = [
+            checkpoint.checkpoint_id for checkpoint in self.invalid_checkpoints
+        ]
+        if len(active_ids) != len(set(active_ids)):
+            raise WorldStateError("active resume checkpoint IDs must be unique")
+        if len(invalid_ids) != len(set(invalid_ids)):
+            raise WorldStateError("invalid checkpoint IDs must be unique")
+        if set(active_ids).intersection(invalid_ids):
+            raise WorldStateError(
+                "active and invalid checkpoint IDs must be disjoint"
+            )
         if not isinstance(self.teleport_points, tuple) or len(
             self.teleport_points
         ) > MAX_TELEPORT_POINTS:
@@ -256,12 +506,13 @@ class MatrixWorldState:
         entity_ids = [point.entity_id for point in self.teleport_points]
         if len(entity_ids) != len(set(entity_ids)):
             raise WorldStateError("teleport point entity IDs must be unique")
-        if (
-            isinstance(self.updated_at_unix_ns, bool)
-            or not isinstance(self.updated_at_unix_ns, int)
-            or self.updated_at_unix_ns < 0
-        ):
-            raise WorldStateError("updated_at_unix_ns is invalid")
+        object.__setattr__(
+            self,
+            "updated_at_unix_ns",
+            _validate_timestamp(
+                self.updated_at_unix_ns, label="updated_at_unix_ns"
+            ),
+        )
 
     @classmethod
     def empty(cls, *, world_id: str, world_revision: str) -> "MatrixWorldState":
@@ -274,6 +525,7 @@ class MatrixWorldState:
     def to_mapping(self) -> dict[str, object]:
         return {
             "schema": WORLD_STATE_SCHEMA,
+            "generation": self.generation,
             "world": {
                 "id": self.world_id,
                 "revision": self.world_revision,
@@ -293,6 +545,12 @@ class MatrixWorldState:
             ),
             "home": self.home.to_mapping() if self.home is not None else None,
             "resume_source": self.resume_source,
+            "resume_checkpoints": [
+                checkpoint.to_mapping() for checkpoint in self.resume_checkpoints
+            ],
+            "invalid_checkpoints": [
+                checkpoint.to_mapping() for checkpoint in self.invalid_checkpoints
+            ],
             "teleport_points": [
                 point.to_mapping() for point in self.teleport_points
             ],
@@ -301,7 +559,7 @@ class MatrixWorldState:
 
     @classmethod
     def from_mapping(cls, value: object) -> "MatrixWorldState":
-        required = {
+        common = {
             "schema",
             "world",
             "last_observed",
@@ -312,10 +570,21 @@ class MatrixWorldState:
             "teleport_points",
             "updated_at_unix_ns",
         }
-        if not isinstance(value, dict) or set(value) != required:
+        if not isinstance(value, dict):
             raise WorldStateError("world state has an invalid schema")
-        if value.get("schema") != WORLD_STATE_SCHEMA:
+        schema = value.get("schema")
+        if schema == WORLD_STATE_SCHEMA_V1:
+            required = common
+        elif schema == WORLD_STATE_SCHEMA:
+            required = common | {
+                "generation",
+                "resume_checkpoints",
+                "invalid_checkpoints",
+            }
+        else:
             raise WorldStateError("world state schema version is unsupported")
+        if set(value) != required:
+            raise WorldStateError("world state has an invalid schema")
         world = value.get("world")
         if not isinstance(world, dict) or set(world) != {
             "id",
@@ -334,7 +603,27 @@ class MatrixWorldState:
         points = value.get("teleport_points")
         if not isinstance(points, list):
             raise WorldStateError("teleport_points must be a list")
-        return cls(
+        generation = 0
+        resume_checkpoints: tuple[ResumeCheckpoint, ...] = ()
+        invalid_checkpoints: tuple[InvalidCheckpoint, ...] = ()
+        if schema == WORLD_STATE_SCHEMA:
+            generation = _validate_generation(value.get("generation"))
+            raw_checkpoints = value.get("resume_checkpoints")
+            if not isinstance(raw_checkpoints, list):
+                raise WorldStateError("resume_checkpoints must be a list")
+            resume_checkpoints = tuple(
+                ResumeCheckpoint.from_mapping(checkpoint, index=index)
+                for index, checkpoint in enumerate(raw_checkpoints)
+            )
+            raw_invalid = value.get("invalid_checkpoints")
+            if not isinstance(raw_invalid, list):
+                raise WorldStateError("invalid_checkpoints must be a list")
+            invalid_checkpoints = tuple(
+                InvalidCheckpoint.from_mapping(checkpoint, index=index)
+                for index, checkpoint in enumerate(raw_invalid)
+            )
+
+        state = cls(
             world_id=world.get("id"),
             world_revision=world.get("revision"),
             last_observed=optional_pose("last_observed"),
@@ -342,12 +631,81 @@ class MatrixWorldState:
             last_exit=optional_pose("last_exit"),
             home=optional_pose("home"),
             resume_source=value.get("resume_source"),
+            generation=generation,
+            resume_checkpoints=resume_checkpoints,
+            invalid_checkpoints=invalid_checkpoints,
             teleport_points=tuple(
                 TeleportPoint.from_mapping(point, index=index)
                 for index, point in enumerate(points)
             ),
             updated_at_unix_ns=value.get("updated_at_unix_ns"),
         )
+        if schema == WORLD_STATE_SCHEMA_V1:
+            legacy_pose, legacy_source = state.resume_pose()
+            if legacy_pose is not None:
+                checkpoint = ResumeCheckpoint(
+                    checkpoint_id=_legacy_checkpoint_id(
+                        world_id=state.world_id,
+                        world_revision=state.world_revision,
+                        pose=legacy_pose,
+                        source=legacy_source,
+                        updated_at_unix_ns=state.updated_at_unix_ns,
+                    ),
+                    pose=legacy_pose,
+                    source=legacy_source,
+                    created_at_unix_ns=state.updated_at_unix_ns,
+                )
+                state = replace(state, resume_checkpoints=(checkpoint,))
+        return state
+
+    def _next_generation(self) -> int:
+        return self.generation + 1
+
+    def _new_checkpoint(
+        self,
+        *,
+        pose: WorldPose,
+        source: str,
+        timestamp: int,
+        force_new: bool,
+    ) -> tuple[ResumeCheckpoint, ...]:
+        checkpoints = self.resume_checkpoints
+        if checkpoints and not force_new:
+            latest = checkpoints[-1]
+            if (
+                _pose_distance_metres(latest.anchor_pose, pose)
+                < RESUME_CHECKPOINT_DEDUP_METRES
+                and _yaw_distance_rad(latest.anchor_pose.yaw_rad, pose.yaw_rad)
+                < RESUME_CHECKPOINT_DEDUP_YAW_RAD
+            ):
+                # Keep the segment's original anchor for cumulative thresholding,
+                # while refreshing the resumable pose so a normal restart does
+                # not retreat by almost the entire deduplication window.
+                latest = replace(
+                    latest,
+                    pose=pose,
+                    source=source,
+                    created_at_unix_ns=timestamp,
+                )
+                return (*checkpoints[:-1], latest)
+        used_ids = {
+            checkpoint.checkpoint_id for checkpoint in self.resume_checkpoints
+        } | {checkpoint.checkpoint_id for checkpoint in self.invalid_checkpoints}
+        checkpoint_id = ""
+        for _attempt in range(16):
+            candidate = f"cp-{uuid.uuid4().hex}"
+            if candidate not in used_ids:
+                checkpoint_id = candidate
+                break
+        if not checkpoint_id:
+            raise WorldStateError("cannot allocate a unique resume checkpoint ID")
+        checkpoint = ResumeCheckpoint(
+            checkpoint_id=checkpoint_id,
+            pose=pose,
+            source=source,
+            created_at_unix_ns=timestamp,
+        )
+        return (*checkpoints, checkpoint)[-MAX_RESUME_CHECKPOINTS:]
 
     def checkpoint(
         self,
@@ -359,27 +717,45 @@ class MatrixWorldState:
         if not isinstance(pose, WorldPose) or type(upright) is not bool:
             raise WorldStateError("checkpoint requires a pose and boolean upright flag")
         timestamp = time.time_ns() if now_unix_ns is None else now_unix_ns
+        timestamp = _validate_timestamp(timestamp, label="checkpoint timestamp")
         if upright:
+            checkpoints = self._new_checkpoint(
+                pose=pose,
+                source="upright_checkpoint",
+                timestamp=timestamp,
+                force_new=False,
+            )
             return replace(
                 self,
                 last_observed=pose,
                 last_safe=pose,
                 last_exit=pose,
                 resume_source="upright_checkpoint",
+                generation=self._next_generation(),
+                resume_checkpoints=checkpoints,
                 updated_at_unix_ns=timestamp,
             )
         if self.last_safe is None:
             return replace(
                 self,
                 last_observed=pose,
+                generation=self._next_generation(),
                 updated_at_unix_ns=timestamp,
             )
         if pose.distance_xy(self.last_safe) > MAX_FALLEN_RESUME_DRIFT_METRES:
+            checkpoints = self._new_checkpoint(
+                pose=self.last_safe,
+                source="fallen_outlier_last_safe",
+                timestamp=timestamp,
+                force_new=False,
+            )
             return replace(
                 self,
                 last_observed=pose,
                 last_exit=self.last_safe,
                 resume_source="fallen_outlier_last_safe",
+                generation=self._next_generation(),
+                resume_checkpoints=checkpoints,
                 updated_at_unix_ns=timestamp,
             )
         upright_exit = WorldPose(
@@ -388,11 +764,19 @@ class MatrixWorldState:
             self.last_safe.z,
             self.last_safe.yaw_rad,
         )
+        checkpoints = self._new_checkpoint(
+            pose=upright_exit,
+            source="fallen_xy_last_safe_upright",
+            timestamp=timestamp,
+            force_new=False,
+        )
         return replace(
             self,
             last_observed=pose,
             last_exit=upright_exit,
             resume_source="fallen_xy_last_safe_upright",
+            generation=self._next_generation(),
+            resume_checkpoints=checkpoints,
             updated_at_unix_ns=timestamp,
         )
 
@@ -406,12 +790,21 @@ class MatrixWorldState:
         if source not in {"teleport_command", "home"}:
             raise WorldStateError("unsupported explicit resume source")
         timestamp = time.time_ns() if now_unix_ns is None else now_unix_ns
+        timestamp = _validate_timestamp(timestamp, label="resume pose timestamp")
+        checkpoints = self._new_checkpoint(
+            pose=pose,
+            source=source,
+            timestamp=timestamp,
+            force_new=True,
+        )
         return replace(
             self,
             last_observed=pose,
             last_safe=pose,
             last_exit=pose,
             resume_source=source,
+            generation=self._next_generation(),
+            resume_checkpoints=checkpoints,
             updated_at_unix_ns=timestamp,
         )
 
@@ -429,6 +822,7 @@ class MatrixWorldState:
         if not normalized_tags:
             raise WorldStateError("teleport point requires at least one tag")
         timestamp = time.time_ns() if now_unix_ns is None else now_unix_ns
+        timestamp = _validate_timestamp(timestamp, label="teleport point timestamp")
         point = TeleportPoint(
             entity_id=entity_id or f"tp-{uuid.uuid4().hex}",
             pose=pose,
@@ -441,6 +835,7 @@ class MatrixWorldState:
                 self,
                 home=home,
                 teleport_points=(*self.teleport_points, point),
+                generation=self._next_generation(),
                 updated_at_unix_ns=timestamp,
             ),
             point,
@@ -471,24 +866,200 @@ class MatrixWorldState:
         )
         return tuple(matches[:limit])
 
-    def resume_pose(self) -> tuple[WorldPose | None, str]:
+    def resolve_start(self, default: WorldPose | None = None) -> ResolvedStart:
+        if default is not None and not isinstance(default, WorldPose):
+            raise WorldStateError("default start pose must be a WorldPose or null")
+        if self.resume_checkpoints:
+            checkpoint = self.resume_checkpoints[-1]
+            return ResolvedStart(
+                pose=checkpoint.pose,
+                source="last_exit",
+                checkpoint_id=checkpoint.checkpoint_id,
+                generation=self.generation,
+            )
         if self.last_exit is not None:
             if (
                 self.last_safe is not None
                 and self.last_exit.distance_xy(self.last_safe)
                 > MAX_FALLEN_RESUME_DRIFT_METRES
             ):
-                return self.last_safe, "last_safe_outlier_fallback"
-            return self.last_exit, "last_exit"
+                return ResolvedStart(
+                    pose=self.last_safe,
+                    source="last_safe_outlier_fallback",
+                    checkpoint_id=None,
+                    generation=self.generation,
+                )
+            return ResolvedStart(
+                pose=self.last_exit,
+                source="last_exit",
+                checkpoint_id=None,
+                generation=self.generation,
+            )
         if self.home is not None:
-            return self.home, "home"
-        return None, "none"
+            return ResolvedStart(
+                pose=self.home,
+                source="home",
+                checkpoint_id=None,
+                generation=self.generation,
+            )
+        if default is not None:
+            return ResolvedStart(
+                pose=default,
+                source="default",
+                checkpoint_id=None,
+                generation=self.generation,
+            )
+        return ResolvedStart(
+            pose=None,
+            source="none",
+            checkpoint_id=None,
+            generation=self.generation,
+        )
+
+    def resume_pose(self) -> tuple[WorldPose | None, str]:
+        resolved = self.resolve_start()
+        return resolved.pose, resolved.source
 
     def startup_pose(self, default: WorldPose) -> tuple[WorldPose, str]:
-        pose, source = self.resume_pose()
-        if pose is not None:
-            return pose, source
-        return default, "default"
+        resolved = self.resolve_start(default)
+        assert resolved.pose is not None
+        return resolved.pose, resolved.source
+
+    def reject_active_checkpoint(
+        self,
+        *,
+        expected_id: str,
+        expected_generation: int,
+        reason: str,
+        run_id: str,
+        now_unix_ns: int | None = None,
+    ) -> "RejectActiveCheckpointResult":
+        checkpoint_id = validate_checkpoint_id(expected_id)
+        generation = _validate_generation(
+            expected_generation, label="expected_generation"
+        )
+        validated_reason = _validate_audit_value(
+            reason, label="invalid checkpoint reason"
+        )
+        validated_run_id = _validate_audit_value(
+            run_id, label="invalid checkpoint run_id"
+        )
+        for tombstone in self.invalid_checkpoints:
+            if tombstone.checkpoint_id != checkpoint_id:
+                continue
+            if tombstone.reason != validated_reason or tombstone.run_id != validated_run_id:
+                raise WorldStateError(
+                    "checkpoint was already rejected by a different audit event"
+                )
+            replacement_checkpoint = (
+                self.resume_checkpoints[-1] if self.resume_checkpoints else None
+            )
+            return RejectActiveCheckpointResult(
+                state=self,
+                tombstone=tombstone,
+                rejected_checkpoint=tombstone.checkpoint,
+                replacement_checkpoint=replacement_checkpoint,
+                idempotent=True,
+            )
+        if generation != self.generation:
+            raise WorldStateError(
+                "resume checkpoint generation changed before rejection"
+            )
+        if not self.resume_checkpoints:
+            raise WorldStateError("there is no active resume checkpoint to reject")
+        rejected = self.resume_checkpoints[-1]
+        if rejected.checkpoint_id != checkpoint_id:
+            raise WorldStateError("only the exact active resume checkpoint may be rejected")
+        timestamp = time.time_ns() if now_unix_ns is None else now_unix_ns
+        timestamp = _validate_timestamp(
+            timestamp, label="checkpoint rejection timestamp"
+        )
+        tombstone = InvalidCheckpoint(
+            checkpoint=rejected,
+            invalidated_at_unix_ns=timestamp,
+            reason=validated_reason,
+            run_id=validated_run_id,
+        )
+        checkpoints = self.resume_checkpoints[:-1]
+        invalid = (*self.invalid_checkpoints, tombstone)[-MAX_INVALID_CHECKPOINTS:]
+        replacement_checkpoint = checkpoints[-1] if checkpoints else None
+        replacement_pose = (
+            replacement_checkpoint.pose if replacement_checkpoint is not None else None
+        )
+        checkpoint_source = (
+            replacement_checkpoint.source
+            if replacement_checkpoint is not None
+            else None
+        )
+        replacement_source = (
+            checkpoint_source
+            if checkpoint_source in _RESUME_SOURCE_VALUES
+            else ("upright_checkpoint" if checkpoint_source is not None else None)
+        )
+        state = replace(
+            self,
+            last_observed=replacement_pose,
+            last_safe=replacement_pose,
+            last_exit=replacement_pose,
+            resume_source=replacement_source,
+            generation=self._next_generation(),
+            resume_checkpoints=checkpoints,
+            invalid_checkpoints=invalid,
+            updated_at_unix_ns=timestamp,
+        )
+        return RejectActiveCheckpointResult(
+            state=state,
+            tombstone=tombstone,
+            rejected_checkpoint=rejected,
+            replacement_checkpoint=replacement_checkpoint,
+            idempotent=False,
+        )
+
+
+@dataclass(frozen=True)
+class RejectActiveCheckpointResult:
+    state: MatrixWorldState
+    tombstone: InvalidCheckpoint
+    rejected_checkpoint: ResumeCheckpoint
+    replacement_checkpoint: ResumeCheckpoint | None
+    idempotent: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, MatrixWorldState):
+            raise WorldStateError("checkpoint rejection state is invalid")
+        if not isinstance(self.tombstone, InvalidCheckpoint):
+            raise WorldStateError("checkpoint rejection tombstone is invalid")
+        if not isinstance(self.rejected_checkpoint, ResumeCheckpoint):
+            raise WorldStateError("rejected checkpoint payload is invalid")
+        if self.replacement_checkpoint is not None and not isinstance(
+            self.replacement_checkpoint, ResumeCheckpoint
+        ):
+            raise WorldStateError("replacement checkpoint payload is invalid")
+        if type(self.idempotent) is not bool:
+            raise WorldStateError("checkpoint rejection idempotency flag is invalid")
+
+
+def _legacy_checkpoint_id(
+    *,
+    world_id: str,
+    world_revision: str,
+    pose: WorldPose,
+    source: str,
+    updated_at_unix_ns: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "world_id": world_id,
+            "world_revision": world_revision,
+            "pose": pose.to_mapping(),
+            "source": source,
+            "updated_at_unix_ns": updated_at_unix_ns,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"cp-{hashlib.sha256(b'matrix-world-state-v1-migration\0' + payload).hexdigest()[:32]}"
 
 
 def _strict_json_object(
@@ -732,6 +1303,350 @@ def _atomic_write(path: Path, payload: bytes) -> None:
         os.close(parent_fd)
 
 
+def _validate_commit_marker_path(
+    path: Path,
+    *,
+    label: str,
+    forbidden_paths: frozenset[Path],
+) -> Path:
+    marker_path = Path(path)
+    _state_path_components(marker_path)
+    encoded = os.fsencode(marker_path)
+    if len(encoded) > MAX_COMMIT_MARKER_PATH_BYTES:
+        raise WorldStateError(f"{label} path is too long")
+    if any(byte < 0x20 or byte == 0x7F for byte in encoded):
+        raise WorldStateError(f"{label} path contains control characters")
+    if marker_path in forbidden_paths:
+        raise WorldStateError(f"{label} path collides with durable world state")
+    return marker_path
+
+
+def _open_private_marker_parent(path: Path) -> tuple[int, str]:
+    parent_fd, filename = _open_parent_directory(path, create=False)
+    try:
+        metadata = os.fstat(parent_fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise WorldStateError(
+                f"commit marker parent is not a directory: {path.parent}"
+            )
+        if metadata.st_uid != os.getuid():
+            raise WorldStateError(
+                f"commit marker parent has an unexpected owner: {path.parent}"
+            )
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise WorldStateError(
+                f"commit marker parent must be private: {path.parent}"
+            )
+        return parent_fd, filename
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _read_private_commit_marker(
+    path: Path,
+    *,
+    expected_payload: bytes,
+    label: str,
+) -> bool:
+    """Return whether an exact, private, regular marker is present."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or nonblock is None:
+        raise WorldStateError(
+            "secure commit markers require O_NOFOLLOW and O_NONBLOCK support"
+        )
+    parent_fd, filename = _open_private_marker_parent(path)
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | nofollow | nonblock
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(filename, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise WorldStateError(f"cannot open {label} marker {path}: {exc}") from exc
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise WorldStateError(f"{label} marker is not a regular file: {path}")
+        if metadata.st_uid != os.getuid():
+            raise WorldStateError(f"{label} marker has an unexpected owner: {path}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise WorldStateError(f"{label} marker must be private: {path}")
+        if metadata.st_nlink != 1:
+            raise WorldStateError(f"{label} marker must not be hard-linked: {path}")
+        chunks: list[bytes] = []
+        remaining = len(expected_payload) + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if payload != expected_payload:
+            raise WorldStateError(f"{label} marker has an invalid protocol payload")
+        return True
+    except WorldStateError:
+        raise
+    except OSError as exc:
+        raise WorldStateError(f"cannot read {label} marker {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
+def _create_private_commit_marker(
+    path: Path,
+    *,
+    payload: bytes,
+    label: str,
+) -> None:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise WorldStateError("secure commit markers require O_NOFOLLOW support")
+    parent_fd, filename = _open_private_marker_parent(path)
+    descriptor: int | None = None
+    created = False
+    published = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(filename, flags, 0o600, dir_fd=parent_fd)
+            created = True
+        except FileExistsError as exc:
+            raise WorldStateError(f"refusing stale {label} marker: {path}") from exc
+        except OSError as exc:
+            raise WorldStateError(f"cannot create {label} marker {path}: {exc}") from exc
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            written = os.write(descriptor, view[offset:])
+            if written <= 0:
+                raise WorldStateError(f"short write while creating {label} marker")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.fsync(parent_fd)
+        published = True
+    except WorldStateError:
+        raise
+    except OSError as exc:
+        raise WorldStateError(f"cannot publish {label} marker {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if created and not published:
+            try:
+                os.unlink(filename, dir_fd=parent_fd)
+            except OSError:
+                pass
+        os.close(parent_fd)
+
+
+class _RejectCheckpointCommitGate:
+    """Hold a prepared rejection until a private authorize marker is published."""
+
+    def __init__(
+        self,
+        *,
+        state_path: Path,
+        backup_path: Path,
+        ready_path: Path,
+        authorize_path: Path,
+        cancel_path: Path,
+        timeout_seconds: float,
+    ) -> None:
+        if isinstance(timeout_seconds, bool) or not isinstance(
+            timeout_seconds, (int, float)
+        ):
+            raise WorldStateError("commit gate timeout must be a finite number")
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or not (
+            REJECT_COMMIT_GATE_MIN_TIMEOUT_SECONDS
+            <= timeout
+            <= REJECT_COMMIT_GATE_MAX_TIMEOUT_SECONDS
+        ):
+            raise WorldStateError(
+                "commit gate timeout must be between "
+                f"{REJECT_COMMIT_GATE_MIN_TIMEOUT_SECONDS:g} and "
+                f"{REJECT_COMMIT_GATE_MAX_TIMEOUT_SECONDS:g} seconds"
+            )
+        forbidden = frozenset({state_path, backup_path})
+        self.ready_path = _validate_commit_marker_path(
+            ready_path,
+            label="commit-ready",
+            forbidden_paths=forbidden,
+        )
+        self.authorize_path = _validate_commit_marker_path(
+            authorize_path,
+            label="commit-authorize",
+            forbidden_paths=forbidden,
+        )
+        self.cancel_path = _validate_commit_marker_path(
+            cancel_path,
+            label="commit-cancel",
+            forbidden_paths=forbidden,
+        )
+        if len({self.ready_path, self.authorize_path, self.cancel_path}) != 3:
+            raise WorldStateError("commit marker paths must be distinct")
+        self.timeout_seconds = timeout
+        self._signal_number: int | None = None
+        self._commit_started = False
+
+    def _handle_signal(self, signal_number: int, _frame: object) -> None:
+        if self._commit_started or self._signal_number is not None:
+            return
+        self._signal_number = signal_number
+
+    @contextmanager
+    def signal_handlers(self):
+        previous: dict[int, object] = {}
+        try:
+            for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                previous[signal_number] = signal.getsignal(signal_number)
+                signal.signal(signal_number, self._handle_signal)
+            yield
+        finally:
+            for signal_number, handler in previous.items():
+                signal.signal(signal_number, handler)
+
+    def await_authorization(self, _result: "RejectActiveCheckpointResult") -> None:
+        if self._signal_number is not None:
+            raise WorldStateError(
+                f"checkpoint rejection canceled by signal {self._signal_number}"
+            )
+        if _read_private_commit_marker(
+            self.ready_path,
+            expected_payload=REJECT_COMMIT_READY_PAYLOAD,
+            label="commit-ready",
+        ):
+            raise WorldStateError(f"refusing stale commit-ready marker: {self.ready_path}")
+        if _read_private_commit_marker(
+            self.authorize_path,
+            expected_payload=REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+            label="commit-authorize",
+        ):
+            raise WorldStateError(
+                f"refusing preexisting commit-authorize marker: {self.authorize_path}"
+            )
+        if _read_private_commit_marker(
+            self.cancel_path,
+            expected_payload=REJECT_COMMIT_CANCEL_PAYLOAD,
+            label="commit-cancel",
+        ):
+            raise WorldStateError("checkpoint rejection canceled before readiness")
+
+        _create_private_commit_marker(
+            self.ready_path,
+            payload=REJECT_COMMIT_READY_PAYLOAD,
+            label="commit-ready",
+        )
+        deadline_monotonic = time.monotonic() + self.timeout_seconds
+        while True:
+            if _read_private_commit_marker(
+                self.cancel_path,
+                expected_payload=REJECT_COMMIT_CANCEL_PAYLOAD,
+                label="commit-cancel",
+            ):
+                raise WorldStateError("checkpoint rejection canceled by marker")
+            if _read_private_commit_marker(
+                self.authorize_path,
+                expected_payload=REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+                label="commit-authorize",
+            ):
+                # Close the outer launcher's cancel-vs-authorize race with one
+                # final cancel observation.  Assigning _commit_started after
+                # this check is the irreversible helper-side commit point.
+                if _read_private_commit_marker(
+                    self.cancel_path,
+                    expected_payload=REJECT_COMMIT_CANCEL_PAYLOAD,
+                    label="commit-cancel",
+                ):
+                    raise WorldStateError("checkpoint rejection canceled by marker")
+                if self._signal_number is not None:
+                    raise WorldStateError(
+                        "checkpoint rejection canceled by signal "
+                        f"{self._signal_number}"
+                    )
+                self._commit_started = True
+                return
+            if self._signal_number is not None:
+                raise WorldStateError(
+                    f"checkpoint rejection canceled by signal {self._signal_number}"
+                )
+            if time.monotonic() >= deadline_monotonic:
+                raise WorldStateError("checkpoint rejection commit gate timed out")
+            time.sleep(
+                min(
+                    REJECT_COMMIT_GATE_POLL_SECONDS,
+                    max(0.0, deadline_monotonic - time.monotonic()),
+                )
+            )
+
+
+@contextmanager
+def _state_file_lock(path: Path):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise WorldStateError("secure world-state locks require O_NOFOLLOW support")
+    directory_flags = _directory_open_flags()
+    try:
+        parent_fd = os.open("/tmp", directory_flags)
+    except OSError as exc:
+        raise WorldStateError(f"cannot open world-state lock directory: {exc}") from exc
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDWR | os.O_CREAT | nofollow
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        path_digest = hashlib.sha256(os.fsencode(path)).hexdigest()
+        lock_name = f".matrix-world-state-{os.getuid()}-{path_digest}.lock"
+        try:
+            descriptor = os.open(lock_name, flags, 0o600, dir_fd=parent_fd)
+        except OSError as exc:
+            raise WorldStateError(f"cannot open world-state lock for {path}: {exc}") from exc
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise WorldStateError(f"world-state lock is not a regular file: {path}")
+        if metadata.st_uid != os.getuid():
+            raise WorldStateError(f"world-state lock has an unexpected owner: {path}")
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise WorldStateError(f"cannot lock world state {path}: {exc}") from exc
+        yield
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
+def _serialize_state(state: MatrixWorldState) -> bytes:
+    return (
+        json.dumps(
+            state.to_mapping(),
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 class WorldStateStore:
     """Load, mutate, and durably persist one exact world revision."""
 
@@ -750,6 +1665,7 @@ class WorldStateStore:
     def load(self) -> MatrixWorldState:
         errors: list[str] = []
         found = False
+        valid: list[tuple[str, MatrixWorldState]] = []
         for label, candidate in (("primary", self.path), ("backup", self.backup_path)):
             try:
                 payload = _read_regular_file(candidate)
@@ -773,6 +1689,15 @@ class WorldStateStore:
             except WorldStateError as exc:
                 errors.append(f"{label}: {exc}")
                 continue
+            valid.append((label, state))
+        if valid:
+            label, state = max(
+                valid,
+                key=lambda item: (
+                    item[1].generation,
+                    1 if item[0] == "primary" else 0,
+                ),
+            )
             self.state = state
             self.load_status = "loaded" if label == "primary" else "backup"
             self.load_error = "; ".join(errors) or None
@@ -791,29 +1716,86 @@ class WorldStateStore:
             or candidate.world_revision != self.world_revision
         ):
             raise WorldStateError("refusing to save state for another world revision")
-        payload = (
-            json.dumps(
-                candidate.to_mapping(),
-                indent=2,
-                sort_keys=True,
-                allow_nan=False,
-            )
-            + "\n"
-        ).encode("utf-8")
-        try:
-            previous = _read_regular_file(self.path)
-            previous_state = _decode_state_bytes(previous)
+        with _state_file_lock(self.path):
+            self._save_unlocked(candidate)
+
+    def _save_unlocked(self, candidate: MatrixWorldState) -> None:
+        predecessors: list[tuple[str, MatrixWorldState, bytes]] = []
+        for label, path in (("primary", self.path), ("backup", self.backup_path)):
+            try:
+                payload = _read_regular_file(path)
+                state = _decode_state_bytes(payload)
+            except WorldStateError:
+                continue
             if (
-                previous_state.world_id != self.world_id
-                or previous_state.world_revision != self.world_revision
+                state.world_id == self.world_id
+                and state.world_revision == self.world_revision
             ):
-                previous = None
-        except WorldStateError:
-            previous = None
-        if previous is not None:
-            _atomic_write(self.backup_path, previous)
+                predecessors.append((label, state, payload))
+
+        predecessor: tuple[str, MatrixWorldState, bytes] | None = None
+        if predecessors:
+            predecessor = max(
+                predecessors,
+                key=lambda item: (
+                    item[1].generation,
+                    1 if item[0] == "primary" else 0,
+                ),
+            )
+        if predecessor is not None and (
+            candidate.generation < predecessor[1].generation
+            or (
+                candidate.generation == predecessor[1].generation
+                and candidate != predecessor[1]
+            )
+        ):
+            raise WorldStateError(
+                "refusing stale world-state generation overwrite"
+            )
+        payload = _serialize_state(candidate)
+        # Rotate only the selected predecessor.  When backup is newer than
+        # primary it is already the durable predecessor and must survive a
+        # failed primary write; copying the stale primary over it would revive
+        # state that a newer generation had quarantined.
+        if predecessor is not None and predecessor[0] == "primary":
+            _atomic_write(self.backup_path, predecessor[2])
         _atomic_write(self.path, payload)
         self.state = candidate
+
+    def reject_active_checkpoint(
+        self,
+        *,
+        expected_id: str,
+        expected_generation: int,
+        reason: str,
+        run_id: str,
+        now_unix_ns: int | None = None,
+        precommit: Callable[[RejectActiveCheckpointResult], None] | None = None,
+    ) -> RejectActiveCheckpointResult:
+        with _state_file_lock(self.path):
+            state = self.load()
+            result = state.reject_active_checkpoint(
+                expected_id=expected_id,
+                expected_generation=expected_generation,
+                reason=reason,
+                run_id=run_id,
+                now_unix_ns=now_unix_ns,
+            )
+            if precommit is not None:
+                if not callable(precommit):
+                    raise WorldStateError("checkpoint rejection precommit gate is invalid")
+                precommit(result)
+            payload = _serialize_state(result.state)
+            # A rejection is a quarantine transaction rather than an ordinary
+            # previous-version rotation.  Replicate the tombstone to both files
+            # so corruption of the primary can never reactivate the rejected
+            # candidate through a stale backup.
+            _atomic_write(self.backup_path, payload)
+            _atomic_write(self.path, payload)
+            self.state = result.state
+            self.load_status = "loaded"
+            self.load_error = None
+            return result
 
     def replace(self, state: MatrixWorldState) -> MatrixWorldState:
         self.save(state)
@@ -901,6 +1883,20 @@ def _parse_cli_args() -> argparse.Namespace:
     resolve.add_argument("--file", type=Path, required=True)
     resolve.add_argument("--world-id", required=True)
     resolve.add_argument("--world-revision", required=True)
+    resolve.add_argument("--include-checkpoint-meta", action="store_true")
+
+    reject = subparsers.add_parser("reject-checkpoint")
+    reject.add_argument("--file", type=Path, required=True)
+    reject.add_argument("--world-id", required=True)
+    reject.add_argument("--world-revision", required=True)
+    reject.add_argument("--checkpoint-id", required=True)
+    reject.add_argument("--expected-generation", type=int, required=True)
+    reject.add_argument("--reason", required=True)
+    reject.add_argument("--run-id", required=True)
+    reject.add_argument("--commit-ready-file", type=Path)
+    reject.add_argument("--commit-authorize-file", type=Path)
+    reject.add_argument("--commit-cancel-file", type=Path)
+    reject.add_argument("--commit-timeout-seconds", type=float)
     return parser.parse_args()
 
 
@@ -928,17 +1924,91 @@ def main() -> int:
                 world_revision=args.world_revision,
             )
             state = store.load()
-            pose, source = state.resume_pose()
-            if pose is None:
+            resolved = state.resolve_start()
+            if resolved.pose is None:
                 print("none")
             else:
                 print("pose")
-                print(format(pose.x, ".17g"))
-                print(format(pose.y, ".17g"))
-                print(format(pose.z, ".17g"))
-                print(format(pose.yaw_rad, ".17g"))
-                print(source)
+                print(format(resolved.pose.x, ".17g"))
+                print(format(resolved.pose.y, ".17g"))
+                print(format(resolved.pose.z, ".17g"))
+                print(format(resolved.pose.yaw_rad, ".17g"))
+                print(resolved.source)
             print(store.load_status)
+            if args.include_checkpoint_meta:
+                print(resolved.checkpoint_id or "none")
+                print(resolved.generation)
+            return 0
+        if args.command == "reject-checkpoint":
+            store = WorldStateStore(
+                args.file,
+                world_id=args.world_id,
+                world_revision=args.world_revision,
+            )
+            marker_paths = (
+                args.commit_ready_file,
+                args.commit_authorize_file,
+                args.commit_cancel_file,
+            )
+            marker_count = sum(path is not None for path in marker_paths)
+            if marker_count not in {0, 3}:
+                raise WorldStateError(
+                    "commit-ready, commit-authorize, and commit-cancel files "
+                    "must be supplied together"
+                )
+            if marker_count == 0 and args.commit_timeout_seconds is not None:
+                raise WorldStateError(
+                    "commit gate timeout requires all three commit marker files"
+                )
+            if marker_count == 3:
+                assert all(path is not None for path in marker_paths)
+                gate = _RejectCheckpointCommitGate(
+                    state_path=store.path,
+                    backup_path=store.backup_path,
+                    ready_path=args.commit_ready_file,
+                    authorize_path=args.commit_authorize_file,
+                    cancel_path=args.commit_cancel_file,
+                    timeout_seconds=(
+                        REJECT_COMMIT_GATE_DEFAULT_TIMEOUT_SECONDS
+                        if args.commit_timeout_seconds is None
+                        else args.commit_timeout_seconds
+                    ),
+                )
+                with gate.signal_handlers():
+                    result = store.reject_active_checkpoint(
+                        expected_id=args.checkpoint_id,
+                        expected_generation=args.expected_generation,
+                        reason=args.reason,
+                        run_id=args.run_id,
+                        precommit=gate.await_authorization,
+                    )
+            else:
+                result = store.reject_active_checkpoint(
+                    expected_id=args.checkpoint_id,
+                    expected_generation=args.expected_generation,
+                    reason=args.reason,
+                    run_id=args.run_id,
+                )
+            replacement = result.replacement_checkpoint
+            print(
+                json.dumps(
+                    {
+                        "schema": "matrix-world-state-rejection/v1",
+                        "rejected_checkpoint_id": (
+                            result.rejected_checkpoint.checkpoint_id
+                        ),
+                        "replacement_checkpoint_id": (
+                            replacement.checkpoint_id
+                            if replacement is not None
+                            else None
+                        ),
+                        "generation": result.state.generation,
+                        "idempotent": result.idempotent,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
             return 0
     except WorldStateError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc
@@ -947,6 +2017,12 @@ def main() -> int:
 
 __all__ = [
     "MatrixWorldState",
+    "InvalidCheckpoint",
+    "MAX_INVALID_CHECKPOINTS",
+    "MAX_RESUME_CHECKPOINTS",
+    "RejectActiveCheckpointResult",
+    "ResolvedStart",
+    "ResumeCheckpoint",
     "TeleportPoint",
     "TELEPORT_POINT_TYPE",
     "WorldPose",
@@ -954,6 +2030,7 @@ __all__ = [
     "WorldStateStore",
     "default_world_state_path",
     "validate_tag",
+    "validate_checkpoint_id",
     "validate_world_id",
     "world_revision_for_files",
 ]

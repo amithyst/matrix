@@ -6,12 +6,15 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -25,6 +28,7 @@ if os.fspath(SCRIPTS) not in sys.path:
 CORE = importlib.import_module("matrix_game_control")
 PROVIDER = importlib.import_module("matrix_game_control_input")
 OVERLAY = importlib.import_module("matrix_ue_overlay")
+WORLD_STATE = importlib.import_module("matrix_world_state")
 RUNTIME_SPEC = importlib.util.spec_from_file_location(
     "matrix_game_control_integration_runtime",
     SCRIPTS / "run_matrix_sonic.py",
@@ -368,6 +372,62 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         if executable:
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
+    @staticmethod
+    def rollback_proposal_status(
+        *,
+        state_file: Path,
+        world_id: str,
+        world_revision: str,
+        checkpoint_id: str,
+        generation: int,
+        source: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        return {
+            "acceptance_failures": ["numerical_instability"],
+            "active_elapsed_s": 0.0,
+            "active_frames": 0,
+            "active_lowcmd": False,
+            "active_lowcmd_longest_s": 0.0,
+            "completed": False,
+            "elapsed_wall_s": 0.5,
+            "failed_child_exit_code": None,
+            "failed_child_name": None,
+            "fall_detected": False,
+            "game_auto_respawn": False,
+            "game_world_state": {
+                "has_last_exit": True,
+                "last_error": None,
+                "path": os.fspath(state_file),
+                "world_id": world_id,
+                "world_revision": world_revision,
+                "generation": generation,
+                "active_resume_checkpoint_id": checkpoint_id,
+                "active_resume_source": source,
+                "selected_resume_checkpoint_id": checkpoint_id,
+                "selected_resume_generation": generation,
+                "resume_rollback_ineligibility": None,
+                "resume_rollback": {
+                    "requested": True,
+                    "applied": False,
+                    "rejected_checkpoint_id": checkpoint_id,
+                    "rejected_generation": generation,
+                    "reason": "startup_numerical_instability",
+                    "run_id": run_id,
+                },
+            },
+            "instability_resets": 0,
+            "internal_restart": {"requested": False, "reason": None},
+            "interrupted": False,
+            "last_reset_reason": None,
+            "low_cmd_received": False,
+            "numerical_error": "snapshot_sim_time_not_increasing:0.0<=0.0",
+            "passed": False,
+            "run_id": run_id,
+            "termination_reason": "numerical_instability",
+            "termination_signal": None,
+        }
+
     def make_project(self, project: Path) -> dict[str, Path]:
         scripts = project / "scripts"
         scripts.mkdir(parents=True)
@@ -698,11 +758,49 @@ elif script == "run_matrix_sonic.py":
     Path(os.environ["CAPTURE_PATH"]).write_text(
         json.dumps(capture), encoding="utf-8"
     )
+    generation = None
     generation_file = os.environ.get("GENERATION_FILE")
     if generation_file:
         generation_path = Path(generation_file)
         generation = int(generation_path.read_text()) + 1 if generation_path.exists() else 1
         generation_path.write_text(str(generation), encoding="utf-8")
+    rollback_trace_file = os.environ.get("ROLLBACK_TRACE_FILE")
+    if rollback_trace_file:
+        with Path(rollback_trace_file).open("a", encoding="utf-8") as stream:
+            stream.write(
+                os.environ.get("MATRIX_GAME_RESUME_ROLLBACK_COUNT", "missing")
+                + "\\n"
+            )
+    rollback_status_map_file = os.environ.get(
+        "FAKE_RESUME_ROLLBACK_STATUS_MAP_FILE"
+    )
+    if rollback_status_map_file and generation is not None:
+        status_map = json.loads(
+            Path(rollback_status_map_file).read_text(encoding="utf-8")
+        )
+        rollback_status = status_map.get(str(generation))
+        if rollback_status is not None:
+            sonic_status = Path(args[args.index("--status-file") + 1])
+            sonic_status.write_text(json.dumps(rollback_status), encoding="utf-8")
+            raise SystemExit(76)
+    if os.environ.get("FAKE_RESUME_ROLLBACK_PROPOSAL") == "1":
+        sonic_status = Path(args[args.index("--status-file") + 1])
+        sonic_status.write_text(
+            json.dumps(
+                {
+                    "acceptance_failures": ["snapshot_sim_time_not_increasing"],
+                    "completed": False,
+                    "failed_child_exit_code": None,
+                    "failed_child_name": None,
+                    "internal_restart": {"requested": False, "reason": None},
+                    "passed": False,
+                    "termination_reason": "numerical_instability",
+                    "termination_signal": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        raise SystemExit(76)
     internal_reason = os.environ.get("FAKE_WORLD_INTERNAL_RESTART")
     if internal_reason:
         sonic_status = Path(args[args.index("--status-file") + 1])
@@ -1360,6 +1458,57 @@ else:
             self.assertEqual(os.fspath(parsed.game_input_socket), capture["socket_env"])
             self.assertFalse(parsed.game_input_socket.parent.exists())
 
+            # A populated slot must carry the exact selected checkpoint ID and
+            # generation through run_sim into the runtime. Coordinates alone
+            # are insufficient authority for an automatic rejection.
+            world_store = WORLD_STATE.WorldStateStore(
+                parsed.game_world_state_file,
+                world_id=parsed.game_world_id,
+                world_revision=parsed.game_world_revision,
+            )
+            selected_state = world_store.state.set_resume_pose(
+                WORLD_STATE.WorldPose(4.0, 5.0, 0.81, 0.25),
+                now_unix_ns=1,
+            )
+            world_store.save(selected_state)
+            selected = selected_state.resolve_start()
+            resumed_environment = dict(environment)
+            resumed_environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-resume.lock"
+            )
+
+            resumed = subprocess.run(
+                command,
+                env=resumed_environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                resumed.returncode,
+                0,
+                msg=f"stdout:\n{resumed.stdout}\nstderr:\n{resumed.stderr}",
+            )
+            resumed_capture = json.loads(
+                fixture["capture"].read_text(encoding="utf-8")
+            )
+            with mock.patch.object(
+                sys,
+                "argv",
+                ["run_matrix_sonic.py", *resumed_capture["argv"]],
+            ):
+                resumed_args = RUNTIME._parse_args()
+            self.assertEqual(
+                resumed_args.game_world_resume_checkpoint_id,
+                selected.checkpoint_id,
+            )
+            self.assertEqual(
+                resumed_args.game_world_resume_generation,
+                selected.generation,
+            )
+            self.assertEqual(resumed_args.game_resume_rollback_count, 0)
+
             # X11 setup is an experience improvement, never a launch gate.
             # A headless launch and an unreachable X server both continue with
             # an explicit warning and without changing the recorded state.
@@ -1791,9 +1940,57 @@ print(json.dumps(payload, sort_keys=True))
                 timeout=20.0,
                 check=False,
             )
-            self.assertEqual(failed_remove.returncode, 1)
+            self.assertEqual(failed_remove.returncode, 2)
             self.assertIn("Matrix cleanup failed", failed_remove.stderr)
             self.assertTrue(active.exists())
+
+            for label, failure_environment in (
+                ("exit75", {"FAKE_WORLD_INTERNAL_RESTART": "game_teleport"}),
+                ("exit76", {"FAKE_RESUME_ROLLBACK_PROPOSAL": "1"}),
+            ):
+                with self.subTest(privileged_exit=label):
+                    fixture["ue_capture"].unlink(missing_ok=True)
+                    generation_file = project / f"{label}-generations.txt"
+                    environment.update(failure_environment)
+                    environment["GENERATION_FILE"] = os.fspath(generation_file)
+                    environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                        project / f"launcher-remove-failure-{label}.lock"
+                    )
+                    cleanup_rejected = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                            "--scene",
+                            "21",
+                            "--control-source",
+                            "game",
+                        ],
+                        env=environment,
+                        text=True,
+                        capture_output=True,
+                        timeout=20.0,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        cleanup_rejected.returncode,
+                        2,
+                        msg=(
+                            f"stdout:\n{cleanup_rejected.stdout}\n"
+                            f"stderr:\n{cleanup_rejected.stderr}"
+                        ),
+                    )
+                    self.assertEqual(
+                        generation_file.read_text(encoding="utf-8"),
+                        "1",
+                    )
+                    self.assertIn("Matrix cleanup failed", cleanup_rejected.stderr)
+                    self.assertNotIn(
+                        "Validated Matrix world reload",
+                        cleanup_rejected.stdout,
+                    )
+                    for name in failure_environment:
+                        environment.pop(name)
+                    environment.pop("GENERATION_FILE")
 
             fixture["ue_capture"].unlink()
             environment.pop("FAKE_OVERLAY_REMOVE_FAIL")
@@ -2181,6 +2378,75 @@ print(json.dumps(payload, sort_keys=True))
             self.assertEqual(status["failed_child_name"], "ue")
             self.assertEqual(status["failed_child_exit_code"], 42)
 
+    def test_late_ue_failure_invalidates_resume_rollback_proposal_exit_76(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            status_file = project / "outputs/matrix-sonic-status.json"
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_RESUME_ROLLBACK_PROPOSAL": "1",
+                "FAKE_UE_LATE_FAILURE_EXIT_CODE": "42",
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_DISABLE_MC": "1",
+                "MATRIX_GAME_AUTO_RESPAWN": "0",
+                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
+                    project / "outputs/game-input.json"
+                ),
+                "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
+                "MATRIX_GAME_WORLD_PERSISTENCE": "0",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC": "1",
+                "MATRIX_SONIC_CONTROL_SOURCE": "game",
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(status_file),
+                "MATRIX_UNITREE_SDK2_ROOT": os.fspath(
+                    fixture["sonic"]
+                    / "gear_sonic_deploy/thirdparty/unitree_sdk2"
+                ),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_sim.sh"),
+                    "xgb",
+                    "21",
+                    "0",
+                    "0",
+                    "1",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                2,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+            self.assertEqual(
+                status["pre_external_termination_reason"],
+                "numerical_instability",
+            )
+            self.assertEqual(status["termination_reason"], "child_exit")
+            self.assertEqual(status["failed_child_name"], "ue")
+            self.assertEqual(status["failed_child_exit_code"], 42)
+
     def test_outer_launcher_rejects_exit_75_status_with_late_child_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
@@ -2385,6 +2651,654 @@ exit 0
             self.assertGreater(int(window), 0)
             self.assertIn("Validated Matrix world reload", result.stdout)
             self.assertIn("count=1/6", result.stdout)
+
+    def test_outer_launcher_accepts_exact_resume_rollback_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            rollback_trace = project / "rollback-trace.txt"
+            state_file = project / "state/world.json"
+            world_id = "g1_29dof:rollback-test"
+            world_revision = "rollback-revision-v1"
+            store = WORLD_STATE.WorldStateStore(
+                state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+            )
+            older_state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(1.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(older_state)
+            latest_state = older_state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=2,
+            )
+            store.save(latest_state)
+            selected = latest_state.resolve_start()
+            self.assertIsNotNone(selected.checkpoint_id)
+            rejected_id = selected.checkpoint_id
+            assert rejected_id is not None
+            run_id = "a" * 32
+            status = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=rejected_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id=run_id,
+            )
+            self.write(
+                project / "scripts/run_sim.sh",
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+generation=1
+if [[ -f "${{GENERATION_FILE:?}}" ]]; then
+    generation=$(( $(<"$GENERATION_FILE") + 1 ))
+fi
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s\n' "${{MATRIX_GAME_RESUME_ROLLBACK_COUNT:-missing}}" >> "${{ROLLBACK_TRACE_FILE:?}}"
+if [[ "$generation" == "1" ]]; then
+    mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
+    printf '%s\n' {shlex.quote(json.dumps(status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+    exit 76
+fi
+exit 0
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(
+                    project / "outputs/matrix-sonic-status.json"
+                ),
+                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "ROLLBACK_TRACE_FILE": os.fspath(rollback_trace),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
+            self.assertEqual(
+                rollback_trace.read_text(encoding="utf-8").splitlines(),
+                ["missing", "1"],
+            )
+            committed = store.load()
+            self.assertEqual(committed.generation, selected.generation + 1)
+            self.assertEqual(committed.resolve_start().checkpoint_id, older_state.resolve_start().checkpoint_id)
+            self.assertEqual(
+                [item.checkpoint_id for item in committed.invalid_checkpoints],
+                [rejected_id],
+            )
+            self.assertIn("Quarantined failed Matrix resume checkpoint", result.stdout)
+
+    def test_outer_launcher_never_chains_a_second_resume_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            state_file = project / "state/world.json"
+            world_id = "g1_29dof:rollback-test"
+            world_revision = "rollback-revision-v1"
+            store = WORLD_STATE.WorldStateStore(
+                state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+            )
+            state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(state)
+            selected = state.resolve_start()
+            self.assertIsNotNone(selected.checkpoint_id)
+            rejected_id = selected.checkpoint_id
+            assert rejected_id is not None
+            run_id = "b" * 32
+            status = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=rejected_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id=run_id,
+            )
+            self.write(
+                project / "scripts/run_sim.sh",
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+generation=1
+if [[ -f "${{GENERATION_FILE:?}}" ]]; then
+    generation=$(( $(<"$GENERATION_FILE") + 1 ))
+fi
+printf '%s' "$generation" > "$GENERATION_FILE"
+mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
+printf '%s\n' {shlex.quote(json.dumps(status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+exit 76
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(
+                    project / "outputs/matrix-sonic-status.json"
+                ),
+                "MATRIX_GAME_RESUME_ROLLBACK_COUNT": "1",
+                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                76,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
+            unchanged = store.load()
+            self.assertEqual(unchanged.generation, selected.generation)
+            self.assertEqual(unchanged.resolve_start().checkpoint_id, rejected_id)
+            self.assertEqual(unchanged.invalid_checkpoints, ())
+            self.assertIn("resume rollback already attempted once", result.stderr)
+
+    def test_signal_during_authorizer_window_keeps_state_byte_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            # Deterministically hold the copied launcher's exact authorizer job
+            # after it starts but before it execs the atomic marker publisher.
+            # This exercises the narrow signal window that a ready-file-only
+            # test cannot reliably reach without adding a production test hook.
+            launcher = project / "scripts/run_matrix_sonic.sh"
+            launcher_source = launcher.read_text(encoding="utf-8")
+            publisher_exec = (
+                '    exec /usr/bin/python3 -I - "$marker_path" '
+                '"$marker_payload" <<\'PY\'\n'
+            )
+            held_publisher_exec = (
+                '    if [[ "$marker_payload" == '
+                '"matrix-world-state-reject-authorize/v1" ]]; then\n'
+                '        printf \'started\\n\' > '
+                '"${MATRIX_TEST_AUTHORIZER_STARTED_FILE:?}"\n'
+                '        while [[ ! -e '
+                '"${MATRIX_TEST_AUTHORIZER_RELEASE_FILE:?}" ]]; do\n'
+                '            sleep 0.01\n'
+                '        done\n'
+                '    fi\n'
+                + publisher_exec
+            )
+            self.assertEqual(launcher_source.count(publisher_exec), 1)
+            launcher.write_text(
+                launcher_source.replace(publisher_exec, held_publisher_exec),
+                encoding="utf-8",
+            )
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            authorizer_started = project / "authorizer-started"
+            authorizer_release = project / "authorizer-release"
+            generations = project / "generations.txt"
+            state_file = project / "state/world.json"
+            world_id = "g1_29dof:rollback-signal"
+            world_revision = "rollback-signal-revision-v1"
+            store = WORLD_STATE.WorldStateStore(
+                state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+            )
+            state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(state)
+            selected = state.resolve_start()
+            assert selected.checkpoint_id is not None
+            primary_before = state_file.read_bytes()
+            backup_before = (
+                store.backup_path.read_bytes()
+                if store.backup_path.exists()
+                else None
+            )
+            status = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="9" * 32,
+            )
+            self.write(
+                project / "scripts/run_sim.sh",
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '1' > "${{GENERATION_FILE:?}}"
+mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
+printf '%s\n' {shlex.quote(json.dumps(status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+exit 76
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(
+                    project / "outputs/matrix-sonic-status.json"
+                ),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "MATRIX_TEST_AUTHORIZER_RELEASE_FILE": os.fspath(
+                    authorizer_release
+                ),
+                "MATRIX_TEST_AUTHORIZER_STARTED_FILE": os.fspath(
+                    authorizer_started
+                ),
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            process = subprocess.Popen(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 10.0
+            authorizer_observed = False
+            while time.monotonic() < deadline:
+                if authorizer_started.is_file():
+                    authorizer_observed = True
+                    break
+                if process.poll() is not None:
+                    break
+                time.sleep(0.002)
+            if not authorizer_observed:
+                stdout, stderr = process.communicate(timeout=5.0)
+                self.fail(
+                    "rollback authorizer never entered the held window\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=20.0)
+
+            self.assertEqual(
+                process.returncode,
+                143,
+                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
+            self.assertEqual(state_file.read_bytes(), primary_before)
+            if backup_before is None:
+                self.assertFalse(store.backup_path.exists())
+            else:
+                self.assertEqual(store.backup_path.read_bytes(), backup_before)
+            unchanged = store.load()
+            self.assertEqual(unchanged.generation, selected.generation)
+            self.assertEqual(
+                unchanged.resolve_start().checkpoint_id,
+                selected.checkpoint_id,
+            )
+            self.assertEqual(unchanged.invalid_checkpoints, ())
+            self.assertNotIn("Quarantined failed", stdout)
+
+    def test_resume_rollback_one_shot_survives_exit_75_reload_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            rollback_trace = project / "rollback-trace.txt"
+            state_file = project / "state/world.json"
+            world_id = "g1_29dof:rollback-chain"
+            world_revision = "rollback-chain-revision-v1"
+            store = WORLD_STATE.WorldStateStore(
+                state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+            )
+            older_state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(1.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(older_state)
+            latest_state = older_state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=2,
+            )
+            store.save(latest_state)
+            latest = latest_state.resolve_start()
+            older = older_state.resolve_start()
+            assert latest.checkpoint_id is not None
+            assert older.checkpoint_id is not None
+            first_status = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=latest.checkpoint_id,
+                generation=latest.generation,
+                source=latest.source,
+                run_id="c" * 32,
+            )
+            reload_status = {
+                "failed_child_exit_code": None,
+                "failed_child_name": None,
+                "game_auto_respawn": False,
+                "game_world_state": {"has_last_exit": True, "last_error": None},
+                "internal_restart": {
+                    "requested": True,
+                    "reason": "game_teleport",
+                },
+                "termination_reason": "game_teleport",
+                "termination_signal": None,
+            }
+            second_status = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=older.checkpoint_id,
+                generation=latest.generation + 1,
+                source="last_exit",
+                run_id="d" * 32,
+            )
+            self.write(
+                project / "scripts/run_sim.sh",
+                f"""#!/usr/bin/env bash
+set -euo pipefail
+generation=1
+if [[ -f "${{GENERATION_FILE:?}}" ]]; then
+    generation=$(( $(<"$GENERATION_FILE") + 1 ))
+fi
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s\n' "${{MATRIX_GAME_RESUME_ROLLBACK_COUNT:-missing}}" >> "${{ROLLBACK_TRACE_FILE:?}}"
+mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
+case "$generation" in
+    1)
+        printf '%s\n' {shlex.quote(json.dumps(first_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+        exit 76
+        ;;
+    2)
+        printf '%s\n' {shlex.quote(json.dumps(reload_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+        exit 75
+        ;;
+    3)
+        printf '%s\n' {shlex.quote(json.dumps(second_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
+        exit 76
+        ;;
+    *)
+        exit 99
+        ;;
+esac
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(
+                    project / "outputs/matrix-sonic-status.json"
+                ),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "ROLLBACK_TRACE_FILE": os.fspath(rollback_trace),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                76,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "3")
+            self.assertEqual(
+                rollback_trace.read_text(encoding="utf-8").splitlines(),
+                ["missing", "1", "1"],
+            )
+            committed = store.load()
+            self.assertEqual(committed.resolve_start().checkpoint_id, older.checkpoint_id)
+            self.assertEqual(
+                [item.checkpoint_id for item in committed.invalid_checkpoints],
+                [latest.checkpoint_id],
+            )
+            self.assertIn("resume rollback already attempted once", result.stderr)
+
+    def test_resume_rollback_one_shot_survives_f9_reload_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            rollback_trace = project / "rollback-trace.txt"
+            restart_marker = project / "restart-once.marker"
+            status_map_file = project / "rollback-status-map.json"
+            state_file = project / "state/world.json"
+            world_id = "g1_29dof:rollback-f9-chain"
+            world_revision = "rollback-f9-chain-revision-v1"
+            store = WORLD_STATE.WorldStateStore(
+                state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+            )
+            older_state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(1.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(older_state)
+            latest_state = older_state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
+                upright=True,
+                now_unix_ns=2,
+            )
+            store.save(latest_state)
+            latest = latest_state.resolve_start()
+            older = older_state.resolve_start()
+            assert latest.checkpoint_id is not None
+            assert older.checkpoint_id is not None
+            status_map_file.write_text(
+                json.dumps(
+                    {
+                        "1": self.rollback_proposal_status(
+                            state_file=state_file,
+                            world_id=world_id,
+                            world_revision=world_revision,
+                            checkpoint_id=latest.checkpoint_id,
+                            generation=latest.generation,
+                            source=latest.source,
+                            run_id="e" * 32,
+                        ),
+                        "3": self.rollback_proposal_status(
+                            state_file=state_file,
+                            world_id=world_id,
+                            world_revision=world_revision,
+                            checkpoint_id=older.checkpoint_id,
+                            generation=latest.generation + 1,
+                            source="last_exit",
+                            run_id="f" * 32,
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_RESUME_ROLLBACK_STATUS_MAP_FILE": os.fspath(
+                    status_map_file
+                ),
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
+                    project / "outputs/game-input.json"
+                ),
+                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_SONIC_STATUS_FILE": os.fspath(
+                    project / "outputs/matrix-sonic-status.json"
+                ),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "ROLLBACK_TRACE_FILE": os.fspath(rollback_trace),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TRIGGER_RESTART_MARKER": os.fspath(restart_marker),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=40.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                76,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "3")
+            self.assertEqual(
+                rollback_trace.read_text(encoding="utf-8").splitlines(),
+                ["missing", "1", "1"],
+            )
+            committed = store.load()
+            self.assertEqual(committed.resolve_start().checkpoint_id, older.checkpoint_id)
+            self.assertEqual(
+                [item.checkpoint_id for item in committed.invalid_checkpoints],
+                [latest.checkpoint_id],
+            )
+            self.assertIn("resume rollback already attempted once", result.stderr)
 
     def test_private_request_restarts_whole_runtime_after_clean_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

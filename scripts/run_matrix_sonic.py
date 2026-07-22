@@ -69,8 +69,17 @@ from matrix_world_state import (
 
 
 _GAME_INTERNAL_RESTART_EXIT_CODE = 75
+_GAME_RESUME_ROLLBACK_EXIT_CODE = 76
 _GAME_INTERNAL_RESTART_REASONS = frozenset(
     {"game_fall_respawn", "game_teleport"}
+)
+_GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
+    {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
+)
+_GAME_WORLD_RESUME_PROBATION_SECONDS = 5.0
+_GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES = (
+    "snapshot_non_finite:",
+    "snapshot_sim_time_not_increasing:",
 )
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
@@ -394,6 +403,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-world-id")
     parser.add_argument("--game-world-revision")
     parser.add_argument("--game-world-state-file", type=Path)
+    parser.add_argument("--game-world-resume-checkpoint-id")
+    parser.add_argument("--game-world-resume-generation", type=int)
+    parser.add_argument("--game-resume-rollback-count", type=int, default=0)
     parser.add_argument(
         "--game-world-checkpoint-seconds",
         type=float,
@@ -1487,6 +1499,8 @@ class _GameWorldStateRuntime:
         world_id: str,
         world_revision: str,
         checkpoint_seconds: float,
+        selected_resume_checkpoint_id: str | None = None,
+        selected_resume_generation: int | None = None,
     ) -> None:
         interval = float(checkpoint_seconds)
         if not math.isfinite(interval) or not 0.1 <= interval <= 60.0:
@@ -1499,6 +1513,32 @@ class _GameWorldStateRuntime:
             world_revision=world_revision,
         )
         self.state = self.store.load()
+        self.selected_resume_checkpoint_id = selected_resume_checkpoint_id
+        self.selected_resume_generation = selected_resume_generation
+        self.resume_rollback: dict[str, object] = {
+            "requested": False,
+            "applied": False,
+            "rejected_checkpoint_id": selected_resume_checkpoint_id,
+            "rejected_generation": selected_resume_generation,
+            "replacement_checkpoint_id": None,
+            "replacement_source": None,
+            "committed_generation": None,
+            "reason": None,
+            "run_id": None,
+            "tombstone": None,
+            "idempotent": False,
+        }
+        self.resume_rollback_ineligibility: str | None = None
+        if selected_resume_checkpoint_id is not None:
+            resolved = self.state.resolve_start()
+            if resolved.checkpoint_id != selected_resume_checkpoint_id:
+                raise WorldStateError(
+                    "selected resume checkpoint does not match the active world state"
+                )
+            if resolved.generation != selected_resume_generation:
+                raise WorldStateError(
+                    "selected resume generation does not match the active world state"
+                )
         self.checkpoint_seconds = interval
         self.next_checkpoint_s = 0.0
         self.checkpoint_count = 0
@@ -1538,7 +1578,115 @@ class _GameWorldStateRuntime:
         self.next_checkpoint_s = now + self.checkpoint_seconds
         return True
 
+    def reject_selected_resume_checkpoint(
+        self,
+        *,
+        reason: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        checkpoint_id = self.selected_resume_checkpoint_id
+        generation = self.selected_resume_generation
+        if checkpoint_id is None or generation is None:
+            raise WorldStateError("cannot reject an unselected resume checkpoint")
+        try:
+            result = self.store.reject_active_checkpoint(
+                expected_id=checkpoint_id,
+                expected_generation=generation,
+                reason=reason,
+                run_id=run_id,
+            )
+        except WorldStateError as exc:
+            self.last_error = str(exc)
+            self.resume_rollback["reason"] = f"rollback_error:{exc}"
+            raise
+        self.state = result.state
+        replacement = result.replacement_checkpoint
+        resolved = self.state.resolve_start()
+        if replacement is not None and resolved.checkpoint_id != replacement.checkpoint_id:
+            raise WorldStateError("checkpoint rejection selected an unexpected replacement")
+        tombstone = result.tombstone
+        if hasattr(tombstone, "to_mapping"):
+            tombstone_evidence: object = tombstone.to_mapping()
+        else:
+            tombstone_evidence = {
+                "checkpoint_id": getattr(tombstone, "checkpoint_id", checkpoint_id),
+                "reason": getattr(tombstone, "reason", reason),
+            }
+        self.resume_rollback = {
+            "requested": True,
+            "applied": True,
+            "rejected_checkpoint_id": result.rejected_checkpoint.checkpoint_id,
+            "rejected_generation": generation,
+            "replacement_checkpoint_id": (
+                replacement.checkpoint_id if replacement is not None else None
+            ),
+            "replacement_source": (
+                replacement.source if replacement is not None else resolved.source
+            ),
+            "committed_generation": result.state.generation,
+            "reason": reason,
+            "run_id": run_id,
+            "tombstone": tombstone_evidence,
+            "idempotent": bool(result.idempotent),
+        }
+        self.last_error = None
+        return dict(self.resume_rollback)
+
+    def propose_selected_resume_rollback(
+        self,
+        *,
+        reason: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        """Publish rollback intent without mutating either world-state copy."""
+
+        checkpoint_id = self.selected_resume_checkpoint_id
+        generation = self.selected_resume_generation
+        if checkpoint_id is None or generation is None:
+            raise WorldStateError("cannot propose rollback for an unselected checkpoint")
+        resolved = self.state.resolve_start()
+        if (
+            resolved.checkpoint_id != checkpoint_id
+            or resolved.generation != generation
+        ):
+            raise WorldStateError(
+                "selected resume checkpoint changed before rollback proposal"
+            )
+        if not isinstance(reason, str) or not reason:
+            raise WorldStateError("rollback proposal reason must be non-empty")
+        if not isinstance(run_id, str) or not run_id:
+            raise WorldStateError("rollback proposal run ID must be non-empty")
+        self.resume_rollback = {
+            "requested": True,
+            "applied": False,
+            "rejected_checkpoint_id": checkpoint_id,
+            "rejected_generation": generation,
+            "replacement_checkpoint_id": None,
+            "replacement_source": None,
+            "committed_generation": None,
+            "reason": reason,
+            "run_id": run_id,
+            "tombstone": None,
+            "idempotent": False,
+        }
+        self.resume_rollback_ineligibility = None
+        return dict(self.resume_rollback)
+
+    def cancel_resume_rollback_proposal(self, reason: str) -> None:
+        """Fail closed when a late boundary invalidates a published proposal."""
+
+        self.resume_rollback.update(
+            {
+                "requested": False,
+                "applied": False,
+                "reason": None,
+                "run_id": None,
+            }
+        )
+        self.resume_rollback_ineligibility = reason
+
     def telemetry(self) -> dict[str, object]:
+        resolved = self.state.resolve_start()
         return {
             "enabled": True,
             "path": str(self.store.path),
@@ -1546,6 +1694,19 @@ class _GameWorldStateRuntime:
             "world_revision": self.store.world_revision,
             "load_status": self.store.load_status,
             "load_error": self.store.load_error,
+            "generation": self.state.generation,
+            "active_resume_checkpoint_id": resolved.checkpoint_id,
+            "active_resume_source": resolved.source,
+            "resume_checkpoint_count": len(
+                getattr(self.state, "resume_checkpoints", ())
+            ),
+            "invalid_checkpoint_count": len(
+                getattr(self.state, "invalid_checkpoints", ())
+            ),
+            "selected_resume_checkpoint_id": self.selected_resume_checkpoint_id,
+            "selected_resume_generation": self.selected_resume_generation,
+            "resume_rollback": dict(self.resume_rollback),
+            "resume_rollback_ineligibility": self.resume_rollback_ineligibility,
             "checkpoint_count": self.checkpoint_count,
             "checkpoint_seconds": self.checkpoint_seconds,
             "last_checkpoint_monotonic_s": self.last_checkpoint_monotonic_s,
@@ -1966,6 +2127,203 @@ def _pace_absolute_deadline(deadline_s: float, period_s: float) -> float:
     if now - deadline_s > 2.0 * period_s:
         return now + period_s
     return deadline_s + period_s
+
+
+def _game_world_resume_probation_active(
+    *, selected_checkpoint_id: str | None, elapsed_s: float
+) -> bool:
+    """Keep a selected durable resume point read-only during its first 5 seconds."""
+
+    if selected_checkpoint_id is None:
+        return False
+    elapsed = float(elapsed_s)
+    return math.isfinite(elapsed) and 0.0 <= elapsed <= _GAME_WORLD_RESUME_PROBATION_SECONDS
+
+
+def _handle_game_auto_respawn_fall(
+    *,
+    game_world: _GameWorldStateRuntime,
+    game_input: GameInputRuntime,
+    planner: NativePlannerClient,
+    snapshot: Any,
+    selected_checkpoint_id: str | None,
+    resume_elapsed_s: float,
+    now_s: float,
+) -> tuple[str, RobotMotionCommand]:
+    """Stop every fall, but persist/reload only outside resume probation."""
+
+    game_command = game_input.emergency_stop(
+        now_s=now_s,
+        reason="fall_respawn_reload",
+    )
+    planner.send_game_command(game_command)
+    if _game_world_resume_probation_active(
+        selected_checkpoint_id=selected_checkpoint_id,
+        elapsed_s=resume_elapsed_s,
+    ):
+        return "fall_detected", game_command
+    game_world.checkpoint(
+        snapshot,
+        now_s=now_s,
+        force=True,
+        required=True,
+    )
+    return "game_fall_respawn", game_command
+
+
+def _validate_game_world_resume_metadata(
+    *,
+    selected_checkpoint_id: str | None,
+    selected_generation: int | None,
+    rollback_count: int,
+    world_state_configured: bool,
+) -> None:
+    selected_values = (selected_checkpoint_id, selected_generation)
+    if any(value is not None for value in selected_values) and not all(
+        value is not None for value in selected_values
+    ):
+        raise ValueError("game world resume checkpoint arguments are all-or-none")
+    if selected_checkpoint_id is not None and not selected_checkpoint_id:
+        raise ValueError("game world resume checkpoint ID must be non-empty")
+    if any(value is not None for value in selected_values) and not world_state_configured:
+        raise ValueError("game world resume checkpoint requires world-state persistence")
+    if (
+        isinstance(rollback_count, bool)
+        or not isinstance(rollback_count, int)
+        or rollback_count not in {0, 1}
+    ):
+        raise ValueError("game resume rollback count must be 0 or 1")
+    if rollback_count != 0 and not world_state_configured:
+        raise ValueError("game resume rollback count requires world-state persistence")
+    if selected_generation is not None and selected_generation < 0:
+        raise ValueError("game world resume generation must be non-negative")
+
+
+class _ResumeRollbackEvidence:
+    """Sticky, fail-closed evidence sampled before snapshot validation."""
+
+    def __init__(self, *, initial_reset_count: int) -> None:
+        self.initial_reset_count = int(initial_reset_count)
+        self.low_cmd_received = False
+        self.active_lowcmd = False
+        self.active_frames = 0
+        self.fall_detected = False
+        self.reset_observed = False
+        self.max_reset_count = self.initial_reset_count
+
+    def observe(self, snapshot: Any) -> None:
+        # These fields are monotonic evidence only. Validation remains the
+        # authority for schema correctness, while an invalid failure frame can
+        # never erase evidence already seen on an earlier frame.
+        try:
+            low_cmd_received = getattr(snapshot, "low_cmd_received", None)
+        except Exception:
+            low_cmd_received = None
+        try:
+            low_cmd_fresh = getattr(snapshot, "low_cmd_fresh", None)
+        except Exception:
+            low_cmd_fresh = None
+        if low_cmd_received is True:
+            self.low_cmd_received = True
+        if low_cmd_fresh is True:
+            self.low_cmd_received = True
+            self.active_lowcmd = True
+            self.active_frames += 1
+
+        try:
+            native_fall = getattr(snapshot, "fall_detected", None)
+        except Exception:
+            native_fall = None
+        if native_fall is True:
+            self.fall_detected = True
+
+        try:
+            raw_reset_count = getattr(snapshot, "reset_count")
+            if isinstance(raw_reset_count, bool):
+                raise ValueError("boolean reset count")
+            reset_count = int(raw_reset_count)
+            if reset_count != raw_reset_count or reset_count < 0:
+                raise ValueError("invalid reset count")
+        except Exception:
+            # Invalid reset metadata is rejected by snapshot validation. Keep
+            # this gate sticky too, so an earlier allowlisted field failure can
+            # never mask malformed reset evidence on the same frame.
+            self.reset_observed = True
+        else:
+            self.max_reset_count = max(self.max_reset_count, reset_count)
+            if reset_count != self.initial_reset_count:
+                self.reset_observed = True
+
+
+def _game_world_rollback_ineligibility(
+    *,
+    selected_checkpoint_id: str | None,
+    selected_generation: int | None,
+    rollback_count: int,
+    elapsed_s: float,
+    termination_reason: str | None,
+    numerical_error: str | None,
+    low_cmd_received: bool,
+    active_lowcmd: bool,
+    active_frames: int,
+    active_elapsed_s: float,
+    termination_signal: int | None,
+    child_failure: tuple[str, int] | None,
+    fall_detected: bool,
+    initial_reset_count: int,
+    final_reset_count: int,
+    reset_observed: bool = False,
+) -> str | None:
+    """Return why a failed resume cannot authorize one automatic rollback."""
+
+    if selected_checkpoint_id is None or selected_generation is None:
+        return "no_selected_checkpoint"
+    if rollback_count != 0:
+        return "rollback_already_attempted"
+    elapsed = float(elapsed_s)
+    if (
+        not math.isfinite(elapsed)
+        or elapsed < 0.0
+        or elapsed > _GAME_WORLD_RESUME_PROBATION_SECONDS
+    ):
+        return "outside_resume_probation"
+    if termination_signal is not None:
+        return "termination_signal"
+    if child_failure is not None:
+        return "child_failure"
+    if fall_detected:
+        return "fall_detected"
+    if reset_observed or final_reset_count != initial_reset_count:
+        return "reset_detected"
+    if low_cmd_received or active_lowcmd or active_frames != 0 or active_elapsed_s > 0.0:
+        return "lowcmd_observed"
+    if termination_reason != "numerical_instability":
+        return "not_numerical_instability"
+    if not isinstance(numerical_error, str) or not numerical_error.startswith(
+        _GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES
+    ):
+        return "numerical_error_not_allowlisted"
+    return None
+
+
+def _runtime_exit_code(
+    *,
+    internal_restart_requested: bool,
+    passed: bool,
+    qualification_attempted: bool,
+    interrupted: bool,
+    acceptance_failures: list[str],
+    resume_rollback_requested: bool = False,
+) -> int:
+    if resume_rollback_requested:
+        return _GAME_RESUME_ROLLBACK_EXIT_CODE
+    if internal_restart_requested:
+        return _GAME_INTERNAL_RESTART_EXIT_CODE
+    if passed or (
+        not qualification_attempted and interrupted and not acceptance_failures
+    ):
+        return 0
+    return 2
 
 
 def _acceptance_failures(
@@ -6400,6 +6758,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ("game_world_revision", None),
         ("game_world_state_file", None),
         ("game_world_checkpoint_seconds", 0.75),
+        ("game_world_resume_checkpoint_id", None),
+        ("game_world_resume_generation", None),
+        ("game_resume_rollback_count", 0),
         ("game_auto_respawn", False),
     ):
         if not hasattr(args, name):
@@ -6544,6 +6905,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         value is not None for value in world_values
     ):
         raise SystemExit("game world-state arguments are all-or-none")
+    try:
+        _validate_game_world_resume_metadata(
+            selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+            selected_generation=args.game_world_resume_generation,
+            rollback_count=args.game_resume_rollback_count,
+            world_state_configured=all(value is not None for value in world_values),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if all(value is not None for value in world_values):
         if args.control_source != "game":
             raise SystemExit("game world-state persistence requires game control")
@@ -6651,6 +7021,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     physical_recovery = None
     game_command = None
     processes = None
+    resume_probation_selected = args.game_world_resume_checkpoint_id is not None
+    resume_probation_started_wall: float | None = None
+    resume_rollback_ineligibility: str | None = None
+    resume_rollback_requested = False
+    resume_probation_fall_stop = False
     previous_signal_handlers: dict[int, Any] = {}
     running = True
     termination_reason: str | None = None
@@ -6691,8 +7066,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     world_id=args.game_world_id,
                     world_revision=args.game_world_revision,
                     checkpoint_seconds=args.game_world_checkpoint_seconds,
+                    selected_resume_checkpoint_id=(
+                        args.game_world_resume_checkpoint_id
+                    ),
+                    selected_resume_generation=args.game_world_resume_generation,
                 )
-                if _snapshot_world_upright(snapshot):
+                if (
+                    not resume_probation_selected
+                    and _snapshot_world_upright(snapshot)
+                ):
                     game_world.checkpoint(
                         snapshot,
                         now_s=time.perf_counter(),
@@ -6911,6 +7293,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         )
 
         started_wall = time.perf_counter()
+        resume_probation_started_wall = started_wall
         heading_anchor_telemetry = (
             _HeadingAnchorTelemetry(initial_root_yaw_rad, snapshot)
             if initial_root_yaw_rad is not None
@@ -6925,7 +7308,12 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         control_frames = 0
         active_frames = 0
         physics_steps = 0
-        instability_resets = int(snapshot.reset_count)
+        initial_reset_count = int(snapshot.reset_count)
+        resume_rollback_evidence = _ResumeRollbackEvidence(
+            initial_reset_count=initial_reset_count
+        )
+        resume_rollback_evidence.observe(snapshot)
+        instability_resets = initial_reset_count
         unstable = False
         fall_detected = bool(snapshot.fall_detected)
         min_root_z = float(snapshot.qpos[2])
@@ -7247,6 +7635,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 # per-step sleep otherwise accumulates scheduler overshoot.
                 next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
+                # Accumulate fail-closed evidence before validation. An invalid
+                # frame remains unavailable for physics/rendering, but its
+                # LowCmd/fall/reset flags must still veto checkpoint rollback.
+                resume_rollback_evidence.observe(next_snapshot)
                 step_error = _snapshot_validation_error(next_snapshot, snapshot)
                 if step_error is not None:
                     unstable = True
@@ -7286,18 +7678,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         assert game_world is not None
                         assert game_input is not None
                         assert planner is not None
-                        game_command = game_input.emergency_stop(
-                            now_s=time.perf_counter(),
-                            reason="fall_respawn_reload",
-                        )
-                        planner.send_game_command(game_command)
-                        walking = False
+                        fall_wall = time.perf_counter()
                         try:
-                            game_world.checkpoint(
-                                snapshot,
-                                now_s=time.perf_counter(),
-                                force=True,
-                                required=True,
+                            termination_reason, game_command = (
+                                _handle_game_auto_respawn_fall(
+                                    game_world=game_world,
+                                    game_input=game_input,
+                                    planner=planner,
+                                    snapshot=snapshot,
+                                    selected_checkpoint_id=(
+                                        args.game_world_resume_checkpoint_id
+                                    ),
+                                    resume_elapsed_s=max(
+                                        fall_wall - started_wall, 0.0
+                                    ),
+                                    now_s=fall_wall,
+                                )
                             )
                         except WorldStateError as exc:
                             running = False
@@ -7309,13 +7705,21 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 flush=True,
                             )
                             break
+                        walking = False
                         running = False
-                        termination_reason = "game_fall_respawn"
-                        print(
-                            "matrix-sonic-runtime fall detected; saved an "
-                            "upright cold-respawn checkpoint",
-                            flush=True,
-                        )
+                        if termination_reason == "fall_detected":
+                            resume_probation_fall_stop = True
+                            print(
+                                "matrix-sonic-runtime fall detected during "
+                                "resume probation; stopped without checkpoint",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                "matrix-sonic-runtime fall detected; saved an "
+                                "upright cold-respawn checkpoint",
+                                flush=True,
+                            )
                         break
                     if args.fail_on_fall:
                         running = False
@@ -7337,7 +7741,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             active_lowcmd = bool(snapshot.low_cmd_fresh)
             low_cmd_age_s = snapshot.low_cmd_age_s
             freshness_sample_wall = time.perf_counter()
-            if game_world is not None:
+            resume_probation_active = _game_world_resume_probation_active(
+                selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+                elapsed_s=(
+                    freshness_sample_wall - resume_probation_started_wall
+                    if resume_probation_started_wall is not None
+                    else 0.0
+                ),
+            )
+            if game_world is not None and not resume_probation_active:
                 game_world.checkpoint(snapshot, now_s=freshness_sample_wall)
             if active_lowcmd:
                 if active_started_wall is None:
@@ -7493,6 +7905,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 last_physics_steps = physics_steps
                 next_print = now + max(args.print_every, 0.1)
 
+        resume_probation_stop_wall = time.perf_counter()
+        resume_probation_elapsed_s = max(
+            resume_probation_stop_wall - started_wall, 0.0
+        )
+
         # Drain packets already queued at the exact acceptance boundary.  The
         # duration gate can otherwise break before observing a final focus-loss,
         # EOF, or malformed packet.  dt=0 updates only input state; this command
@@ -7553,6 +7970,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         if (
             game_world is not None
             and termination_reason not in _GAME_INTERNAL_RESTART_REASONS
+            and not resume_probation_fall_stop
+            and not _game_world_resume_probation_active(
+                selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+                elapsed_s=resume_probation_elapsed_s,
+            )
         ):
             try:
                 game_world.checkpoint(
@@ -7579,6 +8001,70 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         # channel after committing the native boundary so neither child class
         # can hide in the handoff between loop completion and acceptance.
         poll_failed_child()
+
+        # The runtime never deletes a durable checkpoint. After both child
+        # failure boundaries are closed, it may publish one exact proposal for
+        # the outer supervisor to validate against UE lifecycle evidence and
+        # apply atomically. Until then the active ID/generation remain intact.
+        if resume_probation_selected and game_world is not None:
+            resume_rollback_ineligibility = _game_world_rollback_ineligibility(
+                selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+                selected_generation=args.game_world_resume_generation,
+                rollback_count=args.game_resume_rollback_count,
+                elapsed_s=resume_probation_elapsed_s,
+                termination_reason=termination_reason,
+                numerical_error=numerical_error,
+                low_cmd_received=(
+                    resume_rollback_evidence.low_cmd_received
+                    or bool(snapshot.low_cmd_received)
+                ),
+                active_lowcmd=(
+                    resume_rollback_evidence.active_lowcmd
+                    or bool(snapshot.low_cmd_fresh)
+                ),
+                active_frames=max(
+                    active_frames, resume_rollback_evidence.active_frames
+                ),
+                active_elapsed_s=longest_active_elapsed_s,
+                termination_signal=termination_signal,
+                child_failure=child_failure,
+                fall_detected=(
+                    resume_rollback_evidence.fall_detected
+                    or fall_detected
+                    or bool(snapshot.fall_detected)
+                ),
+                initial_reset_count=initial_reset_count,
+                final_reset_count=max(
+                    int(snapshot.reset_count),
+                    resume_rollback_evidence.max_reset_count,
+                ),
+                reset_observed=resume_rollback_evidence.reset_observed,
+            )
+            game_world.resume_rollback_ineligibility = resume_rollback_ineligibility
+            if resume_rollback_ineligibility is None:
+                try:
+                    proposal = game_world.propose_selected_resume_rollback(
+                        reason="startup_numerical_instability",
+                        run_id=run_id,
+                    )
+                except WorldStateError as exc:
+                    resume_rollback_ineligibility = "rollback_proposal_failed"
+                    game_world.resume_rollback_ineligibility = (
+                        resume_rollback_ineligibility
+                    )
+                    print(
+                        "matrix-sonic-runtime ERROR cannot propose resume "
+                        f"rollback: {exc}",
+                        flush=True,
+                    )
+                else:
+                    resume_rollback_requested = True
+                    print(
+                        "matrix-sonic-runtime proposed failed resume checkpoint "
+                        f"rollback id={proposal['rejected_checkpoint_id']} "
+                        f"generation={proposal['rejected_generation']}",
+                        flush=True,
+                    )
         if termination_reason is None:
             termination_reason = "signal" if not running else "unknown"
 
@@ -7803,17 +8289,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             f"failures={acceptance_failures}",
             flush=True,
         )
-        if internal_restart_requested:
-            proposed_exit_code = _GAME_INTERNAL_RESTART_EXIT_CODE
-        elif passed or (
-            not qualification_attempted
-            and interrupted
-            and not acceptance_failures
-        ):
-            proposed_exit_code = 0
-        else:
-            proposed_exit_code = 2
-        return 0 if passed else 2
+        proposed_exit_code = _runtime_exit_code(
+            internal_restart_requested=internal_restart_requested,
+            passed=passed,
+            qualification_attempted=qualification_attempted,
+            interrupted=interrupted,
+            acceptance_failures=acceptance_failures,
+            resume_rollback_requested=resume_rollback_requested,
+        )
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_errors = []
@@ -7852,8 +8335,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 cleanup_errors.append(error)
         if (
             not active_exception
-            and not cleanup_errors
-            and proposed_exit_code == _GAME_INTERNAL_RESTART_EXIT_CODE
+            and proposed_exit_code in _GAME_SIGNAL_BOUNDARY_EXIT_CODES
         ):
             try:
                 termination_boundary_previous_mask = signal.pthread_sigmask(
@@ -7863,10 +8345,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 termination_boundary_safe = True
             except (AttributeError, OSError, ValueError) as exc:
                 print(
-                    "matrix-sonic-runtime ERROR cannot close the internal "
-                    f"restart signal boundary: {exc}",
+                    "matrix-sonic-runtime ERROR cannot close the runtime "
+                    f"handoff signal boundary: {exc}",
                     flush=True,
                 )
+                if proposed_exit_code == _GAME_RESUME_ROLLBACK_EXIT_CODE:
+                    resume_rollback_requested = False
+                    if game_world is not None:
+                        game_world.cancel_resume_rollback_proposal(
+                            "signal_boundary_unavailable"
+                        )
+                    if final_status is not None and game_world is not None:
+                        final_status["game_world_state"] = game_world.telemetry()
+                        _atomic_json(args.status_file, final_status)
         for signum, previous_handler in previous_signal_handlers.items():
             try:
                 signal.signal(signum, previous_handler)
@@ -7880,13 +8371,40 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     f"signal handler {signum}: {exc}"
                 )
         if cleanup_errors:
+            resume_rollback_cleanup_downgrade = (
+                proposed_exit_code == _GAME_RESUME_ROLLBACK_EXIT_CODE
+                and not active_exception
+            )
+            if resume_rollback_cleanup_downgrade:
+                proposed_exit_code = 2
+                resume_rollback_requested = False
+                if game_world is not None:
+                    game_world.cancel_resume_rollback_proposal("cleanup_failure")
+                if final_status is not None:
+                    failures = final_status.get("acceptance_failures")
+                    if not isinstance(failures, list):
+                        failures = []
+                    if "cleanup_failure" not in failures:
+                        failures.append("cleanup_failure")
+                    final_status["acceptance_failures"] = failures
+                    final_status["cleanup_errors"] = cleanup_errors
+                    final_status["passed"] = False
+                    final_status["pre_cleanup_termination_reason"] = (
+                        final_status.get("termination_reason")
+                    )
+                    final_status["termination_reason"] = "cleanup_failure"
+                    if game_world is not None:
+                        final_status["game_world_state"] = game_world.telemetry()
+                    _atomic_json(args.status_file, final_status)
+            else:
+                _record_cleanup_failure(args.status_file, cleanup_errors)
             if termination_boundary_previous_mask is not None:
                 signal.pthread_sigmask(
                     signal.SIG_SETMASK,
                     termination_boundary_previous_mask,
                 )
-            _record_cleanup_failure(args.status_file, cleanup_errors)
-            if not active_exception:
+                termination_boundary_previous_mask = None
+            if not active_exception and not resume_rollback_cleanup_downgrade:
                 raise RuntimeError(
                     "native cleanup failed: " + "; ".join(cleanup_errors)
                 )
@@ -7926,6 +8444,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "requested": False,
                     "reason": None,
                 }
+                status_changed = True
+        elif proposed_exit_code == _GAME_RESUME_ROLLBACK_EXIT_CODE and (
+            termination_signal is not None or not termination_boundary_safe
+        ):
+            proposed_exit_code = 2
+            resume_rollback_requested = False
+            cancellation_reason = (
+                "termination_signal"
+                if termination_signal is not None
+                else "signal_boundary_unavailable"
+            )
+            if game_world is not None:
+                game_world.cancel_resume_rollback_proposal(cancellation_reason)
+            if final_status is not None:
+                if game_world is not None:
+                    final_status["game_world_state"] = game_world.telemetry()
                 status_changed = True
         if status_changed:
             _atomic_json(args.status_file, final_status)

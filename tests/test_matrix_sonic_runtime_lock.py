@@ -503,6 +503,117 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-1.5', trna)
         self.assertIn('"$PROFILE" == "trna"', launcher)
 
+    def test_trna_short_game_launch_defaults_are_profile_driven(self) -> None:
+        launcher = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+        profile = REPO_ROOT / "config/hosts/trna.env"
+        profile_text = profile.read_text(encoding="utf-8")
+        expected_profile_defaults = (
+            'MATRIX_SONIC_CONTROL_SOURCE:-game',
+            'MATRIX_GAME_INPUT_SOURCE:-keyboard',
+            'MATRIX_GAME_CAMERA_YAW_SOURCE:-ue-final-pov',
+            'MATRIX_GAME_LOOK_BUTTON:-left',
+            'MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12',
+            'MATRIX_GAME_CAMERA_YAW_SIGN:--1',
+            'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0',
+            "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE-$HOME/"
+            "matrix-artifacts/matrix-centered-camera-custom-v1",
+        )
+        for default in expected_profile_defaults:
+            self.assertIn(default, profile_text)
+        self.assertNotIn("MATRIX_VERIFY_RUNTIME", profile_text)
+        self.assertIn("unset LD_LIBRARY_PATH PYTHONPATH", profile_text)
+        self.assertIn(
+            'if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]',
+            launcher,
+        )
+
+        control_default = 'CONTROL_SOURCE="${MATRIX_SONIC_CONTROL_SOURCE:-planner}"'
+        self.assertIn(control_default, launcher)
+        self.assertIn('--control-source) CONTROL_SOURCE="$2"', launcher)
+        self.assertLess(
+            launcher.index('source "$PROFILE_FILE"'),
+            launcher.index(control_default),
+        )
+        self.assertLess(
+            launcher.index(control_default),
+            launcher.index('while [[ $# -gt 0 ]]'),
+        )
+
+        names = (
+            "MATRIX_SONIC_CONTROL_SOURCE",
+            "MATRIX_GAME_INPUT_SOURCE",
+            "MATRIX_GAME_CAMERA_YAW_SOURCE",
+            "MATRIX_GAME_LOOK_BUTTON",
+            "MATRIX_GAME_MOUSE_SENSITIVITY_DEG",
+            "MATRIX_GAME_CAMERA_YAW_SIGN",
+            "MATRIX_GAME_CAMERA_YAW_OFFSET_DEG",
+            "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE",
+            "MATRIX_VERIFY_RUNTIME",
+            "LD_LIBRARY_PATH",
+            "PYTHONPATH",
+        )
+        emit = " ".join(f'"${{{name}-}}"' for name in names)
+        command = (
+            'set -euo pipefail; source "$1"; '
+            f"printf '%s\\0' {emit}"
+        )
+
+        def load_profile(overrides: dict[str, str]) -> list[str]:
+            environment = {
+                "HOME": "/home/trna",
+                "MATRIX_PROJECT_ROOT": "/matrix",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                **overrides,
+            }
+            result = subprocess.run(
+                ["bash", "-c", command, "bash", os.fspath(profile)],
+                env=environment,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return [
+                field.decode("utf-8")
+                for field in result.stdout.removesuffix(b"\0").split(b"\0")
+            ]
+
+        self.assertEqual(
+            load_profile({}),
+            [
+                "game",
+                "keyboard",
+                "ue-final-pov",
+                "left",
+                "0.12",
+                "-1",
+                "0.0",
+                "/home/trna/matrix-artifacts/"
+                "matrix-centered-camera-custom-v1",
+                "",
+                "",
+                "",
+            ],
+        )
+        overrides = {
+            "MATRIX_SONIC_CONTROL_SOURCE": "planner",
+            "MATRIX_GAME_INPUT_SOURCE": "auto",
+            "MATRIX_GAME_CAMERA_YAW_SOURCE": "fixed",
+            "MATRIX_GAME_LOOK_BUTTON": "right",
+            "MATRIX_GAME_MOUSE_SENSITIVITY_DEG": "0.25",
+            "MATRIX_GAME_CAMERA_YAW_SIGN": "1",
+            "MATRIX_GAME_CAMERA_YAW_OFFSET_DEG": "90.0",
+            "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE": "",
+            "MATRIX_VERIFY_RUNTIME": "0",
+            "LD_LIBRARY_PATH": "/tmp/host-libraries",
+            "PYTHONPATH": "/tmp/host-python",
+        }
+        self.assertEqual(
+            load_profile(overrides),
+            [*list(overrides.values())[:-2], "", ""],
+        )
+
     def test_env_check_skips_mc_only_for_external_control_topology(self) -> None:
         command = [
             "bash",
@@ -1928,6 +2039,8 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                             str(launcher),
                             "--profile",
                             "trna",
+                            "--control-source",
+                            "planner",
                             "--max-seconds",
                             "1",
                         ],
