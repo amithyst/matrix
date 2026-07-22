@@ -1199,6 +1199,22 @@ def add_fixed_collision_geom(body: ET.Element, link: ET.Element) -> None:
         insert_before_child_bodies(body, geom)
         return
 
+def remove_flattened_visual_only_geoms(root: ET.Element, link: ET.Element) -> int:
+    if link.find("inertial") is not None or link.findall("collision"):
+        return 0
+    mesh_names = {
+        Path(mesh.get("filename")).stem
+        for mesh in link.findall("visual/geometry/mesh")
+        if mesh.get("filename")
+    }
+    removed = 0
+    for body in root.iter("body"):
+        for geom in list(body.findall("geom")):
+            if geom.get("mesh") in mesh_names:
+                body.remove(geom)
+                removed += 1
+    return removed
+
 for link in urdf_root.findall("link"):
     link_name = link.get("name")
     if not link_name:
@@ -1217,6 +1233,8 @@ for link in urdf_root.findall("link"):
     parent_body = find_body(mjcf_root, parent_link)
     if parent_body is None:
         continue
+
+    remove_flattened_visual_only_geoms(mjcf_root, link)
 
     origin = joint.find("origin")
     pos = parse_xyz(origin.get("xyz") if origin is not None else None)

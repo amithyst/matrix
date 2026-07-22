@@ -34,6 +34,19 @@ v 0 1 0
 f 1 2 3
 """
 
+PALETTE_WEAPON_OBJ = """v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0.21875 0.5
+vt 0.34375 0.5
+vt 0.59375 0.5
+vt 0.71875 0.5
+f 1/1 2/1 3/1
+f 1/2 2/2 3/2
+f 1/3 2/3 3/3
+f 1/4 2/4 3/4
+"""
+
 
 class BuildWeaponPropPocUrdfTest(unittest.TestCase):
     def _fixture(self, root: Path) -> tuple[Path, Path]:
@@ -116,6 +129,25 @@ class BuildWeaponPropPocUrdfTest(unittest.TestCase):
                     root / "derived",
                     parent_link="missing_hand",
                 )
+
+    def test_splits_uv_atlas_into_four_palette_meshes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            weapon = root / "palette_blaster.obj"
+            weapon.write_text(PALETTE_WEAPON_OBJ, encoding="utf-8")
+            output = root / "palette"
+            output.mkdir()
+
+            counts = MODULE.convert_obj_to_palette_stls(weapon, output)
+
+            self.assertEqual(
+                counts,
+                {"dark": 1, "graphite": 1, "silver_blue": 1, "orange": 1},
+            )
+            for group in counts:
+                stl = (output / f"training_blaster_{group}.stl").read_bytes()
+                self.assertEqual(struct.unpack("<I", stl[80:84])[0], 1)
+                self.assertEqual(len(stl), 84 + 50)
 
 
 if __name__ == "__main__":
