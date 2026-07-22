@@ -4084,6 +4084,46 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
         "Linux Unix seqpacket credentials are required",
     )
+    def test_managed_control_disconnect_identifies_exact_child(self) -> None:
+        controls = (
+            (
+                MODULE._RecoveryWorkerControl,
+                "recovery-policy",
+                "recovery policy control disconnected",
+            ),
+            (
+                MODULE._SonicWriterControl,
+                "deploy",
+                "SONIC writer gate control disconnected",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, (control_type, child_name, message) in enumerate(controls):
+                with self.subTest(child_name=child_name):
+                    path = Path(temporary) / f"managed-{index}.sock"
+                    control = control_type(path)
+                    control.open()
+                    control.bind_expected_peer_pid(os.getpid())
+                    peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    try:
+                        peer.connect(str(path))
+                        control.poll()
+                        self.assertEqual(control.peer_pid, os.getpid())
+                        peer.close()
+                        with self.assertRaises(MODULE._ManagedControlDisconnect) as caught:
+                            control.poll()
+                        self.assertEqual(caught.exception.child_name, child_name)
+                        self.assertEqual(caught.exception.peer_pid, os.getpid())
+                        self.assertIn(message, str(caught.exception))
+                        self.assertEqual(control.error, str(caught.exception))
+                    finally:
+                        peer.close()
+                        control.close()
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
     def test_sonic_writer_control_tracks_hard_writer_fence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "sonic.sock"
@@ -5833,6 +5873,44 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertIsNone(group.failed_child())
         finally:
             group.close()
+
+    def test_process_group_waits_nonreaping_for_named_disconnect_peer(self) -> None:
+        deploy = mock.Mock(pid=4321)
+        recovery = mock.Mock(pid=4322)
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        group.children.extend(
+            (("deploy", deploy), ("recovery-policy", recovery))
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_peek_child_returncode",
+                side_effect=(None, None, -11),
+            ) as peek,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                group.wait_for_unexpected_child("deploy", timeout=0.1),
+                ("deploy", -11),
+            )
+
+        self.assertEqual(peek.call_args_list, [mock.call(deploy)] * 3)
+        sleep.assert_called()
+        deploy.wait.assert_not_called()
+        recovery.wait.assert_not_called()
+
+    @mock.patch.object(MODULE, "_peek_child_returncode", return_value=None)
+    def test_process_group_named_disconnect_wait_can_time_out(self, peek) -> None:
+        deploy = mock.Mock(pid=4321)
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        group.children.append(("deploy", deploy))
+
+        self.assertIsNone(
+            group.wait_for_unexpected_child("deploy", timeout=0.0)
+        )
+        peek.assert_called_once_with(deploy)
+        deploy.wait.assert_not_called()
 
     def test_process_group_close_kills_term_ignoring_descendant_before_reap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

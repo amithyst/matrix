@@ -4402,6 +4402,42 @@ class NativeProcessGroup:
                 return name, code
         return None
 
+    def wait_for_unexpected_child(
+        self,
+        name: str,
+        *,
+        timeout: float = 0.1,
+    ) -> tuple[str, int] | None:
+        """Briefly preserve one named child's exit before teardown can mask it.
+
+        A managed control socket can reach EOF a few scheduler ticks before its
+        direct child becomes waitable.  Poll with ``WNOWAIT`` so the original
+        exit code or signal remains authoritative for the normal stop boundary;
+        never reap, signal, or broaden the lookup to another process group.
+        """
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("managed child name must be non-empty")
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError("managed child wait timeout must be finite and nonnegative")
+        matching = [
+            process
+            for child_name, process in self.children
+            if child_name == name and process.pid not in self._expected_exit_pids
+        ]
+        if not matching or self._stopping:
+            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            for process in matching:
+                code = _peek_child_returncode(process)
+                if code is not None:
+                    return name, code
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            time.sleep(min(0.005, remaining))
+
     def begin_expected_stop(self) -> tuple[str, int] | None:
         """Set the authoritative stop boundary after one final non-reaping peek."""
 
@@ -4478,9 +4514,30 @@ class NativeProcessGroup:
             raise RuntimeError("; ".join(cleanup_errors))
 
 
+class _ManagedControlDisconnect(RuntimeError):
+    """A PID-authenticated child closed its authority-control endpoint."""
+
+    def __init__(
+        self,
+        *,
+        child_name: str,
+        endpoint: str,
+        peer_pid: int | None,
+    ) -> None:
+        self.child_name = child_name
+        self.endpoint = endpoint
+        self.peer_pid = peer_pid
+        peer_detail = "unknown" if peer_pid is None else str(peer_pid)
+        super().__init__(
+            f"{endpoint} control disconnected peer_pid={peer_detail}"
+        )
+
+
 class _RecoveryWorkerControl:
     """Own the local writer-gate socket; the worker owns only policy/DDS I/O."""
 
+    MANAGED_CHILD_NAME = "recovery-policy"
+    ENDPOINT_LABEL = "recovery policy"
     SCHEMAS = {
         "matrix.sonic_host_worker.control.v1",
         "matrix.sonic_amp_worker.control.v1",
@@ -5024,12 +5081,18 @@ class _RecoveryWorkerControl:
             except BlockingIOError:
                 break
             if not packet:
+                disconnected_peer_pid = self.peer_pid
                 self.connection.close()
                 self.connection = None
                 self.peer_pid = None
                 if not self.stopped:
-                    self.error = "recovery worker control disconnected"
-                    raise RuntimeError(self.error)
+                    disconnect = _ManagedControlDisconnect(
+                        child_name=self.MANAGED_CHILD_NAME,
+                        endpoint=self.ENDPOINT_LABEL,
+                        peer_pid=disconnected_peer_pid,
+                    )
+                    self.error = str(disconnect)
+                    raise disconnect
                 break
             self._handle_packet(packet)
 
@@ -5279,6 +5342,8 @@ class _RecoveryWorkerControl:
 class _SonicWriterControl(_RecoveryWorkerControl):
     """Authenticate and drive one native SONIC rt/lowcmd startup gate."""
 
+    MANAGED_CHILD_NAME = "deploy"
+    ENDPOINT_LABEL = "SONIC writer gate"
     SCHEMA = "matrix.sonic_deploy.control.v1"
 
     def __init__(
@@ -7705,6 +7770,36 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 failure = processes.failed_child()
             return register_child_failure(failure)
 
+        def stop_for_physical_recovery_exception(
+            exc: BaseException,
+            *,
+            action: bool,
+        ) -> None:
+            """Fail closed while retaining an EOF peer's original exit status."""
+
+            nonlocal unstable, running, termination_reason, numerical_error
+            unstable = True
+            running = False
+            context = "physical_recovery_action" if action else "physical_recovery"
+            numerical_error = f"{context}:{exc}"
+            classified_child = False
+            if isinstance(exc, _ManagedControlDisconnect):
+                classified_child = register_child_failure(
+                    processes.wait_for_unexpected_child(
+                        exc.child_name,
+                        timeout=0.1,
+                    )
+                )
+            if not classified_child:
+                classified_child = poll_failed_child()
+            if not classified_child:
+                termination_reason = "physical_recovery_failed"
+            label = "physical recovery action" if action else "physical recovery"
+            print(
+                f"matrix-sonic-runtime ERROR {label}: {exc}",
+                flush=True,
+            )
+
         # The parent shell supervises UE from the instant it is spawned. A UE
         # failure during the historical seven-second startup window is already
         # present here and must prevent deploy/PICO from starting.
@@ -8015,14 +8110,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 processes=processes,
                             )
                         except (OSError, RuntimeError, ValueError) as exc:
-                            unstable = True
-                            running = False
-                            termination_reason = "physical_recovery_failed"
-                            numerical_error = f"physical_recovery:{exc}"
-                            print(
-                                "matrix-sonic-runtime ERROR physical recovery: "
-                                f"{exc}",
-                                flush=True,
+                            stop_for_physical_recovery_exception(
+                                exc,
+                                action=False,
                             )
                             break
                         if _reanchor_game_heading_after_recovery_transition(
@@ -8134,14 +8224,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     planner.send_game_command(game_command)
                                     command_published = True
                         except (OSError, RuntimeError, ValueError) as exc:
-                            unstable = True
-                            running = False
-                            termination_reason = "physical_recovery_failed"
-                            numerical_error = f"physical_recovery_action:{exc}"
-                            print(
-                                "matrix-sonic-runtime ERROR physical recovery "
-                                f"action: {exc}",
-                                flush=True,
+                            stop_for_physical_recovery_exception(
+                                exc,
+                                action=True,
                             )
                             break
                         if physical_output.fail_closed:
