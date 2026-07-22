@@ -60,6 +60,8 @@ The current SOL-2080 product direction is box-world first: bounded, verified
 scenes such as the city and MoonWorld are linked through ESC teleport
 destinations while preserving one session/state/provenance model. Seamless
 planet-scale streaming is a later renderer track, not a cooked-PAK promise.
+MoonWorld V1 bootstrap and screenshot acceptance are documented in
+[Matrix MoonWorld Box-World V1](docs/MOON_V1_CN.md).
 
 ### 3. Run Simulation
 ```bash
