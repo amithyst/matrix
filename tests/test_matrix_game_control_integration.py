@@ -357,13 +357,20 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
 
 class LauncherArgumentChainIntegrationTest(unittest.TestCase):
     GAME_CONTROL_DEPENDENCIES = (
-        "matrix_game_control_input.py",
-        "matrix_external_control.py",
-        "matrix_calibration_overlay.py",
-        "matrix_mc_commands.py",
-        "matrix_world_state.py",
-        "prepare_sonic_physics_model.py",
-        "compose_custom_scene.py",
+        "scripts/matrix_game_control_input.py",
+        "scripts/matrix_external_control.py",
+        "scripts/matrix_calibration_overlay.py",
+        "scripts/matrix_celestial_navigation.py",
+        "scripts/matrix_celestial_ephemeris.py",
+        "scripts/bootstrap_matrix_celestial.sh",
+        "scripts/matrix_mc_commands.py",
+        "scripts/matrix_motion_settings.py",
+        "scripts/matrix_spawn_clearance.py",
+        "scripts/matrix_world_state.py",
+        "config/universe/sol-2080.json",
+        "config/universe/de440s-2080.lock.json",
+        "scripts/prepare_sonic_physics_model.py",
+        "scripts/compose_custom_scene.py",
     )
 
     @staticmethod
@@ -478,6 +485,9 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "matrix_restart_request.py",
             "matrix_ue_overlay.py",
             "matrix_calibration_overlay.py",
+            "matrix_celestial_navigation.py",
+            "matrix_celestial_ephemeris.py",
+            "bootstrap_matrix_celestial.sh",
             "matrix_mc_commands.py",
             "matrix_world_state.py",
             "compose_custom_scene.py",
@@ -502,6 +512,16 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         shutil.copy2(
             REPO_ROOT / "config/runtime/matrix-centered-camera-overlay-v3.json",
             project / "config/runtime/matrix-centered-camera-overlay-v3.json",
+        )
+        universe_catalog = project / "config/universe/sol-2080.json"
+        universe_catalog.parent.mkdir(parents=True)
+        shutil.copy2(
+            REPO_ROOT / "config/universe/sol-2080.json",
+            universe_catalog,
+        )
+        shutil.copy2(
+            REPO_ROOT / "config/universe/de440s-2080.lock.json",
+            universe_catalog.parent / "de440s-2080.lock.json",
         )
         self.write(
             project / "config/config.json",
@@ -909,6 +929,11 @@ elif script == "run_matrix_sonic.py":
                 args[args.index("--game-restart-launcher-pid") + 1],
             ],
         )
+elif script == "matrix_celestial_navigation.py":
+    os.execv(
+        "/usr/bin/python3",
+        ["/usr/bin/python3", "-I", sys.argv[1], *args],
+    )
 elif script == "matrix_game_control_input.py":
     request = Path(args[args.index("--restart-request-file") + 1])
     capability = Path(args[args.index("--restart-capability-file") + 1])
@@ -1037,7 +1062,7 @@ else:
 
             for dependency in self.GAME_CONTROL_DEPENDENCIES:
                 with self.subTest(dependency=dependency):
-                    path = project / "scripts" / dependency
+                    path = project / dependency
                     held = path.with_name(f".{path.name}.missing")
                     path.rename(held)
                     fixture["capture"].unlink(missing_ok=True)
@@ -1047,7 +1072,8 @@ else:
                             env={
                                 **environment,
                                 "MATRIX_SONIC_HOST_LOCK": os.fspath(
-                                    project / f"launcher-missing-{dependency}.lock"
+                                    project
+                                    / f"launcher-missing-{Path(dependency).name}.lock"
                                 ),
                             },
                             text=True,
@@ -1187,7 +1213,7 @@ printf '%s\n%s\n%s\n' \
 
             for dependency in self.GAME_CONTROL_DEPENDENCIES:
                 with self.subTest(dependency=dependency):
-                    path = project / "scripts" / dependency
+                    path = project / dependency
                     held = path.with_name(f".{path.name}.missing")
                     path.rename(held)
                     fixture["capture"].unlink(missing_ok=True)

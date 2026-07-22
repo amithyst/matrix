@@ -61,6 +61,16 @@ GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
 GAME_CAMERA_YAW_OFFSET_DEG="${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
 GAME_CARLA_HOST="${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
 GAME_CARLA_PORT="${MATRIX_GAME_CARLA_PORT:-2000}"
+CELESTIAL_LIGHTING_BRIDGE="${MATRIX_CELESTIAL_LIGHTING_BRIDGE:-state-only}"
+CELESTIAL_ROOT="${MATRIX_CELESTIAL_ROOT:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-native-v2}/celestial}"
+CELESTIAL_SPK="${MATRIX_CELESTIAL_SPK:-}"
+CELESTIAL_JPLEPHEM_WHEEL="${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}"
+if [[ -z "$CELESTIAL_SPK" && -z "$CELESTIAL_JPLEPHEM_WHEEL" \
+    && -f "$CELESTIAL_ROOT/de440s.bsp" \
+    && -f "$CELESTIAL_ROOT/jplephem-2.23-py3-none-any.whl" ]]; then
+    CELESTIAL_SPK="$CELESTIAL_ROOT/de440s.bsp"
+    CELESTIAL_JPLEPHEM_WHEEL="$CELESTIAL_ROOT/jplephem-2.23-py3-none-any.whl"
+fi
 GAMEPAD_LOOK_YAW_RATE_DEG_S="${MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S:-120.0}"
 GAMEPAD_LOOK_PITCH_RATE_DEG_S="${MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S:-90.0}"
 GAMEPAD_LOOK_DEADZONE="${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
@@ -142,6 +152,7 @@ usage() {
         "  --game-camera-yaw-offset DEG  Provider-to-SONIC zero-frame offset" \
         "  --game-carla-host HOST     Optional fail-closed CARLA spectator host" \
         "  --game-carla-port PORT     Optional CARLA spectator RPC port" \
+        "  --celestial-lighting-bridge MODE  state-only or carla-weather" \
         "  --gamepad-look-yaw-rate DEG_S    Full-stick spectator yaw rate" \
         "  --gamepad-look-pitch-rate DEG_S  Full-stick spectator pitch rate" \
         "  --gamepad-look-deadzone VALUE    Radial right-stick deadzone" \
@@ -204,6 +215,7 @@ while [[ $# -gt 0 ]]; do
         --game-camera-yaw-offset) GAME_CAMERA_YAW_OFFSET_DEG="$2"; shift 2 ;;
         --game-carla-host) GAME_CARLA_HOST="$2"; shift 2 ;;
         --game-carla-port) GAME_CARLA_PORT="$2"; shift 2 ;;
+        --celestial-lighting-bridge) CELESTIAL_LIGHTING_BRIDGE="$2"; shift 2 ;;
         --gamepad-look-yaw-rate) GAMEPAD_LOOK_YAW_RATE_DEG_S="$2"; shift 2 ;;
         --gamepad-look-pitch-rate) GAMEPAD_LOOK_PITCH_RATE_DEG_S="$2"; shift 2 ;;
         --gamepad-look-deadzone) GAMEPAD_LOOK_DEADZONE="$2"; shift 2 ;;
@@ -253,8 +265,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$CELESTIAL_LIGHTING_BRIDGE" in
+    state-only|carla-weather) ;;
+    *)
+        echo "[ERROR] --celestial-lighting-bridge must be state-only or carla-weather" >&2
+        exit 2
+        ;;
+esac
+
 if [[ -n "$G1_SKIN" ]]; then
     export MATRIX_G1_SKIN="$G1_SKIN"
+fi
+if [[ -n "$CELESTIAL_SPK" || -n "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
+    if [[ -z "$CELESTIAL_SPK" || -z "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
+        echo "[ERROR] Matrix celestial DE440s assets are all-or-none" >&2
+        exit 2
+    fi
+    export MATRIX_CELESTIAL_SPK="$CELESTIAL_SPK"
+    export MATRIX_CELESTIAL_JPLEPHEM_WHEEL="$CELESTIAL_JPLEPHEM_WHEEL"
+    echo "[INFO] Celestial ephemeris: locked DE440s"
+else
+    unset MATRIX_CELESTIAL_SPK MATRIX_CELESTIAL_JPLEPHEM_WHEEL
+    echo "[WARN] Celestial ephemeris: analytical visual-navigation fallback"
 fi
 
 if [[ -n "${MATRIX_CPUSET:-}" && "${MATRIX_CPUSET_APPLIED:-0}" != "1" ]]; then
@@ -748,10 +780,15 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
         "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
         "$PROJECT_ROOT/scripts/matrix_external_control.py" \
         "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
+        "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
+        "$PROJECT_ROOT/scripts/matrix_celestial_ephemeris.py" \
+        "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
         "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
         "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
         "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
         "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+        "$PROJECT_ROOT/config/universe/sol-2080.json" \
+        "$PROJECT_ROOT/config/universe/de440s-2080.lock.json" \
         "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
         "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
         if [[ ! -f "$required" ]]; then
@@ -759,6 +796,20 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
             exit 1
         fi
     done
+    CELESTIAL_PREFLIGHT_ARGS=(
+        validate
+        --catalog "$PROJECT_ROOT/config/universe/sol-2080.json"
+        --asset-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
+    )
+    if [[ -n "$CELESTIAL_SPK" ]]; then
+        CELESTIAL_PREFLIGHT_ARGS+=(
+            --de440s-kernel "$CELESTIAL_SPK"
+            --jplephem-wheel "$CELESTIAL_JPLEPHEM_WHEEL"
+        )
+    fi
+    "$MATRIX_SONIC_PYTHON" \
+        "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
+        "${CELESTIAL_PREFLIGHT_ARGS[@]}"
 fi
 
 require_qualified_path() {
@@ -943,6 +994,7 @@ export MATRIX_GAME_CAMERA_YAW_SIGN="$GAME_CAMERA_YAW_SIGN"
 export MATRIX_GAME_CAMERA_YAW_OFFSET_DEG="$GAME_CAMERA_YAW_OFFSET_DEG"
 export MATRIX_GAME_CARLA_HOST="$GAME_CARLA_HOST"
 export MATRIX_GAME_CARLA_PORT="$GAME_CARLA_PORT"
+export MATRIX_CELESTIAL_LIGHTING_BRIDGE="$CELESTIAL_LIGHTING_BRIDGE"
 export MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S="$GAMEPAD_LOOK_YAW_RATE_DEG_S"
 export MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S="$GAMEPAD_LOOK_PITCH_RATE_DEG_S"
 export MATRIX_GAMEPAD_LOOK_DEADZONE="$GAMEPAD_LOOK_DEADZONE"

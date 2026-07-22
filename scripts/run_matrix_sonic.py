@@ -54,6 +54,7 @@ from matrix_mc_commands import (
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
     PolicySlotAssignment,
+    TeleportList,
     decode_command_request,
     encode_command_response,
     execute_command,
@@ -505,6 +506,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-world-id")
     parser.add_argument("--game-world-revision")
     parser.add_argument("--game-world-state-file", type=Path)
+    parser.add_argument("--game-celestial-clock-state-file", type=Path)
+    parser.add_argument(
+        "--game-celestial-assets-manifest",
+        type=Path,
+        default=_SCRIPT_DIR.parent / "config/universe/de440s-2080.lock.json",
+    )
+    parser.add_argument("--game-celestial-de440s-kernel", type=Path)
+    parser.add_argument("--game-celestial-jplephem-wheel", type=Path)
+    parser.add_argument(
+        "--game-celestial-lighting-bridge",
+        choices=("state-only", "carla-weather"),
+        default="state-only",
+    )
     parser.add_argument("--game-world-resume-checkpoint-id")
     parser.add_argument("--game-world-resume-generation", type=int)
     parser.add_argument("--game-resume-rollback-count", type=int, default=0)
@@ -3844,29 +3858,33 @@ class GameCommandRuntime:
                     current_pose=current_pose,
                     now_unix_ns=time.time_ns(),
                 )
-                if effect.restart_required and self.pose_clearance_auditor is not None:
-                    target = effect.state.resolve_start().pose
-                    if target is None:
-                        raise CommandExecutionError(
-                            "E_SPAWN_CLEARANCE",
-                            "Teleport did not produce a resumable target",
-                        )
-                    clearance = self.pose_clearance_auditor(target)
-                    if clearance.get("safe") is not True:
-                        self.rejected_commands += 1
-                        self._send(
-                            self._response(
-                                request,
-                                ok=False,
-                                code="E_SPAWN_CLEARANCE",
-                                message=(
-                                    "Teleport target intersects scene geometry"
-                                ),
-                                data={"spawn_clearance": clearance},
+                if not isinstance(request.command, TeleportList):
+                    if (
+                        effect.restart_required
+                        and self.pose_clearance_auditor is not None
+                    ):
+                        target = effect.state.resolve_start().pose
+                        if target is None:
+                            raise CommandExecutionError(
+                                "E_SPAWN_CLEARANCE",
+                                "Teleport did not produce a resumable target",
                             )
-                        )
-                        continue
-                self.world.store.save(effect.state)
+                        clearance = self.pose_clearance_auditor(target)
+                        if clearance.get("safe") is not True:
+                            self.rejected_commands += 1
+                            self._send(
+                                self._response(
+                                    request,
+                                    ok=False,
+                                    code="E_SPAWN_CLEARANCE",
+                                    message=(
+                                        "Teleport target intersects scene geometry"
+                                    ),
+                                    data={"spawn_clearance": clearance},
+                                )
+                            )
+                            continue
+                    self.world.store.save(effect.state)
             except CommandExecutionError as exc:
                 self.rejected_commands += 1
                 self._send(
@@ -3890,8 +3908,9 @@ class GameCommandRuntime:
                     )
                 )
                 continue
-            self.world.state = effect.state
-            self.world.last_error = None
+            if not isinstance(request.command, TeleportList):
+                self.world.state = effect.state
+                self.world.last_error = None
             self.commands_executed += 1
             self._send(
                 self._response(
@@ -4085,6 +4104,11 @@ class NativeProcessGroup:
         command_fd: int | None = None,
         strategy_loadout_json: str | None = None,
         motion_settings_json: str | None = None,
+        celestial_clock_state_file: Path | None = None,
+        celestial_lighting_bridge: str = "state-only",
+        celestial_assets_manifest: Path | None = None,
+        celestial_de440s_kernel: Path | None = None,
+        celestial_jplephem_wheel: Path | None = None,
     ) -> int:
         command = [
             python,
@@ -4181,6 +4205,37 @@ class NativeProcessGroup:
             command.extend(("--strategy-loadout-json", strategy_loadout_json))
         if motion_settings_json is not None:
             command.extend(("--motion-settings-json", motion_settings_json))
+        if celestial_clock_state_file is not None:
+            command.extend(
+                (
+                    "--celestial-clock-state-file",
+                    str(celestial_clock_state_file),
+                )
+            )
+        if celestial_lighting_bridge not in {"state-only", "carla-weather"}:
+            raise ValueError("celestial lighting bridge is invalid")
+        command.extend(
+            ("--celestial-lighting-bridge", celestial_lighting_bridge)
+        )
+        if celestial_assets_manifest is not None:
+            command.extend(
+                ("--celestial-assets-manifest", str(celestial_assets_manifest))
+            )
+        ephemeris_assets = (celestial_de440s_kernel, celestial_jplephem_wheel)
+        if any(value is not None for value in ephemeris_assets) and not all(
+            value is not None for value in ephemeris_assets
+        ):
+            raise ValueError("celestial ephemeris assets are all-or-none")
+        if celestial_de440s_kernel is not None:
+            assert celestial_jplephem_wheel is not None
+            command.extend(
+                (
+                    "--celestial-de440s-kernel",
+                    str(celestial_de440s_kernel),
+                    "--celestial-jplephem-wheel",
+                    str(celestial_jplephem_wheel),
+                )
+            )
         extra_pass_fds: tuple[int, ...] = ()
         if command_fd is not None:
             if isinstance(command_fd, bool) or not isinstance(command_fd, int):
@@ -7518,6 +7573,57 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             raise SystemExit(
                 "bounded qualification rejects persistent game world state"
             )
+    game_celestial_clock_state_file = getattr(
+        args, "game_celestial_clock_state_file", None
+    )
+    if game_celestial_clock_state_file is not None:
+        if args.control_source != "game":
+            raise SystemExit("celestial clock persistence requires game control")
+        if not all(value is not None for value in world_values):
+            raise SystemExit(
+                "celestial clock persistence requires persistent game world state"
+            )
+        if not game_celestial_clock_state_file.is_absolute():
+            raise SystemExit("--game-celestial-clock-state-file must be absolute")
+        if (
+            game_celestial_clock_state_file.exists()
+            and (
+                game_celestial_clock_state_file.is_symlink()
+                or not game_celestial_clock_state_file.is_file()
+            )
+        ):
+            raise SystemExit(
+                "--game-celestial-clock-state-file must be a regular file when present"
+            )
+    celestial_assets_manifest = getattr(
+        args, "game_celestial_assets_manifest", None
+    )
+    celestial_assets = (
+        getattr(args, "game_celestial_de440s_kernel", None),
+        getattr(args, "game_celestial_jplephem_wheel", None),
+    )
+    if args.control_source == "game" and celestial_assets_manifest is not None:
+        if (
+            not celestial_assets_manifest.is_absolute()
+            or celestial_assets_manifest.is_symlink()
+            or not celestial_assets_manifest.is_file()
+        ):
+            raise SystemExit(
+                "--game-celestial-assets-manifest must be an absolute regular file"
+            )
+    if any(value is not None for value in celestial_assets) and not all(
+        value is not None for value in celestial_assets
+    ):
+        raise SystemExit("game celestial ephemeris assets are all-or-none")
+    if any(value is not None for value in celestial_assets):
+        if args.control_source != "game":
+            raise SystemExit("celestial ephemeris assets require game control")
+        for path in celestial_assets:
+            assert path is not None
+            if not path.is_absolute() or path.is_symlink() or not path.is_file():
+                raise SystemExit(
+                    "game celestial ephemeris assets must be absolute regular files"
+                )
     if args.game_auto_respawn:
         if not all(value is not None for value in world_values):
             raise SystemExit("--game-auto-respawn requires game world-state persistence")
@@ -7928,6 +8034,29 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             )
                             if motion_settings_store is not None
                             else None
+                        ),
+                        celestial_clock_state_file=(
+                            getattr(args, "game_celestial_clock_state_file", None)
+                        ),
+                        celestial_lighting_bridge=getattr(
+                            args,
+                            "game_celestial_lighting_bridge",
+                            "state-only",
+                        ),
+                        celestial_assets_manifest=getattr(
+                            args,
+                            "game_celestial_assets_manifest",
+                            None,
+                        ),
+                        celestial_de440s_kernel=getattr(
+                            args,
+                            "game_celestial_de440s_kernel",
+                            None,
+                        ),
+                        celestial_jplephem_wheel=getattr(
+                            args,
+                            "game_celestial_jplephem_wheel",
+                            None,
                         ),
                     )
                     if game_command_child_socket is not None:

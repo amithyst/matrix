@@ -2033,6 +2033,9 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 with self.subTest(overrides=overrides):
                     environment = os.environ.copy()
                     environment.update(overrides)
+                    # This test owns root/skip validation, not the optional
+                    # host-private centered-camera bundle provisioned on TRNA.
+                    environment["MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE"] = ""
                     environment["MATRIX_SONIC_HOST_LOCK"] = str(
                         root / f"{next(iter(overrides))}.lock"
                     )

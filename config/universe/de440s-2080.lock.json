@@ -1,0 +1,29 @@
+{
+  "schema": "matrix-celestial-assets/v1",
+  "provider": "jpl-de440s-v1",
+  "coverage": {
+    "start_utc": "1849-12-26T00:00:00Z",
+    "end_utc": "2150-01-22T00:00:00Z"
+  },
+  "assets": [
+    {
+      "role": "de440s_spk",
+      "filename": "de440s.bsp",
+      "size": 32726016,
+      "sha256": "c1c7feeab882263fc493a9d5a5b2ddd71b54826cdf65d8d17a76126b260a49f2",
+      "urls": [
+        "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440s.bsp",
+        "https://raw.githubusercontent.com/takashi-cw/Stella-JS_Astrocalc/b0faffed680cff23f2339f9bc9febe19fd0ace94/docs/data/catalogs/de440s.bsp"
+      ]
+    },
+    {
+      "role": "jplephem_wheel",
+      "filename": "jplephem-2.23-py3-none-any.whl",
+      "size": 49368,
+      "sha256": "66110814810b0b30213bdd058a85a41bedbc030bb8a365c85088674fe02546cf",
+      "urls": [
+        "https://files.pythonhosted.org/packages/da/e0/b215df7cae3be61a0a293346723f5b068e359a3430dcadb32ef90ae3398c/jplephem-2.23-py3-none-any.whl"
+      ]
+    }
+  ]
+}

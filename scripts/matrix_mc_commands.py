@@ -27,6 +27,7 @@ from matrix_motion_settings import MOTION_SETTING_PATHS
 COMMAND_PROTOCOL = "matrix-game-command/v1"
 MAX_COMMAND_CHARS = 512
 MAX_COMMAND_PACKET_BYTES = 4096
+MAX_TELEPORT_QUERY_TAGS = 8
 _SESSION_RE = re.compile(r"[0-9a-f]{32}\Z")
 _REQUEST_ID_RE = re.compile(r"cmd-[0-9a-f]{32}\Z")
 _ERROR_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{1,63}\Z")
@@ -40,6 +41,10 @@ _SUMMON_RE = re.compile(
     r"\{Tags:\[(?P<tags>.*)\]\}\s*\Z"
 )
 _TP_RE = re.compile(r"/?tp\s+@s\s+(?P<target>.+?)\s*\Z")
+_TELEPORT_LIST_RE = re.compile(
+    r"/?teleport\s+list(?P<tags>(?:\s+\S+)*)\s*\Z",
+    re.IGNORECASE,
+)
 _POLICY_RE = re.compile(
     r"/?policy\s+(?P<slot>locomotion|recovery)\s+"
     r"(?P<policy>[a-z0-9][a-z0-9._-]{0,63})\s*\Z",
@@ -233,6 +238,30 @@ class TeleportSelector:
 
 
 @dataclass(frozen=True)
+class TeleportList:
+    tags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.tags, tuple)
+            or not 1 <= len(self.tags) <= MAX_TELEPORT_QUERY_TAGS
+        ):
+            raise CommandParseError(
+                "E_TELEPORT_LIST_LIMIT",
+                f"teleport list requires 1-{MAX_TELEPORT_QUERY_TAGS} tags",
+            )
+        try:
+            validated = tuple(validate_tag(tag) for tag in self.tags)
+        except WorldStateError as exc:
+            raise CommandParseError("E_TAG_INVALID", str(exc)) from exc
+        if len(validated) != len(set(validated)):
+            raise CommandParseError(
+                "E_TAG_DUPLICATE", "teleport list tags must be unique"
+            )
+        object.__setattr__(self, "tags", validated)
+
+
+@dataclass(frozen=True)
 class PolicySlotAssignment:
     """Select one already-resident policy for a gameplay strategy slot."""
 
@@ -321,6 +350,7 @@ McCommand: TypeAlias = (
     | TeleportCoordinates
     | TeleportLocalCoordinates
     | TeleportSelector
+    | TeleportList
     | PolicySlotAssignment
     | DataModifyNumber
     | DataModifyInput
@@ -519,6 +549,11 @@ def parse_mc_command(text: object) -> ParsedCommand:
                 policy_id=policy.group("policy"),
             )
         )
+    teleport_list = _TELEPORT_LIST_RE.fullmatch(command_text)
+    if teleport_list is not None:
+        return ParsedCommand(
+            TeleportList(tuple(teleport_list.group("tags").split()))
+        )
     summon = _SUMMON_RE.fullmatch(command_text)
     if summon is not None:
         if summon.group("entity") != TELEPORT_POINT_TYPE:
@@ -577,7 +612,7 @@ def parse_mc_command(text: object) -> ParsedCommand:
         )
     raise CommandParseError(
         "E_COMMAND_UNKNOWN",
-        "supported commands are /summon, /tp, /policy, and /data modify",
+        "supported commands are /summon, /tp, /teleport list, /policy, and /data modify",
     )
 
 
@@ -625,6 +660,11 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "limit": command.limit,
             "sort": command.sort,
             "type": TELEPORT_POINT_TYPE,
+        }
+    if isinstance(command, TeleportList):
+        return {
+            "name": "teleport_list",
+            "tags": list(command.tags),
         }
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
@@ -711,6 +751,13 @@ def command_from_mapping(value: object) -> McCommand:
                 limit=value.get("limit"),
                 sort=value.get("sort"),
             )
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "teleport_list":
+        if set(value) != {"name", "tags"} or not isinstance(value.get("tags"), list):
+            raise CommandProtocolError("teleport list has an invalid schema")
+        try:
+            return TeleportList(tuple(value["tags"]))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     raise CommandProtocolError(f"unsupported typed command {name!r}")
@@ -1034,6 +1081,46 @@ def execute_command(
                 "tags": list(point.tags),
             },
         )
+    if isinstance(command, TeleportList):
+        requested_tags = command.tags
+        results: list[dict[str, object]] = []
+        found_count = 0
+        for tag in requested_tags:
+            try:
+                matches = state.select_teleport_points(
+                    tag=tag,
+                    origin=current_pose,
+                    sort="nearest",
+                    limit=1,
+                )
+            except WorldStateError as exc:
+                raise CommandExecutionError("E_SELECTOR_INVALID", str(exc)) from exc
+            if not matches:
+                results.append({"tag": tag, "found": False})
+                continue
+            point = matches[0]
+            found_count += 1
+            results.append(
+                {
+                    "tag": tag,
+                    "found": True,
+                    "entity_id": point.entity_id,
+                    "position": [point.pose.x, point.pose.y, point.pose.z],
+                    "yaw_rad": point.pose.yaw_rad,
+                }
+            )
+        return CommandEffect(
+            state=state,
+            code="OK_TELEPORT_LIST",
+            message=(
+                f"Found {found_count}/{len(requested_tags)} requested teleport points"
+            ),
+            restart_required=False,
+            data={
+                "world_id": state.world_id,
+                "teleport_points": results,
+            },
+        )
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
@@ -1048,11 +1135,13 @@ __all__ = [
     "DataModifyNumber",
     "GameCommandRequest",
     "GameCommandResponse",
+    "MAX_TELEPORT_QUERY_TAGS",
     "ParsedCommand",
     "PolicySlotAssignment",
     "SummonTeleportPoint",
     "TeleportCoordinates",
     "TeleportLocalCoordinates",
+    "TeleportList",
     "TeleportSelector",
     "command_from_mapping",
     "command_to_mapping",

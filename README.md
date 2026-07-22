@@ -52,6 +52,8 @@ backup profiles, use the
 [multi-host runbook](docs/runbook.md). Matrix calls the pinned original
 `gear_sonic` simulator/DDS stack directly; Git-managed source is separated from
 SHA-verified private runtime artifacts behind one bootstrap/preflight path.
+SOL-2080 celestial navigation optionally uses a separately locked 31.3 MiB
+DE440s bundle; provision it with `bash scripts/bootstrap_matrix_celestial.sh`.
 
 ### 3. Run Simulation
 ```bash

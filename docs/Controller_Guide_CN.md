@@ -166,6 +166,8 @@ shell、UE `ExecCmds`、`eval` 或子进程。
 /tp @s ~1 ~ ~-0.2
 /tp @s ^ ^ ^1
 /tp @s @e[type=matrix:teleport_point,tag=XX,limit=1,sort=nearest]
+/teleport list home moon.tranquility mars.utopia
+/policy recovery kungfu
 /data modify entity @s control.motion.gears.walk.speed_mps set value 0.85
 /data modify entity @s control.input.keyboard.w set value true
 ```
@@ -179,12 +181,50 @@ shell、UE `ExecCmds`、`eval` 或子进程。
   世界绝对坐标或 `~` 混写。
 - selector 形式只选择当前场景中含该 tag 的逻辑传送点；当前严格要求
   `type=matrix:teleport_point`、`limit=1`、`sort=nearest`。selector 字段顺序可以调整。
+- `/teleport list` 是有界只读查询，一次必须查询 1–8 个不重复 tag；它不增加 world
+  generation、不替换内存 state，也不触发存档写入。ESC 星体导航页使用的就是这条 typed
+  查询，不会绕过命令通道直接扫描或修改存档。
+- `/policy` 只在已驻留、已校验的策略候选中切换指定槽位，不加载任意路径。
 - 使用 `{Tags:["home"]}` 可设置固定 `home` 回退点。启动仍优先恢复最新活动 checkpoint；需要主动
   回家时执行 selector 的 `tag=home` 传送。
 - `control.motion.gears.<slow|walk|run>.<speed_mps|boost_speed_mps>` 修改 ESC 面板使用的
   六档速度，并落盘到当前 host profile 的配置文件。
 - `control.input.*` 仅供持有外置控制租约的本机 API 使用，直接在 ESC 文本框提交会返回
   `E_EXTERNAL_API_REQUIRED`；外部租约停止刷新后最多 150 ms 自动归零。
+
+#### ESC 星体导航与 SOL-2080 坐标
+
+ESC 战术终端的“星体导航”页不是存档选择器。Matrix 只维护一个持续存在的宇宙；地球
+Overworld、月球和火星是同一宇宙内的天体与目的地。页面先通过现有 typed command
+通道刷新目录中的逻辑传送点，再把可用目的地解析成同一套 `TeleportSelector`：
+
+- 地球是当前唯一 `active` runtime；只有世界存档中确实发现 `home` 后，“Overworld
+  归航点”才可点击。
+- 月球静海前哨和火星乌托邦平原前哨当前为 `planned`，页面明确显示“未部署”且不可点击。
+  在场景资产、碰撞/重力、SONIC 运行参数、入口点和冷重启路由完成验收前，不得只改一个
+  状态字段把它们伪装成可用。
+- 点击地球归航点仍先原子保存目标，再由最外层 launcher 冷重启整条
+  Matrix/UE/SONIC 链；不存在从 UI 直接写 MuJoCo `qpos` 的旁路。
+
+目录真值位于 `config/universe/sol-2080.json`，固定使用米、整数 TAI 纳秒、
+`2080-01-01T00:00:00Z` 场景纪元、太阳中心 ICRF 和原点重定位。目的地保存星体、经纬高、
+地图朝向与局部 pose；运行时按当前场景时间计算
+`body center(t) + body rotation(t) × body-fixed point`。MuJoCo、UE Actor、SONIC observation
+和 `WorldPose` 始终只接收当前地表附近的局部坐标，范围继续限制为 ±100 km。
+
+执行 `bash scripts/bootstrap_matrix_celestial.sh` 后，launcher 会自动使用 SHA256 锁定的
+DE440s 计算地球/月球/火星中心位置；未 provision 的机器明确退到
+`matrix-analytical-v1`，ESC 会显示实际 provider。自转目前仍是 IAU uniform 近似；太阳
+方向、逆平方辐照度、视半径和遮挡比例由同一 frame graph 计算。互动时间会写入同一
+profile 下的 `universe-sol-2080-clock.json`，冷重启不会回到纪元；它仍是本机状态，不随
+Git 在河源/TRNA/ZZA 间自动同步。完整 PCK/LSK/SpiceyPy 升级门见
+`docs/adr/0001-sol-2080-celestial-frames.md`。
+
+默认只把光照作为 AI/导航真值发布。实验性可视同步可加
+`--celestial-lighting-bridge carla-weather`，它只写 CARLA weather 的太阳高度/方位并要求
+readback 一致；当前 cooked 地图的大气、云、曝光、材质和阴影仍由原生 UE 资产管理。
+因此界面只有显示“CARLA已读回”时才能声称 RPC 太阳角已应用，且这不证明可见相机已经
+采用该天气，更不等于完整行星光照验收。
 
 Matrix 世界坐标为右手系，单位米：X 向前、Y 向左、Z 向上。传送不会在线修改 MuJoCo
 `qpos`，也不会调用 SONIC 的不完整 reset。成功的 `/tp` 先原子保存目标并返回结果，再由
