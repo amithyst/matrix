@@ -519,13 +519,18 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0',
             "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE-$HOME/"
             "matrix-artifacts/matrix-centered-camera-custom-v1",
+            "MATRIX_PROFILE_VERIFY_RUNTIME_DEFAULT:-0",
         )
         for default in expected_profile_defaults:
             self.assertIn(default, profile_text)
-        self.assertNotIn("MATRIX_VERIFY_RUNTIME", profile_text)
+        self.assertNotIn("export MATRIX_VERIFY_RUNTIME=", profile_text)
         self.assertIn("unset LD_LIBRARY_PATH PYTHONPATH", profile_text)
         self.assertIn(
             'if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]',
+            launcher,
+        )
+        self.assertIn(
+            'MATRIX_PROFILE_VERIFY_RUNTIME_DEFAULT:-1',
             launcher,
         )
 

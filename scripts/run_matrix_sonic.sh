@@ -357,6 +357,9 @@ PY
 )"; then
     exit 2
 fi
+if [[ ! -v MATRIX_VERIFY_RUNTIME && "$QUALIFICATION_REQUESTED" == "0" ]]; then
+    export MATRIX_VERIFY_RUNTIME="${MATRIX_PROFILE_VERIFY_RUNTIME_DEFAULT:-1}"
+fi
 case "${GAME_WORLD_PERSISTENCE,,}" in
     auto)
         if [[ "$CONTROL_SOURCE" == "game" \
