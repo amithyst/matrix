@@ -151,7 +151,7 @@
   "source_revisions": {
     "gr00t_whole_body_control": {
       "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/GR00T-WholeBodyControl.git",
-      "commit": "a38e57630e679f25c527f50db907050077e8d5d6",
+      "commit": "228a4f6f52dab4b858002165aca210c3fbae71ec",
       "critical_source_paths": [
         "gear_sonic/scripts/run_sim_loop.py",
         "gear_sonic/utils/mujoco_sim/configs.py",
@@ -167,6 +167,8 @@
         "gear_sonic/trl/utils/rotation_conversion.py",
         "gear_sonic/trl/utils/torch_transform.py",
         "gear_sonic/scripts/pico_manager_thread_server.py",
+        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/localmotion_kplanner.hpp",
+        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
         "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
         "gear_sonic_deploy/policy/release/observation_config.yaml"
       ]
@@ -250,6 +252,16 @@
     },
     {
       "root": "sonic",
+      "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/localmotion_kplanner.hpp",
+      "sha256": "cd7c46763d5cc13ba05fad5c421667ffceb256138faa5ac9e403938172cbeb93"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+      "sha256": "5188eac0de5989bdb5dbd7446475fb4cd4f4906b30f760135a0a2dbe1a301420"
+    },
+    {
+      "root": "sonic",
       "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
       "sha256": "00b4e3d74fcc4a63aae8cc26466a99c33eaa1e6683f2858b059486d9a0f147b5"
     },
@@ -261,7 +273,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
-      "sha256": "bf9b2362ed750b6b3f67c33197517474cd18a331d7e3d1c652cfdd740203c21e"
+      "sha256": "b70f1c78ef0547f8bd29823e65ea3910f3e8a31d50c3678e9eba4852071cf2a6"
     },
     {
       "root": "sonic",

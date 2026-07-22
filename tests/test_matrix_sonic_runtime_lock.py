@@ -318,7 +318,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertEqual(self.lock["runtime_id"], "matrix-sonic-native-v2")
         self.assertEqual(
             self.lock["source_revisions"]["gr00t_whole_body_control"]["commit"],
-            "a38e57630e679f25c527f50db907050077e8d5d6",
+            "228a4f6f52dab4b858002165aca210c3fbae71ec",
         )
 
     def test_host_profiles_use_repo_local_runtime(self) -> None:
