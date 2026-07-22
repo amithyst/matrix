@@ -5414,6 +5414,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 status_file=Path("/matrix/outputs/game-input.json"),
                 command_fd=command_fd,
                 motion_settings_json='{"settings":"runtime-owned"}',
+                celestial_visual_catalog=Path(
+                    "/matrix/config/universe/celestial-visual-profiles-v1.json"
+                ),
+                celestial_visual_profile="earth-clear-v1",
             )
         finally:
             command_parent.close()
@@ -5447,6 +5451,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--motion-settings-json") + 1],
             '{"settings":"runtime-owned"}',
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-catalog") + 1],
+            "/matrix/config/universe/celestial-visual-profiles-v1.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-profile") + 1],
+            "earth-clear-v1",
         )
         self.assertNotIn("--ue-camera-state-file", command)
         self.assertEqual(

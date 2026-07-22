@@ -79,6 +79,13 @@ from matrix_celestial_ephemeris import (
     CelestialEphemerisError,
     PersistentSimulationClock,
 )
+from matrix_celestial_visuals import (
+    CarlaWeatherSample,
+    CelestialVisualCatalog,
+    CelestialVisualError,
+    DEFAULT_VISUAL_CATALOG_PATH,
+    load_visual_catalog,
+)
 from matrix_mc_commands import (
     CommandParseError,
     CommandProtocolError,
@@ -1505,11 +1512,7 @@ _MAX_XI2_EVENTS_PER_POLL = 4096
 
 
 class CarlaCelestialLightingBridge:
-    """Apply ephemeris-derived Sun angles through CARLA weather RPC.
-
-    Only azimuth and altitude are changed. Atmosphere coefficients remain map
-    owned until Matrix ships an audited UE sky/atmosphere bridge.
-    """
+    """Apply a complete, versioned visual profile through CARLA weather RPC."""
 
     def __init__(
         self,
@@ -1520,6 +1523,7 @@ class CarlaCelestialLightingBridge:
         retry_seconds: float = 1.0,
         apply_interval_seconds: float = 0.5,
         readback_tolerance_deg: float = 0.5,
+        weather_readback_tolerance: float = 1e-4,
         carla_module: Any | None = None,
     ) -> None:
         for name, value in (
@@ -1527,6 +1531,7 @@ class CarlaCelestialLightingBridge:
             ("retry_seconds", retry_seconds),
             ("apply_interval_seconds", apply_interval_seconds),
             ("readback_tolerance_deg", readback_tolerance_deg),
+            ("weather_readback_tolerance", weather_readback_tolerance),
         ):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
@@ -1538,6 +1543,7 @@ class CarlaCelestialLightingBridge:
         self._retry = retry_seconds
         self._interval = apply_interval_seconds
         self._tolerance = readback_tolerance_deg
+        self._weather_tolerance = weather_readback_tolerance
         self._carla_module = carla_module
         self._client: Any | None = None
         self._world: Any | None = None
@@ -1545,8 +1551,8 @@ class CarlaCelestialLightingBridge:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._latest_angles: tuple[float, float] | None = None
-        self._applied_angles: tuple[float, float] | None = None
+        self._latest_sample: CarlaWeatherSample | None = None
+        self._applied_sample: CarlaWeatherSample | None = None
         self._generation = 0
         self._next_attempt = 0.0
         self._status = "pending"
@@ -1567,41 +1573,54 @@ class CarlaCelestialLightingBridge:
     def _angle_delta_deg(left: float, right: float) -> float:
         return abs((left - right + 180.0) % 360.0 - 180.0)
 
-    @staticmethod
-    def _validated_angles(lighting: Mapping[str, object]) -> tuple[float, float]:
-        altitude = lighting.get("sun_altitude_deg")
-        azimuth = lighting.get("sun_azimuth_deg")
-        if (
-            isinstance(altitude, bool)
-            or not isinstance(altitude, (int, float))
-            or isinstance(azimuth, bool)
-            or not isinstance(azimuth, (int, float))
-            or not math.isfinite(float(altitude))
-            or not math.isfinite(float(azimuth))
-            or not -90.0 <= float(altitude) <= 90.0
-            or not 0.0 <= float(azimuth) < 360.0
-        ):
-            raise ValueError("celestial lighting contains invalid Sun angles")
-        return float(altitude), float(azimuth)
+    def _parameter_matches(self, name: str, expected: float, actual: float) -> bool:
+        if name in {"sun_altitude_angle", "sun_azimuth_angle"}:
+            if name == "sun_azimuth_angle":
+                return self._angle_delta_deg(actual, expected) <= self._tolerance
+            return abs(actual - expected) <= self._tolerance
+        return math.isclose(
+            actual,
+            expected,
+            rel_tol=self._weather_tolerance,
+            abs_tol=self._weather_tolerance,
+        )
 
-    def _apply_weather(self, altitude: float, azimuth: float) -> None:
+    def _samples_match(
+        self,
+        expected: CarlaWeatherSample,
+        applied: CarlaWeatherSample,
+    ) -> bool:
+        if expected.profile_sha256 != applied.profile_sha256:
+            return False
+        return all(
+            expected_name == applied_name
+            and self._parameter_matches(expected_name, expected_value, applied_value)
+            for (expected_name, expected_value), (applied_name, applied_value) in zip(
+                expected.parameters,
+                applied.parameters,
+                strict=True,
+            )
+        )
+
+    def _apply_weather(self, sample: CarlaWeatherSample) -> None:
         if self._world is None:
             self._connect()
         assert self._world is not None
         weather = self._world.get_weather()
-        weather.sun_altitude_angle = altitude
-        weather.sun_azimuth_angle = azimuth
+        for name, value in sample.parameters:
+            if not hasattr(weather, name):
+                raise RuntimeError(f"CARLA weather does not expose {name}")
+            setattr(weather, name, value)
         self._world.set_weather(weather)
         readback = self._world.get_weather()
-        readback_altitude = float(readback.sun_altitude_angle)
-        readback_azimuth = float(readback.sun_azimuth_angle)
-        if (
-            not math.isfinite(readback_altitude)
-            or not math.isfinite(readback_azimuth)
-            or abs(readback_altitude - altitude) > self._tolerance
-            or self._angle_delta_deg(readback_azimuth, azimuth) > self._tolerance
-        ):
-            raise RuntimeError("CARLA weather readback did not match")
+        for name, expected in sample.parameters:
+            if not hasattr(readback, name):
+                raise RuntimeError(f"CARLA weather readback does not expose {name}")
+            actual = float(getattr(readback, name))
+            if not math.isfinite(actual) or not self._parameter_matches(
+                name, expected, actual
+            ):
+                raise RuntimeError(f"CARLA weather readback did not match {name}")
 
     def _worker(self) -> None:
         while not self._stop.is_set():
@@ -1609,7 +1628,7 @@ class CarlaCelestialLightingBridge:
             if self._stop.is_set():
                 return
             with self._state_lock:
-                sample = self._latest_angles
+                sample = self._latest_sample
                 generation = self._generation
                 next_attempt = self._next_attempt
             if sample is None:
@@ -1619,7 +1638,7 @@ class CarlaCelestialLightingBridge:
             if delay > 0.0 and self._stop.wait(delay):
                 return
             try:
-                self._apply_weather(*sample)
+                self._apply_weather(sample)
             except Exception:
                 self._disconnect()
                 with self._state_lock:
@@ -1631,7 +1650,7 @@ class CarlaCelestialLightingBridge:
             with self._state_lock:
                 self._status = "applied"
                 self._error = None
-                self._applied_angles = sample
+                self._applied_sample = sample
                 self._next_attempt = time.monotonic() + self._interval
                 if generation == self._generation:
                     self._wake.clear()
@@ -1651,22 +1670,39 @@ class CarlaCelestialLightingBridge:
     def apply(
         self,
         lighting: Mapping[str, object],
+        sample: CarlaWeatherSample,
         *,
         now: float | None = None,
     ) -> dict[str, object]:
         if now is not None and (not math.isfinite(now) or now < 0.0):
             raise ValueError("CARLA lighting time must be finite and non-negative")
-        angles = self._validated_angles(lighting)
+        if not isinstance(sample, CarlaWeatherSample):
+            raise ValueError("CARLA lighting requires a typed weather sample")
+        parameters = sample.parameters_mapping()
+        altitude = lighting.get("sun_altitude_deg")
+        azimuth = lighting.get("sun_azimuth_deg")
+        if (
+            isinstance(altitude, bool)
+            or not isinstance(altitude, (int, float))
+            or isinstance(azimuth, bool)
+            or not isinstance(azimuth, (int, float))
+            or not self._parameter_matches(
+                "sun_altitude_angle",
+                float(altitude),
+                parameters["sun_altitude_angle"],
+            )
+            or not self._parameter_matches(
+                "sun_azimuth_angle",
+                float(azimuth),
+                parameters["sun_azimuth_angle"],
+            )
+        ):
+            raise ValueError("visual profile Sun angles do not match celestial truth")
         with self._state_lock:
-            self._latest_angles = angles
+            self._latest_sample = sample
             self._generation += 1
-            if self._status == "applied" and self._applied_angles is not None:
-                applied_altitude, applied_azimuth = self._applied_angles
-                if (
-                    abs(applied_altitude - angles[0]) > self._tolerance
-                    or self._angle_delta_deg(applied_azimuth, angles[1])
-                    > self._tolerance
-                ):
+            if self._status == "applied" and self._applied_sample is not None:
+                if not self._samples_match(sample, self._applied_sample):
                     self._status = "pending"
                     self._error = None
             status = self._status
@@ -3595,6 +3631,8 @@ class GameCommandClient:
         initial_motion_settings: object = None,
         celestial_catalog: CelestialCatalog | None = None,
         celestial_clock: PersistentSimulationClock | None = None,
+        celestial_visual_catalog: CelestialVisualCatalog | None = None,
+        celestial_visual_profile: str = "auto",
         celestial_lighting_bridge: CarlaCelestialLightingBridge | None = None,
     ) -> None:
         self._connection: socket.socket | None = None
@@ -3629,6 +3667,13 @@ class GameCommandClient:
         self._celestial_catalog = celestial_catalog
         if celestial_clock is not None and celestial_catalog is None:
             raise ValueError("celestial clock requires a celestial catalog")
+        if celestial_visual_catalog is not None and celestial_catalog is None:
+            raise ValueError("celestial visuals require a celestial catalog")
+        if (
+            celestial_lighting_bridge is not None
+            and celestial_visual_catalog is None
+        ):
+            raise ValueError("celestial lighting bridge requires visual profiles")
         self._celestial_clock = (
             celestial_clock
             if celestial_clock is not None
@@ -3638,6 +3683,8 @@ class GameCommandClient:
                 else None
             )
         )
+        self._celestial_visual_catalog = celestial_visual_catalog
+        self._celestial_visual_profile = celestial_visual_profile
         self._celestial_lighting_bridge = celestial_lighting_bridge
         self._teleport_probes = {}
         if file_descriptor is None:
@@ -3781,8 +3828,20 @@ class GameCommandClient:
             simulation_time=snapshot,
         )
         lighting = mapping.get("lighting")
-        if self._celestial_lighting_bridge is not None and isinstance(lighting, dict):
-            mapping["lighting"] = self._celestial_lighting_bridge.apply(lighting)
+        visual_catalog = self._celestial_visual_catalog
+        if visual_catalog is not None and isinstance(lighting, dict):
+            sample = visual_catalog.sample(
+                lighting,
+                profile_id=self._celestial_visual_profile,
+            )
+            profiled_lighting = dict(lighting)
+            profiled_lighting["visual_profile"] = sample.profile_mapping()
+            if self._celestial_lighting_bridge is not None:
+                profiled_lighting = self._celestial_lighting_bridge.apply(
+                    profiled_lighting,
+                    sample,
+                )
+            mapping["lighting"] = profiled_lighting
         clock.checkpoint()
         return mapping
 
@@ -4929,8 +4988,14 @@ def _parse_args() -> argparse.Namespace:
         "--celestial-lighting-bridge",
         choices=("state-only", "carla-weather"),
         default="state-only",
-        help="Optional readback-verified UE Sun-angle bridge",
+        help="Optional readback-verified CARLA visual-profile bridge",
     )
+    parser.add_argument(
+        "--celestial-visual-catalog",
+        type=Path,
+        default=DEFAULT_VISUAL_CATALOG_PATH,
+    )
+    parser.add_argument("--celestial-visual-profile", default="auto")
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print canonical packets; do not connect"
@@ -5107,6 +5172,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         or not args.celestial_assets_manifest.is_file()
     ):
         raise SystemExit("--celestial-assets-manifest must be an absolute regular file")
+    if (
+        not args.celestial_visual_catalog.is_absolute()
+        or args.celestial_visual_catalog.is_symlink()
+        or not args.celestial_visual_catalog.is_file()
+    ):
+        raise SystemExit("--celestial-visual-catalog must be an absolute regular file")
     ephemeris_assets = (
         args.celestial_de440s_kernel,
         args.celestial_jplephem_wheel,
@@ -5254,12 +5325,21 @@ def main() -> int:
         celestial_clock = celestial_catalog.create_clock(
             args.celestial_clock_state_file
         )
+        celestial_visual_catalog = load_visual_catalog(
+            args.celestial_visual_catalog
+        )
+        if args.celestial_visual_profile != "auto":
+            celestial_visual_catalog.profile(args.celestial_visual_profile)
         celestial_lighting_bridge = (
             CarlaCelestialLightingBridge(args.carla_host, args.carla_port)
             if args.celestial_lighting_bridge == "carla-weather"
             else None
         )
-    except (CelestialNavigationError, CelestialEphemerisError) as exc:
+    except (
+        CelestialNavigationError,
+        CelestialEphemerisError,
+        CelestialVisualError,
+    ) as exc:
         raise SystemExit(
             f"Matrix game-control input cannot load celestial catalog: {exc}"
         ) from exc
@@ -5270,6 +5350,8 @@ def main() -> int:
             initial_motion_settings=initial_motion_settings,
             celestial_catalog=celestial_catalog,
             celestial_clock=celestial_clock,
+            celestial_visual_catalog=celestial_visual_catalog,
+            celestial_visual_profile=args.celestial_visual_profile,
             celestial_lighting_bridge=celestial_lighting_bridge,
         )
     except (OSError, ValueError) as exc:

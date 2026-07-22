@@ -24,6 +24,7 @@ CORE = importlib.import_module("matrix_game_control")
 MC_COMMANDS = importlib.import_module("matrix_mc_commands")
 MOTION_SETTINGS = importlib.import_module("matrix_motion_settings")
 RESTART = importlib.import_module("matrix_restart_request")
+VISUALS = importlib.import_module("matrix_celestial_visuals")
 SCRIPT_PATH = SCRIPTS / "matrix_game_control_input.py"
 SPEC = importlib.util.spec_from_file_location("matrix_game_control_input", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -674,6 +675,7 @@ class GameCommandClientTest(unittest.TestCase):
         client = MODULE.GameCommandClient(
             provider.detach(),
             celestial_catalog=catalog,
+            celestial_visual_catalog=VISUALS.load_visual_catalog(),
         )
         runtime.settimeout(1.0)
         self.addCleanup(client.close)
@@ -733,6 +735,10 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertTrue(client.poll())
 
         navigation = client.celestial_navigation_mapping()
+        self.assertEqual(
+            navigation["lighting"]["visual_profile"]["id"],
+            "earth-wet-cloudy-v1",
+        )
         earth, moon, mars = navigation["destinations"]
         self.assertEqual(earth["status"], "ready")
         self.assertTrue(earth["enabled"])
@@ -790,9 +796,10 @@ class GameCommandClientTest(unittest.TestCase):
                 self.closed = False
                 self.applied = 0
 
-            def apply(self, lighting):
+            def apply(self, lighting, sample):
                 self.applied += 1
                 self.assert_open()
+                self.last_profile = sample.profile_id
                 return dict(lighting)
 
             def assert_open(self) -> None:
@@ -807,6 +814,7 @@ class GameCommandClientTest(unittest.TestCase):
         client = MODULE.GameCommandClient(
             None,
             celestial_catalog=catalog,
+            celestial_visual_catalog=VISUALS.load_visual_catalog(),
             celestial_lighting_bridge=bridge,
         )
 
@@ -814,6 +822,7 @@ class GameCommandClientTest(unittest.TestCase):
         mapping = client.celestial_navigation_mapping()
         self.assertEqual(mapping["version"], 2)
         self.assertEqual(bridge.applied, 1)
+        self.assertEqual(bridge.last_profile, "earth-wet-cloudy-v1")
         self.assertFalse(bridge.closed)
         client.finalize_celestial_resources()
         self.assertTrue(bridge.closed)
@@ -840,6 +849,7 @@ class GameCommandClientTest(unittest.TestCase):
             None,
             celestial_catalog=Catalog(ephemeris),
             celestial_clock=clock,
+            celestial_visual_catalog=mock.Mock(),
             celestial_lighting_bridge=bridge,
         )
 
@@ -2975,9 +2985,12 @@ class CarlaSpectatorCameraTest(unittest.TestCase):
 
 class CarlaCelestialLightingBridgeTest(unittest.TestCase):
     class Weather:
-        def __init__(self, altitude: float = 0.0, azimuth: float = 0.0) -> None:
-            self.sun_altitude_angle = altitude
-            self.sun_azimuth_angle = azimuth
+        def __init__(self, values: dict[str, float] | None = None) -> None:
+            values = values or {
+                name: 0.0 for name in VISUALS.CARLA_WEATHER_FIELDS
+            }
+            for name in VISUALS.CARLA_WEATHER_FIELDS:
+                setattr(self, name, values[name])
 
     class World:
         def __init__(self) -> None:
@@ -2987,27 +3000,37 @@ class CarlaCelestialLightingBridgeTest(unittest.TestCase):
 
         def get_weather(self):
             return CarlaCelestialLightingBridgeTest.Weather(
-                self.weather.sun_altitude_angle,
-                self.weather.sun_azimuth_angle,
+                {
+                    name: getattr(self.weather, name)
+                    for name in VISUALS.CARLA_WEATHER_FIELDS
+                }
             )
 
         def set_weather(self, weather) -> None:
             self.set_calls += 1
             if not self.ignore_writes:
                 self.weather = CarlaCelestialLightingBridgeTest.Weather(
-                    weather.sun_altitude_angle,
-                    weather.sun_azimuth_angle,
+                    {
+                        name: getattr(weather, name)
+                        for name in VISUALS.CARLA_WEATHER_FIELDS
+                    }
                 )
 
     @staticmethod
     def lighting() -> dict[str, object]:
         return {
+            "body_id": "earth",
+            "atmosphere": "earth_nitrogen_oxygen",
             "sun_altitude_deg": 12.5,
             "sun_azimuth_deg": 123.0,
             "render_authority": "state-only",
             "render_status": "not-applied",
             "render_error": None,
         }
+
+    @classmethod
+    def sample(cls):
+        return VISUALS.load_visual_catalog().sample(cls.lighting())
 
     @staticmethod
     def wait_status(bridge, expected: str) -> None:
@@ -3025,9 +3048,9 @@ class CarlaCelestialLightingBridgeTest(unittest.TestCase):
         bridge._world = world
         self.addCleanup(bridge.close)
 
-        submitted = bridge.apply(self.lighting(), now=1.0)
+        submitted = bridge.apply(self.lighting(), self.sample(), now=1.0)
         self.wait_status(bridge, "applied")
-        applied = bridge.apply(self.lighting(), now=1.1)
+        applied = bridge.apply(self.lighting(), self.sample(), now=1.1)
 
         self.assertEqual(submitted["render_status"], "pending")
         self.assertGreaterEqual(world.set_calls, 1)
@@ -3036,6 +3059,8 @@ class CarlaCelestialLightingBridgeTest(unittest.TestCase):
         self.assertIsNone(applied["render_error"])
         self.assertAlmostEqual(world.weather.sun_altitude_angle, 12.5)
         self.assertAlmostEqual(world.weather.sun_azimuth_angle, 123.0)
+        self.assertAlmostEqual(world.weather.cloudiness, 60.0)
+        self.assertAlmostEqual(world.weather.precipitation_deposits, 50.0)
 
     def test_weather_bridge_fails_closed_on_readback_mismatch(self) -> None:
         world = self.World()
@@ -3046,9 +3071,9 @@ class CarlaCelestialLightingBridgeTest(unittest.TestCase):
         bridge._world = world
         self.addCleanup(bridge.close)
 
-        bridge.apply(self.lighting(), now=2.0)
+        bridge.apply(self.lighting(), self.sample(), now=2.0)
         self.wait_status(bridge, "unavailable")
-        result = bridge.apply(self.lighting(), now=2.1)
+        result = bridge.apply(self.lighting(), self.sample(), now=2.1)
 
         self.assertEqual(result["render_authority"], "state-only")
         self.assertEqual(result["render_status"], "unavailable")
@@ -3069,12 +3094,43 @@ class CarlaCelestialLightingBridgeTest(unittest.TestCase):
         self.addCleanup(bridge.close)
 
         started = time.monotonic()
-        submitted = bridge.apply(self.lighting())
+        submitted = bridge.apply(self.lighting(), self.sample())
         elapsed = time.monotonic() - started
 
         self.assertEqual(submitted["render_status"], "pending")
         self.assertLess(elapsed, 0.02)
         self.wait_status(bridge, "applied")
+
+    def test_profile_change_returns_to_pending_until_new_readback(self) -> None:
+        world = self.World()
+        bridge = MODULE.CarlaCelestialLightingBridge("127.0.0.1", 2000)
+        bridge._world = world
+        self.addCleanup(bridge.close)
+        catalog = VISUALS.load_visual_catalog()
+        wet = catalog.sample(self.lighting())
+        clear = catalog.sample(self.lighting(), profile_id="earth-clear-v1")
+
+        bridge.apply(self.lighting(), wet)
+        self.wait_status(bridge, "applied")
+        changed = bridge.apply(self.lighting(), clear)
+
+        self.assertEqual(changed["render_authority"], "state-only")
+        self.assertEqual(changed["render_status"], "pending")
+        self.wait_status(bridge, "applied")
+
+    def test_weather_bridge_fails_closed_when_runtime_lacks_profile_field(self) -> None:
+        world = self.World()
+        del world.weather.dust_storm
+        bridge = MODULE.CarlaCelestialLightingBridge(
+            "127.0.0.1", 2000, retry_seconds=10.0
+        )
+        bridge._world = world
+        self.addCleanup(bridge.close)
+
+        bridge.apply(self.lighting(), self.sample())
+        self.wait_status(bridge, "unavailable")
+
+        self.assertIsNone(bridge._world)
 
 
 class XInput2RawMotionTest(unittest.TestCase):

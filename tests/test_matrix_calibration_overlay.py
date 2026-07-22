@@ -133,6 +133,31 @@ def celestial_navigation_state() -> dict[str, object]:
                 "eclipse_fraction": 0.0,
                 "eclipse_occluder_id": None,
                 "starfield_visibility": 0.0,
+                "visual_profile": {
+                    "schema": "matrix-celestial-visual-profile/v1",
+                    "id": "earth-wet-cloudy-v1",
+                    "sha256": "a" * 64,
+                    "display_name": "Earth Wet Cloudy",
+                    "body_id": "earth",
+                    "atmosphere": "earth_nitrogen_oxygen",
+                    "renderer": "carla-weather-v1",
+                    "weather_parameters": {
+                        "cloudiness": 60.0,
+                        "precipitation": 0.0,
+                        "precipitation_deposits": 50.0,
+                        "wind_intensity": 10.0,
+                        "sun_azimuth_angle": 120.0,
+                        "sun_altitude_angle": 10.0,
+                        "fog_density": 3.0,
+                        "fog_distance": 0.75,
+                        "fog_falloff": 0.1,
+                        "wetness": 0.0,
+                        "scattering_intensity": 1.0,
+                        "mie_scattering_scale": 0.03,
+                        "rayleigh_scattering_scale": 0.0331,
+                        "dust_storm": 0.0,
+                    },
+                },
                 "render_authority": "state-only",
                 "render_status": "not-applied",
                 "render_error": None,
@@ -825,6 +850,10 @@ class OverlayStateTest(unittest.TestCase):
         self.assertTrue(model.origin_rebasing)
         self.assertTrue(model.refresh_enabled)
         self.assertEqual(
+            model.lighting.visual_profile.profile_id,
+            "earth-wet-cloudy-v1",
+        )
+        self.assertEqual(
             [destination.status for destination in model.destinations],
             ["ready", "world_unavailable", "world_unavailable"],
         )
@@ -845,6 +874,13 @@ class OverlayStateTest(unittest.TestCase):
         overflowing = json.loads(json.dumps(celestial_navigation_state()))
         overflowing["celestial_navigation"]["simulation_local_bound_m"] = 10**1000
         rejected = MODULE.celestial_navigation_model(overflowing)
+        self.assertFalse(rejected.available)
+
+        mismatched_weather = json.loads(json.dumps(celestial_navigation_state()))
+        mismatched_weather["celestial_navigation"]["lighting"]["visual_profile"][
+            "weather_parameters"
+        ]["sun_altitude_angle"] = -45.0
+        rejected = MODULE.celestial_navigation_model(mismatched_weather)
         self.assertFalse(rejected.available)
 
     def test_navigation_clicks_emit_refresh_and_only_ready_destination(self) -> None:

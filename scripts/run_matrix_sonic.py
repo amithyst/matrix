@@ -512,6 +512,15 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=_SCRIPT_DIR.parent / "config/universe/de440s-2080.lock.json",
     )
+    parser.add_argument(
+        "--game-celestial-visual-catalog",
+        type=Path,
+        default=(
+            _SCRIPT_DIR.parent
+            / "config/universe/celestial-visual-profiles-v1.json"
+        ),
+    )
+    parser.add_argument("--game-celestial-visual-profile", default="auto")
     parser.add_argument("--game-celestial-de440s-kernel", type=Path)
     parser.add_argument("--game-celestial-jplephem-wheel", type=Path)
     parser.add_argument(
@@ -4107,6 +4116,8 @@ class NativeProcessGroup:
         celestial_clock_state_file: Path | None = None,
         celestial_lighting_bridge: str = "state-only",
         celestial_assets_manifest: Path | None = None,
+        celestial_visual_catalog: Path | None = None,
+        celestial_visual_profile: str = "auto",
         celestial_de440s_kernel: Path | None = None,
         celestial_jplephem_wheel: Path | None = None,
     ) -> int:
@@ -4221,6 +4232,11 @@ class NativeProcessGroup:
             command.extend(
                 ("--celestial-assets-manifest", str(celestial_assets_manifest))
             )
+        if celestial_visual_catalog is not None:
+            command.extend(
+                ("--celestial-visual-catalog", str(celestial_visual_catalog))
+            )
+        command.extend(("--celestial-visual-profile", celestial_visual_profile))
         ephemeris_assets = (celestial_de440s_kernel, celestial_jplephem_wheel)
         if any(value is not None for value in ephemeris_assets) and not all(
             value is not None for value in ephemeris_assets
@@ -8047,6 +8063,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             args,
                             "game_celestial_assets_manifest",
                             None,
+                        ),
+                        celestial_visual_catalog=getattr(
+                            args,
+                            "game_celestial_visual_catalog",
+                            None,
+                        ),
+                        celestial_visual_profile=getattr(
+                            args,
+                            "game_celestial_visual_profile",
+                            "auto",
                         ),
                         celestial_de440s_kernel=getattr(
                             args,

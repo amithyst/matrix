@@ -362,6 +362,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         "scripts/matrix_calibration_overlay.py",
         "scripts/matrix_celestial_navigation.py",
         "scripts/matrix_celestial_ephemeris.py",
+        "scripts/matrix_celestial_visuals.py",
         "scripts/bootstrap_matrix_celestial.sh",
         "scripts/matrix_mc_commands.py",
         "scripts/matrix_motion_settings.py",
@@ -369,6 +370,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         "scripts/matrix_world_state.py",
         "config/universe/sol-2080.json",
         "config/universe/de440s-2080.lock.json",
+        "config/universe/celestial-visual-profiles-v1.json",
         "scripts/prepare_sonic_physics_model.py",
         "scripts/compose_custom_scene.py",
     )
@@ -487,6 +489,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "matrix_calibration_overlay.py",
             "matrix_celestial_navigation.py",
             "matrix_celestial_ephemeris.py",
+            "matrix_celestial_visuals.py",
             "bootstrap_matrix_celestial.sh",
             "matrix_mc_commands.py",
             "matrix_world_state.py",
@@ -522,6 +525,10 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         shutil.copy2(
             REPO_ROOT / "config/universe/de440s-2080.lock.json",
             universe_catalog.parent / "de440s-2080.lock.json",
+        )
+        shutil.copy2(
+            REPO_ROOT / "config/universe/celestial-visual-profiles-v1.json",
+            universe_catalog.parent / "celestial-visual-profiles-v1.json",
         )
         self.write(
             project / "config/config.json",
@@ -930,6 +937,11 @@ elif script == "run_matrix_sonic.py":
             ],
         )
 elif script == "matrix_celestial_navigation.py":
+    os.execv(
+        "/usr/bin/python3",
+        ["/usr/bin/python3", "-I", sys.argv[1], *args],
+    )
+elif script == "matrix_celestial_visuals.py":
     os.execv(
         "/usr/bin/python3",
         ["/usr/bin/python3", "-I", sys.argv[1], *args],

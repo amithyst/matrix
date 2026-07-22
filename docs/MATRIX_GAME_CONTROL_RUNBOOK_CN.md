@@ -153,7 +153,8 @@ bash scripts/bootstrap_matrix_celestial.sh --verify-only
 6. ESC 应显示推进中的 2080 场景时间、太阳高度/方位与辐照度；完整冷重启后时间不得回到
    `2080-01-01T00:00:00Z`。对应时钟文件默认与 world state 位于同一 profile 目录。
 7. 需要试验 UE 太阳角同步时，启动命令增加
-   `--celestial-lighting-bridge carla-weather`。只有写入后 CARLA readback 一致，界面才显示
+   `--celestial-lighting-bridge carla-weather --celestial-visual-profile earth-wet-cloudy-v1`。
+   当前会写入并读回太阳、云雾、降雨、湿地和大气散射的完整 profile；只有全部一致，界面才显示
    “CARLA已读回”；连接失败必须显示“仅光照真值”并继续保持导航可用。最终可见相机仍需
    screenshot/probe 单独验收。
 
@@ -161,6 +162,7 @@ bash scripts/bootstrap_matrix_celestial.sh --verify-only
 `visual-navigation` fallback，不是 SPICE 科学历表。跨机器的 world state 与宇宙时钟仍是
 本机数据，不由 Git 自动同步。详细坐标合同、开源方案与未实现边界见
 `docs/Controller_Guide_CN.md` 和 `docs/adr/0001-sol-2080-celestial-frames.md`。
+视觉 profile、开源来源和 A/B 命令见 `docs/MATRIX_CELESTIAL_VISUALS_CN.md`。
 
 ## 河源启动前检查
 

@@ -62,6 +62,7 @@ GAME_CAMERA_YAW_OFFSET_DEG="${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
 GAME_CARLA_HOST="${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
 GAME_CARLA_PORT="${MATRIX_GAME_CARLA_PORT:-2000}"
 CELESTIAL_LIGHTING_BRIDGE="${MATRIX_CELESTIAL_LIGHTING_BRIDGE:-state-only}"
+CELESTIAL_VISUAL_PROFILE="${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
 CELESTIAL_ROOT="${MATRIX_CELESTIAL_ROOT:-${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-native-v2}/celestial}"
 CELESTIAL_SPK="${MATRIX_CELESTIAL_SPK:-}"
 CELESTIAL_JPLEPHEM_WHEEL="${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}"
@@ -153,6 +154,7 @@ usage() {
         "  --game-carla-host HOST     Optional fail-closed CARLA spectator host" \
         "  --game-carla-port PORT     Optional CARLA spectator RPC port" \
         "  --celestial-lighting-bridge MODE  state-only or carla-weather" \
+        "  --celestial-visual-profile ID  auto or a locked profile id" \
         "  --gamepad-look-yaw-rate DEG_S    Full-stick spectator yaw rate" \
         "  --gamepad-look-pitch-rate DEG_S  Full-stick spectator pitch rate" \
         "  --gamepad-look-deadzone VALUE    Radial right-stick deadzone" \
@@ -216,6 +218,7 @@ while [[ $# -gt 0 ]]; do
         --game-carla-host) GAME_CARLA_HOST="$2"; shift 2 ;;
         --game-carla-port) GAME_CARLA_PORT="$2"; shift 2 ;;
         --celestial-lighting-bridge) CELESTIAL_LIGHTING_BRIDGE="$2"; shift 2 ;;
+        --celestial-visual-profile) CELESTIAL_VISUAL_PROFILE="$2"; shift 2 ;;
         --gamepad-look-yaw-rate) GAMEPAD_LOOK_YAW_RATE_DEG_S="$2"; shift 2 ;;
         --gamepad-look-pitch-rate) GAMEPAD_LOOK_PITCH_RATE_DEG_S="$2"; shift 2 ;;
         --gamepad-look-deadzone) GAMEPAD_LOOK_DEADZONE="$2"; shift 2 ;;
@@ -272,6 +275,11 @@ case "$CELESTIAL_LIGHTING_BRIDGE" in
         exit 2
         ;;
 esac
+if [[ "$CELESTIAL_VISUAL_PROFILE" != "auto" \
+    && ! "$CELESTIAL_VISUAL_PROFILE" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+    echo "[ERROR] --celestial-visual-profile is invalid" >&2
+    exit 2
+fi
 
 if [[ -n "$G1_SKIN" ]]; then
     export MATRIX_G1_SKIN="$G1_SKIN"
@@ -782,6 +790,7 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
         "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
         "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
         "$PROJECT_ROOT/scripts/matrix_celestial_ephemeris.py" \
+        "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" \
         "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
         "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
         "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
@@ -789,6 +798,7 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
         "$PROJECT_ROOT/scripts/matrix_world_state.py" \
         "$PROJECT_ROOT/config/universe/sol-2080.json" \
         "$PROJECT_ROOT/config/universe/de440s-2080.lock.json" \
+        "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
         "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
         "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
         if [[ ! -f "$required" ]]; then
@@ -810,6 +820,10 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
     "$MATRIX_SONIC_PYTHON" \
         "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
         "${CELESTIAL_PREFLIGHT_ARGS[@]}"
+    "$MATRIX_SONIC_PYTHON" \
+        "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" validate \
+        --catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
+        --profile "$CELESTIAL_VISUAL_PROFILE"
 fi
 
 require_qualified_path() {
@@ -995,6 +1009,7 @@ export MATRIX_GAME_CAMERA_YAW_OFFSET_DEG="$GAME_CAMERA_YAW_OFFSET_DEG"
 export MATRIX_GAME_CARLA_HOST="$GAME_CARLA_HOST"
 export MATRIX_GAME_CARLA_PORT="$GAME_CARLA_PORT"
 export MATRIX_CELESTIAL_LIGHTING_BRIDGE="$CELESTIAL_LIGHTING_BRIDGE"
+export MATRIX_CELESTIAL_VISUAL_PROFILE="$CELESTIAL_VISUAL_PROFILE"
 export MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S="$GAMEPAD_LOOK_YAW_RATE_DEG_S"
 export MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S="$GAMEPAD_LOOK_PITCH_RATE_DEG_S"
 export MATRIX_GAMEPAD_LOOK_DEADZONE="$GAMEPAD_LOOK_DEADZONE"

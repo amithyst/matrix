@@ -54,6 +54,8 @@ backup profiles, use the
 SHA-verified private runtime artifacts behind one bootstrap/preflight path.
 SOL-2080 celestial navigation optionally uses a separately locked 31.3 MiB
 DE440s bundle; provision it with `bash scripts/bootstrap_matrix_celestial.sh`.
+Its deterministic CARLA visual profiles and renderer acceptance boundary are
+documented in [Matrix SOL-2080 Celestial Visuals](docs/MATRIX_CELESTIAL_VISUALS_CN.md).
 
 ### 3. Run Simulation
 ```bash
@@ -84,6 +86,7 @@ To keep this README concise, detailed guides have been organized into the `docs/
 - [Matrix Overworld Adjacent V1](docs/OVERWORLD_ADJACENT_V1_CN.md) - Six-scene SONIC physics composition and its explicit UE visual gate
 - [Matrix SONIC Video Capture](docs/MATRIX_VIDEO_CAPTURE_CN.md) - Native-resolution main-launcher recording with provenance and quality gates
 - [Matrix Urban V1](docs/URBAN_V1_CN.md) - Native Town10 city baseline and URDF-preserved G1 materials
+- [Matrix SOL-2080 Celestial Visuals](docs/MATRIX_CELESTIAL_VISUALS_CN.md) - Versioned CARLA weather profiles, OSS audit, and UE pixel gate
 - [Matrix + SONIC Multi-Host Runbook](docs/runbook.md) - Git sync, locked artifacts, bootstrap, and host profiles
 
 **Advanced Features**

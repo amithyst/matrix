@@ -991,6 +991,39 @@ _CELESTIAL_DESTINATION_STATUSES = frozenset(
     }
 )
 _CELESTIAL_RUNTIME_STATUSES = frozenset({"reference", "active", "planned"})
+_CELESTIAL_VISUAL_PROFILE_SCHEMA = "matrix-celestial-visual-profile/v1"
+_CARLA_WEATHER_FIELDS = (
+    "cloudiness",
+    "precipitation",
+    "precipitation_deposits",
+    "wind_intensity",
+    "sun_azimuth_angle",
+    "sun_altitude_angle",
+    "fog_density",
+    "fog_distance",
+    "fog_falloff",
+    "wetness",
+    "scattering_intensity",
+    "mie_scattering_scale",
+    "rayleigh_scattering_scale",
+    "dust_storm",
+)
+_CARLA_WEATHER_BOUNDS = {
+    "cloudiness": (0.0, 100.0),
+    "precipitation": (0.0, 100.0),
+    "precipitation_deposits": (0.0, 100.0),
+    "wind_intensity": (0.0, 100.0),
+    "sun_azimuth_angle": (0.0, 360.0),
+    "sun_altitude_angle": (-90.0, 90.0),
+    "fog_density": (0.0, 100.0),
+    "fog_distance": (0.0, 100_000.0),
+    "fog_falloff": (0.0, 10.0),
+    "wetness": (0.0, 100.0),
+    "scattering_intensity": (0.0, 10.0),
+    "mie_scattering_scale": (0.0, 10.0),
+    "rayleigh_scattering_scale": (0.0, 10.0),
+    "dust_storm": (0.0, 100.0),
+}
 
 
 @dataclass(frozen=True)
@@ -1014,6 +1047,17 @@ class CelestialSimulationTimeModel:
 
 
 @dataclass(frozen=True)
+class CelestialVisualProfileModel:
+    profile_id: str
+    profile_sha256: str
+    display_name: str
+    body_id: str
+    atmosphere: str
+    renderer: str
+    weather_parameters: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True)
 class CelestialLightingModel:
     body_id: str
     atmosphere: str
@@ -1027,6 +1071,7 @@ class CelestialLightingModel:
     eclipse_fraction: float
     eclipse_occluder_id: str | None
     starfield_visibility: float
+    visual_profile: CelestialVisualProfileModel
     render_authority: str
     render_status: str
     render_error: str | None
@@ -1170,6 +1215,16 @@ def _celestial_integer(
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if minimum <= value <= maximum else None
+
+
+def _celestial_sha256(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return None
+    return value
 
 
 def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationModel:
@@ -1393,6 +1448,7 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
         "eclipse_fraction",
         "eclipse_occluder_id",
         "starfield_visibility",
+        "visual_profile",
         "render_authority",
         "render_status",
         "render_error",
@@ -1421,6 +1477,48 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
     starfield_visibility = _celestial_number(
         lighting_value.get("starfield_visibility")
     )
+    visual_profile_value = lighting_value.get("visual_profile")
+    expected_visual_profile = {
+        "schema",
+        "id",
+        "sha256",
+        "display_name",
+        "body_id",
+        "atmosphere",
+        "renderer",
+        "weather_parameters",
+    }
+    if (
+        not isinstance(visual_profile_value, dict)
+        or set(visual_profile_value) != expected_visual_profile
+        or visual_profile_value.get("schema") != _CELESTIAL_VISUAL_PROFILE_SCHEMA
+    ):
+        return fallback
+    visual_profile_id = _celestial_identifier(visual_profile_value.get("id"))
+    visual_profile_sha256 = _celestial_sha256(visual_profile_value.get("sha256"))
+    visual_profile_name = _celestial_text(visual_profile_value.get("display_name"))
+    visual_profile_body = _celestial_identifier(visual_profile_value.get("body_id"))
+    visual_profile_atmosphere = _celestial_identifier(
+        visual_profile_value.get("atmosphere")
+    )
+    visual_profile_renderer = _celestial_identifier(
+        visual_profile_value.get("renderer")
+    )
+    weather_value = visual_profile_value.get("weather_parameters")
+    if not isinstance(weather_value, dict) or set(weather_value) != set(
+        _CARLA_WEATHER_FIELDS
+    ):
+        return fallback
+    weather_parameters: list[tuple[str, float]] = []
+    for name in _CARLA_WEATHER_FIELDS:
+        number = _celestial_number(weather_value.get(name))
+        minimum, maximum = _CARLA_WEATHER_BOUNDS[name]
+        if number is None or not minimum <= number <= maximum:
+            return fallback
+        if name == "sun_azimuth_angle" and number >= 360.0:
+            return fallback
+        weather_parameters.append((name, number))
+    weather_mapping = dict(weather_parameters)
     occluder_value = lighting_value.get("eclipse_occluder_id")
     eclipse_occluder_id = (
         _celestial_identifier(occluder_value, maximum=64)
@@ -1468,6 +1566,22 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
         or not 0.0 <= eclipse_fraction <= 1.0
         or starfield_visibility is None
         or not 0.0 <= starfield_visibility <= 1.0
+        or visual_profile_id is None
+        or visual_profile_sha256 is None
+        or visual_profile_name is None
+        or visual_profile_body != lighting_body_id
+        or visual_profile_atmosphere != lighting_atmosphere
+        or visual_profile_renderer != "carla-weather-v1"
+        or not math.isclose(
+            weather_mapping["sun_altitude_angle"],
+            sun_altitude,
+            abs_tol=1e-6,
+        )
+        or not math.isclose(
+            weather_mapping["sun_azimuth_angle"],
+            sun_azimuth,
+            abs_tol=1e-6,
+        )
         or (occluder_value is not None and eclipse_occluder_id not in body_models)
         or render_authority is None
         or render_status not in {
@@ -1509,6 +1623,15 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
         eclipse_fraction=eclipse_fraction,
         eclipse_occluder_id=eclipse_occluder_id,
         starfield_visibility=starfield_visibility,
+        visual_profile=CelestialVisualProfileModel(
+            profile_id=visual_profile_id,
+            profile_sha256=visual_profile_sha256,
+            display_name=visual_profile_name,
+            body_id=visual_profile_body,
+            atmosphere=visual_profile_atmosphere,
+            renderer=visual_profile_renderer,
+            weather_parameters=tuple(weather_parameters),
+        ),
         render_authority=render_authority,
         render_status=render_status,
         render_error=render_error,
@@ -4382,6 +4505,7 @@ class X11CalibrationOverlay:
         if not compact and summary[3] >= 105:
             lighting = model.lighting
             lighting_line = (
+                f"{lighting.visual_profile.display_name} · "
                 f"太阳高度 {lighting.sun_altitude_deg:+.1f}° · "
                 f"方位 {lighting.sun_azimuth_deg:.1f}° · "
                 f"{lighting.solar_irradiance_w_m2:.0f} W/m² · "

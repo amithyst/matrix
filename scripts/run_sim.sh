@@ -1342,6 +1342,7 @@ if $MATRIX_SONIC_ENABLED; then
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
             "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
             "$PROJECT_ROOT/scripts/matrix_celestial_ephemeris.py" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" \
             "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
             "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
             "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
@@ -1349,6 +1350,7 @@ if $MATRIX_SONIC_ENABLED; then
             "$PROJECT_ROOT/scripts/matrix_world_state.py" \
             "$PROJECT_ROOT/config/universe/sol-2080.json" \
             "$PROJECT_ROOT/config/universe/de440s-2080.lock.json" \
+            "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
             "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
             "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
             if [[ ! -f "$required" ]]; then
@@ -1376,6 +1378,10 @@ if $MATRIX_SONIC_ENABLED; then
         "$MATRIX_SONIC_PYTHON" \
             "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
             "${CELESTIAL_PREFLIGHT_ARGS[@]}"
+        "$MATRIX_SONIC_PYTHON" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" validate \
+            --catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
+            --profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
     fi
     for required in \
         "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
@@ -1849,6 +1855,8 @@ PY
         --game-carla-port "${MATRIX_GAME_CARLA_PORT:-2000}"
         --game-celestial-lighting-bridge "${MATRIX_CELESTIAL_LIGHTING_BRIDGE:-state-only}"
         --game-celestial-assets-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
+        --game-celestial-visual-catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json"
+        --game-celestial-visual-profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
         --gamepad-look-yaw-rate-deg-s "${MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S:-120.0}"
         --gamepad-look-pitch-rate-deg-s "${MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S:-90.0}"
         --gamepad-look-deadzone "${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"

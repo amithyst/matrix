@@ -221,9 +221,11 @@ Git 在河源/TRNA/ZZA 间自动同步。完整 PCK/LSK/SpiceyPy 升级门见
 `docs/adr/0001-sol-2080-celestial-frames.md`。
 
 默认只把光照作为 AI/导航真值发布。实验性可视同步可加
-`--celestial-lighting-bridge carla-weather`，它只写 CARLA weather 的太阳高度/方位并要求
-readback 一致；当前 cooked 地图的大气、云、曝光、材质和阴影仍由原生 UE 资产管理。
-因此界面只有显示“CARLA已读回”时才能声称 RPC 太阳角已应用，且这不证明可见相机已经
+`--celestial-lighting-bridge carla-weather --celestial-visual-profile earth-wet-cloudy-v1`，
+它写入 CARLA weather 的太阳高度/方位、云、雨、积水、风、雾、湿度和散射，并逐项要求
+readback 一致；profile 来源、SHA256 和参数会进入 ESC 状态。当前 cooked 地图的曝光、
+材质、阴影和最终 SkyAtmosphere 资产仍由原生 UE 管理。
+因此界面只有显示“CARLA已读回”时才能声称 RPC visual profile 已应用，且这不证明可见相机已经
 采用该天气，更不等于完整行星光照验收。
 
 Matrix 世界坐标为右手系，单位米：X 向前、Y 向左、Z 向上。传送不会在线修改 MuJoCo
