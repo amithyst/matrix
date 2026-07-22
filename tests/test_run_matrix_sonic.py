@@ -1578,6 +1578,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "snapshot_expected_dimensions_invalid",
         )
 
+    @mock.patch.dict(
+        sys.modules,
+        {"mujoco": SimpleNamespace(mjtJoint=SimpleNamespace(mjJNT_FREE=0))},
+    )
     def test_creative_inventory_extends_only_unactuated_freejoints(self) -> None:
         body_joints = [f"body_joint_{index}" for index in range(29)]
         actuators = [f"body_actuator_{index}" for index in range(29)]
