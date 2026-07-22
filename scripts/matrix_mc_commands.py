@@ -44,6 +44,10 @@ _POLICY_RE = re.compile(
     r"(?P<policy>[a-z0-9][a-z0-9._-]{0,63})\s*\Z",
     re.IGNORECASE,
 )
+_ITEM_RE = re.compile(
+    r"/?item\s+spawn\s+(?P<item>[a-z0-9][a-z0-9_-]{0,47})\s*\Z",
+    re.IGNORECASE,
+)
 _SELECTOR_RE = re.compile(r"@e\[(?P<body>[^\]]+)\]\Z")
 _POLICY_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 
@@ -187,11 +191,25 @@ class PolicySlotAssignment:
         object.__setattr__(self, "policy_id", policy_id)
 
 
+@dataclass(frozen=True)
+class CreativeSpawnItem:
+    """Take one standalone physical prop from the creative inventory pool."""
+
+    item_id: str
+
+    def __post_init__(self) -> None:
+        item_id = str(self.item_id).strip().lower()
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", item_id) is None:
+            raise CommandParseError("E_INVENTORY_ITEM", "creative item id is invalid")
+        object.__setattr__(self, "item_id", item_id)
+
+
 McCommand: TypeAlias = (
     SummonTeleportPoint
     | TeleportCoordinates
     | TeleportSelector
     | PolicySlotAssignment
+    | CreativeSpawnItem
 )
 
 
@@ -302,6 +320,9 @@ def _parse_selector(text: str) -> TeleportSelector:
 
 def parse_mc_command(text: object) -> ParsedCommand:
     command_text = _validate_text(text)
+    item = _ITEM_RE.fullmatch(command_text)
+    if item is not None:
+        return ParsedCommand(CreativeSpawnItem(item.group("item")))
     policy = _POLICY_RE.fullmatch(command_text)
     if policy is not None:
         return ParsedCommand(
@@ -351,11 +372,13 @@ def parse_mc_command(text: object) -> ParsedCommand:
             "E_COMMAND_UNKNOWN", f"unknown command {first!r}; did you mean /summon?"
         )
     raise CommandParseError(
-        "E_COMMAND_UNKNOWN", "supported commands are /summon, /tp, and /policy"
+        "E_COMMAND_UNKNOWN", "supported commands are /summon, /tp, /policy, and /item spawn"
     )
 
 
 def command_to_mapping(command: McCommand) -> dict[str, object]:
+    if isinstance(command, CreativeSpawnItem):
+        return {"name": "creative_spawn_item", "item_id": command.item_id}
     if isinstance(command, PolicySlotAssignment):
         return {
             "name": "policy_slot_assignment",
@@ -388,6 +411,13 @@ def command_from_mapping(value: object) -> McCommand:
     if not isinstance(value, dict) or not isinstance(value.get("name"), str):
         raise CommandProtocolError("command AST has an invalid schema")
     name = value["name"]
+    if name == "creative_spawn_item":
+        if set(value) != {"name", "item_id"}:
+            raise CommandProtocolError("creative spawn item has an invalid schema")
+        try:
+            return CreativeSpawnItem(item_id=value.get("item_id"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
     if name == "policy_slot_assignment":
         if set(value) != {"name", "slot", "policy_id"}:
             raise CommandProtocolError(
@@ -734,6 +764,7 @@ __all__ = [
     "CommandParseError",
     "CommandProtocolError",
     "Coordinate",
+    "CreativeSpawnItem",
     "GameCommandRequest",
     "GameCommandResponse",
     "ParsedCommand",

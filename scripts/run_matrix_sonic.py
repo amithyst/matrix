@@ -47,6 +47,7 @@ from matrix_game_control import (
 from matrix_mc_commands import (
     CommandExecutionError,
     CommandProtocolError,
+    CreativeSpawnItem,
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
@@ -55,6 +56,11 @@ from matrix_mc_commands import (
     encode_command_response,
     execute_command,
 )
+from matrix_creative_inventory import (
+    CreativeInventoryError,
+    CreativeInventoryRuntime,
+)
+from inject_creative_inventory import InventoryCatalogError, load_catalog
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_world_state import (
     WorldPose,
@@ -2230,9 +2236,17 @@ _EXPECTED_SNAPSHOT_DIMS = {
 }
 
 
-def _snapshot_validation_error(snapshot, previous_snapshot=None) -> str | None:
+def _snapshot_validation_error(
+    snapshot,
+    previous_snapshot=None,
+    *,
+    expected_dims: dict[str, int] | None = None,
+) -> str | None:
     """Return a precise native snapshot invariant violation, if any."""
-    for field, expected in _EXPECTED_SNAPSHOT_DIMS.items():
+    dimensions = expected_dims or _EXPECTED_SNAPSHOT_DIMS
+    if set(dimensions) != set(_EXPECTED_SNAPSHOT_DIMS):
+        return "snapshot_expected_dimensions_invalid"
+    for field, expected in dimensions.items():
         values = getattr(snapshot, field, None)
         if values is None:
             return f"snapshot_missing_field:{field}"
@@ -2296,7 +2310,7 @@ def _snapshot_validation_error(snapshot, previous_snapshot=None) -> str | None:
     if last_reset_reason is not None and not isinstance(last_reset_reason, str):
         return f"snapshot_invalid_last_reset_reason:{last_reset_reason!r}"
 
-    for field in _EXPECTED_SNAPSHOT_DIMS:
+    for field in dimensions:
         for index, value in enumerate(getattr(snapshot, field)):
             try:
                 finite = math.isfinite(float(value))
@@ -2416,6 +2430,108 @@ def _native_config_kwargs(args: argparse.Namespace, model_path: Path) -> dict[st
         "with_hands": False,
         "reset_on_fall": False,
     }
+
+
+def _creative_inventory_joint_names(items: object) -> tuple[str, ...]:
+    return tuple(
+        f"creative_item__{item.item_id}__{index}__freejoint"
+        for item in items
+        for index in range(item.pool_size)
+    )
+
+
+def _validate_creative_inventory_sonic_contract(
+    model: Any,
+    config: Any,
+    inventory_joint_names: tuple[str, ...],
+) -> None:
+    """Extend SONIC's body-only contract with named, unactuated freejoints."""
+
+    expected_shape = (
+        36 + 7 * len(inventory_joint_names),
+        35 + 6 * len(inventory_joint_names),
+        29,
+    )
+    actual_shape = (int(model.nq), int(model.nv), int(model.nu))
+    if actual_shape != expected_shape:
+        raise ValueError(
+            "Creative inventory MuJoCo model must have (nq, nv, nu)="
+            f"{expected_shape}, got {actual_shape}"
+        )
+
+    expected_body_joints = list(config["BODY_JOINT_NAMES"])
+    actual_joints = [
+        model.joint(index).name
+        for index in range(model.njnt)
+        if model.joint(index).name != "floating_base_joint"
+    ]
+    expected_joints = expected_body_joints + list(inventory_joint_names)
+    if actual_joints != expected_joints:
+        raise ValueError(
+            "Creative inventory joint order differs from the canonical body-plus-pool "
+            f"contract: expected {expected_joints}, got {actual_joints}"
+        )
+
+    import mujoco
+
+    joint_id_by_name = {
+        model.joint(index).name: index for index in range(model.njnt)
+    }
+    non_free_inventory_joints = [
+        name
+        for name in inventory_joint_names
+        if int(model.jnt_type[joint_id_by_name[name]])
+        != int(mujoco.mjtJoint.mjJNT_FREE)
+    ]
+    if non_free_inventory_joints:
+        raise ValueError(
+            "Creative inventory pool joints must all be freejoints: "
+            f"{non_free_inventory_joints}"
+        )
+
+    expected_actuators = list(config["BODY_ACTUATOR_NAMES"])
+    actual_actuators = [
+        model.actuator(index).name for index in range(model.nu)
+    ]
+    if actual_actuators != expected_actuators:
+        raise ValueError(
+            "Creative inventory changed the canonical 29-actuator order: "
+            f"expected {expected_actuators}, got {actual_actuators}"
+        )
+    actuated_joints = [
+        model.joint(int(model.actuator_trnid[index, 0])).name
+        for index in range(model.nu)
+    ]
+    if actuated_joints != expected_body_joints:
+        raise ValueError(
+            "Creative inventory actuators must target only canonical body joints: "
+            f"expected {expected_body_joints}, got {actuated_joints}"
+        )
+
+
+def _create_simulator_with_creative_inventory_contract(
+    create_simulator: Callable[[Any], Any],
+    config: Any,
+    inventory_joint_names: tuple[str, ...],
+) -> Any:
+    """Narrowly replace SONIC's shape-only validator during construction."""
+
+    from gear_sonic.utils.mujoco_sim.base_sim import DefaultEnv
+
+    original = DefaultEnv._validate_body_only_model_contract
+
+    def validate(instance: Any) -> None:
+        _validate_creative_inventory_sonic_contract(
+            instance.mj_model,
+            instance.config,
+            inventory_joint_names,
+        )
+
+    DefaultEnv._validate_body_only_model_contract = validate
+    try:
+        return create_simulator(config)
+    finally:
+        DefaultEnv._validate_body_only_model_contract = original
 
 
 def _loopback_zmq_port(endpoint: str) -> int:
@@ -2886,6 +3002,7 @@ class GameCommandRuntime:
         world: _GameWorldStateRuntime | None,
         *,
         policy_slots: Any | None = None,
+        creative_inventory: CreativeInventoryRuntime | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -2901,8 +3018,10 @@ class GameCommandRuntime:
         self.restart_requested = False
         self.last_response: dict[str, object] | None = None
         self.policy_slots = policy_slots
+        self.creative_inventory = creative_inventory
         self.pending_policy_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
+        self.inventory_spawns_executed = 0
 
     def _send(self, response: GameCommandResponse) -> None:
         payload = encode_command_response(response)
@@ -3082,6 +3201,57 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, CreativeSpawnItem):
+                if self.creative_inventory is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_INVENTORY_UNAVAILABLE",
+                            message="Creative inventory is unavailable for this run",
+                        )
+                    )
+                    continue
+                try:
+                    spawned = self.creative_inventory.spawn(
+                        request.command.item_id,
+                        current_pose,
+                    )
+                except CreativeInventoryError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={
+                                "creative_inventory": self.creative_inventory.mapping()
+                            },
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self.inventory_spawns_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code="OK_INVENTORY_SPAWNED",
+                        message=f"Placed {request.command.item_id} in front of the robot",
+                        data={
+                            "creative_inventory": self.creative_inventory.mapping(),
+                            "spawned_item": {
+                                "item_id": spawned.item_id,
+                                "instance_name": spawned.instance_name,
+                                "position": list(spawned.position),
+                                "quaternion": list(spawned.quaternion),
+                            },
+                        },
+                    )
+                )
+                continue
             if self.world is None:
                 self.rejected_commands += 1
                 self._send(
@@ -3150,6 +3320,7 @@ class GameCommandRuntime:
             "requests_received": self.requests_received,
             "commands_executed": self.commands_executed,
             "policy_changes_executed": self.policy_changes_executed,
+            "inventory_spawns_executed": self.inventory_spawns_executed,
             "policy_change_pending": self.pending_policy_request is not None,
             "protocol_errors": self.protocol_errors,
             "rejected_commands": self.rejected_commands,
@@ -3305,6 +3476,7 @@ class NativeProcessGroup:
         restart_launcher_pid: int | None = None,
         command_fd: int | None = None,
         strategy_loadout_json: str | None = None,
+        creative_inventory_json: str | None = None,
     ) -> int:
         command = [
             python,
@@ -3373,6 +3545,8 @@ class NativeProcessGroup:
             command.extend(("--status-file", str(status_file)))
         if strategy_loadout_json is not None:
             command.extend(("--strategy-loadout-json", strategy_loadout_json))
+        if creative_inventory_json is not None:
+            command.extend(("--creative-inventory-json", creative_inventory_json))
         extra_pass_fds: tuple[int, ...] = ()
         if command_fd is not None:
             if isinstance(command_fd, bool) or not isinstance(command_fd, int):
@@ -6527,8 +6701,37 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "Use the SONIC commit pinned by config/runtime/matrix-sonic.lock.json."
         ) from exc
 
+    creative_catalog_value = os.environ.get("MATRIX_CREATIVE_INVENTORY_CATALOG", "")
+    creative_items = None
+    if creative_catalog_value:
+        try:
+            creative_items = load_catalog(Path(creative_catalog_value))
+        except (InventoryCatalogError, OSError) as exc:
+            raise SystemExit(f"cannot load creative inventory catalog: {exc}") from exc
+
     config = SimLoopConfig(**_native_config_kwargs(args, model_path))
-    simulator = create_simulator(config)
+    if creative_items is None:
+        simulator = create_simulator(config)
+    else:
+        simulator = _create_simulator_with_creative_inventory_contract(
+            create_simulator,
+            config,
+            _creative_inventory_joint_names(creative_items),
+        )
+    creative_inventory = None
+    if creative_items is not None:
+        try:
+            creative_inventory = CreativeInventoryRuntime(
+                simulator,
+                Path(creative_catalog_value),
+            )
+        except (CreativeInventoryError, OSError, ValueError) as exc:
+            raise SystemExit(f"cannot initialize creative inventory: {exc}") from exc
+    expected_snapshot_dims = (
+        creative_inventory.expected_snapshot_dimensions
+        if creative_inventory is not None
+        else _EXPECTED_SNAPSHOT_DIMS
+    )
     renderer = None
     planner = None
     game_input = None
@@ -6568,7 +6771,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             previous_signal_handlers[int(signum)] = previous_handler
 
         snapshot = simulator.get_state_snapshot()
-        initial_snapshot_error = _snapshot_validation_error(snapshot)
+        initial_snapshot_error = _snapshot_validation_error(
+            snapshot,
+            expected_dims=expected_snapshot_dims,
+        )
         if initial_snapshot_error is not None:
             raise SystemExit(
                 f"invalid native SONIC initial snapshot: {initial_snapshot_error}"
@@ -6683,7 +6889,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     )
                     physical_recovery.open(zmq_port=planner_port)
                 if not args.no_game_input_provider and (
-                    game_world is not None or physical_recovery is not None
+                    game_world is not None
+                    or physical_recovery is not None
+                    or creative_inventory is not None
                 ):
                     command_parent, game_command_child_socket = socket.socketpair(
                         socket.AF_UNIX,
@@ -6693,6 +6901,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         command_parent,
                         game_world,
                         policy_slots=physical_recovery,
+                        creative_inventory=creative_inventory,
                     )
                 try:
                     game_input.open()
@@ -6755,6 +6964,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 sort_keys=True,
                             )
                             if physical_recovery is not None
+                            else None
+                        ),
+                        creative_inventory_json=(
+                            json.dumps(
+                                creative_inventory.mapping(),
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            if creative_inventory is not None
                             else None
                         ),
                     )
@@ -7136,7 +7354,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 # per-step sleep otherwise accumulates scheduler overshoot.
                 next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
-                step_error = _snapshot_validation_error(next_snapshot, snapshot)
+                step_error = _snapshot_validation_error(
+                    next_snapshot,
+                    snapshot,
+                    expected_dims=expected_snapshot_dims,
+                )
                 if step_error is not None:
                     unstable = True
                     running = False

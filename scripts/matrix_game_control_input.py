@@ -64,6 +64,7 @@ from matrix_game_control import (
 from matrix_mc_commands import (
     CommandParseError,
     CommandProtocolError,
+    CreativeSpawnItem,
     GameCommandRequest,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
@@ -2988,6 +2989,7 @@ class OverlayIntent:
     active: bool | None = None
     slot: str | None = None
     policy_id: str | None = None
+    item_id: str | None = None
 
 
 class GameCommandClient:
@@ -3004,6 +3006,7 @@ class GameCommandClient:
         file_descriptor: int | None,
         *,
         initial_strategy_loadout: object = None,
+        initial_creative_inventory: object = None,
     ) -> None:
         self._connection: socket.socket | None = None
         self._session = os.urandom(16).hex()
@@ -3028,6 +3031,9 @@ class GameCommandClient:
         self.last_request_id: str | None = None
         self._strategy_loadout = self._validate_strategy_loadout(
             initial_strategy_loadout
+        )
+        self._creative_inventory = self._validate_creative_inventory(
+            initial_creative_inventory
         )
         if file_descriptor is None:
             return
@@ -3130,6 +3136,66 @@ class GameCommandClient:
 
     def strategy_loadout_mapping(self) -> dict[str, object]:
         return json.loads(json.dumps(self._strategy_loadout, allow_nan=False))
+
+    @staticmethod
+    def _validate_creative_inventory(value: object) -> dict[str, object]:
+        if value is None:
+            return {
+                "version": 1,
+                "available": False,
+                "spawn_count": 0,
+                "items": [],
+            }
+        if not isinstance(value, dict) or value.get("version") != 1:
+            raise ValueError("creative inventory has an invalid version")
+        if type(value.get("available")) is not bool:
+            raise ValueError("creative inventory availability is invalid")
+        spawn_count = value.get("spawn_count")
+        items = value.get("items")
+        if (
+            type(spawn_count) is not int
+            or spawn_count < 0
+            or not isinstance(items, list)
+            or len(items) > 16
+        ):
+            raise ValueError("creative inventory counters are invalid")
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {
+                "item_id",
+                "label",
+                "pool_size",
+                "remaining",
+            }:
+                raise ValueError("creative inventory item has an invalid schema")
+            item_id = item.get("item_id")
+            label = item.get("label")
+            pool_size = item.get("pool_size")
+            remaining = item.get("remaining")
+            try:
+                CreativeSpawnItem(item_id=item_id)
+            except CommandParseError as exc:
+                raise ValueError(str(exc)) from exc
+            if (
+                item_id in seen
+                or not isinstance(label, str)
+                or not label
+                or len(label) > 40
+                or type(pool_size) is not int
+                or type(remaining) is not int
+                or not 0 <= remaining <= pool_size <= 32
+            ):
+                raise ValueError("creative inventory item values are invalid")
+            seen.add(item_id)
+        try:
+            cloned = json.loads(json.dumps(value, allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("creative inventory is not strict JSON") from exc
+        assert isinstance(cloned, dict)
+        return cloned
+
+    def creative_inventory_mapping(self) -> dict[str, object]:
+        return json.loads(json.dumps(self._creative_inventory, allow_nan=False))
 
     @property
     def available(self) -> bool:
@@ -3398,6 +3464,38 @@ class GameCommandClient:
             pending_message="Switching resident policy; waiting for writer ACK",
         )
 
+    def spawn_creative_item(
+        self,
+        item_id: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        if self.in_flight or self.restart_required or self.outcome_unknown:
+            return False
+        if not calibration_active or not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Open ESC and wait for a neutral frame before taking an item",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        try:
+            command = CreativeSpawnItem(item_id=item_id)
+        except CommandParseError as exc:
+            self._local_error(exc.code, exc.message)
+            return False
+        return self._send_typed_command(
+            command,
+            warning=None,
+            pending_message="Taking item from creative inventory",
+        )
+
     def poll(self) -> bool:
         """Receive at most one exact response; never resend a pending request."""
 
@@ -3435,6 +3533,7 @@ class GameCommandClient:
             return True
         response_data = dict(response.data) if response.data is not None else None
         validated_loadout: dict[str, object] | None = None
+        validated_inventory: dict[str, object] | None = None
         if response_data is not None and "strategy_loadout" in response_data:
             try:
                 validated_loadout = self._validate_strategy_loadout(
@@ -3443,6 +3542,16 @@ class GameCommandClient:
             except ValueError as exc:
                 self._protocol_failure(
                     f"Invalid strategy loadout in command response: {exc}"
+                )
+                return True
+        if response_data is not None and "creative_inventory" in response_data:
+            try:
+                validated_inventory = self._validate_creative_inventory(
+                    response_data["creative_inventory"]
+                )
+            except ValueError as exc:
+                self._protocol_failure(
+                    f"Invalid creative inventory in command response: {exc}"
                 )
                 return True
         self._pending = None
@@ -3458,6 +3567,8 @@ class GameCommandClient:
         self.data = response_data
         if validated_loadout is not None:
             self._strategy_loadout = validated_loadout
+        if validated_inventory is not None:
+            self._creative_inventory = validated_inventory
         self.last_request_id = response.request_id
         if response.ok and response.restart_required:
             self.status = "restarting"
@@ -3735,6 +3846,23 @@ class CalibrationOverlaySupervisor:
                     slot=assignment.slot,
                     policy_id=assignment.policy_id,
                 )
+            elif kind == "creative_spawn":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "item_id",
+                }:
+                    raise RuntimeError("invalid creative-spawn intent schema")
+                try:
+                    item = CreativeSpawnItem(item_id=value.get("item_id"))
+                except CommandParseError as exc:
+                    raise RuntimeError("invalid creative-spawn intent") from exc
+                intent = OverlayIntent(
+                    kind="creative_spawn",
+                    item_id=item.item_id,
+                )
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -3907,6 +4035,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strategy-loadout-json",
         help="Initial resident strategy-slot state supplied by the physics runtime",
+    )
+    parser.add_argument(
+        "--creative-inventory-json",
+        help="Initial creative inventory state supplied by the physics runtime",
     )
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
@@ -4112,6 +4244,7 @@ def main() -> int:
             ) from exc
     publisher = None if args.dry_run else UnixSeqpacketPublisher(args.socket)
     initial_strategy_loadout: object = None
+    initial_creative_inventory: object = None
     if args.strategy_loadout_json is not None:
         try:
             initial_strategy_loadout = json.loads(args.strategy_loadout_json)
@@ -4119,10 +4252,18 @@ def main() -> int:
             raise SystemExit(
                 f"Matrix game-control input received invalid strategy loadout: {exc}"
             ) from exc
+    if args.creative_inventory_json is not None:
+        try:
+            initial_creative_inventory = json.loads(args.creative_inventory_json)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"Matrix game-control input received invalid creative inventory: {exc}"
+            ) from exc
     try:
         game_command_client = GameCommandClient(
             getattr(args, "game_command_fd", None),
             initial_strategy_loadout=initial_strategy_loadout,
+            initial_creative_inventory=initial_creative_inventory,
         )
     except (OSError, ValueError) as exc:
         raise SystemExit(
@@ -4276,6 +4417,17 @@ def main() -> int:
                     command_state_changed = True
                     apply_return.cancel_pending()
                     continue
+                if intent.kind == "creative_spawn":
+                    assert intent.item_id is not None
+                    game_command_client.spawn_creative_item(
+                        intent.item_id,
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    apply_return.cancel_pending()
+                    continue
                 assert intent.kind == "command_submit"
                 assert intent.command is not None
                 command_submitted = game_command_client.submit(
@@ -4300,7 +4452,12 @@ def main() -> int:
                 # settings edge even though the overlay still owned it.
                 or any(
                     intent.kind
-                    in {"command_edit", "command_submit", "strategy_select"}
+                    in {
+                        "command_edit",
+                        "command_submit",
+                        "strategy_select",
+                        "creative_spawn",
+                    }
                     for intent in panel_intents
                 )
             )
@@ -4458,6 +4615,9 @@ def main() -> int:
                             "command_console": game_command_client.mapping(),
                             "strategy_loadout": (
                                 game_command_client.strategy_loadout_mapping()
+                            ),
+                            "creative_inventory": (
+                                game_command_client.creative_inventory_mapping()
                             ),
                             "mirror_sensitivity": sensitivity_telemetry,
                             "camera_yaw": camera_yaw_telemetry(

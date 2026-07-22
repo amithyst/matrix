@@ -10,11 +10,12 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 FORCE_REIMPORT="${SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF:-0}"
 MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
-PIPELINE_VERSION=18
+PIPELINE_VERSION=19
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
 G1_MATERIAL_PALETTE=""
 G1_MATERIAL_SCOPE_ALPHA=""
+CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_LAUNCHER_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -33,6 +34,11 @@ fi
 
 if [[ ! -f "$CUSTOM_URDF" ]]; then
     echo "[ERROR] Custom URDF file not found: $CUSTOM_URDF" >&2
+    exit 1
+fi
+
+if [[ -n "$CREATIVE_INVENTORY_CATALOG" && ! -f "$CREATIVE_INVENTORY_CATALOG" ]]; then
+    echo "[ERROR] Creative inventory catalog not found: $CREATIVE_INVENTORY_CATALOG" >&2
     exit 1
 fi
 
@@ -102,6 +108,72 @@ resolve_g1_skin() {
 }
 
 resolve_g1_skin
+
+append_source_material_palette() {
+    local urdf_path="$1"
+    local base_palette="$2"
+    "$MATRIX_PYTHON" - "$urdf_path" "$base_palette" <<'PY'
+import math
+from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
+
+urdf_path = Path(sys.argv[1])
+base_palette = sys.argv[2]
+existing = {entry for entry in base_palette.split(";") if entry}
+additional = []
+root = ET.parse(urdf_path).getroot()
+for material in root.iter("material"):
+    if not material.get("name", "").startswith("matrix_source_"):
+        continue
+    color = material.find("color")
+    if color is None or not color.get("rgba"):
+        continue
+    parts = color.get("rgba", "").split()
+    if len(parts) not in {3, 4}:
+        raise SystemExit("matrix_source_ material must have RGB or RGBA")
+    values = [float(value) for value in parts[:3]]
+    if any(not math.isfinite(value) or value < 0 or value > 1 for value in values):
+        raise SystemExit("matrix_source_ RGB values must be within [0, 1]")
+    entry = ",".join(f"{value:.9g}" for value in values)
+    if entry not in existing:
+        existing.add(entry)
+        additional.append(entry)
+print(";".join(additional))
+PY
+}
+
+if [[ "${MATRIX_CUSTOM_MATERIAL_PROFILE:-auto}" != "urdf" ]]; then
+    SOURCE_MATERIAL_PALETTE="$(
+        append_source_material_palette "$CUSTOM_URDF" "$G1_MATERIAL_PALETTE"
+    )"
+    if [[ -n "$SOURCE_MATERIAL_PALETTE" ]]; then
+        G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE;$SOURCE_MATERIAL_PALETTE"
+        echo "[INFO] Added source attachment colors to UE material palette: $SOURCE_MATERIAL_PALETTE"
+    fi
+    if [[ -n "$CREATIVE_INVENTORY_CATALOG" ]]; then
+        INVENTORY_MATERIAL_PALETTE="$(
+            "$MATRIX_PYTHON" "$SCRIPT_DIR/inject_creative_inventory.py" \
+                --catalog "$CREATIVE_INVENTORY_CATALOG" --print-palette
+        )"
+        if [[ -n "$INVENTORY_MATERIAL_PALETTE" ]]; then
+            G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE;$INVENTORY_MATERIAL_PALETTE"
+            echo "[INFO] Added creative inventory colors to UE material palette: $INVENTORY_MATERIAL_PALETTE"
+        fi
+    fi
+fi
+
+inject_creative_inventory() {
+    local target_xml="$1"
+    local target_assets="$2"
+    if [[ -z "$CREATIVE_INVENTORY_CATALOG" ]]; then
+        return 0
+    fi
+    "$MATRIX_PYTHON" "$SCRIPT_DIR/inject_creative_inventory.py" \
+        --catalog "$CREATIVE_INVENTORY_CATALOG" \
+        --mjcf "$target_xml" \
+        --assets-dir "$target_assets"
+}
 
 MODEL_DIR="$MATRIX_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model"
 UE_CUSTOM_ROOT="$MODEL_DIR/custom"
@@ -1155,6 +1227,22 @@ def add_fixed_collision_geom(body: ET.Element, link: ET.Element) -> None:
         insert_before_child_bodies(body, geom)
         return
 
+def remove_flattened_visual_only_geoms(root: ET.Element, link: ET.Element) -> int:
+    if link.find("inertial") is not None or link.findall("collision"):
+        return 0
+    mesh_names = {
+        Path(mesh.get("filename")).stem
+        for mesh in link.findall("visual/geometry/mesh")
+        if mesh.get("filename")
+    }
+    removed = 0
+    for body in root.iter("body"):
+        for geom in list(body.findall("geom")):
+            if geom.get("mesh") in mesh_names:
+                body.remove(geom)
+                removed += 1
+    return removed
+
 for link in urdf_root.findall("link"):
     link_name = link.get("name")
     if not link_name:
@@ -1173,6 +1261,8 @@ for link in urdf_root.findall("link"):
     parent_body = find_body(mjcf_root, parent_link)
     if parent_body is None:
         continue
+
+    remove_flattened_visual_only_geoms(mjcf_root, link)
 
     origin = joint.find("origin")
     pos = parse_xyz(origin.get("xyz") if origin is not None else None)
@@ -1515,7 +1605,8 @@ for body in root.iter("body"):
         if geom_type == "mesh":
             if is_visual_geom(geom):
                 geom.set("class", "visual")
-                geom.set("material", "default_material")
+                if not geom.get("material", "").startswith("matrix_source_"):
+                    geom.set("material", "default_material")
                 if "name" not in geom.attrib and geom.get("mesh"):
                     geom.set("name", f"{geom.get('mesh')}_visual")
                 strip_geom_attrs(geom, {"name", "pos", "quat", "type", "mesh", "class", "material"})
@@ -2123,6 +2214,8 @@ PY
         restore_urdf_fixed_links "$UE_TARGET_URDF" "$UE_TARGET_XML"
         echo "[INFO] restoring generic runtime layout in: $UE_TARGET_XML"
         restore_generic_runtime_layout "$UE_TARGET_XML" "$UE_TARGET_URDF"
+        inject_creative_inventory "$TARGET_XML" "$TMP_ASSET_DIR"
+        inject_creative_inventory "$UE_TARGET_XML" "$UE_ASSET_DIR"
         echo "[INFO] copied xml to UE side: $UE_TARGET_XML"
     fi
 
@@ -2137,6 +2230,13 @@ PY
         "$UE_TARGET_XML" "$UE_TARGET_URDF" "$UE_ASSET_DIR"
     echo "[INFO] wrote metadata: $TARGET_METADATA"
     echo "[INFO] wrote metadata: $UE_TARGET_METADATA"
+fi
+
+if [[ "${MATRIX_CUSTOM_URDF_IMPORT_ONLY:-0}" == "1" ]]; then
+    echo "[INFO] Custom URDF import-only mode completed: $CUSTOM_NAME"
+    echo "[INFO] MuJoCo active XML: $MUJOCO_ACTIVE_XML"
+    echo "[INFO] UE active XML: $UE_ACTIVE_XML"
+    exit 0
 fi
 
 CUSTOM_URDF_RELATIVE="custom/scene_terrain_custom.xml"

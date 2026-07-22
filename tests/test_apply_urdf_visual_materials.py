@@ -92,6 +92,91 @@ def _profile_mjcf() -> str:
 
 
 class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
+    def test_preserves_explicit_mjcf_source_material_for_inventory_mesh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            urdf = root / "g1.urdf"
+            urdf.write_text(
+                """<robot name="g1"><link name="pelvis"><visual><geometry><mesh filename="pelvis.STL" /></geometry></visual></link></robot>""",
+                encoding="utf-8",
+            )
+            mjcf = root / "g1.xml"
+            mjcf.write_text(
+                """<mujoco><asset>
+  <mesh name="pelvis" file="pelvis.STL" />
+  <mesh name="creative_prop" file="creative_prop.stl" />
+  <material name="matrix_source_creative_prop" rgba="0.2 0.4 0.8 1" />
+</asset><worldbody>
+  <body name="pelvis"><geom type="mesh" mesh="pelvis" class="visual" /></body>
+  <body name="creative_item__prop__0">
+    <geom name="creative_item__prop__0__visual" type="mesh" mesh="creative_prop" class="visual" material="matrix_source_creative_prop" />
+  </body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+
+            summary = MODULE.apply_urdf_visual_materials(
+                urdf,
+                mjcf,
+                profile="urdf",
+                profile_scope_alpha=0.99609375,
+            )
+
+            parsed = ET.parse(mjcf).getroot()
+            geom = parsed.find(".//geom[@name='creative_item__prop__0__visual']")
+            self.assertIsNotNone(geom)
+            self.assertTrue(geom.get("material", "").startswith("urdf_visual_"))
+            self.assertEqual(geom.get("rgba"), "0.2 0.4 0.8 0.99609375")
+            self.assertEqual(summary.unmatched_visual_geoms, 0)
+    def test_profile_preserves_explicit_source_material_for_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            urdf = root / "g1_29dof.urdf"
+            mjcf = root / "g1_29dof.xml"
+            accessory_urdf = """<link name="training_blaster_link"><visual>
+            <geometry><mesh filename="assets/training_blaster.stl" /></geometry>
+            <material name="matrix_source_training_orange">
+            <color rgba="0.95 0.19 0.035 1" /></material></visual></link>"""
+            accessory_mjcf_mesh = (
+                '<mesh name="training_blaster" file="training_blaster.stl" />'
+            )
+            accessory_mjcf_body = """<body name="training_blaster_link">
+            <geom name="training_blaster_link_visual" type="mesh"
+            mesh="training_blaster" class="visual" /></body>"""
+            urdf.write_text(
+                _profile_urdf().replace("</robot>", accessory_urdf + "</robot>"),
+                encoding="utf-8",
+            )
+            mjcf.write_text(
+                _profile_mjcf()
+                .replace("</asset>", accessory_mjcf_mesh + "</asset>")
+                .replace("</worldbody>", accessory_mjcf_body + "</worldbody>"),
+                encoding="utf-8",
+            )
+
+            summary = MODULE.apply_urdf_visual_materials(
+                urdf,
+                mjcf,
+                profile_scope_alpha=0.99609375,
+            )
+
+            self.assertEqual(summary.profile_id, "matrix_g1_stock_v1")
+            parsed = ET.parse(mjcf).getroot()
+            accessory_geom = next(
+                geom
+                for geom in parsed.iter("geom")
+                if geom.get("name") == "training_blaster_link_visual"
+            )
+            self.assertEqual(
+                accessory_geom.get("rgba"),
+                "0.95 0.19 0.035 0.99609375",
+            )
+            self.assertTrue(
+                accessory_geom.get("material", "").startswith(
+                    MODULE.GENERATED_PREFIX + "matrix_source_training_orange_"
+                )
+            )
+
     def test_preserves_named_inline_and_mesh_fallback_colors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -370,7 +455,7 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("PIPELINE_VERSION=18", launcher)
+        self.assertIn("PIPELINE_VERSION=19", launcher)
         self.assertIn("--describe-skin", launcher)
         self.assertIn("--ue-scope-tag", launcher)
         self.assertIn(
@@ -393,6 +478,7 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         inner = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(
             encoding="utf-8"
         )
+        self.assertIn("--creative-inventory-catalog", inner)
         self.assertLess(
             inner.index(
                 "unset MATRIX_G1_MATERIAL_PALETTE "
