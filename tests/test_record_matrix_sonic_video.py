@@ -144,6 +144,47 @@ class MatrixSonicVideoTest(unittest.TestCase):
         self.assertEqual(MODULE.signalstats_sample_offset_s(0.08), 0.03)
         self.assertEqual(MODULE.signalstats_sample_offset_s(float("inf")), 0.0)
 
+    def test_inspect_video_seeks_before_input_for_signalstats_sample(self) -> None:
+        video = Path("/tmp/capture.mp4")
+
+        def fake_run(command: object, **_: object) -> subprocess.CompletedProcess[str]:
+            values = [str(value) for value in command]
+            if "-progress" in values:
+                return subprocess.CompletedProcess(
+                    values,
+                    0,
+                    "frame=120\nprogress=end\n",
+                    FFMPEG_PROBE,
+                )
+            if "signalstats,metadata=print" in values:
+                self.assertLess(values.index("-ss"), values.index("-i"))
+                self.assertEqual(values[values.index("-ss") + 1], "2")
+                return subprocess.CompletedProcess(
+                    values,
+                    0,
+                    "",
+                    "\n".join(
+                        [
+                            "lavfi.signalstats.YMIN=18",
+                            "lavfi.signalstats.YAVG=89.5",
+                            "lavfi.signalstats.YMAX=228",
+                            "lavfi.signalstats.SATAVG=0.8",
+                        ]
+                    ),
+                )
+            return subprocess.CompletedProcess(
+                values,
+                0,
+                "0,0,0,0,0,abc\n0,0,0,0,0,def\n",
+                "",
+            )
+
+        with mock.patch.object(MODULE, "_run_text", side_effect=fake_run):
+            probe = MODULE.inspect_video(Path("/opt/ffmpeg"), video, sample_fps=5.0)
+
+        self.assertEqual(probe.y_avg, 89.5)
+        self.assertEqual(probe.unique_sample_hashes, 2)
+
     def test_accepts_native_dynamic_video(self) -> None:
         probe = MODULE.VideoProbe(
             codec="h264",

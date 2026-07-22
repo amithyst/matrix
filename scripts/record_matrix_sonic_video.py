@@ -587,10 +587,10 @@ def inspect_video(
         [
             str(ffmpeg),
             "-hide_banner",
-            "-i",
-            str(path),
             "-ss",
             f"{signal_offset_s:g}",
+            "-i",
+            str(path),
             "-map",
             "0:v:0",
             "-frames:v",
@@ -714,7 +714,7 @@ def evaluate_video_quality(
         failures.append(f"video is too small: {file_size} bytes")
     if probe.y_avg <= 2.0 or probe.y_avg >= 253.0 or probe.y_max - probe.y_min < 8.0:
         failures.append(
-            "first frame is visually uniform or clipped: "
+            "sampled frame is visually uniform or clipped: "
             f"YMIN={probe.y_min:g} YAVG={probe.y_avg:g} YMAX={probe.y_max:g}"
         )
     if (
