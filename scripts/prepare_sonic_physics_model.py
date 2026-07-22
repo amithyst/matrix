@@ -17,7 +17,7 @@ import xml.etree.ElementTree as ET
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from compose_custom_scene import compose_custom_scene  # noqa: E402
+from compose_custom_scene import compose_custom_scene, freejoint_body_names  # noqa: E402
 from inject_creative_inventory import (  # noqa: E402
     InventoryCatalogError,
     inject_catalog,
@@ -25,9 +25,15 @@ from inject_creative_inventory import (  # noqa: E402
 )
 
 
-PIPELINE_VERSION = 6
+PIPELINE_VERSION = 7
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
+MOON_DYNAMIC_GROUND_STATIC_TRANSFORM = "moon-dynamic-ground-static-v1"
+MOON_DYNAMIC_GROUND_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
+MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256 = (
+    "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
+)
+MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT = 256
 TOWN10_SOURCE_SCENE_SHA256 = (
     "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
 )
@@ -235,10 +241,35 @@ def _vectors_equal(
 
 def _scene_transform_removals(
     native_scene: Path, scene_transform: str | None
-) -> tuple[str, tuple[str, ...]]:
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     transform = scene_transform or SCENE_TRANSFORM_NONE
     if transform == SCENE_TRANSFORM_NONE:
-        return transform, ()
+        return transform, (), ()
+    if transform == MOON_DYNAMIC_GROUND_STATIC_TRANSFORM:
+        if native_scene.name != MOON_DYNAMIC_GROUND_SCENE_NAME:
+            raise SonicPhysicsModelError(
+                f"{transform} requires {MOON_DYNAMIC_GROUND_SCENE_NAME}, got {native_scene.name}"
+            )
+        actual_sha256 = _file_sha256(native_scene)
+        if actual_sha256 != MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256:
+            raise SonicPhysicsModelError(
+                f"{transform} source SHA drift: "
+                f"expected={MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256} "
+                f"actual={actual_sha256}"
+            )
+        try:
+            root = ET.parse(native_scene).getroot()
+        except ET.ParseError as exc:
+            raise SonicPhysicsModelError(
+                f"invalid Matrix native scene {native_scene}: {exc}"
+            ) from exc
+        names = freejoint_body_names(root)
+        if len(names) != MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT:
+            raise SonicPhysicsModelError(
+                f"{transform} freejoint body count drifted: "
+                f"expected={MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT} actual={len(names)}"
+            )
+        return transform, (), names
     if transform != TOWN10_OPEN_BOUNDARY_TRANSFORM:
         raise SonicPhysicsModelError(f"unsupported scene transform: {transform}")
     if native_scene.name != "scene_terrain_t10.xml":
@@ -305,7 +336,7 @@ def _scene_transform_removals(
             raise SonicPhysicsModelError(
                 f"Town10 perimeter geom {name} collision contract drifted"
             )
-    return transform, TOWN10_PERIMETER_WALL_NAMES
+    return transform, TOWN10_PERIMETER_WALL_NAMES, ()
 
 
 def _native_scene_asset_inventory(native_scene: Path) -> list[dict[str, object]]:
@@ -361,6 +392,7 @@ def _source_contract(
     spawn_yaw: float | None,
     scene_transform: str,
     removed_environment_geoms: tuple[str, ...],
+    staticized_freejoint_bodies: tuple[str, ...],
     creative_inventory_catalog: Path | None,
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
@@ -382,6 +414,7 @@ def _source_contract(
         "spawn_yaw_rad": spawn_yaw,
         "scene_transform": scene_transform,
         "removed_environment_geoms": list(removed_environment_geoms),
+        "staticized_freejoint_bodies": list(staticized_freejoint_bodies),
         "creative_inventory": _creative_inventory_source_contract(
             creative_inventory_catalog
         ),
@@ -433,7 +466,11 @@ def physics_revision_payload(
     preparation and persistence cannot silently drift apart.
     """
 
-    normalized_scene_transform, removed_environment_geoms = (
+    (
+        normalized_scene_transform,
+        removed_environment_geoms,
+        staticized_freejoint_bodies,
+    ) = (
         _scene_transform_removals(native_scene, scene_transform)
     )
     contract = _source_contract(
@@ -445,6 +482,7 @@ def physics_revision_payload(
         spawn_yaw=None,
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
+        staticized_freejoint_bodies=staticized_freejoint_bodies,
         creative_inventory_catalog=None,
     )
     native_scene_assets = []
@@ -469,6 +507,7 @@ def physics_revision_payload(
         "body_joint_names": contract["body_joint_names"],
         "scene_transform": contract["scene_transform"],
         "removed_environment_geoms": contract["removed_environment_geoms"],
+        "staticized_freejoint_bodies": contract["staticized_freejoint_bodies"],
     }
 
 
@@ -657,7 +696,11 @@ def prepare_sonic_physics_model(
         else None
     )
     normalized_spawn_yaw = float(spawn_yaw) if spawn_yaw is not None else None
-    normalized_scene_transform, removed_environment_geoms = (
+    (
+        normalized_scene_transform,
+        removed_environment_geoms,
+        staticized_freejoint_bodies,
+    ) = (
         _scene_transform_removals(native_scene, scene_transform)
     )
 
@@ -670,6 +713,7 @@ def prepare_sonic_physics_model(
         spawn_yaw=normalized_spawn_yaw,
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
+        staticized_freejoint_bodies=staticized_freejoint_bodies,
         creative_inventory_catalog=creative_inventory_catalog,
     )
     manifest_path = output_dir / "manifest.json"
@@ -737,6 +781,7 @@ def prepare_sonic_physics_model(
             source_asset_root=native_scene.parent / "assets",
             target_asset_root=temporary_dir / "meshes",
             remove_geoms=removed_environment_geoms,
+            staticize_freejoint_bodies=bool(staticized_freejoint_bodies),
         )
         contract["body_joint_names"] = list(body_joint_names)
         contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")
@@ -771,7 +816,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--spawn-yaw", type=float)
     parser.add_argument(
         "--scene-transform",
-        choices=(SCENE_TRANSFORM_NONE, TOWN10_OPEN_BOUNDARY_TRANSFORM),
+        choices=(
+            SCENE_TRANSFORM_NONE,
+            TOWN10_OPEN_BOUNDARY_TRANSFORM,
+            MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+        ),
         default=SCENE_TRANSFORM_NONE,
     )
     return parser.parse_args()

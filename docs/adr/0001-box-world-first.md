@@ -18,6 +18,8 @@ Matrix/SONIC 近期按箱庭世界推进：
 - `MoonWorld` 作为第一版非地球箱庭，启动入口是 `scripts/run_matrix_sonic_moon_v1.sh`。
 - 城市、月球等场景之间可以后续通过 ESC/ECS 命令传送，但每个目的地必须有明确 scene/map 路由。
 - 在低重力物理模型完成前，月球只能标注为 `Moon visual smoke` 或 `Earth-gravity MoonWorld smoke`。
+- MoonWorld V1 的 SONIC 物理模型保留官方月面碰撞块，但把这些地块的 freejoint 静态化，
+  不宣称完成动态月壤 benchmark。
 - 真正连续太阳系保留为长期方向，需要源 UE 工程、多坐标系运行时、天体时间系统和跨场景状态迁移。
 
 ## 影响

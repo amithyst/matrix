@@ -321,7 +321,7 @@ material="demo_ground_material" /></worldbody>
             for wall in MODULE.TOWN10_PERIMETER_WALL_NAMES:
                 self.assertNotIn(wall, names)
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(manifest["pipeline_version"], 6)
+            self.assertEqual(manifest["pipeline_version"], 7)
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
@@ -354,6 +354,80 @@ material="demo_ground_material" /></worldbody>
                     body_joint_names=("joint_a",),
                     scene_transform=MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
                 )
+
+    def test_moon_dynamic_ground_transform_staticizes_freejoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            canonical = root / "canonical.xml"
+            meshes = root / "canonical_meshes"
+            native = root / "xgb"
+            output = root / "output"
+            meshes.mkdir()
+            (native / "assets").mkdir(parents=True)
+            canonical.write_text(
+                """<mujoco><worldbody><body name="pelvis">
+<freejoint name="floating" /><joint name="joint_a" />
+</body></worldbody><actuator><motor name="a" joint="joint_a" />
+</actuator></mujoco>""",
+                encoding="utf-8",
+            )
+            scene = native / "scene_terrain_moon_dynamic.xml"
+            scene.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<body name="gb_0_0" pos="-0.75 -0.75 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_0" />
+  <geom name="soil_0_0" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>
+<body name="gb_0_1" pos="-0.75 -0.65 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_1" />
+  <geom name="soil_0_1" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
+                    MODULE._file_sha256(scene),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT",
+                    2,
+                ),
+            ):
+                output_scene = MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    output,
+                    body_joint_names=("joint_a",),
+                    scene_transform=MODULE.MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+                )
+
+            scene_root = ET.parse(output_scene).getroot()
+            self.assertEqual(
+                [(body.get("name"), body.get("pos")) for body in scene_root.iter("body")],
+                [("gb_0_0", "-0.75 -0.75 0"), ("gb_0_1", "-0.75 -0.65 0")],
+            )
+            self.assertEqual([joint.get("name") for joint in scene_root.iter("joint")], [])
+            self.assertEqual(
+                [geom.get("name") for geom in scene_root.iter("geom")],
+                ["soil_0_0", "soil_0_1"],
+            )
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["pipeline_version"], 7)
+            self.assertEqual(
+                manifest["scene_transform"],
+                MODULE.MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+            )
+            self.assertEqual(manifest["removed_environment_geoms"], [])
+            self.assertEqual(
+                manifest["staticized_freejoint_bodies"],
+                ["gb_0_0", "gb_0_1"],
+            )
 
 
 if __name__ == "__main__":

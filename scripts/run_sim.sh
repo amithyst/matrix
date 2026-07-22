@@ -1393,6 +1393,12 @@ if $MATRIX_SONIC_ENABLED; then
         )
         echo "[INFO] Town10 perimeter collision walls removed in derived physics scene"
     fi
+    if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+        SONIC_SCENE_TRANSFORM_ARGS+=(
+            --scene-transform moon-dynamic-ground-static-v1
+        )
+        echo "[INFO] MoonWorld dynamic ground blocks staticized in derived SONIC physics scene"
+    fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
             echo "[ERROR] Persistent Matrix world state requires game control" >&2
