@@ -1,0 +1,86 @@
+{
+  "schema": "matrix-scene-manifest/v1",
+  "scene": {
+    "id": "world.office_outside_ring",
+    "coordinate_frame": {
+      "id": "frame.matrix_world",
+      "meters_per_unit": 1.0,
+      "up_axis": "Z",
+      "handedness": "right"
+    },
+    "asset_references": [
+      {
+        "id": "asset.office_outside_ring.visual",
+        "role": "visual",
+        "backend": "nurec",
+        "locator": {
+          "scheme": "file",
+          "value": "/vepfs/public/wzc/realscan_ready/eval/office-outside-ring/office-outside-ring_merged_zup_flat_mesh_hidden.usdz"
+        },
+        "media_type": "nurec_usdz",
+        "content_hash": {
+          "algorithm": "sha256",
+          "digest": "bc7957674b408d250520a20f916269b1d186c8a46dbe29c6f37700877f418e0c"
+        },
+        "size_bytes": 1692573977,
+        "source_selector": null,
+        "derived_from_asset_id": null
+      },
+      {
+        "id": "asset.office_outside_ring.collision_source",
+        "role": "collision",
+        "backend": "physx_usd",
+        "locator": {
+          "scheme": "file",
+          "value": "/vepfs/public/wzc/realscan_ready/eval/office-outside-ring/office-outside-ring_collision_tri_ds.usd"
+        },
+        "media_type": "usd",
+        "content_hash": {
+          "algorithm": "sha256",
+          "digest": "61ab3ea47b5efe4b71ae084251ef3d008a0a68e7cabd83c80b2a90efe0a0bc33"
+        },
+        "size_bytes": 14941306,
+        "source_selector": "/World/Scene/terrain",
+        "derived_from_asset_id": null
+      }
+    ],
+    "transforms": [
+      {
+        "id": "transform.office_outside_ring.origin",
+        "translation": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    ],
+    "placed_entities": [
+      {
+        "id": "entity.office_outside_ring.scene",
+        "kind": "scene",
+        "transform_id": "transform.office_outside_ring.origin",
+        "visual_asset_id": "asset.office_outside_ring.visual",
+        "collision_asset_id": "asset.office_outside_ring.collision_source",
+        "physics_mode": "none",
+        "visible": true,
+        "collision_enabled": false,
+        "tags": [
+          "benchmark",
+          "office-outside-ring",
+          "persistent"
+        ]
+      }
+    ]
+  }
+}
