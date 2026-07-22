@@ -1619,11 +1619,14 @@ if (
     isinstance(elapsed_wall_s, bool)
     or not isinstance(elapsed_wall_s, (int, float))
     or not math.isfinite(float(elapsed_wall_s))
-    or not 0.0 <= float(elapsed_wall_s) <= 5.0
+    or float(elapsed_wall_s) < 0.0
 ):
     raise SystemExit(1)
 numerical_error = status.get("numerical_error")
+dynamic_resume_clearance = False
 if termination_reason == "numerical_instability":
+    if float(elapsed_wall_s) > 5.0:
+        raise SystemExit(1)
     if not isinstance(numerical_error, str) or not numerical_error.startswith(
         ("snapshot_non_finite:", "snapshot_sim_time_not_increasing:")
     ):
@@ -1663,28 +1666,91 @@ else:
     rollback_reason = f"spawn_clearance:{clearance_reason}"
     if numerical_error != rollback_reason:
         raise SystemExit(1)
-for field in (
-    "active_lowcmd",
-    "completed",
-    "interrupted",
-    "low_cmd_received",
-    "passed",
-):
+    probation = status.get("resume_probation")
+    dynamic_resume_clearance = bool(
+        isinstance(probation, dict)
+        and probation.get("enabled") is True
+        and probation.get("active") is True
+        and probation.get("completed") is False
+        and probation.get("failed") is True
+        and probation.get("phase") == "failed"
+        and probation.get("checkpoint_writes_blocked") is True
+        and probation.get("failure_reason") == clearance_reason
+        and probation.get("last_clearance_audit") == clearance
+        and probation.get("stable_idle_required_s") == 1.5
+        and probation.get("stable_idle_clock") == "sim_time"
+        and probation.get("audit_interval_s") == 0.1
+        and type(probation.get("first_fresh_lowcmd_observed")) is bool
+        and type(probation.get("startup_band_released")) is bool
+        and isinstance(probation.get("stable_idle_elapsed_s"), (int, float))
+        and not isinstance(probation.get("stable_idle_elapsed_s"), bool)
+        and math.isfinite(float(probation.get("stable_idle_elapsed_s")))
+        and float(probation.get("stable_idle_elapsed_s")) >= 0.0
+        and probation.get("stable_idle_sim_elapsed_s")
+        == probation.get("stable_idle_elapsed_s")
+        and probation.get("sim_time_sample_valid") is True
+        and isinstance(probation.get("current_sim_time_s"), (int, float))
+        and not isinstance(probation.get("current_sim_time_s"), bool)
+        and math.isfinite(float(probation.get("current_sim_time_s")))
+        and float(probation.get("current_sim_time_s")) >= 0.0
+        and probation.get("max_sim_sample_gap_s") == 0.05
+        and isinstance(probation.get("audit_count"), int)
+        and not isinstance(probation.get("audit_count"), bool)
+        and probation.get("audit_count") > 0
+    )
+    if not dynamic_resume_clearance and float(elapsed_wall_s) > 5.0:
+        raise SystemExit(1)
+for field in ("completed", "interrupted", "passed"):
     if status.get(field) is not False:
         raise SystemExit(1)
 if type(status.get("fall_detected")) is not bool:
     raise SystemExit(1)
+for field in ("active_lowcmd", "low_cmd_received"):
+    if type(status.get(field)) is not bool:
+        raise SystemExit(1)
 for field in ("active_elapsed_s", "active_lowcmd_longest_s"):
     value = status.get(field)
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not math.isfinite(float(value))
-        or float(value) != 0.0
+        or float(value) < 0.0
     ):
         raise SystemExit(1)
-if status.get("active_frames") != 0 or isinstance(status.get("active_frames"), bool):
+active_frames = status.get("active_frames")
+if (
+    isinstance(active_frames, bool)
+    or not isinstance(active_frames, int)
+    or active_frames < 0
+):
     raise SystemExit(1)
+if dynamic_resume_clearance:
+    probation = status["resume_probation"]
+    if status.get("fall_detected") is not False:
+        raise SystemExit(1)
+    if (
+        status.get("active_lowcmd") is True
+        and status.get("low_cmd_received") is not True
+    ):
+        raise SystemExit(1)
+    if (
+        status.get("low_cmd_received") is True
+        and probation.get("first_fresh_lowcmd_observed") is not True
+    ):
+        raise SystemExit(1)
+else:
+    if (
+        status.get("active_lowcmd") is not False
+        or status.get("low_cmd_received") is not False
+    ):
+        raise SystemExit(1)
+    if active_frames != 0:
+        raise SystemExit(1)
+    if any(
+        float(status[field]) != 0.0
+        for field in ("active_elapsed_s", "active_lowcmd_longest_s")
+    ):
+        raise SystemExit(1)
 if (
     status.get("instability_resets") != 0
     or isinstance(status.get("instability_resets"), bool)
@@ -1717,6 +1783,11 @@ if (
     or re.fullmatch(r"cp-[0-9a-f]{32}", checkpoint_id) is None
     or world.get("selected_resume_checkpoint_id") != checkpoint_id
     or world.get("active_resume_checkpoint_id") != checkpoint_id
+):
+    raise SystemExit(1)
+if (
+    dynamic_resume_clearance
+    and status["resume_probation"].get("selected_checkpoint_id") != checkpoint_id
 ):
     raise SystemExit(1)
 generation = rollback.get("rejected_generation")

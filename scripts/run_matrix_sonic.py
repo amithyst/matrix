@@ -91,7 +91,26 @@ _GAME_INTERNAL_RESTART_REASONS = frozenset(
 _GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
     {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
 )
-_GAME_WORLD_RESUME_PROBATION_SECONDS = 5.0
+# The short wall-clock window remains only for failures that happen before
+# native LowCmd has ever become observable.  Durable checkpoint writes use the
+# dynamic probation state below, because deploy startup can legitimately take
+# much longer than five seconds.
+_GAME_WORLD_RESUME_BOOTSTRAP_ROLLBACK_SECONDS = 5.0
+_GAME_WORLD_RESUME_STABLE_IDLE_SECONDS = 1.5
+_GAME_WORLD_RESUME_CLEARANCE_AUDIT_SECONDS = 0.1
+# A resumed policy must be physically settled, not merely publishing IDLE.
+# These limits cap residual motion during the 1.5-second qualification window
+# to roughly 3 cm of planar travel and 4.3 degrees of yaw in the worst case.
+_GAME_WORLD_RESUME_MAX_ROOT_PLANAR_SPEED_M_S = 0.02
+_GAME_WORLD_RESUME_MAX_ROOT_VERTICAL_SPEED_M_S = 0.02
+_GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S = 0.05
+_GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S = 0.05
+_GAME_WORLD_RESUME_MAX_JOINT_SPEED_RAD_S = 0.10
+_GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S = 0.03
+# The runtime observes every 200 Hz native step.  A gap larger than ten
+# expected samples means the interval was not continuously audited and must
+# restart qualification rather than being credited as stable simulation time.
+_GAME_WORLD_RESUME_MAX_SIM_SAMPLE_GAP_SECONDS = 0.05
 _GAME_MAX_RESUME_ROLLBACKS = MAX_RESUME_CHECKPOINTS
 _GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES = (
     "snapshot_non_finite:",
@@ -2314,15 +2333,556 @@ def _pace_absolute_deadline(deadline_s: float, period_s: float) -> float:
     return deadline_s + period_s
 
 
-def _game_world_resume_probation_active(
-    *, selected_checkpoint_id: str | None, elapsed_s: float
-) -> bool:
-    """Keep a selected durable resume point read-only during its first 5 seconds."""
+def _resume_probation_audit_error(error: BaseException) -> dict[str, object]:
+    return {
+        "schema": SPAWN_CLEARANCE_AUDIT_SCHEMA,
+        "safe": False,
+        "reason": "audit_error",
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error) or type(error).__name__,
+        },
+        "contacts_checked": 0,
+        "external_contact_count": 0,
+        "allowed_contact_count": 0,
+        "rejected_contact_count": 0,
+        "contacts": [],
+        "worst": None,
+        "policy": "resume_probation_no_body_contact",
+    }
 
-    if selected_checkpoint_id is None:
-        return False
-    elapsed = float(elapsed_s)
-    return math.isfinite(elapsed) and 0.0 <= elapsed <= _GAME_WORLD_RESUME_PROBATION_SECONDS
+
+def _resume_probation_clearance_audit(
+    clearance_auditor: Callable[[], dict[str, object]],
+) -> dict[str, object]:
+    """Audit the live pose with stricter contact rules during resume startup.
+
+    The shared spawn classifier permits up to 2 mm of non-foot penetration to
+    absorb contact-solver noise.  That tolerance is useful for one-shot spawn
+    validation but is too permissive for a restored hand resting on a wall: a
+    policy can push that shallow contact deeper after LowCmd begins.  During
+    probation every external non-foot contact is therefore converted into a
+    typed clearance rejection, while valid floor support remains allowed.
+    """
+
+    try:
+        raw = clearance_auditor()
+    except Exception as exc:
+        return _resume_probation_audit_error(exc)
+    if not isinstance(raw, dict):
+        return _resume_probation_audit_error(
+            TypeError("clearance auditor returned a non-object")
+        )
+    result = dict(raw)
+    result["policy"] = "resume_probation_no_body_contact"
+    if (
+        result.get("schema") != SPAWN_CLEARANCE_AUDIT_SCHEMA
+        or type(result.get("safe")) is not bool
+    ):
+        return _resume_probation_audit_error(
+            ValueError("clearance auditor returned malformed metadata")
+        )
+    if result["safe"] is False:
+        return result
+    contacts = result.get("contacts")
+    if result.get("error") is not None or not isinstance(contacts, list):
+        return _resume_probation_audit_error(
+            ValueError("clearance auditor returned malformed safe evidence")
+        )
+
+    strict_contacts: list[dict[str, object]] = []
+    body_contact_indices: list[int] = []
+    for index, item in enumerate(contacts):
+        if not isinstance(item, dict):
+            return _resume_probation_audit_error(
+                ValueError("clearance contact evidence is malformed")
+            )
+        strict_item = dict(item)
+        if strict_item.get("classification") == "allowed_body_contact_tolerance":
+            try:
+                raw_distance = strict_item["distance_m"]
+                if isinstance(raw_distance, bool) or not isinstance(
+                    raw_distance, (int, float)
+                ):
+                    raise ValueError("contact distance is not numeric")
+                distance_m = float(raw_distance)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return _resume_probation_audit_error(
+                    ValueError("body contact distance is malformed")
+                )
+            if not math.isfinite(distance_m):
+                return _resume_probation_audit_error(
+                    ValueError("body contact distance is non-finite")
+                )
+            # MuJoCo may emit a positive-distance margin contact before the
+            # shapes touch.  Keep auditing it, but only touching/penetrating
+            # body contacts are evidence of unsafe restored clearance.
+            if distance_m > 0.0:
+                strict_contacts.append(strict_item)
+                continue
+            strict_item["original_classification"] = (
+                "allowed_body_contact_tolerance"
+            )
+            strict_item["classification"] = "scene_penetration"
+            strict_item["allowed"] = False
+            body_contact_indices.append(index)
+        strict_contacts.append(strict_item)
+    if not body_contact_indices:
+        return result
+
+    worst = strict_contacts[body_contact_indices[0]]
+    result.update(
+        {
+            "safe": False,
+            "reason": "scene_penetration",
+            "contacts": strict_contacts,
+            "allowed_contact_count": max(
+                0,
+                int(result.get("allowed_contact_count", 0))
+                - len(body_contact_indices),
+            ),
+            "rejected_contact_count": int(
+                result.get("rejected_contact_count", 0)
+            )
+            + len(body_contact_indices),
+            "worst": worst,
+        }
+    )
+    return result
+
+
+class _GameWorldResumeProbation:
+    """Keep one selected resume checkpoint read-only until policy stability.
+
+    Completion is tied to observable native readiness, not process wall time:
+    fresh LowCmd, a fully released startup band, an upright live pose, and a
+    continuously published IDLE command must all hold for the configured
+    interval.  Live MuJoCo contacts are audited throughout the active window.
+    """
+
+    def __init__(
+        self,
+        *,
+        selected_checkpoint_id: str | None,
+        clearance_auditor: Callable[[], dict[str, object]],
+        stable_idle_seconds: float = _GAME_WORLD_RESUME_STABLE_IDLE_SECONDS,
+        audit_interval_seconds: float = (
+            _GAME_WORLD_RESUME_CLEARANCE_AUDIT_SECONDS
+        ),
+        max_root_planar_speed_m_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_PLANAR_SPEED_M_S
+        ),
+        max_root_vertical_speed_m_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_VERTICAL_SPEED_M_S
+        ),
+        max_root_roll_pitch_rate_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S
+        ),
+        max_root_yaw_rate_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S
+        ),
+        max_joint_speed_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_JOINT_SPEED_RAD_S
+        ),
+        max_joint_rms_speed_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S
+        ),
+        max_sim_sample_gap_seconds: float = (
+            _GAME_WORLD_RESUME_MAX_SIM_SAMPLE_GAP_SECONDS
+        ),
+    ) -> None:
+        stable_seconds = float(stable_idle_seconds)
+        audit_seconds = float(audit_interval_seconds)
+        max_planar_speed = float(max_root_planar_speed_m_s)
+        max_vertical_speed = float(max_root_vertical_speed_m_s)
+        max_roll_pitch_rate = float(max_root_roll_pitch_rate_rad_s)
+        max_yaw_rate = float(max_root_yaw_rate_rad_s)
+        max_joint_speed = float(max_joint_speed_rad_s)
+        max_joint_rms_speed = float(max_joint_rms_speed_rad_s)
+        max_sim_gap = float(max_sim_sample_gap_seconds)
+        if not math.isfinite(stable_seconds) or stable_seconds <= 0.0:
+            raise ValueError("resume stable IDLE duration must be positive")
+        if not math.isfinite(audit_seconds) or audit_seconds <= 0.0:
+            raise ValueError("resume clearance audit interval must be positive")
+        if not math.isfinite(max_planar_speed) or max_planar_speed < 0.0:
+            raise ValueError("resume planar-speed limit must be nonnegative")
+        if not math.isfinite(max_vertical_speed) or max_vertical_speed < 0.0:
+            raise ValueError("resume vertical-speed limit must be nonnegative")
+        if not math.isfinite(max_roll_pitch_rate) or max_roll_pitch_rate < 0.0:
+            raise ValueError("resume roll/pitch-rate limit must be nonnegative")
+        if not math.isfinite(max_yaw_rate) or max_yaw_rate < 0.0:
+            raise ValueError("resume yaw-rate limit must be nonnegative")
+        if not math.isfinite(max_joint_speed) or max_joint_speed < 0.0:
+            raise ValueError("resume joint-speed limit must be nonnegative")
+        if not math.isfinite(max_joint_rms_speed) or max_joint_rms_speed < 0.0:
+            raise ValueError("resume joint RMS-speed limit must be nonnegative")
+        if not math.isfinite(max_sim_gap) or max_sim_gap <= 0.0:
+            raise ValueError("resume sim sample gap must be positive")
+        if not callable(clearance_auditor):
+            raise TypeError("resume clearance auditor must be callable")
+        self.selected_checkpoint_id = selected_checkpoint_id
+        self.clearance_auditor = clearance_auditor
+        self.stable_idle_seconds = stable_seconds
+        self.audit_interval_seconds = audit_seconds
+        self.max_root_planar_speed_m_s = max_planar_speed
+        self.max_root_vertical_speed_m_s = max_vertical_speed
+        self.max_root_roll_pitch_rate_rad_s = max_roll_pitch_rate
+        self.max_root_yaw_rate_rad_s = max_yaw_rate
+        self.max_joint_speed_rad_s = max_joint_speed
+        self.max_joint_rms_speed_rad_s = max_joint_rms_speed
+        self.max_sim_sample_gap_seconds = max_sim_gap
+        self.completed = False
+        self.failed = False
+        self.failure_reason: str | None = None
+        self.first_fresh_lowcmd_s: float | None = None
+        self.band_released_s: float | None = None
+        self.stable_idle_started_sim_s: float | None = None
+        self.completed_s: float | None = None
+        self.completed_sim_s: float | None = None
+        self.last_observed_s: float | None = None
+        self.last_sim_time_s: float | None = None
+        self.current_sim_time_s: float | None = None
+        self.sim_time_sample_valid = False
+        self.next_audit_s: float | None = None
+        self.audit_count = 0
+        self.last_clearance_audit: dict[str, object] | None = None
+        self.current_root_planar_speed_m_s: float | None = None
+        self.current_root_vertical_speed_m_s: float | None = None
+        self.current_root_roll_rate_rad_s: float | None = None
+        self.current_root_pitch_rate_rad_s: float | None = None
+        self.current_root_yaw_rate_rad_s: float | None = None
+        self.current_max_joint_speed_rad_s: float | None = None
+        self.current_joint_rms_speed_rad_s: float | None = None
+        self.root_motion_valid = False
+        self.root_motion_within_limits = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.selected_checkpoint_id is not None
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and not self.completed
+
+    @staticmethod
+    def _idle_command(command: RobotMotionCommand | None) -> bool:
+        if not isinstance(command, RobotMotionCommand):
+            return False
+        try:
+            movement_zero = all(
+                math.isclose(
+                    float(component),
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                for component in command.movement
+            )
+            speed_zero = math.isclose(
+                float(command.speed_mps),
+                0.0,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            # The runtime deliberately calls emergency_stop() throughout
+            # probation.  GameControlCore represents that hard-zero as a
+            # deadman command, so it is the only command mode that can qualify.
+            command.mode == "deadman"
+            and command.safe_stop is True
+            and command.locomotion_mode == SONIC_IDLE_MODE
+            and movement_zero
+            and speed_zero
+        )
+
+    def _root_motion_stable(self, snapshot: Any) -> bool:
+        """Record finite free-joint motion and enforce settle thresholds."""
+
+        self.current_root_planar_speed_m_s = None
+        self.current_root_vertical_speed_m_s = None
+        self.current_root_roll_rate_rad_s = None
+        self.current_root_pitch_rate_rad_s = None
+        self.current_root_yaw_rate_rad_s = None
+        self.current_max_joint_speed_rad_s = None
+        self.current_joint_rms_speed_rad_s = None
+        self.root_motion_valid = False
+        self.root_motion_within_limits = False
+        try:
+            qvel = snapshot.qvel
+            planar_x = float(qvel[0])
+            planar_y = float(qvel[1])
+            vertical_speed = float(qvel[2])
+            roll_rate = float(qvel[3])
+            pitch_rate = float(qvel[4])
+            yaw_rate = float(qvel[5])
+            joint_velocities = tuple(float(value) for value in qvel[6:])
+        except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+            return False
+        all_velocities = (
+            planar_x,
+            planar_y,
+            vertical_speed,
+            roll_rate,
+            pitch_rate,
+            yaw_rate,
+            *joint_velocities,
+        )
+        if not joint_velocities or not all(
+            math.isfinite(value) for value in all_velocities
+        ):
+            return False
+        planar_speed = math.hypot(planar_x, planar_y)
+        vertical_speed_magnitude = abs(vertical_speed)
+        roll_rate_magnitude = abs(roll_rate)
+        pitch_rate_magnitude = abs(pitch_rate)
+        yaw_rate_magnitude = abs(yaw_rate)
+        max_joint_speed = max(abs(value) for value in joint_velocities)
+        joint_rms_speed = math.sqrt(
+            sum(value * value for value in joint_velocities)
+            / len(joint_velocities)
+        )
+        if not (
+            math.isfinite(planar_speed)
+            and math.isfinite(vertical_speed_magnitude)
+            and math.isfinite(roll_rate_magnitude)
+            and math.isfinite(pitch_rate_magnitude)
+            and math.isfinite(yaw_rate_magnitude)
+            and math.isfinite(max_joint_speed)
+            and math.isfinite(joint_rms_speed)
+        ):
+            return False
+        self.current_root_planar_speed_m_s = planar_speed
+        self.current_root_vertical_speed_m_s = vertical_speed_magnitude
+        self.current_root_roll_rate_rad_s = roll_rate_magnitude
+        self.current_root_pitch_rate_rad_s = pitch_rate_magnitude
+        self.current_root_yaw_rate_rad_s = yaw_rate_magnitude
+        self.current_max_joint_speed_rad_s = max_joint_speed
+        self.current_joint_rms_speed_rad_s = joint_rms_speed
+        self.root_motion_valid = True
+        self.root_motion_within_limits = bool(
+            planar_speed <= self.max_root_planar_speed_m_s
+            and vertical_speed_magnitude <= self.max_root_vertical_speed_m_s
+            and roll_rate_magnitude <= self.max_root_roll_pitch_rate_rad_s
+            and pitch_rate_magnitude <= self.max_root_roll_pitch_rate_rad_s
+            and yaw_rate_magnitude <= self.max_root_yaw_rate_rad_s
+            and max_joint_speed <= self.max_joint_speed_rad_s
+            and joint_rms_speed <= self.max_joint_rms_speed_rad_s
+        )
+        return self.root_motion_within_limits
+
+    def _observe_sim_time(self, snapshot: Any) -> bool:
+        """Record one finite, monotonic, continuously sampled sim timestamp."""
+
+        self.current_sim_time_s = None
+        self.sim_time_sample_valid = False
+        try:
+            raw_sim_time = snapshot.sim_time
+            if isinstance(raw_sim_time, bool):
+                raise ValueError("boolean sim time")
+            sim_time = float(raw_sim_time)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            self.last_sim_time_s = None
+            return False
+        if not math.isfinite(sim_time) or sim_time < 0.0:
+            self.last_sim_time_s = None
+            return False
+        self.current_sim_time_s = sim_time
+        previous = self.last_sim_time_s
+        self.last_sim_time_s = sim_time
+        if previous is not None:
+            sample_gap = sim_time - previous
+            if (
+                sample_gap < 0.0
+                or (
+                    sample_gap > self.max_sim_sample_gap_seconds
+                    and not math.isclose(
+                        sample_gap,
+                        self.max_sim_sample_gap_seconds,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                )
+            ):
+                return False
+        self.sim_time_sample_valid = True
+        return True
+
+    def observe(
+        self,
+        snapshot: Any,
+        command: RobotMotionCommand | None,
+        *,
+        now_s: float,
+        current_fall_detected: bool | None = None,
+        control_frame_boundary: bool = True,
+    ) -> dict[str, object] | None:
+        """Advance probation and return the first fail-closed audit, if any."""
+
+        if not self.active or self.failed:
+            return self.last_clearance_audit if self.failed else None
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("resume probation time must be nonnegative and finite")
+        if self.last_observed_s is not None and now < self.last_observed_s:
+            raise ValueError("resume probation time regressed")
+        if type(control_frame_boundary) is not bool:
+            raise TypeError("control-frame boundary flag must be boolean")
+        self.last_observed_s = now
+
+        fresh = bool(getattr(snapshot, "low_cmd_fresh", False))
+        if fresh and self.first_fresh_lowcmd_s is None:
+            self.first_fresh_lowcmd_s = now
+        native_ready = _GameSonicReadinessGate.snapshot_ready(snapshot)
+        if native_ready and self.band_released_s is None:
+            self.band_released_s = now
+        root_motion_stable = self._root_motion_stable(snapshot)
+        sim_time_sample_valid = self._observe_sim_time(snapshot)
+        stable_idle = bool(
+            native_ready
+            and self._idle_command(command)
+            and root_motion_stable
+            and sim_time_sample_valid
+            and _snapshot_world_upright(
+                snapshot,
+                current_fall_detected=current_fall_detected,
+            )
+        )
+        if stable_idle:
+            if self.stable_idle_started_sim_s is None:
+                self.stable_idle_started_sim_s = self.current_sim_time_s
+        else:
+            self.stable_idle_started_sim_s = None
+        stable_elapsed = (
+            self.current_sim_time_s - self.stable_idle_started_sim_s
+            if self.current_sim_time_s is not None
+            and self.stable_idle_started_sim_s is not None
+            else 0.0
+        )
+        completion_candidate = stable_elapsed >= self.stable_idle_seconds
+
+        if current_fall_detected is True:
+            # A falling body commonly creates body-ground contacts.  The fall
+            # handler below owns this frame and keeps the selected checkpoint
+            # read-only; treating the same contact as bad-spawn evidence here
+            # would incorrectly authorize rollback/tombstoning.
+            return None
+
+        audit_due = self.next_audit_s is None or now >= self.next_audit_s
+        if audit_due or completion_candidate:
+            audit = _resume_probation_clearance_audit(self.clearance_auditor)
+            self.audit_count += 1
+            self.last_clearance_audit = audit
+            self.next_audit_s = now + self.audit_interval_seconds
+            if audit.get("safe") is not True:
+                self.failed = True
+                reason = audit.get("reason")
+                self.failure_reason = (
+                    reason if isinstance(reason, str) and reason else "audit_error"
+                )
+                return audit
+        if completion_candidate and control_frame_boundary:
+            self.completed = True
+            self.completed_s = now
+            self.completed_sim_s = self.current_sim_time_s
+        return None
+
+    def telemetry(self, *, now_s: float | None = None) -> dict[str, object]:
+        stable_elapsed = 0.0
+        if (
+            self.stable_idle_started_sim_s is not None
+            and self.current_sim_time_s is not None
+        ):
+            stable_elapsed = max(
+                0.0,
+                self.current_sim_time_s - self.stable_idle_started_sim_s,
+            )
+        if not self.enabled:
+            phase = "disabled"
+        elif self.failed:
+            phase = "failed"
+        elif self.completed:
+            phase = "completed"
+        elif self.first_fresh_lowcmd_s is None:
+            phase = "waiting_lowcmd"
+        elif self.band_released_s is None:
+            phase = "startup_band"
+        elif self.stable_idle_started_sim_s is None:
+            phase = "waiting_idle"
+        else:
+            phase = "stable_idle"
+        return {
+            "enabled": self.enabled,
+            "selected_checkpoint_id": self.selected_checkpoint_id,
+            "active": self.active,
+            "completed": self.completed,
+            "failed": self.failed,
+            "phase": phase,
+            "checkpoint_writes_blocked": self.active,
+            "stable_idle_required_s": self.stable_idle_seconds,
+            "stable_idle_elapsed_s": round(stable_elapsed, 3),
+            "stable_idle_clock": "sim_time",
+            "stable_idle_sim_elapsed_s": round(stable_elapsed, 3),
+            "current_sim_time_s": (
+                round(self.current_sim_time_s, 6)
+                if self.current_sim_time_s is not None
+                else None
+            ),
+            "sim_time_sample_valid": self.sim_time_sample_valid,
+            "max_sim_sample_gap_s": self.max_sim_sample_gap_seconds,
+            "root_motion_valid": self.root_motion_valid,
+            "root_motion_within_limits": self.root_motion_within_limits,
+            "current_root_planar_speed_m_s": (
+                round(self.current_root_planar_speed_m_s, 6)
+                if self.current_root_planar_speed_m_s is not None
+                else None
+            ),
+            "max_root_planar_speed_m_s": self.max_root_planar_speed_m_s,
+            "current_root_vertical_speed_m_s": (
+                round(self.current_root_vertical_speed_m_s, 6)
+                if self.current_root_vertical_speed_m_s is not None
+                else None
+            ),
+            "max_root_vertical_speed_m_s": self.max_root_vertical_speed_m_s,
+            "current_root_roll_rate_rad_s": (
+                round(self.current_root_roll_rate_rad_s, 6)
+                if self.current_root_roll_rate_rad_s is not None
+                else None
+            ),
+            "current_root_pitch_rate_rad_s": (
+                round(self.current_root_pitch_rate_rad_s, 6)
+                if self.current_root_pitch_rate_rad_s is not None
+                else None
+            ),
+            "max_root_roll_pitch_rate_rad_s": (
+                self.max_root_roll_pitch_rate_rad_s
+            ),
+            "current_root_yaw_rate_rad_s": (
+                round(self.current_root_yaw_rate_rad_s, 6)
+                if self.current_root_yaw_rate_rad_s is not None
+                else None
+            ),
+            "max_root_yaw_rate_rad_s": self.max_root_yaw_rate_rad_s,
+            "current_max_joint_speed_rad_s": (
+                round(self.current_max_joint_speed_rad_s, 6)
+                if self.current_max_joint_speed_rad_s is not None
+                else None
+            ),
+            "max_joint_speed_rad_s": self.max_joint_speed_rad_s,
+            "current_joint_rms_speed_rad_s": (
+                round(self.current_joint_rms_speed_rad_s, 6)
+                if self.current_joint_rms_speed_rad_s is not None
+                else None
+            ),
+            "max_joint_rms_speed_rad_s": self.max_joint_rms_speed_rad_s,
+            "audit_interval_s": self.audit_interval_seconds,
+            "audit_count": self.audit_count,
+            "failure_reason": self.failure_reason,
+            "first_fresh_lowcmd_observed": self.first_fresh_lowcmd_s is not None,
+            "startup_band_released": self.band_released_s is not None,
+            "last_clearance_audit": self.last_clearance_audit,
+        }
 
 
 def _handle_game_auto_respawn_fall(
@@ -2331,21 +2891,17 @@ def _handle_game_auto_respawn_fall(
     game_input: GameInputRuntime,
     planner: NativePlannerClient,
     snapshot: Any,
-    selected_checkpoint_id: str | None,
-    resume_elapsed_s: float,
+    resume_probation_active: bool,
     now_s: float,
 ) -> tuple[str, RobotMotionCommand]:
-    """Stop every fall, but persist/reload only outside resume probation."""
+    """Stop every fall, but persist/reload only after resume probation."""
 
     game_command = game_input.emergency_stop(
         now_s=now_s,
         reason="fall_respawn_reload",
     )
     planner.send_game_command(game_command)
-    if _game_world_resume_probation_active(
-        selected_checkpoint_id=selected_checkpoint_id,
-        elapsed_s=resume_elapsed_s,
-    ):
+    if resume_probation_active:
         return "fall_detected", game_command
     game_world.checkpoint(
         snapshot,
@@ -2462,6 +3018,7 @@ def _game_world_rollback_ineligibility(
     final_reset_count: int,
     reset_observed: bool = False,
     spawn_clearance_audit: dict[str, object] | None = None,
+    resume_probation_active: bool | None = None,
 ) -> str | None:
     """Return why a failed resume cannot authorize another bounded rollback."""
 
@@ -2469,17 +3026,38 @@ def _game_world_rollback_ineligibility(
         return "no_selected_checkpoint"
     if rollback_count >= _GAME_MAX_RESUME_ROLLBACKS:
         return "rollback_limit_reached"
-    elapsed = float(elapsed_s)
-    if (
-        not math.isfinite(elapsed)
-        or elapsed < 0.0
-        or elapsed > _GAME_WORLD_RESUME_PROBATION_SECONDS
-    ):
-        return "outside_resume_probation"
     if termination_signal is not None:
         return "termination_signal"
     if child_failure is not None:
         return "child_failure"
+    if reset_observed or final_reset_count != initial_reset_count:
+        return "reset_detected"
+    if termination_reason == "spawn_clearance_failed" and bool(
+        resume_probation_active
+    ):
+        # A live full-body audit remains authoritative after LowCmd begins.
+        # Dynamic probation proves checkpoint writes were still blocked, so
+        # observed LowCmd cannot disqualify this exact collision.
+        if fall_detected:
+            # Aggregate fall evidence means this frame belongs to the fall
+            # path.  Never reinterpret its body-ground contacts as evidence
+            # that the selected checkpoint itself was malformed.
+            return "fall_detected"
+        clearance_reason = _spawn_clearance_rollback_reason(
+            spawn_clearance_audit
+        )
+        if clearance_reason is None or numerical_error != (
+            f"spawn_clearance:{clearance_reason}"
+        ):
+            return "spawn_clearance_evidence_missing"
+        return None
+    elapsed = float(elapsed_s)
+    if (
+        not math.isfinite(elapsed)
+        or elapsed < 0.0
+        or elapsed > _GAME_WORLD_RESUME_BOOTSTRAP_ROLLBACK_SECONDS
+    ):
+        return "outside_resume_probation"
     # A restored pose can already be marked fallen when its first native step
     # exposes the allowlisted numerical failure below.  That aggregate flag is
     # therefore not sufficient to distinguish a bad resume from an ordinary
@@ -2487,8 +3065,6 @@ def _game_world_rollback_ineligibility(
     # termination reason and must never authorize checkpoint rollback.
     if termination_reason == "fall_detected":
         return "fall_detected"
-    if reset_observed or final_reset_count != initial_reset_count:
-        return "reset_detected"
     if low_cmd_received or active_lowcmd or active_frames != 0 or active_elapsed_s > 0.0:
         return "lowcmd_observed"
     if termination_reason == "spawn_clearance_failed":
@@ -3534,6 +4110,25 @@ class GameInputRuntime:
             self.connection.close()
             self.connection = None
         self.server.close()
+
+
+def _game_command_poll_allowed(
+    command: RobotMotionCommand,
+    *,
+    resume_probation_active: bool,
+) -> bool:
+    """Return whether a queued world/policy command may mutate this frame."""
+
+    if not isinstance(command, RobotMotionCommand):
+        raise TypeError("game command gate requires a RobotMotionCommand")
+    if type(resume_probation_active) is not bool:
+        raise TypeError("resume probation activity must be boolean")
+    return bool(
+        not resume_probation_active
+        and command.safe_stop
+        and command.speed_mps == 0.0
+        and command.mode != "move"
+    )
 
 
 class GameCommandRuntime:
@@ -7602,6 +8197,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             getattr(environment, "mj_data", None),
         )
 
+    resume_probation = _GameWorldResumeProbation(
+        selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+        clearance_auditor=live_clearance_audit,
+    )
+
     renderer = None
     planner = None
     game_input = None
@@ -7613,8 +8213,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     physical_recovery = None
     game_command = None
     processes = None
-    resume_probation_selected = args.game_world_resume_checkpoint_id is not None
-    resume_probation_started_wall: float | None = None
+    resume_probation_selected = resume_probation.enabled
     resume_rollback_ineligibility: str | None = None
     resume_rollback_requested = False
     resume_probation_fall_stop = False
@@ -7695,7 +8294,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 )
                 if (
                     running
-                    and not resume_probation_selected
+                    and not resume_probation.active
                     and _snapshot_world_upright(snapshot)
                 ):
                     game_world.checkpoint(
@@ -7972,7 +8571,6 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         )
 
         started_wall = time.perf_counter()
-        resume_probation_started_wall = started_wall
         heading_anchor_telemetry = (
             _HeadingAnchorTelemetry(initial_root_yaw_rad, snapshot)
             if initial_root_yaw_rad is not None
@@ -8149,6 +8747,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 else "fall_recovery"
                             ),
                         )
+                    elif resume_probation.active:
+                        # Attribute every probation pose to the selected
+                        # checkpoint under a deterministic native IDLE.  Input
+                        # remains neutral-gated after probation completes, so
+                        # a key held through startup cannot move immediately on
+                        # the release frame.
+                        game_command = game_input.emergency_stop(
+                            now_s=frame_wall,
+                            reason="resume_checkpoint_probation",
+                        )
                     else:
                         game_command = ready_game_command
                     if physical_recovery is not None:
@@ -8255,10 +8863,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         game_input.record_published_command(game_command)
                     walking = game_command.mode == "move"
                     if game_commands is not None:
-                        command_allowed = bool(
-                            game_command.safe_stop
-                            and game_command.speed_mps == 0.0
-                            and game_command.mode != "move"
+                        command_allowed = _game_command_poll_allowed(
+                            game_command,
+                            resume_probation_active=resume_probation.active,
                         )
                         try:
                             command_restart = game_commands.poll(
@@ -8295,7 +8902,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         dt=1.0 / args.control_hz,
                     )
 
-            for _ in range(substeps):
+            for substep_index in range(substeps):
                 if not running:
                     break
                 # Keep native DDS lowstate and MuJoCo cadence at 200 Hz instead
@@ -8343,7 +8950,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         )
                         break
                 instability_resets = int(snapshot.reset_count)
-                if bool(snapshot.fall_detected):
+                snapshot_fall_detected = bool(snapshot.fall_detected)
+                if snapshot_fall_detected:
                     fall_detected = True
                     if args.game_auto_respawn:
                         assert game_world is not None
@@ -8357,11 +8965,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     game_input=game_input,
                                     planner=planner,
                                     snapshot=snapshot,
-                                    selected_checkpoint_id=(
-                                        args.game_world_resume_checkpoint_id
-                                    ),
-                                    resume_elapsed_s=max(
-                                        fall_wall - started_wall, 0.0
+                                    resume_probation_active=(
+                                        resume_probation.active
                                     ),
                                     now_s=fall_wall,
                                 )
@@ -8396,6 +9001,42 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         running = False
                         termination_reason = "fall_detected"
                         break
+                if resume_probation.active and not snapshot_fall_detected:
+                    probation_audit = resume_probation.observe(
+                        snapshot,
+                        game_command,
+                        now_s=time.perf_counter(),
+                        current_fall_detected=(
+                            _game_world_current_fall_detected(
+                                snapshot,
+                                game_fall_recovery=game_fall_recovery,
+                                physical_recovery=physical_recovery,
+                            )
+                        ),
+                        control_frame_boundary=(
+                            substep_index == substeps - 1
+                        ),
+                    )
+                    if probation_audit is not None:
+                        spawn_clearance_audit = probation_audit
+                        if game_world is not None:
+                            game_world.last_clearance_audit = probation_audit
+                            game_world.clearance_rejection_count += 1
+                        unstable = True
+                        running = False
+                        termination_reason = "spawn_clearance_failed"
+                        numerical_error = (
+                            "spawn_clearance:"
+                            f"{probation_audit.get('reason', 'audit_error')}"
+                        )
+                        print(
+                            "matrix-sonic-runtime ERROR unsafe live resume "
+                            "clearance: "
+                            f"reason={probation_audit.get('reason')} "
+                            f"worst={probation_audit.get('worst')}",
+                            flush=True,
+                        )
+                        break
                 if instability_resets > args.max_resets:
                     running = False
                     termination_reason = "reset_detected"
@@ -8412,15 +9053,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             active_lowcmd = bool(snapshot.low_cmd_fresh)
             low_cmd_age_s = snapshot.low_cmd_age_s
             freshness_sample_wall = time.perf_counter()
-            resume_probation_active = _game_world_resume_probation_active(
-                selected_checkpoint_id=args.game_world_resume_checkpoint_id,
-                elapsed_s=(
-                    freshness_sample_wall - resume_probation_started_wall
-                    if resume_probation_started_wall is not None
-                    else 0.0
-                ),
-            )
-            if game_world is not None and not resume_probation_active:
+            if game_world is not None and not resume_probation.active:
                 game_world.checkpoint(
                     snapshot,
                     now_s=freshness_sample_wall,
@@ -8557,6 +9190,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 if game_world is not None:
                     status["game_world_state"] = game_world.telemetry()
                     status["game_auto_respawn"] = bool(args.game_auto_respawn)
+                if resume_probation.enabled:
+                    status["resume_probation"] = resume_probation.telemetry(
+                        now_s=now
+                    )
                 if game_commands is not None:
                     status["game_commands"] = game_commands.telemetry()
                     if game_fall_recovery is not None:
@@ -8650,10 +9287,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             game_world is not None
             and termination_reason not in _GAME_INTERNAL_RESTART_REASONS
             and not resume_probation_fall_stop
-            and not _game_world_resume_probation_active(
-                selected_checkpoint_id=args.game_world_resume_checkpoint_id,
-                elapsed_s=resume_probation_elapsed_s,
-            )
+            and not resume_probation.active
         ):
             try:
                 game_world.checkpoint(
@@ -8745,6 +9379,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 ),
                 reset_observed=resume_rollback_evidence.reset_observed,
                 spawn_clearance_audit=spawn_clearance_audit,
+                resume_probation_active=resume_probation.active,
             )
             game_world.resume_rollback_ineligibility = resume_rollback_ineligibility
             if resume_rollback_ineligibility is None:
@@ -8976,6 +9611,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         final_status["game_auto_respawn"] = bool(args.game_auto_respawn)
         if game_world is not None:
             final_status["game_world_state"] = game_world.telemetry()
+        if resume_probation.enabled:
+            final_status["resume_probation"] = resume_probation.telemetry(
+                now_s=finished_wall
+            )
         if game_commands is not None:
             final_status["game_commands"] = game_commands.telemetry()
             if game_fall_recovery is not None:

@@ -385,7 +385,10 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         run_id: str,
         fall_detected: bool = False,
         spawn_clearance_reason: str | None = None,
+        dynamic_resume_clearance: bool = False,
     ) -> dict[str, object]:
+        if dynamic_resume_clearance and spawn_clearance_reason is None:
+            raise ValueError("dynamic resume clearance requires a clearance reason")
         status: dict[str, object] = {
             "acceptance_failures": [
                 "spawn_clearance_failed"
@@ -463,6 +466,39 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
                     "classification": classification,
                 },
             }
+            if dynamic_resume_clearance:
+                status.update(
+                    {
+                        "active_elapsed_s": 1.25,
+                        "active_frames": 250,
+                        "active_lowcmd": True,
+                        "active_lowcmd_longest_s": 1.25,
+                        "elapsed_wall_s": 21.5,
+                        "low_cmd_received": True,
+                    }
+                )
+                status["resume_probation"] = {
+                    "enabled": True,
+                    "selected_checkpoint_id": checkpoint_id,
+                    "active": True,
+                    "completed": False,
+                    "failed": True,
+                    "phase": "failed",
+                    "checkpoint_writes_blocked": True,
+                    "stable_idle_required_s": 1.5,
+                    "stable_idle_elapsed_s": 1.25,
+                    "stable_idle_clock": "sim_time",
+                    "stable_idle_sim_elapsed_s": 1.25,
+                    "current_sim_time_s": 21.25,
+                    "sim_time_sample_valid": True,
+                    "max_sim_sample_gap_s": 0.05,
+                    "audit_interval_s": 0.1,
+                    "audit_count": 216,
+                    "failure_reason": spawn_clearance_reason,
+                    "first_fresh_lowcmd_observed": True,
+                    "startup_band_released": True,
+                    "last_clearance_audit": status["spawn_clearance"],
+                }
         return status
 
     def make_project(self, project: Path) -> dict[str, Path]:
@@ -2880,8 +2916,8 @@ exit 0
                 generation=latest.generation,
                 source=latest.source,
                 run_id="a" * 32,
-                fall_detected=True,
                 spawn_clearance_reason="scene_penetration",
+                dynamic_resume_clearance=True,
             )
             second_status = self.rollback_proposal_status(
                 state_file=state_file,
@@ -3099,6 +3135,77 @@ exit 76
                 "reason"
             ] = "spawn_clearance:audit_error"
             malformed_statuses.append(("spawn_clearance_audit_error", audit_error))
+            completed_probation = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="f" * 32,
+                spawn_clearance_reason="scene_penetration",
+                dynamic_resume_clearance=True,
+            )
+            completed_probation["resume_probation"]["active"] = False
+            completed_probation["resume_probation"]["completed"] = True
+            completed_probation["resume_probation"][
+                "checkpoint_writes_blocked"
+            ] = False
+            malformed_statuses.append(
+                ("completed_dynamic_probation", completed_probation)
+            )
+            falling_dynamic_probation = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="1" * 32,
+                fall_detected=True,
+                spawn_clearance_reason="scene_penetration",
+                dynamic_resume_clearance=True,
+            )
+            malformed_statuses.append(
+                ("falling_dynamic_probation", falling_dynamic_probation)
+            )
+            mismatched_probation_checkpoint = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="2" * 32,
+                spawn_clearance_reason="scene_penetration",
+                dynamic_resume_clearance=True,
+            )
+            mismatched_probation_checkpoint["resume_probation"][
+                "selected_checkpoint_id"
+            ] = "cp-" + ("f" * 32)
+            malformed_statuses.append(
+                (
+                    "mismatched_dynamic_probation_checkpoint",
+                    mismatched_probation_checkpoint,
+                )
+            )
+            wall_clock_probation = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="3" * 32,
+                spawn_clearance_reason="scene_penetration",
+                dynamic_resume_clearance=True,
+            )
+            wall_clock_probation["resume_probation"][
+                "stable_idle_clock"
+            ] = "wall_time"
+            malformed_statuses.append(
+                ("wall_clock_dynamic_probation", wall_clock_probation)
+            )
 
             for label, malformed in malformed_statuses:
                 with self.subTest(case=label):
