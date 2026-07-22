@@ -118,10 +118,11 @@ mode 2，只有达到 2.50 m/s 才发布 mode 3；需要记录实际步态切换
 CLI 允许把模拟量上限配置到原生 `SLOW_WALK` 的 0.80 m/s，但河源 profile 和默认值仍为
 0.30 m/s。从键盘切到已经偏转的摇杆时，同一帧会夹到实际配置上限并回到 mode 1。
 
-## ESC 星体导航验收
+## ESC 箱庭世界导航验收
 
-ESC 战术终端现在有“策略装配 / 控制设置 / 命令台 / 星体导航”四页。星体导航是同一
-SOL-2080 持久宇宙中的传送入口，不是切换存档或启动另一套游戏实例。目录由
+ESC 战术终端现在有“策略装配 / 控制设置 / 命令台 / 星体导航”四页。当前产品口径是
+箱庭世界：星体导航是同一 SOL-2080 持久宇宙中的箱庭目的地入口，不是切换存档或启动
+另一套游戏实例，也不宣称当前 cooked runtime 已支持无缝跨星体飞行。目录由
 `config/universe/sol-2080.json` 管理，provider 使用
 `scripts/matrix_celestial_navigation.py` 严格校验，并由
 `scripts/matrix_celestial_ephemeris.py` 计算动态 frame 与光照；这些文件都在 `run_sim.sh` 的
@@ -144,8 +145,9 @@ bash scripts/bootstrap_matrix_celestial.sh --verify-only
 2. 存档已有 `home` 时，地球 Overworld 归航点应显示“可传送”；没有 `home` 时必须显示
    “未发现”，不能点击。可先在命令台用
    `/summon matrix:teleport_point ~ ~ ~ {Tags:["home"]}` 明确创建。
-3. 月球静海与火星乌托邦当前都必须显示“未部署”，按钮禁用；任何把它们显示为已可达的
-   build 都不通过当前验收。
+3. 月球静海在 MoonWorld chunk、低重力和主链路 smoke 完成前必须显示“未部署”；火星乌托邦
+   已暂停开发，必须保持 disabled/backlog。任何只改状态字段把它们伪装成可达的 build 都
+   不通过当前验收。
 4. 点击已发现的地球归航点后，应走既有 `TeleportSelector` 和完整冷重启，下一代从
    canonical 站姿恢复；不得在线改 MuJoCo `qpos`。
 5. 状态中的 `local_position_m` 必须保持在 ±100 km 仿真局部边界内；数亿米级 SOL
@@ -158,10 +160,12 @@ bash scripts/bootstrap_matrix_celestial.sh --verify-only
    “CARLA已读回”；连接失败必须显示“仅光照真值”并继续保持导航可用。最终可见相机仍需
    screenshot/probe 单独验收。
 
-月球/火星资产、物理参数、场景路由和连续航行动力学尚未部署；当前解析历表是
+月球资产、物理参数和场景路由尚未部署；火星暂停；连续航行动力学不属于箱庭世界第一阶段。
+当前解析历表是
 `visual-navigation` fallback，不是 SPICE 科学历表。跨机器的 world state 与宇宙时钟仍是
 本机数据，不由 Git 自动同步。详细坐标合同、开源方案与未实现边界见
-`docs/Controller_Guide_CN.md` 和 `docs/adr/0001-sol-2080-celestial-frames.md`。
+`docs/Controller_Guide_CN.md`、`docs/adr/0001-sol-2080-celestial-frames.md` 和
+`docs/adr/0003-box-world-first.md`。
 视觉 profile、开源来源和 A/B 命令见 `docs/MATRIX_CELESTIAL_VISUALS_CN.md`。
 
 ## 河源启动前检查

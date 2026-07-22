@@ -192,17 +192,19 @@ shell、UE `ExecCmds`、`eval` 或子进程。
 - `control.input.*` 仅供持有外置控制租约的本机 API 使用，直接在 ESC 文本框提交会返回
   `E_EXTERNAL_API_REQUIRED`；外部租约停止刷新后最多 150 ms 自动归零。
 
-#### ESC 星体导航与 SOL-2080 坐标
+#### ESC 箱庭世界导航与 SOL-2080 坐标
 
-ESC 战术终端的“星体导航”页不是存档选择器。Matrix 只维护一个持续存在的宇宙；地球
-Overworld、月球和火星是同一宇宙内的天体与目的地。页面先通过现有 typed command
+ESC 战术终端的“星体导航”页不是存档选择器。Matrix 只维护一个持续存在的宇宙；近期采用
+箱庭世界形态，地球 Overworld 和月球是同一宇宙内的可验证小世界目的地，火星暂时只保留
+backlog 目录项。页面先通过现有 typed command
 通道刷新目录中的逻辑传送点，再把可用目的地解析成同一套 `TeleportSelector`：
 
 - 地球是当前唯一 `active` runtime；只有世界存档中确实发现 `home` 后，“Overworld
   归航点”才可点击。
-- 月球静海前哨和火星乌托邦平原前哨当前为 `planned`，页面明确显示“未部署”且不可点击。
-  在场景资产、碰撞/重力、SONIC 运行参数、入口点和冷重启路由完成验收前，不得只改一个
-  状态字段把它们伪装成可用。
+- 月球静海前哨当前为 `planned`，页面明确显示“未部署”且不可点击。在 MoonWorld chunk、
+  碰撞/低重力、SONIC 运行参数、入口点和冷重启路由完成验收前，不得只改一个状态字段把它
+  伪装成可用。
+- 火星乌托邦平原前哨暂停开发，只能保持 disabled/backlog。
 - 点击地球归航点仍先原子保存目标，再由最外层 launcher 冷重启整条
   Matrix/UE/SONIC 链；不存在从 UI 直接写 MuJoCo `qpos` 的旁路。
 

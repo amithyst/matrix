@@ -56,6 +56,10 @@ SOL-2080 celestial navigation optionally uses a separately locked 31.3 MiB
 DE440s bundle; provision it with `bash scripts/bootstrap_matrix_celestial.sh`.
 Its deterministic CARLA visual profiles and renderer acceptance boundary are
 documented in [Matrix SOL-2080 Celestial Visuals](docs/MATRIX_CELESTIAL_VISUALS_CN.md).
+The current SOL-2080 product direction is box-world first: bounded, verified
+scenes such as the city and MoonWorld are linked through ESC teleport
+destinations while preserving one session/state/provenance model. Seamless
+planet-scale streaming is a later renderer track, not a cooked-PAK promise.
 
 ### 3. Run Simulation
 ```bash
