@@ -26,6 +26,13 @@ from matrix_external_control import (
 
 
 _CAPABILITY_RE = re.compile(r"[0-9a-f]{64}\Z")
+# The provider publishes at 50 Hz and deliberately requires locomotion-neutral
+# frames when authority changes to the external source.  Keep the new lease in
+# that state across several provider frames so source-change and neutral-rearm
+# interlocks cannot consume the first requested input.  Keyboard actions retain
+# their modifiers during this interval so the double-tap detector establishes
+# the requested speed tier before it sees the first WASD edge.
+_NEUTRAL_WARMUP_SECONDS = 0.12
 
 
 def _read_capability(path: Path) -> str:
@@ -325,10 +332,9 @@ def _state_with_gamepad(args: argparse.Namespace) -> ExternalInputState:
     return ExternalInputState.from_mapping(mapping)
 
 
-def _hold_state(
+def _wait_with_lease_refresh(
     client: MatrixControlClient,
     lease_id: str,
-    state: ExternalInputState,
     *,
     seconds: float,
     refresh_seconds: float,
@@ -336,10 +342,6 @@ def _hold_state(
     sleeper=time.sleep,
 ) -> None:
     deadline = clock() + seconds
-    # A held input is immutable until the next explicit segment.  Replacing the
-    # full state every refresh needlessly amplifies provider/UI telemetry I/O;
-    # renew the lease instead and keep the broker's 150 ms deadman authoritative.
-    client.replace(lease_id, state)
     next_refresh = clock() + refresh_seconds
     while True:
         now = clock()
@@ -354,6 +356,30 @@ def _hold_state(
         next_refresh += refresh_seconds
         if next_refresh <= now:
             next_refresh = now + refresh_seconds
+
+
+def _hold_state(
+    client: MatrixControlClient,
+    lease_id: str,
+    state: ExternalInputState,
+    *,
+    seconds: float,
+    refresh_seconds: float,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+) -> None:
+    # A held input is immutable until the next explicit segment.  Replacing the
+    # full state every refresh needlessly amplifies provider/UI telemetry I/O;
+    # renew the lease instead and keep the configured deadman authoritative.
+    client.replace(lease_id, state)
+    _wait_with_lease_refresh(
+        client,
+        lease_id,
+        seconds=seconds,
+        refresh_seconds=refresh_seconds,
+        clock=clock,
+        sleeper=sleeper,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -534,6 +560,18 @@ def main() -> int:
         response: dict[str, object] | None = None
         lease_available = True
         try:
+            warmup_state = (
+                _state_with_keyboard(None, tuple(args.modifier))
+                if args.action == "key"
+                else neutral
+            )
+            _hold_state(
+                client,
+                lease_id,
+                warmup_state,
+                seconds=_NEUTRAL_WARMUP_SECONDS,
+                refresh_seconds=refresh_seconds,
+            )
             if args.action == "key":
                 seconds = _finite(args.seconds, name="seconds", minimum=0.01, maximum=3600.0)
                 state = _state_with_keyboard(args.key, tuple(args.modifier))
@@ -570,14 +608,22 @@ def main() -> int:
                 seconds = _finite(args.seconds, name="seconds", minimum=0.02, maximum=10.0)
                 state = _state_with_mouse(dx, dy, args.button)
                 client.replace(lease_id, state)
-                # Keep the one-shot delta visible for at least one 50 Hz provider frame.
-                time.sleep(min(0.04, seconds))
+                # Keep the one-shot delta visible for at least one 50 Hz
+                # provider frame.  Renew only the lease: replacing this state
+                # would apply the relative mouse delta more than once.
+                visibility_seconds = min(0.04, seconds)
+                _wait_with_lease_refresh(
+                    client,
+                    lease_id,
+                    seconds=visibility_seconds,
+                    refresh_seconds=refresh_seconds,
+                )
                 held = _state_with_mouse(0.0, 0.0, args.button)
                 _hold_state(
                     client,
                     lease_id,
                     held,
-                    seconds=max(0.0, seconds - 0.04),
+                    seconds=max(0.0, seconds - visibility_seconds),
                     refresh_seconds=refresh_seconds,
                 )
             elif args.action == "gamepad":

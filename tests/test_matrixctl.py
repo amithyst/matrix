@@ -138,6 +138,75 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         client.refresh.assert_has_calls([mock.call("lease")] * 3)
         self.assertAlmostEqual(clock.now, 0.16)
 
+    def test_wait_only_refreshes_fast_enough_for_a_short_deadman(self) -> None:
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        clock = Clock()
+        refresh_times: list[float] = []
+        client = mock.Mock()
+        client.refresh.side_effect = lambda _lease_id: refresh_times.append(
+            clock.now
+        )
+        deadman_seconds = 0.012
+        refresh_seconds = deadman_seconds / 3.0
+
+        MODULE._wait_with_lease_refresh(
+            client,
+            "lease",
+            seconds=0.04,
+            refresh_seconds=refresh_seconds,
+            clock=clock.read,
+            sleeper=clock.sleep,
+        )
+
+        self.assertEqual(client.refresh.call_count, 9)
+        client.replace.assert_not_called()
+        cadence_points = [0.0, *refresh_times, clock.now]
+        for previous, current in zip(cadence_points, cadence_points[1:]):
+            self.assertLessEqual(
+                current - previous,
+                refresh_seconds + 1e-12,
+            )
+        self.assertAlmostEqual(clock.now, 0.04)
+
+    def test_neutral_warmup_renews_until_all_provider_frames_are_covered(
+        self,
+    ) -> None:
+        class Clock:
+            now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            def sleep(self, seconds: float) -> None:
+                self.now += seconds
+
+        client = mock.Mock()
+        neutral = EXTERNAL.ExternalInputState.neutral()
+        clock = Clock()
+
+        MODULE._hold_state(
+            client,
+            "lease",
+            neutral,
+            seconds=MODULE._NEUTRAL_WARMUP_SECONDS,
+            refresh_seconds=0.05,
+            clock=clock.read,
+            sleeper=clock.sleep,
+        )
+
+        client.replace.assert_called_once_with("lease", neutral)
+        self.assertEqual(client.refresh.call_count, 2)
+        client.refresh.assert_has_calls([mock.call("lease")] * 2)
+        self.assertAlmostEqual(clock.now, MODULE._NEUTRAL_WARMUP_SECONDS)
+
     @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
@@ -174,14 +243,245 @@ class MatrixCtlHelpersTest(unittest.TestCase):
 
         self.assertEqual(MODULE.main(), 0)
 
-        self.assertLessEqual(hold_state.call_args.kwargs["refresh_seconds"], 0.05)
+        self.assertEqual(hold_state.call_count, 2)
+        warmup, action = hold_state.call_args_list
+        self.assertEqual(
+            warmup.args,
+            (
+                client,
+                "lease",
+                MODULE._state_with_keyboard(None, ("alt",)),
+            ),
+        )
+        self.assertEqual(
+            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
+        )
+        self.assertEqual(
+            action.args,
+            (client, "lease", MODULE._state_with_keyboard("w", ("alt",))),
+        )
+        self.assertEqual(action.kwargs["seconds"], 1.0)
+        for call in (warmup, action):
+            self.assertLessEqual(call.kwargs["refresh_seconds"], 0.05)
         client.replace.assert_called_once_with(
             "lease",
             EXTERNAL.ExternalInputState.neutral(),
         )
         client.release.assert_called_once_with("lease")
 
-    @mock.patch.object(MODULE, "_hold_state", side_effect=KeyboardInterrupt)
+    @mock.patch.object(MODULE, "_hold_state")
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_main_double_tap_uses_modifier_only_warmup_before_both_taps(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        hold_state,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "key",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "seconds": 0.25,
+                "key": "w",
+                "modifier": ["alt"],
+                "double": True,
+                "tap_gap": 0.08,
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.15)
+
+        self.assertEqual(MODULE.main(), 0)
+
+        pressed = MODULE._state_with_keyboard("w", ("alt",))
+        modifier_only = MODULE._state_with_keyboard(None, ("alt",))
+        self.assertEqual(hold_state.call_count, 4)
+        warmup, first_tap, gap, second_tap = hold_state.call_args_list
+        self.assertEqual(
+            warmup.args,
+            (client, "lease", modifier_only),
+        )
+        self.assertEqual(
+            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
+        )
+        self.assertEqual(first_tap.args, (client, "lease", pressed))
+        self.assertEqual(first_tap.kwargs["seconds"], 0.04)
+        self.assertEqual(gap.args, (client, "lease", modifier_only))
+        self.assertEqual(gap.kwargs["seconds"], 0.08)
+        self.assertEqual(second_tap.args, (client, "lease", pressed))
+        self.assertEqual(second_tap.kwargs["seconds"], 0.25)
+        for call in hold_state.call_args_list:
+            self.assertLessEqual(call.kwargs["refresh_seconds"], 0.05)
+        client.replace.assert_called_once_with(
+            "lease",
+            EXTERNAL.ExternalInputState.neutral(),
+        )
+        client.release.assert_called_once_with("lease")
+
+    def test_main_double_tap_activates_detector_after_external_source_rearm(
+        self,
+    ) -> None:
+        for modifiers in ((), ("alt",), ("ctrl",), ("shift",)):
+            with self.subTest(modifiers=modifiers):
+                detector = PROVIDER.KeyboardDoubleTapDetector(0.30)
+                focus = PROVIDER.KeyboardMouseSample(focused=True)
+                now_s = 1.0
+                # Model the provider's preceding physical-input frame so the
+                # first external frame must traverse the real source-change
+                # reset path before the two W edges arrive.
+                self.assertFalse(
+                    detector.update(
+                        focus,
+                        now_s=now_s - 0.02,
+                        enabled=True,
+                        source_id="physical",
+                    )
+                )
+
+                def observe_hold(
+                    _client,
+                    _lease_id,
+                    state,
+                    *,
+                    seconds,
+                    refresh_seconds,
+                ) -> None:
+                    del refresh_seconds
+                    nonlocal now_s
+                    keyboard, _gamepad = PROVIDER.external_input_samples(
+                        state,
+                        focus=focus,
+                        look_button="left",
+                    )
+                    detector.update(
+                        keyboard,
+                        now_s=now_s,
+                        enabled=True,
+                        source_id="external",
+                    )
+                    now_s += seconds
+
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "action": "key",
+                        "profile": "trna",
+                        "socket": None,
+                        "capability_file": None,
+                        "timeout": 1.0,
+                        "seconds": 0.25,
+                        "key": "w",
+                        "modifier": list(modifiers),
+                        "double": True,
+                        "tap_gap": 0.08,
+                    },
+                )()
+                endpoint = Path("/run/user/1000/control.sock")
+                capability = Path("/run/user/1000/control.cap")
+                with mock.patch.object(
+                    MODULE,
+                    "_parse_args",
+                    return_value=args,
+                ), mock.patch.object(
+                    MODULE,
+                    "_resolved_paths",
+                    return_value=(endpoint, capability),
+                ), mock.patch.object(
+                    MODULE,
+                    "MatrixControlClient",
+                ) as client_type, mock.patch.object(
+                    MODULE,
+                    "_hold_state",
+                    side_effect=observe_hold,
+                ):
+                    client = client_type.return_value.__enter__.return_value
+                    client.acquire.return_value = ("lease", 0.15)
+                    self.assertEqual(MODULE.main(), 0)
+
+                self.assertEqual(detector.activations, 1)
+                self.assertEqual(detector.telemetry["source_id"], "external")
+                self.assertEqual(detector.telemetry["boost_key"], "w")
+
+    @mock.patch.object(MODULE, "_wait_with_lease_refresh")
+    @mock.patch.object(MODULE, "_hold_state")
+    @mock.patch.object(MODULE, "MatrixControlClient")
+    @mock.patch.object(MODULE, "_resolved_paths")
+    @mock.patch.object(MODULE, "_parse_args")
+    def test_mouse_delta_visibility_renews_short_lease_without_repeating_delta(
+        self,
+        parse_args,
+        resolved_paths,
+        client_type,
+        hold_state,
+        wait_with_refresh,
+    ) -> None:
+        parse_args.return_value = type(
+            "Args",
+            (),
+            {
+                "action": "mouse",
+                "profile": "trna",
+                "socket": None,
+                "capability_file": None,
+                "timeout": 1.0,
+                "dx": 12.0,
+                "dy": -3.0,
+                "button": "left",
+                "seconds": 0.25,
+            },
+        )()
+        resolved_paths.return_value = (
+            Path("/run/user/1000/control.sock"),
+            Path("/run/user/1000/control.cap"),
+        )
+        client = client_type.return_value.__enter__.return_value
+        client.acquire.return_value = ("lease", 0.012)
+
+        self.assertEqual(MODULE.main(), 0)
+
+        refresh_seconds = 0.012 / 3.0
+        wait_with_refresh.assert_called_once_with(
+            client,
+            "lease",
+            seconds=0.04,
+            refresh_seconds=refresh_seconds,
+        )
+        delta = MODULE._state_with_mouse(12.0, -3.0, "left")
+        neutral = EXTERNAL.ExternalInputState.neutral()
+        self.assertEqual(
+            client.replace.call_args_list,
+            [mock.call("lease", delta), mock.call("lease", neutral)],
+        )
+        self.assertEqual(hold_state.call_count, 2)
+        warmup, held = hold_state.call_args_list
+        self.assertEqual(warmup.args, (client, "lease", neutral))
+        self.assertEqual(
+            held.args,
+            (client, "lease", MODULE._state_with_mouse(0.0, 0.0, "left")),
+        )
+        self.assertAlmostEqual(held.kwargs["seconds"], 0.21)
+        for call in hold_state.call_args_list:
+            self.assertEqual(call.kwargs["refresh_seconds"], refresh_seconds)
+        client.release.assert_called_once_with("lease")
+
+    @mock.patch.object(
+        MODULE,
+        "_hold_state",
+        side_effect=(None, KeyboardInterrupt),
+    )
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
     @mock.patch.object(MODULE, "_parse_args")
@@ -218,6 +518,19 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             MODULE.main()
 
+        self.assertEqual(_hold_state.call_count, 2)
+        warmup, interrupted_action = _hold_state.call_args_list
+        self.assertEqual(
+            warmup.args,
+            (client, "lease", EXTERNAL.ExternalInputState.neutral()),
+        )
+        self.assertEqual(
+            warmup.kwargs["seconds"], MODULE._NEUTRAL_WARMUP_SECONDS
+        )
+        self.assertEqual(
+            interrupted_action.args,
+            (client, "lease", MODULE._state_with_keyboard("w", ())),
+        )
         client.replace.assert_called_once_with(
             "lease",
             EXTERNAL.ExternalInputState.neutral(),
@@ -304,6 +617,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         client.replace.assert_called_once()
         client.release.assert_not_called()
 
+    @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "_wait_for_command_terminal")
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
@@ -314,6 +628,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         resolved_paths,
         client_type,
         wait_terminal,
+        hold_state,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -354,9 +669,18 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "E_COMMAND_REJECTED"):
             MODULE.main()
 
+        hold_state.assert_called_once_with(
+            client,
+            "lease",
+            EXTERNAL.ExternalInputState.neutral(),
+            seconds=MODULE._NEUTRAL_WARMUP_SECONDS,
+            refresh_seconds=mock.ANY,
+        )
+        client.command.assert_called_once_with("lease", "/tp @s ~ ~ ~")
         client.replace.assert_not_called()
         client.release.assert_not_called()
 
+    @mock.patch.object(MODULE, "_hold_state")
     @mock.patch.object(MODULE, "_wait_for_command_terminal")
     @mock.patch.object(MODULE, "MatrixControlClient")
     @mock.patch.object(MODULE, "_resolved_paths")
@@ -367,6 +691,7 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         resolved_paths,
         client_type,
         wait_terminal,
+        hold_state,
     ) -> None:
         parse_args.return_value = type(
             "Args",
@@ -397,6 +722,14 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         with self.assertRaises(MODULE.MatrixCommandOutcomeUnknownError):
             MODULE.main()
 
+        hold_state.assert_called_once_with(
+            client,
+            "lease",
+            EXTERNAL.ExternalInputState.neutral(),
+            seconds=MODULE._NEUTRAL_WARMUP_SECONDS,
+            refresh_seconds=mock.ANY,
+        )
+        client.command.assert_called_once_with("lease", "/tp @s ~ ~ ~")
         client.replace.assert_not_called()
         client.release.assert_not_called()
 
