@@ -136,11 +136,16 @@ _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
+_CANONICAL_ROOT_POSITION_DOF_COUNT = 7
 _CANONICAL_ROOT_VELOCITY_DOF_COUNT = 6
 _CANONICAL_BODY_JOINT_DOF_COUNT = 29
+_CANONICAL_BODY_QPOS_STOP = (
+    _CANONICAL_ROOT_POSITION_DOF_COUNT + _CANONICAL_BODY_JOINT_DOF_COUNT
+)
 _CANONICAL_BODY_QVEL_STOP = (
     _CANONICAL_ROOT_VELOCITY_DOF_COUNT + _CANONICAL_BODY_JOINT_DOF_COUNT
 )
+_CANONICAL_RENDER_CTRL_COUNT = _CANONICAL_BODY_JOINT_DOF_COUNT
 from matrix_mujoco_contacts import (
     has_external_foot_support,
     has_external_ground_support,
@@ -3738,6 +3743,50 @@ def _canonical_body_joint_velocities(qvel: Any) -> tuple[float, ...]:
             f"{_CANONICAL_BODY_JOINT_DOF_COUNT} values"
         )
     return values
+
+
+def _canonical_render_vectors(
+    snapshot: Any,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    """Project an extended physics snapshot onto the canonical G1 UE ABI."""
+
+    try:
+        ctrl_count = len(snapshot.ctrl)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("canonical UE render ctrl source is invalid") from exc
+    if ctrl_count != _CANONICAL_RENDER_CTRL_COUNT:
+        raise ValueError(
+            "canonical UE render ctrl source must contain exactly "
+            f"{_CANONICAL_RENDER_CTRL_COUNT} values"
+        )
+    try:
+        qpos = tuple(
+            float(value)
+            for value in snapshot.qpos[:_CANONICAL_BODY_QPOS_STOP]
+        )
+        qvel = tuple(
+            float(value)
+            for value in snapshot.qvel[:_CANONICAL_BODY_QVEL_STOP]
+        )
+        ctrl = tuple(
+            float(value)
+            for value in snapshot.ctrl[:_CANONICAL_RENDER_CTRL_COUNT]
+        )
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("canonical UE render state is invalid") from exc
+    dimensions = (
+        (qpos, _CANONICAL_BODY_QPOS_STOP, "qpos"),
+        (qvel, _CANONICAL_BODY_QVEL_STOP, "qvel"),
+        (ctrl, _CANONICAL_RENDER_CTRL_COUNT, "ctrl"),
+    )
+    for values, expected, name in dimensions:
+        if len(values) != expected:
+            raise ValueError(
+                f"canonical UE render {name} must contain {expected} values"
+            )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"canonical UE render {name} contains non-finite values")
+    return qpos, qvel, ctrl
 
 
 def _snapshot_validation_error(
@@ -9207,8 +9256,31 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             if physical_recovery is not None:
                 physical_recovery.bind_initial_sonic_gate(processes=processes)
 
+        try:
+            render_qpos, render_qvel, render_ctrl = _canonical_render_vectors(
+                snapshot
+            )
+        except ValueError as exc:
+            raise SystemExit(f"cannot project canonical UE render state: {exc}") from exc
+        render_dimensions = {
+            "qpos": len(render_qpos),
+            "qvel": len(render_qvel),
+            "ctrl": len(render_ctrl),
+        }
+        physics_dimensions = {
+            "qpos": len(snapshot.qpos),
+            "qvel": len(snapshot.qvel),
+            "ctrl": len(snapshot.ctrl),
+        }
+        render_projection = (
+            "identity"
+            if render_dimensions == physics_dimensions
+            else "canonical_g1_robot_prefix"
+        )
         expected_packet_size = packet_size(
-            nq=len(snapshot.qpos), nv=len(snapshot.qvel), nu=len(snapshot.ctrl)
+            nq=render_dimensions["qpos"],
+            nv=render_dimensions["qvel"],
+            nu=render_dimensions["ctrl"],
         )
         render_target = (
             "disabled"
@@ -9221,7 +9293,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             f"model={model_path} nq={len(snapshot.qpos)} nv={len(snapshot.qvel)} "
             f"nu={len(snapshot.ctrl)} physics_hz={physics_hz:.1f} "
             f"control_hz={args.control_hz:.1f} substeps={substeps} "
-            f"render={render_target} packet_bytes={expected_packet_size} "
+            f"render={render_target} "
+            f"render_dims={render_dimensions['qpos']}/"
+            f"{render_dimensions['qvel']}/{render_dimensions['ctrl']} "
+            f"render_projection={render_projection} "
+            f"packet_bytes={expected_packet_size} "
             f"control_source={args.control_source}",
             flush=True,
         )
@@ -9761,11 +9837,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             fall_detected = fall_detected or bool(snapshot.fall_detected)
 
             if renderer is not None:
+                render_qpos, render_qvel, render_ctrl = (
+                    _canonical_render_vectors(snapshot)
+                )
                 renderer.send(
                     snapshot.sim_time,
-                    snapshot.qpos,
-                    snapshot.qvel,
-                    snapshot.ctrl,
+                    render_qpos,
+                    render_qvel,
+                    render_ctrl,
                 )
             control_frames += 1
 
@@ -9805,7 +9884,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "physics_step_hz": round(window_physics_steps / window_wall, 3),
                     "render_hz": round(window_render / window_wall, 3),
                     "render_packet_bytes": expected_packet_size,
+                    "render_dimensions": render_dimensions,
+                    "render_projection": render_projection,
                     "render_sync_enabled": renderer is not None,
+                    "physics_dimensions": physics_dimensions,
                     "ue_state_sync_hz": round(window_render / window_wall, 3),
                     "ue_pid": args.ue_pid,
                     "root_xyz": [round(float(value), 5) for value in snapshot.qpos[:3]],
@@ -10249,7 +10331,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "qualification_profile": args.qualification_profile,
             "render_hz": round(render_hz_aggregate, 3),
             "render_packet_bytes": expected_packet_size,
+            "render_dimensions": render_dimensions,
+            "render_projection": render_projection,
             "render_sync_enabled": renderer is not None,
+            "physics_dimensions": physics_dimensions,
             "root_displacement_xy_m": round(root_displacement_xy_m, 5),
             "root_final_x": round(float(snapshot.qpos[0]), 5),
             "root_displacement_x_m": round(

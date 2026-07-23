@@ -3176,6 +3176,35 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "snapshot_expected_dimensions_invalid",
         )
 
+    def test_render_projection_hides_inventory_tail_from_canonical_ue(self) -> None:
+        snapshot = self.snapshot(qpos_len=92, qvel_len=83)
+        snapshot.qpos = [float(index) for index in range(92)]
+        snapshot.qvel = [float(index) for index in range(83)]
+        snapshot.ctrl = [float(index) for index in range(29)]
+
+        qpos, qvel, ctrl = MODULE._canonical_render_vectors(snapshot)
+
+        self.assertEqual(qpos, tuple(snapshot.qpos[:36]))
+        self.assertEqual(qvel, tuple(snapshot.qvel[:35]))
+        self.assertEqual(ctrl, tuple(snapshot.ctrl))
+        self.assertEqual((len(qpos), len(qvel), len(ctrl)), (36, 35, 29))
+        self.assertNotIn(snapshot.qpos[36], qpos)
+        self.assertNotIn(snapshot.qvel[35], qvel)
+
+    def test_render_projection_fails_closed_on_short_or_non_finite_state(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "qpos must contain 36"):
+            MODULE._canonical_render_vectors(self.snapshot(qpos_len=35))
+        non_finite = self.snapshot(qpos_len=92, qvel_len=83)
+        non_finite.qvel[7] = math.nan
+        with self.assertRaisesRegex(ValueError, "qvel contains non-finite"):
+            MODULE._canonical_render_vectors(non_finite)
+        extra_ctrl = self.snapshot(qpos_len=92, qvel_len=83)
+        extra_ctrl.ctrl.append(0.0)
+        with self.assertRaisesRegex(ValueError, "ctrl source must contain exactly 29"):
+            MODULE._canonical_render_vectors(extra_ctrl)
+
     @mock.patch.dict(
         sys.modules,
         {"mujoco": SimpleNamespace(mjtJoint=SimpleNamespace(mjJNT_FREE=0))},
