@@ -247,11 +247,11 @@ material="demo_ground_material" /></worldbody>
                 worldbody_names,
                 ["pelvis", "creative_item__prop__0"],
             )
-            self.assertIsNotNone(
-                robot.find(
-                    ".//weld[@name='creative_item__prop__0__storage_weld']"
-                )
+            storage_weld = robot.find(
+                ".//weld[@name='creative_item__prop__0__storage_weld']"
             )
+            self.assertIsNotNone(storage_weld)
+            self.assertNotIn("relpose", storage_weld.attrib)
             retained_assets = {
                 item.get("name") for item in robot.find("asset")
             }
@@ -265,11 +265,44 @@ material="demo_ground_material" /></worldbody>
             self.assertTrue(
                 all("class" not in geom.attrib for geom in inventory_geoms)
             )
+            collision_geom = robot.find(
+                ".//geom[@name='creative_item__prop__0__collision']"
+            )
+            self.assertIsNotNone(collision_geom)
+            self.assertEqual(collision_geom.get("contype"), "0")
+            self.assertEqual(collision_geom.get("conaffinity"), "0")
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(
                 manifest["creative_inventory"]["catalog_sha256"],
                 MODULE._file_sha256(catalog),
             )
+            self.assertEqual(
+                manifest["creative_inventory"]["storage_contract_version"],
+                MODULE.INVENTORY_STORAGE_CONTRACT_VERSION,
+            )
+
+            with mock.patch.object(
+                MODULE,
+                "INVENTORY_STORAGE_CONTRACT_VERSION",
+                MODULE.INVENTORY_STORAGE_CONTRACT_VERSION + 1,
+            ):
+                MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    output,
+                    body_joint_names=("joint_a",),
+                    creative_inventory_catalog=catalog,
+                )
+                rebuilt_manifest = json.loads(
+                    (output / "manifest.json").read_text()
+                )
+                self.assertEqual(
+                    rebuilt_manifest["creative_inventory"][
+                        "storage_contract_version"
+                    ],
+                    MODULE.INVENTORY_STORAGE_CONTRACT_VERSION,
+                )
 
     def test_town10_open_boundary_removes_four_walls_and_retains_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

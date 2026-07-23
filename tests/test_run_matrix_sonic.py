@@ -714,6 +714,26 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(telemetry["stable_idle_sim_elapsed_s"], 0.0)
         self.assertTrue(probation.active)
 
+    def test_resume_probation_ignores_creative_inventory_freejoint_velocity(
+        self,
+    ) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        inventory_snapshot = self.upright_resume_snapshot(low_cmd_fresh=True)
+        inventory_snapshot.qvel.extend([2500.0] * 48)
+        probation.observe(
+            inventory_snapshot,
+            self.resume_idle_command(),
+            now_s=0.0,
+        )
+
+        telemetry = probation.telemetry()
+        self.assertTrue(telemetry["root_motion_valid"])
+        self.assertEqual(telemetry["current_max_joint_speed_rad_s"], 0.0)
+        self.assertEqual(telemetry["current_joint_rms_speed_rad_s"], 0.0)
+
     def test_resume_probation_uses_sim_time_across_wall_pause(self) -> None:
         probation = MODULE._GameWorldResumeProbation(
             selected_checkpoint_id="cp-1",
@@ -5675,12 +5695,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator._maybe_authorize_policy_advance = mock.Mock()
         coordinator._fall_level = mock.Mock(return_value=False)
         snapshot = self.snapshot(
+            qvel_len=83,
             low_cmd_fresh=True,
             low_cmd_received=True,
             low_cmd_age_s=0.01,
         )
         snapshot.qpos[2] = 0.7
         snapshot.qpos[3] = 1.0
+        snapshot.qvel[35:] = [2500.0] * 48
         processes = SimpleNamespace(
             deploy_generation=8,
             deploy_alive=lambda: True,
@@ -5700,6 +5722,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(observation.deploy_safe_idle_hold)
         self.assertFalse(observation.deploy_policy_full_control)
         self.assertTrue(observation.deploy_first_write)
+        self.assertEqual(observation.joint_velocity_rms_rad_s, 0.0)
 
     def test_stabilizing_to_wait_neutral_reanchors_game_core_once(self) -> None:
         core = mock.Mock(spec=GAME_CONTROL.GameControlCore)

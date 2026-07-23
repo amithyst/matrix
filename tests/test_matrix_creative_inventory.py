@@ -141,6 +141,51 @@ class CreativeInventoryTest(unittest.TestCase):
             self.assertEqual(model.nq, 21)
             self.assertEqual(model.nv, 18)
             self.assertEqual(runtime.mapping()["items"][0]["remaining"], 2)
+            pool_entries = runtime.pools["test_prop"]
+            for entry in pool_entries:
+                self.assertEqual(int(model.body_contype[entry.body_id]), 0)
+                self.assertEqual(int(model.body_conaffinity[entry.body_id]), 0)
+                self.assertEqual(int(model.geom_contype[entry.collision_geom_id]), 0)
+                self.assertEqual(
+                    int(model.geom_conaffinity[entry.collision_geom_id]), 0
+                )
+            inactive_qpos = [
+                tuple(
+                    float(value)
+                    for value in data.qpos[
+                        entry.qpos_address : entry.qpos_address + 7
+                    ]
+                )
+                for entry in pool_entries
+            ]
+            for _ in range(8):
+                mujoco.mj_step(model, data)
+            for entry, expected_qpos in zip(
+                pool_entries, inactive_qpos, strict=True
+            ):
+                actual_qpos = tuple(
+                    float(value)
+                    for value in data.qpos[
+                        entry.qpos_address : entry.qpos_address + 7
+                    ]
+                )
+                self.assertLess(
+                    max(
+                        abs(actual - expected)
+                        for actual, expected in zip(
+                            actual_qpos, expected_qpos, strict=True
+                        )
+                    ),
+                    1e-3,
+                )
+                self.assertTrue(
+                    all(
+                        abs(float(value)) < 0.02
+                        for value in data.qvel[
+                            entry.dof_address : entry.dof_address + 6
+                        ]
+                    )
+                )
             spawned = runtime.spawn("test_prop", _Pose())
             self.assertEqual(spawned.position, (1.0, 0.0, 1.0))
             self.assertEqual(runtime.mapping()["items"][0]["remaining"], 1)
@@ -151,6 +196,16 @@ class CreativeInventoryTest(unittest.TestCase):
             )
             qpos_address = int(model.jnt_qposadr[joint_id])
             self.assertAlmostEqual(float(data.qpos[qpos_address]), 1.0)
+            collision_geom_id = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                "creative_item__test_prop__0__collision",
+            )
+            spawned_entry = pool_entries[0]
+            self.assertEqual(int(model.body_contype[spawned_entry.body_id]), 1)
+            self.assertEqual(int(model.body_conaffinity[spawned_entry.body_id]), 1)
+            self.assertEqual(int(model.geom_contype[collision_geom_id]), 1)
+            self.assertEqual(int(model.geom_conaffinity[collision_geom_id]), 1)
             equality_id = mujoco.mj_name2id(
                 model,
                 mujoco.mjtObj.mjOBJ_EQUALITY,
@@ -158,10 +213,26 @@ class CreativeInventoryTest(unittest.TestCase):
             )
             self.assertEqual(int(data.eq_active[equality_id]), 0)
             before_z = float(data.qpos[qpos_address + 2])
-            for _ in range(5):
+            floor_geom_id = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                "floor",
+            )
+            prop_touched_floor = False
+            for _ in range(600):
                 mujoco.mj_step(model, data)
+                prop_touched_floor = prop_touched_floor or any(
+                    {
+                        int(data.contact[contact_index].geom1),
+                        int(data.contact[contact_index].geom2),
+                    }
+                    == {floor_geom_id, collision_geom_id}
+                    for contact_index in range(data.ncon)
+                )
             self.assertLess(float(data.qpos[qpos_address + 2]), before_z)
             self.assertTrue(math.isfinite(float(data.qpos[qpos_address + 2])))
+            self.assertTrue(prop_touched_floor)
+            self.assertAlmostEqual(float(data.qpos[qpos_address + 2]), 0.05, delta=0.02)
 
     @unittest.skipIf(mujoco is None, "MuJoCo Python bindings are unavailable")
     def test_pool_exhaustion_is_explicit(self) -> None:

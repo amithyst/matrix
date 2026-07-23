@@ -19,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from compose_custom_scene import compose_custom_scene, freejoint_body_names  # noqa: E402
 from inject_creative_inventory import (  # noqa: E402
+    INVENTORY_STORAGE_CONTRACT_VERSION,
     InventoryCatalogError,
     inject_catalog,
     load_catalog,
@@ -435,6 +436,7 @@ def _creative_inventory_source_contract(
         key=lambda path: path.as_posix(),
     )
     return {
+        "storage_contract_version": INVENTORY_STORAGE_CONTRACT_VERSION,
         "catalog": str(catalog.resolve()),
         "catalog_sha256": _file_sha256(catalog),
         "meshes": [

@@ -136,6 +136,11 @@ _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
+_CANONICAL_ROOT_VELOCITY_DOF_COUNT = 6
+_CANONICAL_BODY_JOINT_DOF_COUNT = 29
+_CANONICAL_BODY_QVEL_STOP = (
+    _CANONICAL_ROOT_VELOCITY_DOF_COUNT + _CANONICAL_BODY_JOINT_DOF_COUNT
+)
 from matrix_mujoco_contacts import (
     has_external_foot_support,
     has_external_ground_support,
@@ -2744,7 +2749,7 @@ class _GameWorldResumeProbation:
             roll_rate = float(qvel[3])
             pitch_rate = float(qvel[4])
             yaw_rate = float(qvel[5])
-            joint_velocities = tuple(float(value) for value in qvel[6:])
+            joint_velocities = _canonical_body_joint_velocities(qvel)
         except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
             return False
         all_velocities = (
@@ -3713,6 +3718,26 @@ _EXPECTED_SNAPSHOT_DIMS = {
     "ctrl": 29,
     "applied_torque": 29,
 }
+
+
+def _canonical_body_joint_velocities(qvel: Any) -> tuple[float, ...]:
+    """Return only G1's 29 actuated joint velocities from an extended model."""
+
+    try:
+        values = tuple(
+            float(value)
+            for value in qvel[
+                _CANONICAL_ROOT_VELOCITY_DOF_COUNT:_CANONICAL_BODY_QVEL_STOP
+            ]
+        )
+    except (IndexError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("canonical body qvel is invalid") from exc
+    if len(values) != _CANONICAL_BODY_JOINT_DOF_COUNT:
+        raise ValueError(
+            "canonical body qvel must contain "
+            f"{_CANONICAL_BODY_JOINT_DOF_COUNT} values"
+        )
+    return values
 
 
 def _snapshot_validation_error(
@@ -7432,7 +7457,7 @@ class _PhysicalRecoveryCoordinator:
         qvel = tuple(float(value) for value in snapshot.qvel)
         root_linear_speed = math.sqrt(sum(value * value for value in qvel[:3]))
         root_angular_speed = math.sqrt(sum(value * value for value in qvel[3:6]))
-        joint_values = qvel[6:]
+        joint_values = _canonical_body_joint_velocities(qvel)
         joint_rms = math.sqrt(
             sum(value * value for value in joint_values) / len(joint_values)
         )

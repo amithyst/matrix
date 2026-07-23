@@ -23,6 +23,8 @@ _JOINT_RE = re.compile(
     r"creative_item__(?P<item>[a-z0-9][a-z0-9_-]{0,47})__"
     r"(?P<index>[0-9]+)__freejoint\Z"
 )
+_ACTIVE_COLLISION_CONTYPE = 1
+_ACTIVE_COLLISION_CONAFFINITY = 1
 
 
 class CreativeInventoryError(RuntimeError):
@@ -48,6 +50,8 @@ class _PoolEntry:
     qpos_address: int
     dof_address: int
     equality_id: int
+    body_id: int
+    collision_geom_id: int
 
 
 def _quat_multiply(
@@ -108,6 +112,26 @@ class CreativeInventoryRuntime:
                 raise CreativeInventoryError(
                     "E_INVENTORY_MODEL", f"storage weld is missing for {instance_name}"
                 )
+            body_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                instance_name,
+            )
+            if body_id < 0:
+                raise CreativeInventoryError(
+                    "E_INVENTORY_MODEL",
+                    f"pool body is missing for {instance_name}",
+                )
+            collision_geom_id = mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                f"{instance_name}__collision",
+            )
+            if collision_geom_id < 0:
+                raise CreativeInventoryError(
+                    "E_INVENTORY_MODEL",
+                    f"collision geom is missing for {instance_name}",
+                )
             self.pools[item_id].append(
                 _PoolEntry(
                     item_id=item_id,
@@ -116,6 +140,8 @@ class CreativeInventoryRuntime:
                     qpos_address=int(self.model.jnt_qposadr[joint_id]),
                     dof_address=int(self.model.jnt_dofadr[joint_id]),
                     equality_id=equality_id,
+                    body_id=body_id,
+                    collision_geom_id=collision_geom_id,
                 )
             )
         for item in self.items:
@@ -126,6 +152,19 @@ class CreativeInventoryRuntime:
                     f"{item.item_id} pool has {len(entries)} bodies, expected {item.pool_size}",
                 )
             self.pools[item.item_id] = entries
+        # Enforce the inactive-pool contract even when an older cached MJCF
+        # predates the explicit contype/conaffinity attributes.  A body parked
+        # below an infinite plane otherwise receives an enormous separating
+        # impulse while its storage weld simultaneously holds it in place.
+        with self.step_lock:
+            for entries in self.pools.values():
+                for entry in entries:
+                    self.data.eq_active[entry.equality_id] = 1
+                    self.model.body_contype[entry.body_id] = 0
+                    self.model.body_conaffinity[entry.body_id] = 0
+                    self.model.geom_contype[entry.collision_geom_id] = 0
+                    self.model.geom_conaffinity[entry.collision_geom_id] = 0
+            mujoco.mj_forward(self.model, self.data)
         self.spawned: set[str] = set()
         self.spawn_count = 0
 
@@ -205,6 +244,19 @@ class CreativeInventoryRuntime:
                 quaternion, dtype=np.float64
             )
             self.data.qvel[entry.dof_address : entry.dof_address + 6] = 0.0
+            # MuJoCo caches an aggregate collision mask on each body at
+            # compile time.  Restore both levels so broadphase considers the
+            # released prop after its collision geom is re-enabled.
+            self.model.body_contype[entry.body_id] = _ACTIVE_COLLISION_CONTYPE
+            self.model.body_conaffinity[
+                entry.body_id
+            ] = _ACTIVE_COLLISION_CONAFFINITY
+            self.model.geom_contype[
+                entry.collision_geom_id
+            ] = _ACTIVE_COLLISION_CONTYPE
+            self.model.geom_conaffinity[
+                entry.collision_geom_id
+            ] = _ACTIVE_COLLISION_CONAFFINITY
             mujoco.mj_forward(self.model, self.data)
         self.spawned.add(entry.instance_name)
         self.spawn_count += 1

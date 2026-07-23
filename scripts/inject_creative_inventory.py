@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 
 
 CATALOG_SCHEMA = "matrix-creative-inventory/v1"
+INVENTORY_STORAGE_CONTRACT_VERSION = 2
 ITEM_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 MAX_ITEMS = 16
 MAX_POOL_SIZE = 32
@@ -311,6 +312,12 @@ def inject_catalog(
                 "size": _format_vector(item.collision_half_size),
                 "mass": f"{item.mass_kg:.9g}",
                 "rgba": "0 0 0 0",
+                # Stored freejoint props sit below the world and are welded in
+                # place.  An infinite floor plane still collides with bodies
+                # below it, so the inactive pool must be non-colliding until
+                # MatrixCreativeInventory releases one instance.
+                "contype": "0",
+                "conaffinity": "0",
             }
             if use_default_classes:
                 collision_attributes["class"] = "collision"
@@ -326,7 +333,6 @@ def inject_catalog(
                     "name": f"{body_name}__storage_weld",
                     "body1": body_name,
                     "active": "true",
-                    "relpose": f"0 0 {storage_z:.9g} 1 0 0 0",
                 },
             )
             body_count += 1
