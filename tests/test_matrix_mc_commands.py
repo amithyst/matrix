@@ -206,6 +206,24 @@ class McCommandParserTest(unittest.TestCase):
             MODULE.TeleportLocalCoordinates(left=-1.5, up=0.0, forward=2.0),
         )
 
+    def test_teleport_list_is_bounded_unique_and_typed(self) -> None:
+        parsed = MODULE.parse_mc_command(
+            "/teleport list home moon.tranquility mars.utopia"
+        )
+        self.assertEqual(
+            parsed.command,
+            MODULE.TeleportList(("home", "moon.tranquility", "mars.utopia")),
+        )
+        for command in (
+            "/teleport list",
+            "/teleport list home home",
+            "/teleport list " + " ".join(f"tag{index}" for index in range(9)),
+        ):
+            with self.subTest(command=command), self.assertRaises(
+                MODULE.CommandParseError
+            ):
+                MODULE.parse_mc_command(command)
+
     def test_selector_order_is_irrelevant_but_contract_is_strict(self) -> None:
         selector = MODULE.parse_mc_command(
             "/tp @s @e[tag=XX,sort=nearest,limit=1,type=matrix:teleport_point]"
@@ -314,6 +332,19 @@ class McCommandProtocolTest(unittest.TestCase):
         payload = MODULE.encode_command_request(request)
 
         self.assertNotIn(b"/data", payload)
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+
+    def test_teleport_list_round_trip_contains_only_typed_tags(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=6,
+            request_id=REQUEST_ID,
+            command=MODULE.TeleportList(("home", "moon.tranquility")),
+        )
+
+        payload = MODULE.encode_command_request(request)
+
+        self.assertNotIn(b"/teleport", payload)
         self.assertEqual(MODULE.decode_command_request(payload), request)
 
     def test_policy_slot_assignment_round_trip_is_typed(self) -> None:
@@ -479,6 +510,41 @@ class McCommandExecutionTest(unittest.TestCase):
 
         self.assertEqual(context.exception.code, "E_SELECTOR_NO_TARGET")
         self.assertEqual(self.state.teleport_points, ())
+
+    def test_teleport_list_returns_requested_snapshot_without_mutation(self) -> None:
+        state, point = self.state.add_teleport_point(
+            WorldPose(12.0, 18.0, 0.8, 0.25),
+            ("home",),
+            entity_id="tp-" + "c" * 32,
+            now_unix_ns=2,
+        )
+
+        effect = MODULE.execute_command(
+            MODULE.TeleportList(("home", "moon.tranquility")),
+            state=state,
+            current_pose=self.origin,
+            now_unix_ns=3,
+        )
+
+        self.assertIs(effect.state, state)
+        self.assertFalse(effect.restart_required)
+        self.assertEqual(effect.code, "OK_TELEPORT_LIST")
+        self.assertEqual(
+            effect.data,
+            {
+                "world_id": "town10",
+                "teleport_points": [
+                    {
+                        "tag": "home",
+                        "found": True,
+                        "entity_id": point.entity_id,
+                        "position": [12.0, 18.0, 0.8],
+                        "yaw_rad": 0.25,
+                    },
+                    {"tag": "moon.tranquility", "found": False},
+                ],
+            },
+        )
 
     def test_resolved_out_of_world_coordinate_fails_before_mutation(self) -> None:
         command = MODULE.parse_mc_command("/tp @s 100001 0 1").command

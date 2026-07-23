@@ -2,6 +2,10 @@
 
 ## 目标
 
+本文件保留 `overworld` 作为历史脚本和实验目录名。2026-07-22 起，产品方向改为
+箱庭世界优先；本实验只证明多个 MuJoCo 物理代理能相邻拼接，不再作为近期“无缝大世界”
+交付目标。
+
 第一版把 `Town10World`、`Warehouse`、`YardWorld`、`ApartmentWorld`、
 `OfficeWorld` 和 `MeetRoomWorld` 放进同一个连续坐标系。Town10 保持原位，另外
 五个场景沿其东侧开放边界从南到北排列，场景包围盒不重叠，连接带宽度允许 G1
@@ -96,7 +100,8 @@ python3 -m json.tool \
 
 ## 视觉层下一步
 
-需要 Matrix 对应版本的 UE 5.5 可编辑工程和六张源地图。拿到后按当前 layout 的
+箱庭世界路线不要求近期把六个 cooked 地图做成无缝 UE 视觉拼接。若以后重新启动
+无缝视觉实验，仍需要 Matrix 对应版本的 UE 5.5 可编辑工程和六张源地图。拿到后按当前 layout 的
 transform 创建 `/Game/Maps/Overworld`，使用 level instance 打包，再同时验收：
 视觉位置与 MuJoCo 碰撞一致、六块地图可同时存在、SONIC 跨边界不断链、实际 UE
 帧率和相机传感器输出。拿到源工程前不做粗糙自制平替，也不提交 Town10 单图截图

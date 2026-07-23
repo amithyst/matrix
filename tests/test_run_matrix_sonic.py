@@ -4078,6 +4078,77 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_game_command_runtime_teleport_list_is_strictly_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            state, point = world.state.add_teleport_point(
+                WORLD_STATE.WorldPose(160.0, 117.0, 1.2, 0.0),
+                ("home",),
+                entity_id="tp-" + "d" * 32,
+                now_unix_ns=2,
+            )
+            world.state = state
+            world.last_error = "existing diagnostic"
+            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            current_pose = WORLD_STATE.WorldPose(160.0, 117.0, 1.2, 0.0)
+            request = self.game_command_request(
+                "/teleport list home moon.tranquility mars.utopia",
+                sequence=1,
+                request_character="e",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                with mock.patch.object(world.store, "save") as save:
+                    self.assertFalse(
+                        runtime.poll(
+                            current_pose=current_pose,
+                            command_allowed=True,
+                        )
+                    )
+                    save.assert_not_called()
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_TELEPORT_LIST")
+                self.assertFalse(response.restart_required)
+                self.assertEqual(
+                    response.data,
+                    {
+                        "world_id": "town10:test",
+                        "teleport_points": [
+                            {
+                                "tag": "home",
+                                "found": True,
+                                "entity_id": point.entity_id,
+                                "position": [160.0, 117.0, 1.2],
+                                "yaw_rad": 0.0,
+                            },
+                            {"tag": "moon.tranquility", "found": False},
+                            {"tag": "mars.utopia", "found": False},
+                        ],
+                    },
+                )
+                self.assertIs(world.state, state)
+                self.assertEqual(world.last_error, "existing diagnostic")
+                self.assertEqual(runtime.commands_executed, 1)
+                self.assertFalse(state_path.exists())
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_required_world_checkpoint_surfaces_durable_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             world = MODULE._GameWorldStateRuntime(
@@ -6422,6 +6493,21 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 status_file=Path("/matrix/outputs/game-input.json"),
                 command_fd=command_fd,
                 motion_settings_json='{"settings":"runtime-owned"}',
+                celestial_clock_state_file=Path(
+                    "/matrix/state/celestial-clock.json"
+                ),
+                celestial_lighting_bridge="carla-weather",
+                celestial_assets_manifest=Path(
+                    "/matrix/config/universe/de440s-2080.lock.json"
+                ),
+                celestial_visual_catalog=Path(
+                    "/matrix/config/universe/celestial-visual-profiles-v1.json"
+                ),
+                celestial_visual_profile="earth-clear-v1",
+                celestial_de440s_kernel=Path("/matrix/assets/de440s.bsp"),
+                celestial_jplephem_wheel=Path(
+                    "/matrix/assets/jplephem-2.24-py3-none-any.whl"
+                ),
             )
         finally:
             command_parent.close()
@@ -6455,6 +6541,34 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--motion-settings-json") + 1],
             '{"settings":"runtime-owned"}',
+        )
+        self.assertEqual(
+            command[command.index("--celestial-clock-state-file") + 1],
+            "/matrix/state/celestial-clock.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-lighting-bridge") + 1],
+            "carla-weather",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-assets-manifest") + 1],
+            "/matrix/config/universe/de440s-2080.lock.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-catalog") + 1],
+            "/matrix/config/universe/celestial-visual-profiles-v1.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-profile") + 1],
+            "earth-clear-v1",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-de440s-kernel") + 1],
+            "/matrix/assets/de440s.bsp",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-jplephem-wheel") + 1],
+            "/matrix/assets/jplephem-2.24-py3-none-any.whl",
         )
         self.assertNotIn("--ue-camera-state-file", command)
         self.assertEqual(
@@ -6508,6 +6622,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(popen.call_args.kwargs["cwd"], Path("/matrix"))
         self.assertEqual(popen.call_args.kwargs["pass_fds"], (command_fd,))
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_native_process_group_rejects_partial_celestial_ephemeris_assets(
+        self,
+        popen,
+    ) -> None:
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+
+        with self.assertRaisesRegex(ValueError, "all-or-none"):
+            group.start_game_input(
+                "/runtime/python",
+                Path("/matrix/scripts/matrix_game_control_input.py"),
+                input_socket=Path("/run/user/1000/matrix-game.sock"),
+                input_source="auto",
+                camera_yaw_source="x11-mirror",
+                look_button="left",
+                initial_camera_yaw_deg=0.0,
+                mouse_sensitivity_deg=0.12,
+                camera_yaw_sign=1,
+                camera_yaw_offset_deg=0.0,
+                carla_host="127.0.0.1",
+                carla_port=2000,
+                gamepad_look_yaw_rate_deg_s=120.0,
+                gamepad_look_pitch_rate_deg_s=90.0,
+                gamepad_look_deadzone=0.1,
+                gamepad_move_deadzone=0.1,
+                gamepad_look_min_pitch_deg=-70.0,
+                gamepad_look_max_pitch_deg=50.0,
+                focus_title="matrix",
+                expected_ue_pid=4242,
+                status_file=None,
+                celestial_de440s_kernel=Path("/matrix/assets/de440s.bsp"),
+            )
+
+        popen.assert_not_called()
 
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_native_process_group_forwards_final_pov_state_file(self, popen) -> None:

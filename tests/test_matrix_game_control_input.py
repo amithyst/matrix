@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import socket
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -24,6 +25,7 @@ EXTERNAL = importlib.import_module("matrix_external_control")
 MC_COMMANDS = importlib.import_module("matrix_mc_commands")
 MOTION_SETTINGS = importlib.import_module("matrix_motion_settings")
 RESTART = importlib.import_module("matrix_restart_request")
+VISUALS = importlib.import_module("matrix_celestial_visuals")
 SCRIPT_PATH = SCRIPTS / "matrix_game_control_input.py"
 SPEC = importlib.util.spec_from_file_location("matrix_game_control_input", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -265,6 +267,71 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                         ),
                     ),
                 )
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
+    def test_private_intent_socket_accepts_only_strict_navigation_intents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            try:
+                sender.send(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "session": supervisor._action_session,
+                            "sequence": 1,
+                            "kind": "navigation_refresh",
+                        }
+                    ).encode("ascii")
+                )
+                sender.send(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "session": supervisor._action_session,
+                            "sequence": 2,
+                            "kind": "navigation_select",
+                            "destination_id": "earth-overworld-home",
+                        }
+                    ).encode("ascii")
+                )
+                self.assertEqual(
+                    supervisor.drain_intents(),
+                    (
+                        MODULE.OverlayIntent(kind="navigation_refresh"),
+                        MODULE.OverlayIntent(
+                            kind="navigation_select",
+                            destination_id="earth-overworld-home",
+                        ),
+                    ),
+                )
+
+                sender.send(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "session": supervisor._action_session,
+                            "sequence": 3,
+                            "kind": "navigation_select",
+                            "destination_id": "Earth Home",
+                        }
+                    ).encode("ascii")
+                )
+                with self.assertRaisesRegex(RuntimeError, "navigation-selection"):
+                    supervisor.drain_intents()
             finally:
                 sender.close()
                 receiver.close()
@@ -670,6 +737,197 @@ class GameCommandClientTest(unittest.TestCase):
         inventory = client.creative_inventory_mapping()
         self.assertEqual(inventory["spawn_count"], 1)
         self.assertEqual(inventory["items"][0]["remaining"], 7)
+
+    def test_celestial_refresh_discovers_home_and_blocks_planned_worlds(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            celestial_catalog=catalog,
+            celestial_visual_catalog=VISUALS.load_visual_catalog(),
+        )
+        runtime.settimeout(1.0)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertTrue(
+            client.refresh_celestial_navigation(
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            request.command,
+            MC_COMMANDS.TeleportList(
+                ("home", "moon.tranquility", "mars.utopia")
+            ),
+        )
+        self.assertFalse(
+            client.select_celestial_destination(
+                "moon-tranquility-outpost",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertTrue(client.in_flight)
+        self.assertEqual(client.status, "pending")
+        self.assertIsNone(client.code)
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_LIST",
+                    message="Found 1/3 requested teleport points",
+                    data={
+                        "world_id": "town10:test",
+                        "teleport_points": [
+                            {
+                                "tag": "home",
+                                "found": True,
+                                "entity_id": "tp-" + "b" * 32,
+                                "position": [160.0, 117.0, 1.2],
+                                "yaw_rad": 0.0,
+                            },
+                            {"tag": "moon.tranquility", "found": False},
+                            {"tag": "mars.utopia", "found": False},
+                        ],
+                    },
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+
+        navigation = client.celestial_navigation_mapping()
+        self.assertEqual(
+            navigation["lighting"]["visual_profile"]["id"],
+            "earth-wet-cloudy-v1",
+        )
+        earth, moon, mars = navigation["destinations"]
+        self.assertEqual(earth["status"], "ready")
+        self.assertTrue(earth["enabled"])
+        self.assertEqual(moon["status"], "world_unavailable")
+        self.assertEqual(mars["status"], "world_unavailable")
+        self.assertFalse(
+            client.select_celestial_destination(
+                "moon-tranquility-outpost",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertEqual(client.code, "E_WORLD_UNAVAILABLE")
+
+        self.assertTrue(
+            client.select_celestial_destination(
+                "earth-overworld-home",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        teleport = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(teleport.command, MC_COMMANDS.TeleportSelector("home"))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=teleport.session,
+                    sequence=teleport.sequence,
+                    request_id=teleport.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_RESTART",
+                    message="Teleporting home",
+                    restart_required=True,
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertTrue(client.restart_required)
+        self.assertFalse(
+            client.select_celestial_destination(
+                "moon-tranquility-outpost",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertTrue(client.restart_required)
+        self.assertEqual(client.code, "OK_TELEPORT_RESTART")
+
+    def test_final_celestial_mapping_precedes_provider_resource_close(self) -> None:
+        class LightingBridge:
+            def __init__(self) -> None:
+                self.closed = False
+                self.applied = 0
+
+            def apply(self, lighting, sample):
+                self.applied += 1
+                self.assert_open()
+                self.last_profile = sample.profile_id
+                return dict(lighting)
+
+            def assert_open(self) -> None:
+                if self.closed:
+                    raise RuntimeError("bridge is closed")
+
+            def close(self) -> None:
+                self.closed = True
+
+        catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
+        bridge = LightingBridge()
+        client = MODULE.GameCommandClient(
+            None,
+            celestial_catalog=catalog,
+            celestial_visual_catalog=VISUALS.load_visual_catalog(),
+            celestial_lighting_bridge=bridge,
+        )
+
+        client.close()
+        mapping = client.celestial_navigation_mapping()
+        self.assertEqual(mapping["version"], 2)
+        self.assertEqual(bridge.applied, 1)
+        self.assertEqual(bridge.last_profile, "earth-wet-cloudy-v1")
+        self.assertFalse(bridge.closed)
+        client.finalize_celestial_resources()
+        self.assertTrue(bridge.closed)
+
+    def test_celestial_resource_cleanup_continues_after_clock_failure(self) -> None:
+        class Resource:
+            def __init__(self, *, failure: Exception | None = None) -> None:
+                self.closed = False
+                self.failure = failure
+
+            def close(self) -> None:
+                self.closed = True
+                if self.failure is not None:
+                    raise self.failure
+
+        class Catalog:
+            def __init__(self, ephemeris) -> None:
+                self.ephemeris = ephemeris
+
+        clock = Resource(failure=OSError("clock fsync failed"))
+        bridge = Resource()
+        ephemeris = Resource()
+        client = MODULE.GameCommandClient(
+            None,
+            celestial_catalog=Catalog(ephemeris),
+            celestial_clock=clock,
+            celestial_visual_catalog=mock.Mock(),
+            celestial_lighting_bridge=bridge,
+        )
+
+        with self.assertRaisesRegex(OSError, "clock fsync failed"):
+            client.finalize_celestial_resources()
+
+        self.assertTrue(clock.closed)
+        self.assertTrue(bridge.closed)
+        self.assertTrue(ephemeris.closed)
 
     def test_only_one_request_is_in_flight_and_restart_response_is_terminal(self) -> None:
         client, runtime = self.make_client()
@@ -4190,6 +4448,156 @@ class CarlaSpectatorCameraTest(unittest.TestCase):
                 minimum_pitch_rad=1.0,
                 maximum_pitch_rad=0.0,
             )
+
+
+class CarlaCelestialLightingBridgeTest(unittest.TestCase):
+    class Weather:
+        def __init__(self, values: dict[str, float] | None = None) -> None:
+            values = values or {
+                name: 0.0 for name in VISUALS.CARLA_WEATHER_FIELDS
+            }
+            for name in VISUALS.CARLA_WEATHER_FIELDS:
+                setattr(self, name, values[name])
+
+    class World:
+        def __init__(self) -> None:
+            self.weather = CarlaCelestialLightingBridgeTest.Weather()
+            self.set_calls = 0
+            self.ignore_writes = False
+
+        def get_weather(self):
+            return CarlaCelestialLightingBridgeTest.Weather(
+                {
+                    name: getattr(self.weather, name)
+                    for name in VISUALS.CARLA_WEATHER_FIELDS
+                }
+            )
+
+        def set_weather(self, weather) -> None:
+            self.set_calls += 1
+            if not self.ignore_writes:
+                self.weather = CarlaCelestialLightingBridgeTest.Weather(
+                    {
+                        name: getattr(weather, name)
+                        for name in VISUALS.CARLA_WEATHER_FIELDS
+                    }
+                )
+
+    @staticmethod
+    def lighting() -> dict[str, object]:
+        return {
+            "body_id": "earth",
+            "atmosphere": "earth_nitrogen_oxygen",
+            "sun_altitude_deg": 12.5,
+            "sun_azimuth_deg": 123.0,
+            "render_authority": "state-only",
+            "render_status": "not-applied",
+            "render_error": None,
+        }
+
+    @classmethod
+    def sample(cls):
+        return VISUALS.load_visual_catalog().sample(cls.lighting())
+
+    @staticmethod
+    def wait_status(bridge, expected: str) -> None:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with bridge._state_lock:
+                if bridge._status == expected:
+                    return
+            time.sleep(0.005)
+        raise AssertionError(f"lighting bridge did not reach {expected}")
+
+    def test_weather_bridge_applies_and_readbacks_sun_angles(self) -> None:
+        world = self.World()
+        bridge = MODULE.CarlaCelestialLightingBridge("127.0.0.1", 2000)
+        bridge._world = world
+        self.addCleanup(bridge.close)
+
+        submitted = bridge.apply(self.lighting(), self.sample(), now=1.0)
+        self.wait_status(bridge, "applied")
+        applied = bridge.apply(self.lighting(), self.sample(), now=1.1)
+
+        self.assertEqual(submitted["render_status"], "pending")
+        self.assertGreaterEqual(world.set_calls, 1)
+        self.assertEqual(applied["render_authority"], "carla-weather")
+        self.assertEqual(applied["render_status"], "applied")
+        self.assertIsNone(applied["render_error"])
+        self.assertAlmostEqual(world.weather.sun_altitude_angle, 12.5)
+        self.assertAlmostEqual(world.weather.sun_azimuth_angle, 123.0)
+        self.assertAlmostEqual(world.weather.cloudiness, 60.0)
+        self.assertAlmostEqual(world.weather.precipitation_deposits, 50.0)
+
+    def test_weather_bridge_fails_closed_on_readback_mismatch(self) -> None:
+        world = self.World()
+        world.ignore_writes = True
+        bridge = MODULE.CarlaCelestialLightingBridge(
+            "127.0.0.1", 2000, retry_seconds=10.0
+        )
+        bridge._world = world
+        self.addCleanup(bridge.close)
+
+        bridge.apply(self.lighting(), self.sample(), now=2.0)
+        self.wait_status(bridge, "unavailable")
+        result = bridge.apply(self.lighting(), self.sample(), now=2.1)
+
+        self.assertEqual(result["render_authority"], "state-only")
+        self.assertEqual(result["render_status"], "unavailable")
+        self.assertEqual(result["render_error"], "carla-weather-unavailable")
+        self.assertIsNone(bridge._world)
+
+    def test_weather_rpc_never_blocks_the_control_thread(self) -> None:
+        world = self.World()
+        original_set_weather = world.set_weather
+
+        def slow_set_weather(weather) -> None:
+            time.sleep(0.05)
+            original_set_weather(weather)
+
+        world.set_weather = slow_set_weather
+        bridge = MODULE.CarlaCelestialLightingBridge("127.0.0.1", 2000)
+        bridge._world = world
+        self.addCleanup(bridge.close)
+
+        started = time.monotonic()
+        submitted = bridge.apply(self.lighting(), self.sample())
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(submitted["render_status"], "pending")
+        self.assertLess(elapsed, 0.02)
+        self.wait_status(bridge, "applied")
+
+    def test_profile_change_returns_to_pending_until_new_readback(self) -> None:
+        world = self.World()
+        bridge = MODULE.CarlaCelestialLightingBridge("127.0.0.1", 2000)
+        bridge._world = world
+        self.addCleanup(bridge.close)
+        catalog = VISUALS.load_visual_catalog()
+        wet = catalog.sample(self.lighting())
+        clear = catalog.sample(self.lighting(), profile_id="earth-clear-v1")
+
+        bridge.apply(self.lighting(), wet)
+        self.wait_status(bridge, "applied")
+        changed = bridge.apply(self.lighting(), clear)
+
+        self.assertEqual(changed["render_authority"], "state-only")
+        self.assertEqual(changed["render_status"], "pending")
+        self.wait_status(bridge, "applied")
+
+    def test_weather_bridge_fails_closed_when_runtime_lacks_profile_field(self) -> None:
+        world = self.World()
+        del world.weather.dust_storm
+        bridge = MODULE.CarlaCelestialLightingBridge(
+            "127.0.0.1", 2000, retry_seconds=10.0
+        )
+        bridge._world = world
+        self.addCleanup(bridge.close)
+
+        bridge.apply(self.lighting(), self.sample())
+        self.wait_status(bridge, "unavailable")
+
+        self.assertIsNone(bridge._world)
 
 
 class XInput2RawMotionTest(unittest.TestCase):

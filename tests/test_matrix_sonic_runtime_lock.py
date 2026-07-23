@@ -101,7 +101,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             packages["MoonWorld"]["sha256"],
             "c4e3dee47ffa434712b0238d08b0b68067f1b1c9820e2ddb455f996f04e364b1",
         )
-        self.assertEqual(packages["MoonWorld"]["size"], 633678813)
+        self.assertEqual(
+            packages["MoonWorld"]["size"],
+            633678813,
+        )
         self.assertEqual(sum(item["size"] for item in packages.values()), 8391341372)
         installed = {
             entry["path"]: entry
@@ -2066,6 +2069,9 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 with self.subTest(overrides=overrides):
                     environment = os.environ.copy()
                     environment.update(overrides)
+                    # This test owns root/skip validation, not the optional
+                    # host-private centered-camera bundle provisioned on TRNA.
+                    environment["MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE"] = ""
                     environment["MATRIX_SONIC_HOST_LOCK"] = str(
                         root / f"{next(iter(overrides))}.lock"
                     )

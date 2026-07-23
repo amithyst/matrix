@@ -24,9 +24,6 @@ def _load_module(name: str, path: Path):
     return module
 
 
-CORE = _load_module("matrix_game_control", CORE_PATH)
-
-
 def _load_runtime_target():
     """Load the isolated runtime edit without importing recovery dependencies."""
 
@@ -80,7 +77,15 @@ def _load_runtime_target():
                 sys.modules[name] = prior
 
 
-RUNTIME = _load_runtime_target()
+_PREVIOUS_MATRIX_GAME_CONTROL = sys.modules.get("matrix_game_control")
+try:
+    CORE = _load_module("matrix_game_control", CORE_PATH)
+    RUNTIME = _load_runtime_target()
+finally:
+    if _PREVIOUS_MATRIX_GAME_CONTROL is None:
+        sys.modules.pop("matrix_game_control", None)
+    else:
+        sys.modules["matrix_game_control"] = _PREVIOUS_MATRIX_GAME_CONTROL
 
 
 def snapshot(

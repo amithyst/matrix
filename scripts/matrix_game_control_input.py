@@ -35,7 +35,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from matrix_mouse_settings import (
     PROFILE_LOCAL,
@@ -76,6 +76,25 @@ from matrix_external_control import (
     ExternalInputToken,
     ProviderGateTelemetry,
 )
+from matrix_celestial_navigation import (
+    CelestialCatalog,
+    CelestialNavigationError,
+    DEFAULT_ASSET_MANIFEST_PATH,
+    DEFAULT_CATALOG_PATH,
+    load_catalog,
+    probes_from_response,
+)
+from matrix_celestial_ephemeris import (
+    CelestialEphemerisError,
+    PersistentSimulationClock,
+)
+from matrix_celestial_visuals import (
+    CarlaWeatherSample,
+    CelestialVisualCatalog,
+    CelestialVisualError,
+    DEFAULT_VISUAL_CATALOG_PATH,
+    load_visual_catalog,
+)
 from matrix_mc_commands import (
     CommandParseError,
     CommandProtocolError,
@@ -86,6 +105,8 @@ from matrix_mc_commands import (
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
     PolicySlotAssignment,
+    TeleportList,
+    TeleportSelector,
     decode_command_response,
     encode_command_request,
     parse_mc_command,
@@ -1931,6 +1952,224 @@ _XI_RAW_BUTTON_PRESS = 15
 _XI_RAW_BUTTON_RELEASE = 16
 _XI_RAW_MOTION = 17
 _MAX_XI2_EVENTS_PER_POLL = 4096
+
+
+class CarlaCelestialLightingBridge:
+    """Apply a complete, versioned visual profile through CARLA weather RPC."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout_seconds: float = 0.2,
+        retry_seconds: float = 1.0,
+        apply_interval_seconds: float = 0.5,
+        readback_tolerance_deg: float = 0.5,
+        weather_readback_tolerance: float = 1e-4,
+        carla_module: Any | None = None,
+    ) -> None:
+        for name, value in (
+            ("timeout_seconds", timeout_seconds),
+            ("retry_seconds", retry_seconds),
+            ("apply_interval_seconds", apply_interval_seconds),
+            ("readback_tolerance_deg", readback_tolerance_deg),
+            ("weather_readback_tolerance", weather_readback_tolerance),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
+        if not 1 <= port <= 65535:
+            raise ValueError("CARLA lighting port must be in [1, 65535]")
+        self._host = host
+        self._port = port
+        self._timeout = timeout_seconds
+        self._retry = retry_seconds
+        self._interval = apply_interval_seconds
+        self._tolerance = readback_tolerance_deg
+        self._weather_tolerance = weather_readback_tolerance
+        self._carla_module = carla_module
+        self._client: Any | None = None
+        self._world: Any | None = None
+        self._state_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._latest_sample: CarlaWeatherSample | None = None
+        self._applied_sample: CarlaWeatherSample | None = None
+        self._generation = 0
+        self._next_attempt = 0.0
+        self._status = "pending"
+        self._error: str | None = None
+
+    def _connect(self) -> None:
+        carla = self._carla_module or importlib.import_module("carla")
+        client = carla.Client(self._host, self._port)
+        client.set_timeout(self._timeout)
+        self._world = client.get_world()
+        self._client = client
+
+    def _disconnect(self) -> None:
+        self._client = None
+        self._world = None
+
+    @staticmethod
+    def _angle_delta_deg(left: float, right: float) -> float:
+        return abs((left - right + 180.0) % 360.0 - 180.0)
+
+    def _parameter_matches(self, name: str, expected: float, actual: float) -> bool:
+        if name in {"sun_altitude_angle", "sun_azimuth_angle"}:
+            if name == "sun_azimuth_angle":
+                return self._angle_delta_deg(actual, expected) <= self._tolerance
+            return abs(actual - expected) <= self._tolerance
+        return math.isclose(
+            actual,
+            expected,
+            rel_tol=self._weather_tolerance,
+            abs_tol=self._weather_tolerance,
+        )
+
+    def _samples_match(
+        self,
+        expected: CarlaWeatherSample,
+        applied: CarlaWeatherSample,
+    ) -> bool:
+        if expected.profile_sha256 != applied.profile_sha256:
+            return False
+        return all(
+            expected_name == applied_name
+            and self._parameter_matches(expected_name, expected_value, applied_value)
+            for (expected_name, expected_value), (applied_name, applied_value) in zip(
+                expected.parameters,
+                applied.parameters,
+                strict=True,
+            )
+        )
+
+    def _apply_weather(self, sample: CarlaWeatherSample) -> None:
+        if self._world is None:
+            self._connect()
+        assert self._world is not None
+        weather = self._world.get_weather()
+        for name, value in sample.parameters:
+            if not hasattr(weather, name):
+                raise RuntimeError(f"CARLA weather does not expose {name}")
+            setattr(weather, name, value)
+        self._world.set_weather(weather)
+        readback = self._world.get_weather()
+        for name, expected in sample.parameters:
+            if not hasattr(readback, name):
+                raise RuntimeError(f"CARLA weather readback does not expose {name}")
+            actual = float(getattr(readback, name))
+            if not math.isfinite(actual) or not self._parameter_matches(
+                name, expected, actual
+            ):
+                raise RuntimeError(f"CARLA weather readback did not match {name}")
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(timeout=0.25)
+            if self._stop.is_set():
+                return
+            with self._state_lock:
+                sample = self._latest_sample
+                generation = self._generation
+                next_attempt = self._next_attempt
+            if sample is None:
+                self._wake.clear()
+                continue
+            delay = max(0.0, next_attempt - time.monotonic())
+            if delay > 0.0 and self._stop.wait(delay):
+                return
+            try:
+                self._apply_weather(sample)
+            except Exception:
+                self._disconnect()
+                with self._state_lock:
+                    self._status = "unavailable"
+                    self._error = "carla-weather-unavailable"
+                    self._next_attempt = time.monotonic() + self._retry
+                # Keep the wake flag set so the latest sample is retried.
+                continue
+            with self._state_lock:
+                self._status = "applied"
+                self._error = None
+                self._applied_sample = sample
+                self._next_attempt = time.monotonic() + self._interval
+                if generation == self._generation:
+                    self._wake.clear()
+
+    def _ensure_worker(self) -> None:
+        if self._thread is not None:
+            return
+        with self._state_lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._worker,
+                    name="matrix-celestial-lighting",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def apply(
+        self,
+        lighting: Mapping[str, object],
+        sample: CarlaWeatherSample,
+        *,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        if now is not None and (not math.isfinite(now) or now < 0.0):
+            raise ValueError("CARLA lighting time must be finite and non-negative")
+        if not isinstance(sample, CarlaWeatherSample):
+            raise ValueError("CARLA lighting requires a typed weather sample")
+        parameters = sample.parameters_mapping()
+        altitude = lighting.get("sun_altitude_deg")
+        azimuth = lighting.get("sun_azimuth_deg")
+        if (
+            isinstance(altitude, bool)
+            or not isinstance(altitude, (int, float))
+            or isinstance(azimuth, bool)
+            or not isinstance(azimuth, (int, float))
+            or not self._parameter_matches(
+                "sun_altitude_angle",
+                float(altitude),
+                parameters["sun_altitude_angle"],
+            )
+            or not self._parameter_matches(
+                "sun_azimuth_angle",
+                float(azimuth),
+                parameters["sun_azimuth_angle"],
+            )
+        ):
+            raise ValueError("visual profile Sun angles do not match celestial truth")
+        with self._state_lock:
+            self._latest_sample = sample
+            self._generation += 1
+            if self._status == "applied" and self._applied_sample is not None:
+                if not self._samples_match(sample, self._applied_sample):
+                    self._status = "pending"
+                    self._error = None
+            status = self._status
+            error = self._error
+        self._ensure_worker()
+        self._wake.set()
+        result = dict(lighting)
+        result["render_authority"] = (
+            "carla-weather" if status == "applied" else "state-only"
+        )
+        result["render_status"] = status
+        result["render_error"] = error
+        return result
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=max(1.0, self._timeout + 0.5))
+        writer_alive = thread is not None and thread.is_alive()
+        self._disconnect()
+        if writer_alive:
+            raise RuntimeError("CARLA celestial lighting worker did not stop")
 
 
 class _XGenericEventCookie(ctypes.Structure):
@@ -3899,6 +4138,7 @@ class OverlayIntent:
     slot: str | None = None
     policy_id: str | None = None
     item_id: str | None = None
+    destination_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3927,6 +4167,11 @@ class GameCommandClient:
         initial_strategy_loadout: object = None,
         initial_creative_inventory: object = None,
         initial_motion_settings: object = None,
+        celestial_catalog: CelestialCatalog | None = None,
+        celestial_clock: PersistentSimulationClock | None = None,
+        celestial_visual_catalog: CelestialVisualCatalog | None = None,
+        celestial_visual_profile: str = "auto",
+        celestial_lighting_bridge: CarlaCelestialLightingBridge | None = None,
     ) -> None:
         self._connection: socket.socket | None = None
         self._session = os.urandom(16).hex()
@@ -3961,6 +4206,29 @@ class GameCommandClient:
             if initial_motion_settings is None
             else validate_motion_settings_telemetry(initial_motion_settings)
         )
+        self._celestial_catalog = celestial_catalog
+        if celestial_clock is not None and celestial_catalog is None:
+            raise ValueError("celestial clock requires a celestial catalog")
+        if celestial_visual_catalog is not None and celestial_catalog is None:
+            raise ValueError("celestial visuals require a celestial catalog")
+        if (
+            celestial_lighting_bridge is not None
+            and celestial_visual_catalog is None
+        ):
+            raise ValueError("celestial lighting bridge requires visual profiles")
+        self._celestial_clock = (
+            celestial_clock
+            if celestial_clock is not None
+            else (
+                celestial_catalog.create_clock()
+                if celestial_catalog is not None
+                else None
+            )
+        )
+        self._celestial_visual_catalog = celestial_visual_catalog
+        self._celestial_visual_profile = celestial_visual_profile
+        self._celestial_lighting_bridge = celestial_lighting_bridge
+        self._teleport_probes = {}
         if file_descriptor is None:
             return
         if (
@@ -4129,6 +4397,59 @@ class GameCommandClient:
             if self._motion_settings is not None
             else None
         )
+
+    def celestial_navigation_mapping(self) -> dict[str, object]:
+        catalog = self._celestial_catalog
+        clock = self._celestial_clock
+        if catalog is None or clock is None:
+            return {
+                "version": 2,
+                "available": False,
+                "status": "unavailable",
+                "universe_id": "unavailable",
+                "display_name": "Universe unavailable",
+                "reference_epoch_utc": None,
+                "time_scale": None,
+                "frame": None,
+                "ephemeris": None,
+                "simulation_time": None,
+                "origin_rebasing": True,
+                "simulation_local_bound_m": 100000.0,
+                "current_body_id": None,
+                "bodies": [],
+                "lighting": None,
+                "destinations": [],
+            }
+        snapshot = clock.snapshot()
+        mapping = catalog.navigation_mapping(
+            self._teleport_probes,
+            command_available=self.available,
+            in_flight=self.in_flight,
+            restart_required=self.restart_required,
+            outcome_unknown=self.outcome_unknown,
+            simulation_time=snapshot,
+        )
+        lighting = mapping.get("lighting")
+        visual_catalog = self._celestial_visual_catalog
+        if visual_catalog is not None and isinstance(lighting, dict):
+            sample = visual_catalog.sample(
+                lighting,
+                profile_id=self._celestial_visual_profile,
+            )
+            profiled_lighting = dict(lighting)
+            profiled_lighting["visual_profile"] = sample.profile_mapping()
+            if self._celestial_lighting_bridge is not None:
+                profiled_lighting = self._celestial_lighting_bridge.apply(
+                    profiled_lighting,
+                    sample,
+                )
+            mapping["lighting"] = profiled_lighting
+        clock.checkpoint()
+        return mapping
+
+    def checkpoint_celestial_clock(self) -> bool:
+        clock = self._celestial_clock
+        return clock.checkpoint() if clock is not None else False
 
     @property
     def available(self) -> bool:
@@ -4632,6 +4953,111 @@ class GameCommandClient:
             pending_message="Taking item from creative inventory",
         )
 
+    def refresh_celestial_navigation(
+        self,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Query only catalog tags over the existing typed command channel."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        catalog = self._celestial_catalog
+        if catalog is None:
+            self._local_error(
+                "E_NAVIGATION_UNAVAILABLE", "Celestial navigation is unavailable"
+            )
+            return False
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before refreshing")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        command = TeleportList(
+            tuple(destination.teleport_tag for destination in catalog.destinations)
+        )
+        sent = self._send_typed_command(
+            command,
+            warning=None,
+            pending_message="Refreshing celestial teleport points",
+        )
+        if sent:
+            self._teleport_probes = {}
+        return sent
+
+    def select_celestial_destination(
+        self,
+        destination_id: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Resolve one catalog destination to a typed teleport selector."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before teleporting")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        catalog = self._celestial_catalog
+        if catalog is None:
+            self._local_error(
+                "E_NAVIGATION_UNAVAILABLE", "Celestial navigation is unavailable"
+            )
+            return False
+        if not isinstance(destination_id, str):
+            self._local_error(
+                "E_DESTINATION_INVALID", "Celestial destination id is invalid"
+            )
+            return False
+        try:
+            destination = catalog.destination(destination_id)
+            body = catalog.body(destination.body_id)
+        except CelestialNavigationError as exc:
+            self._local_error("E_DESTINATION_INVALID", str(exc))
+            return False
+        probe = self._teleport_probes.get(destination.teleport_tag)
+        if not body.runtime_ready:
+            self._local_error(
+                "E_WORLD_UNAVAILABLE",
+                f"{body.display_name} runtime is not deployed on this build",
+            )
+            return False
+        if probe is None or not probe.found:
+            self._local_error(
+                "E_SELECTOR_NO_TARGET",
+                f"Teleport point {destination.teleport_tag!r} is not discovered",
+            )
+            return False
+        return self._send_typed_command(
+            TeleportSelector(tag=destination.teleport_tag),
+            warning=None,
+            pending_message=f"Routing to {destination.display_name}",
+        )
+
     def poll(self) -> bool:
         """Receive at most one exact response; never resend a pending request."""
 
@@ -4701,6 +5127,22 @@ class GameCommandClient:
                     f"Invalid motion settings in command response: {exc}"
                 )
                 return True
+        teleport_probes = None
+        if (
+            response.ok
+            and isinstance(pending.command, TeleportList)
+            and self._celestial_catalog is not None
+        ):
+            try:
+                teleport_probes = probes_from_response(
+                    response_data,
+                    catalog=self._celestial_catalog,
+                )
+            except CelestialNavigationError as exc:
+                self._protocol_failure(
+                    f"Invalid celestial navigation response: {exc}"
+                )
+                return True
         self._pending = None
         warning = self._pending_warning
         self._pending_warning = None
@@ -4718,6 +5160,8 @@ class GameCommandClient:
             self._creative_inventory = validated_inventory
         if validated_motion_settings is not None:
             self._motion_settings = validated_motion_settings
+        if teleport_probes is not None:
+            self._teleport_probes = teleport_probes
         self.last_request_id = response.request_id
         if response.ok and response.restart_required:
             self.status = "restarting"
@@ -4773,6 +5217,38 @@ class GameCommandClient:
             self.last_request_id = None
         self._pending_warning = None
         self._close_channel()
+
+    def finalize_celestial_resources(self) -> None:
+        """Close providers after the final status mapping has been serialized."""
+
+        first_error: BaseException | None = None
+        operations = (
+            (
+                self._celestial_clock.close
+                if self._celestial_clock is not None
+                else None
+            ),
+            (
+                self._celestial_lighting_bridge.close
+                if self._celestial_lighting_bridge is not None
+                else None
+            ),
+            (
+                self._celestial_catalog.ephemeris.close
+                if self._celestial_catalog is not None
+                else None
+            ),
+        )
+        for operation in operations:
+            if operation is None:
+                continue
+            try:
+                operation()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 def validate_motion_settings_telemetry(value: object) -> dict[str, object]:
@@ -5078,6 +5554,35 @@ class CalibrationOverlaySupervisor:
                     kind="creative_spawn",
                     item_id=item.item_id,
                 )
+            elif kind == "navigation_refresh":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                }:
+                    raise RuntimeError("invalid navigation-refresh intent schema")
+                intent = OverlayIntent(kind="navigation_refresh")
+            elif kind == "navigation_select":
+                destination_id = value.get("destination_id")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "destination_id",
+                    }
+                    or not isinstance(destination_id, str)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", destination_id)
+                    is None
+                ):
+                    raise RuntimeError("invalid navigation-selection intent schema")
+                intent = OverlayIntent(
+                    kind="navigation_select",
+                    destination_id=destination_id,
+                )
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -5281,6 +5786,36 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.15,
     )
+    parser.add_argument(
+        "--celestial-catalog",
+        type=Path,
+        default=DEFAULT_CATALOG_PATH,
+        help="Strict SOL universe/body/destination catalog",
+    )
+    parser.add_argument(
+        "--celestial-clock-state-file",
+        type=Path,
+        help="Optional persistent TAI clock state shared across cold reloads",
+    )
+    parser.add_argument(
+        "--celestial-assets-manifest",
+        type=Path,
+        default=DEFAULT_ASSET_MANIFEST_PATH,
+    )
+    parser.add_argument("--celestial-de440s-kernel", type=Path)
+    parser.add_argument("--celestial-jplephem-wheel", type=Path)
+    parser.add_argument(
+        "--celestial-lighting-bridge",
+        choices=("state-only", "carla-weather"),
+        default="state-only",
+        help="Optional readback-verified CARLA visual-profile bridge",
+    )
+    parser.add_argument(
+        "--celestial-visual-catalog",
+        type=Path,
+        default=DEFAULT_VISUAL_CATALOG_PATH,
+    )
+    parser.add_argument("--celestial-visual-profile", default="auto")
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print canonical packets; do not connect"
@@ -5432,6 +5967,53 @@ def _validate_args(args: argparse.Namespace) -> None:
         or not 0.01 <= args.external_control_deadman_seconds <= 0.15
     ):
         raise SystemExit("--external-control-deadman-seconds must be in [0.01, 0.15]")
+    if not args.celestial_catalog.is_absolute():
+        raise SystemExit("--celestial-catalog must be an absolute path")
+    if not args.celestial_catalog.is_file() or args.celestial_catalog.is_symlink():
+        raise SystemExit(
+            f"--celestial-catalog must be a regular file: {args.celestial_catalog}"
+        )
+    if args.celestial_clock_state_file is not None:
+        if not args.celestial_clock_state_file.is_absolute():
+            raise SystemExit("--celestial-clock-state-file must be an absolute path")
+        if (
+            args.celestial_clock_state_file.exists()
+            and (
+                args.celestial_clock_state_file.is_symlink()
+                or not args.celestial_clock_state_file.is_file()
+            )
+        ):
+            raise SystemExit(
+                "--celestial-clock-state-file must be a regular file when present"
+            )
+    if (
+        not args.celestial_assets_manifest.is_absolute()
+        or args.celestial_assets_manifest.is_symlink()
+        or not args.celestial_assets_manifest.is_file()
+    ):
+        raise SystemExit("--celestial-assets-manifest must be an absolute regular file")
+    if (
+        not args.celestial_visual_catalog.is_absolute()
+        or args.celestial_visual_catalog.is_symlink()
+        or not args.celestial_visual_catalog.is_file()
+    ):
+        raise SystemExit("--celestial-visual-catalog must be an absolute regular file")
+    ephemeris_assets = (
+        args.celestial_de440s_kernel,
+        args.celestial_jplephem_wheel,
+    )
+    if any(value is not None for value in ephemeris_assets) and not all(
+        value is not None for value in ephemeris_assets
+    ):
+        raise SystemExit("DE440s kernel and jplephem wheel are all-or-none")
+    for name in ("celestial_de440s_kernel", "celestial_jplephem_wheel"):
+        path = getattr(args, name)
+        if path is not None and (
+            not path.is_absolute() or path.is_symlink() or not path.is_file()
+        ):
+            raise SystemExit(
+                f"--{name.replace('_', '-')} must be an absolute regular file"
+            )
 
 
 def main() -> int:
@@ -5571,11 +6153,44 @@ def main() -> int:
                 f"Matrix game-control input received invalid motion settings: {exc}"
             ) from exc
     try:
+        celestial_catalog = load_catalog(
+            args.celestial_catalog,
+            de440s_kernel=args.celestial_de440s_kernel,
+            jplephem_wheel=args.celestial_jplephem_wheel,
+            asset_manifest=args.celestial_assets_manifest,
+        )
+        celestial_clock = celestial_catalog.create_clock(
+            args.celestial_clock_state_file
+        )
+        celestial_visual_catalog = load_visual_catalog(
+            args.celestial_visual_catalog
+        )
+        if args.celestial_visual_profile != "auto":
+            celestial_visual_catalog.profile(args.celestial_visual_profile)
+        celestial_lighting_bridge = (
+            CarlaCelestialLightingBridge(args.carla_host, args.carla_port)
+            if args.celestial_lighting_bridge == "carla-weather"
+            else None
+        )
+    except (
+        CelestialNavigationError,
+        CelestialEphemerisError,
+        CelestialVisualError,
+    ) as exc:
+        raise SystemExit(
+            f"Matrix game-control input cannot load celestial catalog: {exc}"
+        ) from exc
+    try:
         game_command_client = GameCommandClient(
             getattr(args, "game_command_fd", None),
             initial_strategy_loadout=initial_strategy_loadout,
             initial_creative_inventory=initial_creative_inventory,
             initial_motion_settings=initial_motion_settings,
+            celestial_catalog=celestial_catalog,
+            celestial_clock=celestial_clock,
+            celestial_visual_catalog=celestial_visual_catalog,
+            celestial_visual_profile=args.celestial_visual_profile,
+            celestial_lighting_bridge=celestial_lighting_bridge,
         )
     except (OSError, ValueError) as exc:
         raise SystemExit(
@@ -5660,6 +6275,9 @@ def main() -> int:
                         initial_motion_settings, game_command_client
                     ),
                     "strategy_loadout": game_command_client.strategy_loadout_mapping(),
+                    "celestial_navigation": (
+                        game_command_client.celestial_navigation_mapping()
+                    ),
                     "mirror_sensitivity": sensitivity_telemetry,
                     "pointer": x11.pointer_telemetry,
                     "camera_yaw": camera_yaw_telemetry(
@@ -5689,6 +6307,7 @@ def main() -> int:
             next_frame = max(next_frame + 1.0 / args.rate_hz, now)
 
             command_state_changed = False
+            game_command_client.checkpoint_celestial_clock()
             physical_keyboard = x11.poll()
             last_keyboard = physical_keyboard
             physical_pad = gamepad.poll(now)
@@ -5834,6 +6453,26 @@ def main() -> int:
                     command_state_changed = True
                     apply_return.cancel_pending()
                     continue
+                if intent.kind == "navigation_refresh":
+                    game_command_client.refresh_celestial_navigation(
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    apply_return.cancel_pending()
+                    continue
+                if intent.kind == "navigation_select":
+                    assert intent.destination_id is not None
+                    game_command_client.select_celestial_destination(
+                        intent.destination_id,
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    apply_return.cancel_pending()
+                    continue
                 assert intent.kind == "command_submit"
                 assert intent.command is not None
                 command_submitted = game_command_client.submit(
@@ -5910,6 +6549,8 @@ def main() -> int:
                         "command_submit",
                         "strategy_select",
                         "creative_spawn",
+                        "navigation_refresh",
+                        "navigation_select",
                     }
                     for intent in panel_intents
                 )
@@ -6144,6 +6785,9 @@ def main() -> int:
                             "creative_inventory": (
                                 game_command_client.creative_inventory_mapping()
                             ),
+                            "celestial_navigation": (
+                                game_command_client.celestial_navigation_mapping()
+                            ),
                             "mirror_sensitivity": sensitivity_telemetry,
                             "camera_yaw": camera_yaw_telemetry(
                                 args.camera_yaw_source,
@@ -6342,6 +6986,9 @@ def main() -> int:
                     initial_motion_settings, game_command_client
                 ),
                 "strategy_loadout": game_command_client.strategy_loadout_mapping(),
+                "celestial_navigation": (
+                    game_command_client.celestial_navigation_mapping()
+                ),
                 "gamepad_camera": {
                     "driver": "carla-spectator"
                     if args.camera_yaw_source == "carla"
@@ -6392,6 +7039,10 @@ def main() -> int:
             "status_prepare",
             build_final_status,
             default=None,
+        )
+        cleanup.run(
+            "celestial_resources",
+            game_command_client.finalize_celestial_resources,
         )
         _close_provider_resources(
             cleanup,

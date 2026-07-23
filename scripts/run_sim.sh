@@ -1341,10 +1341,17 @@ if $MATRIX_SONIC_ENABLED; then
             "$PROJECT_ROOT/scripts/matrix_external_control.py" \
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
             "$PROJECT_ROOT/scripts/matrix_ui_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_ephemeris.py" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" \
+            "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
             "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
             "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
             "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
             "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+            "$PROJECT_ROOT/config/universe/sol-2080.json" \
+            "$PROJECT_ROOT/config/universe/de440s-2080.lock.json" \
+            "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
             "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
             "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
             if [[ ! -f "$required" ]]; then
@@ -1352,6 +1359,30 @@ if $MATRIX_SONIC_ENABLED; then
                 exit 1
             fi
         done
+        CELESTIAL_PREFLIGHT_ARGS=(
+            validate
+            --catalog "$PROJECT_ROOT/config/universe/sol-2080.json"
+            --asset-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
+        )
+        if [[ -n "${MATRIX_CELESTIAL_SPK:-}" \
+            || -n "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+            if [[ -z "${MATRIX_CELESTIAL_SPK:-}" \
+                || -z "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+                echo "[ERROR] Matrix celestial assets are all-or-none" >&2
+                exit 1
+            fi
+            CELESTIAL_PREFLIGHT_ARGS+=(
+                --de440s-kernel "$MATRIX_CELESTIAL_SPK"
+                --jplephem-wheel "$MATRIX_CELESTIAL_JPLEPHEM_WHEEL"
+            )
+        fi
+        "$MATRIX_SONIC_PYTHON" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
+            "${CELESTIAL_PREFLIGHT_ARGS[@]}"
+        "$MATRIX_SONIC_PYTHON" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" validate \
+            --catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
+            --profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
     fi
     for required in \
         "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
@@ -1430,6 +1461,11 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] MATRIX_GAME_WORLD_STATE_FILE must be absolute" >&2
             exit 1
         fi
+        GAME_CELESTIAL_CLOCK_STATE_FILE="${MATRIX_CELESTIAL_CLOCK_STATE_FILE:-$(dirname "$GAME_WORLD_STATE_FILE")/universe-sol-2080-clock.json}"
+        if [[ "$GAME_CELESTIAL_CLOCK_STATE_FILE" != /* ]]; then
+            echo "[ERROR] MATRIX_CELESTIAL_CLOCK_STATE_FILE must be absolute" >&2
+            exit 1
+        fi
         if ! GAME_WORLD_START_OUTPUT="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 resolve-start \
@@ -1473,6 +1509,7 @@ if $MATRIX_SONIC_ENABLED; then
             --game-world-id "$GAME_WORLD_ID"
             --game-world-revision "$GAME_WORLD_REVISION"
             --game-world-state-file "$GAME_WORLD_STATE_FILE"
+            --game-celestial-clock-state-file "$GAME_CELESTIAL_CLOCK_STATE_FILE"
             --game-world-checkpoint-seconds "${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
             --game-resume-rollback-count "${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
         )
@@ -1838,6 +1875,10 @@ PY
         --game-camera-yaw-offset-deg "${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
         --game-carla-host "${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
         --game-carla-port "${MATRIX_GAME_CARLA_PORT:-2000}"
+        --game-celestial-lighting-bridge "${MATRIX_CELESTIAL_LIGHTING_BRIDGE:-state-only}"
+        --game-celestial-assets-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
+        --game-celestial-visual-catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json"
+        --game-celestial-visual-profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
         --gamepad-look-yaw-rate-deg-s "${MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S:-120.0}"
         --gamepad-look-pitch-rate-deg-s "${MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S:-90.0}"
         --gamepad-look-deadzone "${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
@@ -1862,6 +1903,19 @@ PY
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
     GAME_INPUT_ARGS+=("${GAME_EXTERNAL_CONTROL_ARGS[@]}")
+    if [[ -n "${MATRIX_CELESTIAL_SPK:-}" \
+        || -n "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+        if [[ -z "${MATRIX_CELESTIAL_SPK:-}" \
+            || -z "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+            echo "[ERROR] MATRIX_CELESTIAL_SPK and " \
+                "MATRIX_CELESTIAL_JPLEPHEM_WHEEL are all-or-none" >&2
+            exit 1
+        fi
+        GAME_INPUT_ARGS+=(
+            --game-celestial-de440s-kernel "$MATRIX_CELESTIAL_SPK"
+            --game-celestial-jplephem-wheel "$MATRIX_CELESTIAL_JPLEPHEM_WHEEL"
+        )
+    fi
     if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
         if [[ -z "$UE_CAMERA_STATE_FILE" ]]; then
             echo "[ERROR] UE final-POV state file was not initialized" >&2

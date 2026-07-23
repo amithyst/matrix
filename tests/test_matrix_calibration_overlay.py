@@ -27,6 +27,185 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
+def celestial_navigation_state() -> dict[str, object]:
+    def destination(
+        destination_id: str,
+        body_id: str,
+        body_name: str,
+        display_name: str,
+        tag: str,
+        *,
+        runtime_status: str,
+        status: str,
+        enabled: bool,
+        position: list[float] | None = None,
+        gravity: float,
+        atmosphere: str,
+    ) -> dict[str, object]:
+        return {
+            "id": destination_id,
+            "body_id": body_id,
+            "body_name": body_name,
+            "display_name": display_name,
+            "teleport_tag": tag,
+            "runtime_status": runtime_status,
+            "status": status,
+            "enabled": enabled,
+            "surface_coordinates_deg_m": [22.5, 114.0, 20.0],
+            "surface_heading_deg": 0.0,
+            "local_position_m": position,
+            "site_universe_position_m": [1.0e11, 2.0e10, 3.0e9],
+            "universe_position_m": position,
+            "gravity_m_s2": gravity,
+            "atmosphere": atmosphere,
+        }
+
+    return {
+        "celestial_navigation": {
+            "version": 2,
+            "available": True,
+            "status": "ready",
+            "universe_id": "sol-2080",
+            "display_name": "SOL-2080",
+            "reference_epoch_utc": "2080-01-01T00:00:00Z",
+            "time_scale": "TAI",
+            "frame": "sol_heliocentric_icrf",
+            "ephemeris": {
+                "provider": "matrix-analytical-v1",
+                "accuracy_class": "visual-navigation",
+                "upgrade_target": "naif-spice-de440",
+            },
+            "simulation_time": {
+                "elapsed_tai_ns": 0,
+                "scenario_tai_ns": 3471292837000000000,
+                "scenario_utc": "2080-01-01T00:00:00Z",
+                "rate_numerator": 1,
+                "rate_denominator": 1,
+                "utc_assumption": "frozen-tai-minus-utc-at-scenario-epoch",
+            },
+            "origin_rebasing": True,
+            "simulation_local_bound_m": 100_000.0,
+            "current_body_id": "earth",
+            "bodies": [
+                {
+                    "id": "sun",
+                    "display_name": "Sun",
+                    "naif_id": 10,
+                    "runtime_status": "reference",
+                    "center_inertial_m": [0.0, 0.0, 0.0],
+                    "solar_distance_m": 0.0,
+                },
+                {
+                    "id": "earth",
+                    "display_name": "Earth",
+                    "naif_id": 399,
+                    "runtime_status": "active",
+                    "center_inertial_m": [1.0e11, 2.0e10, 3.0e9],
+                    "solar_distance_m": 1.02e11,
+                },
+                {
+                    "id": "moon",
+                    "display_name": "Moon",
+                    "naif_id": 301,
+                    "runtime_status": "planned",
+                    "center_inertial_m": [1.003e11, 2.0e10, 3.0e9],
+                    "solar_distance_m": 1.023e11,
+                },
+                {
+                    "id": "mars",
+                    "display_name": "Mars",
+                    "naif_id": 499,
+                    "runtime_status": "planned",
+                    "center_inertial_m": [2.0e11, 4.0e10, 5.0e9],
+                    "solar_distance_m": 2.04e11,
+                },
+            ],
+            "lighting": {
+                "body_id": "earth",
+                "atmosphere": "earth_nitrogen_oxygen",
+                "sun_direction_local": [1.0, 0.0, 0.0],
+                "directional_light_direction_local": [-1.0, 0.0, 0.0],
+                "sun_altitude_deg": 10.0,
+                "sun_azimuth_deg": 120.0,
+                "solar_distance_m": 1.47e11,
+                "solar_irradiance_w_m2": 1400.0,
+                "sun_angular_radius_deg": 0.27,
+                "eclipse_fraction": 0.0,
+                "eclipse_occluder_id": None,
+                "starfield_visibility": 0.0,
+                "visual_profile": {
+                    "schema": "matrix-celestial-visual-profile/v1",
+                    "id": "earth-wet-cloudy-v1",
+                    "sha256": "a" * 64,
+                    "display_name": "Earth Wet Cloudy",
+                    "body_id": "earth",
+                    "atmosphere": "earth_nitrogen_oxygen",
+                    "renderer": "carla-weather-v1",
+                    "weather_parameters": {
+                        "cloudiness": 60.0,
+                        "precipitation": 0.0,
+                        "precipitation_deposits": 50.0,
+                        "wind_intensity": 10.0,
+                        "sun_azimuth_angle": 120.0,
+                        "sun_altitude_angle": 10.0,
+                        "fog_density": 3.0,
+                        "fog_distance": 0.75,
+                        "fog_falloff": 0.1,
+                        "wetness": 0.0,
+                        "scattering_intensity": 1.0,
+                        "mie_scattering_scale": 0.03,
+                        "rayleigh_scattering_scale": 0.0331,
+                        "dust_storm": 0.0,
+                    },
+                },
+                "render_authority": "state-only",
+                "render_status": "not-applied",
+                "render_error": None,
+                "visible_camera_verified": False,
+            },
+            "destinations": [
+                destination(
+                    "earth-overworld-home",
+                    "earth",
+                    "Earth",
+                    "Overworld Home",
+                    "home",
+                    runtime_status="active",
+                    status="ready",
+                    enabled=True,
+                    position=[160.0, 117.0, 1.2],
+                    gravity=9.80665,
+                    atmosphere="nitrogen_oxygen",
+                ),
+                destination(
+                    "moon-tranquility-outpost",
+                    "moon",
+                    "Moon",
+                    "Tranquility Outpost",
+                    "moon.tranquility",
+                    runtime_status="planned",
+                    status="world_unavailable",
+                    enabled=False,
+                    gravity=1.62,
+                    atmosphere="vacuum",
+                ),
+                destination(
+                    "mars-utopia-outpost",
+                    "mars",
+                    "Mars",
+                    "Utopia Outpost",
+                    "mars.utopia",
+                    runtime_status="planned",
+                    status="world_unavailable",
+                    enabled=False,
+                    gravity=3.72076,
+                    atmosphere="carbon_dioxide_thin",
+                ),
+            ],
+        }
+    }
+
+
 class OverlayLayoutTest(unittest.TestCase):
     @staticmethod
     def intersects(left, right) -> bool:
@@ -247,6 +426,40 @@ class OverlayLayoutTest(unittest.TestCase):
             for index, rectangle in enumerate(rectangles):
                 for other in rectangles[index + 1 :]:
                     self.assertFalse(self.intersects(rectangle, other))
+
+    def test_navigation_targets_are_page_scoped_and_outside_crosshair(self) -> None:
+        for geometry in (
+            MODULE.WindowGeometry(1, 0, 0, 480, 360),
+            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
+        ):
+            with self.subTest(geometry=geometry):
+                layout = MODULE.overlay_layout(geometry)
+                targets = ("navigation_refresh",) + tuple(
+                    f"navigation_destination_{index}" for index in range(3)
+                )
+                for name in targets:
+                    x, y, width, height = layout[name]
+                    self.assertEqual(
+                        MODULE.panel_action_at(
+                            layout,
+                            x + width // 2,
+                            y + height // 2,
+                            page="navigation",
+                        ),
+                        name,
+                    )
+                    self.assertFalse(
+                        self.intersects(layout[name], layout["crosshair_safe"])
+                    )
+                refresh = layout["navigation_refresh"]
+                self.assertIsNone(
+                    MODULE.panel_action_at(
+                        layout,
+                        refresh[0] + refresh[2] // 2,
+                        refresh[1] + refresh[3] // 2,
+                        page="console",
+                    )
+                )
 
     def test_font_slider_is_bounded_page_scoped_and_maps_the_full_range(self) -> None:
         for geometry in (
@@ -660,6 +873,150 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertFalse(model.policy_enabled("host"))
 
+    def test_celestial_navigation_model_is_strict_and_honest(self) -> None:
+        model = MODULE.celestial_navigation_model(celestial_navigation_state())
+
+        self.assertTrue(model.available)
+        self.assertEqual(model.universe_id, "sol-2080")
+        self.assertTrue(model.origin_rebasing)
+        self.assertTrue(model.refresh_enabled)
+        self.assertEqual(
+            model.lighting.visual_profile.profile_id,
+            "earth-wet-cloudy-v1",
+        )
+        self.assertEqual(
+            [destination.status for destination in model.destinations],
+            ["ready", "world_unavailable", "world_unavailable"],
+        )
+        self.assertTrue(model.destination_enabled("earth-overworld-home"))
+        self.assertFalse(model.destination_enabled("moon-tranquility-outpost"))
+
+        malformed = json.loads(json.dumps(celestial_navigation_state()))
+        malformed["celestial_navigation"]["destinations"][1]["enabled"] = True
+        rejected = MODULE.celestial_navigation_model(malformed)
+        self.assertFalse(rejected.available)
+        self.assertEqual(rejected.destinations, ())
+
+        extra_field = json.loads(json.dumps(celestial_navigation_state()))
+        extra_field["celestial_navigation"]["shell_command"] = "rm -rf /"
+        rejected = MODULE.celestial_navigation_model(extra_field)
+        self.assertFalse(rejected.available)
+
+        overflowing = json.loads(json.dumps(celestial_navigation_state()))
+        overflowing["celestial_navigation"]["simulation_local_bound_m"] = 10**1000
+        rejected = MODULE.celestial_navigation_model(overflowing)
+        self.assertFalse(rejected.available)
+
+        mismatched_weather = json.loads(json.dumps(celestial_navigation_state()))
+        mismatched_weather["celestial_navigation"]["lighting"]["visual_profile"][
+            "weather_parameters"
+        ]["sun_altitude_angle"] = -45.0
+        rejected = MODULE.celestial_navigation_model(mismatched_weather)
+        self.assertFalse(rejected.available)
+
+    def test_navigation_clicks_emit_refresh_and_only_ready_destination(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._last_layout = layout
+        overlay._active_page = "navigation"
+        overlay._last_navigation_model = MODULE.celestial_navigation_model(
+            celestial_navigation_state()
+        )
+        overlay._last_command_status = MODULE.CommandConsoleStatus(
+            available=True,
+            provider_editing=False,
+            in_flight=False,
+            status="idle",
+            request_id=None,
+            sequence=None,
+            result_revision=0,
+            ok=None,
+            code=None,
+            message=None,
+            warning=None,
+            restart_required=False,
+            outcome_unknown=False,
+        )
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        overlay._visible = True
+        overlay._font_slider_dragging = False
+        publisher = mock.Mock()
+        events = []
+        for target in (
+            "navigation_refresh",
+            "navigation_destination_0",
+            "navigation_destination_1",
+        ):
+            x, y, width, height = layout[target]
+            for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
+                event = MODULE.XEvent()
+                event.type = event_type
+                event.xbutton.button = 1
+                event.xbutton.window = 2
+                event.xbutton.x_root = x + width // 2
+                event.xbutton.y_root = y + height // 2
+                events.append(event)
+
+        overlay._x11.XPending.side_effect = lambda _display: len(events)
+
+        def next_event(_display, destination):
+            event = events.pop(0)
+            MODULE.ctypes.memmove(
+                destination,
+                MODULE.ctypes.byref(event),
+                MODULE.ctypes.sizeof(event),
+            )
+
+        overlay._x11.XNextEvent.side_effect = next_event
+
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 2)
+        publisher.publish_navigation_refresh.assert_called_once_with()
+        publisher.publish_navigation_select.assert_called_once_with(
+            "earth-overworld-home"
+        )
+
+    def test_navigation_page_draws_ready_earth_and_disabled_planned_bodies(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.celestial_navigation_model(celestial_navigation_state())
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "navigation_summary")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+
+        overlay._draw_navigation_page(layout, model)
+
+        buttons = {
+            call.args[1]: call for call in overlay._draw_button.call_args_list
+        }
+        self.assertFalse(buttons["navigation_refresh"].kwargs["disabled"])
+        self.assertFalse(buttons["navigation_destination_0"].kwargs["disabled"])
+        self.assertTrue(buttons["navigation_destination_1"].kwargs["disabled"])
+        self.assertTrue(buttons["navigation_destination_2"].kwargs["disabled"])
+        self.assertIn("可传送", buttons["navigation_destination_0"].args[2])
+        self.assertIn("未部署", buttons["navigation_destination_1"].args[2])
+
     def test_disabled_locomotion_candidate_emits_no_selection_intent(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
         model = MODULE.StrategyLoadoutModel(
@@ -1043,6 +1400,30 @@ class HotFontSizeTest(unittest.TestCase):
 
 
 class PointerActionPublisherTest(unittest.TestCase):
+    def test_navigation_intents_are_strict_and_typed(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_navigation_refresh()
+            publisher.publish_navigation_select("earth-overworld-home")
+            refresh = json.loads(receiver.recv(1024).decode("ascii"))
+            select = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(
+                set(refresh),
+                {"version", "session", "sequence", "kind"},
+            )
+            self.assertEqual(refresh["kind"], "navigation_refresh")
+            self.assertEqual(select["kind"], "navigation_select")
+            self.assertEqual(select["destination_id"], "earth-overworld-home")
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                publisher.publish_navigation_select("Earth Home")
+        finally:
+            publisher.close()
+            receiver.close()
+
     def test_strategy_selection_is_a_strict_typed_intent(self) -> None:
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         publisher = MODULE.PointerActionPublisher(

@@ -127,6 +127,56 @@ mode 2，只有达到 2.50 m/s 才发布 mode 3；需要记录实际步态切换
 CLI 允许把模拟量上限配置到原生 `SLOW_WALK` 的 0.80 m/s，但河源 profile 和默认值仍为
 0.30 m/s。从键盘切到已经偏转的摇杆时，同一帧会夹到实际配置上限并回到 mode 1。
 
+## ESC 箱庭世界导航验收
+
+ESC 战术终端现在有“策略装配 / 控制设置 / 命令台 / 星体导航”四页。当前产品口径是
+箱庭世界：星体导航是同一 SOL-2080 持久宇宙中的箱庭目的地入口，不是切换存档或启动
+另一套游戏实例，也不宣称当前 cooked runtime 已支持无缝跨星体飞行。目录由
+`config/universe/sol-2080.json` 管理，provider 使用
+`scripts/matrix_celestial_navigation.py` 严格校验，并由
+`scripts/matrix_celestial_ephemeris.py` 计算动态 frame 与光照；这些文件都在 `run_sim.sh` 的
+`game` 启动预检内，缺失或 catalog schema 错误必须在进入交互前失败。
+
+每台机器首次使用先 provision 约 31.3 MiB 的锁定历表；后续 `--verify-only` 不产生流量：
+
+```bash
+bash scripts/bootstrap_matrix_celestial.sh
+bash scripts/bootstrap_matrix_celestial.sh --verify-only
+```
+
+正常 launcher 会自动发现 runtime 下的 DE440s。ESC provider 应显示 `jpl-de440s-v1`；显示
+`matrix-analytical-v1` 代表正在使用低精度 fallback，应先修复资产路径再做跨星体数据验收。
+
+手工验收顺序：
+
+1. 按 ESC 后打开“星体导航”，点击“刷新坐标”；命令结果应为
+   `OK_TELEPORT_LIST`，不重启 runtime，也不写 world state。
+2. 存档已有 `home` 时，地球 Overworld 归航点应显示“可传送”；没有 `home` 时必须显示
+   “未发现”，不能点击。可先在命令台用
+   `/summon matrix:teleport_point ~ ~ ~ {Tags:["home"]}` 明确创建。
+3. 月球静海在 MoonWorld chunk、低重力和主链路 smoke 完成前必须显示“未部署”；火星乌托邦
+   已暂停开发，必须保持 disabled/backlog。任何只改状态字段把它们伪装成可达的 build 都
+   不通过当前验收。
+4. 点击已发现的地球归航点后，应走既有 `TeleportSelector` 和完整冷重启，下一代从
+   canonical 站姿恢复；不得在线改 MuJoCo `qpos`。
+5. 状态中的 `local_position_m` 必须保持在 ±100 km 仿真局部边界内；数亿米级 SOL
+   坐标只允许出现在 `universe_position_m` 展示/路由字段，不能进入物理 root pose。
+6. ESC 应显示推进中的 2080 场景时间、太阳高度/方位与辐照度；完整冷重启后时间不得回到
+   `2080-01-01T00:00:00Z`。对应时钟文件默认与 world state 位于同一 profile 目录。
+7. 需要试验 UE 太阳角同步时，启动命令增加
+   `--celestial-lighting-bridge carla-weather --celestial-visual-profile earth-wet-cloudy-v1`。
+   当前会写入并读回太阳、云雾、降雨、湿地和大气散射的完整 profile；只有全部一致，界面才显示
+   “CARLA已读回”；连接失败必须显示“仅光照真值”并继续保持导航可用。最终可见相机仍需
+   screenshot/probe 单独验收。
+
+月球资产、物理参数和场景路由尚未部署；火星暂停；连续航行动力学不属于箱庭世界第一阶段。
+当前解析历表是
+`visual-navigation` fallback，不是 SPICE 科学历表。跨机器的 world state 与宇宙时钟仍是
+本机数据，不由 Git 自动同步。详细坐标合同、开源方案与未实现边界见
+`docs/Controller_Guide_CN.md`、`docs/adr/0001-sol-2080-celestial-frames.md` 和
+`docs/adr/0003-box-world-first.md`。
+视觉 profile、开源来源和 A/B 命令见 `docs/MATRIX_CELESTIAL_VISUALS_CN.md`。
+
 ## 河源启动前检查
 
 保留 `/home/kaijie/matrix` 作为 clean main checkout；本功能使用独立实验 worktree 和
