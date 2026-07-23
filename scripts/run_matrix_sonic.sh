@@ -389,6 +389,83 @@ fi
 MATRIX_MOTION_SETTINGS_FILE="$(realpath -m "$MATRIX_MOTION_SETTINGS_FILE")"
 export MATRIX_MOTION_SETTINGS_FILE
 echo "[INFO] Motion settings file: $MATRIX_MOTION_SETTINGS_FILE"
+MATRIX_VIDEO_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${PROFILE:-local}}"
+MATRIX_VIDEO_SETTINGS_FILE="${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_VIDEO_SETTINGS_PROFILE}/video-settings.json}"
+if [[ "$MATRIX_VIDEO_SETTINGS_FILE" != /* ]]; then
+    echo "[ERROR] MATRIX_VIDEO_SETTINGS_FILE must be absolute" >&2
+    exit 2
+fi
+MATRIX_VIDEO_APPLIED_JSON="$(
+    /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_video_settings.py" \
+        launch-json --file "$MATRIX_VIDEO_SETTINGS_FILE"
+)"
+VIDEO_LAUNCH_FIELDS="$(
+    /usr/bin/python3 -I - "$MATRIX_VIDEO_APPLIED_JSON" <<'PY'
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+expected = {
+    "revision",
+    "resolution",
+    "resolution_width",
+    "resolution_height",
+    "window_mode",
+    "fps_limit",
+    "quality",
+    "camera_smoothing",
+}
+if not isinstance(value, dict) or set(value) != expected:
+    raise SystemExit("invalid video-settings helper output")
+fields = (
+    value["resolution_width"],
+    value["resolution_height"],
+    value["window_mode"],
+    value["fps_limit"],
+    value["quality"],
+    value["camera_smoothing"],
+    value["revision"],
+)
+if any(isinstance(item, bool) for item in fields):
+    raise SystemExit("invalid boolean in video-settings helper output")
+print("\t".join(str(item) for item in fields))
+PY
+)"
+IFS=$'\t' read -r MATRIX_VIDEO_APPLIED_WIDTH \
+    MATRIX_VIDEO_APPLIED_HEIGHT MATRIX_VIDEO_APPLIED_WINDOW_MODE \
+    MATRIX_VIDEO_APPLIED_FPS_LIMIT MATRIX_VIDEO_APPLIED_QUALITY \
+    MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING MATRIX_VIDEO_APPLIED_REVISION \
+    <<<"$VIDEO_LAUNCH_FIELDS"
+export MATRIX_VIDEO_SETTINGS_FILE MATRIX_VIDEO_APPLIED_JSON
+export MATRIX_VIDEO_APPLIED_WIDTH MATRIX_VIDEO_APPLIED_HEIGHT
+export MATRIX_VIDEO_APPLIED_WINDOW_MODE MATRIX_VIDEO_APPLIED_FPS_LIMIT
+export MATRIX_VIDEO_APPLIED_QUALITY MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING
+export MATRIX_VIDEO_APPLIED_REVISION
+echo "[INFO] Video launch settings: ${MATRIX_VIDEO_APPLIED_WIDTH}x${MATRIX_VIDEO_APPLIED_HEIGHT}" \
+    "mode=$MATRIX_VIDEO_APPLIED_WINDOW_MODE fps=$MATRIX_VIDEO_APPLIED_FPS_LIMIT" \
+    "quality=$MATRIX_VIDEO_APPLIED_QUALITY smoothing=$MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING" \
+    "revision=$MATRIX_VIDEO_APPLIED_REVISION"
+MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
+MATRIX_CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
+if [[ -n "$MATRIX_ITEM_INVENTORY_CATALOG" \
+    && -n "$MATRIX_CREATIVE_INVENTORY_CATALOG" \
+    && "$(realpath -m "$MATRIX_ITEM_INVENTORY_CATALOG")" \
+        != "$(realpath -m "$MATRIX_CREATIVE_INVENTORY_CATALOG")" ]]; then
+    echo "[ERROR] MATRIX_ITEM_INVENTORY_CATALOG conflicts with the legacy" \
+        "MATRIX_CREATIVE_INVENTORY_CATALOG alias" >&2
+    exit 2
+fi
+if [[ -z "$MATRIX_ITEM_INVENTORY_CATALOG" ]]; then
+    MATRIX_ITEM_INVENTORY_CATALOG="$MATRIX_CREATIVE_INVENTORY_CATALOG"
+fi
+MATRIX_CREATIVE_INVENTORY_CATALOG="$MATRIX_ITEM_INVENTORY_CATALOG"
+MATRIX_ITEM_PACK_ROOT="${MATRIX_ITEM_PACK_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/matrix/item-packs}"
+if [[ "$MATRIX_ITEM_PACK_ROOT" != /* ]]; then
+    echo "[ERROR] MATRIX_ITEM_PACK_ROOT must be absolute" >&2
+    exit 2
+fi
+export MATRIX_ITEM_INVENTORY_CATALOG MATRIX_CREATIVE_INVENTORY_CATALOG
+export MATRIX_ITEM_PACK_ROOT
 MATRIX_SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
 export MATRIX_SONIC_STATUS_FILE
 rm -f -- "$MATRIX_SONIC_STATUS_FILE"
@@ -793,6 +870,7 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
         "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" \
         "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
         "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
+        "$PROJECT_ROOT/scripts/matrix_item_asset_pack.py" \
         "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
         "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
         "$PROJECT_ROOT/scripts/matrix_world_state.py" \

@@ -1519,6 +1519,88 @@ class WorldStateStoreTest(unittest.TestCase):
                 list(PHYSICS.TOWN10_PERIMETER_WALL_NAMES),
             )
 
+    def test_revision_changes_with_inventory_topology_and_not_its_location(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def source(name: str, pool_size: int) -> tuple[Path, Path, Path, Path]:
+                base = root / name
+                meshes = base / "meshes"
+                native = base / "native"
+                meshes.mkdir(parents=True)
+                native.mkdir()
+                model = base / "robot.xml"
+                scene = native / "scene.xml"
+                prop = base / "prop.stl"
+                catalog = base / "inventory.json"
+                model.write_text("<mujoco/>", encoding="utf-8")
+                scene.write_text("<mujoco/>", encoding="utf-8")
+                (meshes / "body.stl").write_bytes(b"body")
+                prop.write_bytes(b"prop")
+                catalog.write_text(
+                    json.dumps(
+                        {
+                            "schema": "matrix-creative-inventory/v1",
+                            "items": [
+                                {
+                                    "item_id": "prop",
+                                    "label": "Prop",
+                                    "pool_size": pool_size,
+                                    "mass_kg": 1.0,
+                                    "collision_half_size": [0.1, 0.1, 0.1],
+                                    "spawn_distance_m": 1.0,
+                                    "spawn_height_m": 1.0,
+                                    "spawn_quat": [1.0, 0.0, 0.0, 0.0],
+                                    "visuals": [
+                                        {
+                                            "mesh": "prop.stl",
+                                            "rgba": [1.0, 1.0, 1.0, 1.0],
+                                            "scale": [1.0, 1.0, 1.0],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return model, meshes, scene, catalog
+
+            model_a, meshes_a, scene_a, catalog_a = source("a", 2)
+            model_b, meshes_b, scene_b, catalog_b = source("b", 2)
+            revision_a = MODULE.world_revision_for_files(
+                world_id="g1:inventory",
+                native_scene=scene_a,
+                canonical_model=model_a,
+                canonical_meshes=meshes_a,
+                creative_inventory_catalog=catalog_a,
+            )
+            revision_b = MODULE.world_revision_for_files(
+                world_id="g1:inventory",
+                native_scene=scene_b,
+                canonical_model=model_b,
+                canonical_meshes=meshes_b,
+                creative_inventory_catalog=catalog_b,
+            )
+            self.assertEqual(revision_a, revision_b)
+
+            changed_model, changed_meshes, changed_scene, changed_catalog = source(
+                "changed",
+                3,
+            )
+            self.assertNotEqual(
+                revision_a,
+                MODULE.world_revision_for_files(
+                    world_id="g1:inventory",
+                    native_scene=changed_scene,
+                    canonical_model=changed_model,
+                    canonical_meshes=changed_meshes,
+                    creative_inventory_catalog=changed_catalog,
+                ),
+            )
+
 
 class RejectCheckpointCommitGateTest(unittest.TestCase):
     def _make_state(

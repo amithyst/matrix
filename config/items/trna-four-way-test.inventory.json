@@ -1,0 +1,24 @@
+{
+  "schema": "matrix-item-inventory/v1",
+  "inventory": {
+    "inventory_id": "trna-four-way-test",
+    "entries": [
+      {
+        "slot_id": "primary_prop",
+        "pack_digest": "sha256:95b6d2f82365230dfe5efae7b200a40535575ae420fb80ce152fb14b707b467a",
+        "item_id": "blaster-h",
+        "pool_size": 8,
+        "spawn": {
+          "distance_m": 0.9,
+          "height_m": 1.0,
+          "quaternion_wxyz": [
+            0.707106781,
+            0.0,
+            0.707106781,
+            0.0
+          ]
+        }
+      }
+    ]
+  }
+}

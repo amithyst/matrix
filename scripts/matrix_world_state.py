@@ -2071,6 +2071,7 @@ def world_revision_for_files(
     canonical_model: Path,
     canonical_meshes: Path,
     scene_transform: str | None = None,
+    creative_inventory_catalog: Path | None = None,
 ) -> str:
     """Bind a save slot to physics inputs without including its spawn override."""
 
@@ -2088,6 +2089,7 @@ def world_revision_for_files(
             canonical_meshes,
             native_scene,
             scene_transform=scene_transform,
+            creative_inventory_catalog=creative_inventory_catalog,
         )
     except (OSError, SonicPhysicsModelError) as exc:
         raise WorldStateError(f"cannot build physics source contract: {exc}") from exc
@@ -2098,7 +2100,7 @@ def world_revision_for_files(
         allow_nan=False,
     ).encode("utf-8")
     digest = hashlib.sha256()
-    digest.update(b"matrix-world-revision/v2\0")
+    digest.update(b"matrix-world-revision/v3\0")
     digest.update(identity.encode("ascii"))
     digest.update(b"\0")
     digest.update(payload)
@@ -2114,6 +2116,7 @@ def _parse_cli_args() -> argparse.Namespace:
     revision.add_argument("--native-scene", type=Path, required=True)
     revision.add_argument("--canonical-model", type=Path, required=True)
     revision.add_argument("--canonical-meshes", type=Path, required=True)
+    revision.add_argument("--creative-inventory-catalog", type=Path)
     revision.add_argument(
         "--scene-transform",
         choices=(
@@ -2160,6 +2163,7 @@ def main() -> int:
                     canonical_model=args.canonical_model,
                     canonical_meshes=args.canonical_meshes,
                     scene_transform=args.scene_transform,
+                    creative_inventory_catalog=args.creative_inventory_catalog,
                 )
             )
             return 0

@@ -169,6 +169,82 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 receiver.close()
                 supervisor._action_socket = None
 
+    def test_video_setting_intent_is_strict_cas_and_next_launch_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            path = root / "config/video.json"
+            applied = MODULE.VideoSettings()
+            controller = MODULE.VideoSettingsController(
+                store=MODULE.VideoSettingsStore(path, initial=applied),
+                applied=applied,
+            )
+            packet = {
+                "version": 1,
+                "session": supervisor._action_session,
+                "sequence": 1,
+                "kind": "video_setting",
+                "field": "fps_limit",
+                "value": 90,
+                "expected_revision": 0,
+            }
+            try:
+                sender.send(json.dumps(packet).encode("ascii"))
+                intents = supervisor.drain_intents()
+                self.assertEqual(
+                    intents,
+                    (
+                        MODULE.OverlayIntent(
+                            kind="video_setting",
+                            video_field="fps_limit",
+                            video_value=90,
+                            expected_revision=0,
+                        ),
+                    ),
+                )
+                intent = intents[0]
+                self.assertTrue(
+                    controller.apply_intent(
+                        intent.video_field,
+                        intent.video_value,
+                        expected_revision=intent.expected_revision,
+                        active=True,
+                    )
+                )
+                mapping = controller.live_mapping()
+                self.assertEqual(mapping["current"]["fps_limit"], 60)
+                self.assertEqual(mapping["next_launch"]["fps_limit"], 90)
+                self.assertEqual(mapping["revision"], 1)
+                self.assertTrue(mapping["pending_restart"])
+                self.assertFalse(
+                    controller.apply_intent(
+                        "quality",
+                        "epic",
+                        expected_revision=0,
+                        active=True,
+                    )
+                )
+                self.assertIsNone(controller.persistence_error)
+                reconciled = controller.live_mapping()
+                self.assertEqual(reconciled["revision"], 1)
+                self.assertEqual(reconciled["next_launch"]["fps_limit"], 90)
+                self.assertEqual(reconciled["next_launch"]["quality"], "high")
+                self.assertTrue(reconciled["pending_restart"])
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
     def test_private_action_socket_rejects_wrong_session_and_direct_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

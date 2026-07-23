@@ -379,6 +379,38 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("MATRIX_CUDA_ROOT", zza)
         self.assertIn('PATH="$MATRIX_TOOLS_ROOT/bin:$PATH"', zza)
 
+    def test_trna_item_inventory_preserves_the_legacy_host_override(self) -> None:
+        profile = REPO_ROOT / "config/hosts/trna.env"
+        legacy_catalog = "/tmp/matrix-legacy-inventory.json"
+        command = (
+            'set -euo pipefail; '
+            f'export MATRIX_PROJECT_ROOT={shlex.quote(os.fspath(REPO_ROOT))}; '
+            "unset MATRIX_ITEM_INVENTORY_CATALOG; "
+            f'export MATRIX_CREATIVE_INVENTORY_CATALOG={legacy_catalog}; '
+            f'source {shlex.quote(os.fspath(profile))}; '
+            'printf "%s\\n" "$MATRIX_ITEM_INVENTORY_CATALOG"'
+        )
+        result = subprocess.run(
+            ["/bin/bash", "-c", command],
+            env={
+                "HOME": "/tmp/matrix-profile-test-home",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout.strip(), legacy_catalog)
+
+        for launcher in ("run_sim.sh", "run_custom_urdf.sh"):
+            text = (REPO_ROOT / "scripts" / launcher).read_text(encoding="utf-8")
+            self.assertIn("MATRIX_ITEM_INVENTORY_CATALOG", text)
+            self.assertIn(
+                "conflicts with the legacy",
+                text,
+            )
+
     def test_release_installs_do_not_dirty_the_checkout(self) -> None:
         text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
         for pattern in (

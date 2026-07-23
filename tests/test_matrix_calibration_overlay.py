@@ -1400,6 +1400,81 @@ class HotFontSizeTest(unittest.TestCase):
 
 
 class PointerActionPublisherTest(unittest.TestCase):
+    def test_video_settings_model_and_intent_are_revision_guarded(self) -> None:
+        model = MODULE.video_settings_panel_model(
+            {
+                "video_settings": {
+                    "available": True,
+                    "revision": 4,
+                    "current": {
+                        "resolution": "1920x1080",
+                        "window_mode": "borderless",
+                        "fps_limit": 60,
+                        "quality": "high",
+                        "camera_smoothing": "medium",
+                    },
+                    "next_launch": {
+                        "resolution": "1920x1080",
+                        "window_mode": "borderless",
+                        "fps_limit": 60,
+                        "quality": "high",
+                        "camera_smoothing": "medium",
+                    },
+                    "pending_restart": False,
+                    "persistence_error": None,
+                }
+            }
+        )
+        self.assertTrue(model.available)
+        self.assertEqual(model.stepped_value("video_fps_limit_up"), 90)
+        geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 720)
+        layout = MODULE.overlay_layout(geometry)
+        self.assertIn("tab_video", layout)
+        x, y, width, height = layout["video_fps_limit_up"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="video",
+            ),
+            "video_fps_limit_up",
+        )
+
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_video_setting(
+                "fps_limit",
+                90,
+                expected_revision=model.revision,
+            )
+            packet = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(
+                packet,
+                {
+                    "version": 1,
+                    "session": "known-session",
+                    "sequence": 1,
+                    "kind": "video_setting",
+                    "field": "fps_limit",
+                    "value": 90,
+                    "expected_revision": 4,
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                publisher.publish_video_setting(
+                    "fps_limit",
+                    "90;quit",
+                    expected_revision=4,
+                )
+        finally:
+            publisher.close()
+            receiver.close()
+
     def test_navigation_intents_are_strict_and_typed(self) -> None:
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         publisher = MODULE.PointerActionPublisher(

@@ -55,6 +55,13 @@ from matrix_ui_settings import (
     step_font_scale,
 )
 from matrix_motion_settings import MotionSettings, MotionSettingsError
+from matrix_video_settings import (
+    VideoSettings,
+    VideoSettingsError,
+    VideoSettingsPersistenceError,
+    VideoSettingsStore,
+    default_settings_file as default_video_settings_file,
+)
 from matrix_restart_request import (
     RestartRequest,
     atomic_write_request,
@@ -1106,6 +1113,88 @@ class UiSettingsController:
             "load_status": self.load_status,
             "persistence_error": self.persistence_error,
             "change_count": self.change_count,
+        }
+
+
+class VideoSettingsController:
+    """Persist fixed video presets; the running UE keeps its applied snapshot."""
+
+    def __init__(
+        self,
+        *,
+        store: VideoSettingsStore,
+        applied: VideoSettings,
+    ) -> None:
+        self.store = store
+        self.applied = applied
+        self.persistence_error = store.load_error
+        self.change_count = 0
+
+    @staticmethod
+    def _values(settings: VideoSettings) -> dict[str, object]:
+        mapping = settings.to_mapping()
+        return {
+            key: value
+            for key, value in mapping.items()
+            if key not in {"version", "revision"}
+        }
+
+    def apply_intent(
+        self,
+        field: str,
+        value: object,
+        *,
+        expected_revision: int,
+        active: bool,
+    ) -> bool:
+        if not active:
+            return False
+        try:
+            modification = self.store.modify(
+                field,
+                value,
+                expected_revision=expected_revision,
+            )
+        except VideoSettingsError as exc:
+            if exc.code == "E_VIDEO_REVISION_CONFLICT":
+                try:
+                    self.store.reload()
+                except (VideoSettingsPersistenceError, OSError) as reload_exc:
+                    self.persistence_error = str(reload_exc)
+                    return False
+                # A fast duplicate click or another authenticated writer may
+                # legitimately advance the revision before this intent is
+                # handled. Reconcile to the durable snapshot and let the
+                # overlay retry from its next revision instead of deadlocking
+                # the restart gate on a stale intent.
+                self.persistence_error = None
+                return False
+            self.persistence_error = str(exc)
+            return False
+        except (VideoSettingsPersistenceError, OSError) as exc:
+            self.persistence_error = str(exc)
+            return False
+        self.persistence_error = None
+        if modification.changed:
+            self.change_count += 1
+        return modification.changed
+
+    def pending_restart(self) -> bool:
+        return self._values(self.store.settings) != self._values(self.applied)
+
+    def live_mapping(self) -> dict[str, object]:
+        desired = self.store.settings
+        return {
+            "available": True,
+            "settings_file": os.fspath(self.store.path),
+            "revision": desired.revision,
+            "current": self._values(self.applied),
+            "next_launch": self._values(desired),
+            "pending_restart": self.pending_restart(),
+            "load_status": self.store.load_status,
+            "persistence_error": self.persistence_error,
+            "change_count": self.change_count,
+            "apply_mode": "whole_runtime_restart",
         }
 
 
@@ -4127,6 +4216,59 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+def decode_applied_video_settings(value: str) -> VideoSettings:
+    """Decode the launcher's structured runtime mapping without free-form text."""
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate applied video setting {key!r}")
+            result[key] = item
+        return result
+
+    try:
+        raw = json.loads(
+            value,
+            object_pairs_hook=strict_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"invalid applied video constant {token}")
+            ),
+        )
+        if not isinstance(raw, dict):
+            raise ValueError("applied video settings must be an object")
+        expected = {
+            "revision",
+            "resolution",
+            "resolution_width",
+            "resolution_height",
+            "window_mode",
+            "fps_limit",
+            "quality",
+            "camera_smoothing",
+        }
+        if set(raw) != expected:
+            raise ValueError("applied video settings have an invalid schema")
+        settings = VideoSettings(
+            revision=raw.get("revision"),
+            resolution=raw.get("resolution"),
+            window_mode=raw.get("window_mode"),
+            fps_limit=raw.get("fps_limit"),
+            quality=raw.get("quality"),
+            camera_smoothing=raw.get("camera_smoothing"),
+        )
+        if settings.runtime_mapping() != raw:
+            raise ValueError("applied video settings runtime fields disagree")
+        return settings
+    except (
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        VideoSettingsError,
+    ) as exc:
+        raise ValueError(f"invalid applied video settings: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class OverlayIntent:
     """One authenticated action emitted by the supervised overlay child."""
@@ -4139,6 +4281,9 @@ class OverlayIntent:
     policy_id: str | None = None
     item_id: str | None = None
     destination_id: str | None = None
+    video_field: str | None = None
+    video_value: object = None
+    expected_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -5583,6 +5728,34 @@ class CalibrationOverlaySupervisor:
                     kind="navigation_select",
                     destination_id=destination_id,
                 )
+            elif kind == "video_setting":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "field",
+                    "value",
+                    "expected_revision",
+                }:
+                    raise RuntimeError("invalid video-setting intent schema")
+                expected_revision = value.get("expected_revision")
+                if (
+                    type(expected_revision) is not int
+                    or not 0 <= expected_revision < 2**63
+                ):
+                    raise RuntimeError("invalid video-setting intent revision")
+                field = value.get("field")
+                try:
+                    VideoSettings().with_patch({field: value.get("value")})
+                except (TypeError, ValueError, VideoSettingsError) as exc:
+                    raise RuntimeError("invalid video-setting intent value") from exc
+                intent = OverlayIntent(
+                    kind="video_setting",
+                    video_field=field,
+                    video_value=value.get("value"),
+                    expected_revision=expected_revision,
+                )
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -5746,6 +5919,16 @@ def _parse_args() -> argparse.Namespace:
         default=default_settings_file(),
     )
     parser.add_argument(
+        "--video-settings-file",
+        type=Path,
+        default=None,
+        help="Host-scoped next-launch video settings",
+    )
+    parser.add_argument(
+        "--applied-video-settings-json",
+        help="Validated video settings snapshot frozen by the launcher",
+    )
+    parser.add_argument(
         "--applied-mouse-profile",
         choices=(PROFILE_LOCAL, PROFILE_REMOTE),
         default=PROFILE_LOCAL,
@@ -5892,6 +6075,13 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
     if not args.mouse_settings_file.is_absolute():
         raise SystemExit("--mouse-settings-file must be absolute")
+    if args.video_settings_file is not None and not args.video_settings_file.is_absolute():
+        raise SystemExit("--video-settings-file must be absolute")
+    if args.applied_video_settings_json is not None:
+        try:
+            decode_applied_video_settings(args.applied_video_settings_json)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     try:
         AppliedMouseSettings(
             profile=args.applied_mouse_profile,
@@ -6037,6 +6227,19 @@ def main() -> int:
         desired=loaded_ui.settings,
         load_status=loaded_ui.status,
         load_error=loaded_ui.error,
+    )
+    video_settings_path = args.video_settings_file or default_video_settings_file(
+        os.environ.get("MATRIX_HOST_PROFILE", "local")
+    )
+    video_store = VideoSettingsStore(video_settings_path)
+    applied_video = (
+        decode_applied_video_settings(args.applied_video_settings_json)
+        if args.applied_video_settings_json is not None
+        else video_store.settings
+    )
+    video_settings = VideoSettingsController(
+        store=video_store,
+        applied=applied_video,
     )
     restart_requester = RuntimeRestartRequester(
         request_file=args.restart_request_file,
@@ -6268,6 +6471,7 @@ def main() -> int:
                     **source_claim,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "ui_settings": ui_settings.live_mapping(),
+                    "video_settings": video_settings.live_mapping(),
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "command_console": game_command_client.mapping(),
@@ -6307,6 +6511,7 @@ def main() -> int:
             next_frame = max(next_frame + 1.0 / args.rate_hz, now)
 
             command_state_changed = False
+            video_settings_changed = False
             game_command_client.checkpoint_celestial_clock()
             physical_keyboard = x11.poll()
             last_keyboard = physical_keyboard
@@ -6473,6 +6678,27 @@ def main() -> int:
                     command_state_changed = True
                     apply_return.cancel_pending()
                     continue
+                if intent.kind == "video_setting":
+                    assert intent.video_field is not None
+                    assert intent.expected_revision is not None
+                    video_settings_changed = bool(
+                        video_settings.apply_intent(
+                            intent.video_field,
+                            intent.video_value,
+                            expected_revision=intent.expected_revision,
+                            active=(
+                                calibration.active
+                                and not restart_requester.requested
+                                and not game_command_client.editing
+                                and not game_command_client.in_flight
+                                and not game_command_client.restart_required
+                                and not game_command_client.outcome_unknown
+                            ),
+                        )
+                        or video_settings_changed
+                    )
+                    apply_return.cancel_pending()
+                    continue
                 assert intent.kind == "command_submit"
                 assert intent.command is not None
                 command_submitted = game_command_client.submit(
@@ -6551,6 +6777,7 @@ def main() -> int:
                         "creative_spawn",
                         "navigation_refresh",
                         "navigation_select",
+                        "video_setting",
                     }
                     for intent in panel_intents
                 )
@@ -6595,8 +6822,14 @@ def main() -> int:
                 pressed=raw_keyboard.apply_restart,
                 calibration_active=keyboard_panel_active,
                 neutral_frame_ready=neutral_frame_ready,
-                pending_restart=mouse_settings.pending_restart(applied_mouse),
-                persistence_ok=mouse_settings.persistence_error is None,
+                pending_restart=bool(
+                    mouse_settings.pending_restart(applied_mouse)
+                    or video_settings.pending_restart()
+                ),
+                persistence_ok=bool(
+                    mouse_settings.persistence_error is None
+                    and video_settings.persistence_error is None
+                ),
                 requester=restart_requester,
             )
             left_calibration, ui_restart_requested = apply_return.update(
@@ -6612,8 +6845,14 @@ def main() -> int:
                     neutral_frame_ready
                     and not command_controls_blocked
                 ),
-                pending_restart=mouse_settings.pending_restart(applied_mouse),
-                persistence_error=mouse_settings.persistence_error,
+                pending_restart=bool(
+                    mouse_settings.pending_restart(applied_mouse)
+                    or video_settings.pending_restart()
+                ),
+                persistence_error=(
+                    mouse_settings.persistence_error
+                    or video_settings.persistence_error
+                ),
                 requester=restart_requester,
             )
             restart_requested = restart_requested or ui_restart_requested
@@ -6753,6 +6992,7 @@ def main() -> int:
                     or command_state_changed
                     or mouse_settings_changed
                     or ui_settings_changed
+                    or video_settings_changed
                     or restart_requested
                     or external_control_changed
                     or teleport_rejections != last_teleport_rejections
@@ -6773,6 +7013,7 @@ def main() -> int:
                                 applied_mouse
                             ),
                             "ui_settings": ui_settings.live_mapping(),
+                            "video_settings": video_settings.live_mapping(),
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
                             "command_console": game_command_client.mapping(),
@@ -6970,6 +7211,7 @@ def main() -> int:
                 "effective_input_source": input_source,
                 "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                 "ui_settings": ui_settings.live_mapping(),
+                "video_settings": video_settings.live_mapping(),
                 "mirror_sensitivity": sensitivity_telemetry,
                 "camera_yaw": camera_yaw_telemetry(
                     args.camera_yaw_source,

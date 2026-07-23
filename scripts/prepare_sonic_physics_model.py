@@ -457,6 +457,7 @@ def physics_revision_payload(
     *,
     body_joint_names: tuple[str, ...] = G1_BODY_JOINT_NAMES,
     scene_transform: str | None = None,
+    creative_inventory_catalog: Path | None = None,
 ) -> dict[str, object]:
     """Return the location-independent source contract for save isolation.
 
@@ -485,7 +486,7 @@ def physics_revision_payload(
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
         staticized_freejoint_bodies=staticized_freejoint_bodies,
-        creative_inventory_catalog=None,
+        creative_inventory_catalog=creative_inventory_catalog,
     )
     native_scene_assets = []
     for asset in contract["native_scene_assets"]:
@@ -498,6 +499,30 @@ def physics_revision_payload(
                 "sha256": asset["sha256"],
             }
         )
+    creative_inventory = contract["creative_inventory"]
+    inventory_revision = None
+    if creative_inventory is not None:
+        if not isinstance(creative_inventory, dict):
+            raise SonicPhysicsModelError("creative inventory contract is invalid")
+        meshes = creative_inventory.get("meshes")
+        if not isinstance(meshes, list):
+            raise SonicPhysicsModelError("creative inventory mesh contract is invalid")
+        inventory_revision = {
+            "storage_contract_version": creative_inventory[
+                "storage_contract_version"
+            ],
+            "catalog_sha256": creative_inventory["catalog_sha256"],
+            "meshes": [
+                {
+                    "size": mesh["size"],
+                    "sha256": mesh["sha256"],
+                }
+                for mesh in meshes
+                if isinstance(mesh, dict)
+            ],
+        }
+        if len(inventory_revision["meshes"]) != len(meshes):
+            raise SonicPhysicsModelError("creative inventory mesh entry is invalid")
     return {
         "schema": "matrix-sonic-physics-source/v1",
         "pipeline_version": contract["pipeline_version"],
@@ -508,6 +533,7 @@ def physics_revision_payload(
         "native_scene_assets": native_scene_assets,
         "body_joint_names": contract["body_joint_names"],
         "scene_transform": contract["scene_transform"],
+        "creative_inventory": inventory_revision,
         "removed_environment_geoms": contract["removed_environment_geoms"],
         "staticized_freejoint_bodies": contract["staticized_freejoint_bodies"],
     }

@@ -7,10 +7,19 @@ import argparse
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
 import xml.etree.ElementTree as ET
+
+from matrix_item_asset_pack import (
+    INVENTORY_SCHEMA as ITEM_INVENTORY_SCHEMA,
+    ItemAssetPackError,
+    LegacyInjectorItemSpec,
+    loads_json_strict,
+    resolve_inventory,
+)
 
 
 CATALOG_SCHEMA = "matrix-creative-inventory/v1"
@@ -62,12 +71,131 @@ class InventoryItem:
     visuals: tuple[VisualPart, ...]
 
 
-def load_catalog(path: Path) -> tuple[InventoryItem, ...]:
-    path = path.resolve()
+def _runtime_item_from_resolved(spec: LegacyInjectorItemSpec) -> InventoryItem:
+    """Apply the existing MuJoCo injector bounds to a generic pack item."""
+
+    name = f"resolved item {spec.item_id!r}"
+    if ITEM_ID_RE.fullmatch(spec.item_id) is None:
+        raise InventoryCatalogError(f"{name} slot id is not runtime-safe")
+    if not isinstance(spec.label, str) or not spec.label or len(spec.label) > 40:
+        raise InventoryCatalogError(f"{name} label is invalid")
+    if (
+        isinstance(spec.pool_size, bool)
+        or not isinstance(spec.pool_size, int)
+        or not 1 <= spec.pool_size <= MAX_POOL_SIZE
+    ):
+        raise InventoryCatalogError(f"{name} pool_size is invalid")
+    if (
+        isinstance(spec.mass_kg, bool)
+        or not isinstance(spec.mass_kg, (int, float))
+        or not math.isfinite(float(spec.mass_kg))
+        or not 0.01 <= float(spec.mass_kg) <= 100.0
+    ):
+        raise InventoryCatalogError(f"{name} mass_kg is invalid")
+    collision = tuple(float(value) for value in spec.collision_half_size)
+    if (
+        len(collision) != 3
+        or any(not math.isfinite(value) for value in collision)
+        or any(not 0.005 <= value <= 5.0 for value in collision)
+    ):
+        raise InventoryCatalogError(
+            f"{name} collision_half_size is outside [0.005, 5]"
+        )
+    distance = float(spec.spawn_distance_m)
+    height = float(spec.spawn_height_m)
+    if not math.isfinite(distance) or not 0.3 <= distance <= 5.0:
+        raise InventoryCatalogError(f"{name} spawn_distance_m is invalid")
+    if not math.isfinite(height) or not 0.05 <= height <= 3.0:
+        raise InventoryCatalogError(f"{name} spawn_height_m is invalid")
+    spawn_quat = tuple(float(value) for value in spec.spawn_quat)
+    if len(spawn_quat) != 4 or any(
+        not math.isfinite(value) for value in spawn_quat
+    ):
+        raise InventoryCatalogError(f"{name} spawn_quat is invalid")
+    norm = math.sqrt(sum(value * value for value in spawn_quat))
+    if norm < 1e-9:
+        raise InventoryCatalogError(f"{name} spawn_quat is zero")
+    spawn_quat = tuple(value / norm for value in spawn_quat)
+    if not 1 <= len(spec.visuals) <= 16:
+        raise InventoryCatalogError(f"{name} visuals are invalid")
+    visuals: list[VisualPart] = []
+    for index, visual in enumerate(spec.visuals):
+        mesh = visual.mesh
+        if not mesh.is_file() or mesh.suffix.lower() != ".stl":
+            raise InventoryCatalogError(
+                f"{name} visual {index} mesh is missing or not STL: {mesh}"
+            )
+        rgba = tuple(float(value) for value in visual.rgba)
+        if (
+            len(rgba) != 4
+            or any(not math.isfinite(value) for value in rgba)
+            or any(not 0.0 <= value <= 1.0 for value in rgba)
+        ):
+            raise InventoryCatalogError(
+                f"{name} visual {index} RGBA values are invalid"
+            )
+        scale = tuple(float(value) for value in visual.scale)
+        if (
+            len(scale) != 3
+            or any(not math.isfinite(value) for value in scale)
+            or any(not 0.001 <= value <= 100.0 for value in scale)
+        ):
+            raise InventoryCatalogError(
+                f"{name} visual {index} scale values are invalid"
+            )
+        visuals.append(VisualPart(mesh=mesh, rgba=rgba, scale=scale))
+    return InventoryItem(
+        item_id=spec.item_id,
+        label=spec.label,
+        pool_size=spec.pool_size,
+        mass_kg=float(spec.mass_kg),
+        collision_half_size=collision,
+        spawn_distance_m=distance,
+        spawn_height_m=height,
+        spawn_quat=spawn_quat,
+        visuals=tuple(visuals),
+    )
+
+
+def load_catalog(
+    path: Path,
+    *,
+    item_pack_root: Path | None = None,
+) -> tuple[InventoryItem, ...]:
+    # Keep the lexical path so the generic inventory verifier can reject
+    # symlink ancestors and leaves instead of receiving an already-resolved
+    # target path from this compatibility adapter.
+    path = Path(os.path.abspath(os.fspath(path)))
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        value = loads_json_strict(
+            path.read_text(encoding="utf-8"),
+            source=str(path),
+        )
+    except (OSError, UnicodeError, ItemAssetPackError) as exc:
         raise InventoryCatalogError(f"cannot read inventory catalog: {exc}") from exc
+    if isinstance(value, dict) and value.get("schema") == ITEM_INVENTORY_SCHEMA:
+        root = item_pack_root
+        if root is None:
+            configured_root = os.environ.get("MATRIX_ITEM_PACK_ROOT")
+            root = Path(configured_root) if configured_root else None
+        if root is None:
+            raise InventoryCatalogError(
+                "matrix-item-inventory/v1 requires MATRIX_ITEM_PACK_ROOT "
+                "or item_pack_root"
+            )
+        if not root.is_absolute():
+            raise InventoryCatalogError("item pack root must be absolute")
+        try:
+            specs = resolve_inventory(path, root).legacy_injector_specs()
+        except ItemAssetPackError as exc:
+            raise InventoryCatalogError(
+                f"cannot resolve item asset inventory: {exc}"
+            ) from exc
+        if not 1 <= len(specs) <= MAX_ITEMS:
+            raise InventoryCatalogError(
+                f"items must contain 1..{MAX_ITEMS} entries"
+            )
+        return tuple(_runtime_item_from_resolved(spec) for spec in specs)
     if not isinstance(value, dict) or set(value) != {"schema", "items"}:
         raise InventoryCatalogError("inventory catalog has an invalid root schema")
     if value.get("schema") != CATALOG_SCHEMA:
@@ -223,10 +351,11 @@ def inject_catalog(
     catalog_path: Path,
     *,
     use_default_classes: bool = True,
+    item_pack_root: Path | None = None,
 ) -> dict[str, object]:
     mjcf_path = mjcf_path.resolve()
     assets_dir = assets_dir.resolve()
-    items = load_catalog(catalog_path)
+    items = load_catalog(catalog_path, item_pack_root=item_pack_root)
     tree = ET.parse(mjcf_path)
     root = tree.getroot()
     if any(
@@ -353,6 +482,7 @@ def inject_catalog(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", type=Path, required=True)
+    parser.add_argument("--item-pack-root", type=Path)
     parser.add_argument("--mjcf", type=Path)
     parser.add_argument("--assets-dir", type=Path)
     parser.add_argument("--print-palette", action="store_true")
@@ -360,13 +490,25 @@ def main() -> int:
     if args.print_palette:
         if args.mjcf is not None or args.assets_dir is not None:
             parser.error("--print-palette cannot be combined with injection arguments")
-        print(palette(load_catalog(args.catalog)))
+        print(
+            palette(
+                load_catalog(
+                    args.catalog,
+                    item_pack_root=args.item_pack_root,
+                )
+            )
+        )
         return 0
     if args.mjcf is None or args.assets_dir is None:
         parser.error("--mjcf and --assets-dir are required for injection")
     print(
         json.dumps(
-            inject_catalog(args.mjcf, args.assets_dir, args.catalog),
+            inject_catalog(
+                args.mjcf,
+                args.assets_dir,
+                args.catalog,
+                item_pack_root=args.item_pack_root,
+            ),
             indent=2,
             sort_keys=True,
         )

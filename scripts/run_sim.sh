@@ -26,6 +26,21 @@ MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
 MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
 MATRIX_UE_CAMERA_LAYOUT="${MATRIX_UE_CAMERA_LAYOUT:-$PROJECT_ROOT/config/runtime/matrix-ue-camera-layout-v1.json}"
+MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
+MATRIX_CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
+if [[ -n "$MATRIX_ITEM_INVENTORY_CATALOG" \
+    && -n "$MATRIX_CREATIVE_INVENTORY_CATALOG" \
+    && "$(realpath -m "$MATRIX_ITEM_INVENTORY_CATALOG")" \
+        != "$(realpath -m "$MATRIX_CREATIVE_INVENTORY_CATALOG")" ]]; then
+    echo "[ERROR] MATRIX_ITEM_INVENTORY_CATALOG conflicts with the legacy" \
+        "MATRIX_CREATIVE_INVENTORY_CATALOG alias" >&2
+    exit 1
+fi
+if [[ -z "$MATRIX_ITEM_INVENTORY_CATALOG" ]]; then
+    MATRIX_ITEM_INVENTORY_CATALOG="$MATRIX_CREATIVE_INVENTORY_CATALOG"
+fi
+MATRIX_CREATIVE_INVENTORY_CATALOG="$MATRIX_ITEM_INVENTORY_CATALOG"
+export MATRIX_ITEM_INVENTORY_CATALOG MATRIX_CREATIVE_INVENTORY_CATALOG
 CENTERED_CAMERA_OVERLAY_STEM="pakchunk99-MatrixCentered-Linux_P"
 MATRIX_GAME_CAMERA_DISTANCE_CM="${MATRIX_GAME_CAMERA_DISTANCE_CM:-150}"
 
@@ -704,12 +719,92 @@ USE_OFFSCREEN=""
 USE_PIXELSTREAMER=""
 [[ "$PIXELSTREAM" == "1" ]] && USE_PIXELSTREAMER="-PixelStreamingURL=ws://127.0.0.1:8888"
 
-UE_MAX_FPS="${MATRIX_UE_MAX_FPS:-30}"
+VIDEO_WIDTH="${MATRIX_VIDEO_APPLIED_WIDTH:-1920}"
+VIDEO_HEIGHT="${MATRIX_VIDEO_APPLIED_HEIGHT:-1080}"
+VIDEO_WINDOW_MODE="${MATRIX_VIDEO_APPLIED_WINDOW_MODE:-borderless}"
+VIDEO_QUALITY="${MATRIX_VIDEO_APPLIED_QUALITY:-high}"
+VIDEO_CAMERA_SMOOTHING="${MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING:-medium}"
+case "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" in
+    1280x720|1600x900|1920x1080|2560x1440) ;;
+    *)
+    echo "[ERROR] Invalid applied Matrix video resolution:" \
+        "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" >&2
+    exit 1
+        ;;
+esac
+case "$VIDEO_WINDOW_MODE" in
+    windowed) VIDEO_WINDOW_ARGS=(-windowed) ;;
+    borderless) VIDEO_WINDOW_ARGS=(-windowed -borderless) ;;
+    fullscreen) VIDEO_WINDOW_ARGS=(-fullscreen) ;;
+    *)
+        echo "[ERROR] Invalid Matrix video window mode: $VIDEO_WINDOW_MODE" >&2
+        exit 1
+        ;;
+esac
+case "$VIDEO_QUALITY" in
+    low) VIDEO_QUALITY_LEVEL=0 ;;
+    medium) VIDEO_QUALITY_LEVEL=1 ;;
+    high) VIDEO_QUALITY_LEVEL=2 ;;
+    epic) VIDEO_QUALITY_LEVEL=3 ;;
+    *)
+        echo "[ERROR] Invalid Matrix video quality preset: $VIDEO_QUALITY" >&2
+        exit 1
+        ;;
+esac
+case "$VIDEO_CAMERA_SMOOTHING" in
+    off)
+        VIDEO_CAMERA_LAG=false
+        VIDEO_CAMERA_LAG_SPEED=12
+        ;;
+    low)
+        VIDEO_CAMERA_LAG=true
+        VIDEO_CAMERA_LAG_SPEED=12
+        ;;
+    medium)
+        VIDEO_CAMERA_LAG=true
+        VIDEO_CAMERA_LAG_SPEED=8
+        ;;
+    high)
+        VIDEO_CAMERA_LAG=true
+        VIDEO_CAMERA_LAG_SPEED=4
+        ;;
+    *)
+        echo "[ERROR] Invalid Matrix camera smoothing preset:" \
+            "$VIDEO_CAMERA_SMOOTHING" >&2
+        exit 1
+        ;;
+esac
+UE_MAX_FPS="${MATRIX_VIDEO_APPLIED_FPS_LIMIT:-${MATRIX_UE_MAX_FPS:-30}}"
 if [[ ! "$UE_MAX_FPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] MATRIX_UE_MAX_FPS must be a non-negative number: $UE_MAX_FPS" >&2
     exit 1
 fi
+case "$UE_MAX_FPS" in
+    30|60|90|120) ;;
+    *)
+        echo "[ERROR] Matrix video FPS must be one of 30/60/90/120:" \
+            "$UE_MAX_FPS" >&2
+        exit 1
+        ;;
+esac
+VIDEO_REVISION="${MATRIX_VIDEO_APPLIED_REVISION:-0}"
+if [[ ! "$VIDEO_REVISION" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] Invalid Matrix video settings revision: $VIDEO_REVISION" >&2
+    exit 1
+fi
+if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
+    MATRIX_VIDEO_APPLIED_JSON="$(
+        printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+            "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+            "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
+            "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
+    )"
+    export MATRIX_VIDEO_APPLIED_JSON
+fi
 UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS,r.MotionBlurQuality 0"
+for group in ViewDistance AntiAliasing Shadow PostProcess Texture Effects Foliage Shading; do
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},sg.${group}Quality ${VIDEO_QUALITY_LEVEL}"
+done
 
 #######################################
 # 场景配置
@@ -980,8 +1075,10 @@ PY
                 ;;
         esac
     fi
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag False"
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag False"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag ${VIDEO_CAMERA_LAG}"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag ${VIDEO_CAMERA_LAG}"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent CameraLagSpeed ${VIDEO_CAMERA_LAG_SPEED}"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent CameraRotationLagSpeed ${VIDEO_CAMERA_LAG_SPEED}"
     UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bDoCollisionTest True"
     if $CENTERED_CAMERA_OVERLAY_ENABLED; then
         UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent TargetArmLength ${MATRIX_GAME_CAMERA_DISTANCE_CM}"
@@ -1279,6 +1376,9 @@ else
 fi
 UE_COMMAND+=(
     -game "$MAPNAME"
+    "-ResX=$VIDEO_WIDTH"
+    "-ResY=$VIDEO_HEIGHT"
+    "${VIDEO_WINDOW_ARGS[@]}"
     # The stock cooked package enables UE's legacy PlayerInput mouse
     # smoothing.  Override it in the Input config hierarchy so a released
     # drag has no interpolated tail; disabling FOV scaling also keeps one
@@ -1341,6 +1441,8 @@ if $MATRIX_SONIC_ENABLED; then
             "$PROJECT_ROOT/scripts/matrix_external_control.py" \
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
             "$PROJECT_ROOT/scripts/matrix_ui_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_video_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_item_asset_pack.py" \
             "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
             "$PROJECT_ROOT/scripts/matrix_celestial_ephemeris.py" \
             "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" \
@@ -1446,7 +1548,8 @@ if $MATRIX_SONIC_ENABLED; then
                 --native-scene "$NATIVE_SONIC_SCENE" \
                 --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
                 --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES" \
-                "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
+                "${SONIC_SCENE_TRANSFORM_ARGS[@]}" \
+                "${SONIC_INVENTORY_ARGS[@]}"
         )"
         GAME_WORLD_STATE_FILE="${MATRIX_GAME_WORLD_STATE_FILE:-}"
         if [[ -z "$GAME_WORLD_STATE_FILE" ]]; then
@@ -1869,6 +1972,8 @@ PY
         --game-mouse-sensitivity-deg "${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
         --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
         --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-local}/motion-control.json}"
+        --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-local}/video-settings.json}"
+        --game-applied-video-settings-json "${MATRIX_VIDEO_APPLIED_JSON:-}"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"

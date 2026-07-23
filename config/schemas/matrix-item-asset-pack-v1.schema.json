@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrix.local/schemas/matrix-item-asset-pack-v1.schema.json",
+  "title": "Matrix Item Asset Pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "pack"],
+  "properties": {
+    "schema": {"const": "matrix-item-asset-pack/v1"},
+    "pack": {"$ref": "#/$defs/pack"}
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,127}$"
+    },
+    "finiteNumber": {
+      "type": "number"
+    },
+    "vector3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {"$ref": "#/$defs/finiteNumber"}
+    },
+    "quaternion": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"$ref": "#/$defs/finiteNumber"}
+    },
+    "pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pack_id",
+        "revision",
+        "license",
+        "provenance",
+        "coordinate_frame",
+        "files",
+        "items"
+      ],
+      "properties": {
+        "pack_id": {"$ref": "#/$defs/identifier"},
+        "revision": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"
+        },
+        "license": {"$ref": "#/$defs/license"},
+        "provenance": {"$ref": "#/$defs/provenance"},
+        "coordinate_frame": {"$ref": "#/$defs/coordinateFrame"},
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": {"$ref": "#/$defs/file"}
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/item"}
+        }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spdx_id", "attribution"],
+      "properties": {
+        "spdx_id": {
+          "type": "string",
+          "pattern": "^(?:LicenseRef-[A-Za-z0-9][A-Za-z0-9.-]{0,127}|(?!LicenseRef-)[A-Za-z0-9][A-Za-z0-9.+-]{0,127})$"
+        },
+        "attribution": {"type": "string", "maxLength": 4096}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_name",
+        "source_uri",
+        "source_revision",
+        "source_item_ids"
+      ],
+      "properties": {
+        "source_name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "source_uri": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "source_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "source_item_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 256}
+        }
+      }
+    },
+    "coordinateFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "up_axis",
+        "forward_axis",
+        "handedness",
+        "meters_per_unit"
+      ],
+      "properties": {
+        "up_axis": {"enum": ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]},
+        "forward_axis": {"enum": ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]},
+        "handedness": {"enum": ["left", "right"]},
+        "meters_per_unit": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000000
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_id",
+        "path",
+        "size_bytes",
+        "sha256",
+        "role",
+        "media_type",
+        "format"
+      ],
+      "properties": {
+        "file_id": {"$ref": "#/$defs/identifier"},
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "role": {
+          "enum": [
+            "visual_mesh",
+            "license",
+            "provenance",
+            "material",
+            "texture",
+            "auxiliary"
+          ]
+        },
+        "media_type": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,127}$"
+        },
+        "format": {
+          "enum": [
+            "stl",
+            "obj",
+            "glb",
+            "gltf",
+            "fbx",
+            "usd",
+            "usda",
+            "usdc",
+            "text",
+            "markdown",
+            "mtl",
+            "png",
+            "jpeg",
+            "json",
+            "binary"
+          ]
+        }
+      }
+    },
+    "physics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mass_kg", "collision"],
+      "properties": {
+        "mass_kg": {
+          "type": "number",
+          "minimum": 0.001,
+          "maximum": 10000
+        },
+        "collision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["shape", "half_extents_m"],
+          "properties": {
+            "shape": {"const": "box"},
+            "half_extents_m": {
+              "type": "array",
+              "minItems": 3,
+              "maxItems": 3,
+              "items": {
+                "type": "number",
+                "minimum": 0.0001,
+                "maximum": 1000
+              }
+            }
+          }
+        }
+      }
+    },
+    "visualPart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "part_id",
+        "file_id",
+        "rgba",
+        "scale",
+        "translation_m",
+        "rotation_wxyz"
+      ],
+      "properties": {
+        "part_id": {"$ref": "#/$defs/identifier"},
+        "file_id": {"$ref": "#/$defs/identifier"},
+        "rgba": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {"type": "number", "minimum": 0, "maximum": 1}
+        },
+        "scale": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "number",
+            "minimum": 0.000001,
+            "maximum": 1000000
+          }
+        },
+        "translation_m": {"$ref": "#/$defs/vector3"},
+        "rotation_wxyz": {"$ref": "#/$defs/quaternion"}
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "label", "physics", "visual_parts"],
+      "properties": {
+        "item_id": {"$ref": "#/$defs/identifier"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 128},
+        "physics": {"$ref": "#/$defs/physics"},
+        "visual_parts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/visualPart"}
+        }
+      }
+    }
+  }
+}

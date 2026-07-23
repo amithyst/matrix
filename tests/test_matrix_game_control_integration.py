@@ -518,6 +518,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "run_sim.sh",
             "matrix_mouse_settings.py",
             "matrix_ui_settings.py",
+            "matrix_video_settings.py",
             "matrix_external_control.py",
             "matrix_motion_settings.py",
             "matrix_spawn_clearance.py",
@@ -529,6 +530,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "matrix_celestial_visuals.py",
             "bootstrap_matrix_celestial.sh",
             "matrix_mc_commands.py",
+            "matrix_item_asset_pack.py",
             "matrix_world_state.py",
             "compose_custom_scene.py",
             "prepare_sonic_physics_model.py",
@@ -1522,6 +1524,10 @@ printf '%s\n%s\n%s\n' \
             runtime_dir = project / "runtime"
             runtime_dir.mkdir()
             mouse_settings = project / "home/.config/matrix/mouse-control.json"
+            video_settings = (
+                project
+                / "home/.config/matrix/hosts/local/video-settings.json"
+            )
             xset_log = project / "xset.log"
             xset_state = project / "xset.state"
             material_fix = project / "outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
@@ -1529,6 +1535,20 @@ printf '%s\n%s\n%s\n' \
                 mouse_settings,
                 json.dumps(
                     {"version": 1, "profile": "remote", "speed_scale": 0.01}
+                ),
+            )
+            self.write(
+                video_settings,
+                json.dumps(
+                    {
+                        "version": 1,
+                        "revision": 7,
+                        "resolution": "1600x900",
+                        "window_mode": "windowed",
+                        "fps_limit": 90,
+                        "quality": "epic",
+                        "camera_smoothing": "off",
+                    }
                 ),
             )
             self.write(xset_log)
@@ -1543,6 +1563,7 @@ printf '%s\n%s\n%s\n' \
                     fixture["stale_status"]
                 ),
                 "MATRIX_MOUSE_SETTINGS_FILE": os.fspath(mouse_settings),
+                "MATRIX_VIDEO_SETTINGS_FILE": os.fspath(video_settings),
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
                 "MATRIX_G1_MATERIAL_PALETTE": (
                     "0.018,0.024,0.035;0.055,0.075,0.11;"
@@ -1677,16 +1698,34 @@ printf '%s\n%s\n%s\n' \
                 "bEnableFOVScaling=False",
                 ue_capture["command"],
             )
-            self.assertIn(
-                "-ExecCmds=t.MaxFPS 30,r.MotionBlurQuality 0,"
-                "set Engine.SpringArmComponent bEnableCameraLag False,"
-                "set Engine.SpringArmComponent bEnableCameraRotationLag False,"
-                "set Engine.SpringArmComponent bDoCollisionTest True,"
-                "viewclass MujocoSim_Custom_C,"
-                "set Engine.SpringArmComponent bEnableCameraLag True,"
-                "viewclass OperatorCamera_C",
-                ue_capture["command"],
+            self.assertIn("-ResX=1600", ue_capture["command"])
+            self.assertIn("-ResY=900", ue_capture["command"])
+            self.assertIn("-windowed", ue_capture["command"])
+            self.assertNotIn("-borderless", ue_capture["command"])
+            exec_commands = next(
+                argument
+                for argument in ue_capture["command"]
+                if argument.startswith("-ExecCmds=")
             )
+            self.assertIn("t.MaxFPS 90,r.MotionBlurQuality 0", exec_commands)
+            self.assertIn("sg.ViewDistanceQuality 3", exec_commands)
+            self.assertIn(
+                "set Engine.SpringArmComponent bEnableCameraLag false",
+                exec_commands,
+            )
+            self.assertIn(
+                "set Engine.SpringArmComponent CameraLagSpeed 12",
+                exec_commands,
+            )
+            self.assertLess(
+                exec_commands.index(
+                    "set Engine.SpringArmComponent bEnableCameraLag false"
+                ),
+                exec_commands.rindex(
+                    "set Engine.SpringArmComponent bEnableCameraLag True"
+                ),
+            )
+            self.assertTrue(exec_commands.endswith("viewclass OperatorCamera_C"))
 
             with mock.patch.object(
                 sys,
@@ -1703,6 +1742,20 @@ printf '%s\n%s\n%s\n' \
             self.assertEqual(parsed.game_applied_mouse_profile, "remote")
             self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.01)
             self.assertEqual(parsed.game_mouse_settings_file, mouse_settings)
+            self.assertEqual(parsed.game_video_settings_file, video_settings)
+            self.assertEqual(
+                json.loads(parsed.game_applied_video_settings_json),
+                {
+                    "camera_smoothing": "off",
+                    "fps_limit": 90,
+                    "quality": "epic",
+                    "resolution": "1600x900",
+                    "resolution_height": 900,
+                    "resolution_width": 1600,
+                    "revision": 7,
+                    "window_mode": "windowed",
+                },
+            )
             self.assertIsNotNone(parsed.game_restart_request_file)
             self.assertIsNotNone(parsed.game_restart_capability_file)
             self.assertGreater(parsed.game_restart_launcher_pid, 1)
@@ -2416,8 +2469,15 @@ print(json.dumps(payload, sort_keys=True))
             disabled_ue = json.loads(
                 fixture["ue_capture"].read_text(encoding="utf-8")
             )["command"]
+            disabled_exec_commands = next(
+                argument
+                for argument in disabled_ue
+                if argument.startswith("-ExecCmds=")
+            )
             self.assertIn(
-                "-ExecCmds=t.MaxFPS 30,r.MotionBlurQuality 0", disabled_ue
+                "-ExecCmds=t.MaxFPS 60,r.MotionBlurQuality 0,"
+                "sg.ViewDistanceQuality 2",
+                disabled_exec_commands,
             )
             self.assertFalse(any("SpringArmComponent" in arg for arg in disabled_ue))
             self.assertFalse(any("viewclass" in arg for arg in disabled_ue))

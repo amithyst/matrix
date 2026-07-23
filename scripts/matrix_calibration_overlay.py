@@ -458,7 +458,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_height = 32 if compact else 46
     tab_y = panel_y + (30 if compact else 76)
     tab_gap = 4 if compact else 8
-    tab_width = max(1, (panel_width - 2 * margin - 4 * tab_gap) // 5)
+    tab_width = max(1, (panel_width - 2 * margin - 5 * tab_gap) // 6)
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
@@ -611,6 +611,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         ),
         "tab_navigation": (
             panel_x + margin + 4 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_video": (
+            panel_x + margin + 5 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
@@ -773,6 +779,35 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             navigation_destination_width,
             navigation_destination_height,
         )
+    video_top = tab_y + tab_height + gap
+    video_bottom = apply_y - gap
+    video_row_gap = 4 if compact else 8
+    video_row_height = max(
+        24,
+        (video_bottom - video_top - 4 * video_row_gap) // 5,
+    )
+    video_button_width = max(34, min(64, panel_width // 14))
+    for index, field in enumerate(_VIDEO_SETTING_PRESETS):
+        row_y = video_top + index * (video_row_height + video_row_gap)
+        stem = f"video_{field}"
+        result[f"{stem}_down"] = (
+            panel_x + margin,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
+        result[f"{stem}_value"] = (
+            panel_x + margin + video_button_width,
+            row_y,
+            max(1, panel_width - 2 * margin - 2 * video_button_width),
+            video_row_height,
+        )
+        result[f"{stem}_up"] = (
+            panel_x + panel_width - margin - video_button_width,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
     return result
 
 
@@ -834,12 +869,44 @@ _MOTION_STEP_ACTION_DETAILS = {
 }
 _MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
 
+_VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
+    "resolution": ("1280x720", "1600x900", "1920x1080", "2560x1440"),
+    "window_mode": ("windowed", "borderless", "fullscreen"),
+    "fps_limit": (30, 60, 90, 120),
+    "quality": ("low", "medium", "high", "epic"),
+    "camera_smoothing": ("off", "low", "medium", "high"),
+}
+_VIDEO_SETTING_LABELS = {
+    "resolution": "分辨率",
+    "window_mode": "窗口模式",
+    "fps_limit": "帧率上限",
+    "quality": "画质档位",
+    "camera_smoothing": "相机平滑",
+}
+_VIDEO_VALUE_LABELS = {
+    "windowed": "窗口",
+    "borderless": "无边框",
+    "fullscreen": "全屏",
+    "low": "低",
+    "medium": "中",
+    "high": "高",
+    "epic": "极高",
+    "off": "关闭",
+}
+_VIDEO_STEP_ACTION_DETAILS = {
+    f"video_{field}_{suffix}": (field, direction)
+    for field in _VIDEO_SETTING_PRESETS
+    for suffix, direction in (("down", -1), ("up", 1))
+}
+_VIDEO_STEP_ACTIONS = tuple(_VIDEO_STEP_ACTION_DETAILS)
+
 _PANEL_TABS = (
     "tab_loadout",
     "tab_settings",
     "tab_console",
     "tab_inventory",
     "tab_navigation",
+    "tab_video",
 )
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
@@ -863,6 +930,7 @@ _PANEL_HIT_TARGETS = (
     + _POLICY_HIT_TARGETS
     + _INVENTORY_HIT_TARGETS
     + _NAVIGATION_HIT_TARGETS
+    + _VIDEO_STEP_ACTIONS
 )
 
 
@@ -904,6 +972,8 @@ def panel_action_at(
         targets = _PANEL_TABS + ("apply_return",) + _INVENTORY_HIT_TARGETS
     elif page == "navigation":
         targets = _PANEL_TABS + ("apply_return",) + _NAVIGATION_HIT_TARGETS
+    elif page == "video":
+        targets = _PANEL_TABS + ("apply_return",) + _VIDEO_STEP_ACTIONS
     for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
@@ -2034,6 +2104,83 @@ class MotionSettingsPanelModel:
         return motion_step_target(self, action) is not None
 
 
+@dataclass(frozen=True)
+class VideoSettingsPanelModel:
+    """Strict render-only view of provider-owned next-launch video settings."""
+
+    available: bool
+    revision: int
+    current: tuple[tuple[str, object], ...]
+    next_launch: tuple[tuple[str, object], ...]
+    pending_restart: bool
+    error: str | None
+
+    def value(self, field: str, *, applied: bool = False) -> object:
+        values = dict(self.current if applied else self.next_launch)
+        return values[field]
+
+    def stepped_value(self, action: str) -> object | None:
+        detail = _VIDEO_STEP_ACTION_DETAILS.get(action)
+        if detail is None or not self.available or self.error is not None:
+            return None
+        field, direction = detail
+        presets = _VIDEO_SETTING_PRESETS[field]
+        current = self.value(field)
+        try:
+            index = presets.index(current)
+        except ValueError:
+            return None
+        target = index + direction
+        return presets[target] if 0 <= target < len(presets) else None
+
+
+def _canonical_video_settings_mapping(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict) or set(value) != set(_VIDEO_SETTING_PRESETS):
+        return None
+    result: dict[str, object] = {}
+    for field, presets in _VIDEO_SETTING_PRESETS.items():
+        candidate = value.get(field)
+        if candidate not in presets or type(candidate) is not type(presets[0]):
+            return None
+        result[field] = candidate
+    return result
+
+
+def video_settings_panel_model(state: dict[str, object]) -> VideoSettingsPanelModel:
+    raw = state.get("video_settings")
+    raw = raw if isinstance(raw, dict) else {}
+    current = _canonical_video_settings_mapping(raw.get("current"))
+    next_launch = _canonical_video_settings_mapping(raw.get("next_launch"))
+    revision = raw.get("revision")
+    error_value = raw.get("persistence_error")
+    error = (
+        _bounded_status_text(error_value, maximum=256)
+        if isinstance(error_value, str)
+        else None
+    )
+    available = bool(
+        raw.get("available") is True
+        and current is not None
+        and next_launch is not None
+        and type(revision) is int
+        and 0 <= revision < 2**63
+    )
+    if current is None:
+        current = {
+            field: presets[0] for field, presets in _VIDEO_SETTING_PRESETS.items()
+        }
+    if next_launch is None:
+        next_launch = dict(current)
+    return VideoSettingsPanelModel(
+        available=available,
+        revision=revision if type(revision) is int and revision >= 0 else 0,
+        current=tuple(current.items()),
+        next_launch=tuple(next_launch.items()),
+        pending_restart=raw.get("pending_restart") is True,
+        error=error,
+    )
+
+
 def _motion_settings_candidate(state: dict[str, object]) -> object:
     direct = state.get("motion_settings")
     if direct is not None:
@@ -2476,6 +2623,8 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
     apply_return = apply_return if isinstance(apply_return, dict) else {}
     ui_settings = state.get("ui_settings")
     ui_settings = ui_settings if isinstance(ui_settings, dict) else {}
+    video_settings = state.get("video_settings")
+    video_settings = video_settings if isinstance(video_settings, dict) else {}
 
     def profile(value: object) -> str:
         return "Remote" if value == "remote" else "Local"
@@ -2494,17 +2643,27 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
 
     current_scale = preset(current.get("effective_scale"))
     next_scale = preset(next_launch.get("effective_scale"))
-    pending = settings.get("pending_restart") is True
+    pending = bool(
+        settings.get("pending_restart") is True
+        or video_settings.get("pending_restart") is True
+    )
     requested = restart.get("requested") is True
     restart_available = restart.get("available") is True
     persistence_error = settings.get("persistence_error")
     restart_error = restart.get("error")
     action_error = apply_return.get("error")
     ui_error = ui_settings.get("persistence_error")
+    video_error = video_settings.get("persistence_error")
     error_value = next(
         (
             value
-            for value in (persistence_error, ui_error, restart_error, action_error)
+            for value in (
+                persistence_error,
+                ui_error,
+                video_error,
+                restart_error,
+                action_error,
+            )
             if isinstance(value, str) and value
         ),
         None,
@@ -2694,6 +2853,31 @@ class PointerActionPublisher:
             {"destination_id": normalized},
         )
 
+    def publish_video_setting(
+        self,
+        field: str,
+        value: object,
+        *,
+        expected_revision: int,
+    ) -> None:
+        presets = _VIDEO_SETTING_PRESETS.get(field)
+        if (
+            presets is None
+            or value not in presets
+            or type(value) is not type(presets[0])
+            or type(expected_revision) is not int
+            or not 0 <= expected_revision < 2**63
+        ):
+            raise ValueError("video setting intent is invalid")
+        self._publish(
+            "video_setting",
+            {
+                "field": field,
+                "value": value,
+                "expected_revision": expected_revision,
+            },
+        )
+
     def close(self) -> None:
         self._socket.close()
 
@@ -2835,6 +3019,7 @@ class X11CalibrationOverlay:
         self._last_strategy_model: StrategyLoadoutModel | None = None
         self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_navigation_model: CelestialNavigationModel | None = None
+        self._last_video_model: VideoSettingsPanelModel | None = None
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = -1
@@ -4318,6 +4503,7 @@ class X11CalibrationOverlay:
             ("tab_console", "命令台", "console"),
             ("tab_inventory", "创造物品", "inventory"),
             ("tab_navigation", "星体导航", "navigation"),
+            ("tab_video", "视频设置", "video"),
         ):
             self._draw_button(
                 layout,
@@ -4741,6 +4927,61 @@ class X11CalibrationOverlay:
                 disabled=not enabled,
             )
 
+    def _draw_video_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: VideoSettingsPanelModel,
+    ) -> None:
+        for field, presets in _VIDEO_SETTING_PRESETS.items():
+            stem = f"video_{field}"
+            current = model.value(field)
+            try:
+                index = presets.index(current)
+            except ValueError:
+                index = -1
+            for suffix, allowed in (
+                ("down", index > 0),
+                ("up", 0 <= index < len(presets) - 1),
+            ):
+                enabled = bool(model.available and model.error is None and allowed)
+                self._draw_button(
+                    layout,
+                    f"{stem}_{suffix}",
+                    "‹" if suffix == "down" else "›",
+                    fill=self._colours["button" if enabled else "disabled"],
+                    disabled=not enabled,
+                )
+            label_value = _VIDEO_VALUE_LABELS.get(str(current), str(current))
+            if field == "fps_limit":
+                label_value = f"{current} FPS"
+            self._draw_text(
+                f"{_VIDEO_SETTING_LABELS[field]}  ·  {label_value}",
+                x=0,
+                y=0,
+                colour=self._colours["white" if model.available else "muted"],
+                centred_in=self._panel_rectangle(layout, f"{stem}_value"),
+            )
+        first_row = self._panel_rectangle(layout, "video_resolution_value")
+        status = (
+            f"保存失败：{model.error}"
+            if model.error is not None
+            else (
+                "已保存；返回游戏后将安全重启并应用"
+                if model.pending_restart
+                else "当前视频设置已生效"
+            )
+        )
+        self._draw_text(
+            status,
+            x=first_row[0],
+            y=max(18, first_row[1] - 8),
+            colour=self._colours[
+                "error"
+                if model.error is not None
+                else ("pending" if model.pending_restart else "muted")
+            ],
+        )
+
     @staticmethod
     def _celestial_status_label(status: str, *, refreshing: bool) -> str:
         if refreshing:
@@ -4948,6 +5189,7 @@ class X11CalibrationOverlay:
         motion_model: MotionSettingsPanelModel | None = None,
         inventory_model: CreativeInventoryModel | None = None,
         navigation_model: CelestialNavigationModel | None = None,
+        video_model: VideoSettingsPanelModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -4994,6 +5236,11 @@ class X11CalibrationOverlay:
             self._draw_navigation_page(
                 layout,
                 navigation_model or _unavailable_celestial_navigation(),
+            )
+        elif page == "video":
+            self._draw_video_page(
+                layout,
+                video_model or video_settings_panel_model({}),
             )
         apply_disabled = not model.action_enabled("apply_return")
         self._draw_button(
@@ -5283,6 +5530,34 @@ class X11CalibrationOverlay:
                                 candidate.policy_id,
                             )
                             emitted += 1
+                elif action in _VIDEO_STEP_ACTIONS:
+                    video_model = getattr(self, "_last_video_model", None)
+                    panel_model = self._last_panel_model
+                    target_value = (
+                        video_model.stepped_value(action)
+                        if video_model is not None
+                        else None
+                    )
+                    if (
+                        target_value is not None
+                        and panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting"}
+                    ):
+                        field, _direction = _VIDEO_STEP_ACTION_DETAILS[action]
+                        publisher.publish_video_setting(
+                            field,
+                            target_value,
+                            expected_revision=video_model.revision,
+                        )
+                        emitted += 1
                 elif action in _MOTION_STEP_ACTIONS:
                     motion_model = getattr(self, "_last_motion_model", None)
                     panel_model = self._last_panel_model
@@ -5339,6 +5614,7 @@ class X11CalibrationOverlay:
         strategy_model = strategy_loadout_model(state)
         inventory_model = creative_inventory_model(state)
         navigation_model = celestial_navigation_model(state)
+        video_model = video_settings_panel_model(state)
         command_status = command_console_status(state)
         self._command_editor.reconcile(command_status)
         model_changed = bool(
@@ -5348,6 +5624,7 @@ class X11CalibrationOverlay:
             or strategy_model != getattr(self, "_last_strategy_model", None)
             or inventory_model != getattr(self, "_last_inventory_model", None)
             or navigation_model != getattr(self, "_last_navigation_model", None)
+            or video_model != getattr(self, "_last_video_model", None)
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
             != getattr(self, "_last_rendered_font_size", None)
             or getattr(self, "_active_page", "loadout")
@@ -5388,6 +5665,7 @@ class X11CalibrationOverlay:
                 motion_model,
                 inventory_model,
                 navigation_model,
+                video_model,
             )
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
@@ -5425,6 +5703,7 @@ class X11CalibrationOverlay:
         self._last_strategy_model = strategy_model
         self._last_inventory_model = inventory_model
         self._last_navigation_model = navigation_model
+        self._last_video_model = video_model
         self._last_rendered_font_size = getattr(
             self,
             "_font_size",

@@ -513,6 +513,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-mouse-sensitivity-deg", type=float, default=0.12)
     parser.add_argument("--game-mouse-settings-file", type=Path)
     parser.add_argument("--game-motion-settings-file", type=Path)
+    parser.add_argument("--game-video-settings-file", type=Path)
+    parser.add_argument("--game-applied-video-settings-json")
     parser.add_argument(
         "--game-applied-mouse-profile",
         choices=("local", "remote"),
@@ -5201,6 +5203,8 @@ class NativeProcessGroup:
         keyboard_double_tap_window_s: float = 0.30,
         ue_camera_state_file: Path | None = None,
         mouse_settings_file: Path | None = None,
+        video_settings_file: Path | None = None,
+        applied_video_settings_json: str | None = None,
         applied_mouse_profile: str = "local",
         applied_mouse_speed_scale: float = 1.0,
         restart_request_file: Path | None = None,
@@ -5292,6 +5296,12 @@ class NativeProcessGroup:
             )
         if mouse_settings_file is not None:
             command.extend(("--mouse-settings-file", str(mouse_settings_file)))
+        if video_settings_file is not None:
+            command.extend(("--video-settings-file", str(video_settings_file)))
+        if applied_video_settings_json is not None:
+            command.extend(
+                ("--applied-video-settings-json", applied_video_settings_json)
+            )
         if ue_camera_state_file is not None:
             command.extend(("--ue-camera-state-file", str(ue_camera_state_file)))
         restart_values = (
@@ -8430,6 +8440,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ("game_world_resume_generation", None),
         ("game_resume_rollback_count", 0),
         ("game_auto_respawn", False),
+        ("game_video_settings_file", None),
+        ("game_applied_video_settings_json", None),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -8590,6 +8602,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             and not args.game_mouse_settings_file.is_absolute()
         ):
             raise SystemExit("--game-mouse-settings-file must be absolute")
+        if (
+            args.game_video_settings_file is not None
+            and not args.game_video_settings_file.is_absolute()
+        ):
+            raise SystemExit("--game-video-settings-file must be absolute")
         if args.game_camera_yaw_source == "ue-final-pov":
             if args.game_ue_camera_state_file is None:
                 raise SystemExit(
@@ -9126,6 +9143,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             args.game_keyboard_double_tap_window
                         ),
                         mouse_settings_file=args.game_mouse_settings_file,
+                        video_settings_file=args.game_video_settings_file,
+                        applied_video_settings_json=(
+                            args.game_applied_video_settings_json
+                        ),
                         applied_mouse_profile=args.game_applied_mouse_profile,
                         applied_mouse_speed_scale=(
                             args.game_applied_mouse_speed_scale

@@ -1,0 +1,248 @@
+{
+  "schema": "matrix-item-asset-import-recipe/v1",
+  "import": {
+    "pack": {
+      "pack_id": "kenney.blaster-kit-2-1.blaster-h",
+      "revision": "2.1-matrix-stl-v1",
+      "license": {
+        "spdx_id": "CC0-1.0",
+        "attribution": "Kenney, Blaster Kit 2.1; attribution is appreciated but not required."
+      },
+      "provenance": {
+        "source_name": "Kenney Blaster Kit",
+        "source_uri": "https://kenney.nl/assets/blaster-kit",
+        "source_revision": "2.1",
+        "source_item_ids": [
+          "blaster-h"
+        ]
+      },
+      "coordinate_frame": {
+        "up_axis": "+Z",
+        "forward_axis": "+X",
+        "handedness": "right",
+        "meters_per_unit": 1.0
+      },
+      "items": [
+        {
+          "item_id": "blaster-h",
+          "label": "Kenney Blaster H Prop",
+          "physics": {
+            "mass_kg": 1.2,
+            "collision": {
+              "shape": "box",
+              "half_extents_m": [
+                0.058,
+                0.096,
+                0.227
+              ]
+            }
+          },
+          "visual_parts": [
+            {
+              "part_id": "dark",
+              "file_id": "stl_dark",
+              "rgba": [
+                0.235294118,
+                0.235294118,
+                0.262745098,
+                1.0
+              ],
+              "scale": [
+                0.7,
+                0.7,
+                0.7
+              ],
+              "translation_m": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "rotation_wxyz": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "part_id": "graphite",
+              "file_id": "stl_graphite",
+              "rgba": [
+                0.42745098,
+                0.447058824,
+                0.541176471,
+                1.0
+              ],
+              "scale": [
+                0.7,
+                0.7,
+                0.7
+              ],
+              "translation_m": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "rotation_wxyz": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "part_id": "silver_blue",
+              "file_id": "stl_silver_blue",
+              "rgba": [
+                0.623529412,
+                0.650980392,
+                0.780392157,
+                1.0
+              ],
+              "scale": [
+                0.7,
+                0.7,
+                0.7
+              ],
+              "translation_m": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "rotation_wxyz": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            },
+            {
+              "part_id": "orange",
+              "file_id": "stl_orange",
+              "rgba": [
+                0.917647059,
+                0.384313725,
+                0.274509804,
+                1.0
+              ],
+              "scale": [
+                0.7,
+                0.7,
+                0.7
+              ],
+              "translation_m": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "rotation_wxyz": [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "files": [
+      {
+        "file_id": "license",
+        "source_path": "License.txt",
+        "target_path": "evidence/License.txt",
+        "role": "license",
+        "media_type": "text/plain",
+        "format": "text"
+      },
+      {
+        "file_id": "source_notes",
+        "source_path": "SOURCE.md",
+        "target_path": "evidence/SOURCE.md",
+        "role": "provenance",
+        "media_type": "text/markdown",
+        "format": "markdown"
+      },
+      {
+        "file_id": "source_glb",
+        "source_path": "blaster-h.glb",
+        "target_path": "source/blaster-h.glb",
+        "role": "auxiliary",
+        "media_type": "model/gltf-binary",
+        "format": "glb"
+      },
+      {
+        "file_id": "source_mtl",
+        "source_path": "blaster-h.mtl",
+        "target_path": "source/blaster-h.mtl",
+        "role": "material",
+        "media_type": "text/plain",
+        "format": "mtl"
+      },
+      {
+        "file_id": "source_obj",
+        "source_path": "blaster-h.obj",
+        "target_path": "source/blaster-h.obj",
+        "role": "auxiliary",
+        "media_type": "model/obj",
+        "format": "obj"
+      },
+      {
+        "file_id": "preview",
+        "source_path": "blaster-h.png",
+        "target_path": "source/blaster-h.png",
+        "role": "auxiliary",
+        "media_type": "image/png",
+        "format": "png"
+      },
+      {
+        "file_id": "colormap",
+        "source_path": "colormap.png",
+        "target_path": "source/colormap.png",
+        "role": "texture",
+        "media_type": "image/png",
+        "format": "png"
+      },
+      {
+        "file_id": "legacy_catalog",
+        "source_path": "creative-inventory.json",
+        "target_path": "evidence/creative-inventory.json",
+        "role": "provenance",
+        "media_type": "application/json",
+        "format": "json"
+      },
+      {
+        "file_id": "stl_dark",
+        "source_path": "training_blaster_dark.stl",
+        "target_path": "meshes/dark.stl",
+        "role": "visual_mesh",
+        "media_type": "model/stl",
+        "format": "stl"
+      },
+      {
+        "file_id": "stl_graphite",
+        "source_path": "training_blaster_graphite.stl",
+        "target_path": "meshes/graphite.stl",
+        "role": "visual_mesh",
+        "media_type": "model/stl",
+        "format": "stl"
+      },
+      {
+        "file_id": "stl_orange",
+        "source_path": "training_blaster_orange.stl",
+        "target_path": "meshes/orange.stl",
+        "role": "visual_mesh",
+        "media_type": "model/stl",
+        "format": "stl"
+      },
+      {
+        "file_id": "stl_silver_blue",
+        "source_path": "training_blaster_silver_blue.stl",
+        "target_path": "meshes/silver-blue.stl",
+        "role": "visual_mesh",
+        "media_type": "model/stl",
+        "format": "stl"
+      }
+    ]
+  }
+}
