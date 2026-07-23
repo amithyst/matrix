@@ -72,15 +72,23 @@ from matrix_motion_settings import (
     MotionSettingsStore,
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
+from matrix_moon_dynamic_ground import (
+    LOCKED_MOONWORLD_SHA256,
+    MoonDynamicGround,
+    MoonDynamicGroundError,
+)
 from matrix_policy_slots import (
     BFM_TEACHER50K_POLICY_ID,
     PolicyCandidateState,
     evaluate_policy_candidate,
 )
+from prepare_sonic_physics_model import MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM
 from matrix_spawn_clearance import (
     AUDIT_SCHEMA as SPAWN_CLEARANCE_AUDIT_SCHEMA,
+    GROUND_SUPPORT_SCHEMA,
     apply_root_pose_and_audit,
     audit_spawn_clearance,
+    audit_spawn_safety,
 )
 from matrix_world_state import (
     MAX_RESUME_CHECKPOINTS,
@@ -130,7 +138,7 @@ _GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES = (
     "snapshot_sim_time_not_increasing:",
 )
 _GAME_WORLD_ROLLBACK_CLEARANCE_REASONS = frozenset(
-    {"scene_penetration", "unsafe_foot_contact"}
+    {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
 )
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
@@ -234,6 +242,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--sonic-root", type=Path, required=True)
+    parser.add_argument("--moon-dynamic-map", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--moon-dynamic-map-sha256", help=argparse.SUPPRESS)
     parser.add_argument(
         "--control-source",
         choices=("planner", "game", "pico", "external"),
@@ -1009,6 +1019,74 @@ def _regular_json(path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
+def _validate_moon_dynamic_ground_model_binding(
+    model_path: Path,
+    *,
+    map_path: Path | None,
+    map_sha256: str | None,
+) -> None:
+    """Bind the rolling-height-map runtime to its exact derived model contract."""
+
+    dynamic_values = (map_path, map_sha256)
+    if any(value is not None for value in dynamic_values) and not all(
+        value is not None for value in dynamic_values
+    ):
+        raise SystemExit("MoonWorld dynamic map arguments are all-or-none")
+
+    dynamic_enabled = all(value is not None for value in dynamic_values)
+    if map_path is not None:
+        if (
+            not map_path.is_absolute()
+            or map_path.is_symlink()
+            or not map_path.is_file()
+        ):
+            raise SystemExit(
+                "--moon-dynamic-map must be an absolute regular non-symlink file"
+            )
+        if map_sha256 != LOCKED_MOONWORLD_SHA256:
+            raise SystemExit(
+                "--moon-dynamic-map-sha256 does not match the locked MoonWorld map"
+            )
+
+    manifest_path = model_path.parent / "manifest.json"
+    scene_transform = None
+    if manifest_path.exists() or manifest_path.is_symlink():
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise SystemExit(
+                f"physics model manifest must be a regular non-symlink file: "
+                f"{manifest_path}"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise SystemExit(
+                f"invalid physics model manifest {manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise SystemExit(
+                f"invalid physics model manifest object: {manifest_path}"
+            )
+        scene_transform = manifest.get("scene_transform")
+        if scene_transform is not None and (
+            not isinstance(scene_transform, str) or not scene_transform
+        ):
+            raise SystemExit("physics model manifest has an invalid scene transform")
+
+    model_requires_dynamic_ground = (
+        scene_transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM
+    )
+    if model_requires_dynamic_ground and not dynamic_enabled:
+        raise SystemExit(
+            "moon-dynamic-ground-mocap-v3 physics model requires the locked "
+            "MoonWorld dynamic map arguments"
+        )
+    if dynamic_enabled and not model_requires_dynamic_ground:
+        raise SystemExit(
+            "MoonWorld dynamic map arguments require a "
+            "moon-dynamic-ground-mocap-v3 physics model manifest"
+        )
+
+
 def _validate_qualified_model(
     args: argparse.Namespace,
     model_path: Path,
@@ -1638,10 +1716,76 @@ def _snapshot_world_pose(snapshot: Any) -> WorldPose:
         raise WorldStateError(f"snapshot does not contain a valid root pose: {exc}") from exc
 
 
+def _final_checkpoint_disposition(
+    clearance_audit: object,
+    resume_source: object,
+) -> str:
+    if isinstance(clearance_audit, dict) and clearance_audit.get("safe") is True:
+        if resume_source == "upright_checkpoint":
+            return "saved_current_pose"
+        if resume_source == "fallen_xy_last_safe_upright":
+            return "saved_recovered_safe_pose"
+    return "retained_previous_safe"
+
+
+def _install_moon_relative_fall_check(
+    environment: Any,
+    dynamic_ground: MoonDynamicGround,
+) -> None:
+    """Replace SONIC's sea-level fall test with terrain-relative clearance."""
+
+    for name in (
+        "check_fall",
+        "fall",
+        "fall_detected",
+        "mj_data",
+        "reset_on_fall",
+    ):
+        if not hasattr(environment, name):
+            raise MoonDynamicGroundError(
+                f"SONIC environment is missing MoonWorld fall field {name!r}"
+            )
+    if not callable(getattr(environment, "reset", None)):
+        raise MoonDynamicGroundError(
+            "SONIC environment has no callable reset for MoonWorld fall handling"
+        )
+
+    def check_relative_fall() -> None:
+        try:
+            qpos = environment.mj_data.qpos
+            root_x = float(qpos[0])
+            root_y = float(qpos[1])
+            root_z = float(qpos[2])
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise MoonDynamicGroundError(
+                "SONIC MoonWorld fall check cannot read root qpos"
+            ) from exc
+        ground_z = dynamic_ground.sample_height(root_x, root_y)
+        root_clearance = root_z - ground_z
+        if not math.isfinite(root_clearance):
+            raise MoonDynamicGroundError(
+                "SONIC MoonWorld root clearance is non-finite"
+            )
+        environment.fall = root_clearance < 0.2
+        if environment.fall:
+            environment.fall_detected = True
+            print(
+                "Warning: Robot has fallen, terrain-relative height: "
+                f"{root_clearance:.3f} m "
+                f"(root_z={root_z:.3f}, ground_z={ground_z:.3f})",
+                flush=True,
+            )
+            if bool(environment.reset_on_fall):
+                environment.reset(reason="fall")
+
+    environment.check_fall = check_relative_fall
+
+
 def _snapshot_world_upright(
     snapshot: Any,
     *,
     current_fall_detected: bool | None = None,
+    ground_height_m: float = 0.0,
 ) -> bool:
     try:
         if current_fall_detected is not None and type(current_fall_detected) is not bool:
@@ -1652,12 +1796,16 @@ def _snapshot_world_upright(
             else current_fall_detected
         )
         qvel = snapshot.qvel
+        ground_height = float(ground_height_m)
+        if not math.isfinite(ground_height):
+            raise ValueError("ground height must be finite")
         vertical_speed = float(qvel[2])
         roll_rate = float(qvel[3])
         pitch_rate = float(qvel[4])
         return bool(
             not current_fall
-            and float(snapshot.qpos[2]) >= _WORLD_SAFE_MIN_ROOT_Z
+            and float(snapshot.qpos[2]) - ground_height
+            >= _WORLD_SAFE_MIN_ROOT_Z
             and _root_up_z(snapshot.qpos) >= _WORLD_SAFE_MIN_ROOT_UP_Z
             and math.isfinite(vertical_speed)
             and abs(vertical_speed) <= _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S
@@ -1763,6 +1911,7 @@ class _GameWorldStateRuntime:
         force: bool = False,
         required: bool = False,
         current_fall_detected: bool | None = None,
+        ground_height_m: float = 0.0,
     ) -> bool:
         now = float(now_s)
         if not math.isfinite(now) or now < 0.0:
@@ -1812,6 +1961,7 @@ class _GameWorldStateRuntime:
                 upright=_snapshot_world_upright(
                     snapshot,
                     current_fall_detected=current_fall_detected,
+                    ground_height_m=ground_height_m,
                 ),
                 clearance_safe=clearance_safe,
             )
@@ -2212,14 +2362,20 @@ class _GameFallRecoveryGate:
         self.native_mode = SONIC_IDLE_MODE
         self.target_height = -1.0
 
-    def observe(self, snapshot: Any, *, now_s: float) -> str | None:
+    def observe(
+        self,
+        snapshot: Any,
+        *,
+        now_s: float,
+        ground_height_m: float = 0.0,
+    ) -> str | None:
         """Observe one control-frame snapshot and return a transition name."""
 
         now = float(now_s)
         if not math.isfinite(now) or now < 0.0:
             raise ValueError("fall recovery time must be non-negative and finite")
         try:
-            root_z = float(snapshot.qpos[2])
+            root_z = float(snapshot.qpos[2]) - float(ground_height_m)
             root_up_z = _root_up_z(snapshot.qpos)
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
             raise ValueError("fall recovery requires a valid root pose") from exc
@@ -2857,6 +3013,7 @@ class _GameWorldResumeProbation:
         now_s: float,
         current_fall_detected: bool | None = None,
         control_frame_boundary: bool = True,
+        ground_height_m: float = 0.0,
     ) -> dict[str, object] | None:
         """Advance probation and return the first fail-closed audit, if any."""
 
@@ -2887,6 +3044,7 @@ class _GameWorldResumeProbation:
             and _snapshot_world_upright(
                 snapshot,
                 current_fall_detected=current_fall_detected,
+                ground_height_m=ground_height_m,
             )
         )
         if stable_idle:
@@ -3150,6 +3308,7 @@ def _handle_game_auto_respawn_fall(
     snapshot: Any,
     checkpoint_writes_blocked: bool,
     now_s: float,
+    ground_height_m: float = 0.0,
 ) -> tuple[str, RobotMotionCommand]:
     """Stop every fall, but persist/reload only after writes are armed."""
 
@@ -3160,12 +3319,17 @@ def _handle_game_auto_respawn_fall(
     planner.send_game_command(game_command)
     if checkpoint_writes_blocked:
         return "fall_detected", game_command
-    game_world.checkpoint(
+    saved = game_world.checkpoint(
         snapshot,
         now_s=now_s,
         force=True,
-        required=True,
+        required=False,
+        ground_height_m=ground_height_m,
     )
+    if not saved:
+        raise WorldStateError(
+            game_world.last_error or "cannot retain fall observation"
+        )
     return "game_fall_respawn", game_command
 
 
@@ -3348,7 +3512,8 @@ def _spawn_clearance_rollback_reason(
     """Return the typed rollback reason for a trusted collision audit.
 
     Parser/model failures deliberately stay outside the rollback allowlist:
-    only an actual classified scene collision may quarantine a checkpoint.
+    only classified scene collision or exact no-ground evidence may quarantine
+    a checkpoint.
     """
 
     if not isinstance(audit, dict):
@@ -3361,6 +3526,107 @@ def _spawn_clearance_rollback_reason(
         or reason not in _GAME_WORLD_ROLLBACK_CLEARANCE_REASONS
     ):
         return None
+    if reason == "no_ground_support":
+        support = audit.get("support")
+        rejected_count = audit.get("rejected_contact_count")
+        required_hits = (
+            support.get("required_hits") if isinstance(support, dict) else None
+        )
+        accepted_hits = (
+            support.get("accepted_hits") if isinstance(support, dict) else None
+        )
+        ray_direction = (
+            support.get("ray_direction") if isinstance(support, dict) else None
+        )
+        if (
+            not isinstance(support, dict)
+            or support.get("schema") != GROUND_SUPPORT_SCHEMA
+            or support.get("supported") is not False
+            or isinstance(required_hits, bool)
+            or not isinstance(required_hits, int)
+            or required_hits != 1
+            or isinstance(accepted_hits, bool)
+            or not isinstance(accepted_hits, int)
+            or accepted_hits != 0
+            or support.get("method") != "downward_foot_geom_rays"
+            or support.get("maximum_drop_m") != 0.12
+            or support.get("minimum_normal_z") != 0.8
+            or not isinstance(ray_direction, list)
+            or len(ray_direction) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in ray_direction
+            )
+            or [float(value) for value in ray_direction]
+            != [0.0, 0.0, -1.0]
+            or isinstance(rejected_count, bool)
+            or rejected_count != 0
+        ):
+            return None
+        probes = support.get("probes")
+        if not isinstance(probes, list) or len(probes) != 2:
+            return None
+        expected_names = {
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+        }
+        observed_names: set[str] = set()
+        for probe in probes:
+            if not isinstance(probe, dict):
+                return None
+            foot_body = probe.get("foot_body")
+            origins = probe.get("origins")
+            if (
+                not isinstance(foot_body, dict)
+                or isinstance(foot_body.get("id"), bool)
+                or not isinstance(foot_body.get("id"), int)
+                or int(foot_body["id"]) <= 0
+                or foot_body.get("name") not in expected_names
+                or not isinstance(origins, list)
+                or not 1 <= len(origins) <= 32
+                or probe.get("accepted") is not False
+                or probe.get("distance_m") is not None
+                or probe.get("normal") is not None
+                or probe.get("probe_geom") is not None
+                or probe.get("ray_origin_m") is not None
+                or probe.get("scene_geom") is not None
+            ):
+                return None
+            observed_geom_ids: set[int] = set()
+            for origin in origins:
+                if not isinstance(origin, dict):
+                    return None
+                geom_id = origin.get("geom_id")
+                geom_name = origin.get("geom_name")
+                position = origin.get("position_m")
+                if (
+                    isinstance(geom_id, bool)
+                    or not isinstance(geom_id, int)
+                    or geom_id < 0
+                    or geom_id in observed_geom_ids
+                    or (
+                        geom_name is not None
+                        and (
+                            not isinstance(geom_name, str)
+                            or not geom_name
+                            or len(geom_name) > 256
+                        )
+                    )
+                    or not isinstance(position, list)
+                    or len(position) != 3
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        for value in position
+                    )
+                ):
+                    return None
+                observed_geom_ids.add(geom_id)
+            observed_names.add(str(foot_body["name"]))
+        return str(reason) if observed_names == expected_names else None
     rejected_count = audit.get("rejected_contact_count")
     worst = audit.get("worst")
     if (
@@ -4988,7 +5254,7 @@ class GameCommandRuntime:
                                     ok=False,
                                     code="E_SPAWN_CLEARANCE",
                                     message=(
-                                        "Teleport target intersects scene geometry"
+                                        "Teleport target is not a safe supported spawn pose"
                                     ),
                                     data={"spawn_clearance": clearance},
                                 )
@@ -7343,8 +7609,14 @@ class _PhysicalRecoveryCoordinator:
             raise RuntimeError("initial gated SONIC has no process PID")
         self.sonic_writer.bind_expected_peer_pid(deploy_pid)
 
-    def _fall_level(self, snapshot: Any, now_s: float) -> bool:
-        root_z = float(snapshot.qpos[2])
+    def _fall_level(
+        self,
+        snapshot: Any,
+        now_s: float,
+        *,
+        ground_height_m: float = 0.0,
+    ) -> bool:
+        root_z = float(snapshot.qpos[2]) - float(ground_height_m)
         root_up_z = _root_up_z(snapshot.qpos)
         pose_candidate = (
             root_z < self.POSE_TRIGGER_HEIGHT_M
@@ -7494,6 +7766,7 @@ class _PhysicalRecoveryCoordinator:
         foot_contact: bool,
         grounded_contact: bool,
         processes: NativeProcessGroup,
+        ground_height_m: float = 0.0,
     ) -> RecoveryOutput | ResidentRecoveryOutput:
         self.worker.poll()
         self.sonic_writer.poll()
@@ -7521,7 +7794,7 @@ class _PhysicalRecoveryCoordinator:
         joint_rms = math.sqrt(
             sum(value * value for value in joint_values) / len(joint_values)
         )
-        root_z = float(snapshot.qpos[2])
+        root_z = float(snapshot.qpos[2]) - float(ground_height_m)
         root_up_z = _root_up_z(snapshot.qpos)
         policy_alive = processes.recovery_policy_alive()
         worker_controller = (
@@ -7536,7 +7809,11 @@ class _PhysicalRecoveryCoordinator:
             )
             resident_observation = ResidentRecoveryInput(
                 now_s=now_s,
-                fall_detected=self._fall_level(snapshot, now_s),
+                fall_detected=self._fall_level(
+                    snapshot,
+                    now_s,
+                    ground_height_m=ground_height_m,
+                ),
                 root_z_m=root_z,
                 root_up_z=root_up_z,
                 root_linear_speed_m_s=root_linear_speed,
@@ -7612,7 +7889,11 @@ class _PhysicalRecoveryCoordinator:
         gated_deploy = self.sonic_writer.expected_peer_pid is not None
         observation = RecoveryInput(
             now_s=now_s,
-            fall_detected=self._fall_level(snapshot, now_s),
+            fall_detected=self._fall_level(
+                snapshot,
+                now_s,
+                ground_height_m=ground_height_m,
+            ),
             root_z_m=root_z,
             root_up_z=root_up_z,
             root_linear_speed_m_s=root_linear_speed,
@@ -8443,6 +8724,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ("game_auto_respawn", False),
         ("game_video_settings_file", None),
         ("game_applied_video_settings_json", None),
+        ("moon_dynamic_map", None),
+        ("moon_dynamic_map_sha256", None),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -8452,6 +8735,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     model_path = args.model.resolve()
     if not model_path.is_file():
         raise SystemExit(f"composed Matrix model is missing: {model_path}")
+    _validate_moon_dynamic_ground_model_binding(
+        model_path,
+        map_path=args.moon_dynamic_map,
+        map_sha256=args.moon_dynamic_map_sha256,
+    )
     if args.physics_hz <= 0.0 or args.control_hz <= 0.0:
         raise SystemExit("--physics-hz and --control-hz must be positive")
     if not math.isfinite(args.max_seconds) or args.max_seconds < 0.0:
@@ -8840,16 +9128,47 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     config = SimLoopConfig(**_native_config_kwargs(args, model_path))
     simulator = None
     creative_inventory = None
+    moon_dynamic_ground: MoonDynamicGround | None = None
     expected_snapshot_dims = _EXPECTED_SNAPSHOT_DIMS
     mujoco_module = sys.modules.get("mujoco")
 
     def pose_clearance_audit(pose: WorldPose) -> dict[str, object]:
         model = getattr(getattr(simulator, "sim_env", None), "mj_model", None)
-        return apply_root_pose_and_audit(mujoco_module, model, pose)
+        return apply_root_pose_and_audit(
+            mujoco_module,
+            model,
+            pose,
+            data_preparer=(
+                moon_dynamic_ground.update_mocap
+                if moon_dynamic_ground is not None
+                else None
+            ),
+        )
+
+    def local_ground_height(snapshot: Any) -> float:
+        if moon_dynamic_ground is None:
+            return 0.0
+        try:
+            return moon_dynamic_ground.sample_height(
+                snapshot.qpos[0],
+                snapshot.qpos[1],
+            )
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise MoonDynamicGroundError(
+                "MoonWorld snapshot has no finite root x/y"
+            ) from exc
 
     def live_clearance_audit() -> dict[str, object]:
         environment = getattr(simulator, "sim_env", None)
         return audit_spawn_clearance(
+            getattr(environment, "mj_model", None),
+            getattr(environment, "mj_data", None),
+        )
+
+    def live_checkpoint_audit() -> dict[str, object]:
+        environment = getattr(simulator, "sim_env", None)
+        return audit_spawn_safety(
+            mujoco_module,
             getattr(environment, "mj_model", None),
             getattr(environment, "mj_data", None),
         )
@@ -8928,7 +9247,32 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     f"cannot initialize creative inventory: {exc}"
                 ) from exc
             expected_snapshot_dims = creative_inventory.expected_snapshot_dimensions
+        if args.moon_dynamic_map is not None:
+            environment = getattr(simulator, "sim_env", None)
+            model = getattr(environment, "mj_model", None)
+            data = getattr(environment, "mj_data", None)
+            if mujoco_module is None or model is None or data is None:
+                raise SystemExit(
+                    "MoonWorld dynamic ground requires live MuJoCo model/data"
+                )
+            try:
+                moon_dynamic_ground = MoonDynamicGround(
+                    args.moon_dynamic_map,
+                    model,
+                    expected_sha256=args.moon_dynamic_map_sha256,
+                )
+                moon_dynamic_ground.update_mocap(data)
+                mujoco_module.mj_forward(model, data)
+                _install_moon_relative_fall_check(
+                    environment,
+                    moon_dynamic_ground,
+                )
+            except (MoonDynamicGroundError, OSError, ValueError) as exc:
+                raise SystemExit(
+                    f"cannot initialize MoonWorld dynamic ground: {exc}"
+                ) from exc
         snapshot = simulator.get_state_snapshot()
+        initial_ground_height_m = local_ground_height(snapshot)
         initial_snapshot_error = _snapshot_validation_error(
             snapshot,
             expected_dims=expected_snapshot_dims,
@@ -8968,18 +9312,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         args.game_world_resume_checkpoint_id
                     ),
                     selected_resume_generation=args.game_world_resume_generation,
-                    clearance_auditor=live_clearance_audit,
+                    clearance_auditor=live_checkpoint_audit,
                 )
                 if (
                     running
                     and resume_probation.checkpoint_writes_armed
-                    and _snapshot_world_upright(snapshot)
+                    and _snapshot_world_upright(
+                        snapshot,
+                        ground_height_m=initial_ground_height_m,
+                    )
                 ):
                     game_world.checkpoint(
                         snapshot,
                         now_s=time.perf_counter(),
                         force=True,
                         required=bool(args.game_auto_respawn),
+                        ground_height_m=initial_ground_height_m,
                     )
             except WorldStateError as exc:
                 raise SystemExit(f"cannot initialize game world state: {exc}") from exc
@@ -9348,6 +9696,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         unstable = False
         fall_detected = bool(snapshot.fall_detected)
         min_root_z = float(snapshot.qpos[2])
+        min_root_clearance_m = min_root_z - initial_ground_height_m
+        snapshot_ground_height_m = initial_ground_height_m
         active_started_wall = None
         longest_active_elapsed_s = 0.0
         walking = False
@@ -9357,6 +9707,18 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             if poll_failed_child():
                 break
             frame_wall = time.perf_counter()
+            try:
+                frame_ground_height_m = local_ground_height(snapshot)
+            except MoonDynamicGroundError as exc:
+                unstable = True
+                running = False
+                termination_reason = "numerical_instability"
+                numerical_error = f"moon_dynamic_ground:{exc}"
+                print(
+                    f"matrix-sonic-runtime ERROR MoonWorld ground sample: {exc}",
+                    flush=True,
+                )
+                break
             elapsed_wall = frame_wall - started_wall
             if args.max_seconds > 0.0 and elapsed_wall >= args.max_seconds:
                 if termination_reason is None:
@@ -9389,6 +9751,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             recovery_transition = game_fall_recovery.observe(
                                 snapshot,
                                 now_s=frame_wall,
+                                ground_height_m=frame_ground_height_m,
                             )
                         except ValueError as exc:
                             unstable = True
@@ -9460,6 +9823,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 foot_contact=foot_contact,
                                 grounded_contact=grounded_contact,
                                 processes=processes,
+                                ground_height_m=frame_ground_height_m,
                             )
                         except (OSError, RuntimeError, ValueError) as exc:
                             stop_for_physical_recovery_exception(
@@ -9579,6 +9943,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     foot_contact=foot_contact,
                                     grounded_contact=grounded_contact,
                                     processes=processes,
+                                    ground_height_m=frame_ground_height_m,
                                 )
                                 physical_recovery.verify_writer_free_prewarm_start(
                                     physical_output,
@@ -9680,6 +10045,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 # of emitting four back-to-back steps once per 50 Hz frame.
                 # Matrix owns the absolute deadline because SONIC's relative
                 # per-step sleep otherwise accumulates scheduler overshoot.
+                if moon_dynamic_ground is not None:
+                    try:
+                        moon_dynamic_ground.update_mocap(
+                            simulator.sim_env.mj_data
+                        )
+                    except MoonDynamicGroundError as exc:
+                        unstable = True
+                        running = False
+                        termination_reason = "numerical_instability"
+                        numerical_error = f"moon_dynamic_ground:{exc}"
+                        print(
+                            "matrix-sonic-runtime ERROR MoonWorld tile update: "
+                            f"{exc}",
+                            flush=True,
+                        )
+                        break
                 next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
                 # Record fail-closed resume evidence before validating the
@@ -9702,6 +10083,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     )
                     break
                 snapshot = next_snapshot
+                try:
+                    snapshot_ground_height_m = local_ground_height(snapshot)
+                except MoonDynamicGroundError as exc:
+                    unstable = True
+                    running = False
+                    termination_reason = "numerical_instability"
+                    numerical_error = f"moon_dynamic_ground:{exc}"
+                    print(
+                        "matrix-sonic-runtime ERROR MoonWorld ground sample: "
+                        f"{exc}",
+                        flush=True,
+                    )
+                    break
                 if heading_anchor_telemetry is not None:
                     try:
                         heading_anchor_telemetry.observe(
@@ -9741,6 +10135,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                         resume_probation.checkpoint_writes_blocked
                                     ),
                                     now_s=fall_wall,
+                                    ground_height_m=snapshot_ground_height_m,
                                 )
                             )
                         except WorldStateError as exc:
@@ -9789,6 +10184,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         control_frame_boundary=(
                             substep_index == substeps - 1
                         ),
+                        ground_height_m=snapshot_ground_height_m,
                     )
                     if probation_audit is not None:
                         spawn_clearance_audit = probation_audit
@@ -9838,6 +10234,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         game_fall_recovery=game_fall_recovery,
                         physical_recovery=physical_recovery,
                     ),
+                    ground_height_m=snapshot_ground_height_m,
                 )
             if active_lowcmd:
                 if active_started_wall is None:
@@ -9852,8 +10249,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 active_elapsed = 0.0
 
             root_z = float(snapshot.qpos[2])
+            root_clearance_m = root_z - snapshot_ground_height_m
             root_up_z = _root_up_z(snapshot.qpos)
             min_root_z = min(min_root_z, root_z)
+            min_root_clearance_m = min(
+                min_root_clearance_m,
+                root_clearance_m,
+            )
             # SONIC is the sole fall authority. Height and orientation remain
             # diagnostics only, so Matrix cannot disagree with its snapshot.
             fall_detected = fall_detected or bool(snapshot.fall_detected)
@@ -9902,6 +10304,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "min_final_x": args.min_final_x,
                     "min_forward_x_m": args.min_forward_x_m,
                     "min_root_z": round(min_root_z, 5),
+                    "min_root_clearance_m": round(
+                        min_root_clearance_m,
+                        5,
+                    ),
                     "physics_hz_target": physics_hz,
                     "physics_step_hz": round(window_physics_steps / window_wall, 3),
                     "render_hz": round(window_render / window_wall, 3),
@@ -9913,6 +10319,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "ue_state_sync_hz": round(window_render / window_wall, 3),
                     "ue_pid": args.ue_pid,
                     "root_xyz": [round(float(value), 5) for value in snapshot.qpos[:3]],
+                    "local_ground_z_m": round(snapshot_ground_height_m, 6),
+                    "root_clearance_m": round(root_clearance_m, 6),
                     "root_displacement_xy_m": round(
                         float(
                             np.linalg.norm(
@@ -9972,6 +10380,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 if game_world is not None:
                     status["game_world_state"] = game_world.telemetry()
                     status["game_auto_respawn"] = bool(args.game_auto_respawn)
+                if moon_dynamic_ground is not None:
+                    status["moon_dynamic_ground"] = (
+                        moon_dynamic_ground.telemetry()
+                    )
                 if resume_probation.enabled:
                     status["resume_probation"] = resume_probation.telemetry(
                         now_s=now
@@ -10072,17 +10484,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             and resume_probation.checkpoint_writes_armed
         ):
             try:
-                game_world.checkpoint(
+                checkpoint_saved = game_world.checkpoint(
                     snapshot,
                     now_s=time.perf_counter(),
                     force=True,
-                    required=True,
+                    required=False,
                     current_fall_detected=_game_world_current_fall_detected(
                         snapshot,
                         game_fall_recovery=game_fall_recovery,
                         physical_recovery=physical_recovery,
                     ),
+                    ground_height_m=snapshot_ground_height_m,
                 )
+                if not checkpoint_saved:
+                    raise WorldStateError(
+                        game_world.last_error or "cannot retain final observation"
+                    )
                 final_world = game_world.telemetry()
                 final_checkpoint_id = final_world.get(
                     "active_resume_checkpoint_id"
@@ -10103,6 +10520,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "run_id": run_id,
                     "checkpoint_id": final_checkpoint_id,
                     "generation": final_generation,
+                    "resume_source": final_world.get("active_resume_source"),
+                    "disposition": _final_checkpoint_disposition(
+                        game_world.last_clearance_audit,
+                        final_world.get("active_resume_source"),
+                    ),
                 }
             except WorldStateError as exc:
                 world_checkpoint_failed = True
@@ -10234,8 +10656,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         render_count = renderer.packet_count if renderer is not None else 0
         render_hz_aggregate = render_count / max(elapsed_wall_s, 1e-9)
         root_z = float(snapshot.qpos[2])
+        root_clearance_m = root_z - snapshot_ground_height_m
         root_up_z = _root_up_z(snapshot.qpos)
         min_root_z = min(min_root_z, root_z)
+        min_root_clearance_m = min(
+            min_root_clearance_m,
+            root_clearance_m,
+        )
         fall_detected = fall_detected or bool(snapshot.fall_detected)
         instability_resets = int(snapshot.reset_count)
         root_displacement_xy_m = float(
@@ -10329,6 +10756,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "min_final_x": args.min_final_x,
             "min_forward_x_m": args.min_forward_x_m,
             "min_root_z": round(min_root_z, 5),
+            "min_root_clearance_m": round(min_root_clearance_m, 5),
             "min_rtf": args.min_rtf,
             "max_resets": args.max_resets,
             "matrix_commit": args.matrix_commit,
@@ -10364,6 +10792,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             ),
             "root_up_z": round(root_up_z, 5),
             "root_xyz": [round(float(value), 5) for value in snapshot.qpos[:3]],
+            "local_ground_z_m": round(snapshot_ground_height_m, 6),
+            "root_clearance_m": round(root_clearance_m, 6),
             "rtf": round(rtf_aggregate, 4),
             "rtf_aggregate": round(rtf_aggregate, 4),
             "run_id": run_id,
@@ -10423,6 +10853,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         final_status["game_auto_respawn"] = bool(args.game_auto_respawn)
         if game_world is not None:
             final_status["game_world_state"] = game_world.telemetry()
+        if moon_dynamic_ground is not None:
+            final_status["moon_dynamic_ground"] = (
+                moon_dynamic_ground.telemetry()
+            )
         if resume_probation.enabled:
             final_status["resume_probation"] = resume_probation.telemetry(
                 now_s=finished_wall
@@ -10492,6 +10926,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             ("physical recovery", physical_recovery),
             ("native processes", processes),
             ("renderer", renderer),
+            ("MoonWorld dynamic ground", moon_dynamic_ground),
             ("simulator", simulator),
         ):
             error = _close_runtime_resource(name, resource)

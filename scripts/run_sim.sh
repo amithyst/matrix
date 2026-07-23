@@ -1509,6 +1509,7 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_SPAWN_ARGS=()
     SONIC_WORLD_ARGS=()
     SONIC_SCENE_TRANSFORM_ARGS=()
+    SONIC_DYNAMIC_GROUND_ARGS=()
     SONIC_INVENTORY_ARGS=()
     if [[ -n "${MATRIX_CREATIVE_INVENTORY_CATALOG:-}" ]]; then
         if [[ ! -f "$MATRIX_CREATIVE_INVENTORY_CATALOG" ]]; then
@@ -1531,9 +1532,22 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
-            --scene-transform moon-dynamic-ground-static-v2
+            --scene-transform moon-dynamic-ground-mocap-v3
         )
-        echo "[INFO] MoonWorld dynamic ground blocks staticized with derived support plane"
+        SONIC_DYNAMIC_GROUND_ARGS=(
+            --moon-dynamic-map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
+            --moon-dynamic-map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+        )
+        echo "[INFO] MoonWorld rolling collision tiles enabled from locked dynamic height map"
+    fi
+    if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
+        && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
+        SONIC_SPAWN_ARGS=(
+            --spawn-x "0"
+            --spawn-y "0"
+            --spawn-z "-0.1366965003013611"
+        )
+        echo "[INFO] MoonWorld map-default spawn aligned to locked terrain height"
     fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
@@ -2067,6 +2081,7 @@ PY
         --min-physics-hz "${MATRIX_SONIC_MIN_PHYSICS_HZ:-195}" \
         --min-rtf "${MATRIX_SONIC_MIN_RTF:-0.95}" \
         --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
+        "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
         "${PHYSICAL_RECOVERY_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \

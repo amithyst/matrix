@@ -31,7 +31,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from prepare_sonic_physics_model import (
-    MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+    MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
     SCENE_TRANSFORM_NONE,
     SonicPhysicsModelError,
     TOWN10_OPEN_BOUNDARY_TRANSFORM,
@@ -2122,7 +2122,7 @@ def _parse_cli_args() -> argparse.Namespace:
         choices=(
             SCENE_TRANSFORM_NONE,
             TOWN10_OPEN_BOUNDARY_TRANSFORM,
-            MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+            MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
         ),
         default=SCENE_TRANSFORM_NONE,
     )

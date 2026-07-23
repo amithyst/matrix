@@ -64,6 +64,63 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             elastic_band_scale=elastic_band_scale,
         )
 
+    def test_moon_dynamic_map_and_model_manifest_are_bidirectionally_bound(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "scene.xml"
+            model.write_text("<mujoco/>", encoding="utf-8")
+            height_map = root / "moonworld.bin"
+            height_map.write_bytes(b"fixture")
+            manifest = root / "manifest.json"
+
+            MODULE._validate_moon_dynamic_ground_model_binding(
+                model,
+                map_path=None,
+                map_sha256=None,
+            )
+
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "scene_transform": (
+                            MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM
+                        )
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SystemExit,
+                "requires the locked MoonWorld dynamic map arguments",
+            ):
+                MODULE._validate_moon_dynamic_ground_model_binding(
+                    model,
+                    map_path=None,
+                    map_sha256=None,
+                )
+
+            MODULE._validate_moon_dynamic_ground_model_binding(
+                model,
+                map_path=height_map.resolve(),
+                map_sha256=MODULE.LOCKED_MOONWORLD_SHA256,
+            )
+
+            manifest.write_text(
+                json.dumps({"scene_transform": "none"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SystemExit,
+                "require a moon-dynamic-ground-mocap-v3",
+            ):
+                MODULE._validate_moon_dynamic_ground_model_binding(
+                    model,
+                    map_path=height_map.resolve(),
+                    map_sha256=MODULE.LOCKED_MOONWORLD_SHA256,
+                )
+
     @classmethod
     def snapshot_with_yaw(cls, yaw_rad: float, **kwargs) -> SimpleNamespace:
         snapshot = cls.snapshot(**kwargs)
@@ -157,6 +214,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         walking.qvel[0] = 2.5
         walking.qvel[1] = -2.5
         self.assertTrue(MODULE._snapshot_world_upright(walking))
+        moon_walking = upright_snapshot()
+        moon_walking.qpos[2] = -0.13
+        self.assertTrue(
+            MODULE._snapshot_world_upright(
+                moon_walking,
+                ground_height_m=-0.93,
+            )
+        )
+        self.assertFalse(MODULE._snapshot_world_upright(moon_walking))
 
         unsafe_velocities = (
             (2, MODULE._WORLD_SAFE_MAX_VERTICAL_SPEED_M_S + 0.01),
@@ -177,6 +243,66 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         tilted.qpos[3] = math.cos(tilt_radians / 2.0)
         tilted.qpos[4] = math.sin(tilt_radians / 2.0)
         self.assertFalse(MODULE._snapshot_world_upright(tilted))
+
+    def test_moon_fall_override_uses_local_ground_clearance(self) -> None:
+        dynamic_ground = mock.Mock()
+        dynamic_ground.sample_height.return_value = -0.93
+        environment = SimpleNamespace(
+            check_fall=lambda: None,
+            fall=False,
+            fall_detected=False,
+            mj_data=SimpleNamespace(qpos=[0.0, 0.0, -0.13]),
+            reset_on_fall=False,
+            reset=mock.Mock(),
+        )
+
+        MODULE._install_moon_relative_fall_check(
+            environment,
+            dynamic_ground,
+        )
+        environment.check_fall()
+        self.assertFalse(environment.fall)
+        self.assertFalse(environment.fall_detected)
+
+        environment.mj_data.qpos[2] = -0.75
+        environment.check_fall()
+        self.assertTrue(environment.fall)
+        self.assertTrue(environment.fall_detected)
+        environment.reset.assert_not_called()
+
+        environment.reset_on_fall = True
+        environment.check_fall()
+        environment.reset.assert_called_once_with(reason="fall")
+
+    def test_final_checkpoint_disposition_matches_persisted_resume_source(
+        self,
+    ) -> None:
+        safe = {"safe": True}
+        unsafe = {"safe": False}
+        self.assertEqual(
+            MODULE._final_checkpoint_disposition(
+                safe,
+                "upright_checkpoint",
+            ),
+            "saved_current_pose",
+        )
+        self.assertEqual(
+            MODULE._final_checkpoint_disposition(
+                safe,
+                "fallen_xy_last_safe_upright",
+            ),
+            "saved_recovered_safe_pose",
+        )
+        for audit, source in (
+            (unsafe, "upright_checkpoint"),
+            (safe, "fallen_outlier_last_safe"),
+            (None, "upright_checkpoint"),
+        ):
+            with self.subTest(audit=audit, source=source):
+                self.assertEqual(
+                    MODULE._final_checkpoint_disposition(audit, source),
+                    "retained_previous_safe",
+                )
 
     @staticmethod
     def resume_idle_command():
@@ -1227,6 +1353,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             snapshot=snapshot,
             checkpoint_writes_blocked=False,
             now_s=10.0,
+            ground_height_m=-0.93,
         )
 
         self.assertEqual(termination_reason, "game_fall_respawn")
@@ -1236,7 +1363,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             snapshot,
             now_s=10.0,
             force=True,
-            required=True,
+            required=False,
+            ground_height_m=-0.93,
         )
         self.assertEqual(
             MODULE._runtime_exit_code(
@@ -1249,6 +1377,63 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             ),
             75,
         )
+
+    def test_auto_respawn_no_ground_retains_previous_safe_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            clearance = {"safe": True, "reason": "clear"}
+            world = MODULE._GameWorldStateRuntime(
+                path=Path(temporary) / "world.json",
+                world_id="moon:test",
+                world_revision="c" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: dict(clearance),
+            )
+            safe = self.snapshot()
+            safe.qpos[:7] = [0.0, 0.0, -0.14, 1.0, 0.0, 0.0, 0.0]
+            self.assertTrue(
+                world.checkpoint(
+                    safe,
+                    now_s=1.0,
+                    force=True,
+                    ground_height_m=-0.93,
+                )
+            )
+            selected = world.state.resolve_start()
+            clearance.update(
+                {
+                    "safe": False,
+                    "reason": "no_ground_support",
+                }
+            )
+            fallen = self.snapshot(fall_detected=True)
+            fallen.qpos[:7] = [20.0, 0.0, -4.0, 1.0, 0.0, 0.0, 0.0]
+            game_input = mock.Mock()
+            game_input.emergency_stop.return_value = SimpleNamespace(
+                mode="idle",
+                safe_stop=True,
+            )
+            planner = mock.Mock()
+
+            reason, _ = MODULE._handle_game_auto_respawn_fall(
+                game_world=world,
+                game_input=game_input,
+                planner=planner,
+                snapshot=fallen,
+                checkpoint_writes_blocked=False,
+                now_s=2.0,
+                ground_height_m=-4.8,
+            )
+
+            self.assertEqual(reason, "game_fall_respawn")
+            self.assertEqual(
+                world.state.resolve_start().checkpoint_id,
+                selected.checkpoint_id,
+            )
+            self.assertEqual(world.state.last_observed.x, 20.0)
+            self.assertEqual(
+                world.telemetry()["last_clearance_audit"]["reason"],
+                "no_ground_support",
+            )
 
     def test_resume_metadata_accepts_rollback_counts_through_limit(self) -> None:
         for rollback_count in (1, 16):
@@ -1329,6 +1514,71 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 }
             )
         )
+        no_ground_audit = {
+            "schema": "matrix-spawn-clearance-audit/v1",
+            "safe": False,
+            "reason": "no_ground_support",
+            "error": None,
+            "rejected_contact_count": 0,
+            "worst": None,
+            "support": {
+                "schema": "matrix-ground-support-probe/v1",
+                "supported": False,
+                "method": "downward_foot_geom_rays",
+                "required_hits": 1,
+                "accepted_hits": 0,
+                "maximum_drop_m": 0.12,
+                "minimum_normal_z": 0.8,
+                "ray_direction": [0.0, 0.0, -1.0],
+                "probes": [
+                    {
+                        "foot_body": {"id": body_id, "name": name},
+                        "origins": [
+                            {
+                                "geom_id": body_id + 100,
+                                "geom_name": f"foot_{body_id}",
+                                "position_m": [float(body_id), 0.0, 0.5],
+                            }
+                        ],
+                        "accepted": False,
+                        "distance_m": None,
+                        "normal": None,
+                        "probe_geom": None,
+                        "ray_origin_m": None,
+                        "scene_geom": None,
+                    }
+                    for body_id, name in (
+                        (7, "left_ankle_roll_link"),
+                        (13, "right_ankle_roll_link"),
+                    )
+                ],
+            },
+        }
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **baseline,
+                    "termination_reason": "spawn_clearance_failed",
+                    "numerical_error": "spawn_clearance:no_ground_support",
+                    "spawn_clearance_audit": no_ground_audit,
+                }
+            )
+        )
+        from tests.test_matrix_spawn_clearance import (
+            FakeData,
+            FakeModel,
+            FakeMujoco,
+        )
+
+        produced_no_ground = MODULE.audit_spawn_safety(
+            FakeMujoco(default_support=False),
+            FakeModel(),
+            FakeData(),
+        )
+        self.assertEqual(
+            MODULE._spawn_clearance_rollback_reason(produced_no_ground),
+            "no_ground_support",
+        )
         for invalid_audit in (
             {
                 "schema": "matrix-spawn-clearance-audit/v1",
@@ -1347,6 +1597,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 "worst": {
                     "allowed": False,
                     "classification": "unsafe_foot_penetration",
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "accepted_hits": 1,
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "required_hits": True,
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "accepted_hits": False,
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "ray_direction": [False, False, -1.0],
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "ray_direction": [0.0, 0.0, 1.0],
                 },
             },
         ):
@@ -2114,6 +2399,36 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "entered",
         )
         self.assertEqual(gate.episodes, 2)
+
+    def test_sonic_fall_recovery_uses_terrain_relative_height(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        upright = self.snapshot(
+            fall_detected=True,
+            low_cmd_fresh=True,
+            elastic_band_scale=0.0,
+        )
+        upright.qpos[2] = -0.21
+        upright.qpos[3] = 1.0
+        self.assertIsNone(
+            gate.observe(
+                upright,
+                now_s=1.0,
+                ground_height_m=-0.93,
+            )
+        )
+        self.assertFalse(gate.current_fallen)
+
+        upright.qpos[2] = -0.75
+        upright.qpos[3] = 0.0
+        upright.qpos[4] = 1.0
+        self.assertEqual(
+            gate.observe(
+                upright,
+                now_s=2.0,
+                ground_height_m=-0.93,
+            ),
+            "entered",
+        )
 
     def test_sonic_fall_recovery_timeout_is_telemetry_not_runtime_exit(self) -> None:
         gate = MODULE._GameFallRecoveryGate(timeout_s=2.0)
@@ -4307,6 +4622,65 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(
                 world.telemetry()["last_clearance_audit"]["reason"],
                 "scene_penetration",
+            )
+
+    def test_world_checkpoint_skips_unsupported_pose_and_keeps_active_slot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            clearance = {"safe": True, "reason": "clear"}
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="moon:test",
+                world_revision="b" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: dict(clearance),
+            )
+            supported = self.snapshot()
+            supported.qpos[:7] = [0.0, 0.0, -0.14, 1.0, 0.0, 0.0, 0.0]
+            self.assertTrue(
+                world.checkpoint(
+                    supported,
+                    now_s=1.0,
+                    force=True,
+                    ground_height_m=-0.93,
+                )
+            )
+            selected = world.state.resolve_start()
+
+            unsupported = self.snapshot()
+            unsupported.qpos[:7] = [10.0, 0.0, -0.14, 1.0, 0.0, 0.0, 0.0]
+            clearance.update(
+                {
+                    "safe": False,
+                    "reason": "no_ground_support",
+                    "support": {
+                        "schema": "matrix-ground-support-probe/v1",
+                        "supported": False,
+                        "accepted_hits": 0,
+                    },
+                }
+            )
+            self.assertTrue(
+                world.checkpoint(
+                    unsupported,
+                    now_s=2.0,
+                    force=True,
+                    ground_height_m=-0.93,
+                )
+            )
+
+            self.assertEqual(
+                world.state.resolve_start().checkpoint_id,
+                selected.checkpoint_id,
+            )
+            self.assertEqual(world.state.resolve_start().pose, selected.pose)
+            self.assertEqual(world.state.last_observed.x, 10.0)
+            self.assertEqual(world.clearance_rejection_count, 1)
+            self.assertEqual(
+                world.telemetry()["last_clearance_audit"]["reason"],
+                "no_ground_support",
             )
 
     def test_game_command_runtime_atomically_updates_live_motion_settings(self) -> None:

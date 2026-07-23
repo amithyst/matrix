@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -26,21 +27,29 @@ from inject_creative_inventory import (  # noqa: E402
 )
 
 
-PIPELINE_VERSION = 7
+PIPELINE_VERSION = 8
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
-MOON_DYNAMIC_GROUND_STATIC_TRANSFORM = "moon-dynamic-ground-static-v2"
+MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
 MOON_DYNAMIC_GROUND_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
 MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256 = (
     "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
 )
 MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT = 256
-MOON_SUPPORT_PLANE_NAME = "matrix_moon_support_plane"
-MOON_SUPPORT_PLANE_POS = (0.0, 0.0, -0.005)
-MOON_SUPPORT_PLANE_SIZE = (0.0, 0.0, 0.01)
-MOON_SUPPORT_PLANE_FRICTION = (1.0, 0.005, 0.0001)
-MOON_SUPPORT_PLANE_SOLREF = (0.02, 1.0)
-MOON_SUPPORT_PLANE_SOLIMP = (0.9, 0.95, 0.001, 0.5, 2.0)
+MOON_DYNAMIC_GROUND_BODY_PATTERN = re.compile(
+    r"gb_(?:[0-9]|1[0-5])_(?:[0-9]|1[0-5])\Z"
+)
+MOON_DYNAMIC_MAP_SIZE_BYTES = 144_000_000
+MOON_DYNAMIC_MAP_SHA256 = (
+    "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+)
+MOON_DYNAMIC_MAP_SIDE_SAMPLES = 6000
+MOON_DYNAMIC_MAP_RESOLUTION_M = 0.1
+MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M = -0.9296965003013611
+MOON_DEFAULT_ROOT_CLEARANCE_M = 0.793
+MOON_DEFAULT_SPAWN_Z_M = (
+    MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M + MOON_DEFAULT_ROOT_CLEARANCE_M
+)
 TOWN10_SOURCE_SCENE_SHA256 = (
     "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
 )
@@ -252,7 +261,7 @@ def _scene_transform_removals(
     transform = scene_transform or SCENE_TRANSFORM_NONE
     if transform == SCENE_TRANSFORM_NONE:
         return transform, (), ()
-    if transform == MOON_DYNAMIC_GROUND_STATIC_TRANSFORM:
+    if transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         if native_scene.name != MOON_DYNAMIC_GROUND_SCENE_NAME:
             raise SonicPhysicsModelError(
                 f"{transform} requires {MOON_DYNAMIC_GROUND_SCENE_NAME}, got {native_scene.name}"
@@ -276,12 +285,15 @@ def _scene_transform_removals(
                 f"{transform} freejoint body count drifted: "
                 f"expected={MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT} actual={len(names)}"
             )
-        if any(
-            geom.get("name") == MOON_SUPPORT_PLANE_NAME
-            for geom in root.iter("geom")
+        if (
+            len(set(names)) != len(names)
+            or any(
+                MOON_DYNAMIC_GROUND_BODY_PATTERN.fullmatch(name) is None
+                for name in names
+            )
         ):
             raise SonicPhysicsModelError(
-                f"{transform} source unexpectedly contains {MOON_SUPPORT_PLANE_NAME}"
+                f"{transform} tile body names drifted"
             )
         return transform, (), names
     if transform != TOWN10_OPEN_BOUNDARY_TRANSFORM:
@@ -354,23 +366,25 @@ def _scene_transform_removals(
 
 
 def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
-    if scene_transform != MOON_DYNAMIC_GROUND_STATIC_TRANSFORM:
+    if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         return None
     return {
-        "support_plane": {
-            "name": MOON_SUPPORT_PLANE_NAME,
-            "type": "plane",
-            "pos": list(MOON_SUPPORT_PLANE_POS),
-            "size": list(MOON_SUPPORT_PLANE_SIZE),
-            "friction": list(MOON_SUPPORT_PLANE_FRICTION),
-            "solref": list(MOON_SUPPORT_PLANE_SOLREF),
-            "solimp": list(MOON_SUPPORT_PLANE_SOLIMP),
-            "contype": 1,
-            "conaffinity": 1,
-            "condim": 3,
-            "margin": 0,
-            "gap": 0,
-            "group": 0,
+        "dynamic_ground": {
+            "schema": "matrix-moon-dynamic-ground/v1",
+            "body_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
+            "body_name_pattern": MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern,
+            "body_mode": "mocap",
+            "map_dtype": "little-endian-float32",
+            "map_shape": [
+                MOON_DYNAMIC_MAP_SIDE_SAMPLES,
+                MOON_DYNAMIC_MAP_SIDE_SAMPLES,
+            ],
+            "map_size_bytes": MOON_DYNAMIC_MAP_SIZE_BYTES,
+            "map_sha256": MOON_DYNAMIC_MAP_SHA256,
+            "resolution_m": MOON_DYNAMIC_MAP_RESOLUTION_M,
+            "height_mode": "absolute_world_z",
+            "update_timing": "before_each_mj_step",
+            "fallback_support_plane": False,
         }
     }
 
@@ -378,7 +392,7 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
 def _apply_scene_transform_additions(
     scene_path: Path, scene_transform: str
 ) -> None:
-    if scene_transform != MOON_DYNAMIC_GROUND_STATIC_TRANSFORM:
+    if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         return
     try:
         tree = ET.parse(scene_path)
@@ -390,44 +404,38 @@ def _apply_scene_transform_additions(
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise SonicPhysicsModelError("MoonWorld derived scene has no worldbody")
-    if any(
-        geom.get("name") == MOON_SUPPORT_PLANE_NAME
-        for geom in worldbody.iter("geom")
+    tile_bodies = [
+        body
+        for body in worldbody.iter("body")
+        if isinstance(body.get("name"), str)
+        and body.get("name", "").startswith("gb_")
+    ]
+    if (
+        len(tile_bodies) != MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT
+        or len({body.get("name") for body in tile_bodies}) != len(tile_bodies)
+        or any(
+            MOON_DYNAMIC_GROUND_BODY_PATTERN.fullmatch(body.get("name", ""))
+            is None
+            for body in tile_bodies
+        )
     ):
         raise SonicPhysicsModelError(
-            f"MoonWorld derived scene already contains {MOON_SUPPORT_PLANE_NAME}"
+            "MoonWorld derived mocap tile body set drifted"
         )
-    worldbody.append(
-        ET.Element(
-            "geom",
-            {
-                "name": MOON_SUPPORT_PLANE_NAME,
-                "type": "plane",
-                "pos": " ".join(f"{value:g}" for value in MOON_SUPPORT_PLANE_POS),
-                "size": " ".join(f"{value:g}" for value in MOON_SUPPORT_PLANE_SIZE),
-                "friction": " ".join(
-                    f"{value:g}" for value in MOON_SUPPORT_PLANE_FRICTION
-                ),
-                "solref": " ".join(
-                    f"{value:g}" for value in MOON_SUPPORT_PLANE_SOLREF
-                ),
-                "solimp": " ".join(
-                    f"{value:g}" for value in MOON_SUPPORT_PLANE_SOLIMP
-                ),
-                "contype": "1",
-                "conaffinity": "1",
-                "condim": "3",
-                "margin": "0",
-                "gap": "0",
-                "group": "0",
-                "rgba": "0.4 0.25 0.1 1",
-            },
-        )
-    )
+    for body in tile_bodies:
+        if any(
+            child.tag == "freejoint"
+            or (child.tag == "joint" and child.get("type") == "free")
+            for child in list(body)
+        ):
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body.get('name')} still owns a free joint"
+            )
+        body.set("mocap", "true")
     root.insert(
         0,
         ET.Comment(
-            " added Matrix MoonWorld support plane below the finite official tile grid "
+            " converted official MoonWorld rolling tiles to runtime-updated mocap bodies "
         ),
     )
     ET.indent(tree, space="  ")
@@ -954,7 +962,7 @@ def _parse_args() -> argparse.Namespace:
         choices=(
             SCENE_TRANSFORM_NONE,
             TOWN10_OPEN_BOUNDARY_TRANSFORM,
-            MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+            MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
         ),
         default=SCENE_TRANSFORM_NONE,
     )

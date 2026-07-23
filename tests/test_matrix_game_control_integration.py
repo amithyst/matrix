@@ -459,22 +459,71 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "termination_signal": None,
         }
         if spawn_clearance_reason is not None:
-            classification = (
-                "scene_penetration"
-                if spawn_clearance_reason == "scene_penetration"
-                else "unsafe_foot_penetration"
-            )
-            status["spawn_clearance"] = {
-                "schema": "matrix-spawn-clearance-audit/v1",
-                "safe": False,
-                "reason": spawn_clearance_reason,
-                "error": None,
-                "rejected_contact_count": 1,
-                "worst": {
-                    "allowed": False,
-                    "classification": classification,
-                },
-            }
+            if spawn_clearance_reason == "no_ground_support":
+                status["spawn_clearance"] = {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": "no_ground_support",
+                    "error": None,
+                    "rejected_contact_count": 0,
+                    "worst": None,
+                    "support": {
+                        "schema": "matrix-ground-support-probe/v1",
+                        "supported": False,
+                        "method": "downward_foot_geom_rays",
+                        "required_hits": 1,
+                        "accepted_hits": 0,
+                        "maximum_drop_m": 0.12,
+                        "minimum_normal_z": 0.8,
+                        "ray_direction": [0.0, 0.0, -1.0],
+                        "probes": [
+                            {
+                                "foot_body": {
+                                    "id": body_id,
+                                    "name": name,
+                                },
+                                "origins": [
+                                    {
+                                        "geom_id": body_id + 100,
+                                        "geom_name": f"foot_{body_id}",
+                                        "position_m": [
+                                            float(body_id),
+                                            0.0,
+                                            0.5,
+                                        ],
+                                    }
+                                ],
+                                "accepted": False,
+                                "distance_m": None,
+                                "normal": None,
+                                "probe_geom": None,
+                                "ray_origin_m": None,
+                                "scene_geom": None,
+                            }
+                            for body_id, name in (
+                                (7, "left_ankle_roll_link"),
+                                (13, "right_ankle_roll_link"),
+                            )
+                        ],
+                    },
+                }
+            else:
+                classification = (
+                    "scene_penetration"
+                    if spawn_clearance_reason == "scene_penetration"
+                    else "unsafe_foot_penetration"
+                )
+                status["spawn_clearance"] = {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": spawn_clearance_reason,
+                    "error": None,
+                    "rejected_contact_count": 1,
+                    "worst": {
+                        "allowed": False,
+                        "classification": classification,
+                    },
+                }
             if dynamic_resume_clearance:
                 status.update(
                     {
@@ -3080,7 +3129,7 @@ exit 0
                 generation=latest.generation,
                 source=latest.source,
                 run_id="a" * 32,
-                spawn_clearance_reason="scene_penetration",
+                spawn_clearance_reason="no_ground_support",
                 dynamic_resume_clearance=True,
             )
             second_status = self.rollback_proposal_status(
@@ -3299,6 +3348,44 @@ exit 76
                 "reason"
             ] = "spawn_clearance:audit_error"
             malformed_statuses.append(("spawn_clearance_audit_error", audit_error))
+            malformed_no_ground = self.rollback_proposal_status(
+                state_file=state_file,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_id=selected.checkpoint_id,
+                generation=selected.generation,
+                source=selected.source,
+                run_id="9" * 32,
+                spawn_clearance_reason="no_ground_support",
+            )
+            malformed_no_ground["spawn_clearance"]["support"]["probes"][0][
+                "accepted"
+            ] = True
+            malformed_statuses.append(
+                ("malformed_no_ground_support", malformed_no_ground)
+            )
+            for suffix, field, value in (
+                ("required_hits_bool", "required_hits", True),
+                ("accepted_hits_bool", "accepted_hits", False),
+                ("ray_direction_bool", "ray_direction", [False, False, -1.0]),
+                (
+                    "ray_direction_numeric",
+                    "ray_direction",
+                    [0.0, 0.0, 1.0],
+                ),
+            ):
+                malformed_counter = self.rollback_proposal_status(
+                    state_file=state_file,
+                    world_id=world_id,
+                    world_revision=world_revision,
+                    checkpoint_id=selected.checkpoint_id,
+                    generation=selected.generation,
+                    source=selected.source,
+                    run_id=("6" if field == "required_hits" else "7") * 32,
+                    spawn_clearance_reason="no_ground_support",
+                )
+                malformed_counter["spawn_clearance"]["support"][field] = value
+                malformed_statuses.append((suffix, malformed_counter))
             completed_probation = self.rollback_proposal_status(
                 state_file=state_file,
                 world_id=world_id,

@@ -1786,28 +1786,131 @@ else:
         clearance.get("schema") != "matrix-spawn-clearance-audit/v1"
         or clearance.get("safe") is not False
         or clearance.get("error") is not None
-        or clearance_reason not in {"scene_penetration", "unsafe_foot_contact"}
+        or clearance_reason
+        not in {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
     ):
         raise SystemExit(1)
     rejected_count = clearance.get("rejected_contact_count")
-    worst = clearance.get("worst")
-    if (
-        isinstance(rejected_count, bool)
-        or not isinstance(rejected_count, int)
-        or rejected_count <= 0
-        or not isinstance(worst, dict)
-        or worst.get("allowed") is not False
-    ):
-        raise SystemExit(1)
-    classification = worst.get("classification")
-    if clearance_reason == "scene_penetration":
-        if classification != "scene_penetration":
+    if clearance_reason == "no_ground_support":
+        support = clearance.get("support")
+        required_hits = (
+            support.get("required_hits") if isinstance(support, dict) else None
+        )
+        accepted_hits = (
+            support.get("accepted_hits") if isinstance(support, dict) else None
+        )
+        ray_direction = (
+            support.get("ray_direction") if isinstance(support, dict) else None
+        )
+        if (
+            isinstance(rejected_count, bool)
+            or rejected_count != 0
+            or not isinstance(support, dict)
+            or support.get("schema") != "matrix-ground-support-probe/v1"
+            or support.get("supported") is not False
+            or isinstance(required_hits, bool)
+            or not isinstance(required_hits, int)
+            or required_hits != 1
+            or isinstance(accepted_hits, bool)
+            or not isinstance(accepted_hits, int)
+            or accepted_hits != 0
+            or support.get("method") != "downward_foot_geom_rays"
+            or support.get("maximum_drop_m") != 0.12
+            or support.get("minimum_normal_z") != 0.8
+            or not isinstance(ray_direction, list)
+            or len(ray_direction) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in ray_direction
+            )
+            or [float(value) for value in ray_direction]
+            != [0.0, 0.0, -1.0]
+        ):
             raise SystemExit(1)
-    elif classification not in {
-        "unsafe_foot_contact_normal",
-        "unsafe_foot_penetration",
-    }:
-        raise SystemExit(1)
+        probes = support.get("probes")
+        if not isinstance(probes, list) or len(probes) != 2:
+            raise SystemExit(1)
+        expected_names = {
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+        }
+        observed_names = set()
+        for probe in probes:
+            if not isinstance(probe, dict):
+                raise SystemExit(1)
+            foot_body = probe.get("foot_body")
+            origins = probe.get("origins")
+            if (
+                not isinstance(foot_body, dict)
+                or isinstance(foot_body.get("id"), bool)
+                or not isinstance(foot_body.get("id"), int)
+                or foot_body.get("id") <= 0
+                or foot_body.get("name") not in expected_names
+                or not isinstance(origins, list)
+                or not 1 <= len(origins) <= 32
+                or probe.get("accepted") is not False
+                or probe.get("distance_m") is not None
+                or probe.get("normal") is not None
+                or probe.get("probe_geom") is not None
+                or probe.get("ray_origin_m") is not None
+                or probe.get("scene_geom") is not None
+            ):
+                raise SystemExit(1)
+            observed_geom_ids = set()
+            for origin in origins:
+                if not isinstance(origin, dict):
+                    raise SystemExit(1)
+                geom_id = origin.get("geom_id")
+                geom_name = origin.get("geom_name")
+                position = origin.get("position_m")
+                if (
+                    isinstance(geom_id, bool)
+                    or not isinstance(geom_id, int)
+                    or geom_id < 0
+                    or geom_id in observed_geom_ids
+                    or (
+                        geom_name is not None
+                        and (
+                            not isinstance(geom_name, str)
+                            or not geom_name
+                            or len(geom_name) > 256
+                        )
+                    )
+                    or not isinstance(position, list)
+                    or len(position) != 3
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        for value in position
+                    )
+                ):
+                    raise SystemExit(1)
+                observed_geom_ids.add(geom_id)
+            observed_names.add(foot_body["name"])
+        if observed_names != expected_names:
+            raise SystemExit(1)
+    else:
+        worst = clearance.get("worst")
+        if (
+            isinstance(rejected_count, bool)
+            or not isinstance(rejected_count, int)
+            or rejected_count <= 0
+            or not isinstance(worst, dict)
+            or worst.get("allowed") is not False
+        ):
+            raise SystemExit(1)
+        classification = worst.get("classification")
+        if clearance_reason == "scene_penetration":
+            if classification != "scene_penetration":
+                raise SystemExit(1)
+        elif classification not in {
+            "unsafe_foot_contact_normal",
+            "unsafe_foot_penetration",
+        }:
+            raise SystemExit(1)
     rollback_reason = f"spawn_clearance:{clearance_reason}"
     if numerical_error != rollback_reason:
         raise SystemExit(1)
