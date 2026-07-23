@@ -82,7 +82,12 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "c4e3dee47ffa434712b0238d08b0b68067f1b1c9820e2ddb455f996f04e364b1",
         )
         self.assertEqual(packages["MoonWorld"]["size"], 633678813)
-        self.assertEqual(sum(item["size"] for item in packages.values()), 8391341372)
+        self.assertEqual(
+            packages["HouseWorld"]["sha256"],
+            "489d8db9c8471bc652bbebb5f0555c1bf50ea5854a90490cecc157667e150822",
+        )
+        self.assertEqual(packages["HouseWorld"]["size"], 402917615)
+        self.assertEqual(sum(item["size"] for item in packages.values()), 8794258987)
         installed = {
             entry["path"]: entry
             for entry in self.lock["matrix_release"]["installed_files"]
@@ -104,6 +109,18 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5",
         )
         self.assertEqual(
+            installed[
+                "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_house.xml"
+            ]["sha256"],
+            "2586d8a5f7263eaa31fd1347202b3767888a181c7aad56e0a4a21838ed250a64",
+        )
+        self.assertEqual(
+            installed[
+                "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_house.xml"
+            ]["size"],
+            13118,
+        )
+        self.assertEqual(
             installed["dynamicmaps/moonworld.bin"]["sha256"],
             "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df",
         )
@@ -113,7 +130,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         )
         self.assertEqual(
             self.lock["matrix_release"]["installed_trees"][1]["sha256"],
-            "504d56c3e971d116949ffbcb9fb0dad668b62ed12939f5bb00654175706b9063",
+            "6063433987ed51cb566e421acf41daf9ef9bacd767c9d7a9abdc88e4034ef2ac",
         )
         for required in (
             "src/UeSim/Linux/Engine/Binaries/Linux/libEOSSDK-Linux-Shipping.so",
@@ -1709,6 +1726,16 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertNotIn("run_sim.sh", moon)
         self.assertNotIn("androidtwin", moon.lower())
 
+    def test_house_launcher_is_a_thin_primary_launcher_wrapper(self) -> None:
+        house = (
+            REPO_ROOT / "scripts/run_matrix_sonic_house_v1.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("HouseWorld (scene 6)", house)
+        self.assertIn('exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 6 "$@"', house)
+        self.assertIn("static MuJoCo collision proxy", house)
+        self.assertNotIn("run_sim.sh", house)
+        self.assertNotIn("androidtwin", house.lower())
+
     def test_local_runtime_override_precedes_profile_derived_paths(self) -> None:
         for script_name in ("bootstrap_matrix_sonic.sh", "run_matrix_sonic.sh"):
             text = (REPO_ROOT / "scripts" / script_name).read_text(
@@ -1738,6 +1765,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         for relative in (
             "scripts/run_matrix_sonic.py",
             "scripts/run_matrix_sonic.sh",
+            "scripts/run_matrix_sonic_house_v1.sh",
             "scripts/run_matrix_sonic_moon_v1.sh",
             "scripts/run_matrix_sonic_overworld_v1.sh",
             "scripts/run_sim.sh",
