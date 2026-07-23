@@ -4011,6 +4011,77 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_game_command_runtime_teleport_list_is_strictly_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            state, point = world.state.add_teleport_point(
+                WORLD_STATE.WorldPose(160.0, 117.0, 1.2, 0.0),
+                ("home",),
+                entity_id="tp-" + "d" * 32,
+                now_unix_ns=2,
+            )
+            world.state = state
+            world.last_error = "existing diagnostic"
+            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            current_pose = WORLD_STATE.WorldPose(160.0, 117.0, 1.2, 0.0)
+            request = self.game_command_request(
+                "/teleport list home moon.tranquility mars.utopia",
+                sequence=1,
+                request_character="e",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                with mock.patch.object(world.store, "save") as save:
+                    self.assertFalse(
+                        runtime.poll(
+                            current_pose=current_pose,
+                            command_allowed=True,
+                        )
+                    )
+                    save.assert_not_called()
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_TELEPORT_LIST")
+                self.assertFalse(response.restart_required)
+                self.assertEqual(
+                    response.data,
+                    {
+                        "world_id": "town10:test",
+                        "teleport_points": [
+                            {
+                                "tag": "home",
+                                "found": True,
+                                "entity_id": point.entity_id,
+                                "position": [160.0, 117.0, 1.2],
+                                "yaw_rad": 0.0,
+                            },
+                            {"tag": "moon.tranquility", "found": False},
+                            {"tag": "mars.utopia", "found": False},
+                        ],
+                    },
+                )
+                self.assertIs(world.state, state)
+                self.assertEqual(world.last_error, "existing diagnostic")
+                self.assertEqual(runtime.commands_executed, 1)
+                self.assertFalse(state_path.exists())
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_required_world_checkpoint_surfaces_durable_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             world = MODULE._GameWorldStateRuntime(
@@ -6355,6 +6426,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 status_file=Path("/matrix/outputs/game-input.json"),
                 command_fd=command_fd,
                 motion_settings_json='{"settings":"runtime-owned"}',
+                celestial_visual_catalog=Path(
+                    "/matrix/config/universe/celestial-visual-profiles-v1.json"
+                ),
+                celestial_visual_profile="earth-clear-v1",
             )
         finally:
             command_parent.close()
@@ -6388,6 +6463,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--motion-settings-json") + 1],
             '{"settings":"runtime-owned"}',
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-catalog") + 1],
+            "/matrix/config/universe/celestial-visual-profiles-v1.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-profile") + 1],
+            "earth-clear-v1",
         )
         self.assertNotIn("--ue-camera-state-file", command)
         self.assertEqual(

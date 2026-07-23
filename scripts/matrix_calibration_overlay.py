@@ -420,7 +420,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_height = 32 if compact else 46
     tab_y = panel_y + (30 if compact else 76)
     tab_gap = 4 if compact else 8
-    tab_width = max(1, (panel_width - 2 * margin - 2 * tab_gap) // 3)
+    tab_width = max(1, (panel_width - 2 * margin - 3 * tab_gap) // 4)
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
@@ -495,6 +495,33 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         1,
         panel_x + panel_width - margin - motion_right_x,
     )
+    navigation_top = tab_y + tab_height + gap
+    navigation_summary_bottom = centre_panel_y - safe_half_size - gap
+    navigation_summary_height = max(1, navigation_summary_bottom - navigation_top)
+    navigation_refresh_width = max(72, min(160, panel_width // 5))
+    navigation_refresh_height = max(
+        28,
+        min(button_height, navigation_summary_height),
+    )
+    navigation_destinations_top = centre_panel_y + safe_half_size + gap
+    navigation_destinations_bottom = apply_y - gap
+    navigation_destinations_height = max(
+        1,
+        navigation_destinations_bottom - navigation_destinations_top,
+    )
+    navigation_destination_gap = 6 if compact else 12
+    navigation_destination_width = max(
+        1,
+        (panel_width - 2 * margin - 2 * navigation_destination_gap) // 3,
+    )
+    navigation_destination_height = max(
+        28,
+        min(button_height, navigation_destinations_height),
+    )
+    navigation_destination_y = max(
+        navigation_destinations_top,
+        navigation_destinations_bottom - navigation_destination_height,
+    )
     font_slider_width = max(190, min(340, panel_width // 3))
     result = {
         "shield": (geometry.x, geometry.y, geometry.width, geometry.height),
@@ -525,6 +552,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         ),
         "tab_console": (
             panel_x + margin + 2 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_navigation": (
+            panel_x + margin + 3 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
@@ -595,6 +628,24 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             panel_width - 2 * margin,
             recovery_height,
         ),
+        "navigation_summary": (
+            panel_x + margin,
+            navigation_top,
+            panel_width - 2 * margin,
+            navigation_summary_height,
+        ),
+        "navigation_refresh": (
+            panel_x + panel_width - margin - navigation_refresh_width,
+            navigation_top,
+            navigation_refresh_width,
+            navigation_refresh_height,
+        ),
+        "navigation_destinations": (
+            panel_x + margin,
+            navigation_destinations_top,
+            panel_width - 2 * margin,
+            navigation_destinations_height,
+        ),
     }
     for index in range(3):
         result[f"recovery_policy_{index}"] = (
@@ -640,6 +691,15 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
                 button_width,
                 motion_row_height,
             )
+    for index in range(3):
+        result[f"navigation_destination_{index}"] = (
+            panel_x
+            + margin
+            + index * (navigation_destination_width + navigation_destination_gap),
+            navigation_destination_y,
+            navigation_destination_width,
+            navigation_destination_height,
+        )
     return result
 
 
@@ -699,12 +759,23 @@ _MOTION_STEP_ACTION_DETAILS = {
 }
 _MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
 
-_PANEL_TABS = ("tab_loadout", "tab_settings", "tab_console")
+_PANEL_TABS = (
+    "tab_loadout",
+    "tab_settings",
+    "tab_console",
+    "tab_navigation",
+)
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
     f"locomotion_policy_{index}" for index in range(3)
 )
 _POLICY_HIT_TARGETS = tuple(f"recovery_policy_{index}" for index in range(3))
+_NAVIGATION_DESTINATION_HIT_TARGETS = tuple(
+    f"navigation_destination_{index}" for index in range(3)
+)
+_NAVIGATION_HIT_TARGETS = (
+    "navigation_refresh",
+) + _NAVIGATION_DESTINATION_HIT_TARGETS
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
@@ -713,6 +784,7 @@ _PANEL_HIT_TARGETS = (
     + _OVERLAY_LOCAL_HIT_TARGETS
     + _LOCOMOTION_POLICY_HIT_TARGETS
     + _POLICY_HIT_TARGETS
+    + _NAVIGATION_HIT_TARGETS
 )
 
 
@@ -750,6 +822,8 @@ def panel_action_at(
         )
     elif page == "console":
         targets = _PANEL_TABS + ("apply_return", "command_input")
+    elif page == "navigation":
+        targets = _PANEL_TABS + ("apply_return",) + _NAVIGATION_HIT_TARGETS
     for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
@@ -903,6 +977,832 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
         locomotion_candidates=tuple(locomotion_candidates),
         recovery_candidates=tuple(recovery_candidates),
         pending_policy_id=pending_policy_id,
+    )
+
+
+_CELESTIAL_ROOT_STATUSES = frozenset({"unavailable", "refreshing", "ready"})
+_CELESTIAL_DESTINATION_STATUSES = frozenset(
+    {
+        "unavailable",
+        "unknown",
+        "undiscovered",
+        "world_unavailable",
+        "ready",
+    }
+)
+_CELESTIAL_RUNTIME_STATUSES = frozenset({"reference", "active", "planned"})
+_CELESTIAL_VISUAL_PROFILE_SCHEMA = "matrix-celestial-visual-profile/v1"
+_CARLA_WEATHER_FIELDS = (
+    "cloudiness",
+    "precipitation",
+    "precipitation_deposits",
+    "wind_intensity",
+    "sun_azimuth_angle",
+    "sun_altitude_angle",
+    "fog_density",
+    "fog_distance",
+    "fog_falloff",
+    "wetness",
+    "scattering_intensity",
+    "mie_scattering_scale",
+    "rayleigh_scattering_scale",
+    "dust_storm",
+)
+_CARLA_WEATHER_BOUNDS = {
+    "cloudiness": (0.0, 100.0),
+    "precipitation": (0.0, 100.0),
+    "precipitation_deposits": (0.0, 100.0),
+    "wind_intensity": (0.0, 100.0),
+    "sun_azimuth_angle": (0.0, 360.0),
+    "sun_altitude_angle": (-90.0, 90.0),
+    "fog_density": (0.0, 100.0),
+    "fog_distance": (0.0, 100_000.0),
+    "fog_falloff": (0.0, 10.0),
+    "wetness": (0.0, 100.0),
+    "scattering_intensity": (0.0, 10.0),
+    "mie_scattering_scale": (0.0, 10.0),
+    "rayleigh_scattering_scale": (0.0, 10.0),
+    "dust_storm": (0.0, 100.0),
+}
+
+
+@dataclass(frozen=True)
+class CelestialBodyModel:
+    body_id: str
+    display_name: str
+    naif_id: int
+    runtime_status: str
+    center_inertial_m: tuple[float, float, float]
+    solar_distance_m: float
+
+
+@dataclass(frozen=True)
+class CelestialSimulationTimeModel:
+    elapsed_tai_ns: int
+    scenario_tai_ns: int
+    scenario_utc: str
+    rate_numerator: int
+    rate_denominator: int
+    utc_assumption: str
+
+
+@dataclass(frozen=True)
+class CelestialVisualProfileModel:
+    profile_id: str
+    profile_sha256: str
+    display_name: str
+    body_id: str
+    atmosphere: str
+    renderer: str
+    weather_parameters: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True)
+class CelestialLightingModel:
+    body_id: str
+    atmosphere: str
+    sun_direction_local: tuple[float, float, float]
+    directional_light_direction_local: tuple[float, float, float]
+    sun_altitude_deg: float
+    sun_azimuth_deg: float
+    solar_distance_m: float
+    solar_irradiance_w_m2: float
+    sun_angular_radius_deg: float
+    eclipse_fraction: float
+    eclipse_occluder_id: str | None
+    starfield_visibility: float
+    visual_profile: CelestialVisualProfileModel
+    render_authority: str
+    render_status: str
+    render_error: str | None
+    visible_camera_verified: bool
+
+
+@dataclass(frozen=True)
+class CelestialDestinationModel:
+    destination_id: str
+    body_id: str
+    body_name: str
+    display_name: str
+    teleport_tag: str
+    runtime_status: str
+    status: str
+    enabled: bool
+    surface_coordinates_deg_m: tuple[float, float, float]
+    surface_heading_deg: float
+    local_position_m: tuple[float, float, float] | None
+    site_universe_position_m: tuple[float, float, float]
+    universe_position_m: tuple[float, float, float] | None
+    gravity_m_s2: float
+    atmosphere: str
+
+
+@dataclass(frozen=True)
+class CelestialNavigationModel:
+    available: bool
+    status: str
+    universe_id: str
+    display_name: str
+    reference_epoch_utc: str | None
+    time_scale: str | None
+    frame: str | None
+    ephemeris_provider: str | None
+    ephemeris_accuracy: str | None
+    ephemeris_upgrade_target: str | None
+    simulation_time: CelestialSimulationTimeModel | None
+    origin_rebasing: bool
+    simulation_local_bound_m: float
+    current_body_id: str | None
+    bodies: tuple[CelestialBodyModel, ...]
+    lighting: CelestialLightingModel | None
+    destinations: tuple[CelestialDestinationModel, ...]
+
+    @property
+    def refresh_enabled(self) -> bool:
+        return self.available and self.status == "ready"
+
+    def destination_enabled(self, destination_id: str) -> bool:
+        return bool(
+            self.available
+            and self.status == "ready"
+            and any(
+                destination.destination_id == destination_id
+                and destination.status == "ready"
+                and destination.enabled
+                for destination in self.destinations
+            )
+        )
+
+
+def _unavailable_celestial_navigation() -> CelestialNavigationModel:
+    return CelestialNavigationModel(
+        available=False,
+        status="unavailable",
+        universe_id="unavailable",
+        display_name="Universe unavailable",
+        reference_epoch_utc=None,
+        time_scale=None,
+        frame=None,
+        ephemeris_provider=None,
+        ephemeris_accuracy=None,
+        ephemeris_upgrade_target=None,
+        simulation_time=None,
+        origin_rebasing=True,
+        simulation_local_bound_m=100_000.0,
+        current_body_id=None,
+        bodies=(),
+        lighting=None,
+        destinations=(),
+    )
+
+
+def _celestial_identifier(
+    value: object,
+    *,
+    maximum: int = 96,
+    punctuation: str = "._-",
+    lowercase: bool = True,
+) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+        return None
+    if lowercase and value != value.lower():
+        return None
+    if not value[0].isascii() or not value[0].isalnum():
+        return None
+    if any(
+        not (
+            character.isascii()
+            and (character.isalnum() or character in punctuation)
+        )
+        for character in value
+    ):
+        return None
+    return value
+
+
+def _celestial_text(value: object, *, maximum: int = 96) -> str | None:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= maximum
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        return None
+    return value
+
+
+def _celestial_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _celestial_vector(value: object) -> tuple[float, float, float] | None:
+    if not isinstance(value, list) or len(value) != 3:
+        return None
+    components = tuple(_celestial_number(component) for component in value)
+    if any(component is None for component in components):
+        return None
+    return (components[0], components[1], components[2])  # type: ignore[return-value]
+
+
+def _celestial_integer(
+    value: object, *, minimum: int, maximum: int
+) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if minimum <= value <= maximum else None
+
+
+def _celestial_sha256(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return None
+    return value
+
+
+def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationModel:
+    """Strictly validate provider-owned celestial state before drawing/clicking."""
+
+    fallback = _unavailable_celestial_navigation()
+    raw = state.get("celestial_navigation")
+    expected_root = {
+        "version",
+        "available",
+        "status",
+        "universe_id",
+        "display_name",
+        "reference_epoch_utc",
+        "time_scale",
+        "frame",
+        "ephemeris",
+        "simulation_time",
+        "origin_rebasing",
+        "simulation_local_bound_m",
+        "current_body_id",
+        "bodies",
+        "lighting",
+        "destinations",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_root or raw.get("version") != 2:
+        return fallback
+    available = raw.get("available")
+    status = raw.get("status")
+    universe_id = _celestial_identifier(raw.get("universe_id"), maximum=64)
+    display_name = _celestial_text(raw.get("display_name"))
+    epoch = raw.get("reference_epoch_utc")
+    time_scale = raw.get("time_scale")
+    frame_value = raw.get("frame")
+    frame = (
+        _celestial_identifier(frame_value)
+        if frame_value is not None
+        else None
+    )
+    bound_value = raw.get("simulation_local_bound_m")
+    bound = _celestial_number(bound_value)
+    current_body_value = raw.get("current_body_id")
+    current_body_id = (
+        _celestial_identifier(current_body_value, maximum=64)
+        if current_body_value is not None
+        else None
+    )
+    ephemeris_value = raw.get("ephemeris")
+    simulation_time_value = raw.get("simulation_time")
+    bodies_value = raw.get("bodies")
+    lighting_value = raw.get("lighting")
+    destinations_value = raw.get("destinations")
+    if (
+        not available
+        and universe_id == "unavailable"
+        and epoch is None
+        and time_scale is None
+        and frame is None
+        and ephemeris_value is None
+        and simulation_time_value is None
+        and current_body_id is None
+        and bodies_value == []
+        and lighting_value is None
+        and destinations_value == []
+    ):
+        return fallback
+    if (
+        type(available) is not bool
+        or status not in _CELESTIAL_ROOT_STATUSES
+        or (available and status == "unavailable")
+        or (not available and status != "unavailable")
+        or universe_id is None
+        or display_name is None
+        or (epoch is not None and _celestial_text(epoch, maximum=32) is None)
+        or time_scale != "TAI"
+        or (frame_value is not None and frame is None)
+        or raw.get("origin_rebasing") is not True
+        or bound is None
+        or not 1.0 <= bound <= 100_000.0
+        or (current_body_value is not None and current_body_id is None)
+        or not isinstance(bodies_value, list)
+        or not 2 <= len(bodies_value) <= 16
+        or not isinstance(destinations_value, list)
+        or len(destinations_value) > 8
+    ):
+        return fallback
+
+    if not isinstance(ephemeris_value, dict) or set(ephemeris_value) != {
+        "provider",
+        "accuracy_class",
+        "upgrade_target",
+    }:
+        return fallback
+    ephemeris_provider = _celestial_identifier(
+        ephemeris_value.get("provider"), maximum=64
+    )
+    ephemeris_accuracy = _celestial_identifier(
+        ephemeris_value.get("accuracy_class"), maximum=64
+    )
+    ephemeris_upgrade_target = _celestial_identifier(
+        ephemeris_value.get("upgrade_target"), maximum=64
+    )
+    if (
+        ephemeris_provider is None
+        or ephemeris_accuracy is None
+        or ephemeris_upgrade_target is None
+    ):
+        return fallback
+
+    expected_time = {
+        "elapsed_tai_ns",
+        "scenario_tai_ns",
+        "scenario_utc",
+        "rate_numerator",
+        "rate_denominator",
+        "utc_assumption",
+    }
+    if not isinstance(simulation_time_value, dict) or set(simulation_time_value) != expected_time:
+        return fallback
+    elapsed_tai_ns = _celestial_integer(
+        simulation_time_value.get("elapsed_tai_ns"),
+        minimum=-(1 << 127),
+        maximum=(1 << 127) - 1,
+    )
+    scenario_tai_ns = _celestial_integer(
+        simulation_time_value.get("scenario_tai_ns"),
+        minimum=-(1 << 127),
+        maximum=(1 << 127) - 1,
+    )
+    scenario_utc = _celestial_text(
+        simulation_time_value.get("scenario_utc"), maximum=40
+    )
+    rate_numerator = _celestial_integer(
+        simulation_time_value.get("rate_numerator"), minimum=0, maximum=1_000_000
+    )
+    rate_denominator = _celestial_integer(
+        simulation_time_value.get("rate_denominator"), minimum=1, maximum=1_000_000
+    )
+    utc_assumption = _celestial_identifier(
+        simulation_time_value.get("utc_assumption"), maximum=64
+    )
+    if None in {
+        elapsed_tai_ns,
+        scenario_tai_ns,
+        scenario_utc,
+        rate_numerator,
+        rate_denominator,
+        utc_assumption,
+    }:
+        return fallback
+    simulation_time = CelestialSimulationTimeModel(
+        elapsed_tai_ns=elapsed_tai_ns,
+        scenario_tai_ns=scenario_tai_ns,
+        scenario_utc=scenario_utc,
+        rate_numerator=rate_numerator,
+        rate_denominator=rate_denominator,
+        utc_assumption=utc_assumption,
+    )
+
+    expected_body = {
+        "id",
+        "display_name",
+        "naif_id",
+        "runtime_status",
+        "center_inertial_m",
+        "solar_distance_m",
+    }
+    bodies: list[CelestialBodyModel] = []
+    for item in bodies_value:
+        if not isinstance(item, dict) or set(item) != expected_body:
+            return fallback
+        body_id = _celestial_identifier(item.get("id"), maximum=64)
+        body_name = _celestial_text(item.get("display_name"))
+        naif_id = _celestial_integer(
+            item.get("naif_id"), minimum=0, maximum=1_000_000_000
+        )
+        runtime_status = item.get("runtime_status")
+        center_inertial = _celestial_vector(item.get("center_inertial_m"))
+        solar_distance = _celestial_number(item.get("solar_distance_m"))
+        if (
+            body_id is None
+            or body_name is None
+            or naif_id is None
+            or runtime_status not in _CELESTIAL_RUNTIME_STATUSES
+            or center_inertial is None
+            or solar_distance is None
+            or solar_distance < 0.0
+        ):
+            return fallback
+        bodies.append(
+            CelestialBodyModel(
+                body_id=body_id,
+                display_name=body_name,
+                naif_id=naif_id,
+                runtime_status=runtime_status,
+                center_inertial_m=center_inertial,
+                solar_distance_m=solar_distance,
+            )
+        )
+    body_ids = [body.body_id for body in bodies]
+    if (
+        len(body_ids) != len(set(body_ids))
+        or "sun" not in body_ids
+        or current_body_id not in body_ids
+    ):
+        return fallback
+    body_models = {body.body_id: body for body in bodies}
+    if body_models["sun"].runtime_status != "reference":
+        return fallback
+
+    expected_lighting = {
+        "body_id",
+        "atmosphere",
+        "sun_direction_local",
+        "directional_light_direction_local",
+        "sun_altitude_deg",
+        "sun_azimuth_deg",
+        "solar_distance_m",
+        "solar_irradiance_w_m2",
+        "sun_angular_radius_deg",
+        "eclipse_fraction",
+        "eclipse_occluder_id",
+        "starfield_visibility",
+        "visual_profile",
+        "render_authority",
+        "render_status",
+        "render_error",
+        "visible_camera_verified",
+    }
+    if not isinstance(lighting_value, dict) or set(lighting_value) != expected_lighting:
+        return fallback
+    lighting_body_id = _celestial_identifier(lighting_value.get("body_id"), maximum=64)
+    lighting_atmosphere = _celestial_identifier(
+        lighting_value.get("atmosphere"), maximum=64
+    )
+    sun_direction = _celestial_vector(lighting_value.get("sun_direction_local"))
+    light_direction = _celestial_vector(
+        lighting_value.get("directional_light_direction_local")
+    )
+    sun_altitude = _celestial_number(lighting_value.get("sun_altitude_deg"))
+    sun_azimuth = _celestial_number(lighting_value.get("sun_azimuth_deg"))
+    solar_distance = _celestial_number(lighting_value.get("solar_distance_m"))
+    solar_irradiance = _celestial_number(
+        lighting_value.get("solar_irradiance_w_m2")
+    )
+    sun_angular_radius = _celestial_number(
+        lighting_value.get("sun_angular_radius_deg")
+    )
+    eclipse_fraction = _celestial_number(lighting_value.get("eclipse_fraction"))
+    starfield_visibility = _celestial_number(
+        lighting_value.get("starfield_visibility")
+    )
+    visual_profile_value = lighting_value.get("visual_profile")
+    expected_visual_profile = {
+        "schema",
+        "id",
+        "sha256",
+        "display_name",
+        "body_id",
+        "atmosphere",
+        "renderer",
+        "weather_parameters",
+    }
+    if (
+        not isinstance(visual_profile_value, dict)
+        or set(visual_profile_value) != expected_visual_profile
+        or visual_profile_value.get("schema") != _CELESTIAL_VISUAL_PROFILE_SCHEMA
+    ):
+        return fallback
+    visual_profile_id = _celestial_identifier(visual_profile_value.get("id"))
+    visual_profile_sha256 = _celestial_sha256(visual_profile_value.get("sha256"))
+    visual_profile_name = _celestial_text(visual_profile_value.get("display_name"))
+    visual_profile_body = _celestial_identifier(visual_profile_value.get("body_id"))
+    visual_profile_atmosphere = _celestial_identifier(
+        visual_profile_value.get("atmosphere")
+    )
+    visual_profile_renderer = _celestial_identifier(
+        visual_profile_value.get("renderer")
+    )
+    weather_value = visual_profile_value.get("weather_parameters")
+    if not isinstance(weather_value, dict) or set(weather_value) != set(
+        _CARLA_WEATHER_FIELDS
+    ):
+        return fallback
+    weather_parameters: list[tuple[str, float]] = []
+    for name in _CARLA_WEATHER_FIELDS:
+        number = _celestial_number(weather_value.get(name))
+        minimum, maximum = _CARLA_WEATHER_BOUNDS[name]
+        if number is None or not minimum <= number <= maximum:
+            return fallback
+        if name == "sun_azimuth_angle" and number >= 360.0:
+            return fallback
+        weather_parameters.append((name, number))
+    weather_mapping = dict(weather_parameters)
+    occluder_value = lighting_value.get("eclipse_occluder_id")
+    eclipse_occluder_id = (
+        _celestial_identifier(occluder_value, maximum=64)
+        if occluder_value is not None
+        else None
+    )
+    render_authority = _celestial_identifier(
+        lighting_value.get("render_authority"), maximum=64
+    )
+    render_status = _celestial_identifier(
+        lighting_value.get("render_status"), maximum=64
+    )
+    render_error_value = lighting_value.get("render_error")
+    render_error = (
+        _celestial_identifier(render_error_value, maximum=64)
+        if render_error_value is not None
+        else None
+    )
+    visible_camera_verified = lighting_value.get("visible_camera_verified")
+    if (
+        lighting_body_id != current_body_id
+        or lighting_atmosphere is None
+        or sun_direction is None
+        or light_direction is None
+        or not math.isclose(
+            sum(component * component for component in sun_direction),
+            1.0,
+            abs_tol=1e-6,
+        )
+        or any(
+            not math.isclose(light_direction[index], -sun_direction[index], abs_tol=1e-6)
+            for index in range(3)
+        )
+        or sun_altitude is None
+        or not -90.0 <= sun_altitude <= 90.0
+        or sun_azimuth is None
+        or not 0.0 <= sun_azimuth < 360.0
+        or solar_distance is None
+        or solar_distance <= 0.0
+        or solar_irradiance is None
+        or not 0.0 < solar_irradiance < 100_000.0
+        or sun_angular_radius is None
+        or not 0.0 < sun_angular_radius < 90.0
+        or eclipse_fraction is None
+        or not 0.0 <= eclipse_fraction <= 1.0
+        or starfield_visibility is None
+        or not 0.0 <= starfield_visibility <= 1.0
+        or visual_profile_id is None
+        or visual_profile_sha256 is None
+        or visual_profile_name is None
+        or visual_profile_body != lighting_body_id
+        or visual_profile_atmosphere != lighting_atmosphere
+        or visual_profile_renderer != "carla-weather-v1"
+        or not math.isclose(
+            weather_mapping["sun_altitude_angle"],
+            sun_altitude,
+            abs_tol=1e-6,
+        )
+        or not math.isclose(
+            weather_mapping["sun_azimuth_angle"],
+            sun_azimuth,
+            abs_tol=1e-6,
+        )
+        or (occluder_value is not None and eclipse_occluder_id not in body_models)
+        or render_authority is None
+        or render_status not in {
+            "not-applied",
+            "pending",
+            "applied",
+            "unavailable",
+        }
+        or (render_error_value is not None and render_error is None)
+        or visible_camera_verified is not False
+        or (
+            render_status == "applied"
+            and (render_authority != "carla-weather" or render_error is not None)
+        )
+        or (
+            render_status == "not-applied"
+            and (render_authority != "state-only" or render_error is not None)
+        )
+        or (
+            render_status == "pending"
+            and (render_authority != "state-only" or render_error is not None)
+        )
+        or (
+            render_status == "unavailable"
+            and (render_authority != "state-only" or render_error is None)
+        )
+    ):
+        return fallback
+    lighting = CelestialLightingModel(
+        body_id=lighting_body_id,
+        atmosphere=lighting_atmosphere,
+        sun_direction_local=sun_direction,
+        directional_light_direction_local=light_direction,
+        sun_altitude_deg=sun_altitude,
+        sun_azimuth_deg=sun_azimuth,
+        solar_distance_m=solar_distance,
+        solar_irradiance_w_m2=solar_irradiance,
+        sun_angular_radius_deg=sun_angular_radius,
+        eclipse_fraction=eclipse_fraction,
+        eclipse_occluder_id=eclipse_occluder_id,
+        starfield_visibility=starfield_visibility,
+        visual_profile=CelestialVisualProfileModel(
+            profile_id=visual_profile_id,
+            profile_sha256=visual_profile_sha256,
+            display_name=visual_profile_name,
+            body_id=visual_profile_body,
+            atmosphere=visual_profile_atmosphere,
+            renderer=visual_profile_renderer,
+            weather_parameters=tuple(weather_parameters),
+        ),
+        render_authority=render_authority,
+        render_status=render_status,
+        render_error=render_error,
+        visible_camera_verified=False,
+    )
+
+    expected_destination = {
+        "id",
+        "body_id",
+        "body_name",
+        "display_name",
+        "teleport_tag",
+        "runtime_status",
+        "status",
+        "enabled",
+        "surface_coordinates_deg_m",
+        "surface_heading_deg",
+        "local_position_m",
+        "site_universe_position_m",
+        "universe_position_m",
+        "gravity_m_s2",
+        "atmosphere",
+    }
+    destinations: list[CelestialDestinationModel] = []
+    for item in destinations_value:
+        if not isinstance(item, dict) or set(item) != expected_destination:
+            return fallback
+        destination_id = _celestial_identifier(item.get("id"), maximum=64)
+        body_id = _celestial_identifier(item.get("body_id"), maximum=64)
+        body_name = _celestial_text(item.get("body_name"))
+        destination_name = _celestial_text(item.get("display_name"))
+        teleport_tag = _celestial_identifier(
+            item.get("teleport_tag"),
+            maximum=64,
+            punctuation="._-:",
+            lowercase=False,
+        )
+        runtime_status = item.get("runtime_status")
+        destination_status = item.get("status")
+        enabled = item.get("enabled")
+        gravity_value = item.get("gravity_m_s2")
+        gravity = _celestial_number(gravity_value)
+        atmosphere = _celestial_identifier(item.get("atmosphere"), maximum=64)
+        local_value = item.get("local_position_m")
+        surface_coordinates = _celestial_vector(
+            item.get("surface_coordinates_deg_m")
+        )
+        surface_heading = _celestial_number(item.get("surface_heading_deg"))
+        site_universe_position = _celestial_vector(
+            item.get("site_universe_position_m")
+        )
+        universe_value = item.get("universe_position_m")
+        local_position = (
+            _celestial_vector(local_value) if local_value is not None else None
+        )
+        universe_position = (
+            _celestial_vector(universe_value)
+            if universe_value is not None
+            else None
+        )
+        if (
+            destination_id is None
+            or body_id is None
+            or body_name is None
+            or destination_name is None
+            or teleport_tag is None
+            or runtime_status not in _CELESTIAL_RUNTIME_STATUSES
+            or destination_status not in _CELESTIAL_DESTINATION_STATUSES
+            or type(enabled) is not bool
+            or (not available and destination_status != "unavailable")
+            or (
+                available
+                and runtime_status == "planned"
+                and destination_status != "world_unavailable"
+            )
+            or (
+                runtime_status == "active"
+                and destination_status == "world_unavailable"
+            )
+            or (
+                enabled
+                and not (
+                    available
+                    and status == "ready"
+                    and destination_status == "ready"
+                )
+            )
+            or gravity is None
+            or not 0.0 < gravity < 100.0
+            or atmosphere is None
+            or surface_coordinates is None
+            or not -90.0 <= surface_coordinates[0] <= 90.0
+            or not -180.0 <= surface_coordinates[1] <= 180.0
+            or surface_heading is None
+            or site_universe_position is None
+            or (local_value is not None and local_position is None)
+            or (universe_value is not None and universe_position is None)
+            or (local_position is None) != (universe_position is None)
+            or (destination_status == "ready" and local_position is None)
+            or (
+                destination_status in {"unknown", "undiscovered"}
+                and local_position is not None
+            )
+            or (
+                local_position is not None
+                and any(abs(component) > bound for component in local_position)
+            )
+        ):
+            return fallback
+        destinations.append(
+            CelestialDestinationModel(
+                destination_id=destination_id,
+                body_id=body_id,
+                body_name=body_name,
+                display_name=destination_name,
+                teleport_tag=teleport_tag,
+                runtime_status=runtime_status,
+                status=destination_status,
+                enabled=enabled,
+                surface_coordinates_deg_m=surface_coordinates,
+                surface_heading_deg=surface_heading,
+                local_position_m=local_position,
+                site_universe_position_m=site_universe_position,
+                universe_position_m=universe_position,
+                gravity_m_s2=gravity,
+                atmosphere=atmosphere,
+            )
+        )
+    destination_ids = [destination.destination_id for destination in destinations]
+    teleport_tags = [destination.teleport_tag for destination in destinations]
+    body_contracts: dict[str, tuple[object, ...]] = {}
+    for destination in destinations:
+        contract = (
+            destination.body_name,
+            destination.runtime_status,
+            destination.gravity_m_s2,
+            destination.atmosphere,
+        )
+        previous = body_contracts.setdefault(destination.body_id, contract)
+        if previous != contract:
+            return fallback
+        body_model = body_models.get(destination.body_id)
+        if (
+            body_model is None
+            or body_model.display_name != destination.body_name
+            or body_model.runtime_status != destination.runtime_status
+        ):
+            return fallback
+    if (
+        len(destination_ids) != len(set(destination_ids))
+        or len(teleport_tags) != len(set(teleport_tags))
+    ):
+        return fallback
+    return CelestialNavigationModel(
+        available=available,
+        status=status,
+        universe_id=universe_id,
+        display_name=display_name,
+        reference_epoch_utc=epoch,
+        time_scale=time_scale,
+        frame=frame,
+        ephemeris_provider=ephemeris_provider,
+        ephemeris_accuracy=ephemeris_accuracy,
+        ephemeris_upgrade_target=ephemeris_upgrade_target,
+        simulation_time=simulation_time,
+        origin_rebasing=True,
+        simulation_local_bound_m=bound,
+        current_body_id=current_body_id,
+        bodies=tuple(bodies),
+        lighting=lighting,
+        destinations=tuple(destinations),
     )
 
 
@@ -1624,6 +2524,18 @@ class PointerActionPublisher:
             {"slot": slot, "policy_id": policy_id.lower()},
         )
 
+    def publish_navigation_refresh(self) -> None:
+        self._publish("navigation_refresh", {})
+
+    def publish_navigation_select(self, destination_id: str) -> None:
+        normalized = _celestial_identifier(destination_id, maximum=64)
+        if normalized is None:
+            raise ValueError("celestial destination id is invalid")
+        self._publish(
+            "navigation_select",
+            {"destination_id": normalized},
+        )
+
     def close(self) -> None:
         self._socket.close()
 
@@ -1761,6 +2673,7 @@ class X11CalibrationOverlay:
         self._last_panel_model: SettingsPanelModel | None = None
         self._last_motion_model: MotionSettingsPanelModel | None = None
         self._last_strategy_model: StrategyLoadoutModel | None = None
+        self._last_navigation_model: CelestialNavigationModel | None = None
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = -1
@@ -3176,6 +4089,7 @@ class X11CalibrationOverlay:
             ("tab_loadout", "策略装配", "loadout"),
             ("tab_settings", "控制设置", "settings"),
             ("tab_console", "命令台", "console"),
+            ("tab_navigation", "星体导航", "navigation"),
         ):
             self._draw_button(
                 layout,
@@ -3520,6 +4434,194 @@ class X11CalibrationOverlay:
             )
 
     @staticmethod
+    def _celestial_status_label(status: str, *, refreshing: bool) -> str:
+        if refreshing:
+            return "同步中"
+        return {
+            "ready": "可传送",
+            "unknown": "待同步",
+            "undiscovered": "未发现",
+            "world_unavailable": "未部署",
+            "unavailable": "不可用",
+        }.get(status, "不可用")
+
+    @staticmethod
+    def _coordinate_text(position: tuple[float, float, float]) -> str:
+        return "[" + ", ".join(f"{component:.1f}" for component in position) + "]"
+
+    @staticmethod
+    def _solar_distance_text(distance_m: float) -> str:
+        astronomical_unit_m = 149_597_870_700.0
+        return f"{distance_m / astronomical_unit_m:.6f} AU"
+
+    def _draw_navigation_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: CelestialNavigationModel,
+    ) -> None:
+        summary = self._fill_panel_band(
+            layout,
+            "navigation_summary",
+            fill=self._colours["button"],
+            outline=self._colours["outline"],
+        )
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        current_body_name = next(
+            (
+                destination.body_name
+                for destination in model.destinations
+                if destination.body_id == model.current_body_id
+            ),
+            model.current_body_id or "未知",
+        )
+        refresh = self._panel_rectangle(layout, "navigation_refresh")
+        text_width = max(1, refresh[0] - summary[0] - 12)
+        summary_line = f"{model.display_name} · 当前天体 {current_body_name}"
+        self._draw_text(
+            self._clip_console_line(summary_line, text_width),
+            x=summary[0] + 10,
+            y=summary[1] + min(22, max(14, summary[3] - 4)),
+            colour=self._colours["white" if model.available else "muted"],
+        )
+        if not compact and summary[3] >= 70:
+            scenario_time = (
+                model.simulation_time.scenario_utc
+                if model.simulation_time is not None
+                else (model.reference_epoch_utc or "unavailable")
+            )
+            if "." in scenario_time and scenario_time.endswith("Z"):
+                scenario_time = scenario_time.split(".", 1)[0] + "Z"
+            provider = model.ephemeris_provider or "unavailable"
+            accuracy = model.ephemeris_accuracy or "unavailable"
+            self._draw_text(
+                self._clip_console_line(
+                    f"{scenario_time} · {provider} · {accuracy}",
+                    text_width,
+                ),
+                x=summary[0] + 10,
+                y=summary[1] + 50,
+                colour=self._colours["muted"],
+            )
+        if not compact and summary[3] >= 105:
+            lighting = model.lighting
+            lighting_line = (
+                f"{lighting.visual_profile.display_name} · "
+                f"太阳高度 {lighting.sun_altitude_deg:+.1f}° · "
+                f"方位 {lighting.sun_azimuth_deg:.1f}° · "
+                f"{lighting.solar_irradiance_w_m2:.0f} W/m² · "
+                f"遮挡 {lighting.eclipse_fraction * 100.0:.1f}% · "
+                f"{'CARLA已读回' if lighting.render_status == 'applied' else '仅光照真值'}"
+                if lighting is not None
+                else "太阳光照状态不可用"
+            )
+            self._draw_text(
+                self._clip_console_line(lighting_line, text_width),
+                x=summary[0] + 10,
+                y=summary[1] + 78,
+                colour=self._colours["cyan"],
+            )
+        current_destination = next(
+            (
+                destination
+                for destination in model.destinations
+                if destination.body_id == model.current_body_id
+                and destination.local_position_m is not None
+                and destination.universe_position_m is not None
+            ),
+            None,
+        )
+        if not compact and summary[3] >= 140 and current_destination is not None:
+            assert current_destination.local_position_m is not None
+            assert current_destination.universe_position_m is not None
+            coordinate_line = (
+                f"{current_destination.display_name} · LOCAL "
+                f"{self._coordinate_text(current_destination.local_position_m)} m · "
+                "距太阳 "
+                f"{self._solar_distance_text(model.lighting.solar_distance_m)}"
+                if model.lighting is not None
+                else f"{current_destination.display_name} · LOCAL "
+                f"{self._coordinate_text(current_destination.local_position_m)} m"
+            )
+            self._draw_text(
+                self._clip_console_line(coordinate_line, text_width),
+                x=summary[0] + 10,
+                y=summary[1] + 106,
+                colour=self._colours["white"],
+            )
+        if not compact and summary[3] >= 175:
+            frame = model.frame or "unavailable"
+            self._draw_text(
+                self._clip_console_line(
+                    "参考系 "
+                    f"{frame} · 原点重定位 · 局部 ±"
+                    f"{model.simulation_local_bound_m / 1000.0:.0f} km",
+                    text_width,
+                ),
+                x=summary[0] + 10,
+                y=summary[1] + 134,
+                colour=self._colours["muted"],
+            )
+        refresh_disabled = not model.refresh_enabled
+        self._draw_button(
+            layout,
+            "navigation_refresh",
+            "同步中..." if model.status == "refreshing" else "刷新坐标",
+            fill=self._colours[
+                "disabled" if refresh_disabled else "selected"
+            ],
+            disabled=refresh_disabled,
+        )
+
+        destination_band = self._panel_rectangle(layout, "navigation_destinations")
+        if not compact and destination_band[3] >= 70:
+            self._draw_text(
+                "传送点",
+                x=destination_band[0],
+                y=destination_band[1] + 20,
+                colour=self._colours["muted"],
+            )
+        refreshing = model.status == "refreshing"
+        for index, destination in enumerate(model.destinations[:3]):
+            status_label = self._celestial_status_label(
+                destination.status,
+                refreshing=refreshing,
+            )
+            enabled = model.destination_enabled(destination.destination_id)
+            if compact:
+                label = f"{destination.body_name} · {status_label}"
+            else:
+                label = (
+                    f"{destination.body_name} · {destination.display_name} · "
+                    f"{status_label}"
+                )
+            rectangle = self._panel_rectangle(
+                layout,
+                f"navigation_destination_{index}",
+            )
+            label = self._clip_console_line(label, max(1, rectangle[2] - 8))
+            if enabled:
+                fill_name = "apply"
+            elif refreshing or destination.status in {"unknown", "undiscovered"}:
+                fill_name = "pending"
+            else:
+                fill_name = "disabled"
+            self._draw_button(
+                layout,
+                f"navigation_destination_{index}",
+                label,
+                fill=self._colours[fill_name],
+                disabled=not enabled,
+            )
+        if not model.destinations:
+            self._draw_text(
+                "没有已配置的传送点",
+                x=0,
+                y=0,
+                colour=self._colours["disabled"],
+                centred_in=destination_band,
+            )
+
+    @staticmethod
     def _apply_label_chinese(model: SettingsPanelModel) -> str:
         if model.restart_requested or model.status == "restarting":
             return "正在重载 MATRIX..."
@@ -3536,6 +4638,7 @@ class X11CalibrationOverlay:
         command_status: CommandConsoleStatus | None = None,
         strategy_model: StrategyLoadoutModel | None = None,
         motion_model: MotionSettingsPanelModel | None = None,
+        navigation_model: CelestialNavigationModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -3567,11 +4670,16 @@ class X11CalibrationOverlay:
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
             )
-        else:
+        elif page == "console":
             self._draw_command_console(
                 layout,
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
+            )
+        else:
+            self._draw_navigation_page(
+                layout,
+                navigation_model or _unavailable_celestial_navigation(),
             )
         apply_disabled = not model.action_enabled("apply_return")
         self._draw_button(
@@ -3770,6 +4878,46 @@ class X11CalibrationOverlay:
                 if action == "command_input":
                     if self._begin_command_editing(publisher):
                         emitted += 1
+                elif action == "navigation_refresh":
+                    navigation = getattr(self, "_last_navigation_model", None)
+                    if (
+                        navigation is not None
+                        and navigation.refresh_enabled
+                        and self._last_command_status.available
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting", "unavailable"}
+                    ):
+                        publisher.publish_navigation_refresh()
+                        emitted += 1
+                elif action.startswith("navigation_destination_"):
+                    navigation = getattr(self, "_last_navigation_model", None)
+                    try:
+                        destination_index = int(action.rsplit("_", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    if (
+                        navigation is not None
+                        and destination_index < len(navigation.destinations)
+                    ):
+                        destination = navigation.destinations[destination_index]
+                        if (
+                            navigation.destination_enabled(
+                                destination.destination_id
+                            )
+                            and self._last_command_status.available
+                            and not self._last_command_status.in_flight
+                            and not self._last_command_status.restart_required
+                            and not self._last_command_status.outcome_unknown
+                            and self._last_command_status.status
+                            not in {"pending", "restarting", "unavailable"}
+                        ):
+                            publisher.publish_navigation_select(
+                                destination.destination_id
+                            )
+                            emitted += 1
                 elif action.startswith("recovery_policy_"):
                     strategy = getattr(self, "_last_strategy_model", None)
                     try:
@@ -3860,12 +5008,14 @@ class X11CalibrationOverlay:
         model = settings_panel_model(state)
         motion_model = motion_settings_panel_model(state)
         strategy_model = strategy_loadout_model(state)
+        navigation_model = celestial_navigation_model(state)
         command_status = command_console_status(state)
         self._command_editor.reconcile(command_status)
         model_changed = bool(
             model != self._last_panel_model
             or motion_model != getattr(self, "_last_motion_model", None)
             or strategy_model != getattr(self, "_last_strategy_model", None)
+            or navigation_model != getattr(self, "_last_navigation_model", None)
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
             != getattr(self, "_last_rendered_font_size", None)
             or getattr(self, "_active_page", "loadout")
@@ -3904,6 +5054,7 @@ class X11CalibrationOverlay:
                 command_status,
                 strategy_model,
                 motion_model,
+                navigation_model,
             )
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
@@ -3939,6 +5090,7 @@ class X11CalibrationOverlay:
         self._last_panel_model = model
         self._last_motion_model = motion_model
         self._last_strategy_model = strategy_model
+        self._last_navigation_model = navigation_model
         self._last_rendered_font_size = getattr(
             self,
             "_font_size",
@@ -3967,6 +5119,7 @@ class X11CalibrationOverlay:
         self._last_panel_model = None
         self._last_motion_model = None
         self._last_strategy_model = None
+        self._last_navigation_model = None
         self._last_page = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision

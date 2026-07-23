@@ -1,0 +1,193 @@
+{
+  "schema": "matrix-celestial-universe/v2",
+  "universe": {
+    "id": "sol-2080",
+    "display_name": "SOL-2080",
+    "reference_epoch_utc": "2080-01-01T00:00:00Z",
+    "time_scale": "TAI",
+    "tai_minus_utc_at_epoch_s": 37,
+    "clock_rate": {
+      "numerator": 1,
+      "denominator": 1
+    },
+    "frame": "sol_heliocentric_icrf",
+    "ephemeris": {
+      "provider": "matrix-analytical-v1",
+      "accuracy_class": "visual-navigation",
+      "upgrade_target": "naif-spice-de440"
+    },
+    "units": "m",
+    "origin_rebasing": true,
+    "simulation_local_bound_m": 100000.0
+  },
+  "default_body_id": "earth",
+  "bodies": [
+    {
+      "id": "sun",
+      "display_name": "太阳",
+      "naif_id": 10,
+      "ellipsoid_radii_m": [695700000.0, 695700000.0, 695700000.0],
+      "gravity_m_s2": 274.0,
+      "atmosphere": "solar_plasma",
+      "runtime_status": "reference",
+      "rotation": {
+        "model": "iau-uniform-v1",
+        "pole_right_ascension_deg": 286.13,
+        "pole_right_ascension_rate_deg_per_century": 0.0,
+        "pole_declination_deg": 63.87,
+        "pole_declination_rate_deg_per_century": 0.0,
+        "prime_meridian_deg": 84.176,
+        "spin_rate_deg_per_day": 14.1844
+      },
+      "orbit": null,
+      "barycenter_companion_id": null,
+      "primary_to_companion_mass_ratio": null
+    },
+    {
+      "id": "earth",
+      "display_name": "地球",
+      "naif_id": 399,
+      "ellipsoid_radii_m": [6378137.0, 6378137.0, 6356752.314245],
+      "gravity_m_s2": 9.80665,
+      "atmosphere": "earth_nitrogen_oxygen",
+      "runtime_status": "active",
+      "rotation": {
+        "model": "iau-uniform-v1",
+        "pole_right_ascension_deg": 0.0,
+        "pole_right_ascension_rate_deg_per_century": -0.641,
+        "pole_declination_deg": 90.0,
+        "pole_declination_rate_deg_per_century": -0.557,
+        "prime_meridian_deg": 190.147,
+        "spin_rate_deg_per_day": 360.9856235
+      },
+      "orbit": {
+        "model": "jpl-mean-elements-v1",
+        "parent_id": "sun",
+        "semi_major_axis_m": 149597897627.61673,
+        "semi_major_axis_rate_m_per_century": -4487.936121,
+        "eccentricity": 0.01673163,
+        "eccentricity_rate_per_century": -0.00003661,
+        "inclination_deg": -0.00054346,
+        "inclination_rate_deg_per_century": -0.01337178,
+        "mean_longitude_deg": 100.46691572,
+        "mean_longitude_rate_deg_per_century": 35999.37306329,
+        "longitude_periapsis_deg": 102.93005885,
+        "longitude_periapsis_rate_deg_per_century": 0.3179526,
+        "longitude_ascending_node_deg": -5.11260389,
+        "longitude_ascending_node_rate_deg_per_century": -0.24123856
+      },
+      "barycenter_companion_id": "moon",
+      "primary_to_companion_mass_ratio": 81.30056907419062
+    },
+    {
+      "id": "moon",
+      "display_name": "月球",
+      "naif_id": 301,
+      "ellipsoid_radii_m": [1737400.0, 1737400.0, 1737400.0],
+      "gravity_m_s2": 1.62,
+      "atmosphere": "vacuum",
+      "runtime_status": "planned",
+      "rotation": {
+        "model": "iau-uniform-v1",
+        "pole_right_ascension_deg": 269.9949,
+        "pole_right_ascension_rate_deg_per_century": 0.0031,
+        "pole_declination_deg": 66.5392,
+        "pole_declination_rate_deg_per_century": 0.013,
+        "prime_meridian_deg": 38.3213,
+        "spin_rate_deg_per_day": 13.17635815
+      },
+      "orbit": {
+        "model": "jpl-mean-elements-v1",
+        "parent_id": "earth",
+        "semi_major_axis_m": 384400000.0,
+        "semi_major_axis_rate_m_per_century": 0.0,
+        "eccentricity": 0.0549,
+        "eccentricity_rate_per_century": 0.0,
+        "inclination_deg": 5.145,
+        "inclination_rate_deg_per_century": 0.0,
+        "mean_longitude_deg": 218.3164477,
+        "mean_longitude_rate_deg_per_century": 481267.88123421,
+        "longitude_periapsis_deg": 83.3530513,
+        "longitude_periapsis_rate_deg_per_century": 4069.0137287,
+        "longitude_ascending_node_deg": 125.044555,
+        "longitude_ascending_node_rate_deg_per_century": -1934.1361849
+      },
+      "barycenter_companion_id": null,
+      "primary_to_companion_mass_ratio": null
+    },
+    {
+      "id": "mars",
+      "display_name": "火星",
+      "naif_id": 499,
+      "ellipsoid_radii_m": [3396190.0, 3396190.0, 3376200.0],
+      "gravity_m_s2": 3.72076,
+      "atmosphere": "mars_carbon_dioxide_thin",
+      "runtime_status": "planned",
+      "rotation": {
+        "model": "iau-uniform-v1",
+        "pole_right_ascension_deg": 317.68143,
+        "pole_right_ascension_rate_deg_per_century": -0.1061,
+        "pole_declination_deg": 52.8865,
+        "pole_declination_rate_deg_per_century": -0.0609,
+        "prime_meridian_deg": 176.63,
+        "spin_rate_deg_per_day": 350.89198226
+      },
+      "orbit": {
+        "model": "jpl-mean-elements-v1",
+        "parent_id": "sun",
+        "semi_major_axis_m": 227944135087.1228,
+        "semi_major_axis_rate_m_per_century": 145109.934579,
+        "eccentricity": 0.09336511,
+        "eccentricity_rate_per_century": 0.00009149,
+        "inclination_deg": 1.85181869,
+        "inclination_rate_deg_per_century": -0.00724757,
+        "mean_longitude_deg": -4.56813164,
+        "mean_longitude_rate_deg_per_century": 19140.29934243,
+        "longitude_periapsis_deg": -23.91744784,
+        "longitude_periapsis_rate_deg_per_century": 0.45223625,
+        "longitude_ascending_node_deg": 49.71320984,
+        "longitude_ascending_node_rate_deg_per_century": -0.26852431
+      },
+      "barycenter_companion_id": null,
+      "primary_to_companion_mass_ratio": null
+    }
+  ],
+  "destinations": [
+    {
+      "id": "earth-overworld-home",
+      "body_id": "earth",
+      "display_name": "Overworld 归航点",
+      "teleport_tag": "home",
+      "surface_anchor": {
+        "latitude_deg": 22.543096,
+        "longitude_deg": 114.057865,
+        "altitude_m": 20.0,
+        "heading_deg": 0.0
+      }
+    },
+    {
+      "id": "moon-tranquility-outpost",
+      "body_id": "moon",
+      "display_name": "静海前哨",
+      "teleport_tag": "moon.tranquility",
+      "surface_anchor": {
+        "latitude_deg": 0.67408,
+        "longitude_deg": 23.47297,
+        "altitude_m": 0.0,
+        "heading_deg": 0.0
+      }
+    },
+    {
+      "id": "mars-utopia-outpost",
+      "body_id": "mars",
+      "display_name": "乌托邦平原前哨",
+      "teleport_tag": "mars.utopia",
+      "surface_anchor": {
+        "latitude_deg": 46.7,
+        "longitude_deg": 117.5,
+        "altitude_m": -4000.0,
+        "heading_deg": 0.0
+      }
+    }
+  ]
+}
