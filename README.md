@@ -91,6 +91,7 @@ To keep this README concise, detailed guides have been organized into the `docs/
 - [🐕 Custom Robot Tutorial](docs/Custom_Robot_Tutorial.md) - Importing your own MuJoCo URDF models
 - [Matrix Overworld Adjacent V1](docs/OVERWORLD_ADJACENT_V1_CN.md) - Six-scene SONIC physics composition and its explicit UE visual gate
 - [Matrix MoonWorld Box V1](docs/MOON_V1_CN.md) - Official MoonWorld cooked map launcher, locked assets, and screenshot/video acceptance
+- [Matrix House/Furniture V1](docs/HOUSE_FURNITURE_V1_CN.md) - Official HouseWorld indoor furniture box-world launcher and smoke acceptance
 - [Matrix SONIC Video Capture](docs/MATRIX_VIDEO_CAPTURE_CN.md) - Native-resolution main-launcher recording with provenance and quality gates
 - [Matrix Urban V1](docs/URBAN_V1_CN.md) - Native Town10 city baseline and URDF-preserved G1 materials
 - [Matrix SOL-2080 Celestial Visuals](docs/MATRIX_CELESTIAL_VISUALS_CN.md) - Versioned CARLA weather profiles, OSS audit, and UE pixel gate

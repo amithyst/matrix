@@ -42,6 +42,12 @@
         "sha256": "246cc4f96571022f19f7e5cf35aa2788c3c8420a2bf2535b56a6aa2e33a05801"
       },
       {
+        "name": "HouseWorld",
+        "file": "HouseWorld-0.1.2.tar.gz",
+        "size": 402917615,
+        "sha256": "489d8db9c8471bc652bbebb5f0555c1bf50ea5854a90490cecc157667e150822"
+      },
+      {
         "name": "MoonWorld",
         "file": "MoonWorld-0.1.2.tar.gz",
         "size": 633678813,
@@ -95,6 +101,11 @@
         "sha256": "4492e48e800e46ccfe9eb7511baa7a5c05d4fb73bb99b24d9e2694ce10da16ba"
       },
       {
+        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_house.xml",
+        "size": 13118,
+        "sha256": "2586d8a5f7263eaa31fd1347202b3767888a181c7aad56e0a4a21838ed250a64"
+      },
+      {
         "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_meet.xml",
         "size": 9066,
         "sha256": "17a2370eacfaefd4fe682a040d8543c4a34c46c0d1aa81652704af469486e494"
@@ -127,7 +138,7 @@
       },
       {
         "path": "src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks",
-        "sha256": "504d56c3e971d116949ffbcb9fb0dad668b62ed12939f5bb00654175706b9063"
+        "sha256": "6063433987ed51cb566e421acf41daf9ef9bacd767c9d7a9abdc88e4034ef2ac"
       },
       {
         "path": "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",
