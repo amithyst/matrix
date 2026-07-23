@@ -198,7 +198,7 @@
       {
         "file_id": "colormap",
         "source_path": "colormap.png",
-        "target_path": "source/colormap.png",
+        "target_path": "source/Textures/colormap.png",
         "role": "texture",
         "media_type": "image/png",
         "format": "png"

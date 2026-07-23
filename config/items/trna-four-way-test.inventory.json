@@ -5,7 +5,7 @@
     "entries": [
       {
         "slot_id": "primary_prop",
-        "pack_digest": "sha256:95b6d2f82365230dfe5efae7b200a40535575ae420fb80ce152fb14b707b467a",
+        "pack_digest": "sha256:a362f0b7deabb930c30739b2199a34244f2e7110f0b41cfbf4718b34c0c3afae",
         "item_id": "blaster-h",
         "pool_size": 8,
         "spawn": {
