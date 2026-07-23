@@ -51,7 +51,7 @@ SCENE_ID=21
 CUSTOM_URDF="${MATRIX_G1_URDF:-}"
 CUSTOM_NAME="g1_29dof"
 G1_SKIN="${MATRIX_G1_SKIN:-}"
-CONTROL_SOURCE="planner"
+CONTROL_SOURCE="${MATRIX_SONIC_CONTROL_SOURCE:-planner}"
 GAME_INPUT_SOURCE="${MATRIX_GAME_INPUT_SOURCE:-auto}"
 GAME_CAMERA_YAW_SOURCE="${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}"
 GAME_LOOK_BUTTON="${MATRIX_GAME_LOOK_BUTTON:-left}"
@@ -340,6 +340,15 @@ export MATRIX_MOUSE_SETTINGS_FILE MATRIX_MOUSE_APPLIED_PROFILE
 export MATRIX_MOUSE_APPLIED_SPEED_SCALE MATRIX_MOUSE_SETTINGS_LOAD_STATUS
 echo "[INFO] Mouse launch profile: $MATRIX_MOUSE_APPLIED_PROFILE " \
     "scale=$MATRIX_MOUSE_APPLIED_SPEED_SCALE status=$MATRIX_MOUSE_SETTINGS_LOAD_STATUS"
+MATRIX_MOTION_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${PROFILE:-local}}"
+MATRIX_MOTION_SETTINGS_FILE="${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_MOTION_SETTINGS_PROFILE}/motion-control.json}"
+if [[ "$MATRIX_MOTION_SETTINGS_FILE" != /* ]]; then
+    echo "[ERROR] MATRIX_MOTION_SETTINGS_FILE must be absolute" >&2
+    exit 2
+fi
+MATRIX_MOTION_SETTINGS_FILE="$(realpath -m "$MATRIX_MOTION_SETTINGS_FILE")"
+export MATRIX_MOTION_SETTINGS_FILE
+echo "[INFO] Motion settings file: $MATRIX_MOTION_SETTINGS_FILE"
 MATRIX_SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
 export MATRIX_SONIC_STATUS_FILE
 rm -f -- "$MATRIX_SONIC_STATUS_FILE"
@@ -356,6 +365,9 @@ print("1" if value > 0.0 else "0")
 PY
 )"; then
     exit 2
+fi
+if [[ ! -v MATRIX_VERIFY_RUNTIME && "$QUALIFICATION_REQUESTED" == "0" ]]; then
+    export MATRIX_VERIFY_RUNTIME="${MATRIX_PROFILE_VERIFY_RUNTIME_DEFAULT:-1}"
 fi
 case "${GAME_WORLD_PERSISTENCE,,}" in
     auto)
@@ -734,8 +746,11 @@ done
 if [[ "$CONTROL_SOURCE" == "game" ]]; then
     for required in \
         "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+        "$PROJECT_ROOT/scripts/matrix_external_control.py" \
         "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
         "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
+        "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
+        "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
         "$PROJECT_ROOT/scripts/matrix_world_state.py" \
         "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
         "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
@@ -1000,6 +1015,7 @@ export MATRIX_SONIC_STARTUP_BAND_FADE="$STARTUP_BAND_FADE"
 # pre-launch bytes so switching the same feature branch on two hosts stays clean.
 CONFIG_BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/matrix-sonic-config.XXXXXX")"
 GAME_RUNTIME_DIR=""
+EXTERNAL_CONTROL_RUNTIME_DIR=""
 GENERATED_GAME_INPUT_SOCKET=0
 cleanup_prelaunch_temp() {
     rm -rf -- "$CONFIG_BACKUP"
@@ -1017,6 +1033,80 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
     fi
     export MATRIX_GAME_RESTART_REQUEST_FILE="$GAME_RUNTIME_DIR/restart-request.json"
     export MATRIX_GAME_RESTART_CAPABILITY_FILE="$GAME_RUNTIME_DIR/restart-capability"
+    EXTERNAL_CONTROL_SOCKET="${MATRIX_GAME_EXTERNAL_CONTROL_SOCKET:-}"
+    EXTERNAL_CONTROL_CAPABILITY_FILE="${MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE:-}"
+    if [[ -n "$EXTERNAL_CONTROL_SOCKET" \
+        && -z "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]] \
+        || [[ -z "$EXTERNAL_CONTROL_SOCKET" \
+            && -n "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]]; then
+        echo "[ERROR] Matrix external-control socket/capability are all-or-none" >&2
+        exit 2
+    fi
+    if [[ -z "$EXTERNAL_CONTROL_SOCKET" ]]; then
+        EXTERNAL_CONTROL_PROFILE="${MATRIX_PROFILE:-local}"
+        if [[ ! "$EXTERNAL_CONTROL_PROFILE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+            echo "[ERROR] Matrix external-control profile is invalid: $EXTERNAL_CONTROL_PROFILE" >&2
+            exit 2
+        fi
+        EXTERNAL_CONTROL_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/matrix-external-control-${UID}"
+        if ! /usr/bin/python3 -I - "$EXTERNAL_CONTROL_RUNTIME_DIR" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    path.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+metadata = path.stat(follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+    raise SystemExit("external-control runtime path is not an owned directory")
+os.chmod(path, 0o700, follow_symlinks=False)
+if stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o700:
+    raise SystemExit("external-control runtime directory is not private")
+PY
+        then
+            echo "[ERROR] Could not prepare private Matrix external-control runtime directory" >&2
+            exit 2
+        fi
+        EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.sock"
+        EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.cap"
+    fi
+    export MATRIX_GAME_EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_SOCKET"
+    export MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_CAPABILITY_FILE"
+    export MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS="${MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS:-0.15}"
+    if ! /usr/bin/python3 -I - \
+        "$MATRIX_GAME_INPUT_SOCKET" \
+        "$MATRIX_GAME_EXTERNAL_CONTROL_SOCKET" \
+        "$MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE" \
+        "$MATRIX_GAME_RESTART_REQUEST_FILE" \
+        "$MATRIX_GAME_RESTART_CAPABILITY_FILE" \
+        "$MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS" <<'PY'
+import math
+from pathlib import Path
+import sys
+
+paths = [Path(value) for value in sys.argv[1:6]]
+if any(not path.is_absolute() for path in paths):
+    raise SystemExit("all Matrix game IPC paths must be absolute")
+if any(not path.parent.is_dir() for path in paths):
+    raise SystemExit("all Matrix game IPC parent directories must exist")
+canonical = [path.resolve(strict=False) for path in paths]
+if len(set(canonical)) != len(canonical):
+    raise SystemExit("all Matrix game IPC paths must be strictly distinct")
+try:
+    deadman = float(sys.argv[6])
+except ValueError as exc:
+    raise SystemExit("external-control deadman is not numeric") from exc
+if not math.isfinite(deadman) or not 0.01 <= deadman <= 0.15:
+    raise SystemExit("external-control deadman must be in [0.01, 0.15]")
+PY
+    then
+        echo "[ERROR] Invalid Matrix external-control IPC configuration" >&2
+        exit 2
+    fi
     /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_restart_request.py" \
         create-capability --file "$MATRIX_GAME_RESTART_CAPABILITY_FILE"
 fi
@@ -1033,6 +1123,15 @@ for relative in "${MUTABLE_FILES[@]}"; do
 done
 
 restore_tracked_config() {
+    # An unexpected shell exit must not remove the private gate directory while
+    # a rollback transaction or its authorizer still has it open.  These
+    # functions are defined later, so guard the early preflight EXIT path.
+    if declare -F cancel_rollback_helper >/dev/null 2>&1; then
+        cancel_rollback_helper
+    fi
+    if declare -F reap_rollback_gate_children >/dev/null 2>&1; then
+        reap_rollback_gate_children
+    fi
     if [[ "${TRACKED_CONFIG_RESTORED:-0}" == "1" ]]; then
         return 0
     fi
@@ -1081,9 +1180,23 @@ restore_tracked_config() {
 trap restore_tracked_config EXIT
 
 RUN_SIM_PID=""
+ROLLBACK_HELPER_PID=""
+ROLLBACK_AUTHORIZER_PID=""
+ROLLBACK_CANCEL_FILE=""
 FORWARDED_SIGNAL_EXIT_CODE=0
 RESTART_REQUEST_VALID=0
 RESTART_EXPECTED_EXIT_CODE=143
+GAME_RESUME_ROLLBACK_COUNT="${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
+# Keep this equal to matrix_world_state.MAX_RESUME_CHECKPOINTS: each failed
+# generation may quarantine exactly one member of the bounded resume ring.
+GAME_RESUME_ROLLBACK_MAX=16
+NEXT_GAME_RESUME_ROLLBACK_COUNT="$GAME_RESUME_ROLLBACK_COUNT"
+GAME_RESUME_ROLLBACK_WINDOW="${MATRIX_GAME_RESUME_ROLLBACK_WINDOW_EPOCH:-0}"
+GAME_RESUME_ROLLBACK_RATE_COUNT="${MATRIX_GAME_RESUME_ROLLBACK_RATE_COUNT:-0}"
+GAME_RESUME_ROLLBACK_RATE_MAX="${MATRIX_GAME_RESUME_ROLLBACK_MAX_PER_MINUTE:-16}"
+INTERNAL_RESTART_WINDOW="${MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH:-0}"
+INTERNAL_RESTART_COUNT="${MATRIX_GAME_INTERNAL_RESTART_COUNT:-0}"
+INTERNAL_RESTART_MAX="${MATRIX_GAME_INTERNAL_RESTART_MAX_PER_MINUTE:-16}"
 STOP_REQUESTED=0
 FORCED_STOP=0
 INTERNAL_RESTART_TIMEOUT=0
@@ -1093,11 +1206,165 @@ if [[ ! "$RUN_SIM_STOP_TIMEOUT_SECONDS" \
     echo "[ERROR] MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS must be positive" >&2
     exit 2
 fi
+if [[ ! "$GAME_RESUME_ROLLBACK_COUNT" =~ ^[0-9]+$ ]] \
+    || ((GAME_RESUME_ROLLBACK_COUNT > GAME_RESUME_ROLLBACK_MAX)); then
+    echo "[ERROR] MATRIX_GAME_RESUME_ROLLBACK_COUNT must be in " \
+        "[0, $GAME_RESUME_ROLLBACK_MAX]" >&2
+    exit 2
+fi
+if [[ ! "$GAME_RESUME_ROLLBACK_WINDOW" =~ ^[0-9]+$ \
+    || ! "$GAME_RESUME_ROLLBACK_RATE_COUNT" =~ ^[0-9]+$ \
+    || ! "$GAME_RESUME_ROLLBACK_RATE_MAX" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] Invalid Matrix resume-rollback rate guard state" >&2
+    exit 2
+fi
+if [[ ! "$INTERNAL_RESTART_WINDOW" =~ ^[0-9]+$ \
+    || ! "$INTERNAL_RESTART_COUNT" =~ ^[0-9]+$ \
+    || ! "$INTERNAL_RESTART_MAX" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] Invalid Matrix internal-restart guard state" >&2
+    exit 2
+fi
+publish_rollback_gate_marker_exec() {
+    local marker_path="$1"
+    local marker_payload="$2"
+    # The asynchronous authorizer calls this function directly.  exec keeps
+    # $! bound to the actual publisher for its whole lifetime, so a signal
+    # cannot leave an untracked Python descendant behind.
+    exec /usr/bin/python3 -I - "$marker_path" "$marker_payload" <<'PY'
+import os
+from pathlib import Path
+import secrets
+import stat
+import sys
+
+path = Path(sys.argv[1])
+payload = (sys.argv[2] + "\n").encode("ascii")
+if not path.is_absolute() or path.name in {"", ".", ".."}:
+    raise SystemExit(1)
+directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+directory_flags |= getattr(os, "O_CLOEXEC", 0)
+directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+directory_fd = os.open(path.parent, directory_flags)
+temporary_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}"
+temporary_fd = None
+try:
+    directory_stat = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != os.getuid()
+        or directory_stat.st_mode & 0o077
+    ):
+        raise SystemExit(1)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+    offset = 0
+    while offset < len(payload):
+        offset += os.write(temporary_fd, payload[offset:])
+    os.fsync(temporary_fd)
+    os.close(temporary_fd)
+    temporary_fd = None
+    # The private gate directory and fixed payload make replacing an identical
+    # repeated cancel marker safe. rename publishes a fully fsynced, nlink=1
+    # inode in one step, so the polling helper can never observe partial bytes
+    # or the transient two-link state created by a link/unlink protocol.
+    os.replace(
+        temporary_name,
+        path.name,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+    )
+    os.fsync(directory_fd)
+finally:
+    if temporary_fd is not None:
+        os.close(temporary_fd)
+    try:
+        os.unlink(temporary_name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+    os.close(directory_fd)
+PY
+}
+
+publish_rollback_gate_marker() {
+    # Synchronous callers still need the launcher shell after publication.
+    (publish_rollback_gate_marker_exec "$@")
+}
+
+child_job_is_running() {
+    local expected_pid="$1"
+    local child_pid
+    while IFS= read -r child_pid; do
+        if [[ "$child_pid" == "$expected_pid" ]]; then
+            return 0
+        fi
+    done < <(jobs -pr)
+    return 1
+}
+
+WAITED_CHILD_STATUS=127
+wait_for_tracked_child() {
+    local child_pid="$1"
+    local last_status=127
+    local wait_status=127
+
+    # A foreground wait can be interrupted by one of our traps while the child
+    # remains live.  Consult Bash's own job table and retry only while this exact
+    # child job is still running; never inspect /proc after a reap.
+    while child_job_is_running "$child_pid"; do
+        wait "$child_pid"
+        last_status=$?
+    done
+    # If the job completed between the job-table check and wait, one final wait
+    # reaps it.  If an earlier wait already reaped it, Bash returns 127 and the
+    # earlier status is retained.  Bash's job table prevents PID-reuse aliasing.
+    wait "$child_pid" 2>/dev/null
+    wait_status=$?
+    if [[ "$wait_status" != "127" || "$last_status" == "127" ]]; then
+        last_status="$wait_status"
+    fi
+    WAITED_CHILD_STATUS="$last_status"
+}
+
+cancel_rollback_helper() {
+    # Signal the transactional helper first.  Before its commit point SIGTERM
+    # makes the operation fail closed; after that point its handler deliberately
+    # finishes both replicas.  Only then stop the exact authorizer job and add a
+    # durable cancel marker as a second, filesystem-level cancellation channel.
+    if [[ -n "$ROLLBACK_HELPER_PID" ]] \
+        && child_job_is_running "$ROLLBACK_HELPER_PID"; then
+        kill -TERM "$ROLLBACK_HELPER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$ROLLBACK_AUTHORIZER_PID" ]] \
+        && child_job_is_running "$ROLLBACK_AUTHORIZER_PID"; then
+        kill -TERM "$ROLLBACK_AUTHORIZER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$ROLLBACK_CANCEL_FILE" ]]; then
+        publish_rollback_gate_marker \
+            "$ROLLBACK_CANCEL_FILE" \
+            matrix-world-state-reject-cancel/v1 2>/dev/null || true
+    fi
+}
+
+reap_rollback_gate_children() {
+    if [[ -n "$ROLLBACK_AUTHORIZER_PID" ]]; then
+        wait_for_tracked_child "$ROLLBACK_AUTHORIZER_PID"
+        ROLLBACK_AUTHORIZER_PID=""
+    fi
+    if [[ -n "$ROLLBACK_HELPER_PID" ]]; then
+        wait_for_tracked_child "$ROLLBACK_HELPER_PID"
+        ROLLBACK_HELPER_PID=""
+    fi
+    ROLLBACK_CANCEL_FILE=""
+}
+
 forward_signal() {
     local signal_name="$1"
     local exit_code="$2"
     FORWARDED_SIGNAL_EXIT_CODE="$exit_code"
     STOP_REQUESTED=1
+    cancel_rollback_helper
     if [[ -n "$RUN_SIM_PID" ]] && kill -0 "$RUN_SIM_PID" 2>/dev/null; then
         kill "-$signal_name" "$RUN_SIM_PID" 2>/dev/null || true
     fi
@@ -1105,6 +1372,107 @@ forward_signal() {
 trap 'forward_signal INT 130' SIGINT
 trap 'forward_signal TERM 143' SIGTERM
 trap 'forward_signal HUP 129' SIGHUP
+
+run_gated_resume_rejection() {
+    local ready_file="$GAME_RUNTIME_DIR/world-state-reject-ready"
+    local authorize_file="$GAME_RUNTIME_DIR/world-state-reject-authorize"
+    local cancel_file="$GAME_RUNTIME_DIR/world-state-reject-cancel"
+    local result_file="$GAME_RUNTIME_DIR/world-state-reject-result.json"
+    local error_file="$GAME_RUNTIME_DIR/world-state-reject-error.log"
+    local ready_seen=0
+    local helper_status=1
+    local authorize_status=1
+    local poll
+
+    ROLLBACK_CANCEL_FILE="$cancel_file"
+    (
+        umask 077
+        exec /usr/bin/python3 -I \
+            "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+            reject-checkpoint \
+            --file "$ROLLBACK_STATE_FILE" \
+            --world-id "$ROLLBACK_WORLD_ID" \
+            --world-revision "$ROLLBACK_WORLD_REVISION" \
+            --checkpoint-id "$ROLLBACK_CHECKPOINT_ID" \
+            --expected-generation "$ROLLBACK_GENERATION" \
+            --reason "$ROLLBACK_REJECTION_REASON" \
+            --run-id "$ROLLBACK_RUN_ID" \
+            --commit-ready-file "$ready_file" \
+            --commit-authorize-file "$authorize_file" \
+            --commit-cancel-file "$cancel_file" \
+            --commit-timeout-seconds 15
+    ) >"$result_file" 2>"$error_file" &
+    ROLLBACK_HELPER_PID=$!
+    chmod 600 "$result_file" "$error_file" 2>/dev/null || true
+
+    # The helper publishes ready only after acquiring the state lock and
+    # validating the exact checkpoint ID/generation. Keep this loop in the
+    # shell so INT/TERM/HUP traps can cancel the still-reversible transaction.
+    for ((poll = 0; poll < 800; poll++)); do
+        if [[ -f "$ready_file" && ! -L "$ready_file" ]]; then
+            ready_seen=1
+            break
+        fi
+        if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" \
+            || "$FORCED_STOP" != "0" ]] \
+            || ! child_job_is_running "$ROLLBACK_HELPER_PID"; then
+            break
+        fi
+        sleep 0.02
+    done
+
+    if [[ "$ready_seen" != "1" ]]; then
+        cancel_rollback_helper
+        # No authorize marker exists, so a helper that is still blocked before
+        # ready has no world-state write authority and may be boundedly killed.
+        for ((poll = 0; poll < 100; poll++)); do
+            ! child_job_is_running "$ROLLBACK_HELPER_PID" && break
+            sleep 0.01
+        done
+        if child_job_is_running "$ROLLBACK_HELPER_PID"; then
+            kill -KILL "$ROLLBACK_HELPER_PID" 2>/dev/null || true
+        fi
+    else
+        # Give a pending launcher signal one scheduling turn before publishing
+        # authorization. This delay is paid only after an actual bad-resume
+        # proposal, never on a normal launch.
+        sleep 0.10
+        if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
+            && "$FORCED_STOP" == "0" ]]; then
+            publish_rollback_gate_marker_exec \
+                "$authorize_file" \
+                matrix-world-state-reject-authorize/v1 &
+            ROLLBACK_AUTHORIZER_PID=$!
+            wait_for_tracked_child "$ROLLBACK_AUTHORIZER_PID"
+            authorize_status="$WAITED_CHILD_STATUS"
+            ROLLBACK_AUTHORIZER_PID=""
+            if [[ "$authorize_status" != "0" ]]; then
+                cancel_rollback_helper
+            fi
+        else
+            cancel_rollback_helper
+        fi
+    fi
+
+    wait_for_tracked_child "$ROLLBACK_HELPER_PID"
+    helper_status="$WAITED_CHILD_STATUS"
+    ROLLBACK_HELPER_PID=""
+    ROLLBACK_AUTHORIZER_PID=""
+    ROLLBACK_CANCEL_FILE=""
+
+    if [[ "$helper_status" != "0" ]]; then
+        if [[ -s "$error_file" ]]; then
+            echo "[ERROR] Matrix resume rollback helper: " \
+                "$(head -c 2048 "$error_file")" >&2
+        fi
+        return 1
+    fi
+    if [[ ! -f "$result_file" || -L "$result_file" ]]; then
+        return 1
+    fi
+    ROLLBACK_REJECTION_JSON="$(<"$result_file")"
+    [[ -n "$ROLLBACK_REJECTION_JSON" ]]
+}
 
 if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
     exit "$FORWARDED_SIGNAL_EXIT_CODE"
@@ -1207,14 +1575,374 @@ while [[ "$RUN_SIM_COMPLETED" == "0" ]]; do
         fi
     fi
 done
+# The exact run_sim child has been reaped. Clear its numeric PID before the
+# longer status-validation/rollback commit path so a late external signal can
+# never be forwarded to an unrelated process that reused the number.
+RUN_SIM_PID=""
 if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" ]]; then
     exit_code="$FORWARDED_SIGNAL_EXIT_CODE"
 fi
 if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
     && "$FORCED_STOP" == "0" \
+    && "$exit_code" == "76" \
+    && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
+    if ((GAME_RESUME_ROLLBACK_COUNT >= GAME_RESUME_ROLLBACK_MAX)); then
+        echo "[ERROR] Matrix resume rollback limit reached; " \
+            "leaving the runtime stopped" >&2
+    elif VERIFIED_ROLLBACK_OUTPUT="$(
+        /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+import json
+import math
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+if not path.is_file() or path.is_symlink():
+    raise SystemExit(1)
+try:
+    status = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(status, dict):
+    raise SystemExit(1)
+termination_reason = status.get("termination_reason")
+if termination_reason not in {"numerical_instability", "spawn_clearance_failed"}:
+    raise SystemExit(1)
+if "termination_signal" not in status or status["termination_signal"] is not None:
+    raise SystemExit(1)
+for field in ("failed_child_name", "failed_child_exit_code"):
+    if field not in status or status[field] is not None:
+        raise SystemExit(1)
+elapsed_wall_s = status.get("elapsed_wall_s")
+if (
+    isinstance(elapsed_wall_s, bool)
+    or not isinstance(elapsed_wall_s, (int, float))
+    or not math.isfinite(float(elapsed_wall_s))
+    or float(elapsed_wall_s) < 0.0
+):
+    raise SystemExit(1)
+numerical_error = status.get("numerical_error")
+dynamic_resume_clearance = False
+if termination_reason == "numerical_instability":
+    if float(elapsed_wall_s) > 5.0:
+        raise SystemExit(1)
+    if not isinstance(numerical_error, str) or not numerical_error.startswith(
+        ("snapshot_non_finite:", "snapshot_sim_time_not_increasing:")
+    ):
+        raise SystemExit(1)
+    rollback_reason = "startup_numerical_instability"
+else:
+    clearance = status.get("spawn_clearance")
+    if not isinstance(clearance, dict):
+        raise SystemExit(1)
+    clearance_reason = clearance.get("reason")
+    if (
+        clearance.get("schema") != "matrix-spawn-clearance-audit/v1"
+        or clearance.get("safe") is not False
+        or clearance.get("error") is not None
+        or clearance_reason not in {"scene_penetration", "unsafe_foot_contact"}
+    ):
+        raise SystemExit(1)
+    rejected_count = clearance.get("rejected_contact_count")
+    worst = clearance.get("worst")
+    if (
+        isinstance(rejected_count, bool)
+        or not isinstance(rejected_count, int)
+        or rejected_count <= 0
+        or not isinstance(worst, dict)
+        or worst.get("allowed") is not False
+    ):
+        raise SystemExit(1)
+    classification = worst.get("classification")
+    if clearance_reason == "scene_penetration":
+        if classification != "scene_penetration":
+            raise SystemExit(1)
+    elif classification not in {
+        "unsafe_foot_contact_normal",
+        "unsafe_foot_penetration",
+    }:
+        raise SystemExit(1)
+    rollback_reason = f"spawn_clearance:{clearance_reason}"
+    if numerical_error != rollback_reason:
+        raise SystemExit(1)
+    probation = status.get("resume_probation")
+    dynamic_resume_clearance = bool(
+        isinstance(probation, dict)
+        and probation.get("enabled") is True
+        and probation.get("active") is True
+        and probation.get("completed") is False
+        and probation.get("failed") is True
+        and probation.get("phase") == "failed"
+        and probation.get("checkpoint_writes_blocked") is True
+        and probation.get("failure_reason") == clearance_reason
+        and probation.get("last_clearance_audit") == clearance
+        and probation.get("stable_idle_required_s") == 1.5
+        and probation.get("stable_idle_clock") == "sim_time"
+        and probation.get("audit_interval_s") == 0.1
+        and type(probation.get("first_fresh_lowcmd_observed")) is bool
+        and type(probation.get("startup_band_released")) is bool
+        and isinstance(probation.get("stable_idle_elapsed_s"), (int, float))
+        and not isinstance(probation.get("stable_idle_elapsed_s"), bool)
+        and math.isfinite(float(probation.get("stable_idle_elapsed_s")))
+        and float(probation.get("stable_idle_elapsed_s")) >= 0.0
+        and probation.get("stable_idle_sim_elapsed_s")
+        == probation.get("stable_idle_elapsed_s")
+        and probation.get("sim_time_sample_valid") is True
+        and isinstance(probation.get("current_sim_time_s"), (int, float))
+        and not isinstance(probation.get("current_sim_time_s"), bool)
+        and math.isfinite(float(probation.get("current_sim_time_s")))
+        and float(probation.get("current_sim_time_s")) >= 0.0
+        and probation.get("max_sim_sample_gap_s") == 0.05
+        and isinstance(probation.get("audit_count"), int)
+        and not isinstance(probation.get("audit_count"), bool)
+        and probation.get("audit_count") > 0
+    )
+    if not dynamic_resume_clearance and float(elapsed_wall_s) > 5.0:
+        raise SystemExit(1)
+for field in ("completed", "interrupted", "passed"):
+    if status.get(field) is not False:
+        raise SystemExit(1)
+if type(status.get("fall_detected")) is not bool:
+    raise SystemExit(1)
+for field in ("active_lowcmd", "low_cmd_received"):
+    if type(status.get(field)) is not bool:
+        raise SystemExit(1)
+for field in ("active_elapsed_s", "active_lowcmd_longest_s"):
+    value = status.get(field)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+    ):
+        raise SystemExit(1)
+active_frames = status.get("active_frames")
+if (
+    isinstance(active_frames, bool)
+    or not isinstance(active_frames, int)
+    or active_frames < 0
+):
+    raise SystemExit(1)
+if dynamic_resume_clearance:
+    probation = status["resume_probation"]
+    if status.get("fall_detected") is not False:
+        raise SystemExit(1)
+    if (
+        status.get("active_lowcmd") is True
+        and status.get("low_cmd_received") is not True
+    ):
+        raise SystemExit(1)
+    if (
+        status.get("low_cmd_received") is True
+        and probation.get("first_fresh_lowcmd_observed") is not True
+    ):
+        raise SystemExit(1)
+else:
+    if (
+        status.get("active_lowcmd") is not False
+        or status.get("low_cmd_received") is not False
+    ):
+        raise SystemExit(1)
+    if active_frames != 0:
+        raise SystemExit(1)
+    if any(
+        float(status[field]) != 0.0
+        for field in ("active_elapsed_s", "active_lowcmd_longest_s")
+    ):
+        raise SystemExit(1)
+if (
+    status.get("instability_resets") != 0
+    or isinstance(status.get("instability_resets"), bool)
+    or status.get("last_reset_reason") is not None
+):
+    raise SystemExit(1)
+internal = status.get("internal_restart")
+if not isinstance(internal, dict):
+    raise SystemExit(1)
+if internal.get("requested") is not False or internal.get("reason") is not None:
+    raise SystemExit(1)
+run_id = status.get("run_id")
+if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+    raise SystemExit(1)
+world = status.get("game_world_state")
+if not isinstance(world, dict) or world.get("last_error") is not None:
+    raise SystemExit(1)
+rollback = world.get("resume_rollback")
+if not isinstance(rollback, dict):
+    raise SystemExit(1)
+if rollback.get("requested") is not True or rollback.get("applied") is not False:
+    raise SystemExit(1)
+if rollback.get("reason") != rollback_reason:
+    raise SystemExit(1)
+if rollback.get("run_id") != run_id:
+    raise SystemExit(1)
+checkpoint_id = rollback.get("rejected_checkpoint_id")
+if (
+    not isinstance(checkpoint_id, str)
+    or re.fullmatch(r"cp-[0-9a-f]{32}", checkpoint_id) is None
+    or world.get("selected_resume_checkpoint_id") != checkpoint_id
+    or world.get("active_resume_checkpoint_id") != checkpoint_id
+):
+    raise SystemExit(1)
+if (
+    dynamic_resume_clearance
+    and status["resume_probation"].get("selected_checkpoint_id") != checkpoint_id
+):
+    raise SystemExit(1)
+generation = rollback.get("rejected_generation")
+if (
+    isinstance(generation, bool)
+    or not isinstance(generation, int)
+    or generation < 0
+    or world.get("selected_resume_generation") != generation
+    or world.get("generation") != generation
+):
+    raise SystemExit(1)
+if world.get("resume_rollback_ineligibility") is not None:
+    raise SystemExit(1)
+state_path = world.get("path")
+world_id = world.get("world_id")
+world_revision = world.get("world_revision")
+if (
+    not isinstance(state_path, str)
+    or not state_path.startswith("/")
+    or len(state_path) > 4096
+    or any(ord(character) < 0x20 or ord(character) == 0x7F for character in state_path)
+):
+    raise SystemExit(1)
+if (
+    not isinstance(world_id, str)
+    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}", world_id) is None
+):
+    raise SystemExit(1)
+if (
+    not isinstance(world_revision, str)
+    or not world_revision
+    or len(world_revision) > 256
+    or any(ord(character) < 0x21 or ord(character) > 0x7E for character in world_revision)
+):
+    raise SystemExit(1)
+for value in (
+    state_path,
+    world_id,
+    world_revision,
+    checkpoint_id,
+    str(generation),
+    run_id,
+    rollback_reason,
+):
+    print(value)
+PY
+    )"; then
+        mapfile -t VERIFIED_ROLLBACK_FIELDS <<<"$VERIFIED_ROLLBACK_OUTPUT"
+        if [[ "${#VERIFIED_ROLLBACK_FIELDS[@]}" != "7" ]]; then
+            echo "[ERROR] Refusing malformed Matrix resume rollback proposal" >&2
+        else
+            ROLLBACK_STATE_FILE="${VERIFIED_ROLLBACK_FIELDS[0]}"
+            ROLLBACK_WORLD_ID="${VERIFIED_ROLLBACK_FIELDS[1]}"
+            ROLLBACK_WORLD_REVISION="${VERIFIED_ROLLBACK_FIELDS[2]}"
+            ROLLBACK_CHECKPOINT_ID="${VERIFIED_ROLLBACK_FIELDS[3]}"
+            ROLLBACK_GENERATION="${VERIFIED_ROLLBACK_FIELDS[4]}"
+            ROLLBACK_RUN_ID="${VERIFIED_ROLLBACK_FIELDS[5]}"
+            ROLLBACK_REJECTION_REASON="${VERIFIED_ROLLBACK_FIELDS[6]}"
+            EXPECTED_ROLLBACK_STATE_FILE="${MATRIX_GAME_WORLD_STATE_FILE:-}"
+            if [[ -z "$EXPECTED_ROLLBACK_STATE_FILE" ]]; then
+                EXPECTED_ROLLBACK_STATE_FILE="$(
+                    /usr/bin/python3 -I \
+                        "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+                        default-path \
+                        --profile "${MATRIX_PROFILE:-local}" \
+                        --world-id "$ROLLBACK_WORLD_ID"
+                )" || EXPECTED_ROLLBACK_STATE_FILE=""
+            fi
+            if [[ -z "$EXPECTED_ROLLBACK_STATE_FILE" \
+                || "$ROLLBACK_STATE_FILE" != "$EXPECTED_ROLLBACK_STATE_FILE" ]]; then
+                echo "[ERROR] Refusing Matrix resume rollback for an unexpected " \
+                    "world-state path" >&2
+            else
+                ROLLBACK_RESTART_NOW="$(date +%s)"
+                if ((GAME_RESUME_ROLLBACK_WINDOW == 0 \
+                    || ROLLBACK_RESTART_NOW - GAME_RESUME_ROLLBACK_WINDOW >= 60)); then
+                    GAME_RESUME_ROLLBACK_WINDOW="$ROLLBACK_RESTART_NOW"
+                    GAME_RESUME_ROLLBACK_RATE_COUNT=0
+                fi
+                GAME_RESUME_ROLLBACK_RATE_COUNT=$((GAME_RESUME_ROLLBACK_RATE_COUNT + 1))
+                if ((GAME_RESUME_ROLLBACK_RATE_COUNT > GAME_RESUME_ROLLBACK_RATE_MAX)); then
+                        echo "[ERROR] Matrix resume rollback rate limit exceeded; " \
+                            "leaving the runtime stopped" >&2
+                elif [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" \
+                        || "$FORCED_STOP" != "0" ]]; then
+                    echo "[INFO] External stop cancelled the pending Matrix " \
+                        "resume rollback" >&2
+                elif run_gated_resume_rejection \
+                        && /usr/bin/python3 -I - \
+                        "$ROLLBACK_REJECTION_JSON" \
+                        "$ROLLBACK_CHECKPOINT_ID" \
+                        "$ROLLBACK_GENERATION" <<'PY'
+import json
+import re
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    raise SystemExit(1)
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+if payload.get("schema") != "matrix-world-state-rejection/v1":
+    raise SystemExit(1)
+if payload.get("rejected_checkpoint_id") != sys.argv[2]:
+    raise SystemExit(1)
+if payload.get("idempotent") is not False:
+    raise SystemExit(1)
+generation = payload.get("generation")
+if isinstance(generation, bool) or generation != int(sys.argv[3]) + 1:
+    raise SystemExit(1)
+replacement = payload.get("replacement_checkpoint_id")
+if replacement is not None and (
+    not isinstance(replacement, str)
+    or re.fullmatch(r"cp-[0-9a-f]{32}", replacement) is None
+    or replacement == sys.argv[2]
+):
+    raise SystemExit(1)
+PY
+                then
+                    if [[ "$FORWARDED_SIGNAL_EXIT_CODE" != "0" \
+                            || "$FORCED_STOP" != "0" ]]; then
+                        echo "[INFO] Matrix resume rollback crossed its " \
+                            "authorized commit point; checkpoint quarantine " \
+                            "completed but the external stop cancelled restart" >&2
+                    else
+                        RESTART_REQUEST_VALID=1
+                        RESTART_EXPECTED_EXIT_CODE=76
+                        NEXT_GAME_RESUME_ROLLBACK_COUNT=$((GAME_RESUME_ROLLBACK_COUNT + 1))
+                        echo "[INFO] Quarantined failed Matrix resume checkpoint " \
+                            "id=$ROLLBACK_CHECKPOINT_ID generation=$ROLLBACK_GENERATION; " \
+                            "validated fallback restart count=${GAME_RESUME_ROLLBACK_RATE_COUNT}/${GAME_RESUME_ROLLBACK_RATE_MAX}"
+                    fi
+                else
+                    echo "[ERROR] Refusing Matrix resume rollback because the " \
+                        "exact checkpoint rejection did not commit" >&2
+                fi
+            fi
+        fi
+    else
+        echo "[ERROR] Refusing unverified Matrix resume rollback proposal" >&2
+    fi
+    if [[ "$RESTART_REQUEST_VALID" != "1" \
+        || "$RESTART_EXPECTED_EXIT_CODE" != "76" ]]; then
+        # Exit 76 is proposal authority only.  Any malformed, ineligible,
+        # rejected, or rate-limited proposal is a normal runtime failure.
+        exit_code=2
+    fi
+fi
+if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
+    && "$FORCED_STOP" == "0" \
     && "$exit_code" == "75" \
     && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
-    if /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+    if VERIFIED_INTERNAL_RESTART_REASON="$(
+        /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -1242,37 +1970,33 @@ if "termination_signal" not in status or status["termination_signal"] is not Non
 for field in ("failed_child_name", "failed_child_exit_code"):
     if field not in status or status[field] is not None:
         raise SystemExit(1)
-if not isinstance(world, dict) or world.get("has_last_exit") is not True:
+if not isinstance(world, dict):
     raise SystemExit(1)
 if world.get("last_error") is not None:
     raise SystemExit(1)
+if world.get("has_last_exit") is not True:
+    raise SystemExit(1)
 if reason == "game_fall_respawn" and status.get("game_auto_respawn") is not True:
     raise SystemExit(1)
+print(reason)
 PY
-    then
+    )"; then
         INTERNAL_RESTART_NOW="$(date +%s)"
-        INTERNAL_RESTART_WINDOW="${MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH:-$INTERNAL_RESTART_NOW}"
-        INTERNAL_RESTART_COUNT="${MATRIX_GAME_INTERNAL_RESTART_COUNT:-0}"
-        INTERNAL_RESTART_MAX="${MATRIX_GAME_INTERNAL_RESTART_MAX_PER_MINUTE:-6}"
-        if [[ ! "$INTERNAL_RESTART_WINDOW" =~ ^[0-9]+$ \
-            || ! "$INTERNAL_RESTART_COUNT" =~ ^[0-9]+$ \
-            || ! "$INTERNAL_RESTART_MAX" =~ ^[1-9][0-9]*$ ]]; then
-            echo "[ERROR] Invalid Matrix internal-restart guard state" >&2
-        else
-            if ((INTERNAL_RESTART_NOW - INTERNAL_RESTART_WINDOW >= 60)); then
+        if [[ "$INTERNAL_RESTART_WINDOW" == "0" ]] \
+            || ((INTERNAL_RESTART_NOW - INTERNAL_RESTART_WINDOW >= 60)); then
                 INTERNAL_RESTART_WINDOW="$INTERNAL_RESTART_NOW"
                 INTERNAL_RESTART_COUNT=0
-            fi
-            INTERNAL_RESTART_COUNT=$((INTERNAL_RESTART_COUNT + 1))
-            if ((INTERNAL_RESTART_COUNT <= INTERNAL_RESTART_MAX)); then
-                RESTART_REQUEST_VALID=1
-                RESTART_EXPECTED_EXIT_CODE=75
-                echo "[INFO] Validated Matrix world reload " \
-                    "count=${INTERNAL_RESTART_COUNT}/${INTERNAL_RESTART_MAX}"
-            else
-                echo "[ERROR] Matrix world reload rate limit exceeded; " \
-                    "leaving the runtime stopped" >&2
-            fi
+        fi
+        INTERNAL_RESTART_COUNT=$((INTERNAL_RESTART_COUNT + 1))
+        if ((INTERNAL_RESTART_COUNT <= INTERNAL_RESTART_MAX)); then
+            RESTART_REQUEST_VALID=1
+            RESTART_EXPECTED_EXIT_CODE=75
+            echo "[INFO] Validated Matrix world reload " \
+                "reason=$VERIFIED_INTERNAL_RESTART_REASON " \
+                "count=${INTERNAL_RESTART_COUNT}/${INTERNAL_RESTART_MAX}"
+        else
+            echo "[ERROR] Matrix world reload rate limit exceeded; " \
+                "leaving the runtime stopped" >&2
         fi
     else
         echo "[ERROR] Refusing unverified Matrix world reload request" >&2
@@ -1284,9 +2008,11 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
     && "$RESTART_EXPECTED_EXIT_CODE" == "143" \
     && "$exit_code" == "143" \
     && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
-    if /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+    if VERIFIED_RESTART_CHECKPOINT_KIND="$(
+        /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
 import json
 from pathlib import Path
+import re
 import signal
 import sys
 
@@ -1316,9 +2042,134 @@ if not isinstance(world, dict) or world.get("has_last_exit") is not True:
     raise SystemExit(1)
 if world.get("last_error") is not None:
     raise SystemExit(1)
+run_id = status.get("run_id")
+if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+    raise SystemExit(1)
+final_checkpoint = status.get("final_checkpoint")
+
+def checkpoint_identity(value, *, schema):
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "run_id",
+        "checkpoint_id",
+        "generation",
+    }:
+        return None
+    checkpoint_id = value.get("checkpoint_id")
+    generation = value.get("generation")
+    if (
+        value.get("schema") != schema
+        or value.get("run_id") != run_id
+        or not isinstance(checkpoint_id, str)
+        or re.fullmatch(r"cp-[0-9a-f]{32}", checkpoint_id) is None
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        return None
+    return checkpoint_id, generation
+
+final_identity = checkpoint_identity(
+    final_checkpoint,
+    schema="matrix-final-world-checkpoint/v1",
+)
+if final_identity is not None:
+    checkpoint_id, generation = final_identity
+    if (
+        world.get("active_resume_checkpoint_id") != checkpoint_id
+        or world.get("generation") != generation
+    ):
+        raise SystemExit(1)
+    print("final")
+    raise SystemExit(0)
+
+# A selected checkpoint stays read-only after startup until a genuine user
+# move/turn.  In that narrow state the runtime may prove that the exact durable
+# selected checkpoint can be reused, without writing SONIC's settling pose.
+if final_checkpoint is not None:
+    raise SystemExit(1)
+reuse = status.get("reused_resume_checkpoint")
+if not isinstance(reuse, dict) or set(reuse) != {
+    "schema",
+    "run_id",
+    "checkpoint_id",
+    "generation",
+    "disposition",
+}:
+    raise SystemExit(1)
+reuse_identity = checkpoint_identity(
+    {key: value for key, value in reuse.items() if key != "disposition"},
+    schema="matrix-reused-selected-world-checkpoint/v1",
+)
+if reuse_identity is None or reuse.get("disposition") != "reused_selected_resume":
+    raise SystemExit(1)
+checkpoint_id, generation = reuse_identity
+if (
+    status.get("fall_detected") is not False
+    or status.get("numerical_error") is not None
+    or status.get("current_fall_detected", False) is not False
+    or world.get("active_resume_checkpoint_id") != checkpoint_id
+    or world.get("generation") != generation
+    or world.get("selected_resume_checkpoint_id") != checkpoint_id
+    or world.get("selected_resume_generation") != generation
+    or world.get("load_error") is not None
+    or world.get("checkpoint_count") != 0
+    or world.get("last_checkpoint_monotonic_s") is not None
+):
+    raise SystemExit(1)
+rollback = world.get("resume_rollback")
+if (
+    not isinstance(rollback, dict)
+    or rollback.get("requested") is not False
+    or rollback.get("applied") is not False
+):
+    raise SystemExit(1)
+probation = status.get("resume_probation")
+if (
+    not isinstance(probation, dict)
+    or probation.get("enabled") is not True
+    or probation.get("selected_checkpoint_id") != checkpoint_id
+    or probation.get("active") is not False
+    or probation.get("completed") is not True
+    or probation.get("failed") is not False
+    or probation.get("phase") != "completed"
+    or probation.get("checkpoint_writes_blocked") is not True
+    or not isinstance(probation.get("audit_count"), int)
+    or isinstance(probation.get("audit_count"), bool)
+    or probation.get("audit_count") <= 0
+):
+    raise SystemExit(1)
+audit = probation.get("last_clearance_audit")
+arming = probation.get("checkpoint_write_arming")
+if (
+    not isinstance(audit, dict)
+    or audit.get("safe") is not True
+    or not isinstance(arming, dict)
+    or arming.get("required") is not True
+    or arming.get("armed") is not False
+    or arming.get("phase") != "waiting_user_motion"
+    or arming.get("waiting_for_user_motion") is not True
+    or arming.get("armed_by_mode") is not None
+    or arming.get("armed_by_sequence") is not None
+):
+    raise SystemExit(1)
+failures = status.get("acceptance_failures")
+if (
+    not isinstance(failures, list)
+    or "world_state_checkpoint_failed" in failures
+):
+    raise SystemExit(1)
+print("reused_selected_resume")
 PY
-    then
-        echo "[INFO] Verified final Matrix world checkpoint for requested restart"
+    )"; then
+        if [[ "$VERIFIED_RESTART_CHECKPOINT_KIND" == "final" ]]; then
+            echo "[INFO] Verified final Matrix world checkpoint for requested restart"
+        elif [[ "$VERIFIED_RESTART_CHECKPOINT_KIND" == "reused_selected_resume" ]]; then
+            echo "[INFO] Verified unchanged selected Matrix world checkpoint for requested restart"
+        else
+            RESTART_REQUEST_VALID=0
+            echo "[ERROR] Refusing Matrix restart with an unknown checkpoint proof" >&2
+        fi
     else
         RESTART_REQUEST_VALID=0
         echo "[ERROR] Refusing Matrix restart without a verified final world checkpoint" >&2
@@ -1352,6 +2203,9 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
                 MATRIX_SONIC_RESTART_LOCK_FD=9 \
                 MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH="${INTERNAL_RESTART_WINDOW:-0}" \
                 MATRIX_GAME_INTERNAL_RESTART_COUNT="${INTERNAL_RESTART_COUNT:-0}" \
+                MATRIX_GAME_RESUME_ROLLBACK_COUNT="$NEXT_GAME_RESUME_ROLLBACK_COUNT" \
+                MATRIX_GAME_RESUME_ROLLBACK_WINDOW_EPOCH="$GAME_RESUME_ROLLBACK_WINDOW" \
+                MATRIX_GAME_RESUME_ROLLBACK_RATE_COUNT="$GAME_RESUME_ROLLBACK_RATE_COUNT" \
                 "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${ORIGINAL_ARGS[@]}"
             echo "[ERROR] Failed to exec restarted Matrix launcher" >&2
             exit 1

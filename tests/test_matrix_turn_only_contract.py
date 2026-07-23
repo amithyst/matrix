@@ -107,8 +107,10 @@ def snapshot(
                 "e": False,
                 "v": False,
                 "ctrl": False,
+                "alt": False,
                 "shift": shift,
             },
+            "keyboard_boost": False,
             "move_stick": {"right": 0.0, "forward": 0.0},
         }
     )
@@ -248,7 +250,7 @@ class TurnOnlyCoreContractTest(unittest.TestCase):
                 turning = core.command(now_s=10.0, dt_s=0.1)
                 self.assertEqual(turning.mode, "turn")
                 self.assertEqual(
-                    turning.locomotion_mode, CORE.SONIC_SLOW_WALK_MODE
+                    turning.locomotion_mode, CORE.SONIC_IDLE_MODE
                 )
                 self.assertEqual(turning.speed_mps, 0.0)
                 self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
@@ -327,8 +329,9 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
         planner_frames: list[dict[str, object]] = []
         planner = self.planner_client(planner_frames)
         planner.send_game_command(turning)
-        self.assertEqual(planner_frames[-1]["mode"], CORE.SONIC_SLOW_WALK_MODE)
-        self.assertEqual(planner_frames[-1]["speed"], 0.0)
+        self.assertEqual(turning.locomotion_mode, CORE.SONIC_IDLE_MODE)
+        self.assertEqual(planner_frames[-1]["mode"], CORE.SONIC_WALK_MODE)
+        self.assertEqual(planner_frames[-1]["speed"], -1.0)
         self.assertEqual(planner_frames[-1]["movement"], [0.0, 0.0, 0.0])
         self.assertEqual(planner_frames[-1]["facing"], list(turning.facing))
 
@@ -386,9 +389,14 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
             dt_s=0.02,
         )
 
+        self.assertEqual(world_command.reason, "aligning_heading")
         self.assertEqual(wire_command.mode, "turn")
         self.assertEqual(
-            wire_command.locomotion_mode, CORE.SONIC_SLOW_WALK_MODE
+            wire_command.reason,
+            "recovery_heading_slew_limited",
+        )
+        self.assertEqual(
+            wire_command.locomotion_mode, CORE.SONIC_IDLE_MODE
         )
         self.assertEqual(wire_command.speed_mps, 0.0)
         self.assertEqual(wire_command.movement, (0.0, 0.0, 0.0))
@@ -404,6 +412,13 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(coordinator.last_reframe_limited)
         self.assertEqual(coordinator.reframe_limited_frames, 1)
+
+        planner_frames: list[dict[str, object]] = []
+        planner = self.planner_client(planner_frames)
+        planner.send_game_command(wire_command)
+        self.assertEqual(planner_frames[-1]["mode"], CORE.SONIC_WALK_MODE)
+        self.assertEqual(planner_frames[-1]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planner_frames[-1]["speed"], -1.0)
 
     def test_recovery_reframe_neutral_holds_measured_deploy_heading(self) -> None:
         recovered_heading = math.radians(150.0)
@@ -449,7 +464,7 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
                 0.0,
             ),
             speed_mps=0.0,
-            locomotion_mode=CORE.SONIC_SLOW_WALK_MODE,
+            locomotion_mode=CORE.SONIC_IDLE_MODE,
             mode="turn",
             safe_stop=False,
             reason="aligning_heading",
@@ -481,7 +496,7 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
             movement=(0.0, 0.0, 0.0),
             facing=(-1.0, 0.0, 0.0),
             speed_mps=0.0,
-            locomotion_mode=CORE.SONIC_SLOW_WALK_MODE,
+            locomotion_mode=CORE.SONIC_IDLE_MODE,
             mode="turn",
             safe_stop=False,
             reason="aligning_heading",
@@ -517,7 +532,7 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
             movement=(0.0, 0.0, 0.0),
             facing=(math.cos(-0.05), math.sin(-0.05), 0.0),
             speed_mps=0.0,
-            locomotion_mode=CORE.SONIC_SLOW_WALK_MODE,
+            locomotion_mode=CORE.SONIC_IDLE_MODE,
             mode="turn",
             safe_stop=False,
             reason="aligning_heading",
@@ -567,7 +582,7 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
             movement=(0.0, 0.0, 0.0),
             facing=(math.cos(-0.05), math.sin(-0.05), 0.0),
             speed_mps=0.0,
-            locomotion_mode=CORE.SONIC_SLOW_WALK_MODE,
+            locomotion_mode=CORE.SONIC_IDLE_MODE,
             mode="turn",
             safe_stop=False,
             reason="aligning_heading",
@@ -662,7 +677,7 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
             movement=(0.0, 0.0, 0.0),
             facing=(-1.0, 0.0, 0.0),
             speed_mps=0.0,
-            locomotion_mode=CORE.SONIC_SLOW_WALK_MODE,
+            locomotion_mode=CORE.SONIC_IDLE_MODE,
             mode="turn",
             safe_stop=False,
             reason="aligning_heading",
@@ -751,7 +766,7 @@ class TurnOnlyRuntimeContractTest(unittest.TestCase):
             self.assertEqual(reframed.movement, (0.0, 0.0, 0.0))
             self.assertEqual(reframed.speed_mps, 0.0)
             self.assertEqual(
-                reframed.locomotion_mode, CORE.SONIC_SLOW_WALK_MODE
+                reframed.locomotion_mode, CORE.SONIC_IDLE_MODE
             )
 
         self.assertAlmostEqual(headings[-1], desired_heading)

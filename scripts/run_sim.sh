@@ -1338,9 +1338,12 @@ if $MATRIX_SONIC_ENABLED; then
     if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         for required in \
             "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+            "$PROJECT_ROOT/scripts/matrix_external_control.py" \
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
             "$PROJECT_ROOT/scripts/matrix_ui_settings.py" \
             "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
+            "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
             "$PROJECT_ROOT/scripts/matrix_world_state.py" \
             "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
             "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
@@ -1432,14 +1435,16 @@ if $MATRIX_SONIC_ENABLED; then
                 resolve-start \
                 --file "$GAME_WORLD_STATE_FILE" \
                 --world-id "$GAME_WORLD_ID" \
-                --world-revision "$GAME_WORLD_REVISION"
+                --world-revision "$GAME_WORLD_REVISION" \
+                --include-checkpoint-meta
         )"; then
             echo "[ERROR] Could not resolve the Matrix world resume pose" >&2
             exit 1
         fi
         mapfile -t GAME_WORLD_START_LINES <<<"$GAME_WORLD_START_OUTPUT"
         if [[ "${GAME_WORLD_START_LINES[0]:-}" == "pose" ]]; then
-            if [[ "${#GAME_WORLD_START_LINES[@]}" != "7" ]]; then
+            if [[ "${#GAME_WORLD_START_LINES[@]}" != "9" \
+                || ! "${GAME_WORLD_START_LINES[8]}" =~ ^[0-9]+$ ]]; then
                 echo "[ERROR] Invalid Matrix world-state pose response" >&2
                 exit 1
             fi
@@ -1450,11 +1455,16 @@ if $MATRIX_SONIC_ENABLED; then
                 --spawn-yaw "${GAME_WORLD_START_LINES[4]}"
             )
             echo "[INFO] Matrix resume pose: ${GAME_WORLD_START_LINES[5]} " \
-                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]}"
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]} " \
+                "checkpoint=${GAME_WORLD_START_LINES[7]} " \
+                "generation=${GAME_WORLD_START_LINES[8]}"
         elif [[ "${GAME_WORLD_START_LINES[0]:-}" == "none" \
-            && "${#GAME_WORLD_START_LINES[@]}" == "2" ]]; then
+            && "${#GAME_WORLD_START_LINES[@]}" == "4" \
+            && "${GAME_WORLD_START_LINES[2]}" == "none" \
+            && "${GAME_WORLD_START_LINES[3]}" =~ ^[0-9]+$ ]]; then
             echo "[INFO] Matrix resume pose: map default " \
-                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]}"
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]} " \
+                "generation=${GAME_WORLD_START_LINES[3]}"
         else
             echo "[ERROR] Invalid Matrix world-state helper response" >&2
             exit 1
@@ -1464,7 +1474,14 @@ if $MATRIX_SONIC_ENABLED; then
             --game-world-revision "$GAME_WORLD_REVISION"
             --game-world-state-file "$GAME_WORLD_STATE_FILE"
             --game-world-checkpoint-seconds "${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
+            --game-resume-rollback-count "${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
         )
+        if [[ "${GAME_WORLD_START_LINES[7]:-none}" != "none" ]]; then
+            SONIC_WORLD_ARGS+=(
+                --game-world-resume-checkpoint-id "${GAME_WORLD_START_LINES[7]}"
+                --game-world-resume-generation "${GAME_WORLD_START_LINES[8]}"
+            )
+        fi
         case "${MATRIX_GAME_AUTO_RESPAWN:-0}" in
             1|true|yes|on) SONIC_WORLD_ARGS+=(--game-auto-respawn) ;;
             0|false|no|off|"") ;;
@@ -1753,8 +1770,59 @@ PY
         && "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         GAME_INPUT_PROVIDER_PYTHON="$MATRIX_SONIC_PYTHON"
     fi
+    GAME_INPUT_SOCKET_VALUE="${MATRIX_GAME_INPUT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}.sock}"
+    GAME_EXTERNAL_CONTROL_ARGS=()
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+        EXTERNAL_CONTROL_SOCKET="${MATRIX_GAME_EXTERNAL_CONTROL_SOCKET:-}"
+        EXTERNAL_CONTROL_CAPABILITY_FILE="${MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE:-}"
+        if [[ -n "$EXTERNAL_CONTROL_SOCKET" \
+            && -z "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]] \
+            || [[ -z "$EXTERNAL_CONTROL_SOCKET" \
+                && -n "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]]; then
+            echo "[ERROR] Matrix external-control socket/capability are all-or-none" >&2
+            exit 1
+        fi
+        if [[ -z "$EXTERNAL_CONTROL_SOCKET" ]]; then
+            EXTERNAL_CONTROL_PROFILE="${MATRIX_PROFILE:-local}"
+            if [[ ! "$EXTERNAL_CONTROL_PROFILE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+                echo "[ERROR] Invalid Matrix external-control profile: $EXTERNAL_CONTROL_PROFILE" >&2
+                exit 1
+            fi
+            EXTERNAL_CONTROL_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/matrix-external-control-${UID}"
+            if ! /usr/bin/python3 -I - "$EXTERNAL_CONTROL_RUNTIME_DIR" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    path.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+metadata = path.stat(follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+    raise SystemExit("external-control runtime path is not an owned directory")
+os.chmod(path, 0o700, follow_symlinks=False)
+PY
+            then
+                echo "[ERROR] Could not prepare private Matrix external-control runtime directory" >&2
+                exit 1
+            fi
+            EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.sock"
+            EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.cap"
+        fi
+        export MATRIX_GAME_EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_SOCKET"
+        export MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_CAPABILITY_FILE"
+        export MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS="${MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS:-0.15}"
+        GAME_EXTERNAL_CONTROL_ARGS=(
+            --game-external-control-socket "$MATRIX_GAME_EXTERNAL_CONTROL_SOCKET"
+            --game-external-control-capability-file "$MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE"
+            --game-external-control-deadman-seconds "$MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS"
+        )
+    fi
     GAME_INPUT_ARGS=(
-        --game-input-socket "${MATRIX_GAME_INPUT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}.sock}"
+        --game-input-socket "$GAME_INPUT_SOCKET_VALUE"
         --game-input-provider "$PROJECT_ROOT/scripts/matrix_game_control_input.py"
         --game-input-provider-python "$GAME_INPUT_PROVIDER_PYTHON"
         --game-input-source "${MATRIX_GAME_INPUT_SOURCE:-auto}"
@@ -1763,6 +1831,7 @@ PY
         --game-initial-camera-yaw-deg "${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
         --game-mouse-sensitivity-deg "${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
         --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+        --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-local}/motion-control.json}"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
@@ -1780,11 +1849,19 @@ PY
         --game-max-acceleration "${MATRIX_GAME_MAX_ACCELERATION:-1.20}"
         --game-max-deceleration "${MATRIX_GAME_MAX_DECELERATION:-2.40}"
         --game-max-turn-rate "${MATRIX_GAME_MAX_TURN_RATE:-2.50}"
+        --game-keyboard-slow-speed "${MATRIX_GAME_KEYBOARD_SLOW_SPEED:-0.10}"
+        --game-keyboard-slow-boost-speed "${MATRIX_GAME_KEYBOARD_SLOW_BOOST_SPEED:-0.20}"
+        --game-keyboard-walk-speed "${MATRIX_GAME_KEYBOARD_WALK_SPEED:-0.80}"
+        --game-keyboard-walk-boost-speed "${MATRIX_GAME_KEYBOARD_WALK_BOOST_SPEED:-1.00}"
+        --game-keyboard-run-speed "${MATRIX_GAME_KEYBOARD_RUN_SPEED:-2.50}"
+        --game-keyboard-run-boost-speed "${MATRIX_GAME_KEYBOARD_RUN_BOOST_SPEED:-2.75}"
+        --game-keyboard-double-tap-window "${MATRIX_GAME_KEYBOARD_DOUBLE_TAP_WINDOW:-0.30}"
         --game-stick-deadzone "${MATRIX_GAME_STICK_DEADZONE:-0.15}"
         --game-input-timeout "${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
         --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
+    GAME_INPUT_ARGS+=("${GAME_EXTERNAL_CONTROL_ARGS[@]}")
     if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
         if [[ -z "$UE_CAMERA_STATE_FILE" ]]; then
             echo "[ERROR] UE final-POV state file was not initialized" >&2
@@ -1920,14 +1997,24 @@ PY
         then
             echo "[ERROR] Failed to merge the UE lifecycle failure into status" >&2
         fi
-        # Exit 75 is authority only for a clean, status-verified world reload.
-        # A UE failure observed at this late boundary must invalidate it just as
-        # it invalidates an otherwise-successful zero exit; otherwise the outer
-        # launcher can mistake a concurrent UE crash for an authorized teleport
-        # or fall respawn.
-        if [[ "$SONIC_EXIT_CODE" == "0" || "$SONIC_EXIT_CODE" == "75" ]]; then
+        # Exit 75 is authority only for a clean, status-verified world reload;
+        # exit 76 is only a proposal to quarantine one failed resume checkpoint.
+        # A UE failure observed at this late boundary invalidates both before the
+        # outer launcher can restart or commit the proposed state mutation.
+        if [[ "$SONIC_EXIT_CODE" == "0" \
+            || "$SONIC_EXIT_CODE" == "75" \
+            || "$SONIC_EXIT_CODE" == "76" ]]; then
             SONIC_EXIT_CODE=2
         fi
+    fi
+    # Privileged runner exits (75=verified world reload, 76=resume rollback
+    # proposal) are not allowed to cross the process-cleanup boundary on their
+    # own.  Run cleanup explicitly while its return value is still observable;
+    # Bash preserves an explicit exit status even when an EXIT trap later
+    # returns non-zero.  cleanup() is idempotent, so the EXIT trap becomes a
+    # no-op after this call.
+    if ! cleanup; then
+        SONIC_EXIT_CODE=2
     fi
     echo "[INFO] Matrix SONIC runtime exited with code $SONIC_EXIT_CODE"
     exit "$SONIC_EXIT_CODE"

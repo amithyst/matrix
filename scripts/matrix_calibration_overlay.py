@@ -46,6 +46,14 @@ from matrix_ui_settings import (
     MIN_FONT_SCALE,
     canonical_font_scale,
 )
+from matrix_motion_settings import (
+    DOUBLE_TAP_SPEED_FIELD,
+    GEARS,
+    MotionSettings,
+    MotionSettingsError,
+    SPEED_FIELD,
+    step_motion_speed,
+)
 
 
 _IS_VIEWABLE = 2
@@ -54,14 +62,23 @@ _CW_EVENT_MASK = 1 << 11
 _SHAPE_BOUNDING = 0
 _SHAPE_INPUT = 2
 _INPUT_ONLY = 2
+_BAD_WINDOW = 3
+_BAD_DRAWABLE = 9
+_X_REQUEST_GET_WINDOW_ATTRIBUTES = 3
+_X_REQUEST_QUERY_TREE = 15
+_X_REQUEST_GET_GEOMETRY = 14
+_X_REQUEST_GET_PROPERTY = 20
+_X_REQUEST_TRANSLATE_COORDINATES = 40
 _KEY_PRESS = 2
 _KEY_RELEASE = 3
 _BUTTON_PRESS = 4
 _BUTTON_RELEASE = 5
+_MOTION_NOTIFY = 6
 _KEY_PRESS_MASK = 1 << 0
 _KEY_RELEASE_MASK = 1 << 1
 _BUTTON_PRESS_MASK = 1 << 2
 _BUTTON_RELEASE_MASK = 1 << 3
+_BUTTON_1_MOTION_MASK = 1 << 8
 _GRAB_SUCCESS = 0
 _GRAB_MODE_ASYNC = 1
 _CURRENT_TIME = 0
@@ -72,8 +89,13 @@ _MIN_CLIENT_WIDTH = 480
 _MIN_CLIENT_HEIGHT = 360
 _MAX_COMMAND_HISTORY = 24
 _MAX_INTENT_PACKET_BYTES = 2048
+_MIN_OVERLAY_FONT_SIZE = 1
+_DEFAULT_OVERLAY_FONT_SIZE = 13
+_MAX_OVERLAY_FONT_SIZE = 22
+_LARGE_FONT_SIZE_DELTA = 5
 _BODY_FONT_CANDIDATES = (b"10x20", b"9x15", b"fixed")
 _LARGE_FONT_CANDIDATES = (b"12x24", b"10x20", b"fixed")
+_XFT_FONT_FAMILIES = ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "sans")
 
 
 def xft_font_candidates(scale: object, *, large: bool) -> tuple[bytes, ...]:
@@ -83,7 +105,7 @@ def xft_font_candidates(scale: object, *, large: bool) -> tuple[bytes, ...]:
     weight = ":weight=bold" if large else ""
     return tuple(
         f"{family}:size={size}{weight}".encode("ascii")
-        for family in ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "sans")
+        for family in _XFT_FONT_FAMILIES
     )
 
 
@@ -102,8 +124,27 @@ def core_font_candidates(scale: object, *, large: bool) -> tuple[bytes, ...]:
     return _BODY_FONT_CANDIDATES
 
 
-_XFT_BODY_FONT_CANDIDATES = xft_font_candidates(1.0, large=False)
-_XFT_LARGE_FONT_CANDIDATES = xft_font_candidates(1.0, large=True)
+def _xft_font_candidates(font_size: int, *, bold: bool) -> tuple[bytes, ...]:
+    weight = ":weight=bold" if bold else ""
+    return tuple(
+        f"{family}:size={font_size}{weight}".encode("ascii")
+        for family in _XFT_FONT_FAMILIES
+    )
+
+
+def _font_size_for_scale(scale: object) -> int:
+    canonical = canonical_font_scale(scale)
+    return max(8, int(round(13 * canonical)))
+
+
+_XFT_BODY_FONT_CANDIDATES = _xft_font_candidates(
+    _DEFAULT_OVERLAY_FONT_SIZE,
+    bold=False,
+)
+_XFT_LARGE_FONT_CANDIDATES = _xft_font_candidates(
+    _DEFAULT_OVERLAY_FONT_SIZE + _LARGE_FONT_SIZE_DELTA,
+    bold=True,
+)
 
 _XK_BACK_SPACE = 0xFF08
 _XK_RETURN = 0xFF0D
@@ -226,13 +267,53 @@ class XKeyEvent(ctypes.Structure):
     ]
 
 
+class XMotionEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("is_hint", ctypes.c_char),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
 class XEvent(ctypes.Union):
     _fields_ = [
         ("type", ctypes.c_int),
         ("xbutton", XButtonEvent),
         ("xkey", XKeyEvent),
+        ("xmotion", XMotionEvent),
         ("padding", ctypes.c_long * 24),
     ]
+
+
+class XErrorEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("resourceid", ctypes.c_ulong),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+    ]
+
+
+_X_ERROR_HANDLER = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.POINTER(XErrorEvent),
+)
 
 
 class XFontStruct(ctypes.Structure):
@@ -262,6 +343,33 @@ class XGlyphInfo(ctypes.Structure):
         ("xOff", ctypes.c_short),
         ("yOff", ctypes.c_short),
     ]
+
+
+@dataclass(frozen=True)
+class X11ErrorRecord:
+    operation: str
+    resource_id: int
+    serial: int
+    error_code: int
+    request_code: int
+    minor_code: int
+
+    def mapping(self) -> dict[str, int | str]:
+        return {
+            "operation": self.operation,
+            "resource_id": self.resource_id,
+            "serial": self.serial,
+            "error_code": self.error_code,
+            "request_code": self.request_code,
+            "minor_code": self.minor_code,
+        }
+
+
+@dataclass(frozen=True)
+class _RecoverableWindowErrorTrap:
+    operation: str
+    resource_id: int
+    error_signatures: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -397,6 +505,44 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     locomotion_bottom = centre_panel_y - safe_half_size - gap
     locomotion_top = tab_y + tab_height + gap
     locomotion_height = max(1, locomotion_bottom - locomotion_top)
+    locomotion_candidate_gap = 6 if compact else 12
+    locomotion_candidate_width = max(
+        1,
+        (panel_width - 2 * margin - 2 * locomotion_candidate_gap) // 3,
+    )
+    locomotion_candidate_height = max(
+        20,
+        min(
+            button_height,
+            max(20, locomotion_height - (4 if compact else 34)),
+        ),
+    )
+    locomotion_candidate_y = max(
+        locomotion_top,
+        locomotion_bottom - locomotion_candidate_height,
+    )
+    motion_outer_gap = 6 if compact else 12
+    motion_row_gap = 4 if compact else 8
+    motion_top = max(
+        tab_y + tab_height + motion_outer_gap,
+        profile_y + button_height + motion_outer_gap,
+    )
+    motion_bottom = speed_y - motion_outer_gap
+    motion_row_height = max(
+        1,
+        (motion_bottom - motion_top - 2 * motion_row_gap) // 3,
+    )
+    motion_left_x = panel_x + margin
+    motion_left_width = max(
+        1,
+        centre_x - safe_half_size - gap - motion_left_x,
+    )
+    motion_right_x = centre_x + safe_half_size + gap
+    motion_right_width = max(
+        1,
+        panel_x + panel_width - margin - motion_right_x,
+    )
+    font_slider_width = max(190, min(340, panel_width // 3))
     result = {
         "shield": (geometry.x, geometry.y, geometry.width, geometry.height),
         "panel": (panel_x, panel_y, panel_width, panel_height),
@@ -405,6 +551,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             panel_y + (2 if compact else 24),
             panel_width - (48 if compact else 80),
             18 if compact else 32,
+        ),
+        "font_size_slider": (
+            panel_x + panel_width - margin - font_slider_width,
+            panel_y + (2 if compact else 24),
+            font_slider_width,
+            24 if compact else 32,
         ),
         "tab_loadout": (
             panel_x + margin,
@@ -524,7 +676,71 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             inventory_width,
             inventory_height,
         )
+    for index in range(3):
+        result[f"locomotion_policy_{index}"] = (
+            panel_x
+            + margin
+            + index
+            * (locomotion_candidate_width + locomotion_candidate_gap),
+            locomotion_candidate_y,
+            locomotion_candidate_width,
+            max(1, locomotion_bottom - locomotion_candidate_y),
+        )
+    for row, gear in enumerate(GEARS):
+        row_y = motion_top + row * (motion_row_height + motion_row_gap)
+        for field, cell_x, cell_width in (
+            (SPEED_FIELD, motion_left_x, motion_left_width),
+            (DOUBLE_TAP_SPEED_FIELD, motion_right_x, motion_right_width),
+        ):
+            button_width = 24 if compact else max(32, min(52, cell_width // 4))
+            value_width = max(1, cell_width - 2 * button_width)
+            stem = f"motion_{gear}_{field}"
+            result[f"{stem}_down"] = (
+                cell_x,
+                row_y,
+                button_width,
+                motion_row_height,
+            )
+            result[f"{stem}_value"] = (
+                cell_x + button_width,
+                row_y,
+                value_width,
+                motion_row_height,
+            )
+            result[f"{stem}_up"] = (
+                cell_x + button_width + value_width,
+                row_y,
+                button_width,
+                motion_row_height,
+            )
     return result
+
+
+def font_slider_track(
+    rectangle: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Return the root-coordinate font-slider track inside its hit target."""
+
+    x, y, width, height = rectangle
+    label_width = min(104, max(96, width // 3))
+    right_padding = max(8, min(16, width // 20))
+    track_x = x + label_width
+    track_right = x + width - right_padding
+    return (track_x, y + height // 2 - 2, max(1, track_right - track_x), 4)
+
+
+def font_size_from_slider(
+    rectangle: tuple[int, int, int, int],
+    root_x: int,
+) -> int:
+    """Map one root-coordinate slider position to the bounded integer size."""
+
+    track_x, _track_y, track_width, _track_height = font_slider_track(rectangle)
+    usable_width = max(1, track_width - 1)
+    offset = max(0, min(usable_width, root_x - track_x))
+    span = _MAX_OVERLAY_FONT_SIZE - _MIN_OVERLAY_FONT_SIZE
+    step = int(math.floor((offset / usable_width) * span + 0.5))
+    return _MIN_OVERLAY_FONT_SIZE + step
 
 
 _PANEL_ACTIONS = (
@@ -537,13 +753,41 @@ _PANEL_ACTIONS = (
     "apply_return",
 )
 
+_MOTION_GEAR_LABELS = {
+    "slow": ("慢速", "S"),
+    "walk": ("行走", "W"),
+    "run": ("奔跑", "R"),
+}
+_MOTION_FIELD_LABELS = {
+    SPEED_FIELD: ("基础", "基"),
+    DOUBLE_TAP_SPEED_FIELD: ("双击", "双"),
+}
+_MOTION_CONTROL_SPECS = tuple(
+    (gear, field)
+    for gear in GEARS
+    for field in (SPEED_FIELD, DOUBLE_TAP_SPEED_FIELD)
+)
+_MOTION_STEP_ACTION_DETAILS = {
+    f"motion_{gear}_{field}_{suffix}": (gear, field, direction)
+    for gear, field in _MOTION_CONTROL_SPECS
+    for suffix, direction in (("down", -1), ("up", 1))
+}
+_MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
+
 _PANEL_TABS = ("tab_loadout", "tab_settings", "tab_console", "tab_inventory")
+_OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
+_LOCOMOTION_POLICY_HIT_TARGETS = tuple(
+    f"locomotion_policy_{index}" for index in range(3)
+)
 _POLICY_HIT_TARGETS = tuple(f"recovery_policy_{index}" for index in range(3))
 _INVENTORY_HIT_TARGETS = tuple(f"creative_item_{index}" for index in range(4))
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
+    + _MOTION_STEP_ACTIONS
     + ("command_input",)
+    + _OVERLAY_LOCAL_HIT_TARGETS
+    + _LOCOMOTION_POLICY_HIT_TARGETS
     + _POLICY_HIT_TARGETS
     + _INVENTORY_HIT_TARGETS
 )
@@ -568,9 +812,19 @@ def panel_action_at(
 
     targets = _PANEL_HIT_TARGETS
     if page == "loadout":
-        targets = _PANEL_TABS + ("apply_return",) + _POLICY_HIT_TARGETS
+        targets = (
+            _PANEL_TABS
+            + ("apply_return",)
+            + _LOCOMOTION_POLICY_HIT_TARGETS
+            + _POLICY_HIT_TARGETS
+        )
     elif page == "settings":
-        targets = _PANEL_TABS + _PANEL_ACTIONS
+        targets = (
+            _PANEL_TABS
+            + _PANEL_ACTIONS
+            + _MOTION_STEP_ACTIONS
+            + _OVERLAY_LOCAL_HIT_TARGETS
+        )
     elif page == "console":
         targets = _PANEL_TABS + ("apply_return", "command_input")
     elif page == "inventory":
@@ -587,6 +841,8 @@ class StrategyPolicyModel:
     policy_id: str
     resident: bool
     available: bool
+    display_name: str | None = None
+    unavailable_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -596,17 +852,30 @@ class StrategyLoadoutModel:
     active_slot: str
     locomotion_policy_id: str
     recovery_policy_id: str
+    locomotion_candidates: tuple[StrategyPolicyModel, ...]
     recovery_candidates: tuple[StrategyPolicyModel, ...]
     pending_policy_id: str | None
 
-    def policy_enabled(self, policy_id: str) -> bool:
+    def policy_enabled(self, policy_id: str, *, slot: str = "recovery") -> bool:
         if not self.available or self.status in {"loading", "switching"}:
             return False
-        if policy_id == self.recovery_policy_id:
+        selected = (
+            self.locomotion_policy_id
+            if slot == "locomotion"
+            else self.recovery_policy_id
+        )
+        candidates = (
+            self.locomotion_candidates
+            if slot == "locomotion"
+            else self.recovery_candidates
+        )
+        if policy_id == selected:
             return False
         return any(
-            candidate.policy_id == policy_id and candidate.available
-            for candidate in self.recovery_candidates
+            candidate.policy_id == policy_id
+            and candidate.available
+            and candidate.resident
+            for candidate in candidates
         )
 
 
@@ -671,7 +940,14 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
     raw = state.get("strategy_loadout")
     if not isinstance(raw, dict) or raw.get("version") != 1:
         return StrategyLoadoutModel(
-            False, "unavailable", "locomotion", "sonic", "kungfu", (), None
+            False,
+            "unavailable",
+            "locomotion",
+            "sonic",
+            "kungfu",
+            (),
+            (),
+            None,
         )
     status = raw.get("status")
     if status not in {"unavailable", "loading", "ready", "switching"}:
@@ -681,7 +957,8 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
         active_slot = "locomotion"
     locomotion = "sonic"
     recovery = "kungfu"
-    candidates: list[StrategyPolicyModel] = []
+    locomotion_candidates: list[StrategyPolicyModel] = []
+    recovery_candidates: list[StrategyPolicyModel] = []
     slots = raw.get("slots")
     if isinstance(slots, list):
         for slot in slots:
@@ -691,6 +968,33 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
             selected = slot.get("selected_policy_id")
             if slot_id == "locomotion" and isinstance(selected, str):
                 locomotion = selected
+                raw_candidates = slot.get("candidates")
+                if isinstance(raw_candidates, list):
+                    for candidate in raw_candidates[:3]:
+                        if not isinstance(candidate, dict):
+                            continue
+                        policy_id = candidate.get("policy_id")
+                        if not isinstance(policy_id, str) or not policy_id:
+                            continue
+                        locomotion_candidates.append(
+                            StrategyPolicyModel(
+                                policy_id=policy_id,
+                                resident=candidate.get("resident") is True,
+                                available=candidate.get("available") is True,
+                                display_name=(
+                                    candidate.get("name")
+                                    if isinstance(candidate.get("name"), str)
+                                    else None
+                                ),
+                                unavailable_reason=(
+                                    candidate.get("unavailable_reason")
+                                    if isinstance(
+                                        candidate.get("unavailable_reason"), str
+                                    )
+                                    else None
+                                ),
+                            )
+                        )
             elif slot_id == "recovery" and isinstance(selected, str):
                 recovery = selected
                 raw_candidates = slot.get("candidates")
@@ -701,11 +1005,23 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                         policy_id = candidate.get("policy_id")
                         if not isinstance(policy_id, str) or not policy_id:
                             continue
-                        candidates.append(
+                        recovery_candidates.append(
                             StrategyPolicyModel(
                                 policy_id=policy_id,
                                 resident=candidate.get("resident") is True,
                                 available=candidate.get("available") is True,
+                                display_name=(
+                                    candidate.get("name")
+                                    if isinstance(candidate.get("name"), str)
+                                    else None
+                                ),
+                                unavailable_reason=(
+                                    candidate.get("unavailable_reason")
+                                    if isinstance(
+                                        candidate.get("unavailable_reason"), str
+                                    )
+                                    else None
+                                ),
                             )
                         )
     pending = raw.get("pending")
@@ -720,7 +1036,8 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
         active_slot=active_slot,
         locomotion_policy_id=locomotion,
         recovery_policy_id=recovery,
-        recovery_candidates=tuple(candidates),
+        locomotion_candidates=tuple(locomotion_candidates),
+        recovery_candidates=tuple(recovery_candidates),
         pending_policy_id=pending_policy_id,
     )
 
@@ -800,6 +1117,133 @@ class SettingsPanelModel:
                 and (not self.pending_restart or self.restart_available)
             )
         return False
+
+
+@dataclass(frozen=True)
+class MotionSettingsPanelModel:
+    settings: MotionSettings
+    available: bool
+    load_status: str
+    error: str | None
+
+    def value(self, gear: str, field: str) -> float:
+        return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
+
+    def action_enabled(self, action: str) -> bool:
+        return motion_step_target(self, action) is not None
+
+
+def _motion_settings_candidate(state: dict[str, object]) -> object:
+    direct = state.get("motion_settings")
+    if direct is not None:
+        return direct
+    game_commands = state.get("game_commands")
+    if (
+        isinstance(game_commands, dict)
+        and game_commands.get("motion_settings") is not None
+    ):
+        return game_commands.get("motion_settings")
+    console = state.get("command_console")
+    console = console if isinstance(console, dict) else {}
+    data = console.get("data")
+    data = data if isinstance(data, dict) else {}
+    return data.get("motion_settings")
+
+
+def motion_settings_panel_model(state: dict[str, object]) -> MotionSettingsPanelModel:
+    """Validate the six runtime-owned motion values used by panel step buttons."""
+
+    raw = _motion_settings_candidate(state)
+    load_status = "unavailable"
+    load_error: str | None = None
+    snapshot = raw
+    if isinstance(raw, dict) and "settings" in raw:
+        snapshot = raw.get("settings")
+        if isinstance(raw.get("load_status"), str):
+            load_status = raw["load_status"]
+        if isinstance(raw.get("load_error"), str) and raw.get("load_error"):
+            load_error = str(raw["load_error"])
+    try:
+        settings = MotionSettings.from_mapping(snapshot)
+    except (MotionSettingsError, TypeError, ValueError) as exc:
+        return MotionSettingsPanelModel(
+            settings=MotionSettings(),
+            available=False,
+            load_status="unavailable",
+            error=(
+                "motion settings unavailable"
+                if raw is None
+                else f"invalid motion settings telemetry: {exc}"
+            ),
+        )
+    return MotionSettingsPanelModel(
+        settings=settings,
+        available=True,
+        load_status=load_status if load_status != "unavailable" else "loaded",
+        error=load_error,
+    )
+
+
+def motion_step_target(
+    model: MotionSettingsPanelModel,
+    action: str,
+) -> float | None:
+    """Return the adjacent validated preset for one strict panel action."""
+
+    if not isinstance(model, MotionSettingsPanelModel):
+        raise TypeError("motion panel model is required")
+    details = _MOTION_STEP_ACTION_DETAILS.get(action)
+    if details is None:
+        raise ValueError(f"unsupported motion panel action: {action}")
+    if not model.available:
+        return None
+    gear, field, direction = details
+    path = f"control.motion.gears.{gear}.{field}"
+    current = model.settings.value_for_path(path)
+    target = step_motion_speed(model.settings, path, direction)
+    return None if math.isclose(target, current, rel_tol=0.0, abs_tol=1e-12) else target
+
+
+def motion_step_command(
+    model: MotionSettingsPanelModel,
+    action: str,
+) -> str | None:
+    """Build one standard MC data command without mutating any local config."""
+
+    target = motion_step_target(model, action)
+    if target is None:
+        return None
+    gear, field, _direction = _MOTION_STEP_ACTION_DETAILS[action]
+    return (
+        f"/data modify entity @s control.motion.gears.{gear}.{field} "
+        f"set value {target:.2f}"
+    )
+
+
+def motion_value_label(
+    model: MotionSettingsPanelModel,
+    gear: str,
+    field: str,
+    *,
+    compact: bool,
+) -> str:
+    """Return a bounded label for one of the six visible motion values."""
+
+    if (gear, field) not in _MOTION_CONTROL_SPECS:
+        raise ValueError("unsupported motion value label")
+    value = model.value(gear, field)
+    if compact:
+        compact_value = f"{value:.2f}".rstrip("0").rstrip(".")
+        if compact_value.startswith("0."):
+            compact_value = compact_value[1:]
+        return (
+            f"{_MOTION_GEAR_LABELS[gear][1]}"
+            f"{_MOTION_FIELD_LABELS[field][1]}{compact_value}"
+        )
+    return (
+        f"{_MOTION_GEAR_LABELS[gear][0]}{_MOTION_FIELD_LABELS[field][0]} "
+        f"{value:.2f} m/s"
+    )
 
 
 _COMMAND_STATUSES = frozenset(
@@ -1412,12 +1856,23 @@ class X11CalibrationOverlay:
         self._x11 = x11
         self._xfixes = xfixes
         self._xft = xft
+        self._x_error_handler_callback: _X_ERROR_HANDLER | None = None
+        self._previous_x_error_handler_address: int | None = None
+        self._previous_x_error_handler: _X_ERROR_HANDLER | None = None
+        self._window_error_trap: _RecoverableWindowErrorTrap | None = None
+        self._trapped_window_error: X11ErrorRecord | None = None
+        self._recoverable_window_error_count = 0
+        self._bad_window_count = 0
+        self._bad_drawable_count = 0
+        self._last_recoverable_window_error: X11ErrorRecord | None = None
+        self._last_bad_window: X11ErrorRecord | None = None
         self._configure_signatures()
         encoded_display = display_name.encode() if display_name else None
         self._display = self._x11.XOpenDisplay(encoded_display)
         if not self._display:
             label = display_name or os.environ.get("DISPLAY", "<unset>")
             raise RuntimeError(f"cannot open X11 display {label}")
+        self._install_x_error_handler()
         self._screen = int(self._x11.XDefaultScreen(self._display))
         self._root = int(self._x11.XRootWindow(self._display, self._screen))
         self._visual = (
@@ -1454,12 +1909,16 @@ class X11CalibrationOverlay:
         self._xft_body_font_name: str | None = None
         self._xft_large_font_name: str | None = None
         self._xft_colours: dict[int, XftColor] = {}
+        self._font_size = _font_size_for_scale(self._font_scale)
+        self._last_rendered_font_size: int | None = None
+        self._font_slider_dragging = False
         self._colours: dict[str, int] = {}
         self._visible = False
         self._cursor_visible = False
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
         self._last_geometry: WindowGeometry | None = None
         self._last_panel_model: SettingsPanelModel | None = None
+        self._last_motion_model: MotionSettingsPanelModel | None = None
         self._last_strategy_model: StrategyLoadoutModel | None = None
         self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_page: str | None = None
@@ -1714,6 +2173,7 @@ class X11CalibrationOverlay:
             ),
             "XFlush": ([ctypes.c_void_p], ctypes.c_int),
             "XSync": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_int),
+            "XSetErrorHandler": ([ctypes.c_void_p], ctypes.c_void_p),
             "XDestroyWindow": ([ctypes.c_void_p, ctypes.c_ulong], ctypes.c_int),
             "XFreeGC": ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
             "XFree": ([ctypes.c_void_p], ctypes.c_int),
@@ -1823,6 +2283,145 @@ class X11CalibrationOverlay:
                 function.argtypes = argtypes
                 function.restype = restype
 
+    def _install_x_error_handler(self) -> None:
+        callback = _X_ERROR_HANDLER(self._handle_x_error)
+        previous = self._x11.XSetErrorHandler(
+            ctypes.cast(callback, ctypes.c_void_p)
+        )
+        previous_address = int(previous) if previous else None
+        self._x_error_handler_callback = callback
+        self._previous_x_error_handler_address = previous_address
+        self._previous_x_error_handler = (
+            _X_ERROR_HANDLER(previous_address) if previous_address is not None else None
+        )
+
+    def _restore_x_error_handler(self) -> None:
+        if getattr(self, "_x_error_handler_callback", None) is None:
+            return
+        previous = getattr(self, "_previous_x_error_handler_address", None)
+        self._x11.XSetErrorHandler(
+            ctypes.c_void_p(previous) if previous is not None else None
+        )
+        self._x_error_handler_callback = None
+        self._previous_x_error_handler_address = None
+        self._previous_x_error_handler = None
+
+    def _handle_x_error(
+        self,
+        display: ctypes.c_void_p,
+        event_pointer: ctypes.POINTER(XErrorEvent),
+    ) -> int:
+        event = event_pointer.contents
+        trap = self._window_error_trap
+        if (
+            trap is not None
+            and int(ctypes.cast(display, ctypes.c_void_p).value or 0)
+            == int(self._display)
+            and int(event.resourceid) == trap.resource_id
+            and (int(event.error_code), int(event.request_code))
+            in trap.error_signatures
+        ):
+            self._trapped_window_error = X11ErrorRecord(
+                operation=trap.operation,
+                resource_id=int(event.resourceid),
+                serial=int(event.serial),
+                error_code=int(event.error_code),
+                request_code=int(event.request_code),
+                minor_code=int(event.minor_code),
+            )
+            return 0
+        previous = self._previous_x_error_handler
+        if previous is None:
+            # Xlib supplies a default handler, so this is defensive only.  An
+            # unhandled protocol error must retain fatal semantics.
+            print(
+                "matrix-calibration-overlay ERROR missing prior Xlib handler "
+                f"for code={int(event.error_code)} "
+                f"request={int(event.request_code)}.{int(event.minor_code)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            os._exit(1)
+        return int(previous(display, event_pointer))
+
+    def _window_probe(
+        self,
+        operation: str,
+        window: int,
+        request_code: int,
+        callback: Callable[[], Any],
+        *,
+        additional_error_signatures: tuple[tuple[int, int], ...] = (),
+    ) -> tuple[Any, bool]:
+        """Run one reply-bearing target query with a precise window-error trap.
+
+        Every caller is synchronous in Xlib, so its protocol error is delivered
+        before ``callback`` returns and before this scoped trap is removed.
+        """
+
+        if self._window_error_trap is not None:
+            raise RuntimeError("nested X11 window-error traps are not supported")
+        self._trapped_window_error = None
+        self._window_error_trap = _RecoverableWindowErrorTrap(
+            operation=operation,
+            resource_id=window,
+            error_signatures=(
+                (_BAD_WINDOW, request_code),
+                *additional_error_signatures,
+            ),
+        )
+        try:
+            result = callback()
+        finally:
+            self._window_error_trap = None
+        record = self._trapped_window_error
+        self._trapped_window_error = None
+        if record is None:
+            return (result, False)
+        self._recoverable_window_error_count += 1
+        self._last_recoverable_window_error = record
+        if record.error_code == _BAD_WINDOW:
+            self._bad_window_count += 1
+            self._last_bad_window = record
+            error_name = "BadWindow"
+        elif record.error_code == _BAD_DRAWABLE:
+            self._bad_drawable_count += 1
+            error_name = "BadDrawable"
+        else:  # The trap signatures currently admit only the two errors above.
+            error_name = f"XError{record.error_code}"
+        # Window churn is usually a single event.  Bound repeated diagnostics
+        # while retaining logarithmic evidence if a client thrashes.
+        count = self._recoverable_window_error_count
+        if count <= 4 or count & (count - 1) == 0:
+            print(
+                f"matrix-calibration-overlay WARN ignored {error_name} "
+                f"operation={record.operation} "
+                f"resource=0x{record.resource_id:x} "
+                f"request={record.request_code}.{record.minor_code} "
+                f"serial={record.serial} count={count}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return (result, True)
+
+    @property
+    def x11_diagnostics(self) -> dict[str, object]:
+        return {
+            "recoverable_window_error_count": self._recoverable_window_error_count,
+            "bad_window_count": self._bad_window_count,
+            "bad_drawable_count": self._bad_drawable_count,
+            "last_recoverable_window_error": (
+                self._last_recoverable_window_error.mapping()
+                if self._last_recoverable_window_error is not None
+                else None
+            ),
+            "last_bad_window": (
+                self._last_bad_window.mapping()
+                if self._last_bad_window is not None
+                else None
+            ),
+        }
+
     def _named_colour(self, name: bytes, fallback: int) -> int:
         screen = XColor()
         exact = XColor()
@@ -1867,6 +2466,7 @@ class X11CalibrationOverlay:
         attributes.event_mask = (
             _BUTTON_PRESS_MASK
             | _BUTTON_RELEASE_MASK
+            | _BUTTON_1_MOTION_MASK
             | _KEY_PRESS_MASK
             | _KEY_RELEASE_MASK
         )
@@ -2111,13 +2711,61 @@ class X11CalibrationOverlay:
                 raise RuntimeError(f"cannot allocate Xft colour {key}")
             self._xft_colours[pixel] = colour
 
+    def _set_font_size(self, font_size: int) -> bool:
+        """Atomically replace both Xft fonts while the overlay stays live."""
+
+        if (
+            type(font_size) is not int
+            or not _MIN_OVERLAY_FONT_SIZE <= font_size <= _MAX_OVERLAY_FONT_SIZE
+        ):
+            raise ValueError("overlay font size is outside the supported range")
+        if font_size == getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE):
+            return False
+        if self._xft is None or getattr(self, "_xft_draw", None) is None:
+            return False
+        try:
+            body_font, body_name = self._load_xft_font(
+                _xft_font_candidates(font_size, bold=False)
+            )
+        except RuntimeError:
+            return False
+        try:
+            large_font, large_name = self._load_xft_font(
+                _xft_font_candidates(
+                    font_size + _LARGE_FONT_SIZE_DELTA,
+                    bold=True,
+                )
+            )
+        except RuntimeError:
+            self._xft.XftFontClose(self._display, ctypes.c_void_p(body_font))
+            return False
+
+        previous_body = self._xft_body_font
+        previous_large = self._xft_large_font
+        self._xft_body_font = body_font
+        self._xft_body_font_name = body_name
+        self._xft_large_font = large_font
+        self._xft_large_font_name = large_name
+        self._font_size = font_size
+        for previous in (previous_body, previous_large):
+            if previous is not None:
+                self._xft.XftFontClose(
+                    self._display,
+                    ctypes.c_void_p(previous),
+                )
+        return True
+
     @property
-    def font_diagnostics(self) -> dict[str, str | float | None]:
+    def font_diagnostics(
+        self,
+    ) -> dict[str, str | float | int | bool | None]:
         return {
             "backend": "xft-utf8" if self._xft_draw is not None else "xlib-core",
             "body": self._xft_body_font_name or self._body_font_name,
             "large": self._xft_large_font_name or self._large_font_name,
             "scale": self._font_scale,
+            "size": self._font_size,
+            "adjustable": self._xft_draw is not None,
         }
 
     def _set_font_scale(self, value: object) -> bool:
@@ -2173,6 +2821,7 @@ class X11CalibrationOverlay:
         self._xft_body_font_name = new_xft_body_name
         self._xft_large_font_name = new_xft_large_name
         self._font_scale = scale
+        self._font_size = _font_size_for_scale(scale)
 
         for font in (old_body, old_large):
             if font is not None:
@@ -2193,22 +2842,32 @@ class X11CalibrationOverlay:
         item_count = ctypes.c_ulong()
         bytes_after = ctypes.c_ulong()
         data = ctypes.POINTER(ctypes.c_ubyte)()
-        status = self._x11.XGetWindowProperty(
-            self._display,
+        status, bad_window = self._window_probe(
+            "XGetWindowProperty",
             window,
-            self._pid_atom,
-            0,
-            1,
-            0,
-            0,
-            ctypes.byref(actual_type),
-            ctypes.byref(actual_format),
-            ctypes.byref(item_count),
-            ctypes.byref(bytes_after),
-            ctypes.byref(data),
+            _X_REQUEST_GET_PROPERTY,
+            lambda: self._x11.XGetWindowProperty(
+                self._display,
+                window,
+                self._pid_atom,
+                0,
+                1,
+                0,
+                0,
+                ctypes.byref(actual_type),
+                ctypes.byref(actual_format),
+                ctypes.byref(item_count),
+                ctypes.byref(bytes_after),
+                ctypes.byref(data),
+            ),
         )
         try:
-            if status != 0 or actual_format.value != 32 or item_count.value < 1:
+            if (
+                bad_window
+                or status != 0
+                or actual_format.value != 32
+                or item_count.value < 1
+            ):
                 return None
             return int(ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[0])
         finally:
@@ -2220,16 +2879,21 @@ class X11CalibrationOverlay:
         parent = ctypes.c_ulong()
         children = ctypes.POINTER(ctypes.c_ulong)()
         count = ctypes.c_uint()
-        ok = self._x11.XQueryTree(
-            self._display,
+        ok, bad_window = self._window_probe(
+            "XQueryTree",
             window,
-            ctypes.byref(root),
-            ctypes.byref(parent),
-            ctypes.byref(children),
-            ctypes.byref(count),
+            _X_REQUEST_QUERY_TREE,
+            lambda: self._x11.XQueryTree(
+                self._display,
+                window,
+                ctypes.byref(root),
+                ctypes.byref(parent),
+                ctypes.byref(children),
+                ctypes.byref(count),
+            ),
         )
         try:
-            if not ok:
+            if bad_window or not ok:
                 return []
             return [int(children[index]) for index in range(count.value)]
         finally:
@@ -2238,9 +2902,24 @@ class X11CalibrationOverlay:
 
     def _geometry(self, window: int) -> WindowGeometry | None:
         attributes = XWindowAttributes()
-        if not self._x11.XGetWindowAttributes(
-            self._display, window, ctypes.byref(attributes)
-        ):
+        attributes_ok, stale_window = self._window_probe(
+            "XGetWindowAttributes",
+            window,
+            _X_REQUEST_GET_WINDOW_ATTRIBUTES,
+            lambda: self._x11.XGetWindowAttributes(
+                self._display,
+                window,
+                ctypes.byref(attributes),
+            ),
+            # libX11 implements XGetWindowAttributes with consecutive
+            # GetWindowAttributes and GetGeometry requests.  If destruction
+            # lands between them, the second request returns BadDrawable.
+            additional_error_signatures=((
+                _BAD_DRAWABLE,
+                _X_REQUEST_GET_GEOMETRY,
+            ),),
+        )
+        if stale_window or not attributes_ok:
             return None
         if (
             attributes.map_state != _IS_VIEWABLE
@@ -2251,16 +2930,22 @@ class X11CalibrationOverlay:
         root_x = ctypes.c_int()
         root_y = ctypes.c_int()
         child = ctypes.c_ulong()
-        if not self._x11.XTranslateCoordinates(
-            self._display,
+        translated, bad_window = self._window_probe(
+            "XTranslateCoordinates",
             window,
-            self._root,
-            0,
-            0,
-            ctypes.byref(root_x),
-            ctypes.byref(root_y),
-            ctypes.byref(child),
-        ):
+            _X_REQUEST_TRANSLATE_COORDINATES,
+            lambda: self._x11.XTranslateCoordinates(
+                self._display,
+                window,
+                self._root,
+                0,
+                0,
+                ctypes.byref(root_x),
+                ctypes.byref(root_y),
+                ctypes.byref(child),
+            ),
+        )
+        if bad_window or not translated:
             return None
         return WindowGeometry(
             window=window,
@@ -2728,10 +3413,102 @@ class X11CalibrationOverlay:
                 ],
             )
 
+    def _draw_font_size_slider(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+    ) -> None:
+        rectangle = self._panel_rectangle(layout, "font_size_slider")
+        x, y, width, height = rectangle
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        adjustable = bool(
+            getattr(self, "_xft", None) is not None
+            and getattr(self, "_xft_draw", None) is not None
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            width,
+            height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
+        )
+
+        panel_x, panel_y, _panel_width, _panel_height = layout["panel"]
+        track_root = font_slider_track(layout["font_size_slider"])
+        track_x = track_root[0] - panel_x
+        track_y = track_root[1] - panel_y
+        track_width = track_root[2]
+        track_height = track_root[3]
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["muted" if adjustable else "disabled"],
+        )
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            track_x,
+            track_y,
+            track_width,
+            track_height,
+        )
+        font_size = getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
+        span = _MAX_OVERLAY_FONT_SIZE - _MIN_OVERLAY_FONT_SIZE
+        fraction = (font_size - _MIN_OVERLAY_FONT_SIZE) / span
+        knob_x = track_x + int(round(max(0, track_width - 1) * fraction))
+        if adjustable:
+            self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                track_x,
+                track_y,
+                max(1, knob_x - track_x + 1),
+                track_height,
+            )
+        knob_width = 9
+        knob_height = max(10, height - 10)
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["white" if adjustable else "disabled"],
+        )
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            knob_x - knob_width // 2,
+            y + (height - knob_height) // 2,
+            knob_width,
+            knob_height,
+        )
+        self._draw_text(
+            f"字号 {font_size}px" if adjustable else "字号固定",
+            x=x + 8,
+            y=y + height // 2 + 6,
+            colour=self._colours["white" if adjustable else "muted"],
+        )
+
     @staticmethod
     def _policy_display_name(policy_id: str) -> str:
         return {
             "sonic": "SONIC",
+            "bfm-sonic-teacher50k": "BFM Teacher50k",
             "kungfu": "KungFu",
             "host": "HoST",
             "amp": "AMP",
@@ -2751,30 +3528,12 @@ class X11CalibrationOverlay:
             ],
         )
         compact = layout["panel"][3] < 500
-        if compact:
-            locomotion_text = (
-                f"移动槽  {self._policy_display_name(model.locomotion_policy_id)}"
-            )
-            self._draw_text(
-                locomotion_text,
-                x=0,
-                y=0,
-                colour=self._colours["white"],
-                centred_in=locomotion,
-            )
-        else:
+        if not compact:
             self._draw_text(
                 "移动策略槽",
                 x=locomotion[0] + 18,
                 y=locomotion[1] + 26,
                 colour=self._colours["muted"],
-            )
-            self._draw_text(
-                self._policy_display_name(model.locomotion_policy_id),
-                x=locomotion[0] + 18,
-                y=locomotion[1] + max(50, locomotion[3] - 18),
-                colour=self._colours["white"],
-                large=True,
             )
             self._draw_text(
                 "当前控制" if model.active_slot == "locomotion" else "已装配",
@@ -2783,6 +3542,38 @@ class X11CalibrationOverlay:
                 colour=self._colours[
                     "cyan" if model.active_slot == "locomotion" else "muted"
                 ],
+            )
+        locomotion_candidates = model.locomotion_candidates[:3]
+        for index, candidate in enumerate(locomotion_candidates):
+            selected = candidate.policy_id == model.locomotion_policy_id
+            pending = candidate.policy_id == model.pending_policy_id
+            enabled = model.policy_enabled(candidate.policy_id, slot="locomotion")
+            fill_name = (
+                "pending"
+                if pending
+                else ("selected" if selected else ("button" if enabled else "disabled"))
+            )
+            label = candidate.display_name or self._policy_display_name(
+                candidate.policy_id
+            )
+            if pending:
+                label = f"{label} · 切换中"
+            elif not candidate.available or not candidate.resident:
+                label = f"{label} · 未就绪"
+            self._draw_button(
+                layout,
+                f"locomotion_policy_{index}",
+                label,
+                fill=self._colours[fill_name],
+                disabled=not enabled and not selected and not pending,
+            )
+        if not locomotion_candidates:
+            self._draw_text(
+                "移动策略尚未就绪",
+                x=0,
+                y=0,
+                colour=self._colours["pending"],
+                centred_in=locomotion,
             )
 
         recovery = self._panel_rectangle(layout, "recovery_slot")
@@ -2828,6 +3619,8 @@ class X11CalibrationOverlay:
         self,
         layout: dict[str, tuple[int, int, int, int]],
         model: SettingsPanelModel,
+        motion_model: MotionSettingsPanelModel,
+        command_status: CommandConsoleStatus,
     ) -> None:
         local_selected = model.next_profile == "Local"
         controls_disabled = model.restart_requested or model.status == "restarting"
@@ -2929,6 +3722,47 @@ class X11CalibrationOverlay:
                 font_value[3],
             ),
         )
+        command_blocked = bool(
+            command_status.in_flight
+            or command_status.restart_required
+            or command_status.outcome_unknown
+            or command_status.status in {"pending", "restarting"}
+            or self._command_editor.editing
+            or self._command_editor.pending
+        )
+        compact_motion_labels = bool(
+            layout["panel"][2] < 800 or layout["panel"][3] < 600
+        )
+        for gear, field in _MOTION_CONTROL_SPECS:
+            stem = f"motion_{gear}_{field}"
+            for suffix in ("down", "up"):
+                action = f"{stem}_{suffix}"
+                disabled = bool(
+                    controls_disabled
+                    or command_blocked
+                    or not motion_model.action_enabled(action)
+                )
+                self._draw_button(
+                    layout,
+                    action,
+                    "-" if suffix == "down" else "+",
+                    fill=self._colours["disabled" if disabled else "button"],
+                    disabled=disabled,
+                )
+            self._draw_text(
+                motion_value_label(
+                    motion_model,
+                    gear,
+                    field,
+                    compact=compact_motion_labels,
+                ),
+                x=0,
+                y=0,
+                colour=self._colours[
+                    "white" if motion_model.available else "muted"
+                ],
+                centred_in=self._panel_rectangle(layout, f"{stem}_value"),
+            )
         if layout["panel"][3] >= 500:
             status = (
                 "正在重载 Matrix"
@@ -3008,6 +3842,7 @@ class X11CalibrationOverlay:
         model: SettingsPanelModel,
         command_status: CommandConsoleStatus | None = None,
         strategy_model: StrategyLoadoutModel | None = None,
+        motion_model: MotionSettingsPanelModel | None = None,
         inventory_model: CreativeInventoryModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
@@ -3024,6 +3859,8 @@ class X11CalibrationOverlay:
             colour=self._colours["white"],
             large=panel_height >= 500,
         )
+        if page == "settings":
+            self._draw_font_size_slider(layout)
         self._draw_tabs(layout, page)
         if page == "loadout":
             self._draw_loadout_page(
@@ -3031,14 +3868,20 @@ class X11CalibrationOverlay:
                 strategy_model or strategy_loadout_model({}),
             )
         elif page == "settings":
-            self._draw_control_settings_page(layout, model)
+            self._draw_control_settings_page(
+                layout,
+                model,
+                motion_model or motion_settings_panel_model({}),
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+            )
         elif page == "console":
             self._draw_command_console(
                 layout,
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
             )
-        else:
+        elif page == "inventory":
             self._draw_inventory_page(
                 layout,
                 inventory_model or creative_inventory_model({}),
@@ -3157,6 +4000,17 @@ class X11CalibrationOverlay:
         ):
             self._ungrab_keyboard()
 
+    def _set_font_size_from_root_x(self, root_x: int) -> bool:
+        layout = self._last_layout
+        if (
+            layout is None
+            or getattr(self, "_active_page", "loadout") != "settings"
+        ):
+            return False
+        return self._set_font_size(
+            font_size_from_slider(layout["font_size_slider"], root_x)
+        )
+
     def drain_pointer_actions(self, publisher: PointerActionPublisher) -> int:
         """Drain bounded keyboard intents and completed left-button clicks."""
 
@@ -3170,6 +4024,10 @@ class X11CalibrationOverlay:
                 continue
             if event_type == _KEY_RELEASE:
                 self._handle_key_release(event.xkey)
+                continue
+            if event_type == _MOTION_NOTIFY:
+                if self._font_slider_dragging and self._visible:
+                    self._set_font_size_from_root_x(event.xmotion.x_root)
                 continue
             if event_type not in {_BUTTON_PRESS, _BUTTON_RELEASE}:
                 continue
@@ -3190,11 +4048,23 @@ class X11CalibrationOverlay:
             if event_type == _BUTTON_PRESS:
                 self._pressed_action = action
                 self._pressed_window = int(button.window)
+                if action == "font_size_slider":
+                    self._font_slider_dragging = bool(
+                        self._xft is not None
+                        and getattr(self, "_xft_draw", None) is not None
+                    )
+                    if self._font_slider_dragging:
+                        self._set_font_size_from_root_x(button.x_root)
             elif event_type == _BUTTON_RELEASE:
                 pressed = self._pressed_action
                 pressed_window = self._pressed_window
                 self._pressed_action = None
                 self._pressed_window = None
+                if pressed == "font_size_slider":
+                    if self._font_slider_dragging and self._visible:
+                        self._set_font_size_from_root_x(button.x_root)
+                    self._font_slider_dragging = False
+                    continue
                 if (
                     pressed is None
                     or action != pressed
@@ -3244,6 +4114,50 @@ class X11CalibrationOverlay:
                             inventory.items[item_index].item_id
                         )
                         emitted += 1
+                elif action.startswith("locomotion_policy_"):
+                    strategy = getattr(self, "_last_strategy_model", None)
+                    try:
+                        policy_index = int(action.rsplit("_", 1)[1])
+                    except (IndexError, ValueError):
+                        continue
+                    if (
+                        strategy is not None
+                        and policy_index < len(strategy.locomotion_candidates)
+                    ):
+                        candidate = strategy.locomotion_candidates[policy_index]
+                        if strategy.policy_enabled(
+                            candidate.policy_id,
+                            slot="locomotion",
+                        ):
+                            publisher.publish_strategy_select(
+                                "locomotion",
+                                candidate.policy_id,
+                            )
+                            emitted += 1
+                elif action in _MOTION_STEP_ACTIONS:
+                    motion_model = getattr(self, "_last_motion_model", None)
+                    panel_model = self._last_panel_model
+                    command = (
+                        motion_step_command(motion_model, action)
+                        if motion_model is not None
+                        else None
+                    )
+                    if (
+                        command is not None
+                        and panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and self._last_command_status.available
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting"}
+                    ):
+                        publisher.publish_command_submit(command)
+                        emitted += 1
                 elif (
                     self._last_panel_model is not None
                     and self._last_panel_model.action_enabled(action)
@@ -3272,6 +4186,7 @@ class X11CalibrationOverlay:
         geometry_changed = geometry != self._last_geometry
         model = settings_panel_model(state)
         font_changed = self._set_font_scale(model.font_scale)
+        motion_model = motion_settings_panel_model(state)
         strategy_model = strategy_loadout_model(state)
         inventory_model = creative_inventory_model(state)
         command_status = command_console_status(state)
@@ -3279,8 +4194,11 @@ class X11CalibrationOverlay:
         model_changed = bool(
             font_changed
             or model != self._last_panel_model
+            or motion_model != getattr(self, "_last_motion_model", None)
             or strategy_model != getattr(self, "_last_strategy_model", None)
             or inventory_model != getattr(self, "_last_inventory_model", None)
+            or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
+            != getattr(self, "_last_rendered_font_size", None)
             or getattr(self, "_active_page", "loadout")
             != getattr(self, "_last_page", None)
             or command_status != self._last_command_status
@@ -3316,6 +4234,7 @@ class X11CalibrationOverlay:
                 model,
                 command_status,
                 strategy_model,
+                motion_model,
                 inventory_model,
             )
         pointer_x, pointer_y = pointer
@@ -3350,8 +4269,14 @@ class X11CalibrationOverlay:
         self._last_layout = layout
         self._last_geometry = geometry
         self._last_panel_model = model
+        self._last_motion_model = motion_model
         self._last_strategy_model = strategy_model
         self._last_inventory_model = inventory_model
+        self._last_rendered_font_size = getattr(
+            self,
+            "_font_size",
+            _DEFAULT_OVERLAY_FONT_SIZE,
+        )
         self._last_page = getattr(self, "_active_page", "loadout")
         self._last_command_status = command_status
         self._last_command_revision = self._command_editor.revision
@@ -3373,6 +4298,7 @@ class X11CalibrationOverlay:
         self._last_layout = None
         self._last_geometry = None
         self._last_panel_model = None
+        self._last_motion_model = None
         self._last_strategy_model = None
         self._last_inventory_model = None
         self._last_page = None
@@ -3382,6 +4308,8 @@ class X11CalibrationOverlay:
         self._last_raise_s = None
         self._pressed_action = None
         self._pressed_window = None
+        self._font_slider_dragging = False
+        self._last_rendered_font_size = None
         self._active_page = "loadout"
 
     def close(self) -> None:
@@ -3427,6 +4355,10 @@ class X11CalibrationOverlay:
             self._x11.XDestroyWindow(display, window)
         windows.clear()
         self._x11.XSync(display, 0)
+        # XSync has delivered every request issued while our scoped handler was
+        # active.  Restore the process-global Xlib handler before invalidating
+        # this display pointer.
+        self._restore_x_error_handler()
         self._x11.XCloseDisplay(display)
         self._display = None
 
@@ -3485,7 +4417,8 @@ def main() -> int:
     }
     overlay: X11CalibrationOverlay | None = None
     action_publisher: PointerActionPublisher | None = None
-    font_diagnostics: dict[str, str | float | None] | None = None
+    font_diagnostics: dict[str, str | float | int | bool | None] | None = None
+    x11_diagnostics: dict[str, object] | None = None
     return_code = 0
     exit_reason = "signal"
     try:
@@ -3500,6 +4433,7 @@ def main() -> int:
             font_scale=args.font_scale,
         )
         font_diagnostics = overlay.font_diagnostics
+        x11_diagnostics = overlay.x11_diagnostics
         atomic_json(
             args.status_file,
             {
@@ -3507,6 +4441,7 @@ def main() -> int:
                 "pid": os.getpid(),
                 "expected_ue_pid": args.expected_ue_pid,
                 "fonts": font_diagnostics,
+                "x11": x11_diagnostics,
             },
         )
         interval = 1.0 / args.poll_hz
@@ -3539,6 +4474,10 @@ def main() -> int:
         print(f"matrix-calibration-overlay ERROR {exc}", flush=True)
     finally:
         if overlay is not None:
+            # Capture the live font selection and any recovered X11 race before
+            # close tears down the display and its process-global error handler.
+            font_diagnostics = overlay.font_diagnostics
+            x11_diagnostics = overlay.x11_diagnostics
             overlay.close()
         if action_publisher is not None:
             action_publisher.close()
@@ -3551,6 +4490,7 @@ def main() -> int:
                     "expected_ue_pid": args.expected_ue_pid,
                     "exit_reason": exit_reason,
                     "fonts": font_diagnostics,
+                    "x11": x11_diagnostics,
                 },
             )
         except OSError:

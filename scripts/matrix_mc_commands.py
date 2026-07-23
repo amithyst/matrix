@@ -21,6 +21,7 @@ from matrix_world_state import (
     WorldStateError,
     validate_tag,
 )
+from matrix_motion_settings import MOTION_SETTING_PATHS
 
 
 COMMAND_PROTOCOL = "matrix-game-command/v1"
@@ -48,8 +49,44 @@ _ITEM_RE = re.compile(
     r"/?item\s+spawn\s+(?P<item>[a-z0-9][a-z0-9_-]{0,47})\s*\Z",
     re.IGNORECASE,
 )
+_DATA_MODIFY_RE = re.compile(
+    r"/?data\s+modify\s+entity\s+@s\s+"
+    r"(?P<path>[A-Za-z0-9_.:-]+)\s+set\s+value\s+"
+    r"(?P<value>\S+)\s*\Z",
+    re.IGNORECASE,
+)
 _SELECTOR_RE = re.compile(r"@e\[(?P<body>[^\]]+)\]\Z")
 _POLICY_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_KEYBOARD_INPUT_PATHS = frozenset(
+    f"control.input.keyboard.{key}"
+    for key in ("w", "a", "s", "d", "q", "e", "v", "ctrl", "alt", "shift")
+)
+_MOUSE_BUTTON_INPUT_PATHS = frozenset(
+    f"control.input.mouse.{button}" for button in ("left", "right", "middle")
+)
+_BOOLEAN_INPUT_PATHS = _KEYBOARD_INPUT_PATHS | _MOUSE_BUTTON_INPUT_PATHS
+_NUMBER_INPUT_RANGES = {
+    **{
+        f"control.input.gamepad.{axis}": (-1.0, 1.0)
+        for axis in ("forward", "right", "look_yaw", "look_pitch")
+    },
+    "control.input.mouse.dx": (-4096.0, 4096.0),
+    "control.input.mouse.dy": (-4096.0, 4096.0),
+}
+_INPUT_PATHS = _BOOLEAN_INPUT_PATHS | frozenset(_NUMBER_INPUT_RANGES)
+_NONFINITE_NUMBER_TOKENS = frozenset(
+    {
+        "nan",
+        "+nan",
+        "-nan",
+        "inf",
+        "+inf",
+        "-inf",
+        "infinity",
+        "+infinity",
+        "-infinity",
+    }
+)
 
 
 class CommandParseError(ValueError):
@@ -150,6 +187,34 @@ class TeleportCoordinates:
 
 
 @dataclass(frozen=True)
+class TeleportLocalCoordinates:
+    """Minecraft-style ``^left ^up ^forward`` coordinates.
+
+    Matrix currently has an authoritative robot yaw but no command-facing
+    pitch observation.  Local coordinates therefore use the robot's yaw-only
+    horizontal frame while preserving its current yaw.
+    """
+
+    left: float
+    up: float
+    forward: float
+
+    def __post_init__(self) -> None:
+        for name in ("left", "up", "forward"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise CommandParseError(
+                    "E_LOCAL_COORD_INVALID", "local coordinate must be numeric"
+                )
+            value = float(value)
+            if not math.isfinite(value):
+                raise CommandParseError(
+                    "E_LOCAL_COORD_NONFINITE", "local coordinate must be finite"
+                )
+            object.__setattr__(self, name, value)
+
+
+@dataclass(frozen=True)
 class TeleportSelector:
     tag: str
     limit: int = 1
@@ -204,12 +269,79 @@ class CreativeSpawnItem:
         object.__setattr__(self, "item_id", item_id)
 
 
+@dataclass(frozen=True)
+class DataModifyNumber:
+    """Set one whitelisted numeric Matrix entity-data path."""
+
+    path: str
+    value: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or self.path not in MOTION_SETTING_PATHS:
+            raise CommandParseError(
+                "E_DATA_PATH_UNKNOWN",
+                f"unsupported entity data path {self.path!r}",
+            )
+        if (
+            isinstance(self.value, bool)
+            or not isinstance(self.value, (int, float))
+            or not math.isfinite(float(self.value))
+        ):
+            raise CommandParseError(
+                "E_DATA_VALUE", "entity data value must be a finite number"
+            )
+        object.__setattr__(self, "value", float(self.value))
+
+
+@dataclass(frozen=True)
+class DataModifyInput:
+    """Set one whitelisted external keyboard, gamepad, or mouse input."""
+
+    path: str
+    value: bool | float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or self.path not in _INPUT_PATHS:
+            raise CommandParseError(
+                "E_DATA_PATH_UNKNOWN",
+                f"unsupported entity data path {self.path!r}",
+            )
+        if self.path in _BOOLEAN_INPUT_PATHS:
+            if type(self.value) is not bool:
+                raise CommandParseError(
+                    "E_DATA_INPUT_TYPE",
+                    f"entity data path {self.path!r} requires true or false",
+                )
+            return
+        if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
+            raise CommandParseError(
+                "E_DATA_INPUT_TYPE",
+                f"entity data path {self.path!r} requires a number",
+            )
+        value = float(self.value)
+        if not math.isfinite(value):
+            raise CommandParseError(
+                "E_DATA_INPUT_NONFINITE", "input value must be finite"
+            )
+        minimum, maximum = _NUMBER_INPUT_RANGES[self.path]
+        if not minimum <= value <= maximum:
+            raise CommandParseError(
+                "E_DATA_INPUT_RANGE",
+                f"entity data path {self.path!r} requires a value in "
+                f"[{minimum:g}, {maximum:g}]",
+            )
+        object.__setattr__(self, "value", value)
+
+
 McCommand: TypeAlias = (
     SummonTeleportPoint
     | TeleportCoordinates
+    | TeleportLocalCoordinates
     | TeleportSelector
     | PolicySlotAssignment
     | CreativeSpawnItem
+    | DataModifyNumber
+    | DataModifyInput
 )
 
 
@@ -256,6 +388,32 @@ def parse_coordinate(token: str) -> Coordinate:
             "E_COORD_INVALID", f"invalid coordinate {token!r}"
         ) from exc
     return Coordinate(value, relative=relative)
+
+
+def parse_local_coordinate(token: str) -> float:
+    if not token.startswith("^"):
+        raise CommandParseError(
+            "E_COORD_MIXED",
+            "local ^ coordinates cannot mix with absolute or ~ coordinates",
+        )
+    number = token[1:]
+    if number == "":
+        return 0.0
+    if _NUMBER_RE.fullmatch(number) is None:
+        raise CommandParseError(
+            "E_LOCAL_COORD_INVALID", f"invalid local coordinate {token!r}"
+        )
+    try:
+        value = float(number)
+    except ValueError as exc:  # pragma: no cover - guarded by the regex.
+        raise CommandParseError(
+            "E_LOCAL_COORD_INVALID", f"invalid local coordinate {token!r}"
+        ) from exc
+    if not math.isfinite(value):
+        raise CommandParseError(
+            "E_LOCAL_COORD_NONFINITE", "local coordinate must be finite"
+        )
+    return value
 
 
 def _parse_tags(body: str) -> tuple[str, ...]:
@@ -318,11 +476,62 @@ def _parse_selector(text: str) -> TeleportSelector:
     return TeleportSelector(tag=entries["tag"], limit=1, sort=sort)
 
 
+def _parse_data_modify(path: str, raw_value: str) -> DataModifyNumber | DataModifyInput:
+    if path in MOTION_SETTING_PATHS:
+        if _NUMBER_RE.fullmatch(raw_value) is None:
+            raise CommandParseError(
+                "E_DATA_VALUE", "entity data value must be a finite number"
+            )
+        try:
+            value = float(raw_value)
+        except ValueError as exc:  # pragma: no cover - guarded by the regex.
+            raise CommandParseError(
+                "E_DATA_VALUE", "entity data value must be a finite number"
+            ) from exc
+        return DataModifyNumber(path=path, value=value)
+
+    if path not in _INPUT_PATHS:
+        raise CommandParseError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported entity data path {path!r}"
+        )
+    if path in _BOOLEAN_INPUT_PATHS:
+        if raw_value not in {"true", "false"}:
+            raise CommandParseError(
+                "E_DATA_INPUT_TYPE",
+                f"entity data path {path!r} requires true or false",
+            )
+        return DataModifyInput(path=path, value=raw_value == "true")
+
+    if raw_value.lower() in _NONFINITE_NUMBER_TOKENS:
+        raise CommandParseError(
+            "E_DATA_INPUT_NONFINITE", "input value must be finite"
+        )
+    if _NUMBER_RE.fullmatch(raw_value) is None:
+        raise CommandParseError(
+            "E_DATA_INPUT_TYPE", f"entity data path {path!r} requires a number"
+        )
+    try:
+        value = float(raw_value)
+    except ValueError as exc:  # pragma: no cover - guarded by the regex.
+        raise CommandParseError(
+            "E_DATA_INPUT_TYPE", f"entity data path {path!r} requires a number"
+        ) from exc
+    return DataModifyInput(path=path, value=value)
+
+
 def parse_mc_command(text: object) -> ParsedCommand:
     command_text = _validate_text(text)
     item = _ITEM_RE.fullmatch(command_text)
     if item is not None:
         return ParsedCommand(CreativeSpawnItem(item.group("item")))
+    data_modify = _DATA_MODIFY_RE.fullmatch(command_text)
+    if data_modify is not None:
+        return ParsedCommand(
+            _parse_data_modify(
+                path=data_modify.group("path"),
+                raw_value=data_modify.group("value"),
+            )
+        )
     policy = _POLICY_RE.fullmatch(command_text)
     if policy is not None:
         return ParsedCommand(
@@ -362,23 +571,52 @@ def parse_mc_command(text: object) -> ParsedCommand:
             raise CommandParseError(
                 "E_COORD_ARITY", "tp @s requires three coordinates or one selector"
             )
+        if any(token.startswith("^") for token in tokens):
+            if not all(token.startswith("^") for token in tokens):
+                raise CommandParseError(
+                    "E_COORD_MIXED",
+                    "local ^ coordinates cannot mix with absolute or ~ coordinates",
+                )
+            left, up, forward = (
+                parse_local_coordinate(token) for token in tokens
+            )
+            return ParsedCommand(TeleportLocalCoordinates(left, up, forward))
         return ParsedCommand(
             TeleportCoordinates(tuple(parse_coordinate(token) for token in tokens))
         )
 
-    first = command_text.lstrip("/").split(maxsplit=1)[0]
+    command_without_slash = command_text.lstrip("/")
+    first = command_without_slash.split(maxsplit=1)[0]
+    if re.match(r"data(?:\s|\Z)", command_without_slash, re.IGNORECASE):
+        raise CommandParseError(
+            "E_DATA_SYNTAX",
+            "data modify must use: /data modify entity @s <path> set value <value>",
+        )
     if first in {"sumon", "summonn", "summom"}:
         raise CommandParseError(
             "E_COMMAND_UNKNOWN", f"unknown command {first!r}; did you mean /summon?"
         )
     raise CommandParseError(
-        "E_COMMAND_UNKNOWN", "supported commands are /summon, /tp, /policy, and /item spawn"
+        "E_COMMAND_UNKNOWN",
+        "supported commands are /summon, /tp, /policy, /item spawn, and /data modify",
     )
 
 
 def command_to_mapping(command: McCommand) -> dict[str, object]:
     if isinstance(command, CreativeSpawnItem):
         return {"name": "creative_spawn_item", "item_id": command.item_id}
+    if isinstance(command, DataModifyInput):
+        return {
+            "name": "data_modify_input",
+            "path": command.path,
+            "value": command.value,
+        }
+    if isinstance(command, DataModifyNumber):
+        return {
+            "name": "data_modify_number",
+            "path": command.path,
+            "value": command.value,
+        }
     if isinstance(command, PolicySlotAssignment):
         return {
             "name": "policy_slot_assignment",
@@ -395,6 +633,13 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
         return {
             "name": "teleport_coordinates",
             "coordinates": [coordinate.to_mapping() for coordinate in command.coordinates],
+        }
+    if isinstance(command, TeleportLocalCoordinates):
+        return {
+            "name": "teleport_local_coordinates",
+            "left": command.left,
+            "up": command.up,
+            "forward": command.forward,
         }
     if isinstance(command, TeleportSelector):
         return {
@@ -416,6 +661,26 @@ def command_from_mapping(value: object) -> McCommand:
             raise CommandProtocolError("creative spawn item has an invalid schema")
         try:
             return CreativeSpawnItem(item_id=value.get("item_id"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "data_modify_input":
+        if set(value) != {"name", "path", "value"}:
+            raise CommandProtocolError("data modify input has an invalid schema")
+        try:
+            return DataModifyInput(
+                path=value.get("path"),
+                value=value.get("value"),
+            )
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "data_modify_number":
+        if set(value) != {"name", "path", "value"}:
+            raise CommandProtocolError("data modify number has an invalid schema")
+        try:
+            return DataModifyNumber(
+                path=value.get("path"),
+                value=value.get("value"),
+            )
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     if name == "policy_slot_assignment":
@@ -450,6 +715,19 @@ def command_from_mapping(value: object) -> McCommand:
                     raise CommandProtocolError("summon tags must be a list")
                 return SummonTeleportPoint(parsed_coordinates, tuple(tags))
             return TeleportCoordinates(parsed_coordinates)
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "teleport_local_coordinates":
+        if set(value) != {"name", "left", "up", "forward"}:
+            raise CommandProtocolError(
+                "teleport local coordinates have an invalid schema"
+            )
+        try:
+            return TeleportLocalCoordinates(
+                left=value.get("left"),
+                up=value.get("up"),
+                forward=value.get("forward"),
+            )
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     if name == "teleport_selector":
@@ -684,6 +962,26 @@ def _resolve_pose(
         raise CommandExecutionError("E_OUT_OF_WORLD", str(exc)) from exc
 
 
+def _resolve_local_pose(
+    coordinates: TeleportLocalCoordinates, origin: WorldPose
+) -> WorldPose:
+    cosine = math.cos(origin.yaw_rad)
+    sine = math.sin(origin.yaw_rad)
+    try:
+        return WorldPose(
+            origin.x
+            + coordinates.forward * cosine
+            - coordinates.left * sine,
+            origin.y
+            + coordinates.forward * sine
+            + coordinates.left * cosine,
+            origin.z + coordinates.up,
+            origin.yaw_rad,
+        )
+    except WorldStateError as exc:
+        raise CommandExecutionError("E_OUT_OF_WORLD", str(exc)) from exc
+
+
 def execute_command(
     command: McCommand,
     *,
@@ -719,6 +1017,18 @@ def execute_command(
             state=next_state,
             code="OK_TELEPORT_RESTART",
             message="Teleport saved; reloading Matrix at the destination",
+            restart_required=True,
+            data={"position": [pose.x, pose.y, pose.z]},
+        )
+    if isinstance(command, TeleportLocalCoordinates):
+        pose = _resolve_local_pose(command, current_pose)
+        next_state = state.set_resume_pose(
+            pose, source="teleport_command", now_unix_ns=now_unix_ns
+        )
+        return CommandEffect(
+            state=next_state,
+            code="OK_TELEPORT_RESTART",
+            message="Local teleport saved; reloading Matrix at the destination",
             restart_required=True,
             data={"position": [pose.x, pose.y, pose.z]},
         )
@@ -765,12 +1075,15 @@ __all__ = [
     "CommandProtocolError",
     "Coordinate",
     "CreativeSpawnItem",
+    "DataModifyInput",
+    "DataModifyNumber",
     "GameCommandRequest",
     "GameCommandResponse",
     "ParsedCommand",
     "PolicySlotAssignment",
     "SummonTeleportPoint",
     "TeleportCoordinates",
+    "TeleportLocalCoordinates",
     "TeleportSelector",
     "command_from_mapping",
     "command_to_mapping",
@@ -780,4 +1093,5 @@ __all__ = [
     "encode_command_response",
     "execute_command",
     "parse_mc_command",
+    "parse_local_coordinate",
 ]
