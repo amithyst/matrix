@@ -1266,6 +1266,7 @@ def _validate_qualified_model(
         for field in (
             "pipeline_version",
             "scene_transform",
+            "scene_transform_contract",
             "removed_environment_geoms",
             "staticized_freejoint_bodies",
         ):

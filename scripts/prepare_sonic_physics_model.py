@@ -29,12 +29,18 @@ from inject_creative_inventory import (  # noqa: E402
 PIPELINE_VERSION = 7
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
-MOON_DYNAMIC_GROUND_STATIC_TRANSFORM = "moon-dynamic-ground-static-v1"
+MOON_DYNAMIC_GROUND_STATIC_TRANSFORM = "moon-dynamic-ground-static-v2"
 MOON_DYNAMIC_GROUND_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
 MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256 = (
     "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
 )
 MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT = 256
+MOON_SUPPORT_PLANE_NAME = "matrix_moon_support_plane"
+MOON_SUPPORT_PLANE_POS = (0.0, 0.0, -0.005)
+MOON_SUPPORT_PLANE_SIZE = (0.0, 0.0, 0.01)
+MOON_SUPPORT_PLANE_FRICTION = (1.0, 0.005, 0.0001)
+MOON_SUPPORT_PLANE_SOLREF = (0.02, 1.0)
+MOON_SUPPORT_PLANE_SOLIMP = (0.9, 0.95, 0.001, 0.5, 2.0)
 TOWN10_SOURCE_SCENE_SHA256 = (
     "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
 )
@@ -270,6 +276,13 @@ def _scene_transform_removals(
                 f"{transform} freejoint body count drifted: "
                 f"expected={MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT} actual={len(names)}"
             )
+        if any(
+            geom.get("name") == MOON_SUPPORT_PLANE_NAME
+            for geom in root.iter("geom")
+        ):
+            raise SonicPhysicsModelError(
+                f"{transform} source unexpectedly contains {MOON_SUPPORT_PLANE_NAME}"
+            )
         return transform, (), names
     if transform != TOWN10_OPEN_BOUNDARY_TRANSFORM:
         raise SonicPhysicsModelError(f"unsupported scene transform: {transform}")
@@ -340,6 +353,89 @@ def _scene_transform_removals(
     return transform, TOWN10_PERIMETER_WALL_NAMES, ()
 
 
+def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
+    if scene_transform != MOON_DYNAMIC_GROUND_STATIC_TRANSFORM:
+        return None
+    return {
+        "support_plane": {
+            "name": MOON_SUPPORT_PLANE_NAME,
+            "type": "plane",
+            "pos": list(MOON_SUPPORT_PLANE_POS),
+            "size": list(MOON_SUPPORT_PLANE_SIZE),
+            "friction": list(MOON_SUPPORT_PLANE_FRICTION),
+            "solref": list(MOON_SUPPORT_PLANE_SOLREF),
+            "solimp": list(MOON_SUPPORT_PLANE_SOLIMP),
+            "contype": 1,
+            "conaffinity": 1,
+            "condim": 3,
+            "margin": 0,
+            "gap": 0,
+            "group": 0,
+        }
+    }
+
+
+def _apply_scene_transform_additions(
+    scene_path: Path, scene_transform: str
+) -> None:
+    if scene_transform != MOON_DYNAMIC_GROUND_STATIC_TRANSFORM:
+        return
+    try:
+        tree = ET.parse(scene_path)
+    except ET.ParseError as exc:
+        raise SonicPhysicsModelError(
+            f"invalid derived Matrix scene {scene_path}: {exc}"
+        ) from exc
+    root = tree.getroot()
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise SonicPhysicsModelError("MoonWorld derived scene has no worldbody")
+    if any(
+        geom.get("name") == MOON_SUPPORT_PLANE_NAME
+        for geom in worldbody.iter("geom")
+    ):
+        raise SonicPhysicsModelError(
+            f"MoonWorld derived scene already contains {MOON_SUPPORT_PLANE_NAME}"
+        )
+    worldbody.append(
+        ET.Element(
+            "geom",
+            {
+                "name": MOON_SUPPORT_PLANE_NAME,
+                "type": "plane",
+                "pos": " ".join(f"{value:g}" for value in MOON_SUPPORT_PLANE_POS),
+                "size": " ".join(f"{value:g}" for value in MOON_SUPPORT_PLANE_SIZE),
+                "friction": " ".join(
+                    f"{value:g}" for value in MOON_SUPPORT_PLANE_FRICTION
+                ),
+                "solref": " ".join(
+                    f"{value:g}" for value in MOON_SUPPORT_PLANE_SOLREF
+                ),
+                "solimp": " ".join(
+                    f"{value:g}" for value in MOON_SUPPORT_PLANE_SOLIMP
+                ),
+                "contype": "1",
+                "conaffinity": "1",
+                "condim": "3",
+                "margin": "0",
+                "gap": "0",
+                "group": "0",
+                "rgba": "0.4 0.25 0.1 1",
+            },
+        )
+    )
+    root.insert(
+        0,
+        ET.Comment(
+            " added Matrix MoonWorld support plane below the finite official tile grid "
+        ),
+    )
+    ET.indent(tree, space="  ")
+    tree.write(scene_path, encoding="utf-8", xml_declaration=False)
+    with scene_path.open("ab") as stream:
+        stream.write(b"\n")
+
+
 def _native_scene_asset_inventory(native_scene: Path) -> list[dict[str, object]]:
     """Resolve every native scene file input, including assets/../ siblings."""
     try:
@@ -397,7 +493,7 @@ def _source_contract(
     creative_inventory_catalog: Path | None,
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
-    return {
+    contract = {
         "pipeline_version": PIPELINE_VERSION,
         "canonical_model": str(canonical_model.resolve()),
         "canonical_model_sha256": _file_sha256(canonical_model),
@@ -420,6 +516,10 @@ def _source_contract(
             creative_inventory_catalog
         ),
     }
+    scene_transform_contract = _scene_transform_contract(scene_transform)
+    if scene_transform_contract is not None:
+        contract["scene_transform_contract"] = scene_transform_contract
+    return contract
 
 
 def _creative_inventory_source_contract(
@@ -523,7 +623,7 @@ def physics_revision_payload(
         }
         if len(inventory_revision["meshes"]) != len(meshes):
             raise SonicPhysicsModelError("creative inventory mesh entry is invalid")
-    return {
+    payload = {
         "schema": "matrix-sonic-physics-source/v1",
         "pipeline_version": contract["pipeline_version"],
         "canonical_model_sha256": contract["canonical_model_sha256"],
@@ -537,6 +637,9 @@ def physics_revision_payload(
         "removed_environment_geoms": contract["removed_environment_geoms"],
         "staticized_freejoint_bodies": contract["staticized_freejoint_bodies"],
     }
+    if "scene_transform_contract" in contract:
+        payload["scene_transform_contract"] = contract["scene_transform_contract"]
+    return payload
 
 
 def _strip_non_body_joints(
@@ -810,6 +913,10 @@ def prepare_sonic_physics_model(
             target_asset_root=temporary_dir / "meshes",
             remove_geoms=removed_environment_geoms,
             staticize_freejoint_bodies=bool(staticized_freejoint_bodies),
+        )
+        _apply_scene_transform_additions(
+            temporary_dir / native_scene.name,
+            normalized_scene_transform,
         )
         contract["body_joint_names"] = list(body_joint_names)
         contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")

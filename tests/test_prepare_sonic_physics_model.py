@@ -359,6 +359,7 @@ material="demo_ground_material" /></worldbody>
                 manifest["scene_transform"],
                 MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
             )
+            self.assertNotIn("scene_transform_contract", manifest)
             self.assertEqual(
                 manifest["removed_environment_geoms"],
                 list(MODULE.TOWN10_PERIMETER_WALL_NAMES),
@@ -448,13 +449,60 @@ material="demo_ground_material" /></worldbody>
             self.assertEqual([joint.get("name") for joint in scene_root.iter("joint")], [])
             self.assertEqual(
                 [geom.get("name") for geom in scene_root.iter("geom")],
-                ["soil_0_0", "soil_0_1"],
+                [
+                    "soil_0_0",
+                    "soil_0_1",
+                    MODULE.MOON_SUPPORT_PLANE_NAME,
+                ],
             )
+            support_planes = [
+                geom
+                for geom in scene_root.iter("geom")
+                if geom.get("name") == MODULE.MOON_SUPPORT_PLANE_NAME
+            ]
+            self.assertEqual(len(support_planes), 1)
+            support_plane = support_planes[0]
+            self.assertEqual(support_plane.get("type"), "plane")
+            self.assertEqual(support_plane.get("pos"), "0 0 -0.005")
+            self.assertEqual(support_plane.get("size"), "0 0 0.01")
+            self.assertEqual(support_plane.get("friction"), "1 0.005 0.0001")
+            self.assertEqual(support_plane.get("solref"), "0.02 1")
+            self.assertEqual(
+                support_plane.get("solimp"),
+                "0.9 0.95 0.001 0.5 2",
+            )
+            self.assertEqual(support_plane.get("contype"), "1")
+            self.assertEqual(support_plane.get("conaffinity"), "1")
+            self.assertEqual(support_plane.get("condim"), "3")
+            self.assertEqual(support_plane.get("margin"), "0")
+            self.assertEqual(support_plane.get("gap"), "0")
+            self.assertEqual(support_plane.get("group"), "0")
+            self.assertEqual(support_plane.get("rgba"), "0.4 0.25 0.1 1")
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["pipeline_version"], 7)
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+            )
+            self.assertEqual(
+                manifest["scene_transform_contract"],
+                {
+                    "support_plane": {
+                        "name": MODULE.MOON_SUPPORT_PLANE_NAME,
+                        "type": "plane",
+                        "pos": [0.0, 0.0, -0.005],
+                        "size": [0.0, 0.0, 0.01],
+                        "friction": [1.0, 0.005, 0.0001],
+                        "solref": [0.02, 1.0],
+                        "solimp": [0.9, 0.95, 0.001, 0.5, 2.0],
+                        "contype": 1,
+                        "conaffinity": 1,
+                        "condim": 3,
+                        "margin": 0,
+                        "gap": 0,
+                        "group": 0,
+                    }
+                },
             )
             self.assertEqual(manifest["removed_environment_geoms"], [])
             self.assertEqual(

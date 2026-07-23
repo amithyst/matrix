@@ -1531,9 +1531,9 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
-            --scene-transform moon-dynamic-ground-static-v1
+            --scene-transform moon-dynamic-ground-static-v2
         )
-        echo "[INFO] MoonWorld dynamic ground blocks staticized in derived SONIC physics scene"
+        echo "[INFO] MoonWorld dynamic ground blocks staticized with derived support plane"
     fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
