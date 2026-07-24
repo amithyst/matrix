@@ -63,7 +63,7 @@ be claimed from this implementation.
 | Native gait intervals | mode 1: 0.10-0.80; mode 2: 0.80-2.50; mode 3: 2.50-7.50 m/s |
 | Acceleration / deceleration | 1.20 / 2.40 m/s² |
 | Maximum heading rate | 2.50 rad/s |
-| Arrow camera rate | 120 deg/s default; 30-360 deg/s in 30 deg/s host-persisted ESC steps |
+| Arrow camera rate | Nominal 120 default; 30-360 in host-persisted ESC steps of 30; final velocity comes from UE final POV |
 | Translation heading gate | start within 15 degrees; stop beyond 30 degrees |
 | Turn before translation | native `IDLE + facing`; never `SLOW_WALK + speed=0` |
 | Left-stick radial deadzone | 0.15 |

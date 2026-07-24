@@ -4666,6 +4666,10 @@ class KeyboardCameraLookTest(unittest.TestCase):
         self.assertFalse(telemetry["configured"])
         self.assertFalse(telemetry["available"])
         self.assertEqual(telemetry["rate_deg_s"], 120.0)
+        self.assertEqual(
+            telemetry["rate_scope"],
+            "nominal_input_rate_not_final_pov_angular_velocity",
+        )
         missing_arrows = MODULE.keyboard_camera_telemetry(
             None,
             MODULE.KeyboardCameraLookIntegrator(),

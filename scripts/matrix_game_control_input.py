@@ -2010,6 +2010,7 @@ def keyboard_camera_telemetry(
         "arrow_keys_available": arrow_keys_available,
         "rate_setting": KEYBOARD_LOOK_RATE_FIELD,
         "rate_deg_s": settings.keyboard_look_rate_deg_s,
+        "rate_scope": "nominal_input_rate_not_final_pov_angular_velocity",
         "integrator": integrator.telemetry,
     }
 

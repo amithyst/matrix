@@ -53,7 +53,7 @@ boundaries of SONIC's documented 0.10-0.80, 0.80-2.50, and 2.50-7.50 m/s gait
 intervals. The slow tier wins modifier conflicts. Q/E is not reused. All six
 base/boost speeds can be adjusted in the ESC motion panel and are persisted in
 the host-scoped motion-control config. The same panel controls the arrow-key
-camera rate (120 deg/s by default). Arrow camera input is disabled for every
+nominal camera rate (120 by default). Arrow camera input is disabled for every
 frame in which the ESC panel is open.
 
 Arrow look is not a second camera script. The main provider samples X11 arrows,
@@ -61,6 +61,9 @@ coalesces deltas on a background worker, and sends native drag events through
 the pre-enumerated uinput bridge without blocking the 50 Hz SONIC loop. Missing
 bridge capability or UE focus fails closed. `ue-final-pov` remains the rendered
 camera readback on TRNA; successful input injection alone is not visual proof.
+The nominal value scales calibrated input deltas; cooked UE sensitivity and
+camera lag still determine final angular velocity, which must be checked from
+`ue-final-pov` rather than treating the setting as precision deg/s.
 
 Acceleration and modifier downshifts remain rate limited. The published native
 mode follows the current ramp, so an upshift reaches mode 2 only at 0.80 m/s

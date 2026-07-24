@@ -2431,7 +2431,7 @@ def motion_value_label(
         if model.camera_control_available is False:
             return "相机不可用" if compact else "方向键相机不可用"
         value = model.value(gear, field)
-        return f"相{value:.0f}" if compact else f"相机转速 {value:.0f} deg/s"
+        return f"相{value:.0f}" if compact else f"相机标称转速 {value:.0f}"
     if (gear, field) not in _MOTION_CONTROL_SPECS:
         raise ValueError("unsupported motion value label")
     value = model.value(gear, field)
