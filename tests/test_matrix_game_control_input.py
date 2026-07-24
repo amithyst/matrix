@@ -1951,6 +1951,11 @@ class ExternalControlArbitrationTest(unittest.TestCase):
                 "physical_keyboard",
             ),
             (
+                MODULE.KeyboardMouseSample(focused=True, arrow_right=True),
+                pad,
+                "physical_keyboard",
+            ),
+            (
                 MODULE.KeyboardMouseSample(focused=True, mouse_dx=1.0),
                 pad,
                 "physical_mouse",
@@ -4454,6 +4459,224 @@ class CameraYawTrackerTest(unittest.TestCase):
         )
 
 
+class KeyboardCameraLookTest(unittest.TestCase):
+    def test_arrow_hold_maps_to_yaw_pitch_and_caps_stalled_frames(self) -> None:
+        integrator = MODULE.KeyboardCameraLookIntegrator()
+        sample = MODULE.KeyboardMouseSample(
+            arrow_up=True,
+            arrow_right=True,
+            focused=True,
+        )
+        self.assertEqual(
+            integrator.update(
+                sample,
+                dt=0.02,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=True,
+            ),
+            (20, -20),
+        )
+        self.assertEqual(
+            integrator.update(
+                sample,
+                dt=1.0,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=True,
+            ),
+            (50, -50),
+        )
+        self.assertEqual(
+            integrator.update(
+                sample,
+                dt=0.0,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=True,
+            ),
+            (0, 0),
+        )
+
+    def test_escape_interlock_neutralizes_arrows_and_residuals(self) -> None:
+        keyboard, _pad = MODULE.apply_calibration_interlock(
+            MODULE.KeyboardMouseSample(
+                arrow_left=True,
+                arrow_down=True,
+                focused=True,
+            ),
+            MODULE.GamepadSample(),
+            active=True,
+        )
+        self.assertFalse(keyboard.arrow_left)
+        self.assertFalse(keyboard.arrow_down)
+        integrator = MODULE.KeyboardCameraLookIntegrator()
+        self.assertEqual(
+            integrator.update(
+                keyboard,
+                dt=0.02,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=False,
+            ),
+            (0, 0),
+        )
+
+    def test_arrow_release_and_opposing_keys_are_inactive(self) -> None:
+        self.assertTrue(
+            MODULE.keyboard_camera_arrow_active(
+                MODULE.KeyboardMouseSample(arrow_left=True, focused=True)
+            )
+        )
+        for sample in (
+            MODULE.KeyboardMouseSample(focused=True),
+            MODULE.KeyboardMouseSample(
+                arrow_left=True,
+                arrow_right=True,
+                focused=True,
+            ),
+            MODULE.KeyboardMouseSample(
+                arrow_up=True,
+                arrow_down=True,
+                focused=True,
+            ),
+        ):
+            with self.subTest(sample=sample):
+                self.assertFalse(MODULE.keyboard_camera_arrow_active(sample))
+
+    def test_background_worker_emits_actual_bridge_action(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                return None
+
+            def request(self, action, payload):
+                calls.append((action, payload))
+                return {
+                    "ok": True,
+                    "data": {
+                        "supported_actions": ["status", "look_delta"],
+                    },
+                }
+
+            def close(self):
+                return None
+
+        worker = MODULE.EngineCameraLookWorker(
+            Path("/tmp/engine.sock"),
+            Path("/tmp/engine.cap"),
+            button="left",
+            client_factory=Client,
+        )
+        worker.start()
+        self.addCleanup(worker.close)
+        deadline = time.monotonic() + 1.0
+        while not worker.telemetry["available"] and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(worker.telemetry["available"])
+        self.assertTrue(worker.submit(18, -6))
+        while worker.telemetry["emitted_batches"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertIn(
+            (
+                "look_delta",
+                {"dx": 18, "dy": -6, "button": "left"},
+            ),
+            calls,
+        )
+        with worker._condition:
+            worker._pending_dx = 4
+            worker._pending_dy = 2
+        self.assertTrue(worker.cancel_pending())
+        self.assertEqual(worker.telemetry["pending_dx"], 0)
+        self.assertEqual(worker.telemetry["pending_dy"], 0)
+
+    def test_unavailable_bridge_drops_input_without_blocking_provider(self) -> None:
+        class FailingClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                raise FileNotFoundError("bridge missing")
+
+            def close(self):
+                return None
+
+        worker = MODULE.EngineCameraLookWorker(
+            Path("/tmp/missing.sock"),
+            Path("/tmp/missing.cap"),
+            button="left",
+            client_factory=FailingClient,
+        )
+        worker.start()
+        self.addCleanup(worker.close)
+        deadline = time.monotonic() + 1.0
+        while worker.telemetry["status"] == "probing" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        started = time.monotonic()
+        self.assertFalse(worker.submit(10, 0))
+        self.assertLess(time.monotonic() - started, 0.02)
+        telemetry = worker.telemetry
+        self.assertFalse(telemetry["available"])
+        self.assertIn("bridge missing", telemetry["last_error"])
+
+    def test_bridge_without_look_capability_is_not_reported_available(self) -> None:
+        class LegacyClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                return None
+
+            def request(self, _action, _payload):
+                return {"data": {"supported_actions": ["status", "mouse"]}}
+
+            def close(self):
+                return None
+
+        worker = MODULE.EngineCameraLookWorker(
+            Path("/tmp/legacy.sock"),
+            Path("/tmp/legacy.cap"),
+            button="left",
+            client_factory=LegacyClient,
+        )
+        worker.start()
+        self.addCleanup(worker.close)
+        deadline = time.monotonic() + 1.0
+        while worker.telemetry["status"] == "probing" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        telemetry = worker.telemetry
+        self.assertFalse(telemetry["available"])
+        self.assertFalse(telemetry["capability_compatible"])
+        self.assertEqual(telemetry["status"], "unsupported")
+        self.assertIn("does not advertise look_delta", telemetry["last_error"])
+        worker._retry_not_before = 0.0
+        self.assertFalse(worker.submit(10, 0))
+
+    def test_disabled_bridge_telemetry_is_honest(self) -> None:
+        telemetry = MODULE.keyboard_camera_telemetry(
+            None,
+            MODULE.KeyboardCameraLookIntegrator(),
+            MOTION_SETTINGS.MotionSettings(),
+        )
+        self.assertFalse(telemetry["configured"])
+        self.assertFalse(telemetry["available"])
+        self.assertEqual(telemetry["rate_deg_s"], 120.0)
+        missing_arrows = MODULE.keyboard_camera_telemetry(
+            None,
+            MODULE.KeyboardCameraLookIntegrator(),
+            MOTION_SETTINGS.MotionSettings(),
+            arrow_keys_available=False,
+        )
+        self.assertFalse(missing_arrows["available"])
+        self.assertFalse(missing_arrows["arrow_keys_available"])
+        self.assertIn("missing", missing_arrows["last_error"])
+
+
 class CarlaSpectatorCameraTest(unittest.TestCase):
     class Rotation:
         def __init__(self, *, yaw: float = 0.0, pitch: float = 0.0) -> None:
@@ -5482,6 +5705,36 @@ class XInput2RawMotionTest(unittest.TestCase):
 
 
 class X11KeyboardMouseSafetyTest(unittest.TestCase):
+    def test_arrow_keysyms_match_x11_standard_values(self) -> None:
+        self.assertEqual(
+            {
+                name: MODULE.X11KeyboardMouse._KEYSYMS[name]
+                for name in (
+                    "arrow_left",
+                    "arrow_up",
+                    "arrow_right",
+                    "arrow_down",
+                )
+            },
+            {
+                "arrow_left": 0xFF51,
+                "arrow_up": 0xFF52,
+                "arrow_right": 0xFF53,
+                "arrow_down": 0xFF54,
+            },
+        )
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._keycodes = {}
+        self.assertFalse(backend.arrow_keys_available)
+        backend._keycodes = {
+            name: index
+            for index, name in enumerate(
+                MODULE.X11KeyboardMouse._ARROW_KEY_NAMES,
+                start=1,
+            )
+        }
+        self.assertTrue(backend.arrow_keys_available)
+
     class AsyncFocusX11:
         """Deliver one queued X error only when the backend calls XSync."""
 
@@ -6296,6 +6549,7 @@ class ProviderCleanupTest(unittest.TestCase):
         x11 = resource("x11")
         publisher = resource("publisher")
         external = resource("external")
+        engine_camera = resource("engine_camera")
         restored: list[int] = []
 
         def restore(signum: int, _handler: object) -> None:
@@ -6319,6 +6573,7 @@ class ProviderCleanupTest(unittest.TestCase):
                 x11=x11,
                 publisher=publisher,
                 external_control=external,
+                engine_camera_worker=engine_camera,
                 previous_handlers={
                     signal.SIGINT: object(),
                     signal.SIGTERM: object(),
@@ -6326,7 +6581,7 @@ class ProviderCleanupTest(unittest.TestCase):
             )
             cleanup.run("status_write", failing_step("status"))
 
-        for owned in (gamepad, overlay, x11, publisher, external):
+        for owned in (gamepad, overlay, x11, publisher, external, engine_camera):
             owned.close.assert_called_once_with()
         self.assertEqual(restored, [signal.SIGINT, signal.SIGTERM])
         self.assertEqual(
@@ -6351,6 +6606,7 @@ class ProviderCleanupTest(unittest.TestCase):
             [
                 "release",
                 "receipt",
+                "engine_camera",
                 "gamepad",
                 "overlay",
                 "x11",
@@ -6543,6 +6799,37 @@ class UnixSeqpacketPublisherTest(unittest.TestCase):
 
 
 class CameraYawSourceCliTest(unittest.TestCase):
+    def test_provider_inherits_complete_engine_camera_bridge_paths(self) -> None:
+        environment = {
+            "MATRIX_ENGINE_INPUT_SOCKET": "/run/user/1000/engine.sock",
+            "MATRIX_ENGINE_INPUT_CAPABILITY_FILE": "/run/user/1000/engine.cap",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+            os.sys,
+            "argv",
+            ["matrix_game_control_input.py", "--dry-run"],
+        ):
+            args = MODULE._parse_args()
+        MODULE._validate_args(args)
+        self.assertEqual(args.engine_input_socket, Path(environment["MATRIX_ENGINE_INPUT_SOCKET"]))
+        self.assertEqual(
+            args.engine_input_capability_file,
+            Path(environment["MATRIX_ENGINE_INPUT_CAPABILITY_FILE"]),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"MATRIX_ENGINE_INPUT_SOCKET": "/run/user/1000/engine.sock"},
+            clear=True,
+        ), mock.patch.object(
+            os.sys,
+            "argv",
+            ["matrix_game_control_input.py", "--dry-run"],
+        ):
+            incomplete = MODULE._parse_args()
+        with self.assertRaisesRegex(SystemExit, "supplied together"):
+            MODULE._validate_args(incomplete)
+
     def test_provider_parser_accepts_an_open_game_command_fd(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:

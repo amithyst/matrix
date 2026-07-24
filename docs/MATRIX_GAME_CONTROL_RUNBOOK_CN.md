@@ -19,7 +19,7 @@ bash scripts/run_matrix_sonic.sh --profile trna --scene 2
 当前键盘语义：Ctrl 或 Alt 为 slow，无修饰为 walk，Shift 为 run；同一个 WASD 键在
 0.30 s 内完成“按下、松开、再次按下”会进入该档 boost，松键立即退出 boost。切换
 slow/walk/run 档位会清除双击候选和已激活 boost，避免 Alt+W 首击被 Shift+W 误判。
-六个 base/boost 速度和转向速度上限均可在 ESC 运控面板用 -/+ 调整，持久化到
+六个 base/boost 速度、转向速度上限和箭头键相机转速均可在 ESC 运控面板用 -/+ 调整，持久化到
 `~/.config/matrix/hosts/trna/motion-control.json`，仓库 profile 只保存跨机器共享默认值。
 字号、鼠标和视频设置也分别保存到同一 host 目录下的 `ui-settings.json`、
 `mouse-control.json` 和 `video-settings.json`。旧的 `~/.config/matrix/ui-settings.json`
@@ -80,6 +80,10 @@ python3 scripts/matrixctl.py --profile trna command \
 - 键盘 WASD 使用原生静走/普通走/跑步：Ctrl 或 Alt、无修饰键、Shift 分别映射
   SONIC mode 1、2、3；同档同方向双击选择该档 boost；
 - Q/E 不再参与机器人 yaw；
+- Left/Right 箭头键旋转实际 UE 相机 yaw，Up/Down 箭头键旋转 pitch；该路径复用主
+  provider 和预枚举 uinput bridge，不启动第二套相机控制进程；
+- ESC 打开、UE 失焦或 uinput bridge 不可用时，箭头键相机输入 fail closed；桥接 I/O
+  位于合并队列后台线程，不阻塞 SONIC 50 Hz provider；
 - 精确 UE PID 失焦、观察到的 V 安全状态切换、鼠标拖相机、输入过期、断连和
   provider 故障都会停机；
 - 原生 LowCmd 必须 fresh 且启动弹性带完全释放，运动帧才会放行；
@@ -113,6 +117,7 @@ Matrix 0.1.2 cooked 运行包目前**没有完成**以下能力：
 | 原生步态区间 | mode 1：0.10-0.80；mode 2：0.80-2.50；mode 3：2.50-7.50 m/s |
 | 加速度 / 减速度 | 1.20 / 2.40 m/s² |
 | 最大朝向变化率 | 2.50 rad/s |
+| 箭头键相机转速 | 默认 120 deg/s；ESC 面板 30-360 deg/s、步长 30 deg/s，按 host 持久化 |
 | 平移朝向门 | 15 度内启动；超过 30 度停止 |
 | 原地转向 | 原生 `IDLE + facing`；禁止 `SLOW_WALK + speed=0` |
 | 左摇杆径向死区 | 0.15 |

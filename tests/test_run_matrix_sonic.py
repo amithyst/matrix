@@ -5112,6 +5112,54 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_game_command_runtime_persists_keyboard_camera_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "motion-control.json"
+            store = MOTION_SETTINGS.MotionSettingsStore(settings_path)
+            core = GAME_CONTROL.GameControlCore(GAME_CONTROL.ControlConfig())
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                None,
+                motion_settings=store,
+                control_core=core,
+            )
+            pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+            try:
+                update = self.game_command_request(
+                    "/data modify entity @s "
+                    "control.camera.keyboard_look_rate_deg_s set value 150",
+                    sequence=1,
+                    request_character="c",
+                )
+                provider_socket.send(MC_COMMANDS.encode_command_request(update))
+
+                self.assertFalse(
+                    runtime.poll(current_pose=pose, command_allowed=True)
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_DATA_MODIFIED")
+                self.assertEqual(store.settings.keyboard_look_rate_deg_s, 150.0)
+                self.assertEqual(store.settings.revision, 1)
+                self.assertEqual(
+                    MOTION_SETTINGS.load_settings(settings_path).settings,
+                    store.settings,
+                )
+                self.assertEqual(
+                    response.data["motion_settings"]["settings"]["camera"],
+                    {"keyboard_look_rate_deg_s": 150.0},
+                )
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_world_runtime_rejects_exact_selected_checkpoint_with_tombstone_evidence(self) -> None:
         selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
         replacement_pose = WORLD_STATE.WorldPose(0.5, 1.5, 0.8, 0.0)

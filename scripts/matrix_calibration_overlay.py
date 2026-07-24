@@ -50,6 +50,8 @@ from matrix_ui_settings import (
 from matrix_motion_settings import (
     DOUBLE_TAP_SPEED_FIELD,
     GEARS,
+    KEYBOARD_LOOK_RATE_FIELD,
+    KEYBOARD_LOOK_RATE_PATH,
     MAX_TURN_RATE_FIELD,
     MAX_TURN_RATE_PATH,
     MotionSettings,
@@ -782,25 +784,46 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
                 motion_row_height,
             )
     turn_y = motion_top + 3 * (motion_row_height + motion_row_gap)
-    turn_width = max(1, panel_width - 2 * margin)
-    turn_button_width = 24 if compact else max(32, min(52, turn_width // 8))
+    turn_width = motion_left_width
+    turn_button_width = 24 if compact else max(32, min(52, turn_width // 4))
     turn_value_width = max(1, turn_width - 2 * turn_button_width)
     result["motion_turn_rate_down"] = (
-        panel_x + margin,
+        motion_left_x,
         turn_y,
         turn_button_width,
         motion_row_height,
     )
     result["motion_turn_rate_value"] = (
-        panel_x + margin + turn_button_width,
+        motion_left_x + turn_button_width,
         turn_y,
         turn_value_width,
         motion_row_height,
     )
     result["motion_turn_rate_up"] = (
-        panel_x + margin + turn_button_width + turn_value_width,
+        motion_left_x + turn_button_width + turn_value_width,
         turn_y,
         turn_button_width,
+        motion_row_height,
+    )
+    look_width = motion_right_width
+    look_button_width = 24 if compact else max(32, min(52, look_width // 4))
+    look_value_width = max(1, look_width - 2 * look_button_width)
+    result["motion_camera_look_rate_down"] = (
+        motion_right_x,
+        turn_y,
+        look_button_width,
+        motion_row_height,
+    )
+    result["motion_camera_look_rate_value"] = (
+        motion_right_x + look_button_width,
+        turn_y,
+        look_value_width,
+        motion_row_height,
+    )
+    result["motion_camera_look_rate_up"] = (
+        motion_right_x + look_button_width + look_value_width,
+        turn_y,
+        look_button_width,
         motion_row_height,
     )
     for index in range(3):
@@ -903,6 +926,16 @@ _MOTION_STEP_ACTION_DETAILS = {
 _MOTION_STEP_ACTION_DETAILS.update(
     {
         f"motion_turn_rate_{suffix}": (None, MAX_TURN_RATE_FIELD, direction)
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_camera_look_rate_{suffix}": (
+            "camera",
+            KEYBOARD_LOOK_RATE_FIELD,
+            direction,
+        )
         for suffix, direction in (("down", -1), ("up", 1))
     }
 )
@@ -2163,13 +2196,22 @@ class MotionSettingsPanelModel:
     available: bool
     load_status: str
     error: str | None
+    camera_control_available: bool | None = None
+    camera_control_error: str | None = None
 
     def value(self, gear: str, field: str) -> float:
         if gear == "turn" and field == MAX_TURN_RATE_FIELD:
             return self.settings.value_for_path(MAX_TURN_RATE_PATH)
+        if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
+            return self.settings.value_for_path(KEYBOARD_LOOK_RATE_PATH)
         return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
 
     def action_enabled(self, action: str) -> bool:
+        if (
+            action.startswith("motion_camera_look_rate_")
+            and self.camera_control_available is False
+        ):
+            return False
         return motion_step_target(self, action) is not None
 
 
@@ -2268,11 +2310,23 @@ def _motion_settings_candidate(state: dict[str, object]) -> object:
 
 
 def motion_settings_panel_model(state: dict[str, object]) -> MotionSettingsPanelModel:
-    """Validate the six runtime-owned motion values used by panel step buttons."""
+    """Validate runtime-owned locomotion and camera values for panel controls."""
 
     raw = _motion_settings_candidate(state)
     load_status = "unavailable"
     load_error: str | None = None
+    camera_control = state.get("keyboard_camera")
+    camera_control_available: bool | None = None
+    camera_control_error: str | None = None
+    if isinstance(camera_control, dict):
+        if type(camera_control.get("available")) is bool:
+            camera_control_available = camera_control["available"]
+        raw_camera_error = camera_control.get("last_error")
+        if isinstance(raw_camera_error, str) and raw_camera_error:
+            camera_control_error = _bounded_status_text(
+                raw_camera_error,
+                maximum=256,
+            )
     snapshot = raw
     if isinstance(raw, dict) and "settings" in raw:
         snapshot = raw.get("settings")
@@ -2292,12 +2346,16 @@ def motion_settings_panel_model(state: dict[str, object]) -> MotionSettingsPanel
                 if raw is None
                 else f"invalid motion settings telemetry: {exc}"
             ),
+            camera_control_available=camera_control_available,
+            camera_control_error=camera_control_error,
         )
     return MotionSettingsPanelModel(
         settings=settings,
         available=True,
         load_status=load_status if load_status != "unavailable" else "loaded",
         error=load_error,
+        camera_control_available=camera_control_available,
+        camera_control_error=camera_control_error,
     )
 
 
@@ -2315,10 +2373,16 @@ def motion_step_target(
     if not model.available:
         return None
     gear, field, direction = details
+    if gear == "camera" and model.camera_control_available is False:
+        return None
     path = (
         MAX_TURN_RATE_PATH
         if gear is None
-        else f"control.motion.gears.{gear}.{field}"
+        else (
+            KEYBOARD_LOOK_RATE_PATH
+            if gear == "camera"
+            else f"control.motion.gears.{gear}.{field}"
+        )
     )
     current = model.settings.value_for_path(path)
     target = step_motion_speed(model.settings, path, direction)
@@ -2340,6 +2404,11 @@ def motion_step_command(
             f"/data modify entity @s {MAX_TURN_RATE_PATH} "
             f"set value {target:.2f}"
         )
+    if gear == "camera":
+        return (
+            f"/data modify entity @s {KEYBOARD_LOOK_RATE_PATH} "
+            f"set value {target:.2f}"
+        )
     return (
         f"/data modify entity @s control.motion.gears.{gear}.{field} "
         f"set value {target:.2f}"
@@ -2353,10 +2422,16 @@ def motion_value_label(
     *,
     compact: bool,
 ) -> str:
-    """Return a bounded label for one of the six visible motion values."""
+    """Return a bounded label for one visible locomotion or camera value."""
 
     if gear == "turn" and field == MAX_TURN_RATE_FIELD:
-        return f"转向上限 {model.value(gear, field):.2f} rad/s"
+        value = model.value(gear, field)
+        return f"转{value:.2f}" if compact else f"转向上限 {value:.2f} rad/s"
+    if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
+        if model.camera_control_available is False:
+            return "相机不可用" if compact else "方向键相机不可用"
+        value = model.value(gear, field)
+        return f"相{value:.0f}" if compact else f"相机转速 {value:.0f} deg/s"
     if (gear, field) not in _MOTION_CONTROL_SPECS:
         raise ValueError("unsupported motion value label")
     value = model.value(gear, field)
@@ -5074,32 +5149,43 @@ class X11CalibrationOverlay:
                 ],
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
-        for action in ("motion_turn_rate_down", "motion_turn_rate_up"):
-            suffix = action.rsplit("_", 1)[1]
-            disabled = bool(
-                controls_disabled
-                or command_blocked
-                or not motion_model.action_enabled(action)
+        for stem, gear, field in (
+            ("motion_turn_rate", "turn", MAX_TURN_RATE_FIELD),
+            ("motion_camera_look_rate", "camera", KEYBOARD_LOOK_RATE_FIELD),
+        ):
+            for suffix in ("down", "up"):
+                action = f"{stem}_{suffix}"
+                disabled = bool(
+                    controls_disabled
+                    or command_blocked
+                    or not motion_model.action_enabled(action)
+                )
+                self._draw_button(
+                    layout,
+                    action,
+                    "-" if suffix == "down" else "+",
+                    fill=self._colours["disabled" if disabled else "button"],
+                    disabled=disabled,
+                )
+            value_available = bool(
+                motion_model.available
+                and not (
+                    gear == "camera"
+                    and motion_model.camera_control_available is False
+                )
             )
-            self._draw_button(
-                layout,
-                action,
-                "-" if suffix == "down" else "+",
-                fill=self._colours["disabled" if disabled else "button"],
-                disabled=disabled,
+            self._draw_text(
+                motion_value_label(
+                    motion_model,
+                    gear,
+                    field,
+                    compact=compact_motion_labels,
+                ),
+                x=0,
+                y=0,
+                colour=self._colours["white" if value_available else "muted"],
+                centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
-        self._draw_text(
-            motion_value_label(
-                motion_model,
-                "turn",
-                MAX_TURN_RATE_FIELD,
-                compact=compact_motion_labels,
-            ),
-            x=0,
-            y=0,
-            colour=self._colours["white" if motion_model.available else "muted"],
-            centred_in=self._panel_rectangle(layout, "motion_turn_rate_value"),
-        )
         if layout["panel"][3] >= 500:
             status = (
                 "正在重载 Matrix"

@@ -37,7 +37,8 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(settings.run_speed_mps, 2.50)
         self.assertEqual(settings.run_double_tap_speed_mps, 2.75)
         self.assertEqual(settings.max_turn_rate_rad_s, 2.50)
-        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 7)
+        self.assertEqual(settings.keyboard_look_rate_deg_s, 120.0)
+        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 8)
 
     def test_strict_mapping_round_trip(self) -> None:
         settings = MODULE.MotionSettings(
@@ -52,7 +53,17 @@ class MotionSettingsValueTest(unittest.TestCase):
         mapping = settings.to_mapping()
         self.assertEqual(
             set(mapping),
-            {"version", "revision", "gears", "max_turn_rate_rad_s"},
+            {
+                "version",
+                "revision",
+                "gears",
+                "max_turn_rate_rad_s",
+                "camera",
+            },
+        )
+        self.assertEqual(
+            mapping["camera"],
+            {"keyboard_look_rate_deg_s": 120.0},
         )
         self.assertEqual(set(mapping["gears"]), {"slow", "walk", "run"})
         for gear in MODULE.GEARS:
@@ -93,10 +104,25 @@ class MotionSettingsValueTest(unittest.TestCase):
         missing_field = json.loads(json.dumps(valid))
         del missing_field["gears"]["run"]["double_tap_speed_mps"]
         mutations.append(missing_field)
+        extra_camera_field = json.loads(json.dumps(valid))
+        extra_camera_field["camera"]["extra"] = 1
+        mutations.append(extra_camera_field)
+        null_camera = json.loads(json.dumps(valid))
+        null_camera["camera"] = None
+        mutations.append(null_camera)
 
         for value in mutations:
             with self.subTest(value=value), self.assertRaises(MODULE.MotionSettingsError):
                 MODULE.MotionSettings.from_mapping(value)
+
+    def test_legacy_v1_mapping_without_camera_uses_safe_default(self) -> None:
+        legacy = MODULE.MotionSettings().to_mapping()
+        del legacy["camera"]
+        loaded = MODULE.MotionSettings.from_mapping(legacy)
+        self.assertEqual(
+            loaded.keyboard_look_rate_deg_s,
+            MODULE.DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
+        )
 
     def test_each_value_must_be_finite_numeric_and_inside_native_tier(self) -> None:
         cases = (
@@ -111,6 +137,9 @@ class MotionSettingsValueTest(unittest.TestCase):
             {"run_speed_mps": float("inf")},
             {"max_turn_rate_rad_s": 2.75},
             {"max_turn_rate_rad_s": True},
+            {"keyboard_look_rate_deg_s": 29.0},
+            {"keyboard_look_rate_deg_s": 361.0},
+            {"keyboard_look_rate_deg_s": True},
         )
         for values in cases:
             with self.subTest(values=values), self.assertRaises(
@@ -151,6 +180,17 @@ class MotionSettingsValueTest(unittest.TestCase):
         )
         self.assertEqual(turn_replacement.max_turn_rate_rad_s, 2.25)
         self.assertEqual(turn_replacement.revision, 4)
+        self.assertEqual(
+            settings.value_for_path(MODULE.KEYBOARD_LOOK_RATE_PATH),
+            MODULE.DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
+        )
+        look_replacement = settings.with_value(
+            MODULE.KEYBOARD_LOOK_RATE_PATH,
+            180.0,
+            revision=5,
+        )
+        self.assertEqual(look_replacement.keyboard_look_rate_deg_s, 180.0)
+        self.assertEqual(look_replacement.revision, 5)
         for invalid in (
             "control.motion.gears.slow.unknown",
             "control.motion.gears.crawl.speed_mps",
@@ -296,6 +336,7 @@ class MotionSettingsStepTest(unittest.TestCase):
             (path("run", "speed_mps"), 1, 2.50),
             (path("run", "double_tap_speed_mps"), 1, 3.00),
             (MODULE.MAX_TURN_RATE_PATH, -1, 2.25),
+            (MODULE.KEYBOARD_LOOK_RATE_PATH, 1, 150.0),
         )
         for setting_path, direction, expected in cases:
             with self.subTest(path=setting_path, direction=direction):
@@ -362,6 +403,14 @@ class MotionSettingsStepTest(unittest.TestCase):
         self.assertEqual(
             MODULE.step_motion_speed(pair_limited, MODULE.MAX_TURN_RATE_PATH, 1),
             2.50,
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(
+                MODULE.MotionSettings(keyboard_look_rate_deg_s=360.0),
+                MODULE.KEYBOARD_LOOK_RATE_PATH,
+                1,
+            ),
+            360.0,
         )
 
         sub_step_gap = MODULE.MotionSettings(

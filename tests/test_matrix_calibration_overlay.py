@@ -723,6 +723,10 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(model.settings.revision, 7)
         self.assertEqual(model.value("walk", "double_tap_speed_mps"), 1.30)
         self.assertEqual(
+            model.value("camera", MODULE.KEYBOARD_LOOK_RATE_FIELD),
+            120.0,
+        )
+        self.assertEqual(
             MODULE.motion_step_command(model, "motion_slow_speed_mps_up"),
             (
                 "/data modify entity @s control.motion.gears.slow.speed_mps "
@@ -737,6 +741,16 @@ class OverlayStateTest(unittest.TestCase):
             (
                 "/data modify entity @s "
                 "control.motion.gears.run.double_tap_speed_mps set value 3.25"
+            ),
+        )
+        self.assertEqual(
+            MODULE.motion_step_command(
+                model,
+                "motion_camera_look_rate_up",
+            ),
+            (
+                "/data modify entity @s control.camera.keyboard_look_rate_deg_s "
+                "set value 150.00"
             ),
         )
         with self.assertRaisesRegex(ValueError, "unsupported motion panel action"):
@@ -803,6 +817,35 @@ class OverlayStateTest(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertFalse(model.action_enabled(action))
                 self.assertIsNone(MODULE.motion_step_command(model, action))
+
+    def test_camera_rate_controls_fail_closed_when_uinput_bridge_is_missing(
+        self,
+    ) -> None:
+        model = MODULE.motion_settings_panel_model(
+            {
+                "motion_settings": MODULE.MotionSettings().to_mapping(),
+                "keyboard_camera": {
+                    "available": False,
+                    "last_error": "bridge unavailable",
+                },
+            }
+        )
+        self.assertTrue(model.available)
+        self.assertFalse(model.camera_control_available)
+        self.assertEqual(model.camera_control_error, "bridge unavailable")
+        self.assertFalse(model.action_enabled("motion_camera_look_rate_up"))
+        self.assertIsNone(
+            MODULE.motion_step_command(model, "motion_camera_look_rate_up")
+        )
+        self.assertIn(
+            "不可用",
+            MODULE.motion_value_label(
+                model,
+                "camera",
+                MODULE.KEYBOARD_LOOK_RATE_FIELD,
+                compact=False,
+            ),
+        )
 
     def test_command_state_is_strict_and_alias_warning_is_ascii_readable(self) -> None:
         status = MODULE.command_console_status(
