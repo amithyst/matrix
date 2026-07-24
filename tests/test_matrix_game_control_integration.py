@@ -716,7 +716,15 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         fake_bin.mkdir()
         self.write(
             fake_bin / "pkill",
-            "#!/usr/bin/env bash\nexit 0\n",
+            """#!/usr/bin/env bash
+set -euo pipefail
+arm_file="${FAKE_PKILL_CLEANUP_ARM_FILE:-}"
+marker_file="${FAKE_PKILL_CLEANUP_MARKER_FILE:-}"
+if [[ -n "$arm_file" && -e "$arm_file" && -n "$marker_file" ]]; then
+    printf 'cleanup-advanced\n' > "$marker_file"
+fi
+exit 0
+""",
             executable=True,
         )
         self.write(
@@ -888,6 +896,16 @@ elif script == "supervise_matrix_ue.py":
     pid_file.write_text(str(os.getpid()), encoding="utf-8")
     for line in sys.stdin:
         if line.strip() == "stop":
+            stop_started = os.environ.get("FAKE_UE_STOP_STARTED_MARKER")
+            if stop_started:
+                Path(stop_started).write_text("stopping", encoding="utf-8")
+            stop_release = os.environ.get("FAKE_UE_STOP_RELEASE_FILE")
+            if stop_release:
+                while not Path(stop_release).exists():
+                    time.sleep(0.01)
+            stop_finished = os.environ.get("FAKE_UE_STOP_FINISHED_MARKER")
+            if stop_finished:
+                Path(stop_finished).write_text("finished", encoding="utf-8")
             break
     late_ue_exit = os.environ.get("FAKE_UE_LATE_FAILURE_EXIT_CODE")
     if late_ue_exit:
@@ -1025,6 +1043,17 @@ elif script == "run_matrix_sonic.py":
                 args[args.index("--game-restart-launcher-pid") + 1],
             ],
         )
+    if os.environ.get("FAKE_SONIC_WAIT_FOR_TERM") == "1":
+        def stop_sonic(*_args):
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, stop_sonic)
+        while True:
+            time.sleep(0.1)
+    exit_gate = os.environ.get("FAKE_SONIC_EXIT_GATE")
+    if exit_gate:
+        while not Path(exit_gate).exists():
+            time.sleep(0.01)
 elif script == "matrix_celestial_navigation.py":
     os.execv(
         "/usr/bin/python3",
@@ -4574,8 +4603,254 @@ esac
                 130,
                 msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
             )
-            self.assertNotIn("external-signal cleanup", stderr)
+            self.assertNotIn(
+                "external-signal cleanup",
+                stderr,
+                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
+            )
             self.assertIn("Cleanup finished", stdout)
+
+    def test_external_sigint_does_not_interrupt_cleanup_already_in_progress(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            sonic_exit_gate = project / "sonic-exit.gate"
+            watchdog_stop_started = project / "watchdog-stop-started.marker"
+            watchdog_stop_finished = project / "watchdog-stop-finished.marker"
+            run_sim = project / "scripts/run_sim.sh"
+            run_sim_source = run_sim.read_text(encoding="utf-8")
+            watchdog_trap = "trap 'exit 0' TERM INT\n        trap '' HUP"
+            delayed_watchdog_trap = (
+                "trap 'printf \"stopping\\n\" > "
+                '"${FAKE_WATCHDOG_STOP_STARTED_MARKER:?}"; '
+                'sleep "${FAKE_WATCHDOG_STOP_DELAY_SECONDS:-0}"; '
+                'printf "finished\\n" > '
+                '"${FAKE_WATCHDOG_STOP_FINISHED_MARKER:?}"; '
+                "exit 0' TERM INT\n        trap '' HUP"
+            )
+            self.assertEqual(run_sim_source.count(watchdog_trap), 1)
+            run_sim.write_text(
+                run_sim_source.replace(watchdog_trap, delayed_watchdog_trap),
+                encoding="utf-8",
+            )
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_SONIC_EXIT_GATE": os.fspath(sonic_exit_gate),
+                "FAKE_WATCHDOG_STOP_DELAY_SECONDS": "1",
+                "FAKE_WATCHDOG_STOP_FINISHED_MARKER": os.fspath(
+                    watchdog_stop_finished
+                ),
+                "FAKE_WATCHDOG_STOP_STARTED_MARKER": os.fspath(
+                    watchdog_stop_started
+                ),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "5",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            process = subprocess.Popen(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 10.0
+            while (
+                time.monotonic() < deadline
+                and not fixture["capture"].is_file()
+                and process.poll() is None
+            ):
+                time.sleep(0.01)
+            if not fixture["capture"].is_file():
+                stdout, stderr = process.communicate(timeout=5.0)
+                self.fail(
+                    "fixture runtime never reached the controlled exit gate\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+
+            sonic_exit_gate.write_text("exit\n", encoding="utf-8")
+            deadline = time.monotonic() + 10.0
+            while (
+                time.monotonic() < deadline
+                and not watchdog_stop_started.is_file()
+                and process.poll() is None
+            ):
+                time.sleep(0.01)
+            if not watchdog_stop_started.is_file():
+                stdout, stderr = process.communicate(timeout=5.0)
+                self.fail(
+                    "fixture cleanup never entered the watchdog wait\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=10.0)
+
+            self.assertEqual(
+                process.returncode,
+                130,
+                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
+            )
+            self.assertNotIn(
+                "external-signal cleanup",
+                stderr,
+                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
+            )
+            self.assertIn(
+                "Deferred signal observed while cleanup was in progress",
+                stdout,
+            )
+            self.assertIn("Cleanup finished", stdout)
+            self.assertTrue(watchdog_stop_finished.is_file())
+
+    def test_repeated_sigint_preserves_supervised_ue_cleanup_barrier(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            cleanup_advanced = project / "cleanup-advanced.marker"
+            cleanup_arm = project / "cleanup.arm"
+            ue_stop_started = project / "ue-stop-started.marker"
+            ue_stop_finished = project / "ue-stop-finished.marker"
+            ue_stop_release = project / "ue-stop.release"
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "FAKE_PKILL_CLEANUP_ARM_FILE": os.fspath(cleanup_arm),
+                "FAKE_PKILL_CLEANUP_MARKER_FILE": os.fspath(cleanup_advanced),
+                "FAKE_SONIC_WAIT_FOR_TERM": "1",
+                "FAKE_UE_STOP_FINISHED_MARKER": os.fspath(ue_stop_finished),
+                "FAKE_UE_STOP_RELEASE_FILE": os.fspath(ue_stop_release),
+                "FAKE_UE_STOP_STARTED_MARKER": os.fspath(ue_stop_started),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "10",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            process = subprocess.Popen(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 10.0
+            while (
+                time.monotonic() < deadline
+                and not fixture["capture"].is_file()
+                and process.poll() is None
+            ):
+                time.sleep(0.01)
+            if not fixture["capture"].is_file():
+                stdout, stderr = process.communicate(timeout=5.0)
+                self.fail(
+                    "fixture runtime never became ready\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+
+            cleanup_arm.write_text("armed\n", encoding="utf-8")
+            process.send_signal(signal.SIGINT)
+            deadline = time.monotonic() + 10.0
+            while (
+                time.monotonic() < deadline
+                and not ue_stop_started.is_file()
+                and process.poll() is None
+            ):
+                time.sleep(0.01)
+            if not ue_stop_started.is_file():
+                stdout, stderr = process.communicate(timeout=5.0)
+                self.fail(
+                    "cleanup never entered the supervised UE wait\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+
+            process.send_signal(signal.SIGINT)
+            ordering_deadline = time.monotonic() + 0.5
+            while (
+                time.monotonic() < ordering_deadline
+                and not cleanup_advanced.is_file()
+                and process.poll() is None
+            ):
+                time.sleep(0.01)
+            cleanup_advanced_early = cleanup_advanced.is_file()
+            process_exited_early = process.poll() is not None
+            ue_stop_release.write_text("release\n", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=10.0)
+
+            self.assertFalse(
+                cleanup_advanced_early,
+                msg="cleanup advanced before the supervised UE was released",
+            )
+            self.assertFalse(
+                process_exited_early,
+                msg="launcher exited before the supervised UE was released",
+            )
+            self.assertEqual(
+                process.returncode,
+                130,
+                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
+            )
+            self.assertNotIn(
+                "external-signal cleanup",
+                stderr,
+                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
+            )
+            self.assertIn(
+                "Deferred signal observed while cleanup was in progress",
+                stdout,
+            )
+            self.assertIn("Cleanup finished", stdout)
+            self.assertTrue(ue_stop_finished.is_file())
+            self.assertTrue(cleanup_advanced.is_file())
 
     def test_restore_verification_failure_never_execs_next_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
