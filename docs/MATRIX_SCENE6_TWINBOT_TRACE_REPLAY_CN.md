@@ -57,7 +57,11 @@ scene；原来不存在的文件会恢复为不存在，原权限位也会恢复
 `recovered-*.json`，恢复失败则拒绝新回放。
 
 `run_sim.sh` 的 external replay 模式具有以下生命周期约束：UE 成功启动并度过 startup
-窗口、且本次 UE 日志出现 HouseWorld `LoadMap complete` 后才启动回放 child；它不启动 stock `robot_mujoco`、MC 或 SONIC；精确监督 replay
+窗口、且本次 UE 日志同时确认 HouseWorld `LoadMap complete`、MuJoCo 模型加载成功和
+UE 持有 UDP 9999 后才启动回放 child；external replay 会显式设置
+`use_custom_urdf=true`，让 scene6 custom robot 使用已纳入事务恢复的
+`model/custom/scene_terrain_custom.xml`。它不启动 stock
+`robot_mujoco`、MC 或 SONIC；精确监督 replay
 child 和 UE supervisor，任一异常退出都会结束另一侧并返回非零。不要手工同时设置
 `MATRIX_EXTERNAL_REPLAY=1` 与 `MATRIX_SONIC=1`。
 

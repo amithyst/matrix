@@ -525,6 +525,22 @@ class ShellIntegrationContractTest(unittest.TestCase):
             "LogGlobalStatus: LoadMap Load map complete {sys.argv[3]}", source
         )
         self.assertIn("|| $MATRIX_EXTERNAL_REPLAY_ENABLED", source)
+        self.assertIn(
+            'local ue_target="$ue_model_root/custom/scene_terrain_custom.xml"',
+            source,
+        )
+        self.assertIn('robot["use_custom_urdf"] = True', source)
+        self.assertIn(
+            'robot["custom_urdf"] = "custom/scene_terrain_custom.xml"',
+            source,
+        )
+        self.assertIn("模型加载成功，开始初始化传感器/网格/线程", source)
+        self.assertIn('print("model-failed")', source)
+        self.assertIn(
+            'XML_FILE="src/robot_mujoco/zsibot_robots/custom/current.xml"',
+            source,
+        )
+        self.assertIn("Staged Matrix replay robot XML not found", source)
 
     def test_recording_contract_uses_status_and_fixed_25_fps(self) -> None:
         source = (SCRIPTS / "record_matrix_scene6_task_video.sh").read_text(

@@ -544,8 +544,17 @@ if size < offset:
     raise SystemExit(0)
 with path.open("rb") as stream:
     stream.seek(offset)
-    current_run = stream.read().decode("utf-8", errors="replace")
+current_run = stream.read().decode("utf-8", errors="replace")
 map_ready = marker in current_run
+model_ready = (
+    "[MuJoCoSimulationRender] "
+    "模型加载成功，开始初始化传感器/网格/线程"
+) in current_run
+model_failed = "[MuJoCoSimulationRender][ERROR]" in current_run
+
+if model_failed:
+    print("model-failed")
+    raise SystemExit(0)
 
 socket_inodes = set()
 for protocol in ("udp", "udp6"):
@@ -580,8 +589,10 @@ for descriptor in descriptors:
     if match is not None:
         owned_socket_inodes.add(match.group(1))
 udp_ready = bool(socket_inodes & owned_socket_inodes)
-if map_ready and udp_ready:
+if map_ready and udp_ready and model_ready:
     print("ready")
+elif map_ready and udp_ready:
+    print("model-wait")
 elif map_ready:
     print("map-ready-udp-wait")
 elif udp_ready:
@@ -595,7 +606,12 @@ PY
                 echo "[INFO] Verified current-run UE map ready: $map_name"
                 return 0
                 ;;
-            missing-log|waiting|map-ready-udp-wait|udp-ready-map-wait)
+            missing-log|waiting|model-wait|map-ready-udp-wait|udp-ready-map-wait)
+                ;;
+            model-failed)
+                echo "[ERROR] UE reported a current-run MuJoCo model-load failure:" \
+                    "$ue_log" >&2
+                return 1
                 ;;
             udp-unreadable)
                 echo "[ERROR] Could not verify that UE owns UDP receiver 9999" >&2
@@ -1242,6 +1258,9 @@ if not isinstance(robot, dict):
 robot["robot_type"] = robot_type
 robot["weapon"] = weapon
 robot["mujoco_running"] = mujoco_running == "true"
+if robot_type == "custom":
+    robot["use_custom_urdf"] = True
+    robot["custom_urdf"] = "custom/scene_terrain_custom.xml"
 robot.setdefault("state_port", 25001)
 robot.setdefault("cmd_port", 25002)
 robot.setdefault("EgoView", True)
@@ -1378,12 +1397,21 @@ else
 fi
 
 if [[ "$ROBOTTYPE" == "custom" ]]; then
-    CUSTOM_MODEL_DIR="${CUSTOM_NAME:-custom}"
-    XML_FILE="src/robot_mujoco/zsibot_robots/custom/_cache/${CUSTOM_MODEL_DIR}/${CUSTOM_MODEL_DIR}.xml"
-    if [[ -f "$XML_FILE" ]]; then
-        echo "[INFO] Custom robot detected, skipping built-in XML position update for ${XML_FILE}"
+    if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
+        XML_FILE="src/robot_mujoco/zsibot_robots/custom/current.xml"
+        if [[ ! -f "$XML_FILE" ]]; then
+            echo "[ERROR] Staged Matrix replay robot XML not found: $XML_FILE" >&2
+            exit 1
+        fi
+        echo "[INFO] External replay staged custom robot detected: $XML_FILE"
     else
-        echo "[WARNING] Custom robot XML not found: $XML_FILE"
+        CUSTOM_MODEL_DIR="${CUSTOM_NAME:-custom}"
+        XML_FILE="src/robot_mujoco/zsibot_robots/custom/_cache/${CUSTOM_MODEL_DIR}/${CUSTOM_MODEL_DIR}.xml"
+        if [[ -f "$XML_FILE" ]]; then
+            echo "[INFO] Custom robot detected, skipping built-in XML position update for ${XML_FILE}"
+        else
+            echo "[WARNING] Custom robot XML not found: $XML_FILE"
+        fi
     fi
 else
     XML_FILE="src/robot_mujoco/zsibot_robots/${ROBOTTYPE}/${ROBOTTYPE}.xml"
