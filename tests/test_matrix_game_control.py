@@ -632,6 +632,44 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(moving.mode, "move")
         self.assertGreater(moving.speed_mps, 0.0)
 
+    def test_walk_curves_during_moderate_camera_body_mismatch(self) -> None:
+        core = armed_core(immediate_config())
+        camera_body_error = math.radians(53.0)
+        core.synchronize_heading(camera_body_error)
+        core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
+
+        entering = core.command(now_s=10.0, dt_s=0.1)
+        curving = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(entering.mode, "move")
+        self.assertEqual(entering.speed_mps, 0.1)
+        self.assertEqual(curving.mode, "move")
+        self.assertGreater(curving.speed_mps, 0.1)
+        self.assertLess(curving.speed_mps, 0.8)
+        self.assertEqual(curving.movement, curving.facing)
+
+        core.synchronize_heading(math.radians(10.0))
+        core.accept_snapshot(
+            snapshot(sequence=2, timestamp=10.01, pressed=("w",)),
+            received_at_s=10.01,
+        )
+        aligned = core.command(now_s=10.01, dt_s=0.1)
+        self.assertEqual(aligned.mode, "move")
+        self.assertEqual(aligned.locomotion_mode, MODULE.SONIC_WALK_MODE)
+        self.assertEqual(aligned.speed_mps, 0.8)
+
+    def test_walk_still_turns_in_place_for_large_camera_body_mismatch(self) -> None:
+        core = armed_core(immediate_config())
+        core.synchronize_heading(math.radians(70.0))
+        core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
+
+        turning = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(turning.mode, "turn")
+        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(turning.speed_mps, 0.0)
+        self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
+
     def test_mid_turn_retarget_waits_for_command_and_body_alignment(self) -> None:
         config = MODULE.ControlConfig(
             max_speed_mps=0.3,
@@ -847,8 +885,9 @@ class GameControlCoreTest(unittest.TestCase):
             core.command(now_s=10.0 + (index * 0.02), dt_s=0.02)
             for index in range(5)
         ]
-        self.assertTrue(all(command.speed_mps == 0.0 for command in starting[:4]))
-        self.assertAlmostEqual(starting[4].speed_mps, 0.1)
+        self.assertTrue(all(command.speed_mps == 0.0 for command in starting[:2]))
+        self.assertAlmostEqual(starting[2].speed_mps, 0.1)
+        self.assertTrue(all(command.speed_mps >= 0.1 for command in starting[2:]))
         after_entry = core.command(now_s=10.1, dt_s=0.02)
         self.assertAlmostEqual(after_entry.speed_mps - starting[4].speed_mps, 0.024)
 
@@ -873,7 +912,7 @@ class GameControlCoreTest(unittest.TestCase):
             )
         )
         core.accept_snapshot(
-            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
             received_at_s=10.0,
         )
         core.synchronize_heading(0.0)
@@ -891,7 +930,7 @@ class GameControlCoreTest(unittest.TestCase):
                     sequence=sequence,
                     timestamp=now,
                     pressed=("w",),
-                    speed_modifiers=("shift",),
+                    speed_modifiers=("ctrl",),
                 ),
                 received_at_s=now,
             )
@@ -909,7 +948,7 @@ class GameControlCoreTest(unittest.TestCase):
                 sequence=sequence,
                 timestamp=now,
                 pressed=("w",),
-                speed_modifiers=("shift",),
+                speed_modifiers=("ctrl",),
             ),
             received_at_s=now,
         )
@@ -924,7 +963,7 @@ class GameControlCoreTest(unittest.TestCase):
                     sequence=sequence,
                     timestamp=now,
                     pressed=("w",),
-                    speed_modifiers=("shift",),
+                    speed_modifiers=("ctrl",),
                 ),
                 received_at_s=now,
             )

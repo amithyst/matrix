@@ -23,6 +23,10 @@ Implemented behavior:
   and Shift map to SONIC modes 1, 2, and 3 respectively; a second tap of the
   same direction inside the configured window selects that tier's boost speed;
 - Q/E is excluded from locomotion yaw;
+- left/right arrows rotate UE camera yaw and up/down arrows rotate pitch through
+  the main provider's pre-enumerated uinput bridge;
+- ESC-open, UE-focus-loss, and missing-bridge frames disable arrow camera input;
+  bridge I/O is coalesced on a background thread outside the 50 Hz loop;
 - exact UE-PID focus loss, observed V safety-state toggles, camera drag, stale
   input, disconnect, and provider failure stop the robot;
 - native LowCmd must be fresh and the startup elastic band fully released
@@ -59,6 +63,7 @@ be claimed from this implementation.
 | Native gait intervals | mode 1: 0.10-0.80; mode 2: 0.80-2.50; mode 3: 2.50-7.50 m/s |
 | Acceleration / deceleration | 1.20 / 2.40 m/s² |
 | Maximum heading rate | 2.50 rad/s |
+| Arrow camera rate | Nominal 120 default; 30-360 in host-persisted ESC steps of 30; final velocity comes from UE final POV |
 | Translation heading gate | start within 15 degrees; stop beyond 30 degrees |
 | Turn before translation | native `IDLE + facing`; never `SLOW_WALK + speed=0` |
 | Left-stick radial deadzone | 0.15 |

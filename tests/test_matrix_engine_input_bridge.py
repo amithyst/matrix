@@ -17,6 +17,12 @@ import matrix_engine_input_bridge as MODULE  # noqa: E402
 
 
 class MatrixEngineInputBridgeTest(unittest.TestCase):
+    def test_status_capability_includes_immediate_camera_look(self) -> None:
+        self.assertEqual(
+            MODULE.SUPPORTED_ACTIONS,
+            ("status", "key", "mouse", "look_delta", "gamepad"),
+        )
+
     def test_linux_abi_struct_sizes_are_frozen(self) -> None:
         self.assertEqual(MODULE._UINPUT_SETUP.size, 92)
         self.assertEqual(MODULE._UINPUT_ABS_SETUP.size, 28)
@@ -83,6 +89,12 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
             }
         )
         self.assertEqual(key["modifiers"], ("shift",))
+        self.assertEqual(
+            MODULE._validate_look_delta(
+                {"dx": 20.4, "dy": -10.6, "button": "left"}
+            ),
+            {"dx": 20, "dy": -11, "button": "left"},
+        )
         gamepad = MODULE._validate_gamepad(
             {
                 "axes": {
@@ -116,6 +128,15 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
                     "tap_gap": 0.08,
                 }
             )
+        for payload in (
+            {"dx": 0, "dy": 0, "button": "left"},
+            {"dx": 1, "dy": 0, "button": None},
+            {"dx": 1, "dy": 0, "button": "left", "seconds": 0.02},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(
+                MODULE.EngineInputError
+            ):
+                MODULE._validate_look_delta(payload)
 
     def test_capability_requires_private_user_owned_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -143,6 +164,9 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
         controller._sleep = mock.Mock()
 
         controller.mouse(dx=20, dy=-5, button="left", seconds=0.08)
+        sleep_calls_before_look = controller._sleep.call_count
+        controller.look_delta(dx=-7, dy=9, button="left")
+        self.assertEqual(controller._sleep.call_count, sleep_calls_before_look)
         controller.key(
             key="w",
             modifiers=("shift",),
@@ -165,6 +189,8 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
         pointer.emit.assert_any_call(MODULE.EV_REL, MODULE.REL_X, 20)
         pointer.emit.assert_any_call(MODULE.EV_KEY, MODULE.BTN_LEFT, 1)
         pointer.emit.assert_any_call(MODULE.EV_KEY, MODULE.BTN_LEFT, 0)
+        pointer.emit.assert_any_call(MODULE.EV_REL, MODULE.REL_X, -7)
+        pointer.emit.assert_any_call(MODULE.EV_REL, MODULE.REL_Y, 9)
         pointer.emit.assert_any_call(MODULE.EV_KEY, MODULE.KEY_W, 1)
         pointer.emit.assert_any_call(MODULE.EV_KEY, MODULE.KEY_W, 0)
         self.assertEqual(
@@ -202,7 +228,7 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
         self.assertEqual(controller._pointer_pressed, set())
         self.assertEqual(controller._gamepad_pressed, set())
         self.assertTrue(all(value == 0 for value in controller._axis_values.values()))
-        self.assertEqual(controller.actions, 3)
+        self.assertEqual(controller.actions, 4)
 
 
 if __name__ == "__main__":

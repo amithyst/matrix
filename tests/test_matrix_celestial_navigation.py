@@ -26,13 +26,21 @@ class CelestialCatalogTest(unittest.TestCase):
         self.assertEqual(self.catalog.default_body_id, "earth")
         self.assertEqual(
             [body.runtime_status for body in self.catalog.bodies],
-            ["reference", "active", "planned", "planned"],
+            ["reference", "active", "active", "planned"],
         )
         self.assertEqual(self.catalog.frame, "sol_heliocentric_icrf")
         self.assertEqual(self.catalog.ephemeris_provider, "matrix-analytical-v1")
         self.assertEqual(
             [destination.teleport_tag for destination in self.catalog.destinations],
             ["home", "moon.tranquility", "mars.utopia"],
+        )
+        moon = self.catalog.destination("moon-tranquility-outpost")
+        self.assertIsNotNone(moon.launch_route)
+        assert moon.launch_route is not None
+        self.assertEqual(moon.launch_route.scene_id, 15)
+        self.assertEqual(
+            moon.launch_route.world_id,
+            "g1_29dof:scene_terrain_moon_dynamic",
         )
 
     def test_dynamic_inertial_coordinates_never_replace_local_physics_pose(self) -> None:
@@ -124,7 +132,13 @@ class CelestialCatalogTest(unittest.TestCase):
                         "position": [160.0, 117.0, 1.2],
                         "yaw_rad": 0.0,
                     },
-                    {"tag": "moon.tranquility", "found": False},
+                    {
+                        "tag": "moon.tranquility",
+                        "found": True,
+                        "entity_id": "tp-" + "b" * 32,
+                        "position": [0.0, 0.0, -0.1366965003013611],
+                        "yaw_rad": 0.0,
+                    },
                     {"tag": "mars.utopia", "found": False},
                 ],
             },
@@ -147,10 +161,41 @@ class CelestialCatalogTest(unittest.TestCase):
         self.assertEqual(mapping["version"], 2)
         self.assertEqual(mapping["simulation_time"]["scenario_utc"], "2080-01-01T00:00:00Z")
         self.assertEqual(mapping["lighting"]["render_authority"], "state-only")
-        self.assertEqual(moon["status"], "world_unavailable")
+        self.assertEqual(moon["status"], "ready")
         self.assertEqual(mars["status"], "world_unavailable")
-        self.assertFalse(moon["enabled"])
+        self.assertTrue(moon["enabled"])
         self.assertFalse(mars["enabled"])
+        self.assertEqual(moon["local_position_m"], [0.0, 0.0, -0.1366965003013611])
+
+        missing_route = MODULE.probes_from_response(
+            {
+                "world_id": "town10:test",
+                "teleport_points": [
+                    {
+                        "tag": "home",
+                        "found": True,
+                        "entity_id": "tp-" + "a" * 32,
+                        "position": [160.0, 117.0, 1.2],
+                        "yaw_rad": 0.0,
+                    },
+                    {"tag": "moon.tranquility", "found": False},
+                    {"tag": "mars.utopia", "found": False},
+                ],
+            },
+            catalog=self.catalog,
+        )
+        missing_mapping = self.catalog.navigation_mapping(
+            missing_route,
+            command_available=True,
+            in_flight=False,
+            restart_required=False,
+            outcome_unknown=False,
+        )
+        self.assertEqual(
+            missing_mapping["destinations"][1]["status"],
+            "undiscovered",
+        )
+        self.assertFalse(missing_mapping["destinations"][1]["enabled"])
 
         unavailable = self.catalog.navigation_mapping(
             {},

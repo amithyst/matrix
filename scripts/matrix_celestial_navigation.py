@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -154,6 +155,42 @@ class CelestialDestination:
     display_name: str
     teleport_tag: str
     surface_anchor: SurfaceAnchor
+    launch_route: "CelestialLaunchRoute | None" = None
+
+
+@dataclass(frozen=True)
+class CelestialLaunchRoute:
+    scene_id: int
+    world_id: str
+    entry_pose: WorldPose
+    required_assets: tuple[str, ...]
+
+    def missing_assets(self, project_root: Path) -> tuple[str, ...]:
+        """Return catalog-relative assets that are not installed locally."""
+
+        root = Path(project_root)
+        return tuple(
+            relative
+            for relative in self.required_assets
+            if not (root / relative).is_file()
+        )
+
+    def synthetic_entity_id(self, *, destination_id: str, teleport_tag: str) -> str:
+        digest = hashlib.sha256(
+            f"{destination_id}\0{teleport_tag}\0{self.scene_id}".encode("utf-8")
+        ).hexdigest()
+        return f"tp-{digest[:32]}"
+
+    def to_mapping(self, *, destination_id: str, teleport_tag: str) -> dict[str, object]:
+        return {
+            "schema": "matrix-celestial-launch-route/v1",
+            "destination_id": destination_id,
+            "teleport_tag": teleport_tag,
+            "target_scene_id": self.scene_id,
+            "target_world_id": self.world_id,
+            "entry_pose": self.entry_pose.to_mapping(),
+            "required_assets": list(self.required_assets),
+        }
 
 
 @dataclass(frozen=True)
@@ -589,6 +626,64 @@ def _parse_surface_anchor(value: object, *, label: str) -> SurfaceAnchor:
         raise CelestialNavigationError(str(exc)) from exc
 
 
+def _parse_launch_route(value: object, *, label: str) -> CelestialLaunchRoute | None:
+    if value is None:
+        return None
+    expected = {
+        "schema",
+        "target_scene_id",
+        "target_world_id",
+        "entry_pose",
+        "required_assets",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CelestialNavigationError(f"{label} has an invalid schema")
+    if value.get("schema") != "matrix-celestial-launch-route/v1":
+        raise CelestialNavigationError(f"{label}.schema is unsupported")
+    scene_id = _bounded_integer(
+        value.get("target_scene_id"),
+        label=f"{label}.target_scene_id",
+        minimum=0,
+        maximum=99,
+    )
+    try:
+        world_id = validate_world_id(value.get("target_world_id"))
+        entry_pose = WorldPose.from_mapping(
+            value.get("entry_pose"),
+            label=f"{label}.entry_pose",
+        )
+    except WorldStateError as exc:
+        raise CelestialNavigationError(str(exc)) from exc
+    raw_assets = value.get("required_assets")
+    if not isinstance(raw_assets, list) or not 1 <= len(raw_assets) <= 8:
+        raise CelestialNavigationError(f"{label}.required_assets is invalid")
+    assets: list[str] = []
+    for index, asset in enumerate(raw_assets):
+        relative = _bounded_text(
+            asset,
+            label=f"{label}.required_assets[{index}]",
+            maximum=160,
+        )
+        asset_path = Path(relative)
+        if (
+            asset_path.is_absolute()
+            or not asset_path.parts
+            or any(part in {"", ".", ".."} for part in asset_path.parts)
+        ):
+            raise CelestialNavigationError(
+                f"{label}.required_assets[{index}] must be a safe relative path"
+            )
+        assets.append(relative)
+    if len(assets) != len(set(assets)):
+        raise CelestialNavigationError(f"{label}.required_assets must be unique")
+    return CelestialLaunchRoute(
+        scene_id=scene_id,
+        world_id=world_id,
+        entry_pose=entry_pose,
+        required_assets=tuple(assets),
+    )
+
+
 def load_catalog(
     path: Path = DEFAULT_CATALOG_PATH,
     *,
@@ -811,16 +906,29 @@ def load_catalog(
     ):
         raise CelestialNavigationError("celestial destinations collection is invalid")
     destinations: list[CelestialDestination] = []
+    base_destination_fields = {
+        "id",
+        "body_id",
+        "display_name",
+        "teleport_tag",
+        "surface_anchor",
+    }
+    routed_destination_fields = base_destination_fields | {"launch_route"}
     for index, value in enumerate(raw_destinations):
-        if not isinstance(value, dict) or set(value) != {
-            "id",
-            "body_id",
-            "display_name",
-            "teleport_tag",
-            "surface_anchor",
+        fields = frozenset(value) if isinstance(value, dict) else frozenset()
+        if not isinstance(value, dict) or fields not in {
+            frozenset(base_destination_fields),
+            frozenset(routed_destination_fields),
         }:
             raise CelestialNavigationError(
                 f"destinations[{index}] has an invalid schema"
+            )
+        if fields == base_destination_fields:
+            launch_route = None
+        else:
+            launch_route = _parse_launch_route(
+                value.get("launch_route"),
+                label=f"destinations[{index}].launch_route",
             )
         body_id = _safe_id(
             value.get("body_id"), label=f"destinations[{index}].body_id"
@@ -852,6 +960,7 @@ def load_catalog(
                     value.get("surface_anchor"),
                     label=f"destinations[{index}].surface_anchor",
                 ),
+                launch_route=launch_route,
             )
         )
     destination_ids = [destination.destination_id for destination in destinations]
@@ -1003,6 +1112,7 @@ __all__ = [
     "CATALOG_SCHEMA",
     "CelestialCatalog",
     "CelestialDestination",
+    "CelestialLaunchRoute",
     "CelestialNavigationError",
     "DEFAULT_CATALOG_PATH",
     "DEFAULT_ASSET_MANIFEST_PATH",

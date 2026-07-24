@@ -123,6 +123,27 @@ class MouseSettingsFileTest(unittest.TestCase):
             self.assertEqual(loaded.settings, settings)
             self.assertEqual(loaded.settings.effective_scale, 0.01)
 
+    def test_default_path_is_host_scoped_and_legacy_file_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = MODULE.default_settings_file("trna", config_home=root)
+            self.assertEqual(
+                target,
+                root / "matrix/hosts/trna/mouse-control.json",
+            )
+            legacy = MODULE.legacy_settings_file(config_home=root)
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                '{"version":1,"profile":"remote","speed_scale":0.4}',
+                encoding="utf-8",
+            )
+
+            loaded = MODULE.load_settings_with_legacy_fallback(target)
+
+            self.assertEqual(loaded.status, "loaded_legacy")
+            self.assertEqual(loaded.settings.profile, "remote")
+            self.assertEqual(loaded.settings.effective_scale, 0.4)
+
 
 if __name__ == "__main__":
     unittest.main()

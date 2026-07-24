@@ -34,6 +34,7 @@ MAX_SECONDS = 10.0
 MAX_MOUSE_DELTA = 4096
 MOUSE_PRESS_LEAD_SECONDS = 0.02
 _CAPABILITY_RE = re.compile(r"[0-9a-f]{64}\Z")
+SUPPORTED_ACTIONS = ("status", "key", "mouse", "look_delta", "gamepad")
 
 _UINPUT_TYPE = ord("U")
 _IOC_WRITE = 1
@@ -448,6 +449,29 @@ class EngineInputController:
                 self._pointer_device.sync()
         self.actions += 1
 
+    def look_delta(
+        self,
+        *,
+        dx: int,
+        dy: int,
+        button: str,
+    ) -> None:
+        """Emit one ordered look-button drag without sleeping the caller."""
+
+        code = MOUSE_BUTTON_CODES[button]
+        try:
+            self._pointer_key(code, True)
+            self._pointer_device.sync()
+            if dx:
+                self._pointer_device.emit(EV_REL, REL_X, dx)
+            if dy:
+                self._pointer_device.emit(EV_REL, REL_Y, dy)
+            self._pointer_device.sync()
+        finally:
+            self._pointer_key(code, False)
+            self._pointer_device.sync()
+        self.actions += 1
+
     def key(
         self,
         *,
@@ -546,6 +570,30 @@ def _validate_mouse(payload: dict[str, object]) -> dict[str, object]:
         "button": button,
         "seconds": seconds,
     }
+
+
+def _validate_look_delta(payload: dict[str, object]) -> dict[str, object]:
+    _exact(payload, {"dx", "dy", "button"})
+    dx_number = _finite(
+        payload["dx"],
+        name="dx",
+        minimum=-MAX_MOUSE_DELTA,
+        maximum=MAX_MOUSE_DELTA,
+    )
+    dy_number = _finite(
+        payload["dy"],
+        name="dy",
+        minimum=-MAX_MOUSE_DELTA,
+        maximum=MAX_MOUSE_DELTA,
+    )
+    dx = int(round(dx_number))
+    dy = int(round(dy_number))
+    if dx == 0 and dy == 0:
+        raise EngineInputError("E_VALUE", "look delta must not be zero")
+    button = payload["button"]
+    if not isinstance(button, str) or button not in MOUSE_BUTTON_CODES:
+        raise EngineInputError("E_VALUE", "look button is invalid")
+    return {"dx": dx, "dy": dy, "button": button}
 
 
 def _validate_key(payload: dict[str, object]) -> dict[str, object]:
@@ -833,6 +881,7 @@ def main() -> int:
                             "rejected_peers": rejected_peers,
                             "pointer_device": "Matrix Engine Pointer Keyboard",
                             "gamepad_device": "Matrix Engine Gamepad",
+                            "supported_actions": list(SUPPORTED_ACTIONS),
                         }
                         result = _response(
                             sequence=sequence,
@@ -849,6 +898,15 @@ def main() -> int:
                             ok=True,
                             code="OK_MOUSE",
                             message="engine mouse input completed",
+                        )
+                    elif action == "look_delta":
+                        values = _validate_look_delta(payload)
+                        controller.look_delta(**values)
+                        result = _response(
+                            sequence=sequence,
+                            ok=True,
+                            code="OK_LOOK_DELTA",
+                            message="engine camera look delta completed",
                         )
                     elif action == "key":
                         values = _validate_key(payload)

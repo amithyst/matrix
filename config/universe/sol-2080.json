@@ -86,7 +86,7 @@
       "ellipsoid_radii_m": [1737400.0, 1737400.0, 1737400.0],
       "gravity_m_s2": 1.62,
       "atmosphere": "vacuum",
-      "runtime_status": "planned",
+      "runtime_status": "active",
       "rotation": {
         "model": "iau-uniform-v1",
         "pole_right_ascension_deg": 269.9949,
@@ -175,6 +175,20 @@
         "longitude_deg": 23.47297,
         "altitude_m": 0.0,
         "heading_deg": 0.0
+      },
+      "launch_route": {
+        "schema": "matrix-celestial-launch-route/v1",
+        "target_scene_id": 15,
+        "target_world_id": "g1_29dof:scene_terrain_moon_dynamic",
+        "entry_pose": {
+          "position": [0.0, 0.0, -0.1366965003013611],
+          "yaw_rad": 0.0
+        },
+        "required_assets": [
+          "releases/MoonWorld-0.1.2.tar.gz",
+          "dynamicmaps/moonworld.bin",
+          "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_moon_dynamic.xml"
+        ]
       }
     },
     {

@@ -814,7 +814,38 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertEqual(inventory["spawn_count"], 1)
         self.assertEqual(inventory["items"][0]["remaining"], 7)
 
-    def test_celestial_refresh_discovers_home_and_blocks_planned_worlds(self) -> None:
+    def test_disabled_creative_inventory_never_sends_or_decrements(self) -> None:
+        disabled = self.creative_inventory()
+        disabled["available"] = False
+        disabled["unavailable_reason"] = (
+            "packaged_ue_creative_prop_consumer_missing"
+        )
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            initial_creative_inventory=disabled,
+        )
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertFalse(
+            client.spawn_creative_item(
+                "training_blaster",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+        self.assertEqual(client.code, "E_INVENTORY_UNAVAILABLE")
+        inventory = client.creative_inventory_mapping()
+        self.assertEqual(inventory["spawn_count"], 0)
+        self.assertEqual(inventory["items"][0]["remaining"], 8)
+
+    def test_celestial_refresh_discovers_home_and_routes_active_moon(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
         client = MODULE.GameCommandClient(
@@ -870,7 +901,13 @@ class GameCommandClientTest(unittest.TestCase):
                                 "position": [160.0, 117.0, 1.2],
                                 "yaw_rad": 0.0,
                             },
-                            {"tag": "moon.tranquility", "found": False},
+                            {
+                                "tag": "moon.tranquility",
+                                "found": True,
+                                "entity_id": "tp-" + "c" * 32,
+                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "yaw_rad": 0.0,
+                            },
                             {"tag": "mars.utopia", "found": False},
                         ],
                     },
@@ -887,9 +924,9 @@ class GameCommandClientTest(unittest.TestCase):
         earth, moon, mars = navigation["destinations"]
         self.assertEqual(earth["status"], "ready")
         self.assertTrue(earth["enabled"])
-        self.assertEqual(moon["status"], "world_unavailable")
+        self.assertEqual(moon["status"], "ready")
         self.assertEqual(mars["status"], "world_unavailable")
-        self.assertFalse(
+        self.assertTrue(
             client.select_celestial_destination(
                 "moon-tranquility-outpost",
                 calibration_active=True,
@@ -897,9 +934,43 @@ class GameCommandClientTest(unittest.TestCase):
                 restart_requested=False,
             )
         )
-        self.assertEqual(client.code, "E_WORLD_UNAVAILABLE")
+        moon_teleport = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            moon_teleport.command,
+            MC_COMMANDS.TeleportSelector("moon.tranquility"),
+        )
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=moon_teleport.session,
+                    sequence=moon_teleport.sequence,
+                    request_id=moon_teleport.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_ROUTE_RESTART",
+                    message="Routing to MoonWorld",
+                    restart_required=True,
+                    data={
+                        "launch_route": {
+                            "schema": "matrix-celestial-launch-route/v1",
+                            "destination_id": "moon-tranquility-outpost",
+                            "teleport_tag": "moon.tranquility",
+                            "target_scene_id": 15,
+                            "target_world_id": "g1_29dof:scene_terrain_moon_dynamic",
+                            "entry_pose": {
+                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "yaw_rad": 0.0,
+                            },
+                            "entity_id": "tp-" + "d" * 32,
+                        }
+                    },
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertTrue(client.restart_required)
+        self.assertEqual(client.code, "OK_TELEPORT_ROUTE_RESTART")
 
-        self.assertTrue(
+        self.assertFalse(
             client.select_celestial_destination(
                 "earth-overworld-home",
                 calibration_active=True,
@@ -907,33 +978,7 @@ class GameCommandClientTest(unittest.TestCase):
                 restart_requested=False,
             )
         )
-        teleport = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(teleport.command, MC_COMMANDS.TeleportSelector("home"))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=teleport.session,
-                    sequence=teleport.sequence,
-                    request_id=teleport.request_id,
-                    ok=True,
-                    code="OK_TELEPORT_RESTART",
-                    message="Teleporting home",
-                    restart_required=True,
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertTrue(client.restart_required)
-        self.assertFalse(
-            client.select_celestial_destination(
-                "moon-tranquility-outpost",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertTrue(client.restart_required)
-        self.assertEqual(client.code, "OK_TELEPORT_RESTART")
+        self.assertEqual(client.code, "OK_TELEPORT_ROUTE_RESTART")
 
     def test_final_celestial_mapping_precedes_provider_resource_close(self) -> None:
         class LightingBridge:
@@ -1902,6 +1947,11 @@ class ExternalControlArbitrationTest(unittest.TestCase):
             ),
             (
                 MODULE.KeyboardMouseSample(focused=True, w=True),
+                pad,
+                "physical_keyboard",
+            ),
+            (
+                MODULE.KeyboardMouseSample(focused=True, arrow_right=True),
                 pad,
                 "physical_keyboard",
             ),
@@ -3943,9 +3993,9 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             self.assertFalse(keyboard_step(slower=True))
             self.assertFalse(panel.apply_panel_action("speed_down", active=True))
 
-    def test_ui_font_scale_click_persists_and_restores(self) -> None:
+    def test_ui_font_size_click_and_slider_persist_and_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "config/matrix/ui-settings.json"
+            path = Path(temporary) / "config/matrix/hosts/trna/ui-settings.json"
             controller = MODULE.UiSettingsController(
                 path=path,
                 desired=MODULE.UiSettings(),
@@ -3956,15 +4006,23 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
                 controller.apply_panel_action("font_up", active=False)
             )
             self.assertTrue(controller.apply_panel_action("font_up", active=True))
-            self.assertEqual(controller.desired.font_scale, 1.1)
+            self.assertEqual(controller.desired.font_scale, 1.0)
+            self.assertEqual(controller.desired.font_size, 14)
+            self.assertTrue(controller.apply_font_size(20, active=True))
+            self.assertEqual(controller.desired.font_size, 20)
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
-                {"font_scale": 1.1, "version": 1},
+                {
+                    "font_scale": 1.0,
+                    "font_size": 20,
+                    "version": 2,
+                },
             )
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             restored = MODULE.load_ui_settings(path)
             self.assertEqual(restored.status, "loaded")
-            self.assertEqual(restored.settings.font_scale, 1.1)
+            self.assertEqual(restored.settings.font_scale, 1.0)
+            self.assertEqual(restored.settings.font_size, 20)
 
     @staticmethod
     def requester(*, available: bool = True, succeeds: bool = True):
@@ -4399,6 +4457,228 @@ class CameraYawTrackerTest(unittest.TestCase):
             final_pov["button_gate_truth_scope"],
             "xquerypointer_core_level_or_xi2_raw_button_edges",
         )
+
+
+class KeyboardCameraLookTest(unittest.TestCase):
+    def test_arrow_hold_maps_to_yaw_pitch_and_caps_stalled_frames(self) -> None:
+        integrator = MODULE.KeyboardCameraLookIntegrator()
+        sample = MODULE.KeyboardMouseSample(
+            arrow_up=True,
+            arrow_right=True,
+            focused=True,
+        )
+        self.assertEqual(
+            integrator.update(
+                sample,
+                dt=0.02,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=True,
+            ),
+            (20, -20),
+        )
+        self.assertEqual(
+            integrator.update(
+                sample,
+                dt=1.0,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=True,
+            ),
+            (50, -50),
+        )
+        self.assertEqual(
+            integrator.update(
+                sample,
+                dt=0.0,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=True,
+            ),
+            (0, 0),
+        )
+
+    def test_escape_interlock_neutralizes_arrows_and_residuals(self) -> None:
+        keyboard, _pad = MODULE.apply_calibration_interlock(
+            MODULE.KeyboardMouseSample(
+                arrow_left=True,
+                arrow_down=True,
+                focused=True,
+            ),
+            MODULE.GamepadSample(),
+            active=True,
+        )
+        self.assertFalse(keyboard.arrow_left)
+        self.assertFalse(keyboard.arrow_down)
+        integrator = MODULE.KeyboardCameraLookIntegrator()
+        self.assertEqual(
+            integrator.update(
+                keyboard,
+                dt=0.02,
+                rate_deg_s=120.0,
+                degrees_per_pixel=0.12,
+                enabled=False,
+            ),
+            (0, 0),
+        )
+
+    def test_arrow_release_and_opposing_keys_are_inactive(self) -> None:
+        self.assertTrue(
+            MODULE.keyboard_camera_arrow_active(
+                MODULE.KeyboardMouseSample(arrow_left=True, focused=True)
+            )
+        )
+        for sample in (
+            MODULE.KeyboardMouseSample(focused=True),
+            MODULE.KeyboardMouseSample(
+                arrow_left=True,
+                arrow_right=True,
+                focused=True,
+            ),
+            MODULE.KeyboardMouseSample(
+                arrow_up=True,
+                arrow_down=True,
+                focused=True,
+            ),
+        ):
+            with self.subTest(sample=sample):
+                self.assertFalse(MODULE.keyboard_camera_arrow_active(sample))
+
+    def test_background_worker_emits_actual_bridge_action(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                return None
+
+            def request(self, action, payload):
+                calls.append((action, payload))
+                return {
+                    "ok": True,
+                    "data": {
+                        "supported_actions": ["status", "look_delta"],
+                    },
+                }
+
+            def close(self):
+                return None
+
+        worker = MODULE.EngineCameraLookWorker(
+            Path("/tmp/engine.sock"),
+            Path("/tmp/engine.cap"),
+            button="left",
+            client_factory=Client,
+        )
+        worker.start()
+        self.addCleanup(worker.close)
+        deadline = time.monotonic() + 1.0
+        while not worker.telemetry["available"] and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(worker.telemetry["available"])
+        self.assertTrue(worker.submit(18, -6))
+        while worker.telemetry["emitted_batches"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertIn(
+            (
+                "look_delta",
+                {"dx": 18, "dy": -6, "button": "left"},
+            ),
+            calls,
+        )
+        with worker._condition:
+            worker._pending_dx = 4
+            worker._pending_dy = 2
+        self.assertTrue(worker.cancel_pending())
+        self.assertEqual(worker.telemetry["pending_dx"], 0)
+        self.assertEqual(worker.telemetry["pending_dy"], 0)
+
+    def test_unavailable_bridge_drops_input_without_blocking_provider(self) -> None:
+        class FailingClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                raise FileNotFoundError("bridge missing")
+
+            def close(self):
+                return None
+
+        worker = MODULE.EngineCameraLookWorker(
+            Path("/tmp/missing.sock"),
+            Path("/tmp/missing.cap"),
+            button="left",
+            client_factory=FailingClient,
+        )
+        worker.start()
+        self.addCleanup(worker.close)
+        deadline = time.monotonic() + 1.0
+        while worker.telemetry["status"] == "probing" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        started = time.monotonic()
+        self.assertFalse(worker.submit(10, 0))
+        self.assertLess(time.monotonic() - started, 0.02)
+        telemetry = worker.telemetry
+        self.assertFalse(telemetry["available"])
+        self.assertIn("bridge missing", telemetry["last_error"])
+
+    def test_bridge_without_look_capability_is_not_reported_available(self) -> None:
+        class LegacyClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                return None
+
+            def request(self, _action, _payload):
+                return {"data": {"supported_actions": ["status", "mouse"]}}
+
+            def close(self):
+                return None
+
+        worker = MODULE.EngineCameraLookWorker(
+            Path("/tmp/legacy.sock"),
+            Path("/tmp/legacy.cap"),
+            button="left",
+            client_factory=LegacyClient,
+        )
+        worker.start()
+        self.addCleanup(worker.close)
+        deadline = time.monotonic() + 1.0
+        while worker.telemetry["status"] == "probing" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        telemetry = worker.telemetry
+        self.assertFalse(telemetry["available"])
+        self.assertFalse(telemetry["capability_compatible"])
+        self.assertEqual(telemetry["status"], "unsupported")
+        self.assertIn("does not advertise look_delta", telemetry["last_error"])
+        worker._retry_not_before = 0.0
+        self.assertFalse(worker.submit(10, 0))
+
+    def test_disabled_bridge_telemetry_is_honest(self) -> None:
+        telemetry = MODULE.keyboard_camera_telemetry(
+            None,
+            MODULE.KeyboardCameraLookIntegrator(),
+            MOTION_SETTINGS.MotionSettings(),
+        )
+        self.assertFalse(telemetry["configured"])
+        self.assertFalse(telemetry["available"])
+        self.assertEqual(telemetry["rate_deg_s"], 120.0)
+        self.assertEqual(
+            telemetry["rate_scope"],
+            "nominal_input_rate_not_final_pov_angular_velocity",
+        )
+        missing_arrows = MODULE.keyboard_camera_telemetry(
+            None,
+            MODULE.KeyboardCameraLookIntegrator(),
+            MOTION_SETTINGS.MotionSettings(),
+            arrow_keys_available=False,
+        )
+        self.assertFalse(missing_arrows["available"])
+        self.assertFalse(missing_arrows["arrow_keys_available"])
+        self.assertIn("missing", missing_arrows["last_error"])
 
 
 class CarlaSpectatorCameraTest(unittest.TestCase):
@@ -5429,6 +5709,36 @@ class XInput2RawMotionTest(unittest.TestCase):
 
 
 class X11KeyboardMouseSafetyTest(unittest.TestCase):
+    def test_arrow_keysyms_match_x11_standard_values(self) -> None:
+        self.assertEqual(
+            {
+                name: MODULE.X11KeyboardMouse._KEYSYMS[name]
+                for name in (
+                    "arrow_left",
+                    "arrow_up",
+                    "arrow_right",
+                    "arrow_down",
+                )
+            },
+            {
+                "arrow_left": 0xFF51,
+                "arrow_up": 0xFF52,
+                "arrow_right": 0xFF53,
+                "arrow_down": 0xFF54,
+            },
+        )
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._keycodes = {}
+        self.assertFalse(backend.arrow_keys_available)
+        backend._keycodes = {
+            name: index
+            for index, name in enumerate(
+                MODULE.X11KeyboardMouse._ARROW_KEY_NAMES,
+                start=1,
+            )
+        }
+        self.assertTrue(backend.arrow_keys_available)
+
     class AsyncFocusX11:
         """Deliver one queued X error only when the backend calls XSync."""
 
@@ -6243,6 +6553,7 @@ class ProviderCleanupTest(unittest.TestCase):
         x11 = resource("x11")
         publisher = resource("publisher")
         external = resource("external")
+        engine_camera = resource("engine_camera")
         restored: list[int] = []
 
         def restore(signum: int, _handler: object) -> None:
@@ -6266,6 +6577,7 @@ class ProviderCleanupTest(unittest.TestCase):
                 x11=x11,
                 publisher=publisher,
                 external_control=external,
+                engine_camera_worker=engine_camera,
                 previous_handlers={
                     signal.SIGINT: object(),
                     signal.SIGTERM: object(),
@@ -6273,7 +6585,7 @@ class ProviderCleanupTest(unittest.TestCase):
             )
             cleanup.run("status_write", failing_step("status"))
 
-        for owned in (gamepad, overlay, x11, publisher, external):
+        for owned in (gamepad, overlay, x11, publisher, external, engine_camera):
             owned.close.assert_called_once_with()
         self.assertEqual(restored, [signal.SIGINT, signal.SIGTERM])
         self.assertEqual(
@@ -6298,6 +6610,7 @@ class ProviderCleanupTest(unittest.TestCase):
             [
                 "release",
                 "receipt",
+                "engine_camera",
                 "gamepad",
                 "overlay",
                 "x11",
@@ -6490,6 +6803,37 @@ class UnixSeqpacketPublisherTest(unittest.TestCase):
 
 
 class CameraYawSourceCliTest(unittest.TestCase):
+    def test_provider_inherits_complete_engine_camera_bridge_paths(self) -> None:
+        environment = {
+            "MATRIX_ENGINE_INPUT_SOCKET": "/run/user/1000/engine.sock",
+            "MATRIX_ENGINE_INPUT_CAPABILITY_FILE": "/run/user/1000/engine.cap",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+            os.sys,
+            "argv",
+            ["matrix_game_control_input.py", "--dry-run"],
+        ):
+            args = MODULE._parse_args()
+        MODULE._validate_args(args)
+        self.assertEqual(args.engine_input_socket, Path(environment["MATRIX_ENGINE_INPUT_SOCKET"]))
+        self.assertEqual(
+            args.engine_input_capability_file,
+            Path(environment["MATRIX_ENGINE_INPUT_CAPABILITY_FILE"]),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"MATRIX_ENGINE_INPUT_SOCKET": "/run/user/1000/engine.sock"},
+            clear=True,
+        ), mock.patch.object(
+            os.sys,
+            "argv",
+            ["matrix_game_control_input.py", "--dry-run"],
+        ):
+            incomplete = MODULE._parse_args()
+        with self.assertRaisesRegex(SystemExit, "supplied together"):
+            MODULE._validate_args(incomplete)
+
     def test_provider_parser_accepts_an_open_game_command_fd(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
