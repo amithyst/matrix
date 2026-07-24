@@ -354,6 +354,7 @@ robot_needs_mc() {
 motion_controller_is_disabled() {
     local disabled="${MATRIX_DISABLE_MC:-0}"
     local sonic="${MATRIX_SONIC:-0}"
+    local external_replay="${MATRIX_EXTERNAL_REPLAY:-0}"
     case "${disabled,,}" in
         1|true|yes|on)
             return 0
@@ -366,13 +367,32 @@ motion_controller_is_disabled() {
             return 0
             ;;
     esac
+    case "${external_replay,,}" in
+        1|true|yes|on)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+external_replay_is_enabled() {
+    local value="${MATRIX_EXTERNAL_REPLAY:-0}"
+    case "${value,,}" in
+        1|true|yes|on)
+            return 0
+            ;;
+    esac
     return 1
 }
 
 check_runtime_env() {
     echo "[INFO] Checking MATRiX runtime environment"
     check_common_commands
-    require_cmd jq "sudo apt install -y jq"
+    if external_replay_is_enabled; then
+        require_cmd python3 "sudo apt install -y python3"
+    else
+        require_cmd jq "sudo apt install -y jq"
+    fi
     require_cmd pkill "sudo apt install -y procps"
     require_cmd taskset "sudo apt install -y util-linux"
 

@@ -21,6 +21,7 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 MATRIX_DISABLE_MC="${MATRIX_DISABLE_MC:-0}"
 MATRIX_SONIC="${MATRIX_SONIC:-0}"
+MATRIX_EXTERNAL_REPLAY="${MATRIX_EXTERNAL_REPLAY:-0}"
 MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
 MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
@@ -72,6 +73,13 @@ join_ld_library_path() {
 }
 
 setup_runtime_environment() {
+    case "${MATRIX_EXTERNAL_REPLAY,,}" in
+        1|true|yes|on)
+            # Trace replay owns only the loopback render-state publisher.  It
+            # does not use the legacy ROS/MuJoCo process environment.
+            return
+            ;;
+    esac
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # The native SONIC launcher already constructed and verified the
@@ -133,6 +141,13 @@ run_env_check() {
     fi
 
     local checked_mujoco="$MUJOCORUNNING"
+    case "${MATRIX_EXTERNAL_REPLAY,,}" in
+        1|true|yes|on)
+            # The accepted trace was executed by TwinBot's offline MuJoCo
+            # world. Matrix only launches UE and replays recorded state.
+            checked_mujoco=0
+            ;;
+    esac
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # SONIC owns the external MuJoCo process. The bundled robot_mujoco
@@ -178,6 +193,7 @@ PIDS=()
 WATCHDOG_PID=""
 FORCED_CLEANUP_PID=""
 SONIC_PID=""
+TRACE_REPLAY_PID=""
 UE_PID=""
 UE_SUPERVISOR_PID=""
 UE_SUPERVISOR_REAPED=0
@@ -480,6 +496,126 @@ PY
             return 1
             ;;
     esac
+}
+
+wait_for_ue_map_ready() {
+    local ue_log="$1"
+    local start_offset="$2"
+    local map_name="$3"
+    local timeout="${MATRIX_UE_MAP_READY_TIMEOUT_SECONDS:-120}"
+    if [[ ! "$timeout" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "[ERROR] MATRIX_UE_MAP_READY_TIMEOUT_SECONDS must be positive" >&2
+        return 1
+    fi
+    local attempts
+    attempts="$(/usr/bin/python3 -I - "$timeout" <<'PY'
+import math
+import sys
+
+timeout = float(sys.argv[1])
+if not math.isfinite(timeout) or timeout <= 0.0:
+    raise SystemExit("map-ready timeout must be positive and finite")
+print(max(1, math.ceil(timeout / 0.1) + 1))
+PY
+)" || return 1
+    local attempt
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        if [[ -e "$UE_FAILURE_FILE" ]] || ! kill -0 "$UE_PID" 2>/dev/null; then
+            echo "[ERROR] UE exited before its current-run map-ready marker" >&2
+            return 1
+        fi
+        local status
+        status="$(/usr/bin/python3 -I - \
+            "$ue_log" "$start_offset" "$map_name" "$UE_PID" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+offset = int(sys.argv[2])
+marker = f"LogGlobalStatus: LoadMap Load map complete {sys.argv[3]}"
+ue_pid = int(sys.argv[4])
+if not path.is_file():
+    print("missing-log")
+    raise SystemExit(0)
+size = path.stat().st_size
+if size < offset:
+    print("truncated")
+    raise SystemExit(0)
+with path.open("rb") as stream:
+    stream.seek(offset)
+    current_run = stream.read().decode("utf-8", errors="replace")
+map_ready = marker in current_run
+
+socket_inodes = set()
+for protocol in ("udp", "udp6"):
+    try:
+        lines = Path(f"/proc/net/{protocol}").read_text(
+            encoding="ascii", errors="strict"
+        ).splitlines()[1:]
+    except OSError:
+        continue
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 10:
+            continue
+        try:
+            port = int(fields[1].rsplit(":", 1)[1], 16)
+        except (IndexError, ValueError):
+            continue
+        if port == 9999:
+            socket_inodes.add(fields[9])
+try:
+    descriptors = list(Path(f"/proc/{ue_pid}/fd").iterdir())
+except OSError:
+    print("udp-unreadable")
+    raise SystemExit(0)
+owned_socket_inodes = set()
+for descriptor in descriptors:
+    try:
+        target = descriptor.readlink().as_posix()
+    except OSError:
+        continue
+    match = re.fullmatch(r"socket:\[(\d+)\]", target)
+    if match is not None:
+        owned_socket_inodes.add(match.group(1))
+udp_ready = bool(socket_inodes & owned_socket_inodes)
+if map_ready and udp_ready:
+    print("ready")
+elif map_ready:
+    print("map-ready-udp-wait")
+elif udp_ready:
+    print("udp-ready-map-wait")
+else:
+    print("waiting")
+PY
+)" || return 1
+        case "$status" in
+            ready)
+                echo "[INFO] Verified current-run UE map ready: $map_name"
+                return 0
+                ;;
+            missing-log|waiting|map-ready-udp-wait|udp-ready-map-wait)
+                ;;
+            udp-unreadable)
+                echo "[ERROR] Could not verify that UE owns UDP receiver 9999" >&2
+                return 1
+                ;;
+            truncated)
+                echo "[ERROR] UE log truncated after current-run byte boundary:" \
+                    "$ue_log" >&2
+                return 1
+                ;;
+            *)
+                echo "[ERROR] Invalid UE map-ready verifier status: $status" >&2
+                return 1
+                ;;
+        esac
+        sleep 0.1
+    done
+    echo "[ERROR] UE did not become map+UDP ready within ${timeout}s:" \
+        "$map_name / UDP 9999" >&2
+    return 1
 }
 
 schedule_forced_cleanup() {
@@ -837,7 +973,21 @@ case "$ROBOT_ARG" in
         _MANIFEST="src/robot_mujoco/zsibot_robots/custom/_cache/${_CUSTOM_MODEL_DIR}/manifest.json"
         _REF_PROFILE=""
         if [[ -f "$_MANIFEST" ]]; then
-            _REF_PROFILE="$(jq -r '.reference_profile // empty' "$_MANIFEST" 2>/dev/null || true)"
+            case "${MATRIX_EXTERNAL_REPLAY,,}" in
+                1|true|yes|on)
+                    _REF_PROFILE="$(/usr/bin/python3 -I - "$_MANIFEST" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8")).get("reference_profile")
+print(value if isinstance(value, str) else "")
+PY
+)"
+                    ;;
+                *)
+                    _REF_PROFILE="$(jq -r '.reference_profile // empty' "$_MANIFEST" 2>/dev/null || true)"
+                    ;;
+            esac
         fi
         echo "[INFO] custom robot reference_profile: '${_REF_PROFILE:-none}'"
         if [[ -n "$_REF_PROFILE" ]]; then
@@ -900,8 +1050,32 @@ case "${MATRIX_DISABLE_MC,,}" in
         ;;
 esac
 
+case "${MATRIX_EXTERNAL_REPLAY,,}" in
+    1|true|yes|on)
+        MATRIX_EXTERNAL_REPLAY_ENABLED=true
+        ENABLE_MC=false
+        if ! $ENABLE_MUJOCO; then
+            echo "[ERROR] MATRIX_EXTERNAL_REPLAY requires MuJoCo render mode" >&2
+            exit 1
+        fi
+        echo "[INFO] External Matrix UE physics-trace replay enabled"
+        ;;
+    0|false|no|off|"")
+        MATRIX_EXTERNAL_REPLAY_ENABLED=false
+        ;;
+    *)
+        echo "[ERROR] MATRIX_EXTERNAL_REPLAY must be a boolean:" \
+            "$MATRIX_EXTERNAL_REPLAY" >&2
+        exit 1
+        ;;
+esac
+
 case "${MATRIX_SONIC,,}" in
     1|true|yes|on)
+        if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
+            echo "[ERROR] MATRIX_EXTERNAL_REPLAY and MATRIX_SONIC are mutually exclusive" >&2
+            exit 1
+        fi
         MATRIX_SONIC_ENABLED=true
         ENABLE_MC=false
         if ! $ENABLE_MUJOCO; then
@@ -1047,20 +1221,60 @@ if $ENABLE_MUJOCO; then
 fi
 
 CONFIG_TMP="$(mktemp)"
-jq \
-    --arg robot_type "$ROBOTTYPE" \
-    --arg weapon "$WEAPON" \
-    --argjson mujoco_running "$MUJOCO_RUNNING_JSON" \
-    '
-    .robot = (.robot // {})
-    | .robot.robot_type = $robot_type
-    | .robot.weapon = $weapon
-    | .robot.mujoco_running = $mujoco_running
-    | .robot.state_port = (.robot.state_port // 25001)
-    | .robot.cmd_port = (.robot.cmd_port // 25002)
-    | .robot.EgoView = (.robot.EgoView // true)
-    | .robot.position = (.robot.position // {"x": 0, "y": 0, "z": 0})
-    ' config/config.json > "$CONFIG_TMP" && mv "$CONFIG_TMP" config/config.json
+if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
+    if /usr/bin/python3 -I - \
+        config/config.json "$CONFIG_TMP" "$ROBOTTYPE" "$WEAPON" \
+        "$MUJOCO_RUNNING_JSON" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+source, target, robot_type, weapon, mujoco_running = sys.argv[1:]
+payload = json.loads(Path(source).read_text(encoding="utf-8"))
+if not isinstance(payload, dict):
+    raise SystemExit("config root must be an object")
+robot = payload.get("robot")
+if robot is None:
+    robot = {}
+    payload["robot"] = robot
+if not isinstance(robot, dict):
+    raise SystemExit("config robot must be an object")
+robot["robot_type"] = robot_type
+robot["weapon"] = weapon
+robot["mujoco_running"] = mujoco_running == "true"
+robot.setdefault("state_port", 25001)
+robot.setdefault("cmd_port", 25002)
+robot.setdefault("EgoView", True)
+robot.setdefault("position", {"x": 0, "y": 0, "z": 0})
+Path(target).write_text(
+    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    then
+        mv "$CONFIG_TMP" config/config.json
+    else
+        rm -f -- "$CONFIG_TMP"
+        echo "[ERROR] Failed to update Matrix config for trace replay" >&2
+        exit 1
+    fi
+else
+    jq \
+        --arg robot_type "$ROBOTTYPE" \
+        --arg weapon "$WEAPON" \
+        --argjson mujoco_running "$MUJOCO_RUNNING_JSON" \
+        '
+        .robot = (.robot // {})
+        | .robot.robot_type = $robot_type
+        | .robot.weapon = $weapon
+        | .robot.mujoco_running = $mujoco_running
+        | .robot.state_port = (.robot.state_port // 25001)
+        | .robot.cmd_port = (.robot.cmd_port // 25002)
+        | .robot.EgoView = (.robot.EgoView // true)
+        | .robot.position = (.robot.position // {"x": 0, "y": 0, "z": 0})
+        ' config/config.json > "$CONFIG_TMP" \
+        && mv "$CONFIG_TMP" config/config.json
+fi
 
 mkdir -p src/UeSim/Linux/zsibot_mujoco_ue/Content/model/config
 mkdir -p src/UeSim/Linux/zsibot_mujoco_ue/Content/model/SceneLoder
@@ -1147,8 +1361,21 @@ sync_ue_runtime_scene
 #######################################
 # 机器人初始位姿
 #######################################
-ROBOT_X=$(jq -r '.robot.position.x' config/config.json)
-ROBOT_Y=$(jq -r '.robot.position.y' config/config.json)
+if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
+    ROBOT_POSITION="$(/usr/bin/python3 -I - config/config.json <<'PY'
+import json
+from pathlib import Path
+import sys
+
+position = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["robot"]["position"]
+print(position["x"], position["y"])
+PY
+)"
+    read -r ROBOT_X ROBOT_Y <<< "$ROBOT_POSITION"
+else
+    ROBOT_X=$(jq -r '.robot.position.x' config/config.json)
+    ROBOT_Y=$(jq -r '.robot.position.y' config/config.json)
+fi
 
 if [[ "$ROBOTTYPE" == "custom" ]]; then
     CUSTOM_MODEL_DIR="${CUSTOM_NAME:-custom}"
@@ -1169,7 +1396,8 @@ fi
 echo "[INFO] Starting processes..."
 
 cd src/robot_mujoco/simulate/build
-if $ENABLE_MUJOCO && ! $MATRIX_SONIC_ENABLED; then
+if $ENABLE_MUJOCO && ! $MATRIX_SONIC_ENABLED \
+    && ! $MATRIX_EXTERNAL_REPLAY_ENABLED; then
     echo "[INFO] Starting MuJoCo"
     LD_LIBRARY_PATH="$(mujoco_ld_library_path)" ./robot_mujoco > robot_mujoco.log 2>&1 &
     PIDS+=($!)
@@ -1295,7 +1523,8 @@ configure_remote_pointer_acceleration
 UE_LOG="$PWD/zsibot_mujoco_ue.log"
 UE_LOG_START_OFFSET=0
 if $CENTERED_CAMERA_OVERLAY_ENABLED \
-    || [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
+    || [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]] \
+    || $MATRIX_EXTERNAL_REPLAY_ENABLED; then
     if [[ -f "$UE_LOG" ]]; then
         UE_LOG_START_OFFSET="$(/usr/bin/stat -c '%s' -- "$UE_LOG")"
     fi
@@ -1318,6 +1547,68 @@ if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
 fi
 if $CENTERED_CAMERA_OVERLAY_ENABLED; then
     verify_centered_camera_overlay_mount "$UE_LOG" "$UE_LOG_START_OFFSET"
+fi
+
+if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
+    wait_for_ue_map_ready "$UE_LOG" "$UE_LOG_START_OFFSET" "$MAPNAME"
+    TRACE_REPLAY_PYTHON="${MATRIX_EXTERNAL_REPLAY_PYTHON:-${MATRIX_SONIC_PYTHON:-python3}}"
+    TRACE_REPLAY_TRACE="${MATRIX_EXTERNAL_REPLAY_TRACE:-}"
+    TRACE_REPLAY_MODEL="${MATRIX_EXTERNAL_REPLAY_MODEL:-}"
+    TRACE_REPLAY_STATUS_FILE="${MATRIX_EXTERNAL_REPLAY_STATUS_FILE:-${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_trace_replay_status.json}}"
+    TRACE_REPLAY_SUMMARY="${MATRIX_EXTERNAL_REPLAY_SUMMARY:-$PROJECT_ROOT/outputs/matrix_trace_replay_summary.json}"
+    TRACE_REPLAY_PRE_ROLL="${MATRIX_EXTERNAL_REPLAY_PRE_ROLL_SECONDS:-2}"
+    TRACE_REPLAY_FINAL_HOLD="${MATRIX_EXTERNAL_REPLAY_FINAL_HOLD_SECONDS:-6}"
+    if [[ -z "$TRACE_REPLAY_TRACE" ]]; then
+        echo "[ERROR] MATRIX_EXTERNAL_REPLAY_TRACE is required" >&2
+        exit 1
+    fi
+    TRACE_REPLAY_TRACE="$(realpath -- "$TRACE_REPLAY_TRACE")"
+    TRACE_REPLAY_STATUS_FILE="$(realpath -m -- "$TRACE_REPLAY_STATUS_FILE")"
+    TRACE_REPLAY_SUMMARY="$(realpath -m -- "$TRACE_REPLAY_SUMMARY")"
+    if [[ -n "$TRACE_REPLAY_MODEL" ]]; then
+        TRACE_REPLAY_MODEL="$(realpath -- "$TRACE_REPLAY_MODEL")"
+    fi
+    if [[ "$TRACE_REPLAY_STATUS_FILE" == "$TRACE_REPLAY_SUMMARY" \
+        || "$TRACE_REPLAY_STATUS_FILE" == "$TRACE_REPLAY_TRACE" \
+        || "$TRACE_REPLAY_SUMMARY" == "$TRACE_REPLAY_TRACE" \
+        || ( -n "$TRACE_REPLAY_MODEL" \
+            && ( "$TRACE_REPLAY_STATUS_FILE" == "$TRACE_REPLAY_MODEL" \
+                || "$TRACE_REPLAY_SUMMARY" == "$TRACE_REPLAY_MODEL" ) ) ]]; then
+        echo "[ERROR] Matrix trace replay source and output paths must be distinct" >&2
+        exit 1
+    fi
+    for stale_replay_output in \
+        "$TRACE_REPLAY_STATUS_FILE" "$TRACE_REPLAY_SUMMARY"; do
+        if [[ -L "$stale_replay_output" || -d "$stale_replay_output" ]]; then
+            echo "[ERROR] Matrix trace replay output must not be a symlink or directory:" \
+                "$stale_replay_output" >&2
+            exit 1
+        fi
+        rm -f -- "$stale_replay_output"
+    done
+    if [[ ! -f "$PROJECT_ROOT/scripts/replay_matrix_physics_trace.py" ]]; then
+        echo "[ERROR] Matrix physics-trace replay script is missing" >&2
+        exit 1
+    fi
+    TRACE_REPLAY_COMMAND=(
+        "$TRACE_REPLAY_PYTHON"
+        "$PROJECT_ROOT/scripts/replay_matrix_physics_trace.py"
+        --trace "$TRACE_REPLAY_TRACE"
+        --status-file "$TRACE_REPLAY_STATUS_FILE"
+        --summary "$TRACE_REPLAY_SUMMARY"
+        --pre-roll "$TRACE_REPLAY_PRE_ROLL"
+        --final-hold "$TRACE_REPLAY_FINAL_HOLD"
+        --ue-pid "$UE_PID"
+    )
+    if [[ -n "$TRACE_REPLAY_MODEL" ]]; then
+        TRACE_REPLAY_COMMAND+=(--model "$TRACE_REPLAY_MODEL")
+    fi
+    mkdir -p "$PROJECT_ROOT/outputs/logs"
+    echo "[INFO] Starting Matrix UE physics-trace replay"
+    "${TRACE_REPLAY_COMMAND[@]}" \
+        > "$PROJECT_ROOT/outputs/logs/matrix_trace_replay.log" 2>&1 &
+    TRACE_REPLAY_PID=$!
+    PIDS+=("$TRACE_REPLAY_PID")
 fi
 
 if $MATRIX_SONIC_ENABLED; then
@@ -1872,6 +2163,38 @@ fi
 # 阻塞等待
 #######################################
 echo "[INFO] All components started."
+if [[ -n "$TRACE_REPLAY_PID" ]]; then
+    if ((BASH_VERSINFO[0] < 5)) \
+        || ((BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1)); then
+        echo "[ERROR] Matrix trace-replay supervision requires Bash 5.1 or newer" >&2
+        exit 2
+    fi
+    set +e
+    COMPLETED_PID=""
+    wait -n -p COMPLETED_PID "$TRACE_REPLAY_PID" "$UE_SUPERVISOR_PID"
+    FIRST_EXIT_CODE=$?
+    if [[ "$COMPLETED_PID" == "$UE_SUPERVISOR_PID" ]]; then
+        UE_SUPERVISOR_REAPED=1
+        record_ue_supervisor_failure
+        # The replayer pins /proc start-time identity for this exact UE child
+        # and exits on its next 40 ms poll; waiting avoids signaling a reused
+        # numeric PID after wait-n has reaped a near-simultaneous child.
+        wait "$TRACE_REPLAY_PID"
+        TRACE_REPLAY_EXIT_CODE=$?
+    else
+        TRACE_REPLAY_EXIT_CODE="$FIRST_EXIT_CODE"
+    fi
+    remove_managed_pid "$TRACE_REPLAY_PID"
+    TRACE_REPLAY_PID=""
+    set -e
+    stop_supervised_ue
+    if [[ -e "$UE_FAILURE_FILE" && "$TRACE_REPLAY_EXIT_CODE" == "0" ]]; then
+        TRACE_REPLAY_EXIT_CODE=2
+    fi
+    echo "[INFO] Matrix UE physics-trace replay exited with code" \
+        "$TRACE_REPLAY_EXIT_CODE"
+    exit "$TRACE_REPLAY_EXIT_CODE"
+fi
 if [[ -n "$SONIC_PID" ]]; then
     if ((BASH_VERSINFO[0] < 5)) \
         || ((BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1)); then
