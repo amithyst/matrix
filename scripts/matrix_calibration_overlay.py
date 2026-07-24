@@ -79,6 +79,7 @@ _KEY_RELEASE_MASK = 1 << 1
 _BUTTON_PRESS_MASK = 1 << 2
 _BUTTON_RELEASE_MASK = 1 << 3
 _BUTTON_1_MOTION_MASK = 1 << 8
+_BUTTON_1_MASK = 1 << 8
 _GRAB_SUCCESS = 0
 _GRAB_MODE_ASYNC = 1
 _CURRENT_TIME = 0
@@ -1011,9 +1012,16 @@ class StrategyLoadoutModel:
     locomotion_candidates: tuple[StrategyPolicyModel, ...]
     recovery_candidates: tuple[StrategyPolicyModel, ...]
     pending_policy_id: str | None
+    locomotion_locked: bool = False
+    recovery_locked: bool = False
 
     def policy_enabled(self, policy_id: str, *, slot: str = "recovery") -> bool:
-        if not self.available or self.status in {"loading", "switching"}:
+        if not self.available or self.status in {"unavailable", "switching"}:
+            return False
+        if (
+            (slot == "locomotion" and self.locomotion_locked)
+            or (slot == "recovery" and self.recovery_locked)
+        ):
             return False
         selected = (
             self.locomotion_policy_id
@@ -1115,6 +1123,8 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
     recovery = "kungfu"
     locomotion_candidates: list[StrategyPolicyModel] = []
     recovery_candidates: list[StrategyPolicyModel] = []
+    locomotion_locked = False
+    recovery_locked = False
     slots = raw.get("slots")
     if isinstance(slots, list):
         for slot in slots:
@@ -1124,6 +1134,7 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
             selected = slot.get("selected_policy_id")
             if slot_id == "locomotion" and isinstance(selected, str):
                 locomotion = selected
+                locomotion_locked = slot.get("locked") is True
                 raw_candidates = slot.get("candidates")
                 if isinstance(raw_candidates, list):
                     for candidate in raw_candidates[
@@ -1155,6 +1166,7 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                         )
             elif slot_id == "recovery" and isinstance(selected, str):
                 recovery = selected
+                recovery_locked = slot.get("locked") is True
                 raw_candidates = slot.get("candidates")
                 if isinstance(raw_candidates, list):
                     for candidate in raw_candidates[
@@ -1199,6 +1211,8 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
         locomotion_candidates=tuple(locomotion_candidates),
         recovery_candidates=tuple(recovery_candidates),
         pending_policy_id=pending_policy_id,
+        locomotion_locked=locomotion_locked,
+        recovery_locked=recovery_locked,
     )
 
 
@@ -3042,6 +3056,12 @@ class X11CalibrationOverlay:
         self._last_raise_s: float | None = None
         self._pressed_action: str | None = None
         self._pressed_window: int | None = None
+        self._polled_pointer_valid = False
+        self._polled_left_pressed = False
+        self._polled_left_initialized = False
+        self._polled_left_was_down = False
+        self._polled_left_transition_count = 0
+        self._polled_left_fallback_events = 0
         self._target_window: int | None = None
         self._command_editor = CommandLineEditor()
         self._keyboard_grabbed = False
@@ -3283,6 +3303,16 @@ class X11CalibrationOverlay:
             "XPending": ([ctypes.c_void_p], ctypes.c_int),
             "XNextEvent": (
                 [ctypes.c_void_p, ctypes.POINTER(XEvent)],
+                ctypes.c_int,
+            ),
+            "XSendEvent": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_long,
+                    ctypes.POINTER(XEvent),
+                ],
                 ctypes.c_int,
             ),
             "XFlush": ([ctypes.c_void_p], ctypes.c_int),
@@ -3533,6 +3563,12 @@ class X11CalibrationOverlay:
                 self._last_bad_window.mapping()
                 if self._last_bad_window is not None
                 else None
+            ),
+            "polled_left_transition_count": getattr(
+                self, "_polled_left_transition_count", 0
+            ),
+            "polled_left_fallback_events": getattr(
+                self, "_polled_left_fallback_events", 0
             ),
         }
 
@@ -4112,8 +4148,88 @@ class X11CalibrationOverlay:
             ctypes.byref(window_y),
             ctypes.byref(mask),
         ):
+            self._polled_pointer_valid = False
+            self._polled_left_pressed = False
+            self._polled_left_initialized = False
             return None
+        self._polled_pointer_valid = True
+        self._polled_left_pressed = bool(mask.value & _BUTTON_1_MASK)
         return (root_x.value, root_y.value)
+
+    def _queue_polled_left_transition(self, *, cooked_button_seen: bool) -> None:
+        """Recover clicks whose cooked X11 events are held by another client.
+
+        Remote desktop/browser stacks can leave the Matrix override-redirect
+        panel visible while an older client still owns the cooked pointer
+        grab.  XQueryPointer nevertheless exposes the authoritative core
+        Button1 level.  Convert only observed level edges into this client's
+        own event queue; ordinary cooked events remain authoritative and
+        suppress the fallback for that frame.
+        """
+
+        valid = bool(getattr(self, "_polled_pointer_valid", False))
+        current = bool(getattr(self, "_polled_left_pressed", False))
+        initialized = bool(getattr(self, "_polled_left_initialized", False))
+        if (
+            not valid
+            or not getattr(self, "_visible", False)
+            or getattr(self, "_last_layout", None) is None
+            or getattr(self, "_last_pointer", None) is None
+        ):
+            self._polled_left_initialized = False
+            return
+        if cooked_button_seen:
+            self._polled_left_initialized = True
+            self._polled_left_was_down = current
+            return
+        if not initialized:
+            # A button already held when the panel appears cannot prove that
+            # its press began on a visible Matrix control.
+            self._polled_left_initialized = True
+            self._polled_left_was_down = current
+            return
+        previous = bool(getattr(self, "_polled_left_was_down", current))
+        self._polled_left_was_down = current
+        if current == previous:
+            return
+
+        root_x, root_y = self._last_pointer
+        panel_x, panel_y, _panel_width, _panel_height = self._last_layout["panel"]
+        event = XEvent()
+        event.type = _BUTTON_PRESS if current else _BUTTON_RELEASE
+        event.xbutton.type = event.type
+        event.xbutton.send_event = 1
+        event.xbutton.display = self._display
+        event.xbutton.window = self._windows["panel"]
+        event.xbutton.root = self._root
+        event.xbutton.x = root_x - panel_x
+        event.xbutton.y = root_y - panel_y
+        event.xbutton.x_root = root_x
+        event.xbutton.y_root = root_y
+        event.xbutton.state = 0 if current else _BUTTON_1_MASK
+        event.xbutton.button = 1
+        event.xbutton.same_screen = 1
+        event_mask = (
+            _BUTTON_PRESS_MASK if current else _BUTTON_RELEASE_MASK
+        )
+        if (
+            self._x11.XSendEvent(
+                self._display,
+                self._windows["panel"],
+                0,
+                event_mask,
+                ctypes.byref(event),
+            )
+            == 0
+        ):
+            raise RuntimeError("XSendEvent rejected pointer-level fallback")
+        self._x11.XFlush(self._display)
+        self._polled_left_transition_count = (
+            getattr(self, "_polled_left_transition_count", 0) + 1
+        )
+        self._polled_left_fallback_events = (
+            getattr(self, "_polled_left_fallback_events", 0) + 1
+        )
 
     def _panel_rectangle(
         self,
@@ -5389,6 +5505,7 @@ class X11CalibrationOverlay:
         """Drain bounded keyboard intents and completed left-button clicks."""
 
         emitted = 0
+        cooked_button_seen = False
         while self._x11.XPending(self._display) > 0:
             event = XEvent()
             self._x11.XNextEvent(self._display, ctypes.byref(event))
@@ -5408,6 +5525,7 @@ class X11CalibrationOverlay:
             button = event.xbutton
             if button.button != 1:
                 continue
+            cooked_button_seen = True
             layout = self._last_layout
             action = (
                 panel_action_at(
@@ -5613,6 +5731,9 @@ class X11CalibrationOverlay:
                 ):
                     publisher.publish(action)
                     emitted += 1
+        self._queue_polled_left_transition(
+            cooked_button_seen=cooked_button_seen
+        )
         return emitted
 
     def show(
