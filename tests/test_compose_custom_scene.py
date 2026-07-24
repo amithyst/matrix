@@ -46,6 +46,14 @@ class ComposeCustomSceneTest(unittest.TestCase):
             self.assertEqual(scene.find("worldbody/geom").get("name"), "wall")
             self.assertEqual((custom / "assets" / "curb.stl").read_bytes(), b"curb")
             self.assertEqual((custom / "height.png").read_bytes(), b"height")
+            self.assertEqual(
+                scene.find("asset/mesh").get("file"),
+                (custom / "assets" / "curb.stl").resolve().as_posix(),
+            )
+            self.assertEqual(
+                scene.find("asset/hfield").get("file"),
+                (custom / "height.png").resolve().as_posix(),
+            )
             self.assertEqual(len(copied), 2)
 
     def test_removes_only_exact_requested_geoms_and_fails_closed(self) -> None:

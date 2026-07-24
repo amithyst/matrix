@@ -65,6 +65,10 @@ UE 持有 UDP 9999 后才启动回放 child；external replay 会显式设置
 child 和 UE supervisor，任一异常退出都会结束另一侧并返回非零。不要手工同时设置
 `MATRIX_EXTERNAL_REPLAY=1` 与 `MATRIX_SONIC=1`。
 
+custom robot 的 `compiler meshdir` 会影响合并后所有 MuJoCo asset 的解析。scene composer
+因此把 HouseWorld 原生 mesh/height-field 先复制到 custom 目录，再把生成场景中的文件
+引用绑定到这些已核验的绝对副本，避免环境高度图被错误解析到机器人 mesh cache。
+
 ## 录制完整视频
 
 ```bash

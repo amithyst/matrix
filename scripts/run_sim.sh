@@ -544,7 +544,7 @@ if size < offset:
     raise SystemExit(0)
 with path.open("rb") as stream:
     stream.seek(offset)
-current_run = stream.read().decode("utf-8", errors="replace")
+    current_run = stream.read().decode("utf-8", errors="replace")
 map_ready = marker in current_run
 model_ready = (
     "[MuJoCoSimulationRender] "

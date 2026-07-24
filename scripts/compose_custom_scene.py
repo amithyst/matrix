@@ -78,6 +78,14 @@ def _copy_scene_assets(
             )
         if not target.exists():
             shutil.copy2(source, target)
+        # A custom robot include contributes its compiler meshdir globally.
+        # Native-scene assets would otherwise be resolved under that robot
+        # mesh bundle (for example, ../height_field.png beneath the TwinBot
+        # cache) instead of the copied scene asset.  Runtime scenes are
+        # transactionally generated for this checkout, so bind every native
+        # asset to its verified absolute copy and keep robot mesh resolution
+        # independent.
+        element.set("file", target.as_posix())
         copied.append(target)
     return copied
 
