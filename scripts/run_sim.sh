@@ -452,14 +452,24 @@ PY
 verify_material_fix_install() {
     local ue_log="$1"
     local start_offset="$2"
+    local expected_skin="$3"
+    local expected_palette="$4"
     local status
-    status="$(/usr/bin/python3 -I - "$ue_log" "$start_offset" <<'PY'
+    status="$(/usr/bin/python3 -I - \
+        "$ue_log" "$start_offset" "$expected_skin" "$expected_palette" <<'PY'
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
 offset = int(sys.argv[2])
+skin = sys.argv[3]
+palette = sys.argv[4]
 marker = "matrix-ue-material-fix: installed audited Matrix 0.1.2 material bridge"
+palette_count = len(palette.split(";")) if palette else 0
+contract_marker = (
+    f"matrix-ue-material-fix: loaded skin {skin} palette "
+    f"({palette_count} colors)"
+)
 if not path.is_file():
     print("missing-log")
     raise SystemExit(0)
@@ -472,7 +482,9 @@ with path.open("rb") as stream:
     lines = stream.read().decode("utf-8", errors="replace").splitlines()
 if any(line.strip().startswith("matrix-ue-material-fix FATAL:") for line in lines):
     print("fatal")
-elif any(line.strip() == marker for line in lines):
+elif any(line.strip() == marker for line in lines) and any(
+    line.strip() == contract_marker for line in lines
+):
     print("installed")
 else:
     print("missing-marker")
@@ -1687,7 +1699,9 @@ if [[ ! "$UE_STARTUP_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 sleep "$UE_STARTUP_SECONDS"
 if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
-    verify_material_fix_install "$UE_LOG" "$UE_LOG_START_OFFSET"
+    verify_material_fix_install \
+        "$UE_LOG" "$UE_LOG_START_OFFSET" \
+        "$UE_G1_SKIN" "$UE_G1_MATERIAL_PALETTE"
 fi
 if $CENTERED_CAMERA_OVERLAY_ENABLED; then
     verify_centered_camera_overlay_mount "$UE_LOG" "$UE_LOG_START_OFFSET"

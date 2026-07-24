@@ -22,6 +22,49 @@ weld”，操作阶段还固定了站姿 anchor；视频、状态和 summary 都
 
 ## 输入门禁
 
+### 派生 Matrix UE 可见的任务方块模型
+
+Matrix 0.1.2 packaged custom bridge 支持 primitive box，`geom group` 也不是显示过滤条件；
+因此不能靠把 `group=2` 改成 `group=1` 修复。真实 shim-only 诊断保留原 v2 模型并成功加载
+审计 material bridge，但最终桌面和全部任务阶段仍看不到红色方块，视觉门禁继续拒绝
+`carry_lower` / `release_settle`。这份 current-run 失败证据触发 mesh fallback，而不是假设
+UE 不支持 primitive。
+
+不能改 TwinBot 原模型或把 mesh 写进 mieli 的工作区。先生成独立、自包含的 render-only
+模型目录：
+
+```bash
+python3 scripts/prepare_matrix_scene6_render_model.py \
+  --source-scene /artifact/model/scene6_house_task.xml \
+  --source-robot-model /artifact/model/g1_29dof_dex3.scene6.xml \
+  --output-dir /artifact/matrix-render-v3/model \
+  --expected-source-scene-sha256 <sha256> \
+  --expected-source-robot-model-sha256 <sha256> \
+  --expected-source-mesh-closure-sha256 <sha256>
+```
+
+该工具保持原 visual box 的尺寸/质量贡献、collision box、freejoint、pose、inertial、joint
+和 actuator 不变；仅把原 visual box 的 render alpha 置零，并在同一个 `pick_cube` body 上
+增加一个 6 cm、`mass=0`、无碰撞的红色 mesh visual。这样只保留一个可见表面，不会与
+primitive 共面闪烁。
+生成的 binary STL 固定为 12 个三角面、684 bytes；原机器人 50 个 mesh 也以普通文件复制
+进本地 `meshes/`，`compiler.meshdir` 只改为该相对目录。输出目录原子发布且拒绝覆盖，
+`render-model-receipt.json` 记录源/派生 XML、51 文件 mesh closure、生成 STL 和不变量的
+SHA256；生产调用还必须钉死原 50 文件 closure SHA256。该派生仅改变 Matrix UE 表现，
+不修改 source trace 的任何 frame。
+
+红色材质还依赖仓库内经过审计的 Matrix 0.1.2 material bridge：
+
+```bash
+bash scripts/build_matrix_ue_material_fix.sh
+```
+
+Scene6 replay wrapper 会 fail closed 地要求该普通文件存在，从注册的 G1 skin 解析 palette，
+追加 cube RGB `0.95,0.18,0.05`，并使用 scope alpha `0.99609375`。缺 bridge、palette 或
+scope 不匹配时不启动 UE；wrapper 还钉死 bridge SHA256，并要求 current-run UE 日志同时
+出现匹配 skin/颜色数量和审计安装 marker。相同 binding 会进入 replay status/summary，
+postflight v3 再交叉验证，避免产出“有方块但材质未绑定”的候选视频。
+
 ### 将 TwinBot v2 原始 trace 投影为 Matrix replay 输入
 
 TwinBot 的 Scene6 v2 原始 trace 是物理权威，不能就地补字段。若原始文件尚未包含 Matrix
@@ -32,8 +75,8 @@ python3 scripts/prepare_matrix_scene6_replay_trace.py \
   --source-trace /artifact/physics-trace.source.json \
   --source-summary /artifact/summary.source.json \
   --validation /artifact/review/scene6_raise_arm_validation.json \
-  --scene-model /artifact/model/scene6_house_task.xml \
-  --render-robot-model /artifact/model/g1_29dof_dex3.scene6.xml \
+  --scene-model /artifact/matrix-render-v3/model/scene6_house_task.xml \
+  --render-robot-model /artifact/matrix-render-v3/model/g1_29dof_dex3.scene6.xml \
   --output-trace /artifact/physics-trace.matrix-replay.json \
   --receipt /artifact/projection-receipt.json \
   --expected-source-trace-sha256 <sha256> \

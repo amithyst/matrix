@@ -21,6 +21,9 @@ CAMERA_RECEIPT=""
 CAMERA_READY_FILE=""
 CAMERA_READY_TIMEOUT_SECONDS="120"
 CAMERA_SETTLE_SECONDS="0.5"
+SCENE6_CUBE_MATERIAL_RGB="0.95,0.18,0.05"
+SCENE6_CUBE_SCOPE_ALPHA="0.99609375"
+SCENE6_MATERIAL_FIX_SHA256="9f64dd949bd44be61a11dcbbe3e5a49f6ef6f6f318c4771a24385e9781840b96"
 
 usage() {
     echo "Usage: $0 --trace FILE [--model FILE] [--matrix-root DIR]" \
@@ -247,6 +250,7 @@ for required in \
     "$MATRIX_ROOT/scripts/run_sim.sh" \
     "$MATRIX_ROOT/scripts/replay_matrix_physics_trace.py" \
     "$MATRIX_ROOT/scripts/stage_matrix_trace_model.py" \
+    "$MATRIX_ROOT/scripts/apply_urdf_visual_materials.py" \
     "$MATRIX_ROOT/scripts/matrix_ue_overlay.py" \
     "$MATRIX_ROOT/scripts/matrix_scene6_camera_receipt.py"; do
     if [[ ! -f "$required" ]]; then
@@ -256,6 +260,78 @@ for required in \
 done
 
 PYTHON="${MATRIX_EXTERNAL_REPLAY_PYTHON:-${MATRIX_SONIC_PYTHON:-$(command -v python3)}}"
+MATERIAL_FIX="$MATRIX_ROOT/outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
+if [[ -L "$MATERIAL_FIX" || ! -f "$MATERIAL_FIX" ]]; then
+    echo "[ERROR] Scene6 cube rendering requires the audited Matrix UE material" \
+        "bridge; build it first with scripts/build_matrix_ue_material_fix.sh:" \
+        "$MATERIAL_FIX" >&2
+    exit 2
+fi
+MATERIAL_FIX="$(realpath -- "$MATERIAL_FIX")"
+MATERIAL_FIX_SHA256="$(sha256sum -- "$MATERIAL_FIX")"
+MATERIAL_FIX_SHA256="${MATERIAL_FIX_SHA256%% *}"
+if [[ "$MATERIAL_FIX_SHA256" != "$SCENE6_MATERIAL_FIX_SHA256" ]]; then
+    echo "[ERROR] Scene6 audited material bridge SHA256 mismatch: expected" \
+        "$SCENE6_MATERIAL_FIX_SHA256 got $MATERIAL_FIX_SHA256" >&2
+    exit 2
+fi
+if ! MATERIAL_SELECTION="$("$PYTHON" \
+    "$MATRIX_ROOT/scripts/apply_urdf_visual_materials.py" --describe-skin)"; then
+    echo "[ERROR] Failed to resolve the registered G1 material contract" >&2
+    exit 2
+fi
+if ! MATERIAL_FIELDS="$("$PYTHON" - "$MATERIAL_SELECTION" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print(payload["skin_id"])
+print(payload["ue_palette"])
+print(format(float(payload["ue_scope_alpha"]), ".9g"))
+PY
+)"; then
+    echo "[ERROR] Registered G1 material contract is invalid" >&2
+    exit 2
+fi
+mapfile -t MATERIAL_FIELD_ARRAY <<<"$MATERIAL_FIELDS"
+if [[ "${#MATERIAL_FIELD_ARRAY[@]}" != "3" \
+    || -z "${MATERIAL_FIELD_ARRAY[0]}" \
+    || -z "${MATERIAL_FIELD_ARRAY[1]}" \
+    || "${MATERIAL_FIELD_ARRAY[2]}" != "$SCENE6_CUBE_SCOPE_ALPHA" ]]; then
+    echo "[ERROR] Registered G1 material contract has an unexpected scope" >&2
+    exit 2
+fi
+MATERIAL_PALETTE="${MATERIAL_FIELD_ARRAY[1]}"
+case ";$MATERIAL_PALETTE;" in
+    *";$SCENE6_CUBE_MATERIAL_RGB;"*) ;;
+    *)
+        IFS=';' read -r -a MATERIAL_PALETTE_ENTRIES <<<"$MATERIAL_PALETTE"
+        if (( ${#MATERIAL_PALETTE_ENTRIES[@]} >= 16 )); then
+            echo "[ERROR] Registered G1 palette has no slot for Scene6 cube RGB" >&2
+            exit 2
+        fi
+        MATERIAL_PALETTE+=";$SCENE6_CUBE_MATERIAL_RGB"
+        ;;
+esac
+export MATRIX_UE_MATERIAL_FIX_PRELOAD="$MATERIAL_FIX"
+export MATRIX_G1_SKIN="${MATERIAL_FIELD_ARRAY[0]}"
+export MATRIX_G1_MATERIAL_PALETTE="$MATERIAL_PALETTE"
+export MATRIX_G1_MATERIAL_SCOPE_ALPHA="$SCENE6_CUBE_SCOPE_ALPHA"
+MATERIAL_PALETTE_SHA256="$("$PYTHON" - "$MATERIAL_PALETTE" <<'PY'
+import hashlib
+import sys
+
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest())
+PY
+)"
+export MATRIX_SCENE6_MATERIAL_FIX_SHA256="$MATERIAL_FIX_SHA256"
+export MATRIX_SCENE6_MATERIAL_SKIN="${MATERIAL_FIELD_ARRAY[0]}"
+export MATRIX_SCENE6_MATERIAL_PALETTE_SHA256="$MATERIAL_PALETTE_SHA256"
+export MATRIX_SCENE6_MATERIAL_SCOPE_ALPHA="$SCENE6_CUBE_SCOPE_ALPHA"
+export MATRIX_SCENE6_MATERIAL_CUBE_RGB="$SCENE6_CUBE_MATERIAL_RGB"
+echo "[INFO] Scene6 cube material scope: rgb=$SCENE6_CUBE_MATERIAL_RGB" \
+    "alpha=$SCENE6_CUBE_SCOPE_ALPHA bridge_sha256=$MATERIAL_FIX_SHA256" \
+    "palette_sha256=$MATERIAL_PALETTE_SHA256"
 INSPECT_COMMAND=(
     "$PYTHON" "$MATRIX_ROOT/scripts/replay_matrix_physics_trace.py"
     --trace "$TRACE" --inspect

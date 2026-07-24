@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import stat
@@ -37,6 +38,12 @@ DEFAULT_MAX_TRACE_BYTES = 1024 * 1024 * 1024
 # Keep the exact 43-value wire shape while zeroing this unsafe compatibility
 # slot until both stock endpoints are rebuilt to use ``mjData.ctrl``.
 WIRE_THIRD_VECTOR_SEMANTICS = "legacy_act_slot_zeroed"
+MATERIAL_BINDING_SCHEMA = "matrix.scene6_render_material.v1"
+EXPECTED_MATERIAL_FIX_SHA256 = (
+    "9f64dd949bd44be61a11dcbbe3e5a49f6ef6f6f318c4771a24385e9781840b96"
+)
+EXPECTED_MATERIAL_SCOPE_ALPHA = "0.99609375"
+EXPECTED_MATERIAL_CUBE_RGB = "0.95,0.18,0.05"
 REQUIRED_TRANSITION_SUBSEQUENCE = (
     "world_ready",
     "dock_with_pregrasp",
@@ -108,6 +115,33 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _scene6_material_binding() -> dict[str, Any]:
+    values = {
+        "fix_sha256": os.environ.get("MATRIX_SCENE6_MATERIAL_FIX_SHA256", ""),
+        "skin": os.environ.get("MATRIX_SCENE6_MATERIAL_SKIN", ""),
+        "palette_sha256": os.environ.get(
+            "MATRIX_SCENE6_MATERIAL_PALETTE_SHA256", ""
+        ),
+        "scope_alpha": os.environ.get("MATRIX_SCENE6_MATERIAL_SCOPE_ALPHA", ""),
+        "cube_rgb": os.environ.get("MATRIX_SCENE6_MATERIAL_CUBE_RGB", ""),
+    }
+    if values["fix_sha256"] != EXPECTED_MATERIAL_FIX_SHA256:
+        raise TraceValidationError("Scene6 material-fix SHA256 binding is missing/wrong")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", values["skin"]):
+        raise TraceValidationError("Scene6 material skin binding is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", values["palette_sha256"]):
+        raise TraceValidationError("Scene6 material palette SHA256 binding is invalid")
+    if values["scope_alpha"] != EXPECTED_MATERIAL_SCOPE_ALPHA:
+        raise TraceValidationError("Scene6 material scope alpha binding is wrong")
+    if values["cube_rgb"] != EXPECTED_MATERIAL_CUBE_RGB:
+        raise TraceValidationError("Scene6 cube RGB binding is wrong")
+    return {
+        "schema_id": MATERIAL_BINDING_SCHEMA,
+        "bridge": "matrix_ue_material_fix",
+        **values,
+    }
 
 
 def _camera_receipt_binding(path: Path, *, expected_sha256: str) -> dict[str, Any]:
@@ -509,6 +543,7 @@ def replay(
     ue_pid: int | None,
     camera_receipt_path: Path,
     expected_camera_receipt_sha256: str,
+    render_material: dict[str, Any],
 ) -> dict[str, Any]:
     if pre_roll_s < 0.0 or not math.isfinite(pre_roll_s):
         raise ValueError("pre-roll must be a non-negative finite number")
@@ -518,6 +553,8 @@ def replay(
         camera_receipt_path,
         expected_sha256=expected_camera_receipt_sha256,
     )
+    if render_material.get("schema_id") != MATERIAL_BINDING_SCHEMA:
+        raise TraceValidationError("Scene6 render material binding is invalid")
     ue_start_ticks = _process_start_ticks(ue_pid) if ue_pid is not None else None
     pre_roll_packets = round(pre_roll_s * REPLAY_FPS)
     final_hold_packets = round(final_hold_s * REPLAY_FPS)
@@ -579,6 +616,7 @@ def replay(
             "model_provenance": inspection["render_robot_model"],
             "scene_model_provenance": inspection["model"],
             "camera_receipt": camera_receipt,
+            "render_material": render_material,
             "manipulation_assistance": (
                 "contact_gated_wrist_cube_weld_and_anchored_stance"
             ),
@@ -695,6 +733,7 @@ def replay(
             "model": inspection["render_robot_model"],
             "scene_model": inspection["model"],
             "camera_receipt": camera_receipt,
+            "render_material": render_material,
             "dimensions": inspection["dimensions"],
             "wire_third_vector_semantics": WIRE_THIRD_VECTOR_SEMANTICS,
             "source_frame_count": trace_packets,
@@ -789,6 +828,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ue_pid=args.ue_pid,
             camera_receipt_path=args.camera_receipt.expanduser().resolve(),
             expected_camera_receipt_sha256=args.camera_receipt_sha256,
+            render_material=_scene6_material_binding(),
         )
     except (OSError, TraceValidationError, ValueError, RuntimeError) as exc:
         print(f"[matrix-trace-replay] ERROR: {exc}", file=os.sys.stderr)

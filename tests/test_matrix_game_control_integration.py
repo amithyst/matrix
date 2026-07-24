@@ -646,9 +646,24 @@ elif script == "supervise_matrix_ue.py":
     if any(
         value.startswith("LD_PRELOAD=") for value in ue_capture["command"]
     ) and os.environ.get("FAKE_UE_MATERIAL_FIX_LOG") != "missing":
+        skin = next(
+            value.removeprefix("MATRIX_G1_SKIN=")
+            for value in ue_capture["command"]
+            if value.startswith("MATRIX_G1_SKIN=")
+        )
+        palette = next(
+            value.removeprefix("MATRIX_G1_MATERIAL_PALETTE=")
+            for value in ue_capture["command"]
+            if value.startswith("MATRIX_G1_MATERIAL_PALETTE=")
+        )
+        palette_count = len(palette.split(";"))
         with Path(args[args.index("--log") + 1]).open(
             "a", encoding="utf-8"
         ) as log_stream:
+            log_stream.write(
+                f"matrix-ue-material-fix: loaded skin {skin} palette "
+                f"({palette_count} colors)\\n"
+            )
             log_stream.write(
                 "matrix-ue-material-fix: installed audited Matrix 0.1.2 "
                 "material bridge\\n"

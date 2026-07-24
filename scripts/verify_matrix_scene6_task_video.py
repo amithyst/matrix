@@ -17,6 +17,11 @@ import matrix_scene6_camera_receipt as camera_evidence
 import verify_matrix_scene6_visual_motion as visual_motion_evidence
 
 
+EXPECTED_MATERIAL_FIX_SHA256 = (
+    "9f64dd949bd44be61a11dcbbe3e5a49f6ef6f6f318c4771a24385e9781840b96"
+)
+
+
 class PostflightError(RuntimeError):
     pass
 
@@ -212,6 +217,23 @@ def verify(
         raise PostflightError(
             "replay summary lacks the zeroed legacy act-slot safety boundary"
         )
+    render_material = summary.get("render_material")
+    if (
+        not isinstance(render_material, dict)
+        or render_material.get("schema_id") != "matrix.scene6_render_material.v1"
+        or render_material.get("bridge") != "matrix_ue_material_fix"
+        or render_material.get("fix_sha256") != EXPECTED_MATERIAL_FIX_SHA256
+        or render_material.get("skin") != "unitree-stock"
+        or render_material.get("scope_alpha") != "0.99609375"
+        or render_material.get("cube_rgb") != "0.95,0.18,0.05"
+        or not isinstance(render_material.get("palette_sha256"), str)
+        or len(render_material["palette_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in render_material["palette_sha256"]
+        )
+    ):
+        raise PostflightError("replay summary lacks the pinned Scene6 material bridge")
     frame_count = summary.get("source_frame_count")
     packets = summary.get("packets")
     if (
@@ -325,6 +347,7 @@ def verify(
         or status_before.get("wire_third_vector_semantics")
         != "legacy_act_slot_zeroed"
         or status_before.get("camera_receipt") != camera_binding
+        or status_before.get("render_material") != render_material
     ):
         raise PostflightError("video readiness lacks the explicit no-DDS replay boundary")
     launcher = metadata.get("launcher")
@@ -350,6 +373,7 @@ def verify(
         or status_after.get("wire_third_vector_semantics")
         != "legacy_act_slot_zeroed"
         or status_after.get("camera_receipt") != camera_binding
+        or status_after.get("render_material") != render_material
     ):
         raise PostflightError("Matrix replay final status is not complete and inactive")
 
@@ -391,6 +415,7 @@ def verify(
         },
         "trace": summary.get("trace"),
         "model": summary.get("model"),
+        "render_material": render_material,
         "replay_summary": {
             "path": str(summary_path),
             "sha256": _sha256(summary_path),

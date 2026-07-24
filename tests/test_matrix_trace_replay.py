@@ -59,6 +59,28 @@ def write_camera_receipt_fixture(root: Path) -> tuple[Path, str]:
     return path.resolve(), REPLAY._sha256(path)
 
 
+def material_binding() -> dict[str, str]:
+    return {
+        "schema_id": REPLAY.MATERIAL_BINDING_SCHEMA,
+        "bridge": "matrix_ue_material_fix",
+        "fix_sha256": REPLAY.EXPECTED_MATERIAL_FIX_SHA256,
+        "skin": "unitree-stock",
+        "palette_sha256": "a" * 64,
+        "scope_alpha": REPLAY.EXPECTED_MATERIAL_SCOPE_ALPHA,
+        "cube_rgb": REPLAY.EXPECTED_MATERIAL_CUBE_RGB,
+    }
+
+
+def material_environment() -> dict[str, str]:
+    return {
+        "MATRIX_SCENE6_MATERIAL_FIX_SHA256": REPLAY.EXPECTED_MATERIAL_FIX_SHA256,
+        "MATRIX_SCENE6_MATERIAL_SKIN": "unitree-stock",
+        "MATRIX_SCENE6_MATERIAL_PALETTE_SHA256": "a" * 64,
+        "MATRIX_SCENE6_MATERIAL_SCOPE_ALPHA": REPLAY.EXPECTED_MATERIAL_SCOPE_ALPHA,
+        "MATRIX_SCENE6_MATERIAL_CUBE_RGB": REPLAY.EXPECTED_MATERIAL_CUBE_RGB,
+    }
+
+
 def write_fixture(root: Path, *, frame_count: int = 2) -> tuple[Path, Path, Path]:
     model_root = root / "model"
     meshes = model_root / "meshes"
@@ -242,6 +264,16 @@ class TraceValidationTest(unittest.TestCase):
 
 
 class TraceReplayTest(unittest.TestCase):
+    def test_material_binding_requires_pinned_current_run_values(self) -> None:
+        with mock.patch.dict(os.environ, material_environment(), clear=True):
+            self.assertEqual(REPLAY._scene6_material_binding(), material_binding())
+        invalid = material_environment()
+        invalid["MATRIX_SCENE6_MATERIAL_FIX_SHA256"] = "0" * 64
+        with mock.patch.dict(os.environ, invalid, clear=True), self.assertRaisesRegex(
+            REPLAY.TraceValidationError, "material-fix SHA256"
+        ):
+            REPLAY._scene6_material_binding()
+
     def test_replay_writes_fresh_status_and_hashed_summary(self) -> None:
         class FakeSocket:
             def __init__(self) -> None:
@@ -273,6 +305,7 @@ class TraceReplayTest(unittest.TestCase):
                     ue_pid=None,
                     camera_receipt_path=camera_receipt,
                     expected_camera_receipt_sha256=camera_sha256,
+                    render_material=material_binding(),
                 )
 
             self.assertTrue(result["passed"])
@@ -302,6 +335,8 @@ class TraceReplayTest(unittest.TestCase):
             self.assertEqual(
                 written_summary["camera_receipt"]["sha256"], camera_sha256
             )
+            self.assertEqual(written_summary["render_material"], material_binding())
+            self.assertEqual(written_status["render_material"], material_binding())
             self.assertEqual(written_status["camera_receipt"], result["camera_receipt"])
 
     def test_camera_receipt_digest_mismatch_fails_before_status_or_packets(self) -> None:
@@ -325,6 +360,7 @@ class TraceReplayTest(unittest.TestCase):
                     ue_pid=None,
                     camera_receipt_path=camera_receipt,
                     expected_camera_receipt_sha256="0" * 64,
+                    render_material=material_binding(),
                 )
 
             socket_factory.assert_not_called()
@@ -360,6 +396,7 @@ class TraceReplayTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env={**os.environ, **material_environment()},
             )
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
@@ -421,6 +458,7 @@ result = module.replay(
     ue_pid=None,
     camera_receipt_path=camera,
     expected_camera_receipt_sha256=module._sha256(camera),
+    render_material=module._scene6_material_binding(),
 )
 raise SystemExit(0 if result["passed"] else 2)
 '''
@@ -439,6 +477,7 @@ raise SystemExit(0 if result["passed"] else 2)
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=5.0,
+                env={**os.environ, **material_environment()},
             )
 
             self.assertEqual(process.returncode, 0, (process.stdout, process.stderr))
@@ -837,6 +876,19 @@ class ShellIntegrationContractTest(unittest.TestCase):
         self.assertIn("requested_viewclass=$CAMERA_VIEW_CLASS", launcher)
         self.assertIn("matrix_ue_overlay.py\" purge-stale", launcher)
         self.assertIn("matrix_ue_overlay.py\" verify-bundle", launcher)
+        self.assertIn('SCENE6_CUBE_MATERIAL_RGB="0.95,0.18,0.05"', launcher)
+        self.assertIn('SCENE6_CUBE_SCOPE_ALPHA="0.99609375"', launcher)
+        self.assertIn("SCENE6_MATERIAL_FIX_SHA256=", launcher)
+        self.assertIn("apply_urdf_visual_materials.py", launcher)
+        self.assertIn("build_matrix_ue_material_fix.sh", launcher)
+        self.assertIn("MATRIX_UE_MATERIAL_FIX_PRELOAD", launcher)
+        self.assertIn('MATRIX_G1_MATERIAL_PALETTE="$MATERIAL_PALETTE"', launcher)
+        self.assertIn("MATRIX_SCENE6_MATERIAL_PALETTE_SHA256", launcher)
+        self.assertIn("Registered G1 palette has no slot", launcher)
+        self.assertNotIn("jq", launcher)
+        run_sim = (SCRIPTS / "run_sim.sh").read_text(encoding="utf-8")
+        self.assertIn("contract_marker", run_sim)
+        self.assertIn("loaded skin {skin} palette", run_sim)
         self.assertLess(
             launcher.index("matrix_ue_overlay.py\" purge-stale"),
             launcher.index('"${STAGE_COMMAND[@]}"'),
@@ -1009,6 +1061,7 @@ class VideoPostflightTest(unittest.TestCase):
                         "render_mode": "matrix_ue_trace_replay",
                         "dimensions": {"nq": 57, "nv": 55, "nu": 43},
                         "wire_third_vector_semantics": "legacy_act_slot_zeroed",
+                        "render_material": material_binding(),
                         "source_frame_count": 10,
                         "packets": {"trace_sent": 10, "sent": 20, "expected": 20},
                         "trace": {"sha256": trace_sha},
@@ -1092,6 +1145,7 @@ class VideoPostflightTest(unittest.TestCase):
                                     "legacy_act_slot_zeroed"
                                 ),
                                 "camera_receipt": camera_binding,
+                                "render_material": material_binding(),
                             },
                             "after": {
                                 "schema_id": "matrix.physics_trace_replay.status.v2",
@@ -1106,6 +1160,7 @@ class VideoPostflightTest(unittest.TestCase):
                                 "completed": True,
                                 "passed": True,
                                 "camera_receipt": camera_binding,
+                                "render_material": material_binding(),
                             },
                         },
                         "launcher": {
