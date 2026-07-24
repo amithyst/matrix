@@ -102,6 +102,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--status-file", type=Path)
     parser.add_argument("--attach", action="store_true")
     parser.add_argument("--keep-running", action="store_true")
+    parser.add_argument(
+        "--wait-launcher-exit-timeout",
+        type=float,
+        default=0.0,
+        help=(
+            "after capture, wait this many seconds for the launched Matrix "
+            "transaction to finish successfully instead of stopping it"
+        ),
+    )
     parser.add_argument("--draw-mouse", action="store_true")
     parser.add_argument("--allow-static", action="store_true")
     parser.add_argument("--allow-short", action="store_true")
@@ -129,6 +138,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--ready-active-seconds must be non-negative")
     if args.status_max_age <= 0.0:
         parser.error("--status-max-age must be positive")
+    if (
+        args.wait_launcher_exit_timeout < 0.0
+        or not math.isfinite(args.wait_launcher_exit_timeout)
+    ):
+        parser.error("--wait-launcher-exit-timeout must be non-negative and finite")
+    if args.wait_launcher_exit_timeout > 0.0 and (args.attach or args.keep_running):
+        parser.error(
+            "--wait-launcher-exit-timeout cannot be combined with "
+            "--attach or --keep-running"
+        )
     if not 0 <= args.crf <= 51:
         parser.error("--crf must be between 0 and 51")
     if args.quality_sample_fps <= 0.0:
@@ -821,6 +840,22 @@ def _terminate_process(process: subprocess.Popen[Any], *, interrupt: bool) -> in
         return process.wait(timeout=5.0)
 
 
+def _wait_for_launcher_exit(
+    process: subprocess.Popen[Any], *, timeout_s: float
+) -> int:
+    try:
+        return_code = process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        raise VideoCaptureError(
+            f"Matrix launcher did not finish within {timeout_s:g}s after capture"
+        ) from exc
+    if return_code != 0:
+        raise VideoCaptureError(
+            f"Matrix launcher failed after capture with code {return_code}"
+        )
+    return return_code
+
+
 def _command_string(command: Sequence[str]) -> str:
     return shlex.join(str(item) for item in command)
 
@@ -985,10 +1020,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             ffmpeg_log_stream.close()
             ffmpeg_log_stream = None
 
-        status_after = _read_status(status_file)
         if launcher is not None and not args.keep_running:
-            launcher_stopped_by_recorder = True
-            _terminate_process(launcher, interrupt=False)
+            if args.wait_launcher_exit_timeout > 0.0:
+                print(
+                    "[matrix-video] waiting for launcher transaction "
+                    f"timeout={args.wait_launcher_exit_timeout:g}s",
+                    flush=True,
+                )
+                _wait_for_launcher_exit(
+                    launcher,
+                    timeout_s=args.wait_launcher_exit_timeout,
+                )
+            else:
+                launcher_stopped_by_recorder = True
+                _terminate_process(launcher, interrupt=False)
+        status_after = _read_status(status_file)
 
         probe = inspect_video(
             ffmpeg, partial, sample_fps=args.quality_sample_fps

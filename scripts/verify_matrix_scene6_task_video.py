@@ -170,6 +170,8 @@ def verify(
         raise PostflightError("unexpected replay summary schema")
     if summary.get("passed") is not True:
         raise PostflightError(f"trace replay did not pass: {summary.get('failure')}")
+    if summary.get("completion") != "scheduled_replay_complete":
+        raise PostflightError("trace replay did not complete its scheduled final hold")
     if summary.get("physics_execution") != "offline_mujoco_persistent_world":
         raise PostflightError("replay summary physics boundary drifted")
     if summary.get("render_mode") != "matrix_ue_trace_replay":
@@ -184,8 +186,9 @@ def verify(
         or frame_count <= 0
         or not isinstance(packets, dict)
         or packets.get("trace_sent") != frame_count
+        or packets.get("sent") != packets.get("expected")
     ):
-        raise PostflightError("replay did not send every source trace frame")
+        raise PostflightError("replay did not complete every scheduled packet")
 
     if restore.get("schema_id") != "matrix.physics_trace_model_stage.v1":
         raise PostflightError("unexpected model restore schema")
@@ -268,6 +271,27 @@ def verify(
         or status_before.get("dds_lowcmd_active") is not False
     ):
         raise PostflightError("video readiness lacks the explicit no-DDS replay boundary")
+    launcher = metadata.get("launcher")
+    launcher_return_code = (
+        launcher.get("return_code") if isinstance(launcher, dict) else None
+    )
+    if (
+        not isinstance(launcher, dict)
+        or isinstance(launcher_return_code, bool)
+        or launcher_return_code != 0
+        or launcher.get("stopped_by_recorder") is not False
+    ):
+        raise PostflightError("Matrix launcher did not finish naturally with code 0")
+    status_after = ((metadata.get("sonic_status") or {}).get("after") or {})
+    if (
+        status_after.get("active_lowcmd") is not False
+        or status_after.get("completed") is not True
+        or status_after.get("passed") is not True
+        or status_after.get("active_lowcmd_semantics")
+        != "legacy_recorder_readiness_gate_no_dds_lowcmd"
+        or status_after.get("dds_lowcmd_active") is not False
+    ):
+        raise PostflightError("Matrix replay final status is not complete and inactive")
 
     repository = _git_identity(matrix_root)
     udp_inodes = _udp_9999_inodes()

@@ -76,7 +76,10 @@ bash scripts/record_matrix_scene6_task_video.sh \
 质量门禁和 preview 逻辑，但 readiness 使用本回放器的新鲜 status：
 `--ready status` / `active_lowcmd=true`。视频固定 25 FPS；录制时长由
 `pre-roll + trace_frame_count / 25 + tail` 计算。replay final hold 必须长于整个录制
-窗口，因此录制器不会因 launcher 提前退出而截断末尾放置画面。
+窗口，因此录制器不会因 launcher 提前退出而截断末尾放置画面。视频捕获结束后，
+scene6 wrapper 会继续等待 launcher 自然完成 final hold、写完 summary/final status、
+关闭 UE 并恢复运行时事务；等待超时或 launcher 非零退出都会 fail closed，不会生成
+合格回执。
 
 对输出 `task.mp4`，主要产物为：
 
@@ -93,4 +96,6 @@ bash scripts/record_matrix_scene6_task_video.sh \
 最终验收至少检查 MP4 分辨率、25 FPS、时长/帧数、质量 `passed=true`，并将
 trace、模型、视频三个 SHA256 一起保存。postflight 还要求 Matrix Git checkout clean、
 UDP 9999 已释放，并且 UE supervisor、replayer、stock MuJoCo/MC 都无残留。运行时
-staging state、恢复或 cleanup 任一失败时不得把视频标成完成品。
+staging state、恢复或 cleanup 任一失败时不得把视频标成完成品。合格 replay 必须是
+`completion=scheduled_replay_complete`，launcher 返回 0 且不是录制器强停；final
+status 必须 `completed=true`、`passed=true`、`active_lowcmd=false`。

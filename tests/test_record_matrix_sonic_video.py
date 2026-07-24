@@ -371,6 +371,27 @@ class MatrixSonicVideoTest(unittest.TestCase):
             self.assertIn("fps=0.5,scale=384:-1,tile=5x1", command)
             self.assertFalse((root / ".capture.preview.partial.jpg").exists())
 
+    def test_wait_for_launcher_exit_requires_zero_exit(self) -> None:
+        launcher = mock.Mock()
+        launcher.wait.return_value = 0
+
+        self.assertEqual(
+            MODULE._wait_for_launcher_exit(launcher, timeout_s=12.5),
+            0,
+        )
+        launcher.wait.assert_called_once_with(timeout=12.5)
+
+        launcher.wait.return_value = 143
+        with self.assertRaisesRegex(MODULE.VideoCaptureError, "code 143"):
+            MODULE._wait_for_launcher_exit(launcher, timeout_s=12.5)
+
+    def test_wait_for_launcher_exit_fails_closed_on_timeout(self) -> None:
+        launcher = mock.Mock()
+        launcher.wait.side_effect = subprocess.TimeoutExpired("launcher", 8.0)
+
+        with self.assertRaisesRegex(MODULE.VideoCaptureError, "within 8s"):
+            MODULE._wait_for_launcher_exit(launcher, timeout_s=8.0)
+
 
 if __name__ == "__main__":
     unittest.main()

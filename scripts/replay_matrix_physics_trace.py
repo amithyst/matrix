@@ -545,91 +545,106 @@ def replay(
 
     failure: str | None = None
     clean_final_hold_stop = False
-    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        _atomic_json(status_path, status(active=True, completed=False, passed=None))
-        deadline = time.monotonic()
-        last_status_write = 0.0
-        for phase, source_index, frame in sequence:
-            check_runtime()
-            current_source_index = source_index
-            payload = pack_render_packet(frame)
-            sent = sender.sendto(payload, RENDER_ADDRESS)
-            if sent != len(payload):
-                raise RuntimeError(f"partial UDP send: {sent}/{len(payload)} bytes")
-            packet_count += 1
-            if phase == "trace":
-                trace_packets_sent += 1
-                trace_complete = trace_packets_sent == trace_packets
-            now = time.monotonic()
-            if now - last_status_write >= 0.2 or packet_count == expected_packets:
-                _atomic_json(
-                    status_path,
-                    status(active=True, completed=False, passed=None),
-                )
-                last_status_write = now
-            deadline += interval_s
-            sleep_until(deadline)
-    except ReplayFinalHoldStopped:
-        clean_final_hold_stop = True
-    except (OSError, RuntimeError) as exc:
-        failure = str(exc)
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            _atomic_json(
+                status_path,
+                status(active=True, completed=False, passed=None),
+            )
+            deadline = time.monotonic()
+            last_status_write = 0.0
+            for phase, source_index, frame in sequence:
+                check_runtime()
+                current_source_index = source_index
+                payload = pack_render_packet(frame)
+                sent = sender.sendto(payload, RENDER_ADDRESS)
+                if sent != len(payload):
+                    raise RuntimeError(
+                        f"partial UDP send: {sent}/{len(payload)} bytes"
+                    )
+                packet_count += 1
+                if phase == "trace":
+                    trace_packets_sent += 1
+                    trace_complete = trace_packets_sent == trace_packets
+                now = time.monotonic()
+                if (
+                    now - last_status_write >= 0.2
+                    or packet_count == expected_packets
+                ):
+                    _atomic_json(
+                        status_path,
+                        status(active=True, completed=False, passed=None),
+                    )
+                    last_status_write = now
+                deadline += interval_s
+                sleep_until(deadline)
+        except ReplayFinalHoldStopped:
+            clean_final_hold_stop = True
+        except (OSError, RuntimeError) as exc:
+            failure = str(exc)
+        finally:
+            sender.close()
+
+        passed = (
+            failure is None
+            and trace_complete
+            and (clean_final_hold_stop or packet_count == expected_packets)
+        )
+        finished_at = datetime.now(timezone.utc)
+        wall_duration_s = max(0.0, time.monotonic() - started_monotonic)
+        summary = {
+            "schema_id": SUMMARY_SCHEMA,
+            "passed": passed,
+            "failure": failure,
+            "completion": (
+                "trace_complete_final_hold_stopped_by_launcher"
+                if clean_final_hold_stop
+                else "scheduled_replay_complete"
+                if passed
+                else "failed"
+            ),
+            "physics_execution": PHYSICS_EXECUTION,
+            "render_mode": RENDER_MODE,
+            "manipulation_assistance": (
+                "contact_gated_wrist_cube_weld_and_anchored_stance"
+            ),
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "wall_duration_s": round(wall_duration_s, 6),
+            "fps": REPLAY_FPS,
+            "udp": {"host": RENDER_ADDRESS[0], "port": RENDER_ADDRESS[1]},
+            "trace": inspection["trace"],
+            "model": inspection["render_robot_model"],
+            "scene_model": inspection["model"],
+            "dimensions": inspection["dimensions"],
+            "source_frame_count": trace_packets,
+            "source_duration_s": inspection["source_duration_s"],
+            "trace_time_range_s": inspection["trace_time_range_s"],
+            "packets": {
+                "pre_roll": pre_roll_packets,
+                "trace": trace_packets,
+                "trace_sent": trace_packets_sent,
+                "final_hold": final_hold_packets,
+                "expected": expected_packets,
+                "sent": packet_count,
+            },
+            "status_path": str(status_path),
+        }
+        # The recorder stops the whole launcher process group. run_sim then
+        # sends a second SIGTERM to its managed replay child during cleanup.
+        # Keep the cooperative handlers installed until both receipts are
+        # atomically durable so that repeated shutdown signals cannot leave a
+        # zero-byte temporary summary behind.
+        _atomic_json(summary_path, summary)
+        _atomic_json(
+            status_path,
+            status(active=False, completed=True, passed=passed),
+        )
+        return summary
     finally:
-        sender.close()
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
-
-    passed = (
-        failure is None
-        and trace_complete
-        and (clean_final_hold_stop or packet_count == expected_packets)
-    )
-    finished_at = datetime.now(timezone.utc)
-    wall_duration_s = max(0.0, time.monotonic() - started_monotonic)
-    summary = {
-        "schema_id": SUMMARY_SCHEMA,
-        "passed": passed,
-        "failure": failure,
-        "completion": (
-            "trace_complete_final_hold_stopped_by_launcher"
-            if clean_final_hold_stop
-            else "scheduled_replay_complete"
-            if passed
-            else "failed"
-        ),
-        "physics_execution": PHYSICS_EXECUTION,
-        "render_mode": RENDER_MODE,
-        "manipulation_assistance": (
-            "contact_gated_wrist_cube_weld_and_anchored_stance"
-        ),
-        "started_at": started_at.isoformat(),
-        "finished_at": finished_at.isoformat(),
-        "wall_duration_s": round(wall_duration_s, 6),
-        "fps": REPLAY_FPS,
-        "udp": {"host": RENDER_ADDRESS[0], "port": RENDER_ADDRESS[1]},
-        "trace": inspection["trace"],
-        "model": inspection["render_robot_model"],
-        "scene_model": inspection["model"],
-        "dimensions": inspection["dimensions"],
-        "source_frame_count": trace_packets,
-        "source_duration_s": inspection["source_duration_s"],
-        "trace_time_range_s": inspection["trace_time_range_s"],
-        "packets": {
-            "pre_roll": pre_roll_packets,
-            "trace": trace_packets,
-            "trace_sent": trace_packets_sent,
-            "final_hold": final_hold_packets,
-            "expected": expected_packets,
-            "sent": packet_count,
-        },
-        "status_path": str(status_path),
-    }
-    _atomic_json(summary_path, summary)
-    _atomic_json(
-        status_path,
-        status(active=False, completed=True, passed=passed),
-    )
-    return summary
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

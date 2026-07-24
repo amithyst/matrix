@@ -321,6 +321,67 @@ class TraceReplayTest(unittest.TestCase):
                 "trace_complete_final_hold_stopped_by_launcher",
             )
 
+    def test_repeated_sigterm_during_summary_write_keeps_receipts_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace, _scene, _robot = write_fixture(root, frame_count=1)
+            status = root / "status.json"
+            summary = root / "summary.json"
+            child = r'''
+import importlib.util
+import os
+from pathlib import Path
+import signal
+import sys
+
+script, trace, status, summary = map(Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("matrix_replay_signal_test", script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+original_atomic_json = module._atomic_json
+
+def interrupt_summary(path, payload):
+    if payload.get("schema_id") == module.SUMMARY_SCHEMA:
+        os.kill(os.getpid(), signal.SIGTERM)
+    original_atomic_json(path, payload)
+
+module._atomic_json = interrupt_summary
+validated = module.validate_trace(trace)
+result = module.replay(
+    validated,
+    status_path=status,
+    summary_path=summary,
+    pre_roll_s=0.0,
+    final_hold_s=0.0,
+    ue_pid=None,
+)
+raise SystemExit(0 if result["passed"] else 2)
+'''
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    child,
+                    os.fspath(SCRIPTS / "replay_matrix_physics_trace.py"),
+                    os.fspath(trace),
+                    os.fspath(status),
+                    os.fspath(summary),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5.0,
+            )
+
+            self.assertEqual(process.returncode, 0, (process.stdout, process.stderr))
+            written_summary = json.loads(summary.read_text(encoding="utf-8"))
+            written_status = json.loads(status.read_text(encoding="utf-8"))
+            self.assertTrue(written_summary["passed"])
+            self.assertTrue(written_status["completed"])
+            self.assertTrue(written_status["passed"])
+            self.assertFalse(written_status["active_lowcmd"])
+
 
 class ModelStageTest(unittest.TestCase):
     def test_rejects_noncanonical_full_hand_actuator_order(self) -> None:
@@ -473,6 +534,7 @@ class ShellIntegrationContractTest(unittest.TestCase):
         self.assertIn("--fps 25", source)
         self.assertIn("frames / 25.0", source)
         self.assertIn("hold > capture", source)
+        self.assertIn("--wait-launcher-exit-timeout", source)
         self.assertIn("not live SONIC manipulation", source)
         self.assertNotIn("jq", source)
         self.assertIn("verify_matrix_scene6_task_video.py", source)
@@ -521,12 +583,12 @@ class VideoPostflightTest(unittest.TestCase):
                         "schema_id": "matrix.physics_trace_replay.summary.v1",
                         "passed": True,
                         "failure": None,
-                        "completion": "trace_complete_final_hold_stopped_by_launcher",
+                        "completion": "scheduled_replay_complete",
                         "physics_execution": "offline_mujoco_persistent_world",
                         "render_mode": "matrix_ue_trace_replay",
                         "dimensions": {"nq": 57, "nv": 55, "nu": 43},
                         "source_frame_count": 10,
-                        "packets": {"trace_sent": 10},
+                        "packets": {"trace_sent": 10, "sent": 20, "expected": 20},
                         "trace": {"sha256": trace_sha},
                         "model": {"sha256": "b" * 64},
                         "scene_model": {"sha256": "c" * 64},
@@ -573,7 +635,20 @@ class VideoPostflightTest(unittest.TestCase):
                                     "legacy_recorder_readiness_gate_no_dds_lowcmd"
                                 ),
                                 "dds_lowcmd_active": False,
-                            }
+                            },
+                            "after": {
+                                "active_lowcmd": False,
+                                "active_lowcmd_semantics": (
+                                    "legacy_recorder_readiness_gate_no_dds_lowcmd"
+                                ),
+                                "dds_lowcmd_active": False,
+                                "completed": True,
+                                "passed": True,
+                            },
+                        },
+                        "launcher": {
+                            "return_code": 0,
+                            "stopped_by_recorder": False,
                         },
                     }
                 ),
@@ -588,6 +663,58 @@ class VideoPostflightTest(unittest.TestCase):
                 matrix_root=matrix,
             )
             self.assertTrue(receipt["passed"])
+
+            summary_payload = json.loads(summary.read_text(encoding="utf-8"))
+            summary_payload["completion"] = (
+                "trace_complete_final_hold_stopped_by_launcher"
+            )
+            summary.write_text(json.dumps(summary_payload), encoding="utf-8")
+            with self.assertRaisesRegex(POSTFLIGHT.PostflightError, "final hold"):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    matrix_root=matrix,
+                )
+            summary_payload["completion"] = "scheduled_replay_complete"
+            summary.write_text(json.dumps(summary_payload), encoding="utf-8")
+
+            metadata_payload = json.loads(metadata.read_text(encoding="utf-8"))
+            metadata_payload["launcher"]["return_code"] = 143
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
+            with self.assertRaisesRegex(POSTFLIGHT.PostflightError, "naturally"):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    matrix_root=matrix,
+                )
+            metadata_payload["launcher"]["return_code"] = 0
+            metadata_payload["launcher"]["stopped_by_recorder"] = True
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
+            with self.assertRaisesRegex(POSTFLIGHT.PostflightError, "naturally"):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    matrix_root=matrix,
+                )
+            metadata_payload["launcher"]["stopped_by_recorder"] = False
+            metadata_payload["sonic_status"]["after"]["completed"] = False
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
+            with self.assertRaisesRegex(POSTFLIGHT.PostflightError, "final status"):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    matrix_root=matrix,
+                )
+            metadata_payload["sonic_status"]["after"]["completed"] = True
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
 
             payload = json.loads(summary.read_text(encoding="utf-8"))
             payload["passed"] = False

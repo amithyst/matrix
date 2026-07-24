@@ -21,6 +21,7 @@ CAPTURE_TAIL_SECONDS="1"
 FINAL_HOLD_SECONDS=""
 WINDOW_TIMEOUT_SECONDS="120"
 READY_TIMEOUT_SECONDS="180"
+LAUNCHER_EXIT_TIMEOUT_SECONDS=""
 
 usage() {
     echo "Usage: $0 --trace FILE [--model FILE] [--output FILE]" \
@@ -46,6 +47,7 @@ while (($#)); do
         --final-hold) FINAL_HOLD_SECONDS="${2:-}"; shift 2 ;;
         --window-timeout) WINDOW_TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
         --ready-timeout) READY_TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
+        --launcher-exit-timeout) LAUNCHER_EXIT_TIMEOUT_SECONDS="${2:-}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *)
             echo "[ERROR] Unknown argument: $1" >&2
@@ -73,6 +75,12 @@ if [[ -n "$FINAL_HOLD_SECONDS" \
     && ! "$FINAL_HOLD_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] --final-hold must be a non-negative number:" \
         "$FINAL_HOLD_SECONDS" >&2
+    exit 2
+fi
+if [[ -n "$LAUNCHER_EXIT_TIMEOUT_SECONDS" \
+    && ! "$LAUNCHER_EXIT_TIMEOUT_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "[ERROR] --launcher-exit-timeout must be a non-negative number:" \
+        "$LAUNCHER_EXIT_TIMEOUT_SECONDS" >&2
     exit 2
 fi
 MATRIX_ROOT="$(realpath -- "$MATRIX_ROOT")"
@@ -169,6 +177,17 @@ if [[ -z "$FINAL_HOLD_SECONDS" ]]; then
             'BEGIN { printf "%.3f", duration + 5.0 }'
     )"
 fi
+if [[ -z "$LAUNCHER_EXIT_TIMEOUT_SECONDS" ]]; then
+    LAUNCHER_EXIT_TIMEOUT_SECONDS="$(
+        awk -v hold="$FINAL_HOLD_SECONDS" \
+            'BEGIN { printf "%.3f", hold + 60.0 }'
+    )"
+fi
+if ! awk -v timeout="$LAUNCHER_EXIT_TIMEOUT_SECONDS" \
+    'BEGIN { exit !(timeout > 0.0) }'; then
+    echo "[ERROR] --launcher-exit-timeout must be positive" >&2
+    exit 2
+fi
 if ! awk -v hold="$FINAL_HOLD_SECONDS" -v capture="$CAPTURE_DURATION" \
     'BEGIN { exit !(hold > capture) }'; then
     echo "[ERROR] --final-hold must be longer than the derived capture duration" \
@@ -187,6 +206,7 @@ RECORDER_COMMAND=(
     --window-timeout "$WINDOW_TIMEOUT_SECONDS"
     --ready status
     --ready-timeout "$READY_TIMEOUT_SECONDS"
+    --wait-launcher-exit-timeout "$LAUNCHER_EXIT_TIMEOUT_SECONDS"
     --status-file "$STATUS_FILE"
     --notes "TwinBot scene6 task; physics_execution=offline_mujoco_persistent_world; render_mode=matrix_ue_trace_replay; grasp=contact-gated constrained + anchored stance"
 )
