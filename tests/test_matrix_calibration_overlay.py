@@ -405,9 +405,12 @@ class OverlayLayoutTest(unittest.TestCase):
     def test_strategy_targets_are_page_scoped_and_outside_crosshair(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
         layout = MODULE.overlay_layout(geometry)
-        for slot in ("locomotion", "recovery"):
+        for slot, count in (
+            ("locomotion", MODULE._MAX_LOCOMOTION_POLICY_BUTTONS),
+            ("recovery", MODULE._MAX_RECOVERY_POLICY_BUTTONS),
+        ):
             rectangles = []
-            for index in range(3):
+            for index in range(count):
                 name = f"{slot}_policy_{index}"
                 x, y, width, height = layout[name]
                 rectangles.append(layout[name])
@@ -847,6 +850,16 @@ class OverlayStateTest(unittest.TestCase):
                                     "resident": True,
                                     "available": True,
                                 },
+                                {
+                                    "policy_id": "amp",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                                {
+                                    "policy_id": "amp-flat-v3",
+                                    "resident": True,
+                                    "available": True,
+                                },
                             ],
                         },
                     ],
@@ -869,7 +882,7 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertEqual(
             [candidate.policy_id for candidate in model.recovery_candidates],
-            ["kungfu", "host"],
+            ["kungfu", "host", "amp", "amp-flat-v3"],
         )
         self.assertFalse(model.policy_enabled("host"))
 
@@ -1074,6 +1087,95 @@ class OverlayStateTest(unittest.TestCase):
 
         self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
         publisher.publish_strategy_select.assert_not_called()
+
+    def test_fourth_recovery_candidate_is_drawn_and_selectable(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        recovery_candidates = tuple(
+            MODULE.StrategyPolicyModel(policy_id, True, True)
+            for policy_id in ("kungfu", "host", "amp", "amp-flat-v3")
+        )
+        model = MODULE.StrategyLoadoutModel(
+            available=True,
+            status="ready",
+            active_slot="recovery",
+            locomotion_policy_id="sonic",
+            recovery_policy_id="kungfu",
+            locomotion_candidates=(),
+            recovery_candidates=recovery_candidates,
+            pending_policy_id=None,
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+
+        overlay._draw_loadout_page(layout, model)
+
+        fourth = next(
+            call
+            for call in overlay._draw_button.call_args_list
+            if call.args[1] == "recovery_policy_3"
+        )
+        self.assertEqual(fourth.args[2], "AMP flat_v3")
+        self.assertFalse(fourth.kwargs["disabled"])
+
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._last_layout = layout
+        overlay._active_page = "loadout"
+        overlay._last_strategy_model = model
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        overlay._visible = True
+        overlay._font_slider_dragging = False
+        publisher = mock.Mock()
+        x, y, width, height = layout["recovery_policy_3"]
+        events = []
+        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
+            event = MODULE.XEvent()
+            event.type = event_type
+            event.xbutton.button = 1
+            event.xbutton.window = 2
+            event.xbutton.x_root = x + width // 2
+            event.xbutton.y_root = y + height // 2
+            events.append(event)
+
+        overlay._x11.XPending.side_effect = lambda _display: len(events)
+
+        def next_event(_display, destination):
+            event = events.pop(0)
+            MODULE.ctypes.memmove(
+                destination,
+                MODULE.ctypes.byref(event),
+                MODULE.ctypes.sizeof(event),
+            )
+
+        overlay._x11.XNextEvent.side_effect = next_event
+
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
+        publisher.publish_strategy_select.assert_called_once_with(
+            "recovery",
+            "amp-flat-v3",
+        )
 
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):

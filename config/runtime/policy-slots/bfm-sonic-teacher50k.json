@@ -1,5 +1,5 @@
 {
-  "schema": "matrix.locomotion-policy-candidate.v1",
+  "schema": "matrix.locomotion-policy-candidate.v2",
   "policy_id": "bfm-sonic-teacher50k",
   "display_name": "BFM SONIC Teacher50k",
   "slot": "locomotion",
@@ -11,6 +11,18 @@
     "root_env": "MATRIX_BFM_SONIC_SOURCE_ROOT",
     "checkpoint_path_hint": "/vepfs/users/fuhuiqiao/runs/bfm-sonic-t2-activeedge-formal-8h20-50k-retry2-20260715_033852/sonic/model_step_050000.pt"
   },
+  "runtime_sources": [
+    {
+      "repository": "ssh://git@gitlab.xvirobotics.com:2222/bfms/bfm-sonic-realscan-play.git",
+      "commit": "850a71bef1e1472aaeb3ff4cb9004d9848830cfc",
+      "root_env": "MATRIX_BFM_RESCAN_SOURCE_ROOT"
+    },
+    {
+      "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/robo-pfnn.git",
+      "commit": "eb1b8b8001a221d2147f8daa073ca447acc8649e",
+      "root_env": "MATRIX_ROBO_PFNN_SOURCE_ROOT"
+    }
+  ],
   "artifacts": [
     {
       "name": "checkpoint",
@@ -25,19 +37,60 @@
       "executable": false
     },
     {
+      "name": "teacher_onnx",
+      "path_env": "MATRIX_BFM_SONIC_TEACHER_ONNX",
+      "sha256": "edbec19062d6c34621dd97df864c596d29937432d8a019dd949d03785d9cdc45",
+      "executable": false
+    },
+    {
       "name": "runtime_adapter",
       "path_env": "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
-      "sha256": null,
+      "sha256": "3375ffc19f68cc5a2be5541712af656620dcbff27ff6c7209573ac1b395a4dae",
       "executable": true
+    },
+    {
+      "name": "g1_xml",
+      "path_env": "MATRIX_BFM_SONIC_G1_XML",
+      "sha256": "8c586e4747da85804180fe44d8692e0fd8231356728b6327e256dca498087a78",
+      "executable": false
+    },
+    {
+      "name": "formal_ik",
+      "path_env": "MATRIX_BFM_SONIC_FORMAL_IK",
+      "sha256": "c8776f1e7651a4f179ea75e17b9746c41fa77a15be2cacf5809fe648340a7ab2",
+      "executable": false
+    }
+  ],
+  "trees": [
+    {
+      "name": "pfnn_weights",
+      "path_env": "MATRIX_BFM_SONIC_PFNN_WEIGHTS",
+      "sha256": "d1d0a7255a2f8898e81522570a09a3b56624fd7b955a2d7d02b87800f47585cb",
+      "file_count": 305
     }
   ],
   "runtime_contract": {
     "adapter_protocol": "matrix.locomotion-policy-writer.v1",
-    "decoder_input_dim": 1093,
-    "token_dim": 64,
-    "deployable_proprio_dim": 930,
+    "model_input_dim": 1790,
+    "tokenizer_dim": 761,
+    "command_dim": 580,
+    "height_map_dim": 121,
+    "orientation_dim": 60,
+    "actor_observation_dim": 1029,
+    "history_length": 10,
     "compatibility_zero_dim": 99,
     "action_dim": 29,
+    "action_clip": 20,
+    "activation_blend_seconds": 0.1,
+    "activation_contract": "current-lowstate-smoothstep-no-teleport",
+    "standby_history_contract": "repeat-current-frame-zero-unapplied-actions",
+    "turn_reference_contract": "yaw-only-pfnn-forward-seed-v1",
+    "turn_reference_forward_mps": 0.00051,
+    "command_heading_contract": "matrix-wire-facing-formal7168-pd-v2",
+    "command_yaw_gain": 4.0,
+    "command_yaw_limit_rad_s": 1.5,
+    "turn_command_yaw_limit_rad_s": 0.6,
+    "turn_command_yaw_damping_seconds": 0.1,
     "proxy99_exact_zero": true
   },
   "evidence": {

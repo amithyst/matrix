@@ -20,6 +20,7 @@ from matrix_external_control import (
     ExternalInputToken,
     ExternalInputState,
     GAMEPAD_AXIS_FIELDS,
+    GAMEPAD_BUTTON_FIELDS,
     KEYBOARD_FIELDS,
     MAX_PACKET_BYTES,
     PROTOCOL,
@@ -39,6 +40,21 @@ _NEUTRAL_WARMUP_SECONDS = 0.12
 # This is a bounded failure deadline, not a guessed provider warmup.  Readiness
 # comes only from the provider's exact-token two-frame acknowledgement.
 _PROVIDER_GATE_TIMEOUT_SECONDS = 1.0
+ENGINE_INPUT_PROTOCOL = "matrix-engine-input/v1"
+ENGINE_INPUT_MAX_PACKET_BYTES = 4096
+ENGINE_KEYBOARD_FIELDS = (
+    "w",
+    "a",
+    "s",
+    "d",
+    "q",
+    "e",
+    "v",
+    "ctrl",
+    "alt",
+    "shift",
+    "escape",
+)
 
 
 def _read_capability(path: Path) -> str:
@@ -101,6 +117,20 @@ def default_endpoint(profile: str) -> tuple[Path, Path]:
     return runtime_root / f"{profile}.sock", runtime_root / f"{profile}.cap"
 
 
+def default_engine_endpoint(profile: str) -> tuple[Path, Path]:
+    if not isinstance(profile, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,64}",
+        profile,
+    ):
+        raise ValueError(
+            "profile must contain only letters, digits, dot, underscore, or dash"
+        )
+    runtime_root = Path(
+        os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())
+    ) / f"matrix-engine-input-{os.getuid()}"
+    return runtime_root / f"{profile}.sock", runtime_root / f"{profile}.cap"
+
+
 def _finite(value: object, *, name: str, minimum: float, maximum: float) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{name} must be numeric")
@@ -108,6 +138,116 @@ def _finite(value: object, *, name: str, minimum: float, maximum: float) -> floa
     if not math.isfinite(number) or not minimum <= number <= maximum:
         raise ValueError(f"{name} must be finite and in [{minimum:g}, {maximum:g}]")
     return number
+
+
+class MatrixEngineInputClient:
+    """One-request client for the pre-UE uinput bridge."""
+
+    def __init__(
+        self,
+        endpoint: Path,
+        capability_file: Path,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        if not endpoint.is_absolute() or not capability_file.is_absolute():
+            raise ValueError("engine endpoint and capability must be absolute")
+        self.endpoint = endpoint
+        self.capability_file = capability_file
+        self.timeout_seconds = _finite(
+            timeout_seconds,
+            name="timeout_seconds",
+            minimum=0.05,
+            maximum=30.0,
+        )
+        self._socket: socket.socket | None = None
+        self._capability: str | None = None
+        self._sequence = 0
+
+    def connect(self) -> None:
+        if self._socket is not None:
+            return
+        capability = _read_capability(self.capability_file)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        connection.settimeout(self.timeout_seconds)
+        try:
+            connection.connect(os.fspath(self.endpoint))
+        except BaseException:
+            connection.close()
+            raise
+        self._socket = connection
+        self._capability = capability
+
+    def request(
+        self,
+        action: str,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        if self._socket is None or self._capability is None:
+            raise RuntimeError("engine-input client is not connected")
+        self._sequence += 1
+        encoded = json.dumps(
+            {
+                "protocol": ENGINE_INPUT_PROTOCOL,
+                "sequence": self._sequence,
+                "capability": self._capability,
+                "action": action,
+                "payload": payload,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > ENGINE_INPUT_MAX_PACKET_BYTES:
+            raise ValueError("engine-input request is too large")
+        sent = self._socket.send(encoded)
+        if sent != len(encoded):
+            raise RuntimeError("partial engine-input request")
+        raw = self._socket.recv(ENGINE_INPUT_MAX_PACKET_BYTES + 1)
+        if not raw or len(raw) > ENGINE_INPUT_MAX_PACKET_BYTES:
+            raise RuntimeError("engine-input response size is invalid")
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("engine-input response is malformed") from exc
+        if (
+            not isinstance(response, dict)
+            or set(response)
+            != {
+                "protocol",
+                "sequence",
+                "ok",
+                "code",
+                "message",
+                "data",
+            }
+            or response.get("protocol") != ENGINE_INPUT_PROTOCOL
+            or response.get("sequence") != self._sequence
+            or type(response.get("ok")) is not bool
+            or not isinstance(response.get("code"), str)
+            or not isinstance(response.get("message"), str)
+            or not isinstance(response.get("data"), dict)
+        ):
+            raise RuntimeError("engine-input response schema is invalid")
+        if response["ok"] is not True:
+            raise RuntimeError(
+                f"{response['code']}: {response['message']}"
+            )
+        return response
+
+    def close(self) -> None:
+        connection = self._socket
+        self._socket = None
+        self._capability = None
+        if connection is not None:
+            connection.close()
+
+    def __enter__(self) -> "MatrixEngineInputClient":
+        self.connect()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 class MatrixControlClient:
@@ -407,6 +547,8 @@ def _state_with_gamepad(args: argparse.Namespace) -> ExternalInputState:
     mapping = _connected_neutral_gamepad_state().to_mapping()
     for name in GAMEPAD_AXIS_FIELDS:
         mapping["gamepad"]["axes"][name] = getattr(args, name)
+    for name in getattr(args, "button", ()):
+        mapping["gamepad"]["buttons"][name] = True
     return ExternalInputState.from_mapping(mapping)
 
 
@@ -603,16 +745,23 @@ def _hold_state(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
         "--profile",
         default=os.environ.get("MATRIX_PROFILE", "local"),
     )
     parser.add_argument("--socket", type=Path)
     parser.add_argument("--capability-file", type=Path)
+    parser.add_argument("--engine-socket", type=Path)
+    parser.add_argument("--engine-capability-file", type=Path)
     parser.add_argument("--timeout", type=float, default=1.0)
     subparsers = parser.add_subparsers(dest="action", required=True)
-    subparsers.add_parser("status", help="show broker status")
+    status = subparsers.add_parser("status", help="show broker status")
+    status.add_argument(
+        "--engine",
+        action="store_true",
+        help="show the pre-enumerated uinput bridge status",
+    )
 
     key = subparsers.add_parser("key", help="hold or double-tap a virtual key")
     key.add_argument("key", choices=KEYBOARD_FIELDS)
@@ -625,17 +774,38 @@ def _parse_args() -> argparse.Namespace:
     key.add_argument("--seconds", type=float, default=0.50)
     key.add_argument("--double", action="store_true")
     key.add_argument("--tap-gap", type=float, default=0.08)
+    key.add_argument(
+        "--engine",
+        action="store_true",
+        help="inject into UE through the pre-enumerated uinput bridge",
+    )
 
     mouse = subparsers.add_parser("mouse", help="send a virtual mouse delta/button")
     mouse.add_argument("--dx", type=float, default=0.0)
     mouse.add_argument("--dy", type=float, default=0.0)
     mouse.add_argument("--button", choices=("left", "middle", "right"))
     mouse.add_argument("--seconds", type=float, default=0.08)
+    mouse.add_argument(
+        "--engine",
+        action="store_true",
+        help="inject into UE through the pre-enumerated uinput bridge",
+    )
 
     gamepad = subparsers.add_parser("gamepad", help="hold virtual gamepad axes")
     for name in GAMEPAD_AXIS_FIELDS:
         gamepad.add_argument(f"--{name.replace('_', '-')}", type=float, default=0.0)
+    gamepad.add_argument(
+        "--button",
+        action="append",
+        choices=GAMEPAD_BUTTON_FIELDS,
+        default=[],
+    )
     gamepad.add_argument("--seconds", type=float, default=0.50)
+    gamepad.add_argument(
+        "--engine",
+        action="store_true",
+        help="inject into UE through the pre-enumerated uinput bridge",
+    )
 
     command = subparsers.add_parser("command", help="queue an MC-style command")
     command.add_argument("command")
@@ -653,6 +823,18 @@ def _resolved_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     capability = args.capability_file or Path(
         os.environ.get("MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE")
         or os.environ.get("MATRIX_EXTERNAL_CONTROL_CAPABILITY_FILE")
+        or default_capability
+    )
+    return endpoint, capability
+
+
+def _resolved_engine_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    default_socket, default_capability = default_engine_endpoint(args.profile)
+    endpoint = args.engine_socket or Path(
+        os.environ.get("MATRIX_ENGINE_INPUT_SOCKET") or default_socket
+    )
+    capability = args.engine_capability_file or Path(
+        os.environ.get("MATRIX_ENGINE_INPUT_CAPABILITY_FILE")
         or default_capability
     )
     return endpoint, capability
@@ -766,8 +948,101 @@ def _wait_for_command_terminal(
     ) from poll_failure
 
 
+def _run_engine_action(args: argparse.Namespace) -> int:
+    if args.action not in {"status", "key", "mouse", "gamepad"}:
+        raise ValueError("engine input supports status, key, mouse, or gamepad")
+    endpoint, capability = _resolved_engine_paths(args)
+    if args.action == "status":
+        seconds = 0.0
+        payload: dict[str, object] = {}
+    elif args.action == "key":
+        if args.key not in ENGINE_KEYBOARD_FIELDS:
+            raise ValueError(f"{args.key!r} is not an engine keyboard key")
+        seconds = _finite(
+            args.seconds,
+            name="seconds",
+            minimum=0.01,
+            maximum=10.0,
+        )
+        tap_gap = _finite(
+            args.tap_gap,
+            name="tap_gap",
+            minimum=0.04,
+            maximum=0.10,
+        )
+        payload = {
+            "key": args.key,
+            "modifiers": list(args.modifier),
+            "seconds": seconds,
+            "double": bool(args.double),
+            "tap_gap": tap_gap,
+        }
+    elif args.action == "mouse":
+        seconds = _finite(
+            args.seconds,
+            name="seconds",
+            minimum=0.02,
+            maximum=10.0,
+        )
+        payload = {
+            "dx": _finite(
+                args.dx,
+                name="dx",
+                minimum=-4096.0,
+                maximum=4096.0,
+            ),
+            "dy": _finite(
+                args.dy,
+                name="dy",
+                minimum=-4096.0,
+                maximum=4096.0,
+            ),
+            "button": args.button,
+            "seconds": seconds,
+        }
+    else:
+        seconds = _finite(
+            args.seconds,
+            name="seconds",
+            minimum=0.01,
+            maximum=10.0,
+        )
+        payload = {
+            "axes": {
+                name: _finite(
+                    getattr(args, name),
+                    name=name,
+                    minimum=-1.0,
+                    maximum=1.0,
+                )
+                for name in GAMEPAD_AXIS_FIELDS
+            },
+            "buttons": list(args.button),
+            "seconds": seconds,
+        }
+    timeout = max(
+        _finite(
+            args.timeout,
+            name="timeout_seconds",
+            minimum=0.05,
+            maximum=10.0,
+        ),
+        seconds + 2.0,
+    )
+    with MatrixEngineInputClient(
+        endpoint,
+        capability,
+        timeout_seconds=timeout,
+    ) as client:
+        response = client.request(args.action, payload)
+    print(json.dumps(response, indent=2, sort_keys=True))
+    return 0
+
+
 def main() -> int:
     args = _parse_args()
+    if bool(getattr(args, "engine", False)):
+        return _run_engine_action(args)
     endpoint, capability = _resolved_paths(args)
     with MatrixControlClient(endpoint, capability, timeout_seconds=args.timeout) as client:
         if args.action == "status":

@@ -97,6 +97,10 @@ PHYSICAL_RECOVERY_AMP_CONFIG="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG:-}"
 PHYSICAL_RECOVERY_AMP_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL:-}"
 PHYSICAL_RECOVERY_AMP_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256:-}"
 PHYSICAL_RECOVERY_AMP_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256:-}"
+PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG:-}"
+PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL:-}"
+PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256:-}"
+PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256:-}"
 PHYSICAL_RECOVERY_KUNGFU_MODEL="${MATRIX_KUNGFU_RECOVERY_MODEL:-}"
 PHYSICAL_RECOVERY_KUNGFU_MOTION="${MATRIX_KUNGFU_RECOVERY_MOTION:-}"
 PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256="${MATRIX_KUNGFU_RECOVERY_MODEL_SHA256:-}"
@@ -168,12 +172,14 @@ usage() {
         "  --game-fall-recovery MODE  auto, off, sonic, or physical (Heyuan/TRNA auto uses physical for unbounded game runs)" \
         "  --game-fall-recovery-timeout SEC  Mark recovery timed out after SEC while continuing IDLE" \
         "  --physical-recovery-worker PATH  Writer-gated physical get-up worker" \
-        "  --physical-recovery-initial-controller NAME  Initial policy: host, amp, or kungfu" \
+        "  --physical-recovery-initial-controller NAME  Initial policy: host, amp, amp-flat-v3, or kungfu" \
         "  --physical-recovery-handoff NAME  Stable handoff: amp or sonic" \
         "  --physical-recovery-python PATH  Python with numpy, onnxruntime, and unitree_sdk2py" \
         "  --physical-recovery-model PATH   Primary physical get-up ONNX" \
         "  --physical-recovery-amp-config PATH  AMP dynamic-hold JSON" \
         "  --physical-recovery-amp-model PATH   AMP dynamic-hold ONNX" \
+        "  --physical-recovery-amp-flat-v3-config PATH  AMP flat_v3 JSON" \
+        "  --physical-recovery-amp-flat-v3-model PATH   AMP flat_v3 ONNX" \
         "  --physical-recovery-fallback-model PATH  Physically continuous fallback ONNX" \
         "  --physical-recovery-kungfu-model PATH  KungFuAthleteBot recovery ONNX" \
         "  --physical-recovery-kungfu-motion PATH  KungFuAthleteBot 1307 NPZ" \
@@ -238,6 +244,8 @@ while [[ $# -gt 0 ]]; do
         --physical-recovery-model) PHYSICAL_RECOVERY_MODEL="$2"; shift 2 ;;
         --physical-recovery-amp-config) PHYSICAL_RECOVERY_AMP_CONFIG="$2"; shift 2 ;;
         --physical-recovery-amp-model) PHYSICAL_RECOVERY_AMP_MODEL="$2"; shift 2 ;;
+        --physical-recovery-amp-flat-v3-config) PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG="$2"; shift 2 ;;
+        --physical-recovery-amp-flat-v3-model) PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL="$2"; shift 2 ;;
         --physical-recovery-fallback-model) PHYSICAL_RECOVERY_FALLBACK_MODEL="$2"; shift 2 ;;
         --physical-recovery-kungfu-model) PHYSICAL_RECOVERY_KUNGFU_MODEL="$2"; shift 2 ;;
         --physical-recovery-kungfu-motion) PHYSICAL_RECOVERY_KUNGFU_MOTION="$2"; shift 2 ;;
@@ -738,9 +746,9 @@ select_physical_recovery_python() {
 
 if [[ "$GAME_FALL_RECOVERY" == "physical" ]]; then
     case "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" in
-        host|amp|kungfu) ;;
+        host|amp|amp-flat-v3|kungfu) ;;
         *)
-            echo "[ERROR] Physical recovery initial controller must be host, amp, or kungfu" >&2
+            echo "[ERROR] Physical recovery initial controller must be host, amp, amp-flat-v3, or kungfu" >&2
             exit 2
             ;;
     esac
@@ -812,6 +820,41 @@ PY
             exit 2
         fi
     done
+    flat_v3_present=0
+    for value in \
+        "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
+        "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL" \
+        "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
+        "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
+        if [[ -n "$value" ]]; then
+            flat_v3_present=$((flat_v3_present + 1))
+        fi
+    done
+    if ((flat_v3_present != 0 && flat_v3_present != 4)); then
+        echo "[ERROR] AMP flat_v3 requires config, model, and both SHA256 values" >&2
+        exit 2
+    fi
+    if ((flat_v3_present == 4)); then
+        for flat_v3_file in \
+            "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
+            "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"; do
+            if [[ ! -f "$flat_v3_file" ]]; then
+                echo "[ERROR] AMP flat_v3 artifact is missing: $flat_v3_file" >&2
+                exit 1
+            fi
+        done
+        for digest in \
+            "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
+            "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "[ERROR] AMP flat_v3 SHA256 values are invalid" >&2
+                exit 2
+            fi
+        done
+    elif [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "amp-flat-v3" ]]; then
+        echo "[ERROR] amp-flat-v3 initial recovery requires its locked artifacts" >&2
+        exit 2
+    fi
     if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then
         for kungfu_file in \
             "$PHYSICAL_RECOVERY_KUNGFU_MODEL" \
@@ -1113,6 +1156,10 @@ export MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG="$PHYSICAL_RECOVERY_AMP_CONFIG"
 export MATRIX_PHYSICAL_RECOVERY_AMP_MODEL="$PHYSICAL_RECOVERY_AMP_MODEL"
 export MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256="$PHYSICAL_RECOVERY_AMP_CONFIG_SHA256"
 export MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256="$PHYSICAL_RECOVERY_AMP_MODEL_SHA256"
+export MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG="$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG"
+export MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL="$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"
+export MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256="$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256"
+export MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256="$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"
 export MATRIX_KUNGFU_RECOVERY_MODEL="$PHYSICAL_RECOVERY_KUNGFU_MODEL"
 export MATRIX_KUNGFU_RECOVERY_MOTION="$PHYSICAL_RECOVERY_KUNGFU_MOTION"
 export MATRIX_KUNGFU_RECOVERY_MODEL_SHA256="$PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256"
@@ -1267,6 +1314,203 @@ for relative in "${MUTABLE_FILES[@]}"; do
     fi
 done
 
+ENGINE_INPUT_BRIDGE_PID=""
+ENGINE_INPUT_HELPER_PID=""
+ENGINE_INPUT_RUNTIME_DIR=""
+ENGINE_INPUT_SOCKET=""
+ENGINE_INPUT_CAPABILITY_FILE=""
+ENGINE_INPUT_READY_FILE=""
+ENGINE_INPUT_LOG_FILE="$PROJECT_ROOT/outputs/matrix_engine_input_bridge.log"
+
+stop_engine_input_bridge() {
+    local child_pid
+    local poll
+    if [[ -n "$ENGINE_INPUT_BRIDGE_PID" ]]; then
+        child_pid="$ENGINE_INPUT_HELPER_PID"
+        if [[ -z "$child_pid" && -x /usr/bin/pgrep ]]; then
+            child_pid="$(
+                /usr/bin/pgrep -P "$ENGINE_INPUT_BRIDGE_PID" \
+                    | head -n 1 \
+                    || true
+            )"
+        fi
+        if [[ -n "$child_pid" ]]; then
+            kill -TERM "$child_pid" 2>/dev/null || true
+            for ((poll = 0; poll < 50; poll++)); do
+                if ! kill -0 "$child_pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.04
+            done
+            if kill -0 "$child_pid" 2>/dev/null; then
+                kill -KILL "$child_pid" 2>/dev/null || true
+            fi
+        else
+            kill -TERM "$ENGINE_INPUT_BRIDGE_PID" 2>/dev/null || true
+        fi
+        wait "$ENGINE_INPUT_BRIDGE_PID" 2>/dev/null || true
+        ENGINE_INPUT_BRIDGE_PID=""
+        ENGINE_INPUT_HELPER_PID=""
+    fi
+    for path in \
+        "$ENGINE_INPUT_READY_FILE" \
+        "$ENGINE_INPUT_SOCKET" \
+        "$ENGINE_INPUT_CAPABILITY_FILE"; do
+        if [[ -n "$path" ]]; then
+            rm -f -- "$path"
+        fi
+    done
+}
+
+start_engine_input_bridge() {
+    local enabled="${MATRIX_ENGINE_INPUT_BRIDGE:-0}"
+    local profile="${MATRIX_PROFILE:-local}"
+    local target_gid
+    local poll
+    local bridge_status
+    if [[ "$CONTROL_SOURCE" != "game" || "$enabled" == "0" ]]; then
+        return 0
+    fi
+    if [[ "$enabled" != "1" ]]; then
+        echo "[ERROR] MATRIX_ENGINE_INPUT_BRIDGE must be 0 or 1" >&2
+        return 1
+    fi
+    if [[ ! "$profile" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+        echo "[ERROR] Matrix engine-input profile is invalid: $profile" >&2
+        return 1
+    fi
+    if [[ ! -x /usr/bin/sudo || ! -x /usr/bin/python3 ]]; then
+        echo "[ERROR] Matrix engine-input bridge requires sudo and Python" >&2
+        return 1
+    fi
+    if ! /usr/bin/sudo -n test -w /dev/uinput; then
+        echo "[ERROR] Matrix engine-input bridge cannot open /dev/uinput" >&2
+        return 1
+    fi
+    ENGINE_INPUT_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/matrix-engine-input-${UID}"
+    if ! /usr/bin/python3 -I - "$ENGINE_INPUT_RUNTIME_DIR" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    path.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+metadata = path.stat(follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+    raise SystemExit("engine-input runtime path is not an owned directory")
+os.chmod(path, 0o700, follow_symlinks=False)
+if stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o700:
+    raise SystemExit("engine-input runtime directory is not private")
+PY
+    then
+        echo "[ERROR] Could not prepare private engine-input directory" >&2
+        return 1
+    fi
+    ENGINE_INPUT_SOCKET="$ENGINE_INPUT_RUNTIME_DIR/$profile.sock"
+    ENGINE_INPUT_CAPABILITY_FILE="$ENGINE_INPUT_RUNTIME_DIR/$profile.cap"
+    ENGINE_INPUT_READY_FILE="$ENGINE_INPUT_RUNTIME_DIR/$profile.ready"
+    rm -f -- \
+        "$ENGINE_INPUT_SOCKET" \
+        "$ENGINE_INPUT_CAPABILITY_FILE" \
+        "$ENGINE_INPUT_READY_FILE"
+    if ! /usr/bin/python3 -I \
+        "$PROJECT_ROOT/scripts/matrix_restart_request.py" \
+        create-capability --file "$ENGINE_INPUT_CAPABILITY_FILE"; then
+        echo "[ERROR] Could not create engine-input capability" >&2
+        return 1
+    fi
+    target_gid="$(id -g)"
+    /usr/bin/sudo -n /usr/bin/python3 -I \
+        "$PROJECT_ROOT/scripts/matrix_engine_input_bridge.py" \
+        --socket "$ENGINE_INPUT_SOCKET" \
+        --capability-file "$ENGINE_INPUT_CAPABILITY_FILE" \
+        --ready-file "$ENGINE_INPUT_READY_FILE" \
+        --target-uid "$UID" \
+        --target-gid "$target_gid" \
+        >"$ENGINE_INPUT_LOG_FILE" 2>&1 &
+    ENGINE_INPUT_BRIDGE_PID=$!
+    for ((poll = 0; poll < 120; poll++)); do
+        if [[ -f "$ENGINE_INPUT_READY_FILE" \
+            && -S "$ENGINE_INPUT_SOCKET" ]]; then
+            if ! ENGINE_INPUT_HELPER_PID="$(
+                /usr/bin/python3 -I - \
+                    "$ENGINE_INPUT_READY_FILE" \
+                    "$ENGINE_INPUT_SOCKET" \
+                    "$PROJECT_ROOT/scripts/matrix_engine_input_bridge.py" \
+                    "$UID" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+ready = Path(sys.argv[1])
+expected_socket = os.fspath(Path(sys.argv[2]))
+expected_script = Path(sys.argv[3]).resolve(strict=True)
+expected_uid = int(sys.argv[4])
+value = json.loads(ready.read_text(encoding="utf-8"))
+if not isinstance(value, dict) or set(value) != {
+    "protocol",
+    "pid",
+    "socket",
+    "uid",
+}:
+    raise SystemExit(1)
+pid = value["pid"]
+if (
+    value["protocol"] != "matrix-engine-input/v1"
+    or value["socket"] != expected_socket
+    or value["uid"] != expected_uid
+    or isinstance(pid, bool)
+    or not isinstance(pid, int)
+    or pid <= 1
+):
+    raise SystemExit(1)
+cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+paths = {
+    Path(os.fsdecode(field)).resolve(strict=False)
+    for field in cmdline
+    if field.startswith(b"/")
+}
+if expected_script not in paths:
+    raise SystemExit(1)
+print(pid)
+PY
+            )"; then
+                echo "[ERROR] Matrix engine-input readiness proof is invalid" >&2
+                stop_engine_input_bridge
+                return 1
+            fi
+            export MATRIX_ENGINE_INPUT_SOCKET="$ENGINE_INPUT_SOCKET"
+            export MATRIX_ENGINE_INPUT_CAPABILITY_FILE="$ENGINE_INPUT_CAPABILITY_FILE"
+            echo "[INFO] Matrix engine-input bridge ready: $ENGINE_INPUT_SOCKET"
+            return 0
+        fi
+        if ! kill -0 "$ENGINE_INPUT_BRIDGE_PID" 2>/dev/null; then
+            if wait "$ENGINE_INPUT_BRIDGE_PID" 2>/dev/null; then
+                bridge_status=0
+            else
+                bridge_status=$?
+            fi
+            ENGINE_INPUT_BRIDGE_PID=""
+            echo "[ERROR] Matrix engine-input bridge exited with code " \
+                "$bridge_status" >&2
+            if [[ -s "$ENGINE_INPUT_LOG_FILE" ]]; then
+                tail -n 20 "$ENGINE_INPUT_LOG_FILE" >&2
+            fi
+            stop_engine_input_bridge
+            return 1
+        fi
+        sleep 0.10
+    done
+    echo "[ERROR] Matrix engine-input bridge readiness timed out" >&2
+    stop_engine_input_bridge
+    return 1
+}
+
 restore_tracked_config() {
     # An unexpected shell exit must not remove the private gate directory while
     # a rollback transaction or its authorizer still has it open.  These
@@ -1277,6 +1521,7 @@ restore_tracked_config() {
     if declare -F reap_rollback_gate_children >/dev/null 2>&1; then
         reap_rollback_gate_children
     fi
+    stop_engine_input_bridge
     if [[ "${TRACKED_CONFIG_RESTORED:-0}" == "1" ]]; then
         return 0
     fi
@@ -1320,6 +1565,7 @@ restore_tracked_config() {
         unset MATRIX_GAME_INPUT_SOCKET
     fi
     unset MATRIX_GAME_RESTART_REQUEST_FILE MATRIX_GAME_RESTART_CAPABILITY_FILE
+    unset MATRIX_ENGINE_INPUT_SOCKET MATRIX_ENGINE_INPUT_CAPABILITY_FILE
     TRACKED_CONFIG_RESTORED=1
 }
 trap restore_tracked_config EXIT
@@ -1510,13 +1756,23 @@ forward_signal() {
     FORWARDED_SIGNAL_EXIT_CODE="$exit_code"
     STOP_REQUESTED=1
     cancel_rollback_helper
+    stop_engine_input_bridge
     if [[ -n "$RUN_SIM_PID" ]] && kill -0 "$RUN_SIM_PID" 2>/dev/null; then
-        kill "-$signal_name" "$RUN_SIM_PID" 2>/dev/null || true
+        # run_sim is an asynchronous Bash child.  Bash starts asynchronous
+        # commands with SIGINT ignored when job control is disabled, and that
+        # inherited disposition cannot be repaired reliably inside the child.
+        # Always request its normal TERM cleanup while preserving the caller's
+        # signal-specific launcher exit code above.
+        kill -TERM "$RUN_SIM_PID" 2>/dev/null || true
     fi
 }
 trap 'forward_signal INT 130' SIGINT
 trap 'forward_signal TERM 143' SIGTERM
 trap 'forward_signal HUP 129' SIGHUP
+
+if ! start_engine_input_bridge; then
+    exit 2
+fi
 
 run_gated_resume_rejection() {
     local ready_file="$GAME_RUNTIME_DIR/world-state-reject-ready"

@@ -951,12 +951,13 @@ class MatrixWorldState:
                 resume_checkpoints=checkpoints,
                 updated_at_unix_ns=timestamp,
             )
-        upright_exit = WorldPose(
-            pose.x,
-            pose.y,
-            self.last_safe.z,
-            self.last_safe.yaw_rad,
-        )
+        # A world pose carries an absolute terrain-relative Z.  Reusing the
+        # fallen XY with an older safe Z is only valid on a level plane; on a
+        # slope it can respawn the robot metres above or below the local
+        # surface.  Keep the complete previously qualified pose as one atomic
+        # checkpoint.  ``last_observed`` still records the fallen location for
+        # diagnostics, but that unqualified location never becomes resumable.
+        upright_exit = self.last_safe
         checkpoints = self._new_checkpoint(
             pose=upright_exit,
             source="fallen_xy_last_safe_upright",

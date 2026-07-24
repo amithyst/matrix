@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed provenance checks for optional Matrix policy-slot candidates.
-
-This module deliberately stops at registration and admission.  It does not
-start a policy process, grant a LowCmd lease, or define an adapter for a model
-whose runtime writer ABI has not been implemented and reviewed.
-"""
+"""Fail-closed provenance checks for optional Matrix policy-slot candidates."""
 
 from __future__ import annotations
 
@@ -18,7 +13,7 @@ import subprocess
 from typing import Mapping
 
 
-MANIFEST_SCHEMA = "matrix.locomotion-policy-candidate.v1"
+MANIFEST_SCHEMA = "matrix.locomotion-policy-candidate.v2"
 ADAPTER_PROTOCOL = "matrix.locomotion-policy-writer.v1"
 BFM_TEACHER50K_POLICY_ID = "bfm-sonic-teacher50k"
 BFM_TEACHER50K_DISPLAY_NAME = "BFM SONIC Teacher50k"
@@ -48,22 +43,47 @@ class SourceRequirement:
 
 
 @dataclass(frozen=True)
+class TreeRequirement:
+    name: str
+    path_env: str
+    sha256: str
+    file_count: int
+
+
+@dataclass(frozen=True)
 class PolicyCandidateManifest:
     policy_id: str
     display_name: str
     slot: str
     backend: str
     source: SourceRequirement
+    runtime_sources: tuple[SourceRequirement, ...]
     artifacts: tuple[ArtifactRequirement, ...]
+    trees: tuple[TreeRequirement, ...]
     manifest_path: Path
     manifest_sha256: str
     checkpoint_path_hint: str | None
     adapter_protocol: str
-    decoder_input_dim: int
-    token_dim: int
-    deployable_proprio_dim: int
+    model_input_dim: int
+    tokenizer_dim: int
+    command_dim: int
+    height_map_dim: int
+    orientation_dim: int
+    actor_observation_dim: int
+    history_length: int
     compatibility_zero_dim: int
     action_dim: int
+    action_clip: float
+    activation_blend_seconds: float
+    activation_contract: str
+    standby_history_contract: str
+    turn_reference_contract: str
+    turn_reference_forward_mps: float
+    command_heading_contract: str
+    command_yaw_gain: float
+    command_yaw_limit_rad_s: float
+    turn_command_yaw_limit_rad_s: float
+    turn_command_yaw_damping_seconds: float
     proxy99_exact_zero: bool
 
     def provenance_mapping(self) -> dict[str, object]:
@@ -72,6 +92,14 @@ class PolicyCandidateManifest:
             "manifest_sha256": self.manifest_sha256,
             "repository": self.source.repository,
             "source_commit": self.source.commit,
+            "runtime_sources": [
+                {
+                    "repository": source.repository,
+                    "commit": source.commit,
+                    "root_env": source.root_env,
+                }
+                for source in self.runtime_sources
+            ],
             "checkpoint_path_hint": self.checkpoint_path_hint,
             "artifacts": {
                 artifact.name: {
@@ -80,13 +108,40 @@ class PolicyCandidateManifest:
                 }
                 for artifact in self.artifacts
             },
+            "trees": {
+                tree.name: {
+                    "path_env": tree.path_env,
+                    "sha256": tree.sha256,
+                    "file_count": tree.file_count,
+                }
+                for tree in self.trees
+            },
             "adapter_protocol": self.adapter_protocol,
-            "decoder_contract": {
-                "input_dim": self.decoder_input_dim,
-                "token_dim": self.token_dim,
-                "deployable_proprio_dim": self.deployable_proprio_dim,
+            "teacher_contract": {
+                "model_input_dim": self.model_input_dim,
+                "tokenizer_dim": self.tokenizer_dim,
+                "command_dim": self.command_dim,
+                "height_map_dim": self.height_map_dim,
+                "orientation_dim": self.orientation_dim,
+                "actor_observation_dim": self.actor_observation_dim,
+                "history_length": self.history_length,
                 "compatibility_zero_dim": self.compatibility_zero_dim,
                 "action_dim": self.action_dim,
+                "action_clip": self.action_clip,
+                "activation_blend_seconds": self.activation_blend_seconds,
+                "activation_contract": self.activation_contract,
+                "standby_history_contract": self.standby_history_contract,
+                "turn_reference_contract": self.turn_reference_contract,
+                "turn_reference_forward_mps": self.turn_reference_forward_mps,
+                "command_heading_contract": self.command_heading_contract,
+                "command_yaw_gain": self.command_yaw_gain,
+                "command_yaw_limit_rad_s": self.command_yaw_limit_rad_s,
+                "turn_command_yaw_limit_rad_s": (
+                    self.turn_command_yaw_limit_rad_s
+                ),
+                "turn_command_yaw_damping_seconds": (
+                    self.turn_command_yaw_damping_seconds
+                ),
                 "proxy99_exact_zero": self.proxy99_exact_zero,
             },
         }
@@ -150,6 +205,17 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _directory_tree_sha256(path: Path) -> tuple[str, int]:
+    files = sorted(candidate for candidate in path.rglob("*") if candidate.is_file())
+    digest = hashlib.sha256()
+    for candidate in files:
+        relative = candidate.relative_to(path).as_posix()
+        digest.update(
+            f"{_file_sha256(candidate)}  ./{relative}\n".encode("utf-8")
+        )
+    return digest.hexdigest(), len(files)
+
+
 def load_policy_candidate_manifest(path: Path) -> PolicyCandidateManifest:
     resolved = path.resolve()
     try:
@@ -167,7 +233,9 @@ def load_policy_candidate_manifest(path: Path) -> PolicyCandidateManifest:
             "slot",
             "backend",
             "source",
+            "runtime_sources",
             "artifacts",
+            "trees",
             "runtime_contract",
             "evidence",
         },
@@ -213,9 +281,46 @@ def load_policy_candidate_manifest(path: Path) -> PolicyCandidateManifest:
         else None
     )
 
+    runtime_sources_raw = root["runtime_sources"]
+    if not isinstance(runtime_sources_raw, list) or len(runtime_sources_raw) != 2:
+        raise PolicyCandidateError(
+            "runtime_sources must contain RealScan and Robo-PFNN"
+        )
+    runtime_sources: list[SourceRequirement] = []
+    for index, raw in enumerate(runtime_sources_raw):
+        entry = _exact_keys(
+            raw,
+            {"repository", "commit", "root_env"},
+            f"runtime_sources[{index}]",
+        )
+        runtime_commit = _nonempty_string(
+            entry["commit"], f"runtime_sources[{index}].commit"
+        )
+        if _GIT_COMMIT_RE.fullmatch(runtime_commit) is None:
+            raise PolicyCandidateError(
+                f"runtime_sources[{index}].commit must be a full lowercase Git SHA"
+            )
+        runtime_root_env = _nonempty_string(
+            entry["root_env"], f"runtime_sources[{index}].root_env"
+        )
+        if _ENV_NAME_RE.fullmatch(runtime_root_env) is None:
+            raise PolicyCandidateError(
+                f"runtime_sources[{index}].root_env is invalid"
+            )
+        runtime_sources.append(
+            SourceRequirement(
+                repository=_nonempty_string(
+                    entry["repository"],
+                    f"runtime_sources[{index}].repository",
+                ),
+                commit=runtime_commit,
+                root_env=runtime_root_env,
+            )
+        )
+
     artifacts_raw = root["artifacts"]
-    if not isinstance(artifacts_raw, list) or len(artifacts_raw) != 3:
-        raise PolicyCandidateError("artifacts must contain exactly three entries")
+    if not isinstance(artifacts_raw, list) or len(artifacts_raw) != 6:
+        raise PolicyCandidateError("artifacts must contain exactly six entries")
     artifacts: list[ArtifactRequirement] = []
     for index, raw in enumerate(artifacts_raw):
         entry = _exact_keys(
@@ -246,36 +351,107 @@ def load_policy_candidate_manifest(path: Path) -> PolicyCandidateManifest:
     if {artifact.name for artifact in artifacts} != {
         "checkpoint",
         "config",
+        "teacher_onnx",
         "runtime_adapter",
+        "g1_xml",
+        "formal_ik",
     }:
         raise PolicyCandidateError(
-            "artifacts must be checkpoint, config, and runtime_adapter"
+            "artifacts must lock checkpoint, config, Teacher ONNX, adapter, "
+            "G1 XML, and formal IK"
         )
     if sum(artifact.executable for artifact in artifacts) != 1 or not next(
         artifact for artifact in artifacts if artifact.name == "runtime_adapter"
     ).executable:
         raise PolicyCandidateError("only runtime_adapter may be executable")
 
+    trees_raw = root["trees"]
+    if not isinstance(trees_raw, list) or len(trees_raw) != 1:
+        raise PolicyCandidateError("trees must contain exactly pfnn_weights")
+    tree_entry = _exact_keys(
+        trees_raw[0],
+        {"name", "path_env", "sha256", "file_count"},
+        "trees[0]",
+    )
+    tree_name = _nonempty_string(tree_entry["name"], "trees[0].name")
+    if tree_name != "pfnn_weights":
+        raise PolicyCandidateError("trees[0].name must be pfnn_weights")
+    tree_path_env = _nonempty_string(
+        tree_entry["path_env"], "trees[0].path_env"
+    )
+    if _ENV_NAME_RE.fullmatch(tree_path_env) is None:
+        raise PolicyCandidateError("trees[0].path_env is invalid")
+    tree_sha256 = _sha256_or_none(tree_entry["sha256"], "trees[0].sha256")
+    if tree_sha256 is None:
+        raise PolicyCandidateError("trees[0].sha256 must be locked")
+    tree_file_count = tree_entry["file_count"]
+    if (
+        type(tree_file_count) is not int
+        or tree_file_count <= 0
+        or tree_file_count > 100000
+    ):
+        raise PolicyCandidateError("trees[0].file_count is invalid")
+    trees = (
+        TreeRequirement(
+            name=tree_name,
+            path_env=tree_path_env,
+            sha256=tree_sha256,
+            file_count=tree_file_count,
+        ),
+    )
+
     contract = _exact_keys(
         root["runtime_contract"],
         {
             "adapter_protocol",
-            "decoder_input_dim",
-            "token_dim",
-            "deployable_proprio_dim",
+            "model_input_dim",
+            "tokenizer_dim",
+            "command_dim",
+            "height_map_dim",
+            "orientation_dim",
+            "actor_observation_dim",
+            "history_length",
             "compatibility_zero_dim",
             "action_dim",
+            "action_clip",
+            "activation_blend_seconds",
+            "activation_contract",
+            "standby_history_contract",
+            "turn_reference_contract",
+            "turn_reference_forward_mps",
+            "command_heading_contract",
+            "command_yaw_gain",
+            "command_yaw_limit_rad_s",
+            "turn_command_yaw_limit_rad_s",
+            "turn_command_yaw_damping_seconds",
             "proxy99_exact_zero",
         },
         "runtime_contract",
     )
     expected_contract: dict[str, object] = {
         "adapter_protocol": ADAPTER_PROTOCOL,
-        "decoder_input_dim": 1093,
-        "token_dim": 64,
-        "deployable_proprio_dim": 930,
+        "model_input_dim": 1790,
+        "tokenizer_dim": 761,
+        "command_dim": 580,
+        "height_map_dim": 121,
+        "orientation_dim": 60,
+        "actor_observation_dim": 1029,
+        "history_length": 10,
         "compatibility_zero_dim": 99,
         "action_dim": 29,
+        "action_clip": 20,
+        "activation_blend_seconds": 0.1,
+        "activation_contract": "current-lowstate-smoothstep-no-teleport",
+        "standby_history_contract": (
+            "repeat-current-frame-zero-unapplied-actions"
+        ),
+        "turn_reference_contract": "yaw-only-pfnn-forward-seed-v1",
+        "turn_reference_forward_mps": 0.00051,
+        "command_heading_contract": "matrix-wire-facing-formal7168-pd-v2",
+        "command_yaw_gain": 4.0,
+        "command_yaw_limit_rad_s": 1.5,
+        "turn_command_yaw_limit_rad_s": 0.6,
+        "turn_command_yaw_damping_seconds": 0.1,
         "proxy99_exact_zero": True,
     }
     if contract != expected_contract:
@@ -303,16 +479,43 @@ def load_policy_candidate_manifest(path: Path) -> PolicyCandidateManifest:
             commit=commit,
             root_env=root_env,
         ),
+        runtime_sources=tuple(runtime_sources),
         artifacts=tuple(artifacts),
+        trees=trees,
         manifest_path=resolved,
         manifest_sha256=hashlib.sha256(raw_bytes).hexdigest(),
         checkpoint_path_hint=checkpoint_path_hint,
         adapter_protocol=str(contract["adapter_protocol"]),
-        decoder_input_dim=int(contract["decoder_input_dim"]),
-        token_dim=int(contract["token_dim"]),
-        deployable_proprio_dim=int(contract["deployable_proprio_dim"]),
+        model_input_dim=int(contract["model_input_dim"]),
+        tokenizer_dim=int(contract["tokenizer_dim"]),
+        command_dim=int(contract["command_dim"]),
+        height_map_dim=int(contract["height_map_dim"]),
+        orientation_dim=int(contract["orientation_dim"]),
+        actor_observation_dim=int(contract["actor_observation_dim"]),
+        history_length=int(contract["history_length"]),
         compatibility_zero_dim=int(contract["compatibility_zero_dim"]),
         action_dim=int(contract["action_dim"]),
+        action_clip=float(contract["action_clip"]),
+        activation_blend_seconds=float(
+            contract["activation_blend_seconds"]
+        ),
+        activation_contract=str(contract["activation_contract"]),
+        standby_history_contract=str(contract["standby_history_contract"]),
+        turn_reference_contract=str(contract["turn_reference_contract"]),
+        turn_reference_forward_mps=float(
+            contract["turn_reference_forward_mps"]
+        ),
+        command_heading_contract=str(contract["command_heading_contract"]),
+        command_yaw_gain=float(contract["command_yaw_gain"]),
+        command_yaw_limit_rad_s=float(
+            contract["command_yaw_limit_rad_s"]
+        ),
+        turn_command_yaw_limit_rad_s=float(
+            contract["turn_command_yaw_limit_rad_s"]
+        ),
+        turn_command_yaw_damping_seconds=float(
+            contract["turn_command_yaw_damping_seconds"]
+        ),
         proxy99_exact_zero=bool(contract["proxy99_exact_zero"]),
     )
 
@@ -429,6 +632,8 @@ def evaluate_policy_candidate(
         if artifact.sha256 is None:
             failures.append(f"artifact_sha256_unlocked:{artifact.name}")
     failures.extend(_source_checkout_failures(manifest.source, env))
+    for source in manifest.runtime_sources:
+        failures.extend(_source_checkout_failures(source, env))
     for artifact in manifest.artifacts:
         configured = env.get(artifact.path_env, "").strip()
         if not configured:
@@ -452,17 +657,35 @@ def evaluate_policy_candidate(
         if artifact.executable and not os.access(path, os.X_OK):
             failures.append(f"artifact_not_executable:{artifact.name}")
 
+    for tree in manifest.trees:
+        configured = env.get(tree.path_env, "").strip()
+        if not configured:
+            failures.append(f"missing_tree_env:{tree.name}:{tree.path_env}")
+            continue
+        path = Path(configured)
+        if not path.is_absolute():
+            failures.append(f"tree_path_not_absolute:{tree.name}")
+            continue
+        if not path.is_dir():
+            failures.append(f"tree_missing:{tree.name}")
+            continue
+        try:
+            actual_sha256, actual_count = _directory_tree_sha256(path)
+        except OSError:
+            failures.append(f"tree_unreadable:{tree.name}")
+            continue
+        if actual_count != tree.file_count:
+            failures.append(f"tree_file_count_mismatch:{tree.name}")
+        if actual_sha256 != tree.sha256:
+            failures.append(f"tree_sha256_mismatch:{tree.name}")
+
     provenance_verified = not failures
-    # A verified artifact set is still not a writer registration.  Admission
-    # remains closed until a future reviewed adapter owns a resident session
-    # and participates in the existing single-writer hand-off protocol.
-    failures.append("runtime_adapter_not_registered")
     return PolicyCandidateState(
         policy_id=manifest.policy_id,
         display_name=manifest.display_name,
         slot=manifest.slot,
         resident=False,
-        available=False,
+        available=provenance_verified,
         provenance_verified=provenance_verified,
         unavailable_reasons=tuple(failures),
         provenance=manifest.provenance_mapping(),

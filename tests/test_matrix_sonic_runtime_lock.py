@@ -532,7 +532,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("import numpy, onnxruntime", run_sim)
         self.assertIn("ChannelPublisher, ChannelSubscriber", run_sim)
         self.assertIn("MATRIX_GAME_FALL_RECOVERY=physical", run_sim)
-        self.assertIn("host|amp|kungfu", run_sim)
+        self.assertIn("host|amp|amp-flat-v3|kungfu", run_sim)
         self.assertIn(
             'MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-kungfu',
             heyuan,
@@ -566,6 +566,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_HANDOFF:-sonic', trna)
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES:-1', trna)
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER:-cuda', trna)
+        self.assertIn('SONIC_DEPLOY_REENTRY_PROBE_DISABLE:-1', trna)
         self.assertIn('1307-sonic-default-frame15689.npz', trna)
         self.assertIn('MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME:-15689', trna)
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-1.5', trna)

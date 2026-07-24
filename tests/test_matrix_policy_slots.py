@@ -35,22 +35,66 @@ class MatrixPolicySlotsTest(unittest.TestCase):
             {
                 "checkpoint": "613274ee5956db59b8f2509c408619ee600e7b847c4609ad1643e6c7ffd410c1",
                 "config": "e7bed95642a3627cc6f6cff416da784fe2d0841b697d0f34e7039fd73af10e3f",
-                "runtime_adapter": None,
+                "teacher_onnx": "edbec19062d6c34621dd97df864c596d29937432d8a019dd949d03785d9cdc45",
+                "runtime_adapter": "3375ffc19f68cc5a2be5541712af656620dcbff27ff6c7209573ac1b395a4dae",
+                "g1_xml": "8c586e4747da85804180fe44d8692e0fd8231356728b6327e256dca498087a78",
+                "formal_ik": "c8776f1e7651a4f179ea75e17b9746c41fa77a15be2cacf5809fe648340a7ab2",
             },
         )
         self.assertEqual(
             (
-                manifest.decoder_input_dim,
-                manifest.token_dim,
-                manifest.deployable_proprio_dim,
+                manifest.model_input_dim,
+                manifest.tokenizer_dim,
+                manifest.command_dim,
+                manifest.height_map_dim,
+                manifest.orientation_dim,
+                manifest.actor_observation_dim,
+                manifest.history_length,
                 manifest.compatibility_zero_dim,
                 manifest.action_dim,
+                manifest.action_clip,
+                manifest.activation_blend_seconds,
+                manifest.activation_contract,
+                manifest.standby_history_contract,
+                manifest.turn_reference_contract,
+                manifest.turn_reference_forward_mps,
+                manifest.command_heading_contract,
+                manifest.command_yaw_gain,
+                manifest.command_yaw_limit_rad_s,
+                manifest.turn_command_yaw_limit_rad_s,
+                manifest.turn_command_yaw_damping_seconds,
                 manifest.proxy99_exact_zero,
             ),
-            (1093, 64, 930, 99, 29, True),
+            (
+                1790,
+                761,
+                580,
+                121,
+                60,
+                1029,
+                10,
+                99,
+                29,
+                20.0,
+                0.1,
+                "current-lowstate-smoothstep-no-teleport",
+                "repeat-current-frame-zero-unapplied-actions",
+                "yaw-only-pfnn-forward-seed-v1",
+                0.00051,
+                "matrix-wire-facing-formal7168-pd-v2",
+                4.0,
+                1.5,
+                0.6,
+                0.1,
+                True,
+            ),
+        )
+        self.assertEqual(
+            manifest.trees[0].sha256,
+            "d1d0a7255a2f8898e81522570a09a3b56624fd7b955a2d7d02b87800f47585cb",
         )
 
-    def test_unregistered_adapter_is_visible_but_fails_closed_without_processes(self) -> None:
+    def test_missing_runtime_is_visible_but_fails_closed_without_processes(self) -> None:
         with mock.patch.object(MODULE.subprocess, "run") as run:
             state = MODULE.evaluate_policy_candidate(
                 MANIFEST,
@@ -65,11 +109,14 @@ class MatrixPolicySlotsTest(unittest.TestCase):
         self.assertFalse(state.provenance_verified)
         self.assertEqual(
             state.unavailable_reason,
-            "artifact_sha256_unlocked:runtime_adapter",
+            "missing_source_env:MATRIX_BFM_SONIC_SOURCE_ROOT",
         )
-        self.assertIn("runtime_adapter_not_registered", state.unavailable_reasons)
         self.assertIn(
             "missing_artifact_env:checkpoint:MATRIX_BFM_SONIC_CHECKPOINT",
+            state.unavailable_reasons,
+        )
+        self.assertIn(
+            "missing_tree_env:pfnn_weights:MATRIX_BFM_SONIC_PFNN_WEIGHTS",
             state.unavailable_reasons,
         )
 

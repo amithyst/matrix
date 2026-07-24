@@ -89,6 +89,8 @@ _MIN_CLIENT_WIDTH = 480
 _MIN_CLIENT_HEIGHT = 360
 _MAX_COMMAND_HISTORY = 24
 _MAX_INTENT_PACKET_BYTES = 2048
+_MAX_LOCOMOTION_POLICY_BUTTONS = 3
+_MAX_RECOVERY_POLICY_BUTTONS = 4
 _MIN_OVERLAY_FONT_SIZE = 1
 _DEFAULT_OVERLAY_FONT_SIZE = 13
 _MAX_OVERLAY_FONT_SIZE = 22
@@ -498,7 +500,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     candidate_gap = 6 if compact else 12
     candidate_width = max(
         1,
-        (panel_width - 2 * margin - 2 * candidate_gap) // 3,
+        (
+            panel_width
+            - 2 * margin
+            - (_MAX_RECOVERY_POLICY_BUTTONS - 1) * candidate_gap
+        )
+        // _MAX_RECOVERY_POLICY_BUTTONS,
     )
     candidate_height = max(28, min(button_height, recovery_height - 30))
     candidate_y = recovery_bottom - candidate_height - (4 if compact else 10)
@@ -714,7 +721,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             navigation_destinations_height,
         ),
     }
-    for index in range(3):
+    for index in range(_MAX_RECOVERY_POLICY_BUTTONS):
         result[f"recovery_policy_{index}"] = (
             panel_x + margin + index * (candidate_width + candidate_gap),
             candidate_y,
@@ -733,7 +740,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             inventory_width,
             inventory_height,
         )
-    for index in range(3):
+    for index in range(_MAX_LOCOMOTION_POLICY_BUTTONS):
         result[f"locomotion_policy_{index}"] = (
             panel_x
             + margin
@@ -910,9 +917,13 @@ _PANEL_TABS = (
 )
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
-    f"locomotion_policy_{index}" for index in range(3)
+    f"locomotion_policy_{index}"
+    for index in range(_MAX_LOCOMOTION_POLICY_BUTTONS)
 )
-_POLICY_HIT_TARGETS = tuple(f"recovery_policy_{index}" for index in range(3))
+_POLICY_HIT_TARGETS = tuple(
+    f"recovery_policy_{index}"
+    for index in range(_MAX_RECOVERY_POLICY_BUTTONS)
+)
 _INVENTORY_HIT_TARGETS = tuple(f"creative_item_{index}" for index in range(4))
 _NAVIGATION_DESTINATION_HIT_TARGETS = tuple(
     f"navigation_destination_{index}" for index in range(3)
@@ -1115,7 +1126,9 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                 locomotion = selected
                 raw_candidates = slot.get("candidates")
                 if isinstance(raw_candidates, list):
-                    for candidate in raw_candidates[:3]:
+                    for candidate in raw_candidates[
+                        :_MAX_LOCOMOTION_POLICY_BUTTONS
+                    ]:
                         if not isinstance(candidate, dict):
                             continue
                         policy_id = candidate.get("policy_id")
@@ -1144,7 +1157,9 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                 recovery = selected
                 raw_candidates = slot.get("candidates")
                 if isinstance(raw_candidates, list):
-                    for candidate in raw_candidates[:3]:
+                    for candidate in raw_candidates[
+                        :_MAX_RECOVERY_POLICY_BUTTONS
+                    ]:
                         if not isinstance(candidate, dict):
                             continue
                         policy_id = candidate.get("policy_id")
@@ -4613,6 +4628,7 @@ class X11CalibrationOverlay:
             "kungfu": "KungFu",
             "host": "HoST",
             "amp": "AMP",
+            "amp-flat-v3": "AMP flat_v3",
         }.get(policy_id, policy_id.upper())
 
     def _draw_loadout_page(
@@ -4644,7 +4660,9 @@ class X11CalibrationOverlay:
                     "cyan" if model.active_slot == "locomotion" else "muted"
                 ],
             )
-        locomotion_candidates = model.locomotion_candidates[:3]
+        locomotion_candidates = model.locomotion_candidates[
+            :_MAX_LOCOMOTION_POLICY_BUTTONS
+        ]
         for index, candidate in enumerate(locomotion_candidates):
             selected = candidate.policy_id == model.locomotion_policy_id
             pending = candidate.policy_id == model.pending_policy_id
@@ -4687,7 +4705,7 @@ class X11CalibrationOverlay:
                     "cyan" if model.active_slot == "recovery" else "muted"
                 ],
             )
-        candidates = model.recovery_candidates[:3]
+        candidates = model.recovery_candidates[:_MAX_RECOVERY_POLICY_BUTTONS]
         for index, candidate in enumerate(candidates):
             selected = candidate.policy_id == model.recovery_policy_id
             pending = candidate.policy_id == model.pending_policy_id

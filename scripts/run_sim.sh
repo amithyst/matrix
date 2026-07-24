@@ -1722,6 +1722,10 @@ if $MATRIX_SONIC_ENABLED; then
             PHYSICAL_RECOVERY_AMP_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL:-}"
             PHYSICAL_RECOVERY_AMP_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256:-}"
             PHYSICAL_RECOVERY_AMP_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256:-}"
             PHYSICAL_RECOVERY_KUNGFU_MODEL="${MATRIX_KUNGFU_RECOVERY_MODEL:-}"
             PHYSICAL_RECOVERY_KUNGFU_MOTION="${MATRIX_KUNGFU_RECOVERY_MOTION:-}"
             PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256="${MATRIX_KUNGFU_RECOVERY_MODEL_SHA256:-}"
@@ -1732,9 +1736,9 @@ if $MATRIX_SONIC_ENABLED; then
             PHYSICAL_RECOVERY_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_CONTROL_SOCKET:-}"
             PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET:-}"
             case "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" in
-                host|amp|kungfu) ;;
+                host|amp|amp-flat-v3|kungfu) ;;
                 *)
-                    echo "[ERROR] Physical recovery initial controller must be host, amp, or kungfu" >&2
+                    echo "[ERROR] Physical recovery initial controller must be host, amp, amp-flat-v3, or kungfu" >&2
                     exit 1
                     ;;
             esac
@@ -1812,6 +1816,41 @@ PY
                     exit 1
                 fi
             done
+            flat_v3_present=0
+            for value in \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL" \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
+                if [[ -n "$value" ]]; then
+                    flat_v3_present=$((flat_v3_present + 1))
+                fi
+            done
+            if ((flat_v3_present != 0 && flat_v3_present != 4)); then
+                echo "[ERROR] AMP flat_v3 requires config, model, and both SHA256 values" >&2
+                exit 1
+            fi
+            if ((flat_v3_present == 4)); then
+                for flat_v3_file in \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"; do
+                    if [[ ! -f "$flat_v3_file" ]]; then
+                        echo "[ERROR] AMP flat_v3 artifact is missing: $flat_v3_file" >&2
+                        exit 1
+                    fi
+                done
+                for digest in \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
+                    if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+                        echo "[ERROR] AMP flat_v3 SHA256 is invalid" >&2
+                        exit 1
+                    fi
+                done
+            elif [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "amp-flat-v3" ]]; then
+                echo "[ERROR] amp-flat-v3 initial recovery requires its locked artifacts" >&2
+                exit 1
+            fi
             if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then
                 for kungfu_file in \
                     "$PHYSICAL_RECOVERY_KUNGFU_MODEL" \
@@ -1883,6 +1922,14 @@ PY
             if [[ -n "$PHYSICAL_RECOVERY_FALLBACK_MODEL" ]]; then
                 PHYSICAL_RECOVERY_ARGS+=(
                     --physical-recovery-fallback-model "$PHYSICAL_RECOVERY_FALLBACK_MODEL"
+                )
+            fi
+            if ((flat_v3_present == 4)); then
+                PHYSICAL_RECOVERY_ARGS+=(
+                    --physical-recovery-amp-flat-v3-config "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG"
+                    --physical-recovery-amp-flat-v3-model "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"
+                    --physical-recovery-amp-flat-v3-config-sha256 "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256"
+                    --physical-recovery-amp-flat-v3-model-sha256 "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"
                 )
             fi
             if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then

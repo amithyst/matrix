@@ -66,8 +66,17 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         self.assertTrue(endpoint.is_absolute())
         self.assertEqual(endpoint.name, "trna.sock")
         self.assertEqual(capability.name, "trna.cap")
+        engine_endpoint, engine_capability = MODULE.default_engine_endpoint(
+            "trna"
+        )
+        self.assertTrue(engine_endpoint.is_absolute())
+        self.assertEqual(engine_endpoint.name, "trna.sock")
+        self.assertEqual(engine_capability.name, "trna.cap")
+        self.assertIn("matrix-engine-input-", os.fspath(engine_endpoint))
         with self.assertRaisesRegex(ValueError, "profile"):
             MODULE.default_endpoint("../trna")
+        with self.assertRaisesRegex(ValueError, "profile"):
+            MODULE.default_engine_endpoint("../trna")
 
     def test_typed_state_builders_cover_keyboard_mouse_and_gamepad(self) -> None:
         keyboard = MODULE._state_with_keyboard("w", ("alt",))
@@ -82,10 +91,12 @@ class MatrixCtlHelpersTest(unittest.TestCase):
             right = -0.25
             look_yaw = 0.5
             look_pitch = -0.5
+            button = ["south"]
 
         gamepad = MODULE._state_with_gamepad(Args())
         self.assertTrue(gamepad.gamepad_connected)
         self.assertEqual(gamepad.gamepad_axes["forward"], 0.75)
+        self.assertTrue(gamepad.gamepad_buttons["south"])
 
         connected_neutral = MODULE._connected_neutral_gamepad_state()
         self.assertTrue(connected_neutral.gamepad_connected)
@@ -93,6 +104,45 @@ class MatrixCtlHelpersTest(unittest.TestCase):
         self.assertTrue(
             all(value == 0.0 for value in connected_neutral.gamepad_axes.values())
         )
+
+    def test_engine_input_client_validates_typed_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            capability = root / "engine.cap"
+            capability.write_text("a" * 64 + "\n", encoding="ascii")
+            capability.chmod(0o600)
+            endpoint = root / "engine.sock"
+            connection = mock.Mock()
+            connection.send.side_effect = lambda payload: len(payload)
+            connection.recv.return_value = json.dumps(
+                {
+                    "protocol": MODULE.ENGINE_INPUT_PROTOCOL,
+                    "sequence": 1,
+                    "ok": True,
+                    "code": "OK_STATUS",
+                    "message": "ready",
+                    "data": {"uid": os.getuid()},
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            with mock.patch.object(
+                MODULE.socket,
+                "socket",
+                return_value=connection,
+            ):
+                with MODULE.MatrixEngineInputClient(
+                    endpoint,
+                    capability,
+                ) as client:
+                    response = client.request("status", {})
+
+            connection.connect.assert_called_once_with(os.fspath(endpoint))
+            self.assertEqual(response["code"], "OK_STATUS")
+            encoded = connection.send.call_args.args[0]
+            request = json.loads(encoded.decode("utf-8"))
+            self.assertEqual(request["action"], "status")
+            self.assertEqual(request["capability"], "a" * 64)
+            connection.close.assert_called_once()
 
     def test_modifier_only_gap_preserves_double_tap_speed_tier(self) -> None:
         for modifier in ("alt", "ctrl", "shift"):

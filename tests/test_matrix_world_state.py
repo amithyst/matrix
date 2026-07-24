@@ -69,7 +69,7 @@ class MatrixWorldStateTest(unittest.TestCase):
             resumed.startup_pose(self.default), (last_exit, "last_exit")
         )
 
-    def test_fallen_checkpoint_keeps_observed_xy_but_last_safe_upright_pose(self) -> None:
+    def test_fallen_checkpoint_keeps_complete_last_safe_pose_on_terrain(self) -> None:
         safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
         state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
         fallen = MODULE.WorldPose(10.8, 19.7, 0.18, -2.2)
@@ -78,10 +78,8 @@ class MatrixWorldStateTest(unittest.TestCase):
 
         self.assertEqual(state.last_observed, fallen)
         self.assertEqual(state.last_safe, safe)
-        self.assertEqual(
-            state.last_exit,
-            MODULE.WorldPose(fallen.x, fallen.y, safe.z, safe.yaw_rad),
-        )
+        self.assertEqual(state.last_exit, safe)
+        self.assertEqual(state.resolve_start().pose, safe)
         self.assertEqual(state.resume_source, "fallen_xy_last_safe_upright")
 
     def test_scene_penetrating_observation_never_replaces_or_rebases_resume(self) -> None:

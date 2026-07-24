@@ -4427,6 +4427,73 @@ esac
             for path, expected in originals.items():
                 self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
 
+    def test_external_sigint_uses_run_sim_term_cleanup_without_orphans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            temporary_dir = project / "tmp"
+            temporary_dir.mkdir()
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "2",
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "TMPDIR": os.fspath(temporary_dir),
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            process = subprocess.Popen(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 10.0
+            while (
+                time.monotonic() < deadline
+                and not fixture["capture"].is_file()
+                and process.poll() is None
+            ):
+                time.sleep(0.01)
+            if not fixture["capture"].is_file():
+                stdout, stderr = process.communicate(timeout=5.0)
+                self.fail(
+                    "fixture runtime never became ready\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=10.0)
+
+            self.assertEqual(
+                process.returncode,
+                130,
+                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
+            )
+            self.assertNotIn("external-signal cleanup", stderr)
+            self.assertIn("Cleanup finished", stdout)
+
     def test_restore_verification_failure_never_execs_next_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
