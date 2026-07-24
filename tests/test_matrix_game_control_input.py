@@ -5549,6 +5549,52 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         self.assertEqual(x11.delivered, 1)
         self.assertEqual(x11.handler, 0)
 
+    def test_focus_activation_targets_the_exact_supervised_window_via_ewmh(self) -> None:
+        sent = []
+
+        class FakeX11:
+            @staticmethod
+            def XSendEvent(display, window, propagate, mask, source):
+                event = MODULE._XEvent.from_buffer_copy(
+                    ctypes.string_at(source, ctypes.sizeof(MODULE._XEvent))
+                )
+                sent.append((display, window, propagate, mask, event))
+                return 1
+
+            @staticmethod
+            def XFlush(_display):
+                return 1
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 11
+        backend._root = 2
+        backend._active_window_atom = 91
+        backend._focus_activation_requests = 0
+        backend._focus_activation_successes = 0
+        backend._focus_activation_last_window = None
+        backend._focus_activation_last_error = None
+        backend._find_expected_window = lambda: 77
+
+        self.assertTrue(backend.request_expected_focus())
+        self.assertEqual(len(sent), 1)
+        display, window, propagate, mask, event = sent[0]
+        self.assertEqual((display, window, propagate), (11, 2, 0))
+        self.assertEqual(
+            mask,
+            MODULE._X11_SUBSTRUCTURE_NOTIFY_MASK
+            | MODULE._X11_SUBSTRUCTURE_REDIRECT_MASK,
+        )
+        self.assertEqual(event.xclient.type, MODULE._X11_CLIENT_MESSAGE)
+        self.assertEqual(event.xclient.window, 77)
+        self.assertEqual(event.xclient.message_type, 91)
+        self.assertEqual(event.xclient.format, 32)
+        self.assertEqual(event.xclient.data.l[0], 2)
+        self.assertEqual(backend._focus_activation_requests, 1)
+        self.assertEqual(backend._focus_activation_successes, 1)
+        self.assertEqual(backend._focus_activation_last_window, 77)
+        self.assertIsNone(backend._focus_activation_last_error)
+
     @staticmethod
     def _raw_backend(
         *,

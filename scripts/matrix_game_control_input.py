@@ -137,6 +137,9 @@ DEFAULT_CARLA_WRITE_READBACK_TOLERANCE_RAD = math.radians(0.5)
 
 
 _X11_BAD_WINDOW = 3
+_X11_CLIENT_MESSAGE = 33
+_X11_SUBSTRUCTURE_NOTIFY_MASK = 1 << 19
+_X11_SUBSTRUCTURE_REDIRECT_MASK = 1 << 20
 _X11_ERROR_HANDLER_LOCK = threading.RLock()
 
 
@@ -151,6 +154,27 @@ class _XErrorEvent(ctypes.Structure):
         ("error_code", ctypes.c_ubyte),
         ("request_code", ctypes.c_ubyte),
         ("minor_code", ctypes.c_ubyte),
+    )
+
+
+class _XClientMessageData(ctypes.Union):
+    _fields_ = (
+        ("b", ctypes.c_char * 20),
+        ("s", ctypes.c_short * 10),
+        ("l", ctypes.c_long * 5),
+    )
+
+
+class _XClientMessageEvent(ctypes.Structure):
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("data", _XClientMessageData),
     )
 
 
@@ -2276,7 +2300,11 @@ class _XGenericEventCookie(ctypes.Structure):
 
 class _XEvent(ctypes.Union):
     # Xlib guarantees that XEvent is 24 longs on every supported ABI.
-    _fields_ = (("type", ctypes.c_int), ("pad", ctypes.c_long * 24))
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("xclient", _XClientMessageEvent),
+        ("pad", ctypes.c_long * 24),
+    )
 
 
 class _XIEventMask(ctypes.Structure):
@@ -3373,6 +3401,14 @@ class X11KeyboardMouse:
         self._pid_atom = int(
             self._x11.XInternAtom(self._display, b"_NET_WM_PID", 0)
         )
+        self._active_window_atom = int(
+            self._x11.XInternAtom(self._display, b"_NET_ACTIVE_WINDOW", 0)
+        )
+        self._expected_window: int | None = None
+        self._focus_activation_requests = 0
+        self._focus_activation_successes = 0
+        self._focus_activation_last_window: int | None = None
+        self._focus_activation_last_error: str | None = None
         self._look_mask = self._BUTTON_MASK[look_button]
         self._previous_pointer: tuple[int, int] | None = None
         self._previous_look_pressed = False
@@ -3421,6 +3457,18 @@ class X11KeyboardMouse:
             ),
             "last_focus_badwindow_resource": getattr(
                 self, "_last_focus_badwindow_resource", None
+            ),
+            "focus_activation_requests": getattr(
+                self, "_focus_activation_requests", 0
+            ),
+            "focus_activation_successes": getattr(
+                self, "_focus_activation_successes", 0
+            ),
+            "focus_activation_last_window": getattr(
+                self, "_focus_activation_last_window", None
+            ),
+            "focus_activation_last_error": getattr(
+                self, "_focus_activation_last_error", None
             ),
         }
         raw_motion = getattr(self, "_raw_motion", None)
@@ -3491,6 +3539,17 @@ class X11KeyboardMouse:
                 ],
                 ctypes.c_int,
             ),
+            "XSendEvent": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_long,
+                    ctypes.POINTER(_XEvent),
+                ],
+                ctypes.c_int,
+            ),
+            "XFlush": ([ctypes.c_void_p], ctypes.c_int),
             "XSync": (
                 [ctypes.c_void_p, ctypes.c_int],
                 ctypes.c_int,
@@ -3630,6 +3689,29 @@ class X11KeyboardMouse:
             return None
         return int(parent.value)
 
+    def _children(self, window: int) -> tuple[int, ...]:
+        root = ctypes.c_ulong()
+        parent = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        child_count = ctypes.c_uint()
+        ok = self._x11.XQueryTree(
+            self._display,
+            window,
+            ctypes.byref(root),
+            ctypes.byref(parent),
+            ctypes.byref(children),
+            ctypes.byref(child_count),
+        )
+        try:
+            if not ok:
+                return ()
+            return tuple(
+                int(children[index]) for index in range(child_count.value)
+            )
+        finally:
+            if children:
+                self._x11.XFree(children)
+
     def _window_pid(self, window: int) -> int | None:
         if self._pid_atom == 0:
             return None
@@ -3659,6 +3741,88 @@ class X11KeyboardMouse:
         finally:
             if data:
                 self._x11.XFree(data)
+
+    def _find_expected_window(self) -> int | None:
+        expected_pid = getattr(self, "_expected_ue_pid", None)
+        if expected_pid is None:
+            return None
+        candidates: list[tuple[bool, int]] = []
+        with self._focus_window_error_scope() as error_scope:
+            pending = [self._root]
+            visited = 0
+            while pending and visited < 20_000:
+                window = pending.pop()
+                visited += 1
+                error_scope.windows.add(window)
+                if self._window_pid(window) == expected_pid:
+                    title = self._fetch_name(window)
+                    title_matches = bool(
+                        self._focus_pattern is None
+                        or (
+                            title is not None
+                            and self._focus_pattern.search(title)
+                        )
+                    )
+                    candidates.append((title_matches, window))
+                pending.extend(self._children(window))
+        if error_scope.stale_window is not None:
+            self._expected_window = None
+            return None
+        if not candidates:
+            self._expected_window = None
+            return None
+        matching = [window for title_matches, window in candidates if title_matches]
+        selected = matching[0] if matching else candidates[0][1]
+        self._expected_window = selected
+        return selected
+
+    def request_expected_focus(self) -> bool:
+        """Ask the window manager to activate the supervised UE client once."""
+
+        self._focus_activation_requests = (
+            getattr(self, "_focus_activation_requests", 0) + 1
+        )
+        if getattr(self, "_active_window_atom", 0) == 0:
+            self._focus_activation_last_error = "active_window_atom_unavailable"
+            return False
+        try:
+            target = self._find_expected_window()
+        except RuntimeError as exc:
+            self._focus_activation_last_error = str(exc)
+            return False
+        if target is None:
+            self._focus_activation_last_error = "expected_ue_window_unavailable"
+            return False
+
+        event = _XEvent()
+        event.type = _X11_CLIENT_MESSAGE
+        event.xclient.type = _X11_CLIENT_MESSAGE
+        event.xclient.send_event = 1
+        event.xclient.display = self._display
+        event.xclient.window = target
+        event.xclient.message_type = self._active_window_atom
+        event.xclient.format = 32
+        # EWMH source indication 2 means a pager/remote-control surface.
+        event.xclient.data.l[0] = 2
+        event.xclient.data.l[1] = 0
+        sent = self._x11.XSendEvent(
+            self._display,
+            self._root,
+            0,
+            _X11_SUBSTRUCTURE_NOTIFY_MASK
+            | _X11_SUBSTRUCTURE_REDIRECT_MASK,
+            ctypes.byref(event),
+        )
+        if not sent:
+            self._focus_activation_last_error = "active_window_request_rejected"
+            return False
+        self._x11.XFlush(self._display)
+        self._focus_activation_successes = (
+            getattr(self, "_focus_activation_successes", 0) + 1
+        )
+        self._focus_activation_last_window = target
+        self._focus_activation_last_error = None
+        return True
 
     def _focus_identity(self) -> tuple[bool, str | None, frozenset[int]]:
         """Read validity, title, and PIDs from one X11 focus ancestry chain."""
@@ -6273,6 +6437,10 @@ def main() -> int:
         )
     except (OSError, RuntimeError, re.error) as exc:
         raise SystemExit(f"Matrix game-control input cannot initialize X11: {exc}") from exc
+    # The browser/remote-desktop surface can retain focus after launching the
+    # supervised UE process.  Ask the window manager once; normal polling still
+    # enforces the exact UE PID and never treats this request as proof of focus.
+    x11.request_expected_focus()
     overlay: CalibrationOverlaySupervisor | None = None
     if args.expected_ue_pid is not None:
         calibration_state_file = args.calibration_state_file or args.socket.with_name(
@@ -6861,6 +7029,10 @@ def main() -> int:
                 command_state_changed = bool(
                     game_command_client.panel_closed() or command_state_changed
                 )
+                # An override-redirect settings panel cannot restore focus by
+                # itself.  Hand control back to the exact supervised UE client
+                # after Apply & Return, while keeping the PID safety gate.
+                x11.request_expected_focus()
             calibration_interlock_active = calibration_interlock_required(
                 panel_was_active=panel_was_active,
                 panel_active=calibration.active,

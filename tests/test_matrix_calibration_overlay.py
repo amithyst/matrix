@@ -886,6 +886,61 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertFalse(model.policy_enabled("host"))
 
+    def test_loading_loadout_allows_only_an_explicitly_unlocked_slot(self) -> None:
+        model = MODULE.strategy_loadout_model(
+            {
+                "strategy_loadout": {
+                    "version": 1,
+                    "available": True,
+                    "status": "loading",
+                    "active_slot": "locomotion",
+                    "slots": [
+                        {
+                            "slot": "locomotion",
+                            "selected_policy_id": "sonic",
+                            "locked": True,
+                            "candidates": [
+                                {
+                                    "policy_id": "sonic",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                                {
+                                    "policy_id": "bfm-sonic-teacher50k",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                            ],
+                        },
+                        {
+                            "slot": "recovery",
+                            "selected_policy_id": "kungfu",
+                            "locked": False,
+                            "candidates": [
+                                {
+                                    "policy_id": "kungfu",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                                {
+                                    "policy_id": "host",
+                                    "resident": True,
+                                    "available": True,
+                                },
+                            ],
+                        },
+                    ],
+                }
+            }
+        )
+
+        self.assertTrue(model.locomotion_locked)
+        self.assertFalse(model.recovery_locked)
+        self.assertFalse(
+            model.policy_enabled("bfm-sonic-teacher50k", slot="locomotion")
+        )
+        self.assertTrue(model.policy_enabled("host", slot="recovery"))
+
     def test_celestial_navigation_model_is_strict_and_honest(self) -> None:
         model = MODULE.celestial_navigation_model(celestial_navigation_state())
 
@@ -990,6 +1045,94 @@ class OverlayStateTest(unittest.TestCase):
         publisher.publish_navigation_select.assert_called_once_with(
             "earth-overworld-home"
         )
+
+    def test_polled_button_edges_recover_a_missing_cooked_strategy_click(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        x, y, width, height = layout["recovery_policy_1"]
+        events = []
+
+        class FakeX11:
+            @staticmethod
+            def XPending(_display):
+                return len(events)
+
+            @staticmethod
+            def XNextEvent(_display, destination):
+                event = events.pop(0)
+                MODULE.ctypes.memmove(
+                    destination,
+                    MODULE.ctypes.byref(event),
+                    MODULE.ctypes.sizeof(event),
+                )
+
+            @staticmethod
+            def XSendEvent(_display, _window, _propagate, _mask, source):
+                event = MODULE.XEvent.from_buffer_copy(
+                    MODULE.ctypes.string_at(
+                        source,
+                        MODULE.ctypes.sizeof(MODULE.XEvent),
+                    )
+                )
+                events.append(event)
+                return 1
+
+            @staticmethod
+            def XFlush(_display):
+                return 1
+
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = FakeX11()
+        overlay._display = 1
+        overlay._root = 10
+        overlay._windows = {"panel": 2}
+        overlay._last_layout = layout
+        overlay._last_pointer = (x + width // 2, y + height // 2)
+        overlay._active_page = "loadout"
+        overlay._last_strategy_model = MODULE.StrategyLoadoutModel(
+            available=True,
+            status="loading",
+            active_slot="locomotion",
+            locomotion_policy_id="sonic",
+            recovery_policy_id="kungfu",
+            locomotion_candidates=(),
+            recovery_candidates=(
+                MODULE.StrategyPolicyModel("kungfu", True, True),
+                MODULE.StrategyPolicyModel("host", True, True),
+            ),
+            pending_policy_id=None,
+            locomotion_locked=True,
+            recovery_locked=False,
+        )
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        overlay._visible = True
+        overlay._font_slider_dragging = False
+        overlay._polled_pointer_valid = True
+        overlay._polled_left_pressed = False
+        overlay._polled_left_initialized = False
+        overlay._polled_left_was_down = False
+        overlay._polled_left_transition_count = 0
+        overlay._polled_left_fallback_events = 0
+        publisher = mock.Mock()
+
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
+        overlay._polled_left_pressed = True
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, MODULE._BUTTON_PRESS)
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
+        overlay._polled_left_pressed = False
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, MODULE._BUTTON_RELEASE)
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
+
+        publisher.publish_strategy_select.assert_called_once_with(
+            "recovery",
+            "host",
+        )
+        self.assertEqual(overlay._polled_left_transition_count, 2)
+        self.assertEqual(overlay._polled_left_fallback_events, 2)
 
     def test_navigation_page_draws_ready_earth_and_disabled_planned_bodies(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
@@ -2290,6 +2433,8 @@ class X11WindowProbeTest(unittest.TestCase):
                     "request_code": MODULE._X_REQUEST_GET_PROPERTY,
                     "minor_code": 0,
                 },
+                "polled_left_transition_count": 0,
+                "polled_left_fallback_events": 0,
             },
         )
 
@@ -2344,6 +2489,8 @@ class X11WindowProbeTest(unittest.TestCase):
                     "minor_code": 0,
                 },
                 "last_bad_window": None,
+                "polled_left_transition_count": 0,
+                "polled_left_fallback_events": 0,
             },
         )
 
