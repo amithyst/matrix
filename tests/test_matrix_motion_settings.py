@@ -618,6 +618,17 @@ class MotionSettingsStoreTest(unittest.TestCase):
             loaded = MODULE.MotionSettingsStore(file_path, fallback=profile)
             self.assertEqual(loaded.settings, persisted)
             self.assertEqual(loaded.load_status, "loaded")
+            with mock.patch.dict(
+                os.environ,
+                {"MATRIX_HOST_PROFILE": "other-host"},
+                clear=False,
+            ):
+                restarted = MODULE.MotionSettingsStore(file_path, fallback=profile)
+            self.assertEqual(restarted.settings, persisted)
+            telemetry = restarted.mapping()
+            self.assertEqual(telemetry["load_status"], "loaded")
+            self.assertEqual(telemetry["settings"]["revision"], 4)
+            self.assertEqual(telemetry["settings_file"], os.fspath(file_path))
 
     def test_store_rejects_ambiguous_or_invalid_initialization(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

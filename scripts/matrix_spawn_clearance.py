@@ -29,6 +29,11 @@ MINIMUM_FOOT_VERTICAL_NORMAL = 0.8
 MAXIMUM_GROUND_SUPPORT_DROP_M = 0.12
 MINIMUM_GROUND_SUPPORT_NORMAL_Z = 0.8
 REQUIRED_GROUND_SUPPORT_HITS = 1
+REQUIRED_MOON_GROUND_SUPPORT_HITS = 2
+MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M = 0.04
+MOON_CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
+MOON_CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
+_MUJOCO_HFIELD_GEOM_TYPE = 1
 
 _PELVIS_BODY_NAME = "pelvis"
 _FOOT_BODY_NAMES = (
@@ -350,6 +355,80 @@ def _geom_count(model: Any) -> int:
     return _model_count(model, "ngeom")
 
 
+def _moon_continuous_support_geom_id(model: Any, *, ngeom: int) -> int | None:
+    matches = [
+        geom_id
+        for geom_id in range(ngeom)
+        if _optional_name(model, "geom", geom_id)
+        == MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support geom must be unique"
+        )
+    geom_id = matches[0]
+    nhfield = _model_count(model, "nhfield")
+    hfield_matches = [
+        hfield_id
+        for hfield_id in range(nhfield)
+        if _optional_name(model, "hfield", hfield_id)
+        == MOON_CONTINUOUS_SUPPORT_ASSET_NAME
+    ]
+    if not hfield_matches:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support hfield asset is missing"
+        )
+    if len(hfield_matches) != 1:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support hfield asset must be unique"
+        )
+    hfield_id = hfield_matches[0]
+    try:
+        body_id = _index(
+            model.geom_bodyid[geom_id],
+            label=f"model.geom_bodyid[{geom_id}]",
+        )
+        geom_type = _index(
+            model.geom_type[geom_id],
+            label=f"model.geom_type[{geom_id}]",
+        )
+        data_id = _index(
+            model.geom_dataid[geom_id],
+            label=f"model.geom_dataid[{geom_id}]",
+        )
+        contype = _index(
+            model.geom_contype[geom_id],
+            label=f"model.geom_contype[{geom_id}]",
+        )
+        conaffinity = _index(
+            model.geom_conaffinity[geom_id],
+            label=f"model.geom_conaffinity[{geom_id}]",
+        )
+    except (AttributeError, IndexError, KeyError, TypeError) as exc:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support collision metadata is unavailable"
+        ) from exc
+    if body_id != 0:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support must be attached to the world body"
+        )
+    if geom_type != _MUJOCO_HFIELD_GEOM_TYPE:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support geom must be a MuJoCo hfield"
+        )
+    if data_id != hfield_id:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support geom must bind the named hfield asset"
+        )
+    if contype != 1 or conaffinity != 1:
+        raise SpawnClearanceError(
+            "MoonWorld continuous support must use contype=1 and conaffinity=1"
+        )
+    return geom_id
+
+
 def _contact_mapping(
     *,
     model: Any,
@@ -422,6 +501,11 @@ def audit_spawn_clearance(
         )
         nbody = _model_count(model, "nbody")
         ngeom = _geom_count(model)
+        moon_support_geom_id = _moon_continuous_support_geom_id(
+            model,
+            ngeom=ngeom,
+        )
+        moon_spawn_gate = moon_support_geom_id is not None
         pelvis_id = _named_body_id(model, _PELVIS_BODY_NAME, nbody=nbody)
         foot_ids = tuple(
             _named_body_id(model, name, nbody=nbody) for name in _FOOT_BODY_NAMES
@@ -510,33 +594,33 @@ def audit_spawn_clearance(
                     scene_body_id,
                     nbody=nbody,
                 )
-                allowed = bool(
-                    support_normal >= thresholds["minimum_foot_vertical_normal"]
-                    and distance
-                    >= -thresholds["foot_penetration_tolerance_m"]
-                )
-                if allowed:
-                    classification = "allowed_foot_support"
+                allowed = False
+                if moon_terrain_edge:
+                    classification = "unsafe_foot_terrain_edge"
                 elif (
-                    moon_terrain_edge
+                    support_normal >= thresholds["minimum_foot_vertical_normal"]
                     and distance
                     >= -thresholds["foot_penetration_tolerance_m"]
                 ):
                     allowed = True
-                    classification = "allowed_foot_terrain_edge"
+                    classification = "allowed_foot_support"
                 elif support_normal < thresholds["minimum_foot_vertical_normal"]:
                     classification = "unsafe_foot_contact_normal"
                 else:
                     classification = "unsafe_foot_penetration"
             else:
-                allowed = bool(
-                    distance >= -thresholds["body_penetration_tolerance_m"]
-                )
-                classification = (
-                    "allowed_body_contact_tolerance"
-                    if allowed
-                    else "scene_penetration"
-                )
+                if moon_spawn_gate:
+                    allowed = False
+                    classification = "unsafe_body_contact"
+                else:
+                    allowed = bool(
+                        distance >= -thresholds["body_penetration_tolerance_m"]
+                    )
+                    classification = (
+                        "allowed_body_contact_tolerance"
+                        if allowed
+                        else "scene_penetration"
+                    )
             item = _contact_mapping(
                 model=model,
                 contact_index=contact_index,
@@ -589,6 +673,20 @@ def audit_spawn_clearance(
             "reason": reason,
             "error": None,
             "thresholds": thresholds,
+            "moon_spawn_gate": {
+                "enabled": moon_spawn_gate,
+                "continuous_support_geom_id": moon_support_geom_id,
+                "required_supported_feet": (
+                    REQUIRED_MOON_GROUND_SUPPORT_HITS if moon_spawn_gate else 1
+                ),
+                "maximum_foot_support_height_delta_m": (
+                    MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M
+                    if moon_spawn_gate
+                    else None
+                ),
+                "foot_terrain_edge_allowed": False,
+                "body_contact_allowed": not moon_spawn_gate,
+            },
             "robot": {
                 "root_body": {
                     "id": pelvis_id,
@@ -952,6 +1050,9 @@ def probe_ground_support(
     *,
     maximum_drop_m: float = MAXIMUM_GROUND_SUPPORT_DROP_M,
     minimum_normal_z: float = MINIMUM_GROUND_SUPPORT_NORMAL_Z,
+    maximum_foot_support_height_delta_m: float = (
+        MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M
+    ),
 ) -> dict[str, object]:
     """Probe below collision-capable foot geoms for scene support."""
 
@@ -960,11 +1061,30 @@ def probe_ground_support(
         minimum_normal_z,
         label="minimum ground-support normal z",
     )
+    maximum_height_delta = _finite(
+        maximum_foot_support_height_delta_m,
+        label="maximum foot-support height delta",
+    )
     if maximum_drop <= 0.0:
         raise SpawnClearanceError("maximum ground-support drop must be positive")
     if not 0.0 < minimum_normal <= 1.0:
         raise SpawnClearanceError("minimum ground-support normal z must be in (0, 1]")
+    if maximum_height_delta < 0.0:
+        raise SpawnClearanceError(
+            "maximum foot-support height delta must be non-negative"
+        )
+    ngeom = _geom_count(model)
+    moon_support_geom_id = _moon_continuous_support_geom_id(
+        model,
+        ngeom=ngeom,
+    )
+    moon_spawn_gate = moon_support_geom_id is not None
     topology = _ground_support_topology(model)
+    required_hits = (
+        REQUIRED_MOON_GROUND_SUPPORT_HITS
+        if moon_spawn_gate
+        else REQUIRED_GROUND_SUPPORT_HITS
+    )
     try:
         geom_body_ids = model.geom_bodyid
     except AttributeError as exc:
@@ -974,6 +1094,7 @@ def probe_ground_support(
 
     probes: list[dict[str, object]] = []
     accepted_hits = 0
+    support_heights_m: list[float] = []
     for foot_name, foot_id in zip(_FOOT_BODY_NAMES, topology.foot_ids):
         origins: list[dict[str, object]] = []
         best: (
@@ -1025,6 +1146,11 @@ def probe_ground_support(
                 probe_geom_id=probe_geom_id,
                 origin=origin,
             ):
+                if (
+                    moon_support_geom_id is not None
+                    and geom_id != moon_support_geom_id
+                ):
+                    continue
                 distance, normal = _ray_distance_and_normal(
                     mujoco,
                     model,
@@ -1064,11 +1190,18 @@ def probe_ground_support(
                     "probe_geom": None,
                     "ray_origin_m": None,
                     "scene_geom": None,
+                    "support_height_m": None,
                 }
             )
             continue
         distance, normal, geom_id, body_id, probe_geom_id, ray_origin = best
+        support_height_m = float(ray_origin[2]) - distance
+        if not math.isfinite(support_height_m):
+            raise SpawnClearanceError(
+                f"ground-support height is non-finite for {foot_name}"
+            )
         accepted_hits += 1
+        support_heights_m.append(support_height_m)
         probes.append(
             {
                 "foot_body": {"id": foot_id, "name": foot_name},
@@ -1087,16 +1220,52 @@ def probe_ground_support(
                     "body_id": body_id,
                     "body_name": _optional_name(model, "body", body_id),
                 },
+                "support_height_m": support_height_m,
             }
         )
+    height_delta_m = (
+        max(support_heights_m) - min(support_heights_m)
+        if len(support_heights_m) >= 2
+        else None
+    )
+    height_delta_safe = bool(
+        not moon_spawn_gate
+        or (
+            height_delta_m is not None
+            and height_delta_m <= maximum_height_delta
+        )
+    )
+    supported = bool(accepted_hits >= required_hits and height_delta_safe)
     return {
         "schema": GROUND_SUPPORT_SCHEMA,
-        "supported": accepted_hits >= REQUIRED_GROUND_SUPPORT_HITS,
+        "supported": supported,
         "method": "downward_foot_geom_rays",
-        "required_hits": REQUIRED_GROUND_SUPPORT_HITS,
+        "required_hits": required_hits,
         "accepted_hits": accepted_hits,
+        "required_distinct_feet": required_hits,
+        "supported_foot_names": [
+            str(probe["foot_body"]["name"])
+            for probe in probes
+            if probe.get("accepted") is True
+            and isinstance(probe.get("foot_body"), dict)
+        ],
         "maximum_drop_m": maximum_drop,
         "minimum_normal_z": minimum_normal,
+        "height_delta_m": height_delta_m,
+        "maximum_height_delta_m": (
+            maximum_height_delta if moon_spawn_gate else None
+        ),
+        "height_delta_safe": height_delta_safe,
+        "rejection_reason": (
+            None
+            if supported
+            else (
+                "foot_support_height_delta"
+                if accepted_hits >= required_hits and not height_delta_safe
+                else "insufficient_distinct_foot_support"
+            )
+        ),
+        "moon_spawn_gate": moon_spawn_gate,
         "ray_direction": [0.0, 0.0, -1.0],
         "probes": probes,
     }
@@ -1112,6 +1281,9 @@ def audit_spawn_safety(
     minimum_foot_vertical_normal: float = MINIMUM_FOOT_VERTICAL_NORMAL,
     maximum_ground_support_drop_m: float = MAXIMUM_GROUND_SUPPORT_DROP_M,
     minimum_ground_support_normal_z: float = MINIMUM_GROUND_SUPPORT_NORMAL_Z,
+    maximum_foot_support_height_delta_m: float = (
+        MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M
+    ),
 ) -> dict[str, object]:
     """Combine collision clearance with a replayable below-foot support probe."""
 
@@ -1124,6 +1296,10 @@ def audit_spawn_safety(
     )
     if result.get("safe") is not True:
         return result
+    moon_gate = result.get("moon_spawn_gate")
+    moon_spawn_gate = bool(
+        isinstance(moon_gate, dict) and moon_gate.get("enabled") is True
+    )
     contacts = result.get("contacts")
     allowed_foot_contacts = (
         [
@@ -1144,7 +1320,7 @@ def audit_spawn_safety(
         if isinstance(contacts, list)
         else []
     )
-    if allowed_foot_contacts:
+    if allowed_foot_contacts and not moon_spawn_gate:
         supported_feet = {
             str(contact.get("robot_body", {}).get("name"))
             for contact in allowed_foot_contacts
@@ -1175,6 +1351,9 @@ def audit_spawn_safety(
             data,
             maximum_drop_m=maximum_ground_support_drop_m,
             minimum_normal_z=minimum_ground_support_normal_z,
+            maximum_foot_support_height_delta_m=(
+                maximum_foot_support_height_delta_m
+            ),
         )
     except Exception as exc:
         return _audit_error(

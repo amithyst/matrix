@@ -69,6 +69,7 @@ def armed_core(config=None):
     core.accept_snapshot(
         snapshot(sequence=0, timestamp=9.99), received_at_s=9.99
     )
+    core.command(now_s=9.99, dt_s=0.0)
     return core
 
 
@@ -632,31 +633,274 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(moving.mode, "move")
         self.assertGreater(moving.speed_mps, 0.0)
 
-    def test_walk_curves_during_moderate_camera_body_mismatch(self) -> None:
+    def test_walk_turns_in_place_during_moderate_camera_body_mismatch(self) -> None:
         core = armed_core(immediate_config())
         camera_body_error = math.radians(53.0)
         core.synchronize_heading(camera_body_error)
         core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
 
         entering = core.command(now_s=10.0, dt_s=0.1)
-        curving = core.command(now_s=10.0, dt_s=0.1)
+        still_turning = core.command(now_s=10.0, dt_s=0.1)
 
-        self.assertEqual(entering.mode, "move")
-        self.assertEqual(entering.speed_mps, 0.1)
-        self.assertEqual(curving.mode, "move")
-        self.assertGreater(curving.speed_mps, 0.1)
-        self.assertLess(curving.speed_mps, 0.8)
-        self.assertEqual(curving.movement, curving.facing)
+        for command in (entering, still_turning):
+            self.assertEqual(command.mode, "turn")
+            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+            self.assertEqual(command.speed_mps, 0.0)
+            self.assertEqual(command.movement, (0.0, 0.0, 0.0))
 
         core.synchronize_heading(math.radians(10.0))
         core.accept_snapshot(
             snapshot(sequence=2, timestamp=10.01, pressed=("w",)),
             received_at_s=10.01,
         )
+        gait_entry = core.command(now_s=10.01, dt_s=0.1)
         aligned = core.command(now_s=10.01, dt_s=0.1)
+        self.assertEqual(gait_entry.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertEqual(gait_entry.speed_mps, 0.1)
         self.assertEqual(aligned.mode, "move")
         self.assertEqual(aligned.locomotion_mode, MODULE.SONIC_WALK_MODE)
         self.assertEqual(aligned.speed_mps, 0.8)
+
+    def test_digital_chord_locks_world_heading_until_change_or_release(self) -> None:
+        core = armed_core(immediate_config())
+
+        core.accept_snapshot(
+            snapshot(
+                sequence=1,
+                timestamp=10.0,
+                yaw=0.25,
+                pressed=("w",),
+                speed_modifiers=("ctrl",),
+            ),
+            received_at_s=10.0,
+        )
+        first = core.command(now_s=10.0, dt_s=0.1)
+        first_heading = math.atan2(
+            first.desired_facing[1], first.desired_facing[0]
+        )
+        self.assertAlmostEqual(first_heading, 0.25)
+
+        # Modifiers are not part of the movement chord, and a follow-camera
+        # update must not move the target while the same W key remains held.
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.01,
+                yaw=1.0,
+                pressed=("w",),
+                speed_modifiers=("shift",),
+            ),
+            received_at_s=10.01,
+        )
+        held = core.command(now_s=10.01, dt_s=0.1)
+        held_heading = math.atan2(
+            held.desired_facing[1], held.desired_facing[0]
+        )
+        self.assertAlmostEqual(held_heading, first_heading)
+
+        core.accept_snapshot(
+            snapshot(
+                sequence=3,
+                timestamp=10.02,
+                yaw=1.0,
+                pressed=("w", "d"),
+            ),
+            received_at_s=10.02,
+        )
+        diagonal = core.command(now_s=10.02, dt_s=0.1)
+        diagonal_heading = math.atan2(
+            diagonal.desired_facing[1], diagonal.desired_facing[0]
+        )
+        self.assertAlmostEqual(diagonal_heading, 1.0 - (math.pi / 4.0))
+
+        core.accept_snapshot(
+            snapshot(
+                sequence=4,
+                timestamp=10.03,
+                yaw=-0.4,
+                pressed=("d",),
+            ),
+            received_at_s=10.03,
+        )
+        right = core.command(now_s=10.03, dt_s=0.1)
+        right_heading = math.atan2(
+            right.desired_facing[1], right.desired_facing[0]
+        )
+        self.assertAlmostEqual(right_heading, -0.4 - (math.pi / 2.0))
+
+        core.accept_snapshot(
+            snapshot(sequence=5, timestamp=10.04, yaw=-0.4),
+            received_at_s=10.04,
+        )
+        self.assertEqual(core.command(now_s=10.04, dt_s=0.1).mode, "idle")
+        core.accept_snapshot(
+            snapshot(
+                sequence=6,
+                timestamp=10.05,
+                yaw=-1.1,
+                pressed=("w",),
+            ),
+            received_at_s=10.05,
+        )
+        repressed = core.command(now_s=10.05, dt_s=0.1)
+        repressed_heading = math.atan2(
+            repressed.desired_facing[1], repressed.desired_facing[0]
+        )
+        self.assertAlmostEqual(repressed_heading, -1.1)
+
+    def test_transient_chord_boundary_relocks_final_chord_once(self) -> None:
+        core = armed_core(immediate_config())
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(sequence=1, timestamp=10.0, yaw=0.0, pressed=("w",)),
+            received_at_s=10.0,
+        )
+        initial = core.command(now_s=10.0, dt_s=0.1)
+        self.assertAlmostEqual(
+            math.atan2(initial.desired_facing[1], initial.desired_facing[0]),
+            0.0,
+        )
+
+        # Both packets can be accepted by one runtime drain. Although the final
+        # chord is W again, W+D ended the previous W movement interval.
+        core.synchronize_heading(1.0)
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.01,
+                yaw=1.0,
+                pressed=("w", "d"),
+            ),
+            received_at_s=10.01,
+        )
+        core.accept_snapshot(
+            snapshot(sequence=3, timestamp=10.011, yaw=1.0, pressed=("w",)),
+            received_at_s=10.011,
+        )
+        relocked = core.command(now_s=10.011, dt_s=0.1)
+        self.assertEqual(relocked.mode, "move")
+        self.assertAlmostEqual(
+            math.atan2(relocked.desired_facing[1], relocked.desired_facing[0]),
+            1.0,
+        )
+
+        # The epoch is consumed once. A normal held-W snapshot must not chase
+        # a subsequent final-POV update.
+        core.accept_snapshot(
+            snapshot(sequence=4, timestamp=10.02, yaw=1.6, pressed=("w",)),
+            received_at_s=10.02,
+        )
+        held = core.command(now_s=10.02, dt_s=0.1)
+        self.assertAlmostEqual(
+            math.atan2(held.desired_facing[1], held.desired_facing[0]),
+            1.0,
+        )
+
+    def test_release_and_opposing_chords_relock_before_next_command(self) -> None:
+        for boundary in ((), ("w", "s")):
+            with self.subTest(boundary=boundary):
+                core = armed_core(immediate_config())
+                core.accept_snapshot(
+                    snapshot(sequence=1, timestamp=10.0, pressed=("w",)),
+                    received_at_s=10.0,
+                )
+                core.command(now_s=10.0, dt_s=0.1)
+
+                core.accept_snapshot(
+                    snapshot(
+                        sequence=2,
+                        timestamp=10.01,
+                        yaw=0.7,
+                        pressed=boundary,
+                    ),
+                    received_at_s=10.01,
+                )
+                core.accept_snapshot(
+                    snapshot(
+                        sequence=3,
+                        timestamp=10.011,
+                        yaw=0.7,
+                        pressed=("w",),
+                    ),
+                    received_at_s=10.011,
+                )
+                core.synchronize_heading(0.7)
+                repressed = core.command(now_s=10.011, dt_s=0.1)
+                self.assertAlmostEqual(
+                    math.atan2(
+                        repressed.desired_facing[1],
+                        repressed.desired_facing[0],
+                    ),
+                    0.7,
+                )
+
+    def test_analog_heading_remains_continuously_camera_relative(self) -> None:
+        core = armed_core(immediate_config())
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(sequence=1, timestamp=10.0, yaw=0.0, stick=(0.0, 1.0)),
+            received_at_s=10.0,
+        )
+        first = core.command(now_s=10.0, dt_s=0.1)
+        self.assertAlmostEqual(
+            math.atan2(first.desired_facing[1], first.desired_facing[0]),
+            0.0,
+        )
+
+        # A pending digital chord epoch must not make the final analog sample
+        # inherit digital heading-lock semantics.
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.01,
+                yaw=0.5,
+                pressed=("w", "d"),
+            ),
+            received_at_s=10.01,
+        )
+        core.synchronize_heading(1.0)
+        core.accept_snapshot(
+            snapshot(sequence=3, timestamp=10.011, yaw=1.0, stick=(0.0, 1.0)),
+            received_at_s=10.011,
+        )
+        followed = core.command(now_s=10.011, dt_s=0.1)
+        self.assertAlmostEqual(
+            math.atan2(followed.desired_facing[1], followed.desired_facing[0]),
+            1.0,
+        )
+
+    def test_opposing_keys_clear_the_digital_chord_heading(self) -> None:
+        core = armed_core(immediate_config())
+        core.accept_snapshot(
+            snapshot(sequence=1, timestamp=10.0, pressed=("w",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.01,
+                yaw=0.5,
+                pressed=("w", "s"),
+            ),
+            received_at_s=10.01,
+        )
+        self.assertEqual(core.command(now_s=10.01, dt_s=0.1).mode, "idle")
+
+        core.accept_snapshot(
+            snapshot(
+                sequence=3,
+                timestamp=10.02,
+                yaw=math.pi / 2.0,
+                pressed=("w",),
+            ),
+            received_at_s=10.02,
+        )
+        rearmed = core.command(now_s=10.02, dt_s=0.1)
+        rearmed_heading = math.atan2(
+            rearmed.desired_facing[1], rearmed.desired_facing[0]
+        )
+        self.assertAlmostEqual(rearmed_heading, math.pi / 2.0)
 
     def test_walk_still_turns_in_place_for_large_camera_body_mismatch(self) -> None:
         core = armed_core(immediate_config())
@@ -885,9 +1129,8 @@ class GameControlCoreTest(unittest.TestCase):
             core.command(now_s=10.0 + (index * 0.02), dt_s=0.02)
             for index in range(5)
         ]
-        self.assertTrue(all(command.speed_mps == 0.0 for command in starting[:2]))
-        self.assertAlmostEqual(starting[2].speed_mps, 0.1)
-        self.assertTrue(all(command.speed_mps >= 0.1 for command in starting[2:]))
+        self.assertTrue(all(command.speed_mps == 0.0 for command in starting[:4]))
+        self.assertAlmostEqual(starting[4].speed_mps, 0.1)
         after_entry = core.command(now_s=10.1, dt_s=0.02)
         self.assertAlmostEqual(after_entry.speed_mps - starting[4].speed_mps, 0.024)
 
@@ -1109,6 +1352,114 @@ class GameControlCoreTest(unittest.TestCase):
             received_at_s=10.04,
         )
         self.assertEqual(core.command(now_s=10.04, dt_s=0.1).mode, "move")
+
+    def test_recovery_invalidation_rearms_each_wasd_after_one_neutral(self) -> None:
+        direction_headings = {
+            "w": 0.0,
+            "a": math.pi / 2.0,
+            "s": math.pi,
+            "d": -math.pi / 2.0,
+        }
+        for key, heading in direction_headings.items():
+            with self.subTest(key=key):
+                core = armed_core(immediate_config())
+                core.synchronize_heading(heading)
+                core.accept_snapshot(
+                    snapshot(sequence=1, timestamp=10.0, pressed=(key,)),
+                    received_at_s=10.0,
+                )
+                self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "move")
+
+                core.invalidate_input("physical_fall_recovery")
+                core.accept_snapshot(
+                    snapshot(sequence=2, timestamp=10.01, pressed=(key,)),
+                    received_at_s=10.01,
+                )
+                held = core.command(now_s=10.01, dt_s=0.1)
+                self.assertEqual(held.reason, "awaiting_neutral")
+                self.assertEqual(held.speed_mps, 0.0)
+
+                core.accept_snapshot(
+                    snapshot(sequence=3, timestamp=10.02),
+                    received_at_s=10.02,
+                )
+                neutral = core.command(now_s=10.02, dt_s=0.1)
+                self.assertEqual(neutral.mode, "idle")
+
+                resumed_heading = MODULE.wrap_angle_rad(heading + 0.4)
+                core.synchronize_heading(resumed_heading)
+                core.accept_snapshot(
+                    snapshot(
+                        sequence=4,
+                        timestamp=10.03,
+                        yaw=0.4,
+                        pressed=(key,),
+                    ),
+                    received_at_s=10.03,
+                )
+                resumed = core.command(now_s=10.03, dt_s=0.1)
+                self.assertEqual(resumed.mode, "move")
+                self.assertGreater(resumed.speed_mps, 0.0)
+                resumed_target = math.atan2(
+                    resumed.desired_facing[1], resumed.desired_facing[0]
+                )
+                self.assertAlmostEqual(
+                    MODULE.wrap_angle_rad(resumed_target - resumed_heading),
+                    0.0,
+                )
+
+    def test_invalidation_rearm_requires_neutral_frame_then_fresh_w(self) -> None:
+        reasons = (
+            "runtime_resume_awaiting_neutral",
+            "fall_recovered_awaiting_neutral",
+            "physical_fall_recovery",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                core = armed_core(immediate_config())
+                core.accept_snapshot(
+                    snapshot(sequence=1, timestamp=10.0, pressed=("w",)),
+                    received_at_s=10.0,
+                )
+                self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "move")
+
+                core.invalidate_input(reason)
+                core.accept_snapshot(
+                    snapshot(sequence=2, timestamp=10.01, pressed=("w",)),
+                    received_at_s=10.01,
+                )
+                held = core.command(now_s=10.01, dt_s=0.01)
+                self.assertEqual(held.reason, "awaiting_neutral")
+                self.assertEqual(held.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+
+                # Model one runtime drain that consumes neutral and then W
+                # before command() gets a control-frame boundary.
+                core.accept_snapshot(
+                    snapshot(sequence=3, timestamp=10.02),
+                    received_at_s=10.02,
+                )
+                core.accept_snapshot(
+                    snapshot(sequence=4, timestamp=10.021, pressed=("w",)),
+                    received_at_s=10.021,
+                )
+                queued = core.command(now_s=10.021, dt_s=0.01)
+                self.assertEqual(queued.reason, "awaiting_neutral")
+                self.assertEqual(queued.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+                self.assertEqual(queued.speed_mps, 0.0)
+
+                # The queued W belongs to the completed re-arm frame. It cannot
+                # leak into a later command without a newer input snapshot.
+                fenced = core.command(now_s=10.022, dt_s=0.01)
+                self.assertEqual(fenced.reason, "awaiting_neutral")
+                self.assertEqual(fenced.speed_mps, 0.0)
+
+                core.accept_snapshot(
+                    snapshot(sequence=5, timestamp=10.03, pressed=("w",)),
+                    received_at_s=10.03,
+                )
+                resumed = core.command(now_s=10.03, dt_s=0.1)
+                self.assertEqual(resumed.mode, "move")
+                self.assertGreater(resumed.speed_mps, 0.0)
 
     def test_no_input_and_timeout_are_deadman_stops(self) -> None:
         core = MODULE.GameControlCore()

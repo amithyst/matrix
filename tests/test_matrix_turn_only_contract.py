@@ -94,6 +94,10 @@ def snapshot(
     *,
     yaw: float = 0.0,
     w: bool = False,
+    a: bool = False,
+    s: bool = False,
+    d: bool = False,
+    ctrl: bool = False,
     shift: bool = False,
 ):
     return CORE.InputSnapshot.from_mapping(
@@ -105,13 +109,13 @@ def snapshot(
             "camera_yaw_rad": yaw,
             "keys": {
                 "w": w,
-                "a": False,
-                "s": False,
-                "d": False,
+                "a": a,
+                "s": s,
+                "d": d,
                 "q": False,
                 "e": False,
                 "v": False,
-                "ctrl": False,
+                "ctrl": ctrl,
                 "alt": False,
                 "shift": shift,
             },
@@ -150,6 +154,144 @@ def recovery_coordinator(*, rotation_rad: float):
 
 
 class TurnOnlyCoreContractTest(unittest.TestCase):
+    def test_wasd_modifier_heading_matrix_turns_before_translation(self) -> None:
+        direction_offsets = {
+            "w": 0.0,
+            "a": math.pi / 2.0,
+            "s": math.pi,
+            "d": -math.pi / 2.0,
+        }
+        modifier_cases = (
+            ("plain", False, False, CORE.SONIC_WALK_MODE, 0.8),
+            ("ctrl", True, False, CORE.SONIC_SLOW_WALK_MODE, 0.1),
+            ("shift", False, True, CORE.SONIC_RUN_MODE, 2.5),
+        )
+        for error_deg in (0, 20, 53, 78, 90, 180):
+            target_heading = math.radians(error_deg)
+            for modifier, ctrl, shift, expected_mode, expected_speed in modifier_cases:
+                for direction, direction_offset in direction_offsets.items():
+                    with self.subTest(
+                        error_deg=error_deg,
+                        modifier=modifier,
+                        direction=direction,
+                    ):
+                        core = armed_core()
+                        camera_yaw = target_heading - direction_offset
+                        core.accept_snapshot(
+                            snapshot(
+                                1,
+                                10.0,
+                                yaw=camera_yaw,
+                                ctrl=ctrl,
+                                shift=shift,
+                                **{direction: True},
+                            ),
+                            received_at_s=10.0,
+                        )
+
+                        command = core.command(now_s=10.0, dt_s=0.1)
+                        desired_heading = math.atan2(
+                            command.desired_facing[1],
+                            command.desired_facing[0],
+                        )
+                        self.assertAlmostEqual(
+                            CORE.wrap_angle_rad(desired_heading - target_heading),
+                            0.0,
+                        )
+                        if error_deg == 0:
+                            self.assertEqual(command.mode, "move")
+                            self.assertGreater(command.speed_mps, 0.0)
+                            settled = core.command(now_s=10.0, dt_s=0.1)
+                            self.assertEqual(settled.mode, "move")
+                            self.assertEqual(settled.locomotion_mode, expected_mode)
+                            self.assertAlmostEqual(settled.speed_mps, expected_speed)
+                        else:
+                            self.assertEqual(command.mode, "turn")
+                            self.assertEqual(
+                                command.locomotion_mode,
+                                CORE.SONIC_IDLE_MODE,
+                            )
+                            self.assertEqual(command.speed_mps, 0.0)
+                            self.assertEqual(command.movement, (0.0, 0.0, 0.0))
+
+    def test_world_heading_lock_converges_with_corotating_final_pov(self) -> None:
+        direction_offsets = {
+            "w": 0.0,
+            "a": math.pi / 2.0,
+            "s": math.pi,
+            "d": -math.pi / 2.0,
+        }
+        modifier_cases = (
+            ("plain", False, False),
+            ("ctrl", True, False),
+            ("shift", False, True),
+        )
+        target_heading = math.pi
+        for modifier, ctrl, shift in modifier_cases:
+            for direction, direction_offset in direction_offsets.items():
+                with self.subTest(modifier=modifier, direction=direction):
+                    core = armed_core()
+                    initial_camera_yaw = target_heading - direction_offset
+                    core.accept_snapshot(
+                        snapshot(
+                            1,
+                            10.0,
+                            yaw=initial_camera_yaw,
+                            ctrl=ctrl,
+                            shift=shift,
+                            **{direction: True},
+                        ),
+                        received_at_s=10.0,
+                    )
+                    commands = [core.command(now_s=10.0, dt_s=0.02)]
+                    fixed_heading = math.atan2(
+                        commands[0].desired_facing[1],
+                        commands[0].desired_facing[0],
+                    )
+
+                    for frame in range(2, 102):
+                        measured_heading = math.atan2(
+                            commands[-1].facing[1],
+                            commands[-1].facing[0],
+                        )
+                        core.synchronize_heading(measured_heading)
+                        now = 10.0 + ((frame - 1) * 0.02)
+                        core.accept_snapshot(
+                            snapshot(
+                                frame,
+                                now,
+                                yaw=initial_camera_yaw + measured_heading,
+                                ctrl=ctrl,
+                                shift=shift,
+                                **{direction: True},
+                            ),
+                            received_at_s=now,
+                        )
+                        command = core.command(now_s=now, dt_s=0.02)
+                        commands.append(command)
+                        desired_heading = math.atan2(
+                            command.desired_facing[1],
+                            command.desired_facing[0],
+                        )
+                        self.assertAlmostEqual(
+                            CORE.wrap_angle_rad(desired_heading - fixed_heading),
+                            0.0,
+                        )
+                        if command.mode == "move":
+                            break
+
+                    self.assertEqual(commands[-1].mode, "move")
+                    self.assertTrue(
+                        all(command.mode == "turn" for command in commands[:-1])
+                    )
+                    self.assertTrue(
+                        all(
+                            command.movement == (0.0, 0.0, 0.0)
+                            for command in commands[:-1]
+                        )
+                    )
+                    self.assertLess(len(commands), 100)
+
     def test_reanchor_heading_resets_stale_command_once(self) -> None:
         core = CORE.GameControlCore(initial_heading_rad=0.0)
         core.accept_snapshot(snapshot(0, 9.99), received_at_s=9.99)

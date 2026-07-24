@@ -391,6 +391,35 @@ class VideoSettingsStoreTest(unittest.TestCase):
             self.assertEqual(invalid.settings, fallback)
             self.assertEqual(invalid.load_status, "invalid")
 
+    def test_valid_host_beats_fallback_environment_and_survives_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = MODULE.default_settings_file("trna", config_home=root)
+            persisted = MODULE.VideoSettings(
+                revision=7,
+                resolution="2560x1440",
+                fps_limit=120,
+                quality="epic",
+            )
+            fallback = MODULE.VideoSettings(fps_limit=30, quality="low")
+            MODULE.atomic_save_settings(path, persisted)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MATRIX_HOST_PROFILE": "other-host",
+                    "XDG_CONFIG_HOME": str(root),
+                },
+                clear=False,
+            ):
+                first_launch = MODULE.VideoSettingsStore(path, fallback=fallback)
+                restarted = MODULE.VideoSettingsStore(path, fallback=fallback)
+
+            self.assertEqual(first_launch.load_status, "loaded")
+            self.assertEqual(first_launch.settings, persisted)
+            self.assertEqual(restarted.settings, persisted)
+            self.assertEqual(restarted.mapping()["settings"]["revision"], 7)
+
 
 class VideoSettingsCliTest(unittest.TestCase):
     def test_show_and_patch_offer_machine_readable_provider_api(self) -> None:

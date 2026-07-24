@@ -54,7 +54,9 @@ from matrix_mc_commands import (
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
+    MAX_RUNTIME_PAUSE_EPOCH,
     PolicySlotAssignment,
+    RuntimePause,
     TeleportList,
     TeleportRoute,
     decode_command_request,
@@ -108,6 +110,7 @@ from matrix_world_state import (
     WorldPose,
     WorldStateError,
     WorldStateStore,
+    validate_world_id,
 )
 
 
@@ -2010,6 +2013,46 @@ def _final_checkpoint_disposition(
     return "retained_previous_safe"
 
 
+def _world_checkpoint_writes_allowed(
+    *,
+    checkpoint_writes_armed: bool,
+    checkpoint_writes_frozen: bool,
+) -> bool:
+    for name, value in (
+        ("checkpoint_writes_armed", checkpoint_writes_armed),
+        ("checkpoint_writes_frozen", checkpoint_writes_frozen),
+    ):
+        if type(value) is not bool:
+            raise TypeError(f"{name} must be boolean")
+    return checkpoint_writes_armed and not checkpoint_writes_frozen
+
+
+def _final_world_checkpoint_allowed(
+    *,
+    world_available: bool,
+    termination_reason: str | None,
+    read_only_fall_stop: bool,
+    checkpoint_writes_armed: bool,
+    checkpoint_writes_frozen: bool,
+) -> bool:
+    for name, value in (
+        ("world_available", world_available),
+        ("read_only_fall_stop", read_only_fall_stop),
+    ):
+        if type(value) is not bool:
+            raise TypeError(f"{name} must be boolean")
+    writes_allowed = _world_checkpoint_writes_allowed(
+        checkpoint_writes_armed=checkpoint_writes_armed,
+        checkpoint_writes_frozen=checkpoint_writes_frozen,
+    )
+    return bool(
+        world_available
+        and termination_reason not in _GAME_INTERNAL_RESTART_REASONS
+        and not read_only_fall_stop
+        and writes_allowed
+    )
+
+
 def _install_moon_relative_fall_check(
     environment: Any,
     dynamic_ground: MoonDynamicGround,
@@ -3817,6 +3860,11 @@ def _spawn_clearance_rollback_reason(
         accepted_hits = (
             support.get("accepted_hits") if isinstance(support, dict) else None
         )
+        moon_spawn_gate = (
+            support.get("moon_spawn_gate")
+            if isinstance(support, dict)
+            else None
+        )
         ray_direction = (
             support.get("ray_direction") if isinstance(support, dict) else None
         )
@@ -3826,10 +3874,14 @@ def _spawn_clearance_rollback_reason(
             or support.get("supported") is not False
             or isinstance(required_hits, bool)
             or not isinstance(required_hits, int)
-            or required_hits != 1
+            or required_hits not in {1, 2}
             or isinstance(accepted_hits, bool)
             or not isinstance(accepted_hits, int)
-            or accepted_hits != 0
+            or not 0 <= accepted_hits <= required_hits
+            or (required_hits == 1 and accepted_hits != 0)
+            or type(moon_spawn_gate) is not bool
+            or moon_spawn_gate != (required_hits == 2)
+            or support.get("required_distinct_feet") != required_hits
             or support.get("method") != "downward_foot_geom_rays"
             or support.get("maximum_drop_m") != 0.12
             or support.get("minimum_normal_z") != 0.8
@@ -3850,11 +3902,45 @@ def _spawn_clearance_rollback_reason(
         probes = support.get("probes")
         if not isinstance(probes, list) or len(probes) != 2:
             return None
+        supported_foot_names = support.get("supported_foot_names")
+        height_delta_m = support.get("height_delta_m")
+        maximum_height_delta_m = support.get("maximum_height_delta_m")
+        height_delta_safe = support.get("height_delta_safe")
+        rejection_reason = support.get("rejection_reason")
+        if (
+            not isinstance(supported_foot_names, list)
+            or any(not isinstance(name, str) for name in supported_foot_names)
+            or len(supported_foot_names) != accepted_hits
+            or type(height_delta_safe) is not bool
+            or height_delta_safe is not (required_hits == 1)
+            or (
+                required_hits == 1
+                and (
+                    height_delta_m is not None
+                    or maximum_height_delta_m is not None
+                    or rejection_reason != "insufficient_distinct_foot_support"
+                )
+            )
+            or (
+                required_hits == 2
+                and (
+                    maximum_height_delta_m != 0.04
+                    or rejection_reason
+                    not in {
+                        "insufficient_distinct_foot_support",
+                        "foot_support_height_delta",
+                    }
+                )
+            )
+        ):
+            return None
         expected_names = {
             "left_ankle_roll_link",
             "right_ankle_roll_link",
         }
         observed_names: set[str] = set()
+        accepted_names: list[str] = []
+        accepted_support_heights: list[float] = []
         for probe in probes:
             if not isinstance(probe, dict):
                 return None
@@ -3868,12 +3954,7 @@ def _spawn_clearance_rollback_reason(
                 or foot_body.get("name") not in expected_names
                 or not isinstance(origins, list)
                 or not 1 <= len(origins) <= 32
-                or probe.get("accepted") is not False
-                or probe.get("distance_m") is not None
-                or probe.get("normal") is not None
-                or probe.get("probe_geom") is not None
-                or probe.get("ray_origin_m") is not None
-                or probe.get("scene_geom") is not None
+                or type(probe.get("accepted")) is not bool
             ):
                 return None
             observed_geom_ids: set[int] = set()
@@ -3907,8 +3988,123 @@ def _spawn_clearance_rollback_reason(
                 ):
                     return None
                 observed_geom_ids.add(geom_id)
-            observed_names.add(str(foot_body["name"]))
-        return str(reason) if observed_names == expected_names else None
+            foot_name = str(foot_body["name"])
+            observed_names.add(foot_name)
+            if probe["accepted"] is False:
+                if any(
+                    probe.get(field) is not None
+                    for field in (
+                        "distance_m",
+                        "normal",
+                        "probe_geom",
+                        "ray_origin_m",
+                        "scene_geom",
+                        "support_height_m",
+                    )
+                ):
+                    return None
+                continue
+            distance = probe.get("distance_m")
+            normal = probe.get("normal")
+            probe_geom = probe.get("probe_geom")
+            ray_origin = probe.get("ray_origin_m")
+            scene_geom = probe.get("scene_geom")
+            support_height = probe.get("support_height_m")
+            if (
+                isinstance(distance, bool)
+                or not isinstance(distance, (int, float))
+                or not 0.0 <= float(distance) <= 0.12
+                or not isinstance(normal, list)
+                or len(normal) != 3
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in normal
+                )
+                or float(normal[2]) < 0.8
+                or not isinstance(probe_geom, dict)
+                or isinstance(probe_geom.get("id"), bool)
+                or not isinstance(probe_geom.get("id"), int)
+                or probe_geom.get("id") not in observed_geom_ids
+                or not isinstance(probe_geom.get("name"), str)
+                or not probe_geom.get("name")
+                or not isinstance(ray_origin, list)
+                or len(ray_origin) != 3
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in ray_origin
+                )
+                or not isinstance(scene_geom, dict)
+                or isinstance(scene_geom.get("id"), bool)
+                or not isinstance(scene_geom.get("id"), int)
+                or scene_geom.get("id") < 0
+                or not isinstance(scene_geom.get("name"), str)
+                or not scene_geom.get("name")
+                or isinstance(support_height, bool)
+                or not isinstance(support_height, (int, float))
+                or not math.isfinite(float(support_height))
+                or not math.isclose(
+                    float(support_height),
+                    float(ray_origin[2]) - float(distance),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                or (
+                    moon_spawn_gate
+                    and scene_geom.get("name")
+                    != "matrix_moon_continuous_support"
+                )
+            ):
+                return None
+            accepted_names.append(foot_name)
+            accepted_support_heights.append(float(support_height))
+        observed_height_delta = (
+            max(accepted_support_heights) - min(accepted_support_heights)
+            if len(accepted_support_heights) >= 2
+            else None
+        )
+        if (
+            observed_names != expected_names
+            or accepted_hits != len(accepted_names)
+            or supported_foot_names != accepted_names
+            or (
+                height_delta_m is None
+                and observed_height_delta is not None
+            )
+            or (
+                height_delta_m is not None
+                and (
+                    isinstance(height_delta_m, bool)
+                    or not isinstance(height_delta_m, (int, float))
+                    or observed_height_delta is None
+                    or not math.isclose(
+                        float(height_delta_m),
+                        observed_height_delta,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                )
+            )
+            or (
+                required_hits == 2
+                and accepted_hits < 2
+                and rejection_reason != "insufficient_distinct_foot_support"
+            )
+            or (
+                required_hits == 2
+                and accepted_hits == 2
+                and (
+                    rejection_reason != "foot_support_height_delta"
+                    or observed_height_delta is None
+                    or observed_height_delta <= 0.04
+                )
+            )
+        ):
+            return None
+        return str(reason)
     rejected_count = audit.get("rejected_contact_count")
     worst = audit.get("worst")
     if (
@@ -3921,9 +4117,13 @@ def _spawn_clearance_rollback_reason(
         return None
     classification = worst.get("classification")
     expected_classifications = (
-        {"scene_penetration"}
+        {"scene_penetration", "unsafe_body_contact"}
         if reason == "scene_penetration"
-        else {"unsafe_foot_contact_normal", "unsafe_foot_penetration"}
+        else {
+            "unsafe_foot_contact_normal",
+            "unsafe_foot_penetration",
+            "unsafe_foot_terrain_edge",
+        }
     )
     if classification not in expected_classifications:
         return None
@@ -5175,6 +5375,175 @@ def _locomotion_switch_neutral(
     )
 
 
+class _RuntimePauseState:
+    """Authenticated runtime pause lifecycle with stale-request fencing."""
+
+    RUNNING = "running"
+    PAUSE_REQUESTED = "pause_requested"
+    PAUSED = "paused"
+    CONTINUE_REQUESTED = "continue_requested"
+    TRANSITION_TIMEOUT_S = 5.0
+    _STABLE_TARGETS = frozenset({RUNNING, PAUSED})
+
+    def __init__(self) -> None:
+        self.phase = self.RUNNING
+        self.epoch = 0
+        self.transition_count = 0
+        self.requested_monotonic_s: float | None = None
+        self.completed_monotonic_s: float | None = None
+        self.last_error: str | None = None
+
+    @property
+    def physics_frozen(self) -> bool:
+        return self.phase in {self.PAUSED, self.CONTINUE_REQUESTED}
+
+    @property
+    def checkpoint_writes_frozen(self) -> bool:
+        return self.phase != self.RUNNING
+
+    @property
+    def transition_pending(self) -> bool:
+        return self.phase in {
+            self.PAUSE_REQUESTED,
+            self.CONTINUE_REQUESTED,
+        }
+
+    @property
+    def target(self) -> str:
+        if self.phase == self.PAUSE_REQUESTED:
+            return self.PAUSED
+        if self.phase == self.CONTINUE_REQUESTED:
+            return self.RUNNING
+        return self.phase
+
+    def request(
+        self,
+        target: str,
+        *,
+        expected_epoch: int,
+        now_s: float,
+        busy_reason: str | None = None,
+    ) -> bool:
+        """Request a stable state; return True when it is already satisfied."""
+
+        requested = str(target).strip().lower()
+        if requested not in self._STABLE_TARGETS:
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_TARGET",
+                "runtime pause target must be paused or running",
+            )
+        if (
+            type(expected_epoch) is not int
+            or not 0 <= expected_epoch <= MAX_RUNTIME_PAUSE_EPOCH
+        ):
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_EPOCH",
+                "runtime pause epoch must be an integer in [0, 2147483647]",
+            )
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("runtime pause request time must be finite and non-negative")
+        if expected_epoch != self.epoch:
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_STALE",
+                f"runtime pause epoch changed: expected {expected_epoch}, "
+                f"active {self.epoch}",
+            )
+        if self.epoch >= MAX_RUNTIME_PAUSE_EPOCH:
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_EPOCH_EXHAUSTED",
+                "runtime pause epoch is exhausted; restart the runtime",
+            )
+        if self.transition_pending:
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_BUSY",
+                f"runtime pause transition is already {self.phase}",
+            )
+        if requested == self.phase:
+            return True
+        if busy_reason is not None:
+            reason = str(busy_reason).strip()
+            if not reason:
+                raise ValueError("runtime pause busy reason cannot be empty")
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_BUSY",
+                f"runtime pause is busy: {reason}",
+            )
+        self.phase = (
+            self.PAUSE_REQUESTED
+            if requested == self.PAUSED
+            else self.CONTINUE_REQUESTED
+        )
+        self.requested_monotonic_s = now
+        self.last_error = None
+        return False
+
+    def complete(self, target: str, *, now_s: float) -> None:
+        completed = str(target).strip().lower()
+        expected_phase = {
+            self.PAUSED: self.PAUSE_REQUESTED,
+            self.RUNNING: self.CONTINUE_REQUESTED,
+        }.get(completed)
+        if expected_phase is None or self.phase != expected_phase:
+            raise RuntimeError(
+                f"cannot complete runtime pause {completed!r} from {self.phase!r}"
+            )
+        if self.epoch >= MAX_RUNTIME_PAUSE_EPOCH:
+            raise RuntimeError("runtime pause epoch is exhausted")
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("runtime pause completion time is invalid")
+        self.phase = completed
+        self.epoch += 1
+        self.transition_count += 1
+        self.completed_monotonic_s = now
+        self.last_error = None
+
+    def ensure_transition_fresh(self, *, now_s: float) -> None:
+        if not self.transition_pending:
+            return
+        now = float(now_s)
+        started = self.requested_monotonic_s
+        if (
+            not math.isfinite(now)
+            or started is None
+            or not math.isfinite(started)
+            or now < started
+        ):
+            raise RuntimeError("runtime pause transition clock is invalid")
+        elapsed = now - started
+        if elapsed > self.TRANSITION_TIMEOUT_S:
+            self.last_error = f"{self.phase}_timeout"
+            raise RuntimeError(
+                f"runtime pause transition timed out in {self.phase} "
+                f"after {elapsed:.3f}s"
+            )
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "schema": "matrix-runtime-pause/v1",
+            "available": True,
+            "phase": self.phase,
+            "target": self.target,
+            "epoch": self.epoch,
+            "paused": self.phase == self.PAUSED,
+            "physics_frozen": self.physics_frozen,
+            "checkpoint_writes_frozen": self.checkpoint_writes_frozen,
+            "transition_pending": self.transition_pending,
+            "transition_count": self.transition_count,
+            "last_error": self.last_error,
+        }
+
+    def ack_mapping(self) -> dict[str, object]:
+        if self.phase not in self._STABLE_TARGETS:
+            raise RuntimeError("runtime pause ACK requires a stable state")
+        return {
+            "phase": self.phase,
+            "epoch": self.epoch,
+            "paused": self.phase == self.PAUSED,
+        }
+
+
 def _load_celestial_teleport_routes(
     catalog_path: Path = DEFAULT_CELESTIAL_CATALOG_PATH,
     *,
@@ -5228,6 +5597,7 @@ class GameCommandRuntime:
         control_core: GameControlCore | None = None,
         pose_clearance_auditor: Callable[[WorldPose], dict[str, object]] | None = None,
         teleport_routes: Mapping[str, TeleportRoute] | None = None,
+        runtime_pause: _RuntimePauseState | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -5254,9 +5624,12 @@ class GameCommandRuntime:
         self.control_core = control_core
         self.pose_clearance_auditor = pose_clearance_auditor
         self.teleport_routes = dict(teleport_routes or {})
+        self.runtime_pause = runtime_pause
         self.pending_policy_request: GameCommandRequest | None = None
+        self.pending_runtime_pause_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
         self.motion_settings_changes_executed = 0
+        self.runtime_pause_changes_executed = 0
 
     @staticmethod
     def _command_strategy_loadout(
@@ -5414,9 +5787,45 @@ class GameCommandRuntime:
             self.request_ids = {request.request_id}
         return None
 
-    def poll(self, *, current_pose: WorldPose, command_allowed: bool) -> bool:
+    def poll(
+        self,
+        *,
+        current_pose: WorldPose,
+        command_allowed: bool,
+        runtime_pause_busy_reason: str | None = None,
+    ) -> bool:
         if self.restart_requested:
             return True
+        if self.pending_runtime_pause_request is not None:
+            if self.runtime_pause is None:
+                raise RuntimeError("pending runtime pause lost its coordinator")
+            request = self.pending_runtime_pause_request
+            command = request.command
+            if not isinstance(command, RuntimePause):
+                raise RuntimeError("pending runtime pause has the wrong AST")
+            if self.runtime_pause.phase != command.target:
+                return False
+            self.pending_runtime_pause_request = None
+            self.commands_executed += 1
+            self.runtime_pause_changes_executed += 1
+            self._send(
+                self._response(
+                    request,
+                    ok=True,
+                    code=(
+                        "OK_RUNTIME_PAUSED"
+                        if command.target == _RuntimePauseState.PAUSED
+                        else "OK_RUNTIME_RUNNING"
+                    ),
+                    message=(
+                        "Simulation paused"
+                        if command.target == _RuntimePauseState.PAUSED
+                        else "Simulation continued"
+                    ),
+                    data={"runtime_pause": self.runtime_pause.ack_mapping()},
+                )
+            )
+            return False
         if self.pending_policy_request is not None:
             if self.policy_slots is None:
                 raise RuntimeError("pending policy selection lost its coordinator")
@@ -5501,6 +5910,74 @@ class GameCommandRuntime:
                         ok=False,
                         code="E_NOT_PAUSED",
                         message="Open ESC and wait for a neutral frame before commands",
+                    )
+                )
+                continue
+            if isinstance(request.command, RuntimePause):
+                if self.runtime_pause is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_RUNTIME_PAUSE_UNAVAILABLE",
+                            message="Runtime pause requires an authenticated writer gate",
+                        )
+                    )
+                    continue
+                try:
+                    already_satisfied = self.runtime_pause.request(
+                        request.command.target,
+                        expected_epoch=request.command.expected_epoch,
+                        now_s=time.perf_counter(),
+                        busy_reason=(
+                            runtime_pause_busy_reason
+                            if request.command.target
+                            == _RuntimePauseState.PAUSED
+                            else None
+                        ),
+                    )
+                except CommandExecutionError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={
+                                "runtime_pause": self.runtime_pause.telemetry()
+                            },
+                        )
+                    )
+                    continue
+                if not already_satisfied:
+                    self.pending_runtime_pause_request = request
+                    return False
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_RUNTIME_PAUSE_STATE",
+                        message="Runtime already matches the requested pause state",
+                        data={"runtime_pause": self.runtime_pause.telemetry()},
+                    )
+                )
+                continue
+            if (
+                self.runtime_pause is not None
+                and self.runtime_pause.physics_frozen
+                and not isinstance(request.command, DataModifyNumber)
+            ):
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_RUNTIME_PAUSED",
+                        message="Continue the simulation before changing the world",
+                        data={"runtime_pause": self.runtime_pause.telemetry()},
                     )
                 )
                 continue
@@ -5777,6 +6254,23 @@ class GameCommandRuntime:
             "motion_settings_changes_executed": (
                 self.motion_settings_changes_executed
             ),
+            "runtime_pause_changes_executed": (
+                self.runtime_pause_changes_executed
+            ),
+            "runtime_pause_pending": (
+                self.pending_runtime_pause_request is not None
+            ),
+            "runtime_pause": (
+                self.runtime_pause.telemetry()
+                if self.runtime_pause is not None
+                else {
+                    "schema": "matrix-runtime-pause/v1",
+                    "available": False,
+                    "phase": "running",
+                    "epoch": 0,
+                    "paused": False,
+                }
+            ),
             "motion_settings": (
                 self.motion_settings.mapping()
                 if self.motion_settings is not None
@@ -5951,6 +6445,8 @@ class NativeProcessGroup:
         external_control_capability_file: Path | None = None,
         external_control_deadman_seconds: float = 0.15,
         command_fd: int | None = None,
+        runtime_pause_capable: bool = False,
+        game_world_id: str,
         strategy_loadout_json: str | None = None,
         creative_inventory_json: str | None = None,
         motion_settings_json: str | None = None,
@@ -5962,6 +6458,14 @@ class NativeProcessGroup:
         celestial_de440s_kernel: Path | None = None,
         celestial_jplephem_wheel: Path | None = None,
     ) -> int:
+        if type(runtime_pause_capable) is not bool:
+            raise ValueError("runtime pause capability must be boolean")
+        if runtime_pause_capable and command_fd is None:
+            raise ValueError("runtime pause capability requires a game command fd")
+        try:
+            game_world_id = validate_world_id(game_world_id)
+        except WorldStateError as exc:
+            raise ValueError(f"game world id is invalid: {exc}") from exc
         command = [
             python,
             "-u",
@@ -6008,6 +6512,10 @@ class NativeProcessGroup:
             focus_title,
             "--expected-ue-pid",
             str(expected_ue_pid),
+            "--runtime-pause-capability",
+            "available" if runtime_pause_capable else "unavailable",
+            "--game-world-id",
+            game_world_id,
         ]
         _validate_game_external_control(
             input_socket=input_socket,
@@ -6579,6 +7087,7 @@ class _RecoveryWorkerControl:
         self.registered_policy_ids: list[str] = []
         self.initial_policy_id: str | None = None
         self.selected_policy_id: str | None = None
+        self.active_policy_id: str | None = None
         self.policy_selection_transition_id: str | None = None
         self.policy_selection_requested_id: str | None = None
         self.last_policy_selection: dict[str, Any] | None = None
@@ -6628,6 +7137,7 @@ class _RecoveryWorkerControl:
             "registered_policy_ids": list(self.registered_policy_ids),
             "initial_policy_id": self.initial_policy_id,
             "selected_policy_id": self.selected_policy_id,
+            "active_policy_id": self.active_policy_id,
             "last_policy_selection": self.last_policy_selection,
             "last_policy_selection_rejection": self.last_policy_selection_rejection,
             "models_loaded_once": self.models_loaded_once,
@@ -6704,6 +7214,7 @@ class _RecoveryWorkerControl:
         self.registered_policy_ids = []
         self.initial_policy_id = None
         self.selected_policy_id = None
+        self.active_policy_id = None
         self.policy_selection_transition_id = None
         self.policy_selection_requested_id = None
         self.last_policy_selection = None
@@ -6755,6 +7266,7 @@ class _RecoveryWorkerControl:
             self.episode_id = self.episode_counter
             self.episode_started_monotonic = time.monotonic()
         self.first_write = False
+        self.active_policy_id = None
         self.amp_hold_first_write = False
         self.joint_hold_first_write = False
         self.stopped = False
@@ -6904,6 +7416,7 @@ class _RecoveryWorkerControl:
                 raise RuntimeError("recovery worker wrote before supervisor GO")
             self.first_write = True
             self.paused = False
+            self.active_policy_id = self.selected_policy_id
         elif event == "AMP_HOLD_FIRST_WRITE":
             if not self.first_write:
                 raise RuntimeError("AMP hold wrote before the HoST first write")
@@ -6912,6 +7425,7 @@ class _RecoveryWorkerControl:
             if payload.get("transition_id") != self.hold_transition_id:
                 raise RuntimeError("AMP hold transition_id mismatch")
             self.amp_hold_first_write = True
+            self.active_policy_id = "amp"
         elif event == "JOINT_HOLD_FIRST_WRITE":
             if not self.first_write:
                 raise RuntimeError("joint hold wrote before the HoST first write")
@@ -6940,17 +7454,20 @@ class _RecoveryWorkerControl:
             ):
                 raise RuntimeError("joint hold captured a stale LowState")
             self.joint_hold_first_write = True
+            self.active_policy_id = "joint_pose_hold"
         elif event == "STOPPED":
             if not self.stop_sent:
                 raise RuntimeError("recovery worker stopped before supervisor STOP")
             self.stopped = True
             self.paused = False
+            self.active_policy_id = None
         elif event == "PAUSED_NO_WRITER":
             if not self.pause_sent:
                 raise RuntimeError("recovery worker paused before supervisor PAUSE")
             if payload.get("writer_created") is not False:
                 raise RuntimeError("recovery worker PAUSE retained a writer")
             self.paused = True
+            self.active_policy_id = None
         elif event == "PAUSED_RESIDENT_WRITER":
             if not self.pause_sent:
                 raise RuntimeError("recovery worker paused before supervisor PAUSE")
@@ -6961,6 +7478,7 @@ class _RecoveryWorkerControl:
             if payload.get("writer_reused") is not True:
                 raise RuntimeError("resident recovery PAUSE cannot reuse its writer")
             self.paused = True
+            self.active_policy_id = None
         elif event == "STATUS":
             controller = payload.get("controller")
             if controller == "WRITER_FREE_STANDBY":
@@ -6979,6 +7497,26 @@ class _RecoveryWorkerControl:
                 if selected_policy_id not in self.registered_policy_ids:
                     raise RuntimeError("worker STATUS selected an unknown policy")
                 self.selected_policy_id = str(selected_policy_id)
+            active_policy_id = payload.get("active_policy_id")
+            if active_policy_id is not None:
+                if not isinstance(active_policy_id, str) or not active_policy_id:
+                    raise RuntimeError("worker STATUS has an invalid active policy")
+                allowed_active_policy_ids = set(self.registered_policy_ids)
+                allowed_active_policy_ids.update({"amp", "joint_pose_hold"})
+                if active_policy_id not in allowed_active_policy_ids:
+                    raise RuntimeError("worker STATUS activated an unknown policy")
+                if not self.first_write:
+                    raise RuntimeError("worker STATUS activated a policy before first write")
+                if (
+                    self.active_policy_id is not None
+                    and active_policy_id != self.active_policy_id
+                ):
+                    raise RuntimeError(
+                        "worker STATUS changed authority without a first-write event"
+                    )
+                self.active_policy_id = active_policy_id
+            elif controller in {"WRITER_FREE_STANDBY", "PAUSED_RESIDENT_WRITER"}:
+                self.active_policy_id = None
         elif event == "POLICY_SELECTED":
             if payload.get("transition_id") != self.policy_selection_transition_id:
                 raise RuntimeError("policy selection transition_id mismatch")
@@ -7052,6 +7590,13 @@ class _RecoveryWorkerControl:
                 raise RuntimeError("policy switch created an unexpected writer")
             if payload.get("physical_continuation") is not True:
                 raise RuntimeError("policy switch first write was not physical")
+            switched_policy_id = payload.get("to_policy_id")
+            if switched_policy_id is not None:
+                if switched_policy_id not in self.registered_policy_ids:
+                    raise RuntimeError(
+                        "policy switch first write activated an unknown policy"
+                    )
+                self.active_policy_id = str(switched_policy_id)
             self.policy_switch_first_writes.append(dict(payload))
             self.fallback_due = False
             self.advance_transition_id = None
@@ -7331,6 +7876,7 @@ class _RecoveryWorkerControl:
             "registered_policy_ids": list(self.registered_policy_ids),
             "initial_policy_id": self.initial_policy_id,
             "selected_policy_id": self.selected_policy_id,
+            "active_policy_id": self.active_policy_id,
             "policy_selection_pending": self.policy_selection_transition_id is not None,
             "last_policy_selection": self.last_policy_selection,
             "last_policy_selection_rejection": self.last_policy_selection_rejection,
@@ -8490,6 +9036,9 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_admission_ready = False
         self.bfm_switch_admission_reason = "awaiting_runtime_observation"
         self.physics_profiles = None
+        self.runtime_pause_policy_id: str | None = None
+        self.runtime_pause_writer_epoch: int | None = None
+        self.runtime_pause_resume_sent = False
 
     def _load_amp_flat_v3_armatures(self) -> tuple[float, ...] | None:
         config_path = getattr(self, "amp_flat_v3_config", None)
@@ -9068,6 +9617,105 @@ class _PhysicalRecoveryCoordinator:
             self._validate_bfm_runtime_paths()
             self.bfm_control.open()
 
+    def _runtime_pause_writer(self) -> _SonicWriterControl | _BfmTeacherControl:
+        if self.selected_locomotion_policy_id == BFM_TEACHER50K_POLICY_ID:
+            return self.bfm_control
+        return self.sonic_writer
+
+    def runtime_pause_busy_reason(self) -> str | None:
+        if self.fsm.state not in {
+            RecoveryState.GAME_SONIC,
+            ResidentRecoveryState.GAME_SONIC,
+        }:
+            return "physical_recovery"
+        if self._policy_selection_pending is not None:
+            return "policy_switch"
+        if (
+            self.worker.fallback_due
+            or self.worker.advance_transition_id is not None
+        ):
+            return "recovery_policy_switch"
+        writer = self._runtime_pause_writer()
+        if not writer.current_first_write:
+            return "locomotion_writer_not_ready"
+        if isinstance(writer, _SonicWriterControl):
+            if writer.pause_pending or writer.resume_pending:
+                return "locomotion_writer_transition"
+        elif writer.pause_pending or writer.activation_pending:
+            return "locomotion_writer_transition"
+        return None
+
+    def request_runtime_pause(self) -> None:
+        reason = self.runtime_pause_busy_reason()
+        if reason is not None:
+            raise RuntimeError(f"runtime pause is busy: {reason}")
+        writer = self._runtime_pause_writer()
+        policy_id = self.selected_locomotion_policy_id
+        if isinstance(writer, _SonicWriterControl):
+            writer.send("PAUSE")
+        else:
+            writer.pause()
+        self.runtime_pause_policy_id = policy_id
+        self.runtime_pause_writer_epoch = writer.authority_epoch
+        self.runtime_pause_resume_sent = False
+
+    def poll_runtime_pause_controls(self) -> None:
+        self.worker.poll()
+        self.sonic_writer.poll()
+        if self.bfm_process_started:
+            self.bfm_control.poll()
+        if self.worker.error is not None:
+            raise RuntimeError(f"physical recovery worker: {self.worker.error}")
+        if self.sonic_writer.error is not None:
+            raise RuntimeError(
+                f"replacement SONIC writer gate: {self.sonic_writer.error}"
+            )
+        if self.bfm_process_started and self.bfm_control.error is not None:
+            raise RuntimeError(f"BFM Teacher worker: {self.bfm_control.error}")
+
+    def runtime_pause_acknowledged(self) -> bool:
+        if self.runtime_pause_policy_id != self.selected_locomotion_policy_id:
+            raise RuntimeError("locomotion policy changed during runtime pause")
+        writer = self._runtime_pause_writer()
+        if isinstance(writer, _SonicWriterControl):
+            return writer.paused and not writer.pause_pending
+        return writer.paused and not writer.pause_pending
+
+    def request_runtime_continue(self) -> None:
+        if self.runtime_pause_policy_id != self.selected_locomotion_policy_id:
+            raise RuntimeError("locomotion policy changed while runtime was paused")
+        writer = self._runtime_pause_writer()
+        if not writer.paused:
+            raise RuntimeError("locomotion writer is not paused")
+        if self.runtime_pause_resume_sent:
+            raise RuntimeError("runtime continue was already requested")
+        if isinstance(writer, _SonicWriterControl):
+            writer.send("RESUME")
+        else:
+            writer.activate()
+        self.runtime_pause_resume_sent = True
+
+    def runtime_continue_acknowledged(self) -> bool:
+        if not self.runtime_pause_resume_sent:
+            return False
+        if self.runtime_pause_policy_id != self.selected_locomotion_policy_id:
+            raise RuntimeError("locomotion policy changed during runtime continue")
+        writer = self._runtime_pause_writer()
+        previous_epoch = self.runtime_pause_writer_epoch
+        if previous_epoch is None:
+            raise RuntimeError("runtime pause writer epoch is unavailable")
+        return bool(
+            writer.current_first_write
+            and writer.authority_epoch == previous_epoch + 1
+        )
+
+    def finish_runtime_continue(self) -> None:
+        if not self.runtime_continue_acknowledged():
+            raise RuntimeError("runtime continue has no new writer-epoch first write")
+        self.runtime_pause_policy_id = None
+        self.runtime_pause_writer_epoch = None
+        self.runtime_pause_resume_sent = False
+
     def prepare_initial_sonic_gate(self) -> Path:
         self.sonic_writer.reset_for_start()
         self.initial_sonic_gate_pending = True
@@ -9158,7 +9806,7 @@ class _PhysicalRecoveryCoordinator:
         root_angular_speed_rad_s: float,
         joint_velocity_rms_rad_s: float,
         grounded_contact: bool,
-        recovery_state: RecoveryState,
+        recovery_state: RecoveryState | ResidentRecoveryState,
         policy_alive: bool,
         worker_controller: str | None,
     ) -> None:
@@ -9187,14 +9835,18 @@ class _PhysicalRecoveryCoordinator:
             return
 
         eligible_owner = (
-            recovery_state is RecoveryState.POLICY_RECOVERING
+            recovery_state
+            in {
+                RecoveryState.POLICY_RECOVERING,
+                ResidentRecoveryState.POLICY_RECOVERING,
+            }
             and policy_alive
             and self.worker.connection is not None
             and self.worker.go_sent
             and not self.worker.stop_sent
             and not self.worker.amp_hold_sent
             and not self.worker.joint_hold_sent
-            and worker_controller == "HOST_GETUP"
+            and worker_controller in {"HOST_GETUP", "KUNGFU_GETUP"}
         )
         if not eligible_owner:
             self.policy_fallback_quiet_since_s = None
@@ -9439,6 +10091,18 @@ class _PhysicalRecoveryCoordinator:
                 neutral_confirmed=bool(neutral_confirmed),
             )
             previous_resident = self.fsm.state
+            self._maybe_authorize_policy_advance(
+                now_s=now_s,
+                root_z_m=root_z,
+                root_up_z=root_up_z,
+                root_linear_speed_m_s=root_linear_speed,
+                root_angular_speed_rad_s=root_angular_speed,
+                joint_velocity_rms_rad_s=joint_rms,
+                grounded_contact=bool(grounded_contact),
+                recovery_state=previous_resident,
+                policy_alive=policy_alive,
+                worker_controller=worker_controller,
+            )
             output_resident = self.fsm.step(resident_observation)
             self.last_output = output_resident
             if output_resident.state is not previous_resident:
@@ -10166,6 +10830,21 @@ class _PhysicalRecoveryCoordinator:
         if self.sonic_writer.writer_created or self.sonic_writer.first_write:
             raise RuntimeError("writer-free SONIC prewarm acquired LowCmd before GO")
 
+    def _telemetry_authority_policy_id(
+        self,
+        output: RecoveryOutput | ResidentRecoveryOutput | None,
+    ) -> str | None:
+        if self.fsm.state is ResidentRecoveryState.GAME_SONIC:
+            return self.selected_locomotion_policy_id
+        active_policy_id = getattr(self.worker, "active_policy_id", None)
+        if isinstance(active_policy_id, str) and active_policy_id:
+            return active_policy_id
+        if output is not None:
+            authority_policy_id = getattr(output, "authority_policy_id", None)
+            if isinstance(authority_policy_id, str) and authority_policy_id:
+                return authority_policy_id
+        return self.selected_locomotion_policy_id
+
     def telemetry(
         self, *, now_s: float, processes: NativeProcessGroup
     ) -> dict[str, object]:
@@ -10183,19 +10862,14 @@ class _PhysicalRecoveryCoordinator:
             "selected_locomotion_policy_id": (
                 self.selected_locomotion_policy_id
             ),
-            "authority_policy_id": (
-                self.selected_locomotion_policy_id
-                if self.fsm.state is ResidentRecoveryState.GAME_SONIC
-                else (
-                    output.authority_policy_id
-                    if output is not None
-                    else self.selected_locomotion_policy_id
-                )
-            ),
+            "authority_policy_id": self._telemetry_authority_policy_id(output),
             "recovery_policy_id": (
                 output.recovery_policy_id
                 if output is not None
                 else self.initial_controller
+            ),
+            "recovery_active_policy_id": getattr(
+                self.worker, "active_policy_id", None
             ),
             "failure_reason": self.fsm.failure_reason,
             "fail_closed": self.fsm.failed,
@@ -10630,6 +11304,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
         if not args.no_game_input_provider:
+            if args.game_world_id is None:
+                raise SystemExit(
+                    "game input provider requires --game-world-id"
+                )
             if args.ue_pid is None:
                 raise SystemExit(
                     "game input provider requires --ue-pid for exact X11 focus binding"
@@ -10947,6 +11625,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     celestial_teleport_routes: dict[str, TeleportRoute] = {}
     game_fall_recovery = None
     physical_recovery = None
+    runtime_pause: _RuntimePauseState | None = None
+    runtime_pause_started_wall: float | None = None
+    runtime_pause_neutral_command: RobotMotionCommand | None = None
     game_command = None
     processes = None
     resume_probation_selected = resume_probation.enabled
@@ -11226,6 +11907,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             getattr(environment, "mj_data", None),
                         )
                     physical_recovery.open(zmq_port=planner_port)
+                    runtime_pause = _RuntimePauseState()
                 celestial_teleport_routes = _load_celestial_teleport_routes()
                 if not args.no_game_input_provider and (
                     game_world is not None
@@ -11248,6 +11930,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         control_core=game_control_core,
                         pose_clearance_auditor=pose_clearance_audit,
                         teleport_routes=celestial_teleport_routes,
+                        runtime_pause=runtime_pause,
                     )
                 try:
                     game_input.open()
@@ -11320,6 +12003,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             if game_command_child_socket is not None
                             else None
                         ),
+                        runtime_pause_capable=runtime_pause is not None,
+                        game_world_id=args.game_world_id,
                         strategy_loadout_json=(
                             json.dumps(
                                 physical_recovery.strategy_loadout_mapping(),
@@ -11479,6 +12164,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         longest_active_elapsed_s = 0.0
         walking = False
         while running:
+            runtime_pause_transition_frame = False
             # Poll on both sides of the duration gate so a child exit at the
             # acceptance boundary cannot be mistaken for normal completion.
             if poll_failed_child():
@@ -11497,7 +12183,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 )
                 break
             elapsed_wall = frame_wall - started_wall
-            if args.max_seconds > 0.0 and elapsed_wall >= args.max_seconds:
+            if (
+                args.max_seconds > 0.0
+                and not (
+                    runtime_pause is not None
+                    and runtime_pause.physics_frozen
+                )
+                and elapsed_wall >= args.max_seconds
+            ):
                 if termination_reason is None:
                     termination_reason = "max_seconds"
                 poll_failed_child()
@@ -11507,6 +12200,114 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     termination_reason = "scenario_complete"
                 poll_failed_child()
                 break
+
+            if runtime_pause is not None and runtime_pause.phase != runtime_pause.RUNNING:
+                assert physical_recovery is not None
+                assert game_input is not None
+                assert planner is not None
+                try:
+                    runtime_pause.ensure_transition_fresh(now_s=frame_wall)
+                    if (
+                        runtime_pause.phase == runtime_pause.PAUSE_REQUESTED
+                        and physical_recovery.runtime_pause_policy_id is None
+                    ):
+                        physical_recovery.request_runtime_pause()
+                    physical_recovery.poll_runtime_pause_controls()
+                    if (
+                        runtime_pause.phase == runtime_pause.PAUSE_REQUESTED
+                        and physical_recovery.runtime_pause_acknowledged()
+                    ):
+                        runtime_pause.complete(
+                            runtime_pause.PAUSED,
+                            now_s=frame_wall,
+                        )
+                        runtime_pause_started_wall = frame_wall
+                        if runtime_pause_neutral_command is None:
+                            runtime_pause_neutral_command = (
+                                game_input.emergency_stop(
+                                    now_s=frame_wall,
+                                    reason="runtime_paused",
+                                )
+                            )
+                    if game_commands is not None:
+                        game_commands.poll(
+                            current_pose=_snapshot_world_pose(snapshot),
+                            command_allowed=True,
+                        )
+                    if (
+                        runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED
+                        and not physical_recovery.runtime_pause_resume_sent
+                    ):
+                        physical_recovery.request_runtime_continue()
+                    if (
+                        runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED
+                        and physical_recovery.selected_locomotion_policy_id
+                        == BFM_TEACHER50K_POLICY_ID
+                        and runtime_pause_neutral_command is not None
+                    ):
+                        physical_recovery.publish_bfm_shadow_state(
+                            snapshot,
+                            runtime_pause_neutral_command,
+                            height_map_z=bfm_height_map(snapshot),
+                        )
+                    if runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED:
+                        physical_recovery.poll_runtime_pause_controls()
+                        if physical_recovery.runtime_continue_acknowledged():
+                            completed_wall = time.perf_counter()
+                            physical_recovery.finish_runtime_continue()
+                            runtime_pause.complete(
+                                runtime_pause.RUNNING,
+                                now_s=completed_wall,
+                            )
+                            if runtime_pause_started_wall is None:
+                                raise RuntimeError(
+                                    "runtime pause duration anchor is unavailable"
+                                )
+                            paused_wall_s = max(
+                                completed_wall - runtime_pause_started_wall,
+                                0.0,
+                            )
+                            started_wall += paused_wall_s
+                            if active_started_wall is not None:
+                                active_started_wall += paused_wall_s
+                            next_physics_wall = completed_wall + physics_period_s
+                            next_print = completed_wall
+                            last_print_wall = completed_wall
+                            last_render_count = (
+                                renderer.packet_count if renderer is not None else 0
+                            )
+                            last_physics_steps = physics_steps
+                            frame_wall = completed_wall
+                            elapsed_wall = frame_wall - started_wall
+                            game_input.core.invalidate_input(
+                                "runtime_resume_awaiting_neutral"
+                            )
+                            runtime_pause_started_wall = None
+                            runtime_pause_neutral_command = None
+                            if game_commands is not None:
+                                game_commands.poll(
+                                    current_pose=_snapshot_world_pose(snapshot),
+                                    command_allowed=True,
+                                )
+                except (EOFError, OSError, RuntimeError, ValueError) as exc:
+                    stop_for_physical_recovery_exception(exc, action=True)
+                    break
+
+                if runtime_pause.physics_frozen:
+                    time.sleep(0.005)
+                    continue
+                if runtime_pause.phase == runtime_pause.PAUSE_REQUESTED:
+                    runtime_pause_neutral_command = game_input.emergency_stop(
+                        now_s=frame_wall,
+                        reason="runtime_pause_pending",
+                    )
+                    planner.send_game_command(runtime_pause_neutral_command)
+                    game_input.record_published_command(
+                        runtime_pause_neutral_command
+                    )
+                    game_command = runtime_pause_neutral_command
+                    walking = False
+                    runtime_pause_transition_frame = True
 
             active_elapsed = (
                 frame_wall - active_started_wall
@@ -11518,7 +12319,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 and args.walk_after >= 0.0
                 and active_elapsed >= args.walk_after
             )
-            if planner is not None:
+            if planner is not None and not runtime_pause_transition_frame:
                 if game_input is not None:
                     assert initial_root_yaw_rad is not None
                     assert game_readiness is not None
@@ -11811,11 +12612,33 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             game_command,
                             resume_probation_active=resume_probation.active,
                         )
+                        runtime_pause_busy_reason = None
+                        if runtime_pause is not None:
+                            if resume_probation.active:
+                                runtime_pause_busy_reason = "resume_probation"
+                            elif physical_recovery is None:
+                                runtime_pause_busy_reason = "writer_gate_unavailable"
+                            else:
+                                runtime_pause_busy_reason = (
+                                    physical_recovery.runtime_pause_busy_reason()
+                                )
                         try:
                             command_restart = game_commands.poll(
                                 current_pose=_snapshot_world_pose(snapshot),
                                 command_allowed=command_allowed,
+                                runtime_pause_busy_reason=(
+                                    runtime_pause_busy_reason
+                                ),
                             )
+                            if (
+                                runtime_pause is not None
+                                and runtime_pause.phase
+                                == runtime_pause.PAUSE_REQUESTED
+                                and physical_recovery is not None
+                                and physical_recovery.runtime_pause_policy_id is None
+                            ):
+                                runtime_pause_neutral_command = game_command
+                                physical_recovery.request_runtime_pause()
                         except (EOFError, RuntimeError, WorldStateError) as exc:
                             game_input.core.invalidate_input(
                                 "game_command_channel_error"
@@ -11939,8 +12762,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     game_input=game_input,
                                     planner=planner,
                                     snapshot=snapshot,
-                                    checkpoint_writes_blocked=(
-                                        resume_probation.checkpoint_writes_blocked
+                                    checkpoint_writes_blocked=not (
+                                        _world_checkpoint_writes_allowed(
+                                            checkpoint_writes_armed=(
+                                                not resume_probation.checkpoint_writes_blocked
+                                            ),
+                                            checkpoint_writes_frozen=(
+                                                runtime_pause is not None
+                                                and runtime_pause.checkpoint_writes_frozen
+                                            ),
+                                        )
                                     ),
                                     now_s=fall_wall,
                                     ground_height_m=snapshot_ground_height_m,
@@ -12032,7 +12863,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             freshness_sample_wall = time.perf_counter()
             if (
                 game_world is not None
-                and resume_probation.checkpoint_writes_armed
+                and _world_checkpoint_writes_allowed(
+                    checkpoint_writes_armed=(
+                        resume_probation.checkpoint_writes_armed
+                    ),
+                    checkpoint_writes_frozen=(
+                        runtime_pause is not None
+                        and runtime_pause.checkpoint_writes_frozen
+                    ),
+                )
             ):
                 game_world.checkpoint(
                     snapshot,
@@ -12288,14 +13127,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     measured_heading_rad=boundary_measured_heading,
                     dt_s=0.0,
                 )
-            planner.send_game_command(game_command)
+            if runtime_pause is None or not runtime_pause.physics_frozen:
+                planner.send_game_command(game_command)
             walking = False
 
-        if (
-            game_world is not None
-            and termination_reason not in _GAME_INTERNAL_RESTART_REASONS
-            and not resume_checkpoint_read_only_fall_stop
-            and resume_probation.checkpoint_writes_armed
+        if _final_world_checkpoint_allowed(
+            world_available=game_world is not None,
+            termination_reason=termination_reason,
+            read_only_fall_stop=resume_checkpoint_read_only_fall_stop,
+            checkpoint_writes_armed=resume_probation.checkpoint_writes_armed,
+            checkpoint_writes_frozen=(
+                runtime_pause is not None
+                and runtime_pause.checkpoint_writes_frozen
+            ),
         ):
             try:
                 checkpoint_saved = game_world.checkpoint(

@@ -153,6 +153,57 @@ class CelestialEphemerisTest(unittest.TestCase):
             monotonic.value += 500_000_000
             self.assertEqual(resumed.snapshot().elapsed_tai_ns, 150_000_000_000)
 
+    def test_clock_pause_freezes_time_and_resume_does_not_catch_up(self) -> None:
+        monotonic = MutableMonotonicClock(1_000_000_000)
+        with tempfile.TemporaryDirectory() as temporary:
+            clock = EPHEMERIS.PersistentSimulationClock(
+                universe_id="sol-2080",
+                reference_epoch_utc="2080-01-01T00:00:00Z",
+                tai_minus_utc_at_epoch_s=37,
+                rate_numerator=60,
+                rate_denominator=1,
+                state_path=Path(temporary) / "clock.json",
+                monotonic_ns=monotonic,
+            )
+            monotonic.value += 1_000_000_000
+            self.assertTrue(clock.set_paused(True))
+            self.assertTrue(clock.paused)
+            frozen = clock.snapshot().elapsed_tai_ns
+            self.assertEqual(frozen, 60_000_000_000)
+
+            monotonic.value += 5_000_000_000
+            self.assertEqual(clock.snapshot().elapsed_tai_ns, frozen)
+            self.assertFalse(clock.checkpoint())
+            self.assertFalse(clock.set_paused(True))
+
+            self.assertTrue(clock.set_paused(False))
+            monotonic.value += 500_000_000
+            self.assertEqual(
+                clock.snapshot().elapsed_tai_ns,
+                frozen + 30_000_000_000,
+            )
+            clock.close()
+
+    def test_paused_clock_force_checkpoint_and_close_do_not_write(self) -> None:
+        monotonic = MutableMonotonicClock(1_000_000_000)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "clock.json"
+            clock = EPHEMERIS.PersistentSimulationClock(
+                universe_id="sol-2080",
+                reference_epoch_utc="2080-01-01T00:00:00Z",
+                tai_minus_utc_at_epoch_s=37,
+                state_path=path,
+                monotonic_ns=monotonic,
+            )
+            monotonic.value += 1_000_000_000
+            self.assertTrue(clock.set_paused(True))
+            self.assertFalse(clock.checkpoint(force=True))
+            clock.close()
+
+            self.assertFalse(path.exists())
+            self.assertIsNotNone(clock._writer_thread)
+            self.assertFalse(clock._writer_thread.is_alive())
+
     def test_clock_rejects_identity_or_rate_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "clock.json"

@@ -87,6 +87,23 @@ class RecordingRunner:
         return np.asarray(self.outputs.pop(0), dtype=np.float32)
 
 
+class BlockingRunner:
+    def __init__(self, label, output):
+        self.label = label
+        self.output = np.asarray(output, dtype=np.float32)
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.inputs = []
+
+    def __call__(self, observation):
+        self.inputs.append(np.asarray(observation).copy())
+        if len(self.inputs) == 1:
+            self.started.set()
+            if not self.release.wait(timeout=1.0):
+                raise RuntimeError("test did not release blocked HoST inference")
+        return self.output.copy()
+
+
 class HostPolicyTests(unittest.TestCase):
     def test_resident_registry_keeps_flat_v3_as_an_independent_policy(self):
         cascade = worker.HostPolicyCascade(
@@ -415,6 +432,20 @@ class FakeDds:
         return publisher.Write(command)
 
 
+class FailNextWriteDds(FakeDds):
+    def __init__(self):
+        super().__init__()
+        self.fail_next_write = False
+        self.failed_writes = []
+
+    def write(self, publisher, command):
+        if self.fail_next_write:
+            self.fail_next_write = False
+            self.failed_writes.append(command)
+            return False
+        return publisher.Write(command)
+
+
 class FakeKungFuPolicy:
     def __init__(self, event_log=None):
         self.config = SimpleNamespace(
@@ -446,6 +477,14 @@ class FakeKungFuPolicy:
         return SimpleNamespace(
             target_joint_pos=np.full(29, 0.125, dtype=np.float32)
         )
+
+
+def command_pd_vectors(command):
+    motors = command.motor_cmd[: worker.NUM_JOINTS]
+    return tuple(
+        np.asarray([getattr(motor, field) for motor in motors], dtype=np.float32)
+        for field in ("q", "kp", "kd")
+    )
 
 
 @unittest.skipUnless(hasattr(socket, "SOCK_SEQPACKET"), "requires SOCK_SEQPACKET")
@@ -897,6 +936,499 @@ class WorkerHandoffTests(unittest.TestCase):
             supervisor.close()
             child.close()
 
+    def test_kungfu_fallback_continues_in_host_with_the_resident_writer(self):
+        supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        supervisor.settimeout(2.0)
+        state_store = worker.LatestLowState()
+        measured = snapshot(joint_vel_rad_s=np.zeros(29))
+        state_store.set(measured)
+        dds = FakeDds()
+        kungfu = FakeKungFuPolicy()
+        host = RecordingRunner(
+            "host_after_kungfu",
+            [np.zeros(23, dtype=np.float32) for _ in range(200)],
+        )
+        cascade = worker.HostPolicyCascade(
+            config=worker.HostControlConfig.create(),
+            runners=(host,),
+            fallback_after_s=0.05,
+        )
+        resident_manifest = (
+            {
+                "name": "host:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+            {
+                "name": "kungfu:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+        )
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                worker.run_worker(
+                    cascade=cascade,
+                    amp_hold_policy=None,
+                    kungfu_policy=kungfu,
+                    dds=dds,
+                    state_store=state_store,
+                    control=child,
+                    publish_hz=50.0,
+                    lowstate_timeout_s=2.0,
+                    status_hz=20.0,
+                    initial_controller="kungfu",
+                    resident_policies=resident_manifest,
+                )
+            )
+        )
+
+        def receive_event(expected):
+            while True:
+                packet = json.loads(supervisor.recv(4096).decode("utf-8"))
+                if packet["event"] == expected:
+                    return packet
+
+        thread.start()
+        try:
+            receive_event("READY_NO_WRITER")
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": "matrix.sonic_host_worker.control.v1",
+                        "command": "GO",
+                        "episode_id": 1,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("FIRST_WRITE")
+            fallback = receive_event("POLICY_FALLBACK_DUE")
+            self.assertEqual(fallback["policy_index"], -1)
+            self.assertEqual(fallback["next_policy_index"], 0)
+            self.assertEqual(fallback["from_policy_id"], "kungfu")
+            self.assertEqual(fallback["to_policy_id"], "host")
+
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": "matrix.sonic_host_worker.control.v1",
+                        "command": "ADVANCE_POLICY",
+                        "episode_id": 1,
+                        "transition_id": "kungfu-to-host-1",
+                        "expected_from_policy_index": -1,
+                        "expected_to_policy_index": 0,
+                    }
+                ).encode("utf-8")
+            )
+            switched = receive_event("POLICY_SWITCH")
+            first_write = receive_event("POLICY_SWITCH_FIRST_WRITE")
+
+            self.assertEqual(switched["from_policy_id"], "kungfu")
+            self.assertEqual(switched["to_policy_id"], "host")
+            self.assertTrue(switched["physical_continuation"])
+            self.assertEqual(first_write["transition_id"], "kungfu-to-host-1")
+            self.assertTrue(first_write["writer_reused"])
+            self.assertEqual(dds.publisher_calls, 1)
+            self.assertGreaterEqual(len(host.inputs), 1)
+
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": "matrix.sonic_host_worker.control.v1",
+                        "command": "PAUSE",
+                        "episode_id": 1,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("PAUSED_RESIDENT_WRITER")
+            state_store.set(snapshot(joint_vel_rad_s=np.zeros(29)))
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": "matrix.sonic_host_worker.control.v1",
+                        "command": "GO",
+                        "episode_id": 2,
+                    }
+                ).encode("utf-8")
+            )
+            second_episode = receive_event("FIRST_WRITE")
+            self.assertEqual(second_episode["episode_id"], 2)
+            self.assertEqual(len(kungfu.start_calls), 2)
+            self.assertEqual(dds.publisher_calls, 1)
+
+            supervisor.send(b"STOP")
+            receive_event("STOPPED")
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [0])
+        finally:
+            supervisor.close()
+            child.close()
+
+    def test_kungfu_fallback_status_waits_for_successful_host_first_write(self):
+        supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        supervisor.settimeout(2.0)
+        state_store = worker.LatestLowState()
+        state_store.set(snapshot(joint_vel_rad_s=np.zeros(29)))
+        dds = FailNextWriteDds()
+        kungfu = FakeKungFuPolicy()
+        host = BlockingRunner("host_after_kungfu", np.zeros(23, dtype=np.float32))
+        cascade = worker.HostPolicyCascade(
+            config=worker.HostControlConfig.create(),
+            runners=(host,),
+            fallback_after_s=0.05,
+        )
+        resident_manifest = (
+            {
+                "name": "host:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+            {
+                "name": "kungfu:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+        )
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                worker.run_worker(
+                    cascade=cascade,
+                    amp_hold_policy=None,
+                    kungfu_policy=kungfu,
+                    dds=dds,
+                    state_store=state_store,
+                    control=child,
+                    publish_hz=50.0,
+                    lowstate_timeout_s=2.0,
+                    status_hz=20.0,
+                    initial_controller="kungfu",
+                    resident_policies=resident_manifest,
+                )
+            )
+        )
+
+        def receive_event(expected):
+            while True:
+                packet = json.loads(supervisor.recv(4096).decode("utf-8"))
+                if packet["event"] == expected:
+                    return packet
+
+        thread.start()
+        try:
+            receive_event("READY_NO_WRITER")
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": worker.CONTROL_SCHEMA,
+                        "command": "GO",
+                        "episode_id": 1,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("FIRST_WRITE")
+            receive_event("POLICY_FALLBACK_DUE")
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": worker.CONTROL_SCHEMA,
+                        "command": "ADVANCE_POLICY",
+                        "episode_id": 1,
+                        "transition_id": "kungfu-host-authority",
+                        "expected_from_policy_index": -1,
+                        "expected_to_policy_index": 0,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("POLICY_SWITCH")
+            self.assertTrue(host.started.wait(timeout=1.0))
+            successful_writes = len(dds.publisher.commands)
+            dds.fail_next_write = True
+            host.release.set()
+
+            before_first_write = receive_event("STATUS")
+            self.assertEqual(before_first_write["controller"], "HOST_GETUP")
+            self.assertEqual(before_first_write["active_policy_id"], "kungfu")
+            self.assertEqual(before_first_write["selected_policy_id"], "kungfu")
+            self.assertEqual(len(dds.failed_writes), 1)
+            self.assertEqual(len(dds.publisher.commands), successful_writes)
+
+            first_write = receive_event("POLICY_SWITCH_FIRST_WRITE")
+            self.assertEqual(
+                first_write["transition_id"], "kungfu-host-authority"
+            )
+            after_first_write = receive_event("STATUS")
+            self.assertEqual(after_first_write["active_policy_id"], "host")
+            self.assertEqual(after_first_write["selected_policy_id"], "kungfu")
+
+            supervisor.send(b"STOP")
+            receive_event("STOPPED")
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [0])
+        finally:
+            host.release.set()
+            supervisor.close()
+            child.close()
+
+    def test_blocked_host_inference_times_out_without_command_or_first_write(self):
+        supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        supervisor.settimeout(2.0)
+        state_store = worker.LatestLowState()
+        state_store.set(snapshot(joint_vel_rad_s=np.zeros(29)))
+        dds = FakeDds()
+        kungfu = FakeKungFuPolicy()
+        host = BlockingRunner("host_after_kungfu", np.zeros(23, dtype=np.float32))
+        cascade = worker.HostPolicyCascade(
+            config=worker.HostControlConfig.create(),
+            runners=(host,),
+            fallback_after_s=0.01,
+        )
+        resident_manifest = (
+            {
+                "name": "host:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+            {
+                "name": "kungfu:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+        )
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                worker.run_worker(
+                    cascade=cascade,
+                    amp_hold_policy=None,
+                    kungfu_policy=kungfu,
+                    dds=dds,
+                    state_store=state_store,
+                    control=child,
+                    publish_hz=50.0,
+                    lowstate_timeout_s=0.05,
+                    status_hz=20.0,
+                    initial_controller="kungfu",
+                    resident_policies=resident_manifest,
+                )
+            )
+        )
+
+        def receive_event(expected):
+            observed = []
+            while True:
+                packet = json.loads(supervisor.recv(4096).decode("utf-8"))
+                observed.append(packet["event"])
+                if packet["event"] == expected:
+                    return packet, observed
+
+        thread.start()
+        try:
+            receive_event("READY_NO_WRITER")
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": worker.CONTROL_SCHEMA,
+                        "command": "GO",
+                        "episode_id": 1,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("FIRST_WRITE")
+            receive_event("POLICY_FALLBACK_DUE")
+            state_store.set(snapshot(joint_vel_rad_s=np.zeros(29)))
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": worker.CONTROL_SCHEMA,
+                        "command": "ADVANCE_POLICY",
+                        "episode_id": 1,
+                        "transition_id": "kungfu-host-stale-inference",
+                        "expected_from_policy_index": -1,
+                        "expected_to_policy_index": 0,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("POLICY_SWITCH")
+            self.assertTrue(host.started.wait(timeout=1.0))
+            constructed_commands = len(dds.commands)
+            successful_writes = len(dds.publisher.commands)
+            time.sleep(0.08)
+            host.release.set()
+
+            error, observed = receive_event("ERROR")
+            self.assertNotIn("POLICY_SWITCH_FIRST_WRITE", observed)
+            self.assertEqual(
+                error["stale_target_policy"], "reject_without_reinference"
+            )
+            self.assertGreater(error["command_state_age_s"], 0.05)
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [2])
+            self.assertEqual(len(dds.commands), constructed_commands)
+            self.assertEqual(len(dds.publisher.commands), successful_writes)
+        finally:
+            host.release.set()
+            supervisor.close()
+            child.close()
+
+    def test_kungfu_fallback_reuses_last_successful_pd_frame_then_blends(self):
+        supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        supervisor.settimeout(2.0)
+        state_store = worker.LatestLowState()
+        state_store.set(snapshot(joint_vel_rad_s=np.zeros(29)))
+
+        class ChangingKungFuPolicy(FakeKungFuPolicy):
+            def infer(self, **arguments):
+                output = super().infer(**arguments)
+                if len(self.infer_calls) == 1:
+                    self.config.kp.fill(33.0)
+                    self.config.kd.fill(3.0)
+                    return output
+                self.config.kp.fill(77.0)
+                self.config.kd.fill(7.0)
+                return SimpleNamespace(
+                    target_joint_pos=np.full(29, 0.75, dtype=np.float32)
+                )
+
+        class RejectChangedKungFuDds(FakeDds):
+            @staticmethod
+            def write(publisher, command):
+                target, kp, kd = command_pd_vectors(command)
+                if (
+                    np.all(target == np.float32(0.75))
+                    and np.all(kp == np.float32(77.0))
+                    and np.all(kd == np.float32(7.0))
+                ):
+                    return False
+                return publisher.Write(command)
+
+        dds = RejectChangedKungFuDds()
+        kungfu = ChangingKungFuPolicy()
+        host = BlockingRunner("host_after_kungfu", np.zeros(23, dtype=np.float32))
+        cascade = worker.HostPolicyCascade(
+            config=worker.HostControlConfig.create(),
+            runners=(host,),
+            fallback_after_s=0.05,
+            policy_switch_blend_s=0.4,
+        )
+        resident_manifest = (
+            {
+                "name": "host:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+            {
+                "name": "kungfu:test",
+                "execution_provider": "CPUExecutionProvider",
+                "warmed": True,
+            },
+        )
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                worker.run_worker(
+                    cascade=cascade,
+                    amp_hold_policy=None,
+                    kungfu_policy=kungfu,
+                    dds=dds,
+                    state_store=state_store,
+                    control=child,
+                    publish_hz=50.0,
+                    lowstate_timeout_s=2.0,
+                    status_hz=20.0,
+                    initial_controller="kungfu",
+                    resident_policies=resident_manifest,
+                )
+            )
+        )
+
+        def receive_event(expected):
+            while True:
+                packet = json.loads(supervisor.recv(4096).decode("utf-8"))
+                if packet["event"] == expected:
+                    return packet
+
+        thread.start()
+        try:
+            receive_event("READY_NO_WRITER")
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": worker.CONTROL_SCHEMA,
+                        "command": "GO",
+                        "episode_id": 1,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("FIRST_WRITE")
+            receive_event("POLICY_FALLBACK_DUE")
+            self.assertGreaterEqual(len(dds.publisher.commands), 1)
+            last_successful_kungfu = dds.publisher.commands[-1]
+            self.assertTrue(
+                any(
+                    np.all(command_pd_vectors(command)[0] == np.float32(0.75))
+                    for command in dds.commands
+                )
+            )
+
+            supervisor.send(
+                json.dumps(
+                    {
+                        "schema": worker.CONTROL_SCHEMA,
+                        "command": "ADVANCE_POLICY",
+                        "episode_id": 1,
+                        "transition_id": "kungfu-pd-continuity",
+                        "expected_from_policy_index": -1,
+                        "expected_to_policy_index": 0,
+                    }
+                ).encode("utf-8")
+            )
+            receive_event("POLICY_SWITCH")
+            self.assertTrue(host.started.wait(timeout=1.0))
+            first_host_command_index = len(dds.commands)
+            host.release.set()
+            receive_event("POLICY_SWITCH_FIRST_WRITE")
+            first_host = dds.commands[first_host_command_index]
+
+            for actual, expected in zip(
+                command_pd_vectors(first_host),
+                command_pd_vectors(last_successful_kungfu),
+            ):
+                np.testing.assert_array_equal(actual, expected)
+
+            blend_deadline = time.monotonic() + 0.5
+            while time.monotonic() < blend_deadline:
+                state_store.set(
+                    snapshot(
+                        received=time.monotonic(),
+                        joint_vel_rad_s=np.zeros(29),
+                    )
+                )
+                time.sleep(0.01)
+            final_command = dds.publisher.commands[-1]
+            final_target, final_kp, final_kd = command_pd_vectors(final_command)
+            np.testing.assert_allclose(
+                final_target,
+                np.arange(29, dtype=np.float32),
+                atol=1e-6,
+            )
+            np.testing.assert_array_equal(final_kp, cascade.config.kp)
+            np.testing.assert_array_equal(final_kd, cascade.config.kd)
+
+            supervisor.send(b"STOP")
+            receive_event("STOPPED")
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [0])
+        finally:
+            host.release.set()
+            supervisor.close()
+            child.close()
+
     def test_joint_pose_hold_reuses_writer_and_holds_measured_q(self):
         supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         supervisor.settimeout(2.0)
@@ -1073,6 +1605,100 @@ class WorkerHandoffTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(result, [0])
             self.assertTrue(publisher.closed)
+        finally:
+            supervisor.close()
+            child.close()
+
+    def test_amp_hold_status_waits_for_successful_hold_first_write(self):
+        supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        supervisor.settimeout(2.0)
+        state_store = worker.LatestLowState()
+        state_store.set(snapshot())
+        amp_config = worker.PolicyConfig.from_mapping(amp_config_mapping())
+
+        class FailFirstAmpHoldDds(FakeDds):
+            def __init__(self):
+                super().__init__()
+                self.failed_amp_hold_write = False
+
+            def write(self, publisher, command):
+                _target, kp, _kd = command_pd_vectors(command)
+                if (
+                    not self.failed_amp_hold_write
+                    and np.array_equal(kp, amp_config.kp)
+                ):
+                    self.failed_amp_hold_write = True
+                    return False
+                return publisher.Write(command)
+
+        dds = FailFirstAmpHoldDds()
+        cascade = worker.HostPolicyCascade(
+            config=worker.HostControlConfig.create(),
+            runners=(RecordingRunner("prone_v1", [np.zeros(23)] * 200),),
+            fallback_after_s=8.0,
+        )
+        amp_policy = worker.AmpPolicyCore(
+            amp_config,
+            RecordingRunner("amp_hold", [np.zeros(29)] * 200),
+        )
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(
+                worker.run_worker(
+                    cascade=cascade,
+                    amp_hold_policy=amp_policy,
+                    dds=dds,
+                    state_store=state_store,
+                    control=child,
+                    publish_hz=50.0,
+                    lowstate_timeout_s=3.0,
+                    status_hz=20.0,
+                    resident_policies=TEST_RESIDENT_POLICIES,
+                )
+            )
+        )
+
+        def receive_event(expected):
+            while True:
+                packet = json.loads(supervisor.recv(4096).decode("utf-8"))
+                if packet["event"] == expected:
+                    return packet
+
+        thread.start()
+        try:
+            receive_event("READY_NO_WRITER")
+            supervisor.send(b"GO")
+            receive_event("FIRST_WRITE")
+            successful_writes = len(dds.publisher.commands)
+            supervisor.send(b"ENTER_AMP_HOLD")
+
+            before_first_write = None
+            while before_first_write is None:
+                packet = json.loads(supervisor.recv(4096).decode("utf-8"))
+                self.assertNotEqual(packet["event"], "AMP_HOLD_FIRST_WRITE")
+                if (
+                    packet["event"] == "STATUS"
+                    and packet["controller"] == "AMP_ZERO_COMMAND_HOLD"
+                ):
+                    before_first_write = packet
+            self.assertEqual(
+                before_first_write["controller"], "AMP_ZERO_COMMAND_HOLD"
+            )
+            self.assertEqual(before_first_write["active_policy_id"], "host")
+            self.assertEqual(before_first_write["selected_policy_id"], "host")
+            self.assertTrue(dds.failed_amp_hold_write)
+            self.assertEqual(len(dds.publisher.commands), successful_writes)
+
+            receive_event("AMP_HOLD_FIRST_WRITE")
+            after_first_write = receive_event("STATUS")
+            self.assertEqual(after_first_write["active_policy_id"], "amp")
+            self.assertEqual(after_first_write["selected_policy_id"], "host")
+
+            supervisor.send(b"STOP")
+            receive_event("STOPPED")
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result, [0])
         finally:
             supervisor.close()
             child.close()

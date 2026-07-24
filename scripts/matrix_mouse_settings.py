@@ -115,6 +115,15 @@ class SettingsLoad:
     error: str | None = None
 
 
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate mouse settings field {key!r}")
+        result[key] = value
+    return result
+
+
 def default_settings_file(
     profile: object | None = None,
     *,
@@ -152,11 +161,15 @@ def load_settings(path: Path) -> SettingsLoad:
     """Load a versioned file; missing/invalid state safely becomes Local."""
 
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return SettingsLoad(MouseSettings(), "missing")
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError) as exc:
         return SettingsLoad(MouseSettings(), "invalid", f"cannot read settings: {exc}")
+    try:
+        value = json.loads(text, object_pairs_hook=_strict_object)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return SettingsLoad(MouseSettings(), "invalid", f"invalid settings: {exc}")
     try:
         if not isinstance(value, dict) or set(value) != {
             "version",

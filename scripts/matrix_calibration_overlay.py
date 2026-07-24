@@ -95,6 +95,7 @@ _MIN_CLIENT_WIDTH = 480
 _MIN_CLIENT_HEIGHT = 360
 _MAX_COMMAND_HISTORY = 24
 _MAX_INTENT_PACKET_BYTES = 2048
+_MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 _MAX_LOCOMOTION_POLICY_BUTTONS = 3
 _MAX_RECOVERY_POLICY_BUTTONS = 4
 _MIN_OVERLAY_FONT_SIZE = 1
@@ -476,6 +477,9 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     apply_height = max(42, min(80, button_height + 6))
     footer_space = 8 if compact else 42
     apply_y = panel_y + panel_height - footer_space - apply_height
+    footer_width = panel_width - 2 * margin
+    pause_width = max(120, min(260, (footer_width - gap) // 3))
+    apply_width = max(1, footer_width - pause_width - gap)
     console_left = panel_x + margin
     console_width = panel_width - 2 * margin
     console_top = tab_y + tab_height + gap
@@ -667,9 +671,15 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             button_height,
         ),
         "apply_return": (
+            panel_x + margin + pause_width + gap,
+            apply_y,
+            apply_width,
+            apply_height,
+        ),
+        "runtime_pause": (
             panel_x + margin,
             apply_y,
-            max(1, panel_width - 2 * margin),
+            pause_width,
             apply_height,
         ),
         "command_history": (
@@ -999,6 +1009,7 @@ _NAVIGATION_HIT_TARGETS = (
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
+    + ("runtime_pause",)
     + _MOTION_STEP_ACTIONS
     + ("command_input",)
     + _OVERLAY_LOCAL_HIT_TARGETS
@@ -1031,7 +1042,7 @@ def panel_action_at(
     if page == "loadout":
         targets = (
             _PANEL_TABS
-            + ("apply_return",)
+            + ("runtime_pause", "apply_return")
             + _LOCOMOTION_POLICY_HIT_TARGETS
             + _POLICY_HIT_TARGETS
         )
@@ -1039,17 +1050,34 @@ def panel_action_at(
         targets = (
             _PANEL_TABS
             + _PANEL_ACTIONS
+            + ("runtime_pause",)
             + _MOTION_STEP_ACTIONS
             + _OVERLAY_LOCAL_HIT_TARGETS
         )
     elif page == "console":
-        targets = _PANEL_TABS + ("apply_return", "command_input")
+        targets = _PANEL_TABS + (
+            "runtime_pause",
+            "apply_return",
+            "command_input",
+        )
     elif page == "inventory":
-        targets = _PANEL_TABS + ("apply_return",) + _INVENTORY_HIT_TARGETS
+        targets = (
+            _PANEL_TABS
+            + ("runtime_pause", "apply_return")
+            + _INVENTORY_HIT_TARGETS
+        )
     elif page == "navigation":
-        targets = _PANEL_TABS + ("apply_return",) + _NAVIGATION_HIT_TARGETS
+        targets = (
+            _PANEL_TABS
+            + ("runtime_pause", "apply_return")
+            + _NAVIGATION_HIT_TARGETS
+        )
     elif page == "video":
-        targets = _PANEL_TABS + ("apply_return",) + _VIDEO_STEP_ACTIONS
+        targets = (
+            _PANEL_TABS
+            + ("runtime_pause", "apply_return")
+            + _VIDEO_STEP_ACTIONS
+        )
     for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
@@ -2548,6 +2576,106 @@ def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
     )
 
 
+_RUNTIME_PAUSE_STATES = frozenset(
+    {"running", "paused", "pausing", "resuming", "busy", "fault", "unavailable"}
+)
+
+
+@dataclass(frozen=True)
+class RuntimePausePanelModel:
+    state: str
+    epoch: int
+    can_pause: bool
+    can_resume: bool
+    last_error: str | None
+    available: bool
+
+    @property
+    def pause_target(self) -> str | None:
+        if self.state == "running" and self.can_pause:
+            return "paused"
+        if self.state == "paused" and self.can_resume:
+            return "running"
+        return None
+
+    @property
+    def enabled(self) -> bool:
+        return self.available and self.pause_target is not None
+
+    @property
+    def label(self) -> str:
+        if self.state == "running":
+            return "暂停 / Pause" if self.can_pause else "暂停不可用"
+        if self.state == "paused":
+            return "继续 / Continue" if self.can_resume else "继续不可用"
+        if self.state in {"pausing", "busy"}:
+            return "暂停中 / Pausing"
+        if self.state == "resuming":
+            return "继续中 / Resuming"
+        if self.state == "fault":
+            return "暂停故障 / Fault"
+        return "暂停不可用"
+
+
+def runtime_pause_panel_model(state: dict[str, object]) -> RuntimePausePanelModel:
+    """Validate runtime-owned pause telemetry and fail closed on disagreement."""
+
+    console = state.get("command_console")
+    console = console if isinstance(console, dict) else {}
+    raw = console.get("runtime_pause")
+    unavailable = RuntimePausePanelModel(
+        state="unavailable",
+        epoch=0,
+        can_pause=False,
+        can_resume=False,
+        last_error=None,
+        available=False,
+    )
+    if not isinstance(raw, dict) or set(raw) != {
+        "state",
+        "epoch",
+        "can_pause",
+        "can_resume",
+        "last_error",
+    }:
+        return unavailable
+    pause_state = raw.get("state")
+    epoch = raw.get("epoch")
+    can_pause = raw.get("can_pause")
+    can_resume = raw.get("can_resume")
+    error_value = raw.get("last_error")
+    if (
+        type(pause_state) is not str
+        or pause_state not in _RUNTIME_PAUSE_STATES
+        or type(epoch) is not int
+        or not 0 <= epoch <= _MAX_RUNTIME_PAUSE_EPOCH
+        or type(can_pause) is not bool
+        or type(can_resume) is not bool
+        or (error_value is not None and not isinstance(error_value, str))
+        or (can_pause and can_resume)
+        or (pause_state == "running" and can_resume)
+        or (pause_state == "paused" and can_pause)
+        or (
+            pause_state in {"pausing", "resuming", "busy", "fault", "unavailable"}
+            and (can_pause or can_resume)
+        )
+    ):
+        return unavailable
+    last_error = (
+        _bounded_status_text(error_value, maximum=256)
+        if isinstance(error_value, str)
+        else None
+    )
+    return RuntimePausePanelModel(
+        state=pause_state,
+        epoch=epoch,
+        can_pause=can_pause,
+        can_resume=can_resume,
+        last_error=last_error,
+        available=pause_state != "unavailable",
+    )
+
+
 @dataclass(frozen=True)
 class CommandEditOutcome:
     action: str | None = None
@@ -3041,6 +3169,19 @@ class PointerActionPublisher:
             },
         )
 
+    def publish_runtime_pause(self, target: str, *, expected_epoch: int) -> None:
+        if (
+            type(target) is not str
+            or target not in {"paused", "running"}
+            or type(expected_epoch) is not int
+            or not 0 <= expected_epoch <= _MAX_RUNTIME_PAUSE_EPOCH
+        ):
+            raise ValueError("runtime pause intent is invalid")
+        self._publish(
+            "runtime_pause",
+            {"pause_target": target, "expected_epoch": expected_epoch},
+        )
+
     def publish_font_size(self, font_size: int) -> None:
         self._publish("font_size", {"font_size": canonical_font_size(font_size)})
 
@@ -3194,6 +3335,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_navigation_model: CelestialNavigationModel | None = None
         self._last_video_model: VideoSettingsPanelModel | None = None
+        self._last_runtime_pause_model = runtime_pause_panel_model({})
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = -1
@@ -5527,6 +5669,7 @@ class X11CalibrationOverlay:
         inventory_model: CreativeInventoryModel | None = None,
         navigation_model: CelestialNavigationModel | None = None,
         video_model: VideoSettingsPanelModel | None = None,
+        runtime_pause_model: RuntimePausePanelModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -5579,6 +5722,54 @@ class X11CalibrationOverlay:
                 layout,
                 video_model or video_settings_panel_model({}),
             )
+        pause_model = runtime_pause_model or runtime_pause_panel_model({})
+        visible_command_status = command_status or getattr(
+            self, "_last_command_status", command_console_status({})
+        )
+        pause_busy = bool(
+            visible_command_status.in_flight
+            or visible_command_status.restart_required
+            or visible_command_status.outcome_unknown
+            or visible_command_status.status in {"pending", "restarting", "unavailable"}
+            or self._command_editor.editing
+            or self._command_editor.pending
+            or model.restart_requested
+        )
+        pause_disabled = bool(not pause_model.enabled or pause_busy)
+        pause_label = (
+            "处理中 / Busy"
+            if pause_busy and pause_model.state in {"running", "paused"}
+            else pause_model.label
+        )
+        if panel_height < 600:
+            pause_label = {
+                "running": "处理中" if pause_busy else "暂停",
+                "paused": "处理中" if pause_busy else "继续",
+                "pausing": "暂停中",
+                "resuming": "继续中",
+                "busy": "处理中",
+                "fault": "暂停故障",
+                "unavailable": "暂停不可用",
+            }[pause_model.state]
+        pause_fill_name = (
+            "error"
+            if pause_model.state == "fault"
+            else (
+                "pending"
+                if pause_busy
+                or pause_model.state in {"pausing", "resuming", "busy"}
+                else ("selected" if pause_model.state == "paused" else "button")
+            )
+        )
+        self._draw_button(
+            layout,
+            "runtime_pause",
+            pause_label,
+            fill=self._colours[
+                "disabled" if pause_model.state == "unavailable" else pause_fill_name
+            ],
+            disabled=pause_disabled,
+        )
         apply_disabled = not model.action_enabled("apply_return")
         self._draw_button(
             layout,
@@ -5694,18 +5885,30 @@ class X11CalibrationOverlay:
             self._ungrab_keyboard()
 
     def _set_font_size_from_root_x(self, root_x: int) -> bool:
+        """Stage a font-size intent without changing the live Xft fonts."""
+
         layout = self._last_layout
         if (
             layout is None
             or getattr(self, "_active_page", "loadout") != "settings"
+            or getattr(self, "_xft", None) is None
+            or getattr(self, "_xft_draw", None) is None
         ):
             return False
         target_size = font_size_from_slider(layout["font_size_slider"], root_x)
-        changed = self._set_font_size(target_size)
-        if changed:
+        if target_size == getattr(
+            self,
+            "_font_size",
+            _DEFAULT_OVERLAY_FONT_SIZE,
+        ):
             self._pending_font_slider_action = None
-            self._pending_font_slider_size = target_size
-        return changed
+            self._pending_font_slider_size = None
+            return False
+        if target_size == getattr(self, "_pending_font_slider_size", None):
+            return False
+        self._pending_font_slider_action = None
+        self._pending_font_slider_size = target_size
+        return True
 
     def drain_pointer_actions(self, publisher: PointerActionPublisher) -> int:
         """Drain bounded keyboard intents and completed left-button clicks."""
@@ -5793,7 +5996,34 @@ class X11CalibrationOverlay:
                         self._active_page = next_page
                         self._last_page = None
                     continue
-                if action == "command_input":
+                if action == "runtime_pause":
+                    pause_model = getattr(self, "_last_runtime_pause_model", None)
+                    panel_model = self._last_panel_model
+                    pause_target = (
+                        pause_model.pause_target
+                        if isinstance(pause_model, RuntimePausePanelModel)
+                        else None
+                    )
+                    if (
+                        pause_target is not None
+                        and panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and self._last_command_status.available
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting", "unavailable"}
+                    ):
+                        publisher.publish_runtime_pause(
+                            pause_target,
+                            expected_epoch=pause_model.epoch,
+                        )
+                        emitted += 1
+                elif action == "command_input":
                     if self._begin_command_editing(publisher):
                         emitted += 1
                 elif action == "navigation_refresh":
@@ -5977,6 +6207,7 @@ class X11CalibrationOverlay:
         navigation_model = celestial_navigation_model(state)
         video_model = video_settings_panel_model(state)
         command_status = command_console_status(state)
+        runtime_pause_model = runtime_pause_panel_model(state)
         self._command_editor.reconcile(command_status)
         model_changed = bool(
             font_changed
@@ -5987,6 +6218,8 @@ class X11CalibrationOverlay:
             or inventory_model != getattr(self, "_last_inventory_model", None)
             or navigation_model != getattr(self, "_last_navigation_model", None)
             or video_model != getattr(self, "_last_video_model", None)
+            or runtime_pause_model
+            != getattr(self, "_last_runtime_pause_model", runtime_pause_panel_model({}))
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
             != getattr(self, "_last_rendered_font_size", None)
             or getattr(self, "_active_page", "loadout")
@@ -6028,6 +6261,7 @@ class X11CalibrationOverlay:
                 inventory_model,
                 navigation_model,
                 video_model,
+                runtime_pause_model,
             )
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
@@ -6066,6 +6300,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model = inventory_model
         self._last_navigation_model = navigation_model
         self._last_video_model = video_model
+        self._last_runtime_pause_model = runtime_pause_model
         self._last_rendered_font_size = getattr(
             self,
             "_font_size",

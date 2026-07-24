@@ -27,7 +27,7 @@ from inject_creative_inventory import (  # noqa: E402
 )
 
 
-PIPELINE_VERSION = 8
+PIPELINE_VERSION = 9
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
@@ -46,6 +46,12 @@ MOON_DYNAMIC_MAP_SHA256 = (
 MOON_DYNAMIC_MAP_SIDE_SAMPLES = 6000
 MOON_DYNAMIC_MAP_RESOLUTION_M = 0.1
 MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M = -0.9296965003013611
+MOON_CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
+MOON_CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
+MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES = 33
+MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M = 1.6
+MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M = 64.0
+MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
 MOON_DEFAULT_ROOT_CLEARANCE_M = 0.793
 MOON_DEFAULT_SPAWN_Z_M = (
     MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M + MOON_DEFAULT_ROOT_CLEARANCE_M
@@ -370,7 +376,7 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
         return None
     return {
         "dynamic_ground": {
-            "schema": "matrix-moon-dynamic-ground/v1",
+            "schema": "matrix-moon-dynamic-ground/v2",
             "body_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
             "body_name_pattern": MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern,
             "body_mode": "mocap",
@@ -385,6 +391,19 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
             "height_mode": "absolute_world_z",
             "update_timing": "before_each_mj_step",
             "fallback_support_plane": False,
+            "collision": {
+                "mode": "rolling-heightfield-v1",
+                "asset_name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+                "geom_name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "grid_shape": [
+                    MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                    MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                ],
+                "half_extent_m": MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                "height_range_m": MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+                "base_depth_m": MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+                "source_tile_collision_enabled": False,
+            },
         }
     }
 
@@ -404,6 +423,16 @@ def _apply_scene_transform_additions(
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise SonicPhysicsModelError("MoonWorld derived scene has no worldbody")
+    if any(
+        item.get("name") == MOON_CONTINUOUS_SUPPORT_ASSET_NAME
+        for item in root.iter("hfield")
+    ) or any(
+        item.get("name") == MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+        for item in root.iter("geom")
+    ):
+        raise SonicPhysicsModelError(
+            "MoonWorld source already contains Matrix continuous support"
+        )
     tile_bodies = [
         body
         for body in worldbody.iter("body")
@@ -432,10 +461,81 @@ def _apply_scene_transform_additions(
                 f"MoonWorld tile {body.get('name')} still owns a free joint"
             )
         body.set("mocap", "true")
+        body_name = body.get("name", "")
+        suffix = body_name.removeprefix("gb_")
+        tile_geoms = list(body.findall("geom"))
+        if len(tile_geoms) != 1:
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body_name} must own exactly one geom"
+            )
+        tile_geom = tile_geoms[0]
+        if (
+            tile_geom.get("name") != f"soil_{suffix}"
+            or tile_geom.get("type") != "box"
+            or not _vectors_equal(
+                _float_vector(tile_geom, "size", length=3),
+                (0.049, 0.049, 0.5),
+            )
+            or not _vectors_equal(
+                _float_vector(tile_geom, "pos", length=3),
+                (0.0, 0.0, -0.5),
+            )
+        ):
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body_name} collision source contract drifted"
+            )
+        # Preserve the locked native tile geometry for visual/provenance parity,
+        # but fence it out of collision. Its 0.049 m half-width on a 0.1 m
+        # lattice leaves gaps and exposes vertical faces between samples.
+        tile_geom.set("contype", "0")
+        tile_geom.set("conaffinity", "0")
+
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.Element("asset")
+        worldbody_index = list(root).index(worldbody)
+        root.insert(worldbody_index, asset)
+    ET.SubElement(
+        asset,
+        "hfield",
+        {
+            "name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+            "nrow": str(MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES),
+            "ncol": str(MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES),
+            "size": " ".join(
+                f"{value:g}"
+                for value in (
+                    MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                    MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                    MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+                    MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+                )
+            ),
+        },
+    )
+    worldbody.insert(
+        0,
+        ET.Element(
+            "geom",
+            {
+                "name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "type": "hfield",
+                "hfield": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+                "pos": f"0 0 {MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M:.12g}",
+                "contype": "1",
+                "conaffinity": "1",
+                "friction": "1 0.005 0.0001",
+                "solref": "0.02 1",
+                "solimp": "0.9 0.95 0.001 0.5 2",
+                "rgba": "0 0 0 0",
+            },
+        ),
+    )
     root.insert(
         0,
         ET.Comment(
-            " converted official MoonWorld rolling tiles to runtime-updated mocap bodies "
+            " converted official MoonWorld rolling tiles to non-colliding mocap visuals "
+            "and added one runtime-updated continuous collision hfield "
         ),
     )
     ET.indent(tree, space="  ")

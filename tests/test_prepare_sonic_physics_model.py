@@ -354,7 +354,9 @@ material="demo_ground_material" /></worldbody>
             for wall in MODULE.TOWN10_PERIMETER_WALL_NAMES:
                 self.assertNotIn(wall, names)
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(manifest["pipeline_version"], 8)
+            self.assertEqual(
+                manifest["pipeline_version"], MODULE.PIPELINE_VERSION
+            )
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
@@ -447,16 +449,45 @@ material="demo_ground_material" /></worldbody>
                 [("gb_0_0", "-0.75 -0.75 0"), ("gb_0_1", "-0.75 -0.65 0")],
             )
             self.assertEqual([joint.get("name") for joint in scene_root.iter("joint")], [])
+            geoms = list(scene_root.iter("geom"))
             self.assertEqual(
-                [geom.get("name") for geom in scene_root.iter("geom")],
-                ["soil_0_0", "soil_0_1"],
+                [geom.get("name") for geom in geoms],
+                [
+                    MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                    "soil_0_0",
+                    "soil_0_1",
+                ],
+            )
+            support_geom = geoms[0]
+            self.assertEqual(support_geom.get("type"), "hfield")
+            self.assertEqual(
+                support_geom.get("hfield"),
+                MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+            )
+            self.assertEqual(support_geom.get("contype"), "1")
+            self.assertEqual(support_geom.get("conaffinity"), "1")
+            for tile_geom in geoms[1:]:
+                self.assertEqual(tile_geom.get("contype"), "0")
+                self.assertEqual(tile_geom.get("conaffinity"), "0")
+            hfields = list(scene_root.iter("hfield"))
+            self.assertEqual(len(hfields), 1)
+            self.assertEqual(
+                hfields[0].attrib,
+                {
+                    "name": MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+                    "nrow": "33",
+                    "ncol": "33",
+                    "size": "1.6 1.6 64 1",
+                },
             )
             self.assertEqual(
                 [body.get("mocap") for body in scene_root.iter("body")],
                 ["true", "true"],
             )
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(manifest["pipeline_version"], 8)
+            self.assertEqual(
+                manifest["pipeline_version"], MODULE.PIPELINE_VERSION
+            )
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
@@ -465,7 +496,7 @@ material="demo_ground_material" /></worldbody>
                 manifest["scene_transform_contract"],
                 {
                     "dynamic_ground": {
-                        "schema": "matrix-moon-dynamic-ground/v1",
+                        "schema": "matrix-moon-dynamic-ground/v2",
                         "body_count": 2,
                         "body_name_pattern": (
                             MODULE.MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern
@@ -479,6 +510,20 @@ material="demo_ground_material" /></worldbody>
                         "height_mode": "absolute_world_z",
                         "update_timing": "before_each_mj_step",
                         "fallback_support_plane": False,
+                        "collision": {
+                            "mode": "rolling-heightfield-v1",
+                            "asset_name": (
+                                MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME
+                            ),
+                            "geom_name": (
+                                MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+                            ),
+                            "grid_shape": [33, 33],
+                            "half_extent_m": 1.6,
+                            "height_range_m": 64.0,
+                            "base_depth_m": 1.0,
+                            "source_tile_collision_enabled": False,
+                        },
                     }
                 },
             )

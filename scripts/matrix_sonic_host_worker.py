@@ -226,6 +226,41 @@ class HostControlConfig:
         return cls(action_rescale=scale, action_clip=clip, kp=kp, kd=kd)
 
 
+@dataclass(frozen=True)
+class PdWriteFrame:
+    """Exact target and gains accepted by the most recent DDS write."""
+
+    target_joint_pos: np.ndarray
+    kp: np.ndarray
+    kd: np.ndarray
+    controller: str
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        target_joint_pos: np.ndarray,
+        config: HostControlConfig | PolicyConfig,
+        controller: str,
+    ) -> "PdWriteFrame":
+        vectors: list[np.ndarray] = []
+        for name, value in (
+            ("target_joint_pos", target_joint_pos),
+            ("kp", config.kp),
+            ("kd", config.kd),
+        ):
+            vector = np.asarray(value, dtype=np.float32)
+            if vector.shape != (NUM_JOINTS,) or not np.all(np.isfinite(vector)):
+                raise ValueError(f"{name} must be a finite {NUM_JOINTS}-vector")
+            vectors.append(vector.copy())
+        return cls(
+            target_joint_pos=vectors[0],
+            kp=vectors[1],
+            kd=vectors[2],
+            controller=str(controller),
+        )
+
+
 class HostRunner(Protocol):
     label: str
 
@@ -383,6 +418,7 @@ class HostPolicyCascade:
         self.fallback_pending = False
         self._switch_blend_origin: np.ndarray | None = None
         self._switch_blend_started_monotonic: float | None = None
+        self._switch_blend_alpha = 1.0
 
     @property
     def label(self) -> str:
@@ -396,6 +432,32 @@ class HostPolicyCascade:
         self.fallback_pending = False
         self._switch_blend_origin = None
         self._switch_blend_started_monotonic = None
+        self._switch_blend_alpha = 1.0
+
+    @property
+    def switch_blend_alpha(self) -> float:
+        return self._switch_blend_alpha
+
+    def mark_physical_continuation(
+        self,
+        state: LowStateSnapshot,
+        now: float,
+        *,
+        target_origin: np.ndarray | None = None,
+    ) -> None:
+        """Blend an already-started HoST policy from one physical command."""
+
+        origin = state.joint_pos_rad if target_origin is None else target_origin
+        origin_vector = np.asarray(origin, dtype=np.float32)
+        if origin_vector.shape != (NUM_JOINTS,) or not np.all(
+            np.isfinite(origin_vector)
+        ):
+            raise ValueError(
+                f"physical continuation target must be a finite {NUM_JOINTS}-vector"
+            )
+        self._switch_blend_origin = origin_vector.copy()
+        self._switch_blend_started_monotonic = float(now)
+        self._switch_blend_alpha = 0.0
 
     def maybe_request_fallback(
         self, state: LowStateSnapshot, now: float
@@ -451,6 +513,7 @@ class HostPolicyCascade:
         # be up to lowstate_timeout_s old; using its receive timestamp could
         # therefore skip most of a 0.4 s blend on the first command.
         self._switch_blend_started_monotonic = float(now)
+        self._switch_blend_alpha = 0.0
         return {
             "from_policy_index": old_index,
             "from_policy": old_label,
@@ -460,25 +523,35 @@ class HostPolicyCascade:
             "target_blend_seconds": self.policy_switch_blend_s,
         }
 
-    def infer(self, state: LowStateSnapshot) -> HostPolicyOutput:
+    def infer(
+        self, state: LowStateSnapshot, *, now: float | None = None
+    ) -> HostPolicyOutput:
         output = self.core.infer(state)
         if (
             self._switch_blend_origin is None
             or self._switch_blend_started_monotonic is None
         ):
+            self._switch_blend_alpha = 1.0
             return output
+        blend_now = state.received_monotonic if now is None else float(now)
         alpha = float(
             np.clip(
-                (state.received_monotonic - self._switch_blend_started_monotonic)
+                (blend_now - self._switch_blend_started_monotonic)
                 / self.policy_switch_blend_s,
                 0.0,
                 1.0,
             )
         )
-        blended_target = (
-            self._switch_blend_origin * (1.0 - alpha)
-            + output.target_joint_pos * alpha
-        ).astype(np.float32, copy=False)
+        self._switch_blend_alpha = alpha
+        if alpha <= 0.0:
+            blended_target = self._switch_blend_origin.copy()
+        elif alpha >= 1.0:
+            blended_target = output.target_joint_pos.copy()
+        else:
+            blended_target = (
+                self._switch_blend_origin * (1.0 - alpha)
+                + output.target_joint_pos * alpha
+            ).astype(np.float32, copy=False)
         applied_action = (
             (
                 blended_target[HOST_TO_MATRIX_INDICES]
@@ -575,8 +648,8 @@ def build_resident_policy_registry(
             execution_provider=provider_name,
             command_config=cascade.config,
             start_episode_fn=cascade.start,
-            infer_target_fn=lambda state, _now: cascade.infer(
-                state
+            infer_target_fn=lambda state, now: cascade.infer(
+                state, now=now
             ).target_joint_pos,
             status_fields_fn=lambda now, _started: {
                 "policy_index": cascade.index,
@@ -726,6 +799,7 @@ def run_worker(
     next_status = now
     go_time: float | None = None
     latest_target: np.ndarray | None = None
+    latest_target_state: LowStateSnapshot | None = None
     controller = selected_policy.controller
     amp_started_monotonic: float | None = None
     kungfu_started_monotonic: float | None = None
@@ -743,10 +817,15 @@ def run_worker(
     amp_hold_previous_controller: str | None = None
     amp_hold_history_reset = False
     pending_policy_switch_first_write: dict[str, Any] | None = None
+    resident_fallback_pending = False
+    last_successful_pd_write: PdWriteFrame | None = None
+    kungfu_host_blend_origin: PdWriteFrame | None = None
+    kungfu_host_first_write_pending = False
 
     def reset_episode_controller(state: LowStateSnapshot, start_now: float) -> None:
         nonlocal controller
-        nonlocal latest_target, amp_started_monotonic, kungfu_started_monotonic
+        nonlocal latest_target, latest_target_state
+        nonlocal amp_started_monotonic, kungfu_started_monotonic
         nonlocal amp_hold_first_write_pending, amp_hold_first_write_reported
         nonlocal joint_hold_target, joint_hold_config
         nonlocal joint_hold_started_monotonic, joint_hold_capture_age_s
@@ -754,9 +833,13 @@ def run_worker(
         nonlocal joint_hold_first_write_pending, joint_hold_first_write_reported
         nonlocal amp_hold_transition_id, amp_hold_previous_controller
         nonlocal amp_hold_history_reset, pending_policy_switch_first_write
+        nonlocal resident_fallback_pending
+        nonlocal last_successful_pd_write, kungfu_host_blend_origin
+        nonlocal kungfu_host_first_write_pending
 
         controller = selected_policy.controller
         latest_target = None
+        latest_target_state = None
         amp_started_monotonic = None
         kungfu_started_monotonic = None
         amp_hold_first_write_pending = False
@@ -773,6 +856,10 @@ def run_worker(
         amp_hold_previous_controller = None
         amp_hold_history_reset = False
         pending_policy_switch_first_write = None
+        resident_fallback_pending = False
+        last_successful_pd_write = None
+        kungfu_host_blend_origin = None
+        kungfu_host_first_write_pending = False
         active_policy = policy_registry.for_controller(controller)
         if active_policy is None:
             raise RuntimeError(
@@ -786,6 +873,26 @@ def run_worker(
             AMP_FLAT_V3_GETUP_CONTROLLER,
         }:
             amp_started_monotonic = start_now
+
+    def successful_writer_authority_policy_id() -> str | None:
+        if last_successful_pd_write is None:
+            return None
+        successful_policy = policy_registry.for_controller(
+            last_successful_pd_write.controller
+        )
+        if successful_policy is not None:
+            return successful_policy.policy_id
+        fixed_authorities = {
+            JOINT_POSE_HOLD_CONTROLLER: "joint_pose_hold",
+            AMP_ZERO_COMMAND_HOLD_CONTROLLER: "amp",
+        }
+        try:
+            return fixed_authorities[last_successful_pd_write.controller]
+        except KeyError as exc:
+            raise RuntimeError(
+                "successful DDS write has an unknown authority controller: "
+                f"{last_successful_pd_write.controller!r}"
+            ) from exc
 
     try:
         while handoff.state != HandoffStateMachine.STOPPED:
@@ -878,6 +985,7 @@ def run_worker(
                     if command == "PAUSE":
                         go_time = None
                         latest_target = None
+                        latest_target_state = None
                         active_episode_id = None
                     if command == "STOP":
                         break
@@ -923,6 +1031,7 @@ def run_worker(
                     selected_policy = next_policy
                     controller = selected_policy.controller
                     latest_target = None
+                    latest_target_state = None
                     send_event(
                         "POLICY_SELECTED",
                         {
@@ -942,10 +1051,17 @@ def run_worker(
                             {"message": "ADVANCE_POLICY requires an active writer"},
                         )
                         continue
-                    if controller != HOST_GETUP_CONTROLLER:
+                    if controller not in {
+                        HOST_GETUP_CONTROLLER,
+                        KUNGFU_GETUP_CONTROLLER,
+                    }:
                         send_event(
                             "ERROR",
-                            {"message": "ADVANCE_POLICY requires HoST control"},
+                            {
+                                "message": (
+                                    "ADVANCE_POLICY requires HoST or KungFu control"
+                                )
+                            },
                         )
                         continue
                     requested_episode_id = command_fields.get("episode_id")
@@ -991,11 +1107,63 @@ def run_worker(
                             },
                         )
                         continue
-                    try:
-                        switch = cascade.advance(transition_state, transition_now)
-                    except RuntimeError as exc:
-                        send_event("ERROR", {"message": str(exc)})
-                        continue
+                    if controller == HOST_GETUP_CONTROLLER:
+                        try:
+                            switch = cascade.advance(
+                                transition_state, transition_now
+                            )
+                        except RuntimeError as exc:
+                            send_event("ERROR", {"message": str(exc)})
+                            continue
+                    else:
+                        if (
+                            command_fields.get("expected_from_policy_index") != -1
+                            or command_fields.get("expected_to_policy_index") != 0
+                        ):
+                            send_event(
+                                "ERROR",
+                                {
+                                    "message": (
+                                        "KungFu fallback index contract mismatch"
+                                    )
+                                },
+                            )
+                            continue
+                        if (
+                            last_successful_pd_write is None
+                            or last_successful_pd_write.controller
+                            != KUNGFU_GETUP_CONTROLLER
+                        ):
+                            send_event(
+                                "ERROR",
+                                {
+                                    "message": (
+                                        "KungFu fallback requires a successful "
+                                        "KungFu PD write"
+                                    )
+                                },
+                            )
+                            continue
+                        previous_policy = selected_policy
+                        fallback_policy = policy_registry.require("host")
+                        controller = fallback_policy.controller
+                        fallback_policy.start_episode(
+                            transition_state, transition_now
+                        )
+                        kungfu_host_blend_origin = last_successful_pd_write
+                        kungfu_host_first_write_pending = True
+                        kungfu_started_monotonic = None
+                        resident_fallback_pending = False
+                        switch = {
+                            "from_policy_index": -1,
+                            "from_policy": previous_policy.policy_id,
+                            "from_policy_id": previous_policy.policy_id,
+                            "to_policy_index": 0,
+                            "to_policy": fallback_policy.policy_id,
+                            "to_policy_id": fallback_policy.policy_id,
+                            "physical_continuation": True,
+                            "target_blend_seconds": cascade.policy_switch_blend_s,
+                        }
                     switch.update(
                         {
                             "episode_id": active_episode_id,
@@ -1003,6 +1171,7 @@ def run_worker(
                         }
                     )
                     latest_target = None
+                    latest_target_state = None
                     next_policy = transition_now
                     next_publish = transition_now
                     next_status = transition_now
@@ -1102,6 +1271,7 @@ def run_worker(
                     # SONIC finishes writer-free prewarming.
                     joint_hold_previous_controller = controller
                     latest_target = None
+                    latest_target_state = None
                     joint_hold_target = transition_state.joint_pos_rad.copy()
                     joint_hold_config = (
                         cascade.config
@@ -1221,6 +1391,7 @@ def run_worker(
                     amp_hold_previous_controller = controller
                     amp_hold_transition_id = transition_id
                     latest_target = None
+                    latest_target_state = None
                     amp_hold_history_reset = controller in {
                         HOST_GETUP_CONTROLLER,
                         KUNGFU_GETUP_CONTROLLER,
@@ -1315,6 +1486,35 @@ def run_worker(
                 fallback_request = cascade.maybe_request_fallback(state, now)
                 if fallback_request is not None:
                     send_event("POLICY_FALLBACK_DUE", fallback_request)
+            elif (
+                controller == KUNGFU_GETUP_CONTROLLER
+                and kungfu_started_monotonic is not None
+                and now - kungfu_started_monotonic >= cascade.fallback_after_s
+                and not resident_fallback_pending
+                and pending_policy_switch_first_write is None
+            ):
+                resident_fallback_pending = True
+                status = state_status(state)
+                send_event(
+                    "POLICY_FALLBACK_DUE",
+                    {
+                        "policy_index": -1,
+                        "policy": "kungfu",
+                        "from_policy_id": "kungfu",
+                        "next_policy_index": 0,
+                        "next_policy": "host",
+                        "to_policy_id": "host",
+                        "policy_elapsed_s": now - kungfu_started_monotonic,
+                        "requires_supervisor_authorization": True,
+                        "root_up_z_imu": status["root_up_z_imu"],
+                        "root_angular_speed_rad_s": status[
+                            "root_angular_speed_rad_s"
+                        ],
+                        "joint_velocity_rms_rad_s": status[
+                            "joint_velocity_rms_rad_s"
+                        ],
+                    },
+                )
             if now >= next_policy:
                 active_policy = policy_registry.for_controller(controller)
                 if active_policy is not None:
@@ -1325,8 +1525,57 @@ def run_worker(
                 else:
                     assert amp_hold_policy is not None
                     latest_target = amp_hold_policy.infer(state).target_joint_pos
+                latest_target_state = state
                 next_policy = _advance_deadline(next_policy, policy_period, now)
             if latest_target is not None and now >= next_publish:
+                command_state = latest_target_state
+                write_now = monotonic()
+                newest_state = state_store.get()
+                if command_state is None or newest_state is None:
+                    send_event(
+                        "ERROR",
+                        {
+                            "message": "LowState unavailable before command write",
+                            "controller": controller,
+                            "target_state_bound": command_state is not None,
+                            "latest_state_available": newest_state is not None,
+                            "stale_target_policy": "reject_without_reinference",
+                        },
+                    )
+                    handoff.command("STOP")
+                    return 2
+                command_state_age_s = (
+                    write_now - command_state.received_monotonic
+                )
+                newest_state_age_s = write_now - newest_state.received_monotonic
+                if (
+                    command_state_age_s < 0.0
+                    or command_state_age_s > state_timeout_s
+                    or newest_state_age_s < 0.0
+                    or newest_state_age_s > state_timeout_s
+                    or newest_state.received_monotonic
+                    < command_state.received_monotonic
+                ):
+                    # The inferred target remains coupled to command_state.  Do
+                    # not combine it with newest_state or re-run inference in the
+                    # write path; reject the write and close authority instead.
+                    send_event(
+                        "ERROR",
+                        {
+                            "message": (
+                                "LowState command snapshot became stale or "
+                                "regressed after inference"
+                            ),
+                            "command_state_age_s": command_state_age_s,
+                            "latest_state_age_s": newest_state_age_s,
+                            "lowstate_timeout_s": state_timeout_s,
+                            "controller": controller,
+                            "stale_target_policy": "reject_without_reinference",
+                        },
+                    )
+                    handoff.command("STOP")
+                    return 2
+                now = write_now
                 active_policy = policy_registry.for_controller(controller)
                 if active_policy is not None:
                     command_config = active_policy.command_config
@@ -1336,9 +1585,76 @@ def run_worker(
                     assert amp_hold_policy is not None
                     command_config = amp_hold_policy.config
                 assert command_config is not None
-                command = dds.make_low_cmd(latest_target, command_config, state)
-                if dds.write(handoff.publisher, command):
+                published_target = latest_target
+                published_config = command_config
+                blend_alpha: float | None = None
+                if (
+                    controller == HOST_GETUP_CONTROLLER
+                    and kungfu_host_blend_origin is not None
+                ):
+                    if not isinstance(command_config, HostControlConfig):
+                        raise RuntimeError(
+                            "KungFu-to-HoST blend requires HoST command gains"
+                        )
+                    if kungfu_host_first_write_pending:
+                        published_target = (
+                            kungfu_host_blend_origin.target_joint_pos.copy()
+                        )
+                        blended_kp = kungfu_host_blend_origin.kp.copy()
+                        blended_kd = kungfu_host_blend_origin.kd.copy()
+                        blend_alpha = 0.0
+                    else:
+                        blend_alpha = cascade.switch_blend_alpha
+                        if blend_alpha >= 1.0:
+                            blended_kp = command_config.kp
+                            blended_kd = command_config.kd
+                        else:
+                            blended_kp = (
+                                kungfu_host_blend_origin.kp
+                                * (1.0 - blend_alpha)
+                                + command_config.kp * blend_alpha
+                            ).astype(np.float32, copy=False)
+                            blended_kd = (
+                                kungfu_host_blend_origin.kd
+                                * (1.0 - blend_alpha)
+                                + command_config.kd * blend_alpha
+                            ).astype(np.float32, copy=False)
+                    published_config = HostControlConfig(
+                        action_rescale=command_config.action_rescale,
+                        action_clip=command_config.action_clip,
+                        kp=np.asarray(blended_kp, dtype=np.float32).copy(),
+                        kd=np.asarray(blended_kd, dtype=np.float32).copy(),
+                    )
+                command = dds.make_low_cmd(
+                    published_target, published_config, command_state
+                )
+                write_succeeded = dds.write(handoff.publisher, command)
+                if write_succeeded:
+                    last_successful_pd_write = PdWriteFrame.capture(
+                        target_joint_pos=published_target,
+                        config=published_config,
+                        controller=controller,
+                    )
                     handoff.record_successful_write()
+                    if kungfu_host_first_write_pending:
+                        assert kungfu_host_blend_origin is not None
+                        cascade.mark_physical_continuation(
+                            command_state,
+                            now,
+                            target_origin=(
+                                kungfu_host_blend_origin.target_joint_pos
+                            ),
+                        )
+                        kungfu_host_first_write_pending = False
+                        latest_target = None
+                        latest_target_state = None
+                        next_policy = now
+                    elif (
+                        kungfu_host_blend_origin is not None
+                        and blend_alpha is not None
+                        and blend_alpha >= 1.0
+                    ):
+                        kungfu_host_blend_origin = None
                     if pending_policy_switch_first_write is not None:
                         send_event(
                             "POLICY_SWITCH_FIRST_WRITE",
@@ -1398,14 +1714,10 @@ def run_worker(
                 active_policy = policy_registry.for_controller(controller)
                 if active_policy is not None:
                     status.update(active_policy.status_fields(now))
-                    status["active_policy_id"] = active_policy.policy_id
-                    status["selected_policy_id"] = selected_policy.policy_id
                 elif controller == JOINT_POSE_HOLD_CONTROLLER:
                     assert joint_hold_started_monotonic is not None
                     status.update(
                         {
-                            "active_policy_id": "joint_pose_hold",
-                            "selected_policy_id": selected_policy.policy_id,
                             "policy_index": cascade.index,
                             "policy": "measured_joint_pose_hold",
                             "policy_elapsed_s": now
@@ -1422,8 +1734,6 @@ def run_worker(
                     assert amp_started_monotonic is not None
                     status.update(
                         {
-                            "active_policy_id": "amp",
-                            "selected_policy_id": selected_policy.policy_id,
                             "policy_index": None,
                             "policy": (
                                 "amp_walk_run_getup"
@@ -1436,6 +1746,10 @@ def run_worker(
                     )
                 status.update(
                     {
+                        "active_policy_id": (
+                            successful_writer_authority_policy_id()
+                        ),
+                        "selected_policy_id": selected_policy.policy_id,
                         "crc_backend": getattr(dds, "crc_backend", "unknown"),
                         "controller": controller,
                         "amp_hold_first_write": amp_hold_first_write_reported,

@@ -163,6 +163,19 @@
         "longitude_deg": 114.057865,
         "altitude_m": 20.0,
         "heading_deg": 0.0
+      },
+      "launch_route": {
+        "schema": "matrix-celestial-launch-route/v1",
+        "target_scene_id": 2,
+        "target_world_id": "g1_29dof:scene_terrain_t10",
+        "entry_pose": {
+          "position": [0.0, 0.0, 0.793],
+          "yaw_rad": 0.0
+        },
+        "required_assets": [
+          "releases/Town10World-0.1.2.tar.gz",
+          "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_t10.xml"
+        ]
       }
     },
     {

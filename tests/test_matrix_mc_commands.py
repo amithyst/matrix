@@ -2,6 +2,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 
@@ -10,7 +11,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import matrix_mc_commands as MODULE  # noqa: E402
-from matrix_world_state import MatrixWorldState, WorldPose  # noqa: E402
+from matrix_world_state import MatrixWorldState, WorldPose, WorldStateStore  # noqa: E402
 
 
 SESSION = "a" * 32
@@ -18,6 +19,35 @@ REQUEST_ID = "cmd-" + "b" * 32
 
 
 class McCommandParserTest(unittest.TestCase):
+    def test_parses_runtime_pause_with_expected_epoch(self) -> None:
+        self.assertEqual(
+            MODULE.parse_mc_command("/runtime pause paused 0").command,
+            MODULE.RuntimePause(target="paused", expected_epoch=0),
+        )
+        self.assertEqual(
+            MODULE.parse_mc_command("runtime pause RUNNING 12").command,
+            MODULE.RuntimePause(target="running", expected_epoch=12),
+        )
+        self.assertEqual(
+            MODULE.parse_mc_command(
+                f"/runtime pause paused {MODULE.MAX_RUNTIME_PAUSE_EPOCH}"
+            ).command,
+            MODULE.RuntimePause(
+                target="paused",
+                expected_epoch=MODULE.MAX_RUNTIME_PAUSE_EPOCH,
+            ),
+        )
+        for text in (
+            "/runtime pause paused",
+            "/runtime pause toggle 0",
+            "/runtime pause running -1",
+            "/runtime pause paused 2147483648",
+        ):
+            with self.subTest(text=text), self.assertRaises(
+                MODULE.CommandParseError
+            ):
+                MODULE.parse_mc_command(text)
+
     def test_parses_creative_inventory_spawn(self) -> None:
         parsed = MODULE.parse_mc_command("/item spawn Training_Blaster")
 
@@ -259,6 +289,41 @@ class McCommandParserTest(unittest.TestCase):
 
 
 class McCommandProtocolTest(unittest.TestCase):
+    def test_runtime_pause_round_trip_is_typed_and_strict(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=3,
+            request_id=REQUEST_ID,
+            command=MODULE.RuntimePause("paused", 7),
+        )
+        payload = MODULE.encode_command_request(request)
+
+        self.assertNotIn(b"/runtime", payload)
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+        for mapping in (
+            {"name": "runtime_pause", "target": "paused"},
+            {
+                "name": "runtime_pause",
+                "target": "paused",
+                "expected_epoch": True,
+            },
+            {
+                "name": "runtime_pause",
+                "target": "toggle",
+                "expected_epoch": 0,
+            },
+            {
+                "name": "runtime_pause",
+                "target": "paused",
+                "expected_epoch": 0,
+                "extra": 1,
+            },
+        ):
+            with self.subTest(mapping=mapping), self.assertRaises(
+                MODULE.CommandProtocolError
+            ):
+                MODULE.command_from_mapping(mapping)
+
     def test_creative_spawn_round_trip_is_typed(self) -> None:
         request = MODULE.GameCommandRequest(
             session=SESSION,
@@ -546,7 +611,7 @@ class McCommandExecutionTest(unittest.TestCase):
             },
         )
 
-    def test_routed_selector_is_authoritative_over_local_points(self) -> None:
+    def test_cross_world_route_is_authoritative_over_local_points(self) -> None:
         route = MODULE.TeleportRoute(
             tag="moon.tranquility",
             target_scene_id=15,
@@ -615,6 +680,130 @@ class McCommandExecutionTest(unittest.TestCase):
             listed.data["teleport_points"][0]["entity_id"],
             route.entity_id,
         )
+
+    def test_same_world_route_uses_local_point_and_never_relaunches(self) -> None:
+        route = MODULE.TeleportRoute(
+            tag="home",
+            target_scene_id=2,
+            target_world_id="town10",
+            entry_pose=WorldPose(0.0, 0.0, 0.793, 0.0),
+            entity_id="tp-" + "e" * 32,
+            destination_id="earth-overworld-home",
+        )
+        state, point = self.state.add_teleport_point(
+            WorldPose(12.0, 18.0, 0.8, 0.25),
+            ("home",),
+            entity_id="tp-" + "f" * 32,
+            now_unix_ns=2,
+        )
+
+        listed = MODULE.execute_command(
+            MODULE.TeleportList(("home",)),
+            state=state,
+            current_pose=self.origin,
+            teleport_routes={route.tag: route},
+        )
+        effect = MODULE.execute_command(
+            MODULE.TeleportSelector("home"),
+            state=state,
+            current_pose=self.origin,
+            now_unix_ns=3,
+            teleport_routes={route.tag: route},
+        )
+
+        self.assertEqual(
+            listed.data["teleport_points"][0]["entity_id"], point.entity_id
+        )
+        self.assertEqual(effect.code, "OK_TELEPORT_RESTART")
+        self.assertNotIn("launch_route", effect.data)
+        self.assertEqual(effect.state.last_exit, point.pose)
+
+        missing = MODULE.execute_command(
+            MODULE.TeleportList(("home",)),
+            state=self.state,
+            current_pose=self.origin,
+            teleport_routes={route.tag: route},
+        )
+        self.assertEqual(
+            missing.data["teleport_points"],
+            [{"tag": "home", "found": False}],
+        )
+        with self.assertRaises(MODULE.CommandExecutionError) as context:
+            MODULE.execute_command(
+                MODULE.TeleportSelector("home"),
+                state=self.state,
+                current_pose=self.origin,
+                teleport_routes={route.tag: route},
+            )
+        self.assertEqual(context.exception.code, "E_SELECTOR_NO_TARGET")
+
+    def test_reciprocal_routes_preserve_independent_world_state_files(self) -> None:
+        earth_world = "g1_29dof:scene_terrain_t10"
+        moon_world = "g1_29dof:scene_terrain_moon_dynamic"
+        earth_route = MODULE.TeleportRoute(
+            tag="home",
+            target_scene_id=2,
+            target_world_id=earth_world,
+            entry_pose=WorldPose(0.0, 0.0, 0.793, 0.0),
+            entity_id="tp-" + "1" * 32,
+            destination_id="earth-overworld-home",
+        )
+        moon_route = MODULE.TeleportRoute(
+            tag="moon.tranquility",
+            target_scene_id=15,
+            target_world_id=moon_world,
+            entry_pose=WorldPose(0.0, 0.0, -0.1366965003013611, 0.0),
+            entity_id="tp-" + "2" * 32,
+            destination_id="moon-tranquility-outpost",
+        )
+        routes = {earth_route.tag: earth_route, moon_route.tag: moon_route}
+        earth_pose = WorldPose(13.0, -3.0, 0.79, 0.4)
+        moon_pose = WorldPose(6.0, -48.0, -17.3, -0.7)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            earth_store = WorldStateStore(
+                root / "earth.json",
+                world_id=earth_world,
+                world_revision="earth-v1",
+            )
+            moon_store = WorldStateStore(
+                root / "moon.json",
+                world_id=moon_world,
+                world_revision="moon-v1",
+            )
+            earth_store.save(earth_store.state.checkpoint(
+                earth_pose, upright=True, now_unix_ns=1
+            ))
+            moon_store.save(moon_store.state.checkpoint(
+                moon_pose, upright=True, now_unix_ns=1
+            ))
+
+            to_moon = MODULE.execute_command(
+                MODULE.TeleportSelector("moon.tranquility"),
+                state=earth_store.load(),
+                current_pose=earth_pose,
+                now_unix_ns=2,
+                teleport_routes=routes,
+            )
+            earth_store.save(to_moon.state)
+            self.assertEqual(to_moon.data["launch_route"]["target_world_id"], moon_world)
+            self.assertEqual(moon_store.load().last_exit, moon_pose)
+
+            to_earth = MODULE.execute_command(
+                MODULE.TeleportSelector("home"),
+                state=moon_store.load(),
+                current_pose=moon_pose,
+                now_unix_ns=2,
+                teleport_routes=routes,
+            )
+            moon_store.save(to_earth.state)
+
+            self.assertEqual(to_earth.data["launch_route"]["target_world_id"], earth_world)
+            self.assertEqual(earth_store.load().world_id, earth_world)
+            self.assertEqual(moon_store.load().world_id, moon_world)
+            self.assertEqual(earth_store.load().last_exit, earth_pose)
+            self.assertEqual(moon_store.load().last_exit, moon_pose)
 
     def test_resolved_out_of_world_coordinate_fails_before_mutation(self) -> None:
         command = MODULE.parse_mc_command("/tp @s 100001 0 1").command

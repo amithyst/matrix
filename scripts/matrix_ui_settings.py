@@ -117,18 +117,30 @@ class SettingsLoad:
     error: str | None = None
 
 
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate UI settings field {key!r}")
+        result[key] = value
+    return result
+
+
 def default_settings_file(
     profile: object | None = None,
     *,
     config_home: Path | str | None = None,
 ) -> Path:
-    selected = (
-        os.environ.get("MATRIX_HOST_PROFILE")
-        or os.environ.get("PROFILE")
-        or "local"
-        if profile is None
-        else profile
-    )
+    """Resolve one host-scoped path without silently skipping invalid inputs."""
+
+    if profile is not None:
+        selected = profile
+    else:
+        selected = "local"
+        for name in ("MATRIX_HOST_PROFILE", "MATRIX_PROFILE", "PROFILE"):
+            if name in os.environ:
+                selected = os.environ[name]
+                break
     host_profile = canonical_host_profile(selected)
     if config_home is None:
         configured = os.environ.get("XDG_CONFIG_HOME")
@@ -152,11 +164,15 @@ def legacy_settings_file(
 
 def load_settings(path: Path) -> SettingsLoad:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return SettingsLoad(UiSettings(), "missing")
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError) as exc:
         return SettingsLoad(UiSettings(), "invalid", f"cannot read settings: {exc}")
+    try:
+        value = json.loads(text, object_pairs_hook=_strict_object)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return SettingsLoad(UiSettings(), "invalid", f"invalid settings: {exc}")
     try:
         if not isinstance(value, dict):
             raise ValueError("expected settings object")
