@@ -107,7 +107,7 @@ def celestial_navigation_state() -> dict[str, object]:
                     "id": "moon",
                     "display_name": "Moon",
                     "naif_id": 301,
-                    "runtime_status": "planned",
+                    "runtime_status": "active",
                     "center_inertial_m": [1.003e11, 2.0e10, 3.0e9],
                     "solar_distance_m": 1.023e11,
                 },
@@ -183,9 +183,10 @@ def celestial_navigation_state() -> dict[str, object]:
                     "Moon",
                     "Tranquility Outpost",
                     "moon.tranquility",
-                    runtime_status="planned",
-                    status="world_unavailable",
-                    enabled=False,
+                    runtime_status="active",
+                    status="ready",
+                    enabled=True,
+                    position=[0.0, 0.0, -0.1366965003013611],
                     gravity=1.62,
                     atmosphere="vacuum",
                 ),
@@ -665,6 +666,36 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn("unavailable", unavailable.error)
         self.assertFalse(unavailable.action_enabled("apply_return"))
 
+    def test_creative_inventory_visual_blocker_disables_every_item(self) -> None:
+        model = MODULE.creative_inventory_model(
+            {
+                "creative_inventory": {
+                    "version": 1,
+                    "available": False,
+                    "unavailable_reason": (
+                        "packaged_ue_creative_prop_consumer_missing"
+                    ),
+                    "spawn_count": 0,
+                    "items": [
+                        {
+                            "item_id": "training_blaster",
+                            "label": "Training Blaster",
+                            "pool_size": 8,
+                            "remaining": 8,
+                        }
+                    ],
+                }
+            }
+        )
+
+        self.assertFalse(model.available)
+        self.assertEqual(
+            model.unavailable_reason,
+            "packaged_ue_creative_prop_consumer_missing",
+        )
+        self.assertEqual(len(model.items), 1)
+        self.assertFalse(model.item_enabled(0))
+
     def test_motion_panel_model_reads_strict_telemetry_and_builds_set_commands(
         self,
     ) -> None:
@@ -692,6 +723,10 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(model.settings.revision, 7)
         self.assertEqual(model.value("walk", "double_tap_speed_mps"), 1.30)
         self.assertEqual(
+            model.value("camera", MODULE.KEYBOARD_LOOK_RATE_FIELD),
+            120.0,
+        )
+        self.assertEqual(
             MODULE.motion_step_command(model, "motion_slow_speed_mps_up"),
             (
                 "/data modify entity @s control.motion.gears.slow.speed_mps "
@@ -706,6 +741,16 @@ class OverlayStateTest(unittest.TestCase):
             (
                 "/data modify entity @s "
                 "control.motion.gears.run.double_tap_speed_mps set value 3.25"
+            ),
+        )
+        self.assertEqual(
+            MODULE.motion_step_command(
+                model,
+                "motion_camera_look_rate_up",
+            ),
+            (
+                "/data modify entity @s control.camera.keyboard_look_rate_deg_s "
+                "set value 150.00"
             ),
         )
         with self.assertRaisesRegex(ValueError, "unsupported motion panel action"):
@@ -772,6 +817,35 @@ class OverlayStateTest(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertFalse(model.action_enabled(action))
                 self.assertIsNone(MODULE.motion_step_command(model, action))
+
+    def test_camera_rate_controls_fail_closed_when_uinput_bridge_is_missing(
+        self,
+    ) -> None:
+        model = MODULE.motion_settings_panel_model(
+            {
+                "motion_settings": MODULE.MotionSettings().to_mapping(),
+                "keyboard_camera": {
+                    "available": False,
+                    "last_error": "bridge unavailable",
+                },
+            }
+        )
+        self.assertTrue(model.available)
+        self.assertFalse(model.camera_control_available)
+        self.assertEqual(model.camera_control_error, "bridge unavailable")
+        self.assertFalse(model.action_enabled("motion_camera_look_rate_up"))
+        self.assertIsNone(
+            MODULE.motion_step_command(model, "motion_camera_look_rate_up")
+        )
+        self.assertIn(
+            "不可用",
+            MODULE.motion_value_label(
+                model,
+                "camera",
+                MODULE.KEYBOARD_LOOK_RATE_FIELD,
+                compact=False,
+            ),
+        )
 
     def test_command_state_is_strict_and_alias_warning_is_ascii_readable(self) -> None:
         status = MODULE.command_console_status(
@@ -954,13 +1028,13 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertEqual(
             [destination.status for destination in model.destinations],
-            ["ready", "world_unavailable", "world_unavailable"],
+            ["ready", "ready", "world_unavailable"],
         )
         self.assertTrue(model.destination_enabled("earth-overworld-home"))
-        self.assertFalse(model.destination_enabled("moon-tranquility-outpost"))
+        self.assertTrue(model.destination_enabled("moon-tranquility-outpost"))
 
         malformed = json.loads(json.dumps(celestial_navigation_state()))
-        malformed["celestial_navigation"]["destinations"][1]["enabled"] = True
+        malformed["celestial_navigation"]["destinations"][1]["enabled"] = "yes"
         rejected = MODULE.celestial_navigation_model(malformed)
         self.assertFalse(rejected.available)
         self.assertEqual(rejected.destinations, ())
@@ -1040,10 +1114,14 @@ class OverlayStateTest(unittest.TestCase):
 
         overlay._x11.XNextEvent.side_effect = next_event
 
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 2)
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 3)
         publisher.publish_navigation_refresh.assert_called_once_with()
-        publisher.publish_navigation_select.assert_called_once_with(
-            "earth-overworld-home"
+        self.assertEqual(
+            publisher.publish_navigation_select.call_args_list,
+            [
+                mock.call("earth-overworld-home"),
+                mock.call("moon-tranquility-outpost"),
+            ],
         )
 
     def test_polled_button_edges_recover_a_missing_cooked_strategy_click(self) -> None:
@@ -1134,7 +1212,7 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(overlay._polled_left_transition_count, 2)
         self.assertEqual(overlay._polled_left_fallback_events, 2)
 
-    def test_navigation_page_draws_ready_earth_and_disabled_planned_bodies(self) -> None:
+    def test_navigation_page_draws_ready_earth_moon_and_disabled_mars(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
         model = MODULE.celestial_navigation_model(celestial_navigation_state())
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
@@ -1168,10 +1246,10 @@ class OverlayStateTest(unittest.TestCase):
         }
         self.assertFalse(buttons["navigation_refresh"].kwargs["disabled"])
         self.assertFalse(buttons["navigation_destination_0"].kwargs["disabled"])
-        self.assertTrue(buttons["navigation_destination_1"].kwargs["disabled"])
+        self.assertFalse(buttons["navigation_destination_1"].kwargs["disabled"])
         self.assertTrue(buttons["navigation_destination_2"].kwargs["disabled"])
         self.assertIn("可传送", buttons["navigation_destination_0"].args[2])
-        self.assertIn("未部署", buttons["navigation_destination_1"].args[2])
+        self.assertIn("可传送", buttons["navigation_destination_1"].args[2])
 
     def test_disabled_locomotion_candidate_emits_no_selection_intent(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
@@ -1516,23 +1594,23 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn(b":size=13", MODULE._XFT_BODY_FONT_CANDIDATES[0])
         self.assertIn(b":size=18", MODULE._XFT_LARGE_FONT_CANDIDATES[0])
 
-    def test_persisted_font_scale_controls_are_bounded(self) -> None:
-        def model(scale: object):
+    def test_persisted_font_size_controls_are_bounded(self) -> None:
+        def model(font_size: object, *, scale: object = 1.0):
             return MODULE.settings_panel_model(
                 {
-                    "ui_settings": {"font_scale": scale},
+                    "ui_settings": {"font_scale": scale, "font_size": font_size},
                     "restart": {"available": True, "requested": False},
                 }
             )
 
-        minimum = model(0.8)
-        self.assertEqual(minimum.font_scale, 0.8)
+        minimum = model(1)
+        self.assertEqual(minimum.font_size, 1)
         self.assertFalse(minimum.action_enabled("font_down"))
         self.assertTrue(minimum.action_enabled("font_up"))
-        maximum = model(1.5)
+        maximum = model(22)
         self.assertTrue(maximum.action_enabled("font_down"))
         self.assertFalse(maximum.action_enabled("font_up"))
-        self.assertEqual(model(1.05).font_scale, 1.0)
+        self.assertEqual(model(99, scale=1.3).font_size, 17)
 
 
 class HotFontSizeTest(unittest.TestCase):
@@ -2965,7 +3043,8 @@ class X11IntegrationTest(unittest.TestCase):
                         action_receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES)
 
                 # Font sizing is overlay-local: a live Xft swap must not emit a
-                # game-control intent or disturb the focused UE window.
+                # game-control action or disturb the focused UE window; it now
+                # emits a dedicated UI-settings persistence intent.
                 if font_backend == "xft-utf8":
                     slider_track = MODULE.font_slider_track(
                         layout["font_size_slider"]
@@ -2982,7 +3061,17 @@ class X11IntegrationTest(unittest.TestCase):
                     )
                     time.sleep(0.08)
                     self.assertIsNone(overlay.poll())
-                    assert_no_pointer_action()
+                    assert action_receiver is not None
+                    payload = json.loads(
+                        action_receiver.recv(
+                            MODULE._MAX_INTENT_PACKET_BYTES
+                        ).decode("ascii")
+                    )
+                    self.assertEqual(payload["kind"], "font_size")
+                    self.assertEqual(
+                        payload["font_size"],
+                        MODULE._MAX_OVERLAY_FONT_SIZE,
+                    )
                     self.assertEqual(
                         self.run_x11(
                             environment,

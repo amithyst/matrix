@@ -56,15 +56,25 @@ from matrix_mc_commands import (
     MAX_COMMAND_PACKET_BYTES,
     PolicySlotAssignment,
     TeleportList,
+    TeleportRoute,
     decode_command_request,
     encode_command_response,
     execute_command,
+)
+from matrix_celestial_navigation import (
+    DEFAULT_CATALOG_PATH as DEFAULT_CELESTIAL_CATALOG_PATH,
+    CelestialNavigationError,
+    load_catalog as load_celestial_catalog,
 )
 from matrix_creative_inventory import (
     CreativeInventoryError,
     CreativeInventoryRuntime,
 )
-from inject_creative_inventory import InventoryCatalogError, load_catalog
+from matrix_creative_prop_bridge import detect_creative_prop_visual_bridge
+from inject_creative_inventory import (
+    InventoryCatalogError,
+    load_catalog as load_inventory_catalog,
+)
 from matrix_motion_settings import (
     MotionSettings,
     MotionSettingsError,
@@ -815,6 +825,34 @@ def _atomic_json(path: Path | None, payload: dict[str, object]) -> None:
         stream.write("\n")
         temporary_path = Path(stream.name)
     os.replace(temporary_path, path)
+
+
+def _creative_inventory_disabled_mapping(
+    creative_items: object,
+    *,
+    reason: str,
+) -> dict[str, object]:
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("creative inventory disabled reason is required")
+    try:
+        items = tuple(creative_items)
+    except TypeError as exc:
+        raise ValueError("creative inventory items must be iterable") from exc
+    return {
+        "version": 1,
+        "available": False,
+        "unavailable_reason": reason,
+        "spawn_count": 0,
+        "items": [
+            {
+                "item_id": item.item_id,
+                "label": item.label,
+                "pool_size": item.pool_size,
+                "remaining": item.pool_size,
+            }
+            for item in items
+        ],
+    }
 
 
 _UNKNOWN_EXTERNAL_EXIT_CODE = 255
@@ -4221,6 +4259,7 @@ def _control_config_with_motion_settings(
 
     return replace(
         config,
+        max_turn_rate_rad_s=settings.max_turn_rate_rad_s,
         keyboard_slow_speed_mps=settings.slow_speed_mps,
         keyboard_slow_boost_speed_mps=settings.slow_double_tap_speed_mps,
         keyboard_walk_speed_mps=settings.walk_speed_mps,
@@ -5136,6 +5175,44 @@ def _locomotion_switch_neutral(
     )
 
 
+def _load_celestial_teleport_routes(
+    catalog_path: Path = DEFAULT_CELESTIAL_CATALOG_PATH,
+    *,
+    project_root: Path | None = None,
+) -> dict[str, TeleportRoute]:
+    try:
+        catalog = load_celestial_catalog(catalog_path)
+    except CelestialNavigationError as exc:
+        raise SystemExit(f"invalid celestial route catalog: {exc}") from exc
+    asset_root = _SCRIPT_DIR.parent if project_root is None else Path(project_root)
+    routes: dict[str, TeleportRoute] = {}
+    for destination in catalog.destinations:
+        route = destination.launch_route
+        if route is None:
+            continue
+        missing_assets = route.missing_assets(asset_root)
+        if missing_assets:
+            print(
+                "matrix-sonic-runtime celestial route unavailable "
+                f"destination={destination.destination_id} "
+                f"missing_assets={json.dumps(list(missing_assets))}",
+                flush=True,
+            )
+            continue
+        routes[destination.teleport_tag] = TeleportRoute(
+            tag=destination.teleport_tag,
+            target_scene_id=route.scene_id,
+            target_world_id=route.world_id,
+            entry_pose=route.entry_pose,
+            entity_id=route.synthetic_entity_id(
+                destination_id=destination.destination_id,
+                teleport_tag=destination.teleport_tag,
+            ),
+            destination_id=destination.destination_id,
+        )
+    return routes
+
+
 class GameCommandRuntime:
     """Execute typed ESC-panel commands over one inherited private socketpair."""
 
@@ -5146,9 +5223,11 @@ class GameCommandRuntime:
         *,
         policy_slots: Any | None = None,
         creative_inventory: CreativeInventoryRuntime | None = None,
+        creative_inventory_status: Mapping[str, object] | None = None,
         motion_settings: MotionSettingsStore | None = None,
         control_core: GameControlCore | None = None,
         pose_clearance_auditor: Callable[[WorldPose], dict[str, object]] | None = None,
+        teleport_routes: Mapping[str, TeleportRoute] | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -5165,10 +5244,16 @@ class GameCommandRuntime:
         self.last_response: dict[str, object] | None = None
         self.policy_slots = policy_slots
         self.creative_inventory = creative_inventory
+        self.creative_inventory_status = (
+            dict(creative_inventory_status)
+            if creative_inventory_status is not None
+            else None
+        )
         self.inventory_spawns_executed = 0
         self.motion_settings = motion_settings
         self.control_core = control_core
         self.pose_clearance_auditor = pose_clearance_auditor
+        self.teleport_routes = dict(teleport_routes or {})
         self.pending_policy_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
         self.motion_settings_changes_executed = 0
@@ -5471,12 +5556,21 @@ class GameCommandRuntime:
             if isinstance(request.command, CreativeSpawnItem):
                 if self.creative_inventory is None:
                     self.rejected_commands += 1
+                    response_data = (
+                        {"creative_inventory": self.creative_inventory_status}
+                        if self.creative_inventory_status is not None
+                        else None
+                    )
                     self._send(
                         self._response(
                             request,
                             ok=False,
                             code="E_INVENTORY_UNAVAILABLE",
-                            message="Creative inventory is unavailable for this run",
+                            message=(
+                                "Creative inventory is unavailable because the "
+                                "packaged UE prop bridge is not installed"
+                            ),
+                            data=response_data,
                         )
                     )
                     continue
@@ -5600,6 +5694,7 @@ class GameCommandRuntime:
                     state=self.world.state,
                     current_pose=current_pose,
                     now_unix_ns=time.time_ns(),
+                    teleport_routes=self.teleport_routes,
                 )
                 if not isinstance(request.command, TeleportList):
                     if (
@@ -10360,6 +10455,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             try:
                 configured_motion_defaults = MotionSettings(
                     revision=0,
+                    max_turn_rate_rad_s=args.game_max_turn_rate,
                     slow_speed_mps=args.game_keyboard_slow_speed,
                     slow_double_tap_speed_mps=(
                         args.game_keyboard_slow_boost_speed
@@ -10382,6 +10478,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 fallback=configured_motion_defaults,
             )
             motion = motion_settings_store.settings
+            args.game_max_turn_rate = motion.max_turn_rate_rad_s
             args.game_keyboard_slow_speed = motion.slow_speed_mps
             args.game_keyboard_slow_boost_speed = (
                 motion.slow_double_tap_speed_mps
@@ -10713,12 +10810,29 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     creative_items = None
     if creative_catalog_value:
         try:
-            creative_items = load_catalog(Path(creative_catalog_value))
+            creative_items = load_inventory_catalog(Path(creative_catalog_value))
         except (InventoryCatalogError, OSError) as exc:
             raise SystemExit(f"cannot load creative inventory catalog: {exc}") from exc
+    creative_prop_visual_bridge = detect_creative_prop_visual_bridge(
+        _SCRIPT_DIR.parent / "src/UeSim/Linux/zsibot_mujoco_ue",
+        render_sync_enabled=not args.no_render_sync,
+    )
+    creative_prop_visual_bridge_mapping = creative_prop_visual_bridge.mapping()
+    creative_inventory_initial_mapping = (
+        _creative_inventory_disabled_mapping(
+            creative_items,
+            reason=(
+                creative_prop_visual_bridge.reason
+                or "creative_prop_visual_bridge_unavailable"
+            ),
+        )
+        if creative_items is not None and not creative_prop_visual_bridge.available
+        else None
+    )
 
     config = SimLoopConfig(**_native_config_kwargs(args, model_path))
     simulator = None
+    creative_inventory_backend = None
     creative_inventory = None
     moon_dynamic_ground: MoonDynamicGround | None = None
     expected_snapshot_dims = _EXPECTED_SNAPSHOT_DIMS
@@ -10830,6 +10944,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     game_world = None
     game_commands = None
     game_command_child_socket = None
+    celestial_teleport_routes: dict[str, TeleportRoute] = {}
     game_fall_recovery = None
     physical_recovery = None
     game_command = None
@@ -10883,7 +10998,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 _creative_inventory_joint_names(creative_items),
             )
             try:
-                creative_inventory = CreativeInventoryRuntime(
+                creative_inventory_backend = CreativeInventoryRuntime(
                     simulator,
                     Path(creative_catalog_value),
                 )
@@ -10891,7 +11006,12 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 raise SystemExit(
                     f"cannot initialize creative inventory: {exc}"
                 ) from exc
-            expected_snapshot_dims = creative_inventory.expected_snapshot_dimensions
+            expected_snapshot_dims = (
+                creative_inventory_backend.expected_snapshot_dimensions
+            )
+            if creative_prop_visual_bridge.available:
+                creative_inventory = creative_inventory_backend
+                creative_inventory_initial_mapping = creative_inventory.mapping()
         if args.moon_dynamic_map is not None:
             environment = getattr(simulator, "sim_env", None)
             model = getattr(environment, "mj_model", None)
@@ -11106,6 +11226,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             getattr(environment, "mj_data", None),
                         )
                     physical_recovery.open(zmq_port=planner_port)
+                celestial_teleport_routes = _load_celestial_teleport_routes()
                 if not args.no_game_input_provider and (
                     game_world is not None
                     or physical_recovery is not None
@@ -11120,9 +11241,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         game_world,
                         policy_slots=physical_recovery,
                         creative_inventory=creative_inventory,
+                        creative_inventory_status=(
+                            creative_inventory_initial_mapping
+                        ),
                         motion_settings=motion_settings_store,
                         control_core=game_control_core,
                         pose_clearance_auditor=pose_clearance_audit,
+                        teleport_routes=celestial_teleport_routes,
                     )
                 try:
                     game_input.open()
@@ -11206,11 +11331,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         ),
                         creative_inventory_json=(
                             json.dumps(
-                                creative_inventory.mapping(),
+                                creative_inventory_initial_mapping,
                                 separators=(",", ":"),
                                 sort_keys=True,
                             )
-                            if creative_inventory is not None
+                            if creative_inventory_initial_mapping is not None
                             else None
                         ),
                         motion_settings_json=(
@@ -11971,6 +12096,12 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "control_frames": control_frames,
                     "control_hz": args.control_hz,
                     "control_source": args.control_source,
+                    "creative_inventory": (
+                        creative_inventory.mapping()
+                        if creative_inventory is not None
+                        else creative_inventory_initial_mapping
+                    ),
+                    "creative_prop_visual_bridge": creative_prop_visual_bridge_mapping,
                     "elapsed_wall_s": round(now - started_wall, 3),
                     "model": str(model_path),
                     **model_attestation,
@@ -12418,6 +12549,12 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "control_frames": control_frames,
             "control_hz": args.control_hz,
             "control_source": args.control_source,
+            "creative_inventory": (
+                creative_inventory.mapping()
+                if creative_inventory is not None
+                else creative_inventory_initial_mapping
+            ),
+            "creative_prop_visual_bridge": creative_prop_visual_bridge_mapping,
             "elapsed_wall_s": round(elapsed_wall_s, 3),
             "failed_child_exit_code": failed_child_code,
             "failed_child_name": failed_child_name,
@@ -12529,10 +12666,31 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             and not unstable
             and not world_checkpoint_failed
         )
-        final_status["internal_restart"] = {
+        internal_restart_status: dict[str, object] = {
             "requested": internal_restart_requested,
             "reason": termination_reason if internal_restart_requested else None,
         }
+        if internal_restart_requested and termination_reason == "game_teleport":
+            command_telemetry = (
+                game_commands.telemetry() if game_commands is not None else {}
+            )
+            last_response = command_telemetry.get("last_response")
+            response_data = (
+                last_response.get("data")
+                if isinstance(last_response, dict)
+                else None
+            )
+            launch_route = (
+                response_data.get("launch_route")
+                if isinstance(response_data, dict)
+                else None
+            )
+            if isinstance(launch_route, dict):
+                target_scene_id = launch_route.get("target_scene_id")
+                if type(target_scene_id) is int:
+                    internal_restart_status["target_scene_id"] = target_scene_id
+                    internal_restart_status["launch_route"] = dict(launch_route)
+        final_status["internal_restart"] = internal_restart_status
         final_status["game_auto_respawn"] = bool(args.game_auto_respawn)
         if game_world is not None:
             final_status["game_world_state"] = game_world.telemetry()

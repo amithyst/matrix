@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict, host-scoped persistence for Matrix keyboard motion speeds.
+"""Strict host-scoped persistence for Matrix motion and keyboard camera rates.
 
 The runtime is expected to be the sole writer of this file.  UI, typed-command,
 and external-API adapters can all use :class:`MotionSettingsStore` so validation,
@@ -22,6 +22,16 @@ from typing import Callable, Mapping
 
 SETTINGS_VERSION = 1
 MAX_REVISION = (2**63) - 1
+MAX_TURN_RATE_FIELD = "max_turn_rate_rad_s"
+MAX_TURN_RATE_PATH = f"control.motion.{MAX_TURN_RATE_FIELD}"
+DEFAULT_MAX_TURN_RATE_RAD_S = 2.50
+MAX_TURN_RATE_RANGE_RAD_S = (0.25, 2.50)
+MAX_TURN_RATE_STEP_RAD_S = 0.25
+KEYBOARD_LOOK_RATE_FIELD = "keyboard_look_rate_deg_s"
+KEYBOARD_LOOK_RATE_PATH = f"control.camera.{KEYBOARD_LOOK_RATE_FIELD}"
+DEFAULT_KEYBOARD_LOOK_RATE_DEG_S = 120.0
+KEYBOARD_LOOK_RATE_RANGE_DEG_S = (30.0, 360.0)
+KEYBOARD_LOOK_RATE_STEP_DEG_S = 30.0
 
 GEAR_SLOW = "slow"
 GEAR_WALK = "walk"
@@ -52,9 +62,12 @@ GEAR_STEP_MPS: Mapping[str, float] = {
 
 _PATH_PREFIX = "control.motion.gears"
 MOTION_SETTING_PATHS = frozenset(
-    f"{_PATH_PREFIX}.{gear}.{field}"
-    for gear in GEARS
-    for field in SPEED_FIELDS
+    [MAX_TURN_RATE_PATH, KEYBOARD_LOOK_RATE_PATH]
+    + [
+        f"{_PATH_PREFIX}.{gear}.{field}"
+        for gear in GEARS
+        for field in SPEED_FIELDS
+    ]
 )
 _PATH_PARTS: Mapping[str, tuple[str, str]] = {
     f"{_PATH_PREFIX}.{gear}.{field}": (gear, field)
@@ -159,11 +172,29 @@ def _path_parts(path: object) -> tuple[str, str]:
     return _PATH_PARTS[path]
 
 
+def _is_turn_rate_path(path: object) -> bool:
+    if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
+        raise MotionSettingsError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
+        )
+    return path == MAX_TURN_RATE_PATH
+
+
+def _is_keyboard_look_rate_path(path: object) -> bool:
+    if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
+        raise MotionSettingsError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
+        )
+    return path == KEYBOARD_LOOK_RATE_PATH
+
+
 @dataclass(frozen=True)
 class MotionSettings:
-    """One validated, revisioned snapshot of all keyboard motion speeds."""
+    """One validated, revisioned snapshot of motion and keyboard camera rates."""
 
     revision: int = 0
+    max_turn_rate_rad_s: float = DEFAULT_MAX_TURN_RATE_RAD_S
+    keyboard_look_rate_deg_s: float = DEFAULT_KEYBOARD_LOOK_RATE_DEG_S
     slow_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][0]
     slow_double_tap_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][1]
     walk_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_WALK][0]
@@ -173,6 +204,30 @@ class MotionSettings:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "revision", _revision(self.revision))
+        turn_rate = _finite_speed(
+            self.max_turn_rate_rad_s,
+            name=MAX_TURN_RATE_FIELD,
+        )
+        turn_minimum, turn_maximum = MAX_TURN_RATE_RANGE_RAD_S
+        if not turn_minimum <= turn_rate <= turn_maximum:
+            raise MotionSettingsError(
+                "E_DATA_RANGE",
+                f"{MAX_TURN_RATE_FIELD} must be in "
+                f"[{turn_minimum:.2f}, {turn_maximum:.2f}]",
+            )
+        object.__setattr__(self, MAX_TURN_RATE_FIELD, turn_rate)
+        look_rate = _finite_speed(
+            self.keyboard_look_rate_deg_s,
+            name=KEYBOARD_LOOK_RATE_FIELD,
+        )
+        look_minimum, look_maximum = KEYBOARD_LOOK_RATE_RANGE_DEG_S
+        if not look_minimum <= look_rate <= look_maximum:
+            raise MotionSettingsError(
+                "E_DATA_RANGE",
+                f"{KEYBOARD_LOOK_RATE_FIELD} must be in "
+                f"[{look_minimum:.1f}, {look_maximum:.1f}]",
+            )
+        object.__setattr__(self, KEYBOARD_LOOK_RATE_FIELD, look_rate)
         for gear in GEARS:
             minimum, maximum = GEAR_SPEED_RANGES_MPS[gear]
             base_name = _FIELD_NAMES[(gear, SPEED_FIELD)]
@@ -198,6 +253,10 @@ class MotionSettings:
             object.__setattr__(self, boost_name, boost)
 
     def value_for_path(self, path: object) -> float:
+        if _is_turn_rate_path(path):
+            return self.max_turn_rate_rad_s
+        if _is_keyboard_look_rate_path(path):
+            return self.keyboard_look_rate_deg_s
         gear, field = _path_parts(path)
         return getattr(self, _FIELD_NAMES[(gear, field)])
 
@@ -208,8 +267,13 @@ class MotionSettings:
         *,
         revision: int | None = None,
     ) -> "MotionSettings":
-        gear, field = _path_parts(path)
-        field_name = _FIELD_NAMES[(gear, field)]
+        if _is_turn_rate_path(path):
+            field_name = MAX_TURN_RATE_FIELD
+        elif _is_keyboard_look_rate_path(path):
+            field_name = KEYBOARD_LOOK_RATE_FIELD
+        else:
+            gear, field = _path_parts(path)
+            field_name = _FIELD_NAMES[(gear, field)]
         speed = _finite_speed(value, name=field_name)
         next_revision = self.revision if revision is None else _revision(revision)
         return replace(self, revision=next_revision, **{field_name: speed})
@@ -218,6 +282,10 @@ class MotionSettings:
         return {
             "version": SETTINGS_VERSION,
             "revision": self.revision,
+            MAX_TURN_RATE_FIELD: self.max_turn_rate_rad_s,
+            "camera": {
+                KEYBOARD_LOOK_RATE_FIELD: self.keyboard_look_rate_deg_s,
+            },
             "gears": {
                 gear: {
                     SPEED_FIELD: getattr(self, _FIELD_NAMES[(gear, SPEED_FIELD)]),
@@ -231,11 +299,9 @@ class MotionSettings:
 
     @classmethod
     def from_mapping(cls, value: object) -> "MotionSettings":
-        if not isinstance(value, dict) or set(value) != {
-            "version",
-            "revision",
-            "gears",
-        }:
+        required = {"version", "revision", "gears"}
+        allowed = required | {MAX_TURN_RATE_FIELD, "camera"}
+        if not isinstance(value, dict) or not required <= set(value) <= allowed:
             raise MotionSettingsError(
                 "E_DATA_SCHEMA", "motion settings must contain version/revision/gears"
             )
@@ -248,7 +314,26 @@ class MotionSettings:
             raise MotionSettingsError(
                 "E_DATA_SCHEMA", "motion settings must define exactly slow/walk/run"
             )
-        fields: dict[str, object] = {"revision": value.get("revision")}
+        fields: dict[str, object] = {
+            "revision": value.get("revision"),
+            MAX_TURN_RATE_FIELD: value.get(
+                MAX_TURN_RATE_FIELD,
+                DEFAULT_MAX_TURN_RATE_RAD_S,
+            ),
+            KEYBOARD_LOOK_RATE_FIELD: DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
+        }
+        camera = value.get("camera")
+        if "camera" in value:
+            if not isinstance(camera, dict) or set(camera) != {
+                KEYBOARD_LOOK_RATE_FIELD
+            }:
+                raise MotionSettingsError(
+                    "E_DATA_SCHEMA",
+                    "motion settings camera must define exactly keyboard_look_rate_deg_s",
+                )
+            fields[KEYBOARD_LOOK_RATE_FIELD] = camera.get(
+                KEYBOARD_LOOK_RATE_FIELD
+            )
         for gear in GEARS:
             entry = gears.get(gear)
             if not isinstance(entry, dict) or set(entry) != set(SPEED_FIELDS):
@@ -362,6 +447,40 @@ def _step_presets(gear: str) -> tuple[float, ...]:
 _GEAR_STEP_PRESETS: Mapping[str, tuple[float, ...]] = {
     gear: _step_presets(gear) for gear in GEARS
 }
+_MAX_TURN_RATE_STEP_PRESETS = tuple(
+    round(
+        MAX_TURN_RATE_RANGE_RAD_S[0] + index * MAX_TURN_RATE_STEP_RAD_S,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (MAX_TURN_RATE_RANGE_RAD_S[1] - MAX_TURN_RATE_RANGE_RAD_S[0])
+                / MAX_TURN_RATE_STEP_RAD_S
+            )
+        )
+        + 1
+    )
+)
+_KEYBOARD_LOOK_RATE_STEP_PRESETS = tuple(
+    round(
+        KEYBOARD_LOOK_RATE_RANGE_DEG_S[0]
+        + index * KEYBOARD_LOOK_RATE_STEP_DEG_S,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (
+                    KEYBOARD_LOOK_RATE_RANGE_DEG_S[1]
+                    - KEYBOARD_LOOK_RATE_RANGE_DEG_S[0]
+                )
+                / KEYBOARD_LOOK_RATE_STEP_DEG_S
+            )
+        )
+        + 1
+    )
+)
 
 
 def step_motion_speed(
@@ -377,6 +496,22 @@ def step_motion_speed(
         raise MotionSettingsError(
             "E_DATA_STEP", "motion speed step direction must be -1 or 1"
         )
+    if _is_turn_rate_path(path):
+        current = settings.value_for_path(path)
+        presets = _MAX_TURN_RATE_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(value for value in presets if value > current + 1e-12)
+            return candidates[0] if candidates else presets[-1]
+        candidates = tuple(value for value in presets if value < current - 1e-12)
+        return candidates[-1] if candidates else presets[0]
+    if _is_keyboard_look_rate_path(path):
+        current = settings.value_for_path(path)
+        presets = _KEYBOARD_LOOK_RATE_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(value for value in presets if value > current + 1e-12)
+            return candidates[0] if candidates else presets[-1]
+        candidates = tuple(value for value in presets if value < current - 1e-12)
+        return candidates[-1] if candidates else presets[0]
     gear, field = _path_parts(path)
     current = settings.value_for_path(path)
     presets = _GEAR_STEP_PRESETS[gear]
@@ -466,7 +601,11 @@ class MotionSettingsStore:
         expected_revision: int | None = None,
     ) -> MotionSettingsModification:
         canonical_path = path if isinstance(path, str) else path
-        _path_parts(canonical_path)
+        if not isinstance(canonical_path, str) or canonical_path not in MOTION_SETTING_PATHS:
+            raise MotionSettingsError(
+                "E_DATA_PATH_UNKNOWN",
+                f"unsupported motion settings path: {canonical_path!r}",
+            )
         with self._lock:
             current = self._settings
             if expected_revision is not None:
@@ -538,12 +677,22 @@ class MotionSettingsStore:
 
 
 __all__ = [
+    "DEFAULT_KEYBOARD_LOOK_RATE_DEG_S",
     "DEFAULT_GEAR_SPEEDS_MPS",
+    "DEFAULT_MAX_TURN_RATE_RAD_S",
     "DOUBLE_TAP_SPEED_FIELD",
     "GEARS",
     "GEAR_SPEED_RANGES_MPS",
     "GEAR_STEP_MPS",
+    "KEYBOARD_LOOK_RATE_FIELD",
+    "KEYBOARD_LOOK_RATE_PATH",
+    "KEYBOARD_LOOK_RATE_RANGE_DEG_S",
+    "KEYBOARD_LOOK_RATE_STEP_DEG_S",
     "MAX_REVISION",
+    "MAX_TURN_RATE_FIELD",
+    "MAX_TURN_RATE_PATH",
+    "MAX_TURN_RATE_RANGE_RAD_S",
+    "MAX_TURN_RATE_STEP_RAD_S",
     "MOTION_SETTING_PATHS",
     "MotionSettings",
     "MotionSettingsError",

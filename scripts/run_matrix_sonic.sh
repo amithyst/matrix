@@ -319,6 +319,7 @@ if ! command -v flock >/dev/null 2>&1; then
     exit 1
 fi
 MATRIX_SONIC_HOST_LOCK="${MATRIX_SONIC_HOST_LOCK:-/tmp/matrix-sonic-${UID}.lock}"
+MATRIX_SONIC_INTERNAL_RESTART=0
 if [[ "${MATRIX_SONIC_RESTART_LOCK_FD:-}" == "9" ]]; then
     inherited_target="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
     expected_target="$(realpath -m "$MATRIX_SONIC_HOST_LOCK")"
@@ -326,6 +327,7 @@ if [[ "${MATRIX_SONIC_RESTART_LOCK_FD:-}" == "9" ]]; then
         echo "[ERROR] Restart did not inherit the verified Matrix SONIC lock" >&2
         exit 1
     fi
+    MATRIX_SONIC_INTERNAL_RESTART=1
     unset MATRIX_SONIC_RESTART_LOCK_FD
 else
     exec 9>"$MATRIX_SONIC_HOST_LOCK"
@@ -335,6 +337,30 @@ else
     fi
 fi
 export MATRIX_SONIC_HOST_LOCK_FD=9
+
+if [[ "$MATRIX_SONIC_INTERNAL_RESTART" == "1" ]]; then
+    if [[ -n "${MATRIX_SONIC_RESTART_SCENE_ID:-}" ]]; then
+        if [[ ! "$MATRIX_SONIC_RESTART_SCENE_ID" =~ ^[0-9]{1,2}$ ]]; then
+            echo "[ERROR] Matrix restart scene id is invalid" >&2
+            exit 2
+        fi
+        SCENE_ID="$MATRIX_SONIC_RESTART_SCENE_ID"
+    fi
+    if [[ -n "${MATRIX_SONIC_RESTART_WORLD_ID:-}" ]]; then
+        if [[ ! "$MATRIX_SONIC_RESTART_WORLD_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}$ ]]; then
+            echo "[ERROR] Matrix restart world id is invalid" >&2
+            exit 2
+        fi
+        export MATRIX_GAME_WORLD_ID="$MATRIX_SONIC_RESTART_WORLD_ID"
+    fi
+else
+    if [[ -n "${MATRIX_SONIC_RESTART_SCENE_ID:-}" \
+        || -n "${MATRIX_SONIC_RESTART_WORLD_ID:-}" ]]; then
+        echo "[ERROR] Matrix restart route requires the inherited host lock" >&2
+        exit 2
+    fi
+fi
+unset MATRIX_SONIC_RESTART_SCENE_ID MATRIX_SONIC_RESTART_WORLD_ID
 
 # The host lock serializes every mutation of Saved/Paks.  Clear a verified
 # leftover from an interrupted generation before any runtime audit, then verify
@@ -356,7 +382,12 @@ fi
 export MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT
 export MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE
 
-MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+MATRIX_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${PROFILE:-local}}"
+if [[ ! "$MATRIX_SETTINGS_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+    echo "[ERROR] Matrix settings profile is invalid" >&2
+    exit 2
+fi
+MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE}/mouse-control.json}"
 if [[ "$MATRIX_MOUSE_SETTINGS_FILE" != /* ]]; then
     echo "[ERROR] MATRIX_MOUSE_SETTINGS_FILE must be absolute" >&2
     exit 2
@@ -388,7 +419,7 @@ export MATRIX_MOUSE_SETTINGS_FILE MATRIX_MOUSE_APPLIED_PROFILE
 export MATRIX_MOUSE_APPLIED_SPEED_SCALE MATRIX_MOUSE_SETTINGS_LOAD_STATUS
 echo "[INFO] Mouse launch profile: $MATRIX_MOUSE_APPLIED_PROFILE " \
     "scale=$MATRIX_MOUSE_APPLIED_SPEED_SCALE status=$MATRIX_MOUSE_SETTINGS_LOAD_STATUS"
-MATRIX_MOTION_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${PROFILE:-local}}"
+MATRIX_MOTION_SETTINGS_PROFILE="$MATRIX_SETTINGS_PROFILE"
 MATRIX_MOTION_SETTINGS_FILE="${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_MOTION_SETTINGS_PROFILE}/motion-control.json}"
 if [[ "$MATRIX_MOTION_SETTINGS_FILE" != /* ]]; then
     echo "[ERROR] MATRIX_MOTION_SETTINGS_FILE must be absolute" >&2
@@ -397,7 +428,7 @@ fi
 MATRIX_MOTION_SETTINGS_FILE="$(realpath -m "$MATRIX_MOTION_SETTINGS_FILE")"
 export MATRIX_MOTION_SETTINGS_FILE
 echo "[INFO] Motion settings file: $MATRIX_MOTION_SETTINGS_FILE"
-MATRIX_VIDEO_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${PROFILE:-local}}"
+MATRIX_VIDEO_SETTINGS_PROFILE="$MATRIX_SETTINGS_PROFILE"
 MATRIX_VIDEO_SETTINGS_FILE="${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_VIDEO_SETTINGS_PROFILE}/video-settings.json}"
 if [[ "$MATRIX_VIDEO_SETTINGS_FILE" != /* ]]; then
     echo "[ERROR] MATRIX_VIDEO_SETTINGS_FILE must be absolute" >&2
@@ -1577,6 +1608,8 @@ ROLLBACK_CANCEL_FILE=""
 FORWARDED_SIGNAL_EXIT_CODE=0
 RESTART_REQUEST_VALID=0
 RESTART_EXPECTED_EXIT_CODE=143
+NEXT_SCENE_ID="$SCENE_ID"
+NEXT_WORLD_ID=""
 GAME_RESUME_ROLLBACK_COUNT="${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
 # Keep this equal to matrix_world_state.MAX_RESUME_CHECKPOINTS: each failed
 # generation may quarantine exactly one member of the bounded resume ring.
@@ -2448,7 +2481,9 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
     if VERIFIED_INTERNAL_RESTART_REASON="$(
         /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
 import json
+import math
 from pathlib import Path
+import re
 import sys
 
 path = Path(sys.argv[1])
@@ -2482,9 +2517,50 @@ if world.get("has_last_exit") is not True:
     raise SystemExit(1)
 if reason == "game_fall_respawn" and status.get("game_auto_respawn") is not True:
     raise SystemExit(1)
-print(reason)
+target_scene_id = internal.get("target_scene_id")
+launch_route = internal.get("launch_route")
+if target_scene_id is None and launch_route is None:
+    print(reason)
+    raise SystemExit(0)
+if reason != "game_teleport" or not isinstance(launch_route, dict):
+    raise SystemExit(1)
+if target_scene_id != launch_route.get("target_scene_id"):
+    raise SystemExit(1)
+if (
+    launch_route.get("schema") != "matrix-celestial-launch-route/v1"
+    or launch_route.get("destination_id") != "moon-tranquility-outpost"
+    or launch_route.get("teleport_tag") != "moon.tranquility"
+    or launch_route.get("target_scene_id") != 15
+    or launch_route.get("target_world_id") != "g1_29dof:scene_terrain_moon_dynamic"
+):
+    raise SystemExit(1)
+entity_id = launch_route.get("entity_id")
+entry_pose = launch_route.get("entry_pose")
+if not isinstance(entity_id, str) or re.fullmatch(r"tp-[0-9a-f]{32}", entity_id) is None:
+    raise SystemExit(1)
+if not isinstance(entry_pose, dict) or set(entry_pose) != {"position", "yaw_rad"}:
+    raise SystemExit(1)
+position = entry_pose.get("position")
+if (
+    not isinstance(position, list)
+    or len(position) != 3
+    or any(isinstance(component, bool) or not isinstance(component, (int, float)) for component in position)
+    or any(not math.isfinite(float(component)) for component in position)
+    or isinstance(entry_pose.get("yaw_rad"), bool)
+    or not isinstance(entry_pose.get("yaw_rad"), (int, float))
+    or not math.isfinite(float(entry_pose.get("yaw_rad")))
+):
+    raise SystemExit(1)
+print(f"{reason}\t{target_scene_id}\t{launch_route['target_world_id']}")
 PY
     )"; then
+        VERIFIED_INTERNAL_RESTART_TARGET_SCENE=""
+        VERIFIED_INTERNAL_RESTART_TARGET_WORLD=""
+        IFS=$'\t' read -r \
+            VERIFIED_INTERNAL_RESTART_REASON \
+            VERIFIED_INTERNAL_RESTART_TARGET_SCENE \
+            VERIFIED_INTERNAL_RESTART_TARGET_WORLD \
+            <<<"$VERIFIED_INTERNAL_RESTART_REASON"
         INTERNAL_RESTART_NOW="$(date +%s)"
         if [[ "$INTERNAL_RESTART_WINDOW" == "0" ]] \
             || ((INTERNAL_RESTART_NOW - INTERNAL_RESTART_WINDOW >= 60)); then
@@ -2495,8 +2571,14 @@ PY
         if ((INTERNAL_RESTART_COUNT <= INTERNAL_RESTART_MAX)); then
             RESTART_REQUEST_VALID=1
             RESTART_EXPECTED_EXIT_CODE=75
+            if [[ -n "$VERIFIED_INTERNAL_RESTART_TARGET_SCENE" ]]; then
+                NEXT_SCENE_ID="$VERIFIED_INTERNAL_RESTART_TARGET_SCENE"
+                NEXT_WORLD_ID="$VERIFIED_INTERNAL_RESTART_TARGET_WORLD"
+            fi
             echo "[INFO] Validated Matrix world reload " \
                 "reason=$VERIFIED_INTERNAL_RESTART_REASON " \
+                "next_scene=$NEXT_SCENE_ID " \
+                "next_world=${NEXT_WORLD_ID:-current} " \
                 "count=${INTERNAL_RESTART_COUNT}/${INTERNAL_RESTART_MAX}"
         else
             echo "[ERROR] Matrix world reload rate limit exceeded; " \
@@ -2702,6 +2784,12 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
             exit_code="$FORWARDED_SIGNAL_EXIT_CODE"
             echo "[INFO] External stop cancelled the pending Matrix restart" >&2
         else
+            RESTART_ROUTE_ENV=()
+            if [[ -n "$NEXT_WORLD_ID" ]]; then
+                RESTART_ROUTE_ENV+=(
+                    "MATRIX_SONIC_RESTART_WORLD_ID=$NEXT_WORLD_ID"
+                )
+            fi
             exec /usr/bin/env -i \
                 "${ORIGINAL_ENVIRONMENT[@]}" \
                 MATRIX_SONIC_RESTART_LOCK_FD=9 \
@@ -2710,6 +2798,8 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
                 MATRIX_GAME_RESUME_ROLLBACK_COUNT="$NEXT_GAME_RESUME_ROLLBACK_COUNT" \
                 MATRIX_GAME_RESUME_ROLLBACK_WINDOW_EPOCH="$GAME_RESUME_ROLLBACK_WINDOW" \
                 MATRIX_GAME_RESUME_ROLLBACK_RATE_COUNT="$GAME_RESUME_ROLLBACK_RATE_COUNT" \
+                MATRIX_SONIC_RESTART_SCENE_ID="$NEXT_SCENE_ID" \
+                "${RESTART_ROUTE_ENV[@]}" \
                 "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${ORIGINAL_ARGS[@]}"
             echo "[ERROR] Failed to exec restarted Matrix launcher" >&2
             exit 1

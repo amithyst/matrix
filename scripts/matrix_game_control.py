@@ -367,6 +367,14 @@ DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
 # per-command cap even if a caller supplies a larger dt or tuning rate.
 MAX_MEASURED_FACING_LEAD_RAD = 0.05
+# Ordinary WALK/RUN keyboard input should feel like a third-person game: a
+# moderate camera/body mismatch produces a curved path instead of forcing the
+# operator to hold a key through a long turn-in-place.  Reversals and sharp
+# side steps still turn before translating, and precise SLOW_WALK keeps the
+# tighter configurable safety gate below.
+KEYBOARD_CURVE_START_HEADING_ERROR_RAD = math.radians(60.0)
+KEYBOARD_CURVE_STOP_HEADING_ERROR_RAD = math.radians(75.0)
+KEYBOARD_FULL_SPEED_HEADING_ERROR_RAD = math.radians(15.0)
 
 
 def native_locomotion_mode_for_speed(
@@ -855,6 +863,8 @@ class GameControlCore:
         requested_speed = 0.0
         requested_locomotion_mode = SONIC_IDLE_MODE
         desired_heading = self._command_heading_rad
+        gait_start_heading_error_rad = self.config.gait_start_heading_error_rad
+        gait_stop_heading_error_rad = self.config.gait_stop_heading_error_rad
 
         if input_magnitude > 1e-12:
             self._stopped_heading_latched = False
@@ -931,18 +941,26 @@ class GameControlCore:
             requested_speed, requested_locomotion_mode = (
                 self._requested_locomotion(input_magnitude)
             )
+            curved_keyboard_motion = digital_movement and (
+                requested_locomotion_mode in {SONIC_WALK_MODE, SONIC_RUN_MODE}
+            )
+            if curved_keyboard_motion:
+                gait_start_heading_error_rad = (
+                    KEYBOARD_CURVE_START_HEADING_ERROR_RAD
+                )
+                gait_stop_heading_error_rad = KEYBOARD_CURVE_STOP_HEADING_ERROR_RAD
             target_speed = requested_speed * alignment
             if (
                 digital_movement
                 and alignment
-                >= math.cos(self.config.gait_start_heading_error_rad)
+                >= math.cos(KEYBOARD_FULL_SPEED_HEADING_ERROR_RAD)
             ):
                 # Keyboard targets sit exactly on native gait boundaries.
                 # Cosine attenuation at a harmless residual heading error
                 # would otherwise make WALK/RUN mathematically unreachable.
-                # The 15-degree translation gate already supplies the intended
-                # turn-before-move behavior, so preserve the exact tier target
-                # once the body is inside that gate.
+                # Preserve the exact tier target once the body is inside the
+                # tight full-speed gate.  Moderate WALK/RUN turns retain cosine
+                # attenuation and therefore curve naturally toward the camera.
                 target_speed = requested_speed
         else:
             target_speed = 0.0
@@ -1001,7 +1019,7 @@ class GameControlCore:
                 target_speed + self.config.speed_epsilon_mps
                 < self.config.gait_stop_speed_mps
                 or alignment
-                < math.cos(self.config.gait_stop_heading_error_rad)
+                < math.cos(gait_stop_heading_error_rad)
             )
         ):
             # Keep turning in native IDLE until physical alignment can support
@@ -1013,11 +1031,11 @@ class GameControlCore:
             and requested_speed + self.config.speed_epsilon_mps
             >= self.config.gait_start_speed_mps
             and alignment + self.config.speed_epsilon_mps
-            >= math.cos(self.config.gait_start_heading_error_rad)
+            >= math.cos(gait_start_heading_error_rad)
             and self._speed_mps + self.config.speed_epsilon_mps
             >= (
                 self.config.min_gait_speed_mps
-                * math.cos(self.config.gait_start_heading_error_rad)
+                * math.cos(gait_start_heading_error_rad)
             )
         ):
             self._gait_active = True

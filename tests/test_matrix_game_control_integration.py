@@ -3079,6 +3079,89 @@ exit 0
             self.assertIn("Validated Matrix world reload", result.stdout)
             self.assertIn("count=1/16", result.stdout)
 
+    def test_outer_launcher_routes_verified_moon_restart_to_scene_15(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            scene_trace = project / "scene-trace.txt"
+            world_trace = project / "world-trace.txt"
+            self.write(
+                project / "scripts/run_sim.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+generation=1
+if [[ -f "${GENERATION_FILE:?}" ]]; then
+    generation=$(( $(<"$GENERATION_FILE") + 1 ))
+fi
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s\\n' "$2" >> "${SCENE_TRACE_FILE:?}"
+printf '%s\\n' "${MATRIX_GAME_WORLD_ID:-missing}" >> "${WORLD_TRACE_FILE:?}"
+if [[ "$generation" == "1" ]]; then
+    mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
+    cat > "$MATRIX_SONIC_STATUS_FILE" <<'JSON'
+{"failed_child_exit_code":null,"failed_child_name":null,"game_auto_respawn":true,"game_world_state":{"has_last_exit":true,"last_error":null},"internal_restart":{"requested":true,"reason":"game_teleport","target_scene_id":15,"launch_route":{"schema":"matrix-celestial-launch-route/v1","destination_id":"moon-tranquility-outpost","teleport_tag":"moon.tranquility","target_scene_id":15,"target_world_id":"g1_29dof:scene_terrain_moon_dynamic","entry_pose":{"position":[0.0,0.0,-0.1366965003013611],"yaw_rad":0.0},"entity_id":"tp-dddddddddddddddddddddddddddddddd"}},"termination_reason":"game_teleport","termination_signal":null}
+JSON
+    exit 75
+fi
+exit 0
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SCENE_TRACE_FILE": os.fspath(scene_trace),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "WORLD_TRACE_FILE": os.fspath(world_trace),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
+            self.assertEqual(scene_trace.read_text(encoding="utf-8").splitlines(), ["21", "15"])
+            self.assertEqual(
+                world_trace.read_text(encoding="utf-8").splitlines(),
+                ["missing", "g1_29dof:scene_terrain_moon_dynamic"],
+            )
+            self.assertIn("next_scene=15", result.stdout)
+            self.assertIn(
+                "next_world=g1_29dof:scene_terrain_moon_dynamic",
+                result.stdout,
+            )
+
     def test_outer_launcher_quarantines_two_consecutive_candidates_then_succeeds(
         self,
     ) -> None:
@@ -4440,7 +4523,7 @@ esac
                 "HOME": os.fspath(project / "home"),
                 "LANG": "C.UTF-8",
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "2",
+                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "5",
                 "MATRIX_SKIP_ENV_CHECK": "1",
                 "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
                 "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),

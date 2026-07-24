@@ -20,6 +20,7 @@ from matrix_world_state import (
     WorldPose,
     WorldStateError,
     validate_tag,
+    validate_world_id,
 )
 from matrix_motion_settings import MOTION_SETTING_PATHS
 
@@ -263,6 +264,58 @@ class TeleportList:
                 "E_TAG_DUPLICATE", "teleport list tags must be unique"
             )
         object.__setattr__(self, "tags", validated)
+
+
+@dataclass(frozen=True)
+class TeleportRoute:
+    tag: str
+    target_scene_id: int
+    target_world_id: str
+    entry_pose: WorldPose
+    entity_id: str
+    destination_id: str
+
+    def __post_init__(self) -> None:
+        try:
+            tag = validate_tag(self.tag)
+            validate_world_id(self.target_world_id)
+        except WorldStateError as exc:
+            raise CommandParseError("E_ROUTE_INVALID", str(exc)) from exc
+        if (
+            isinstance(self.target_scene_id, bool)
+            or not isinstance(self.target_scene_id, int)
+            or not 0 <= self.target_scene_id <= 99
+        ):
+            raise CommandParseError(
+                "E_ROUTE_INVALID", "route target scene id is invalid"
+            )
+        if not isinstance(self.entry_pose, WorldPose):
+            raise CommandParseError("E_ROUTE_INVALID", "route entry pose is invalid")
+        if (
+            not isinstance(self.entity_id, str)
+            or re.fullmatch(r"tp-[0-9a-f]{32}", self.entity_id) is None
+        ):
+            raise CommandParseError("E_ROUTE_INVALID", "route entity id is invalid")
+        if (
+            not isinstance(self.destination_id, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", self.destination_id)
+            is None
+        ):
+            raise CommandParseError(
+                "E_ROUTE_INVALID", "route destination id is invalid"
+            )
+        object.__setattr__(self, "tag", tag)
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": "matrix-celestial-launch-route/v1",
+            "destination_id": self.destination_id,
+            "teleport_tag": self.tag,
+            "target_scene_id": self.target_scene_id,
+            "target_world_id": self.target_world_id,
+            "entry_pose": self.entry_pose.to_mapping(),
+            "entity_id": self.entity_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -1036,7 +1089,9 @@ def execute_command(
     state: MatrixWorldState,
     current_pose: WorldPose,
     now_unix_ns: int | None = None,
+    teleport_routes: Mapping[str, TeleportRoute] | None = None,
 ) -> CommandEffect:
+    routes = teleport_routes or {}
     if isinstance(command, SummonTeleportPoint):
         pose = _resolve_pose(command.coordinates, current_pose)
         try:
@@ -1081,6 +1136,29 @@ def execute_command(
             data={"position": [pose.x, pose.y, pose.z]},
         )
     if isinstance(command, TeleportSelector):
+        route = routes.get(command.tag)
+        if route is not None:
+            next_state = state.set_resume_pose(
+                current_pose,
+                source="teleport_command",
+                now_unix_ns=now_unix_ns,
+            )
+            return CommandEffect(
+                state=next_state,
+                code="OK_TELEPORT_ROUTE_RESTART",
+                message=f"Routing to {command.tag}; reloading Matrix",
+                restart_required=True,
+                data={
+                    "entity_id": route.entity_id,
+                    "position": [
+                        route.entry_pose.x,
+                        route.entry_pose.y,
+                        route.entry_pose.z,
+                    ],
+                    "tags": [route.tag],
+                    "launch_route": route.to_mapping(),
+                },
+            )
         try:
             matches = state.select_teleport_points(
                 tag=command.tag,
@@ -1117,6 +1195,23 @@ def execute_command(
         results: list[dict[str, object]] = []
         found_count = 0
         for tag in requested_tags:
+            route = routes.get(tag)
+            if route is not None:
+                results.append(
+                    {
+                        "tag": tag,
+                        "found": True,
+                        "entity_id": route.entity_id,
+                        "position": [
+                            route.entry_pose.x,
+                            route.entry_pose.y,
+                            route.entry_pose.z,
+                        ],
+                        "yaw_rad": route.entry_pose.yaw_rad,
+                    }
+                )
+                found_count += 1
+                continue
             try:
                 matches = state.select_teleport_points(
                     tag=tag,
@@ -1174,6 +1269,7 @@ __all__ = [
     "TeleportCoordinates",
     "TeleportLocalCoordinates",
     "TeleportList",
+    "TeleportRoute",
     "TeleportSelector",
     "command_from_mapping",
     "command_to_mapping",
