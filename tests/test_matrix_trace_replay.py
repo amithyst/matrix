@@ -560,6 +560,8 @@ class ShellIntegrationContractTest(unittest.TestCase):
         self.assertIn("/tmp/matrix-sonic-${UID}.lock", launcher)
         self.assertNotIn("matrix-scene6-trace-replay.lock", launcher)
         self.assertIn("Recovering prior Matrix scene6 stage journal", launcher)
+        self.assertIn("TargetArmLength 180", launcher)
+        self.assertIn("viewclass MujocoSim_Custom_C", launcher)
 
 
 class VideoPostflightTest(unittest.TestCase):

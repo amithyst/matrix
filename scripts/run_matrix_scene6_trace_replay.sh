@@ -227,6 +227,14 @@ export MATRIX_DISABLE_MC=1
 export MATRIX_SONIC=0
 export MATRIX_UE_MAX_FPS=25
 export SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=1
+if [[ -z "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+    MATRIX_UE_EXTRA_EXEC_CMDS="set Engine.SpringArmComponent bEnableCameraLag False"
+    MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent bEnableCameraRotationLag False"
+    MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent bDoCollisionTest True"
+    MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent TargetArmLength 180"
+    MATRIX_UE_EXTRA_EXEC_CMDS+=",viewclass MujocoSim_Custom_C"
+    export MATRIX_UE_EXTRA_EXEC_CMDS
+fi
 if [[ -n "$MODEL" ]]; then
     export MATRIX_EXTERNAL_REPLAY_MODEL="$MODEL"
 else
@@ -236,6 +244,7 @@ fi
 echo "[INFO] physics_execution=offline_mujoco_persistent_world"
 echo "[INFO] render_mode=matrix_ue_trace_replay"
 echo "[INFO] manipulation=contact-gated constrained grasp + anchored stance"
+echo "[INFO] replay_camera=MujocoSim_Custom_C spring_arm_cm=180"
 
 cd "$MATRIX_ROOT"
 bash scripts/run_sim.sh custom 6 0 0 1 "" twinbot_scene6_trace_replay
