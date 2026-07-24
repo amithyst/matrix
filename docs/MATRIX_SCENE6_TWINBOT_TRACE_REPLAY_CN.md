@@ -8,13 +8,46 @@
 - `physics_execution=offline_mujoco_persistent_world`：TwinBot 在同一个 MuJoCo
   world/data 实例中执行并记录任务。
 - `render_mode=matrix_ue_trace_replay`：Matrix 以 25 FPS 将记录的
-  `qpos/qvel/ctrl` 发到本机 UDP `127.0.0.1:9999`，由 HouseWorld UE 窗口显示。
+  `qpos/qvel` 发到本机 UDP `127.0.0.1:9999`，由 HouseWorld UE 窗口显示。
+
+精确 packaged UE 的 legacy 第三段虽然按 `nu` 标长，实际却写到 `mjData.act`，不是
+`mjData.ctrl`；对本模型 `na=0`，直接转发 43 维 `ctrl` 会覆盖相邻工作区。external replay
+因此保留 1260-byte ABI，但把第三段固定为 43 个零，并在 status/summary 中记录
+`wire_third_vector_semantics=legacy_act_slot_zeroed`。postflight 缺少该标记就拒绝产物。
+长期修复仍应同时重建 stock sender 与精确 UE receiver，使两端真正读写 `mjData.ctrl`。
 
 它不是 live SONIC manipulation。当前抓取是“拇指与对向手指接触门禁后启用腕部—方块
 weld”，操作阶段还固定了站姿 anchor；视频、状态和 summary 都保留
 `contact_gated_wrist_cube_weld_and_anchored_stance` 标记。不能将其描述为纯摩擦抓取。
 
 ## 输入门禁
+
+### 将 TwinBot v2 原始 trace 投影为 Matrix replay 输入
+
+TwinBot 的 Scene6 v2 原始 trace 是物理权威，不能就地补字段。若原始文件尚未包含 Matrix
+渲染声明，先用确定性 projection 生成新文件：
+
+```bash
+python3 scripts/prepare_matrix_scene6_replay_trace.py \
+  --source-trace /artifact/physics-trace.source.json \
+  --source-summary /artifact/summary.source.json \
+  --validation /artifact/review/scene6_raise_arm_validation.json \
+  --scene-model /artifact/model/scene6_house_task.xml \
+  --render-robot-model /artifact/model/g1_29dof_dex3.scene6.xml \
+  --output-trace /artifact/physics-trace.matrix-replay.json \
+  --receipt /artifact/projection-receipt.json \
+  --expected-source-trace-sha256 <sha256> \
+  --expected-source-summary-sha256 <sha256> \
+  --expected-validation-sha256 <sha256> \
+  --expected-scene-model-sha256 <sha256> \
+  --expected-render-robot-model-sha256 <sha256>
+```
+
+projection 会交叉验证 trace/summary/群附件 validation、2005 帧身份、57/55/43、
+0.002s/25 FPS、辅助机制，以及
+`world_ready → navigation → dock_arm_clearance → dock_with_pregrasp`。它只增加 Matrix
+渲染元数据和持久模型绑定，不修改或重采样任何 frame；输入、frame 与输出 SHA256 均进入
+receipt。输出或 receipt 已存在时拒绝覆盖，自验失败时不会留下可接受产物。
 
 `scripts/replay_matrix_physics_trace.py` fail closed，只接受：
 
@@ -165,17 +198,22 @@ status/summary v2，postflight 再按该哈希、bundle、contract 和日志区�
 - `task.camera.json`（`matrix.scene6_camera_receipt.v1` current-run 相机与挂载证据）；
 - `task.camera-ready.json`（启用双终端 gate 时的人工作图确认输入，其内容也进入 camera
   receipt）；
+- `task.visual-motion.json`（`matrix.scene6_visual_motion_receipt.v1`；按 trace transitions
+  对 navigation、raise/dock、grasp、carry/lower、release/settle 五段抽帧；其中
+  `dock_arm_clearance` 必须先于 `dock_with_pregrasp`，明确覆盖靠桌前抬臂。门禁分别检查全帧与
+  中央机器人/桌面 ROI 的可见像素运动，并以 pre-roll 静止画面校准编码噪声）；
 - `task.replay-status.json`（录制期间持续更新，ready 时
   `active_lowcmd=true`）；
 - `task.replay-summary.json`（包数、帧数、维度、trace/model SHA256 与边界标签）；
 - `task.restore.json`（两份 `current.xml` 及 `run_sim.sh` 运行时改写文件的事务恢复回执）；
-- `task.verified.json`（`matrix.scene6_twinbot_video_postflight.v2`；交叉验证视频质量、
-  完整 trace 发送、模型恢复、相机回执绑定及相关 SHA256 后才生成）；
+- `task.verified.json`（`matrix.scene6_twinbot_video_postflight.v3`；交叉验证视频质量、
+  完整 trace 发送、模型恢复、相机回执、视觉运动回执及相关 SHA256 后才生成）；
 - `task.launch.log`、`task.ffmpeg.log` 以及 Matrix 的
   `outputs/logs/matrix_trace_replay.log`。
 
-最终验收至少检查 MP4 分辨率、25 FPS、时长/帧数、质量 `passed=true`，并将
-trace、模型、视频三个 SHA256 一起保存。postflight 还要求 Matrix Git checkout clean、
+最终验收至少检查 MP4 分辨率、25 FPS、时长/帧数、质量 `passed=true`，且五个任务阶段
+均存在超过编码噪声的可见运动，并将 trace、模型、视频三个 SHA256 一起保存。缺阶段、
+静态画面、视觉回执缺失或 `passed=false` 都不得通过。postflight 还要求 Matrix Git checkout clean、
 UDP 9999 已释放，并且 UE supervisor、replayer、stock MuJoCo/MC 都无残留。运行时
 staging state、恢复或 cleanup 任一失败时不得把视频标成完成品。合格 replay 必须是
 `completion=scheduled_replay_complete`，launcher 返回 0 且不是录制器强停；final

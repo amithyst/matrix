@@ -30,6 +30,13 @@ EXPECTED_DIMS = (57, 55, 43)
 REPLAY_FPS = 25.0
 RENDER_ADDRESS = ("127.0.0.1", 9999)
 DEFAULT_MAX_TRACE_BYTES = 1024 * 1024 * 1024
+# The shipped Matrix sender labels the third vector with ``nu`` but serializes
+# ``mjData.act``; the matching UE build writes it back to the same legacy slot.
+# Full-motor G1 models have ``na == 0``, so forwarding TwinBot's control vector
+# would overwrite adjacent mjData storage.  Rendering only consumes qpos/qvel.
+# Keep the exact 43-value wire shape while zeroing this unsafe compatibility
+# slot until both stock endpoints are rebuilt to use ``mjData.ctrl``.
+WIRE_THIRD_VECTOR_SEMANTICS = "legacy_act_slot_zeroed"
 REQUIRED_TRANSITION_SUBSEQUENCE = (
     "world_ready",
     "dock_with_pregrasp",
@@ -443,18 +450,26 @@ def validate_trace(
 
 
 def pack_render_packet(frame: dict[str, Any]) -> bytes:
-    """Pack one frame using Matrix's little-endian variable-vector protocol."""
+    """Pack one frame using Matrix's legacy little-endian render protocol.
+
+    The third vector is deliberately zeroed.  It is length-tagged with ``nu``
+    by the stock ABI but is read into ``mjData.act`` rather than ``ctrl`` by the
+    exact packaged UE build.  qpos and qvel remain the authoritative replay
+    state used for visualization.
+    """
 
     qpos = frame["qpos"]
     qvel = frame["qvel"]
-    ctrl = frame["ctrl"]
+    legacy_act_slot = (0.0,) * len(frame["ctrl"])
     payload = bytearray(_TIME_AND_SIZE.pack(float(frame["time_s"]), len(qpos)))
     for values in (qpos,):
         payload.extend(struct.pack(f"<{len(values)}d", *values))
     payload.extend(_SIZE.pack(len(qvel)))
     payload.extend(struct.pack(f"<{len(qvel)}d", *qvel))
-    payload.extend(_SIZE.pack(len(ctrl)))
-    payload.extend(struct.pack(f"<{len(ctrl)}d", *ctrl))
+    payload.extend(_SIZE.pack(len(legacy_act_slot)))
+    payload.extend(
+        struct.pack(f"<{len(legacy_act_slot)}d", *legacy_act_slot)
+    )
     return bytes(payload)
 
 
@@ -558,6 +573,7 @@ def replay(
             "packet_count": packet_count,
             "expected_packet_count": expected_packets,
             "dimensions": {"nq": nq, "nv": nv, "nu": nu},
+            "wire_third_vector_semantics": WIRE_THIRD_VECTOR_SEMANTICS,
             "trace": inspection["trace"],
             "model": inspection["render_robot_model"]["path"],
             "model_provenance": inspection["render_robot_model"],
@@ -680,6 +696,7 @@ def replay(
             "scene_model": inspection["model"],
             "camera_receipt": camera_receipt,
             "dimensions": inspection["dimensions"],
+            "wire_third_vector_semantics": WIRE_THIRD_VECTOR_SEMANTICS,
             "source_frame_count": trace_packets,
             "source_duration_s": inspection["source_duration_s"],
             "trace_time_range_s": inspection["trace_time_range_s"],

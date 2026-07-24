@@ -14,6 +14,7 @@ import tempfile
 from typing import Any, Sequence
 
 import matrix_scene6_camera_receipt as camera_evidence
+import verify_matrix_scene6_visual_motion as visual_motion_evidence
 
 
 class PostflightError(RuntimeError):
@@ -163,8 +164,13 @@ def verify(
     restore_path: Path,
     camera_receipt_path: Path,
     matrix_root: Path,
+    visual_motion_receipt_path: Path | None = None,
 ) -> dict[str, Any]:
     output = _file(output, label="accepted MP4")
+    if visual_motion_receipt_path is None:
+        visual_motion_receipt_path = output.with_name(
+            f"{output.stem}.visual-motion.json"
+        )
     metadata_path, metadata = _json(metadata_path, label="video metadata")
     summary_path, summary = _json(summary_path, label="replay summary")
     restore_path, restore = _json(restore_path, label="model restore receipt")
@@ -202,6 +208,10 @@ def verify(
         raise PostflightError("replay summary render boundary drifted")
     if summary.get("dimensions") != {"nq": 57, "nv": 55, "nu": 43}:
         raise PostflightError("replay dimensions are not 57/55/43")
+    if summary.get("wire_third_vector_semantics") != "legacy_act_slot_zeroed":
+        raise PostflightError(
+            "replay summary lacks the zeroed legacy act-slot safety boundary"
+        )
     frame_count = summary.get("source_frame_count")
     packets = summary.get("packets")
     if (
@@ -270,6 +280,18 @@ def verify(
     output_sha = _sha256(output)
     if video.get("sha256") != output_sha:
         raise PostflightError("accepted MP4 hash differs from video metadata")
+    visual_motion_receipt_path = _file(
+        visual_motion_receipt_path, label="visual-motion receipt"
+    )
+    try:
+        visual_motion = visual_motion_evidence.load_receipt(
+            visual_motion_receipt_path,
+            expected_video=output,
+            expected_video_sha256=output_sha,
+            expected_trace_sha256=str((summary.get("trace") or {}).get("sha256")),
+        )
+    except visual_motion_evidence.VisualMotionError as exc:
+        raise PostflightError(f"invalid visual-motion receipt: {exc}") from exc
     requested_fps = capture.get("requested_fps")
     observed_fps = video.get("fps")
     if (
@@ -300,6 +322,8 @@ def verify(
         or status_before.get("active_lowcmd_semantics")
         != "legacy_recorder_readiness_gate_no_dds_lowcmd"
         or status_before.get("dds_lowcmd_active") is not False
+        or status_before.get("wire_third_vector_semantics")
+        != "legacy_act_slot_zeroed"
         or status_before.get("camera_receipt") != camera_binding
     ):
         raise PostflightError("video readiness lacks the explicit no-DDS replay boundary")
@@ -323,6 +347,8 @@ def verify(
         or status_after.get("active_lowcmd_semantics")
         != "legacy_recorder_readiness_gate_no_dds_lowcmd"
         or status_after.get("dds_lowcmd_active") is not False
+        or status_after.get("wire_third_vector_semantics")
+        != "legacy_act_slot_zeroed"
         or status_after.get("camera_receipt") != camera_binding
     ):
         raise PostflightError("Matrix replay final status is not complete and inactive")
@@ -344,7 +370,7 @@ def verify(
         )
 
     return {
-        "schema_id": "matrix.scene6_twinbot_video_postflight.v2",
+        "schema_id": "matrix.scene6_twinbot_video_postflight.v3",
         "passed": True,
         "physics_execution": "offline_mujoco_persistent_world",
         "render_mode": "matrix_ue_trace_replay",
@@ -384,6 +410,12 @@ def verify(
             "sha256": _sha256(camera_receipt_path),
         },
         "camera": camera,
+        "visual_motion_receipt": {
+            "path": str(visual_motion_receipt_path),
+            "sha256": _sha256(visual_motion_receipt_path),
+            "schema_id": visual_motion.get("schema_id"),
+        },
+        "visual_motion": visual_motion,
     }
 
 
@@ -394,6 +426,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--replay-summary", type=Path, required=True)
     parser.add_argument("--restore-receipt", type=Path, required=True)
     parser.add_argument("--camera-receipt", type=Path, required=True)
+    parser.add_argument("--visual-motion-receipt", type=Path, required=True)
     parser.add_argument("--matrix-root", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     return parser.parse_args(argv)
@@ -409,6 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             restore_path=args.restore_receipt,
             camera_receipt_path=args.camera_receipt,
             matrix_root=args.matrix_root,
+            visual_motion_receipt_path=args.visual_motion_receipt,
         )
         _atomic_json(args.receipt.expanduser().resolve(), receipt)
     except (OSError, ValueError, PostflightError) as exc:

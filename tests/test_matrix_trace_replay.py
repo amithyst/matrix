@@ -233,6 +233,12 @@ class TraceValidationTest(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", packet, qvel_size_offset)[0], 55)
         ctrl_size_offset = qvel_size_offset + 4 + 55 * 8
         self.assertEqual(struct.unpack_from("<I", packet, ctrl_size_offset)[0], 43)
+        legacy_slot = struct.unpack_from("<43d", packet, ctrl_size_offset + 4)
+        self.assertEqual(legacy_slot, (0.0,) * 43)
+        self.assertEqual(
+            REPLAY.WIRE_THIRD_VECTOR_SEMANTICS,
+            "legacy_act_slot_zeroed",
+        )
 
 
 class TraceReplayTest(unittest.TestCase):
@@ -1002,6 +1008,7 @@ class VideoPostflightTest(unittest.TestCase):
                         "physics_execution": "offline_mujoco_persistent_world",
                         "render_mode": "matrix_ue_trace_replay",
                         "dimensions": {"nq": 57, "nv": 55, "nu": 43},
+                        "wire_third_vector_semantics": "legacy_act_slot_zeroed",
                         "source_frame_count": 10,
                         "packets": {"trace_sent": 10, "sent": 20, "expected": 20},
                         "trace": {"sha256": trace_sha},
@@ -1081,6 +1088,9 @@ class VideoPostflightTest(unittest.TestCase):
                                     "legacy_recorder_readiness_gate_no_dds_lowcmd"
                                 ),
                                 "dds_lowcmd_active": False,
+                                "wire_third_vector_semantics": (
+                                    "legacy_act_slot_zeroed"
+                                ),
                                 "camera_receipt": camera_binding,
                             },
                             "after": {
@@ -1090,6 +1100,9 @@ class VideoPostflightTest(unittest.TestCase):
                                     "legacy_recorder_readiness_gate_no_dds_lowcmd"
                                 ),
                                 "dds_lowcmd_active": False,
+                                "wire_third_vector_semantics": (
+                                    "legacy_act_slot_zeroed"
+                                ),
                                 "completed": True,
                                 "passed": True,
                                 "camera_receipt": camera_binding,
@@ -1107,6 +1120,60 @@ class VideoPostflightTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            visual_motion_receipt = root / "task.visual-motion.json"
+            visual_motion_receipt.write_text(
+                json.dumps(
+                    {
+                        "schema_id": "matrix.scene6_visual_motion_receipt.v1",
+                        "passed": True,
+                        "failures": [],
+                        "video": {"path": str(output), "sha256": video_sha},
+                        "trace": {
+                            "sha256": trace_sha,
+                            "transitions": [
+                                {"phase": phase}
+                                for phase in (
+                                    "world_ready",
+                                    "dock_arm_clearance",
+                                    "dock_with_pregrasp",
+                                    "assisted_stance_settle",
+                                    "pick_place_contact_stabilized",
+                                    "contact_validated",
+                                    "grasp_stabilizer_active",
+                                    "cube_supported_on_worktop",
+                                    "grasp_stabilizer_released",
+                                )
+                            ],
+                        },
+                        "analyzer": {
+                            "algorithm_id": "trace_phase_rgb_luma_diff.v1"
+                        },
+                        "stages": [
+                            {
+                                "name": name,
+                                "scope": (
+                                    "full_frame"
+                                    if name == "navigation"
+                                    else "central_robot_table_roi"
+                                ),
+                                "passed": True,
+                                "failure": None,
+                                "sample_points": [{"frame_index": index} for index in range(4)],
+                                "comparisons": [{"passed_for_stage_scope": True}] * 4,
+                                "observed": {"passing_comparisons": ["sample_0->sample_3"]},
+                            }
+                            for name in (
+                                "navigation",
+                                "raise_dock",
+                                "grasp",
+                                "carry_lower",
+                                "release_settle",
+                            )
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             receipt = POSTFLIGHT.verify(
                 output=output,
@@ -1118,6 +1185,88 @@ class VideoPostflightTest(unittest.TestCase):
             )
             self.assertTrue(receipt["passed"])
             self.assertEqual(receipt["camera"]["mode"], "robot")
+            visual_motion_payload = json.loads(
+                visual_motion_receipt.read_text(encoding="utf-8")
+            )
+            visual_motion_receipt.unlink()
+            with self.assertRaisesRegex(
+                POSTFLIGHT.PostflightError, "visual-motion receipt"
+            ):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    camera_receipt_path=camera_receipt,
+                    matrix_root=matrix,
+                )
+            visual_motion_receipt.write_text(
+                json.dumps(visual_motion_payload), encoding="utf-8"
+            )
+            failed_visual_motion = json.loads(json.dumps(visual_motion_payload))
+            failed_visual_motion["passed"] = False
+            failed_visual_motion["failures"] = ["static UE actor"]
+            visual_motion_receipt.write_text(
+                json.dumps(failed_visual_motion), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                POSTFLIGHT.PostflightError, "visual-motion receipt did not pass"
+            ):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    camera_receipt_path=camera_receipt,
+                    matrix_root=matrix,
+                )
+            visual_motion_receipt.write_text(
+                json.dumps(visual_motion_payload), encoding="utf-8"
+            )
+
+            safe_summary_payload = json.loads(summary.read_text(encoding="utf-8"))
+            unsafe_summary_payload = json.loads(json.dumps(safe_summary_payload))
+            unsafe_summary_payload.pop("wire_third_vector_semantics")
+            summary.write_text(json.dumps(unsafe_summary_payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                POSTFLIGHT.PostflightError, "zeroed legacy act-slot"
+            ):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    camera_receipt_path=camera_receipt,
+                    matrix_root=matrix,
+                )
+            summary.write_text(json.dumps(safe_summary_payload), encoding="utf-8")
+
+            safe_metadata_payload = json.loads(metadata.read_text(encoding="utf-8"))
+            for status_key, expected_failure in (
+                ("before", "readiness"),
+                ("after", "final status"),
+            ):
+                unsafe_metadata_payload = json.loads(
+                    json.dumps(safe_metadata_payload)
+                )
+                unsafe_metadata_payload["sonic_status"][status_key].pop(
+                    "wire_third_vector_semantics"
+                )
+                metadata.write_text(
+                    json.dumps(unsafe_metadata_payload), encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    POSTFLIGHT.PostflightError, expected_failure
+                ):
+                    POSTFLIGHT.verify(
+                        output=output,
+                        metadata_path=metadata,
+                        summary_path=summary,
+                        restore_path=restore,
+                        camera_receipt_path=camera_receipt,
+                        matrix_root=matrix,
+                    )
+            metadata.write_text(json.dumps(safe_metadata_payload), encoding="utf-8")
 
             metadata_payload = json.loads(metadata.read_text(encoding="utf-8"))
             forged_camera = dict(camera_payload)

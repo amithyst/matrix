@@ -13,6 +13,7 @@ STATUS_FILE=""
 SUMMARY_FILE=""
 RESTORE_RECEIPT=""
 POSTFLIGHT_RECEIPT=""
+VISUAL_MOTION_RECEIPT=""
 DISPLAY_VALUE="${DISPLAY:-:0}"
 XAUTHORITY_VALUE="${XAUTHORITY:-}"
 ENCODER="auto"
@@ -37,6 +38,7 @@ usage() {
         "[--camera-mode robot|spectator-overlay]" \
         "[--camera-distance-cm CM] [--overlay-bundle DIR]" \
         "[--overlay-contract FILE] [--camera-receipt FILE]" \
+        "[--visual-motion-receipt FILE]" \
         "[--camera-ready-file FILE] [--camera-ready-timeout SECONDS]" \
         "[--camera-settle SECONDS]" >&2
 }
@@ -58,6 +60,7 @@ while (($#)); do
         --summary) SUMMARY_FILE="${2:-}"; shift 2 ;;
         --restore-receipt) RESTORE_RECEIPT="${2:-}"; shift 2 ;;
         --postflight-receipt) POSTFLIGHT_RECEIPT="${2:-}"; shift 2 ;;
+        --visual-motion-receipt) VISUAL_MOTION_RECEIPT="${2:-}"; shift 2 ;;
         --display) DISPLAY_VALUE="${2:-}"; shift 2 ;;
         --xauthority) XAUTHORITY_VALUE="${2:-}"; shift 2 ;;
         --encoder) ENCODER="${2:-}"; shift 2 ;;
@@ -99,6 +102,12 @@ for numeric_value in \
         exit 2
     fi
 done
+if ! awk -v value="$PRE_ROLL_SECONDS" \
+    'BEGIN { exit !(value >= 0.5) }'; then
+    echo "[ERROR] --pre-roll must be at least 0.5 seconds for visual motion" \
+        "noise calibration" >&2
+    exit 2
+fi
 if [[ -n "$FINAL_HOLD_SECONDS" \
     && ! "$FINAL_HOLD_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] --final-hold must be a non-negative number:" \
@@ -185,6 +194,7 @@ for required in \
     "$MATRIX_ROOT/scripts/run_matrix_scene6_trace_replay.sh" \
     "$MATRIX_ROOT/scripts/record_matrix_sonic_video.sh" \
     "$MATRIX_ROOT/scripts/matrix_scene6_camera_receipt.py" \
+    "$MATRIX_ROOT/scripts/verify_matrix_scene6_visual_motion.py" \
     "$MATRIX_ROOT/scripts/verify_matrix_scene6_task_video.py"; do
     if [[ ! -f "$required" ]]; then
         echo "[ERROR] Required Matrix scene6 recording component is missing:" \
@@ -207,6 +217,9 @@ fi
 if [[ -z "$POSTFLIGHT_RECEIPT" ]]; then
     POSTFLIGHT_RECEIPT="${OUTPUT%.mp4}.verified.json"
 fi
+if [[ -z "$VISUAL_MOTION_RECEIPT" ]]; then
+    VISUAL_MOTION_RECEIPT="${OUTPUT%.mp4}.visual-motion.json"
+fi
 if [[ -z "$CAMERA_RECEIPT" ]]; then
     CAMERA_RECEIPT="${OUTPUT%.mp4}.camera.json"
 fi
@@ -215,13 +228,15 @@ STATUS_FILE="$(realpath -m -- "$STATUS_FILE")"
 SUMMARY_FILE="$(realpath -m -- "$SUMMARY_FILE")"
 RESTORE_RECEIPT="$(realpath -m -- "$RESTORE_RECEIPT")"
 POSTFLIGHT_RECEIPT="$(realpath -m -- "$POSTFLIGHT_RECEIPT")"
+VISUAL_MOTION_RECEIPT="$(realpath -m -- "$VISUAL_MOTION_RECEIPT")"
 CAMERA_RECEIPT="$(realpath -m -- "$CAMERA_RECEIPT")"
 if [[ -n "$CAMERA_READY_FILE" ]]; then
     CAMERA_READY_FILE="$(realpath -m -- "$CAMERA_READY_FILE")"
 fi
 ARTIFACT_PATHS=(
     "$OUTPUT" "$METADATA" "$STATUS_FILE" "$SUMMARY_FILE"
-    "$RESTORE_RECEIPT" "$POSTFLIGHT_RECEIPT" "$CAMERA_RECEIPT"
+    "$RESTORE_RECEIPT" "$POSTFLIGHT_RECEIPT" "$VISUAL_MOTION_RECEIPT"
+    "$CAMERA_RECEIPT"
 )
 if [[ -n "$CAMERA_READY_FILE" ]]; then
     ARTIFACT_PATHS+=("$CAMERA_READY_FILE")
@@ -375,7 +390,7 @@ if [[ -L "$POSTFLIGHT_RECEIPT" || -d "$POSTFLIGHT_RECEIPT" ]]; then
         "$POSTFLIGHT_RECEIPT" >&2
     exit 2
 fi
-rm -f -- "$POSTFLIGHT_RECEIPT"
+rm -f -- "$POSTFLIGHT_RECEIPT" "$VISUAL_MOTION_RECEIPT"
 
 "${RECORDER_COMMAND[@]}"
 
@@ -404,11 +419,18 @@ temporary.write_text(
 os.replace(temporary, path)
 PY
 
+"$PYTHON" "$MATRIX_ROOT/scripts/verify_matrix_scene6_visual_motion.py" \
+    --video "$OUTPUT" \
+    --trace "$TRACE" \
+    --pre-roll-seconds "$PRE_ROLL_SECONDS" \
+    --receipt "$VISUAL_MOTION_RECEIPT"
+
 "$PYTHON" "$MATRIX_ROOT/scripts/verify_matrix_scene6_task_video.py" \
     --output "$OUTPUT" \
     --metadata "$METADATA" \
     --replay-summary "$SUMMARY_FILE" \
     --restore-receipt "$RESTORE_RECEIPT" \
     --camera-receipt "$CAMERA_RECEIPT" \
+    --visual-motion-receipt "$VISUAL_MOTION_RECEIPT" \
     --matrix-root "$MATRIX_ROOT" \
     --receipt "$POSTFLIGHT_RECEIPT"
