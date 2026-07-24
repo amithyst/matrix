@@ -3605,7 +3605,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("coproc MATRIX_UE_SUPERVISOR", run_sim)
-        self.assertIn('wait "$UE_SUPERVISOR_PID"', run_sim)
+        self.assertIn("wait_for_managed_child() {", run_sim)
+        self.assertIn('wait_for_managed_child "$UE_SUPERVISOR_PID"', run_sim)
         self.assertNotIn('kill -0 "$ue_pid"', run_sim)
         self.assertNotIn('PIDS+=("$UE_PID")', run_sim)
         self.assertNotIn("UE_EXPECTED_STOP_FILE", run_sim)

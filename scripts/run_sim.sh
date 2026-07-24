@@ -204,6 +204,8 @@ UE_CAMERA_STATE_FILE=""
 RUN_SIM_PARENT_PID="${MATRIX_SONIC_LAUNCHER_PID:-$PPID}"
 CLEANUP_STARTED=0
 CLEANUP_FAILED=0
+CLEANUP_SIGNAL_PENDING=0
+WAITED_CHILD_STATUS=127
 X_POINTER_ACCELERATION_RESTORE_NEEDED=0
 X_POINTER_ACCELERATION=""
 X_POINTER_THRESHOLD=""
@@ -231,6 +233,43 @@ remove_managed_pid() {
         fi
     done
     PIDS=("${remaining[@]}")
+}
+
+managed_child_job_is_running() {
+    local expected_pid="$1"
+    local child_pid
+    while IFS= read -r child_pid; do
+        if [[ "$child_pid" == "$expected_pid" ]]; then
+            return 0
+        fi
+    done < <(jobs -pr)
+    return 1
+}
+
+wait_for_managed_child() {
+    local child_pid="$1"
+    local last_status=127
+    local wait_status=127
+
+    # A caught cleanup signal interrupts Bash's wait builtin even though the
+    # exact child remains alive.  Retry from Bash's job table until the child
+    # is no longer running, then perform one final exact reap.
+    while managed_child_job_is_running "$child_pid"; do
+        if wait "$child_pid"; then
+            last_status=0
+        else
+            last_status=$?
+        fi
+    done
+    if wait "$child_pid" 2>/dev/null; then
+        wait_status=0
+    else
+        wait_status=$?
+    fi
+    if [[ "$wait_status" != "127" || "$last_status" == "127" ]]; then
+        last_status="$wait_status"
+    fi
+    WAITED_CHILD_STATUS="$last_status"
 }
 
 start_supervised_ue() {
@@ -308,11 +347,8 @@ stop_supervised_ue() {
         exec {UE_CONTROL_FD}>&-
         UE_CONTROL_FD=""
     fi
-    if wait "$UE_SUPERVISOR_PID"; then
-        supervisor_exit_code=0
-    else
-        supervisor_exit_code=$?
-    fi
+    wait_for_managed_child "$UE_SUPERVISOR_PID"
+    supervisor_exit_code="$WAITED_CHILD_STATUS"
     if [[ "$stop_delivered" != "1" || "$supervisor_exit_code" == "255" ]]; then
         record_ue_supervisor_failure
     elif [[ "$supervisor_exit_code" != "0" && ! -e "$UE_FAILURE_FILE" ]]; then
@@ -532,10 +568,12 @@ start_parent_watchdog() {
 }
 
 stop_parent_watchdog() {
-    if [[ -n "${WATCHDOG_PID:-}" ]] && kill -0 "${WATCHDOG_PID}" 2>/dev/null; then
+    if [[ -n "${WATCHDOG_PID:-}" ]] \
+        && managed_child_job_is_running "$WATCHDOG_PID"; then
         kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
-        wait "${WATCHDOG_PID}" 2>/dev/null || true
+        wait_for_managed_child "$WATCHDOG_PID"
     fi
+    WATCHDOG_PID=""
 }
 
 restore_remote_pointer_acceleration() {
@@ -620,6 +658,12 @@ configure_remote_pointer_acceleration() {
 }
 
 cleanup() {
+    # A normal child exit can enter cleanup just before the top-level launcher
+    # forwards an operator signal.  Do not let that later signal interrupt the
+    # one authoritative teardown; the launcher still owns the bounded KILL
+    # fallback if cleanup itself stalls.  Use caught traps rather than SIG_IGN
+    # so commands spawned during cleanup retain their default signal handling.
+    trap 'CLEANUP_SIGNAL_PENDING=1' SIGINT SIGTERM SIGHUP
     if [[ "$CLEANUP_STARTED" == "1" ]]; then
         return
     fi
@@ -631,7 +675,7 @@ cleanup() {
 
     # 1. 优雅关闭脚本启动的进程
     for pid in "${PIDS[@]:-}"; do
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if [[ -n "$pid" ]] && managed_child_job_is_running "$pid"; then
             echo "[INFO] SIGTERM PID $pid"
             kill -TERM "$pid" 2>/dev/null || true
         fi
@@ -658,7 +702,7 @@ cleanup() {
     for ((attempt = 0; attempt < 150; attempt++)); do
         local any_alive=0
         for pid in "${PIDS[@]:-}"; do
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            if [[ -n "$pid" ]] && managed_child_job_is_running "$pid"; then
                 any_alive=1
                 break
             fi
@@ -669,17 +713,21 @@ cleanup() {
 
     # 3. 最终兜底
     for pid in "${PIDS[@]:-}"; do
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if [[ -n "$pid" ]] && managed_child_job_is_running "$pid"; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
-        [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
+        if [[ -n "$pid" ]]; then
+            wait_for_managed_child "$pid"
+        fi
     done
     kill_known_processes KILL
 
-    if [[ -n "${FORCED_CLEANUP_PID:-}" ]] && kill -0 "${FORCED_CLEANUP_PID}" 2>/dev/null; then
+    if [[ -n "${FORCED_CLEANUP_PID:-}" ]] \
+        && managed_child_job_is_running "$FORCED_CLEANUP_PID"; then
         kill -TERM "${FORCED_CLEANUP_PID}" 2>/dev/null || true
-        wait "${FORCED_CLEANUP_PID}" 2>/dev/null || true
+        wait_for_managed_child "$FORCED_CLEANUP_PID"
     fi
+    FORCED_CLEANUP_PID=""
 
     if [[ -n "${UE_LIFECYCLE_DIR:-}" ]]; then
         rm -rf -- "$UE_LIFECYCLE_DIR"
@@ -688,6 +736,9 @@ cleanup() {
     # Retry once after child teardown if the display was transiently
     # unavailable at the beginning of cleanup.
     restore_remote_pointer_acceleration || true
+    if [[ "$CLEANUP_SIGNAL_PENDING" == "1" ]]; then
+        echo "[INFO] Deferred signal observed while cleanup was in progress"
+    fi
     echo "[INFO] ===== Cleanup finished ====="
     if [[ "$CLEANUP_FAILED" == "1" ]]; then
         echo "[ERROR] Matrix cleanup failed; refusing a successful exit" >&2
