@@ -1,0 +1,104 @@
+{
+  "schema": "matrix.locomotion-policy-candidate.v2",
+  "policy_id": "bfm-sonic-teacher50k",
+  "display_name": "BFM SONIC Teacher50k",
+  "slot": "locomotion",
+  "backend": "bfm-sonic-teacher-v2",
+  "source": {
+    "repository": "ssh://git@gitlab.xvirobotics.com:2222/bfms/bfm-sonic.git",
+    "commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25",
+    "main_at_handoff": "86522b848d3a4c7bcd532d36a3974e77bf00cf81",
+    "root_env": "MATRIX_BFM_SONIC_SOURCE_ROOT",
+    "checkpoint_path_hint": "/vepfs/users/fuhuiqiao/runs/bfm-sonic-t2-activeedge-formal-8h20-50k-retry2-20260715_033852/sonic/model_step_050000.pt"
+  },
+  "runtime_sources": [
+    {
+      "repository": "ssh://git@gitlab.xvirobotics.com:2222/bfms/bfm-sonic-realscan-play.git",
+      "commit": "850a71bef1e1472aaeb3ff4cb9004d9848830cfc",
+      "root_env": "MATRIX_BFM_RESCAN_SOURCE_ROOT"
+    },
+    {
+      "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/robo-pfnn.git",
+      "commit": "eb1b8b8001a221d2147f8daa073ca447acc8649e",
+      "root_env": "MATRIX_ROBO_PFNN_SOURCE_ROOT"
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "checkpoint",
+      "path_env": "MATRIX_BFM_SONIC_CHECKPOINT",
+      "sha256": "613274ee5956db59b8f2509c408619ee600e7b847c4609ad1643e6c7ffd410c1",
+      "executable": false
+    },
+    {
+      "name": "config",
+      "path_env": "MATRIX_BFM_SONIC_CONFIG",
+      "sha256": "e7bed95642a3627cc6f6cff416da784fe2d0841b697d0f34e7039fd73af10e3f",
+      "executable": false
+    },
+    {
+      "name": "teacher_onnx",
+      "path_env": "MATRIX_BFM_SONIC_TEACHER_ONNX",
+      "sha256": "edbec19062d6c34621dd97df864c596d29937432d8a019dd949d03785d9cdc45",
+      "executable": false
+    },
+    {
+      "name": "runtime_adapter",
+      "path_env": "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
+      "sha256": "3375ffc19f68cc5a2be5541712af656620dcbff27ff6c7209573ac1b395a4dae",
+      "executable": true
+    },
+    {
+      "name": "g1_xml",
+      "path_env": "MATRIX_BFM_SONIC_G1_XML",
+      "sha256": "8c586e4747da85804180fe44d8692e0fd8231356728b6327e256dca498087a78",
+      "executable": false
+    },
+    {
+      "name": "formal_ik",
+      "path_env": "MATRIX_BFM_SONIC_FORMAL_IK",
+      "sha256": "c8776f1e7651a4f179ea75e17b9746c41fa77a15be2cacf5809fe648340a7ab2",
+      "executable": false
+    }
+  ],
+  "trees": [
+    {
+      "name": "pfnn_weights",
+      "path_env": "MATRIX_BFM_SONIC_PFNN_WEIGHTS",
+      "sha256": "d1d0a7255a2f8898e81522570a09a3b56624fd7b955a2d7d02b87800f47585cb",
+      "file_count": 305
+    }
+  ],
+  "runtime_contract": {
+    "adapter_protocol": "matrix.locomotion-policy-writer.v1",
+    "model_input_dim": 1790,
+    "tokenizer_dim": 761,
+    "command_dim": 580,
+    "height_map_dim": 121,
+    "orientation_dim": 60,
+    "actor_observation_dim": 1029,
+    "history_length": 10,
+    "compatibility_zero_dim": 99,
+    "action_dim": 29,
+    "action_clip": 20,
+    "activation_blend_seconds": 0.1,
+    "activation_contract": "current-lowstate-smoothstep-no-teleport",
+    "standby_history_contract": "repeat-current-frame-zero-unapplied-actions",
+    "turn_reference_contract": "yaw-only-pfnn-forward-seed-v1",
+    "turn_reference_forward_mps": 0.00051,
+    "command_heading_contract": "matrix-wire-facing-formal7168-pd-v2",
+    "command_yaw_gain": 4.0,
+    "command_yaw_limit_rad_s": 1.5,
+    "turn_command_yaw_limit_rad_s": 0.6,
+    "turn_command_yaw_damping_seconds": 0.1,
+    "proxy99_exact_zero": true
+  },
+  "evidence": {
+    "first_core_document_id": "64413413-8f8f-4636-8d40-fd85b858cd65",
+    "second_core_mirror_id": "50b2254b-df5f-4f4b-8b26-4a649ec398f7",
+    "checkpoint_contract_commit": "ff3608c6e8b9af38a6116c7a41dd49a724c367d1",
+    "checkpoint_contract_path": "docs/autoresearch/student_full_scale_teacher50k_contract_20260720.md",
+    "runtime_contract_commit": "c3f607d161793037d5e8a73b89ee4286ef27780b",
+    "runtime_contract_path": "docs/manifests/student_v1_late_teacher_selection_20260717.json"
+  }
+}

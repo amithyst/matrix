@@ -88,6 +88,54 @@ class RecordingRunner:
 
 
 class HostPolicyTests(unittest.TestCase):
+    def test_resident_registry_keeps_flat_v3_as_an_independent_policy(self):
+        cascade = worker.HostPolicyCascade(
+            config=worker.HostControlConfig.create(),
+            runners=(RecordingRunner("host", [np.zeros(23)]),),
+            fallback_after_s=8.0,
+        )
+        amp_config = worker.PolicyConfig.from_mapping(amp_config_mapping())
+        legacy_amp = worker.AmpPolicyCore(
+            amp_config,
+            RecordingRunner("legacy_amp", [np.zeros(29)]),
+        )
+        flat_v3 = worker.AmpPolicyCore(
+            amp_config,
+            RecordingRunner("flat_v3", [np.ones(29)]),
+        )
+
+        registry = worker.build_resident_policy_registry(
+            cascade=cascade,
+            amp_hold_policy=legacy_amp,
+            amp_flat_v3_policy=flat_v3,
+            kungfu_policy=None,
+            execution_provider="cpu",
+        )
+
+        self.assertEqual(
+            registry.policy_ids,
+            ("host", "amp", "amp-flat-v3"),
+        )
+        legacy = registry.require("amp")
+        terrain = registry.require("amp-flat-v3")
+        self.assertEqual(legacy.controller, worker.AMP_GETUP_CONTROLLER)
+        self.assertEqual(
+            terrain.controller,
+            worker.AMP_FLAT_V3_GETUP_CONTROLLER,
+        )
+        self.assertIsNot(legacy, terrain)
+        state = snapshot()
+        terrain.start_episode(state, 10.0)
+        target = terrain.infer_target(state, 10.02)
+        np.testing.assert_allclose(
+            target,
+            amp_config.default_joint_pos + amp_config.action_scale,
+        )
+        self.assertEqual(
+            terrain.status_fields(10.10)["policy"],
+            "amp_flat_v3_m14000",
+        )
+
     def test_unitree_dds_publisher_lease_releases_for_next_episode(self):
         created = []
 

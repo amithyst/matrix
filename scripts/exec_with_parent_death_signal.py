@@ -27,12 +27,25 @@ def _parse_args() -> argparse.Namespace:
             "Use only for a leaf process whose exact PID is security-relevant."
         ),
     )
+    parser.add_argument(
+        "--argv0",
+        default=None,
+        help=(
+            "Override argv[0] for an exec-mode leaf while still executing the "
+            "exact command path."
+        ),
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command[:1] == ["--"]:
         args.command = args.command[1:]
     if not args.command:
         parser.error("a command is required after --")
+    if args.argv0 is not None:
+        if not args.exec_command:
+            parser.error("--argv0 requires --exec-command")
+        if not args.argv0 or "\0" in args.argv0:
+            parser.error("--argv0 must be a non-empty string without NUL")
     return args
 
 
@@ -95,7 +108,12 @@ def main() -> int:
         # parent-death signal armed above.  The game-input adapter is a leaf
         # process, so retaining a separate process-group reaper would only
         # obscure the SO_PEERCRED identity that the runtime must authenticate.
-        os.execvp(args.command[0], args.command)
+        exec_args = (
+            [args.argv0, *args.command[1:]]
+            if args.argv0 is not None
+            else args.command
+        )
+        os.execvpe(args.command[0], exec_args, os.environ)
         raise AssertionError("os.execvp returned unexpectedly")
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _terminate_process_group)

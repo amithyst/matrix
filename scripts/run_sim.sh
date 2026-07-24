@@ -26,6 +26,21 @@ MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
 MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
 MATRIX_UE_CAMERA_LAYOUT="${MATRIX_UE_CAMERA_LAYOUT:-$PROJECT_ROOT/config/runtime/matrix-ue-camera-layout-v1.json}"
+MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
+MATRIX_CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
+if [[ -n "$MATRIX_ITEM_INVENTORY_CATALOG" \
+    && -n "$MATRIX_CREATIVE_INVENTORY_CATALOG" \
+    && "$(realpath -m "$MATRIX_ITEM_INVENTORY_CATALOG")" \
+        != "$(realpath -m "$MATRIX_CREATIVE_INVENTORY_CATALOG")" ]]; then
+    echo "[ERROR] MATRIX_ITEM_INVENTORY_CATALOG conflicts with the legacy" \
+        "MATRIX_CREATIVE_INVENTORY_CATALOG alias" >&2
+    exit 1
+fi
+if [[ -z "$MATRIX_ITEM_INVENTORY_CATALOG" ]]; then
+    MATRIX_ITEM_INVENTORY_CATALOG="$MATRIX_CREATIVE_INVENTORY_CATALOG"
+fi
+MATRIX_CREATIVE_INVENTORY_CATALOG="$MATRIX_ITEM_INVENTORY_CATALOG"
+export MATRIX_ITEM_INVENTORY_CATALOG MATRIX_CREATIVE_INVENTORY_CATALOG
 CENTERED_CAMERA_OVERLAY_STEM="pakchunk99-MatrixCentered-Linux_P"
 MATRIX_GAME_CAMERA_DISTANCE_CM="${MATRIX_GAME_CAMERA_DISTANCE_CM:-150}"
 
@@ -704,12 +719,92 @@ USE_OFFSCREEN=""
 USE_PIXELSTREAMER=""
 [[ "$PIXELSTREAM" == "1" ]] && USE_PIXELSTREAMER="-PixelStreamingURL=ws://127.0.0.1:8888"
 
-UE_MAX_FPS="${MATRIX_UE_MAX_FPS:-30}"
+VIDEO_WIDTH="${MATRIX_VIDEO_APPLIED_WIDTH:-1920}"
+VIDEO_HEIGHT="${MATRIX_VIDEO_APPLIED_HEIGHT:-1080}"
+VIDEO_WINDOW_MODE="${MATRIX_VIDEO_APPLIED_WINDOW_MODE:-borderless}"
+VIDEO_QUALITY="${MATRIX_VIDEO_APPLIED_QUALITY:-high}"
+VIDEO_CAMERA_SMOOTHING="${MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING:-medium}"
+case "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" in
+    1280x720|1600x900|1920x1080|2560x1440) ;;
+    *)
+    echo "[ERROR] Invalid applied Matrix video resolution:" \
+        "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" >&2
+    exit 1
+        ;;
+esac
+case "$VIDEO_WINDOW_MODE" in
+    windowed) VIDEO_WINDOW_ARGS=(-windowed) ;;
+    borderless) VIDEO_WINDOW_ARGS=(-windowed -borderless) ;;
+    fullscreen) VIDEO_WINDOW_ARGS=(-fullscreen) ;;
+    *)
+        echo "[ERROR] Invalid Matrix video window mode: $VIDEO_WINDOW_MODE" >&2
+        exit 1
+        ;;
+esac
+case "$VIDEO_QUALITY" in
+    low) VIDEO_QUALITY_LEVEL=0 ;;
+    medium) VIDEO_QUALITY_LEVEL=1 ;;
+    high) VIDEO_QUALITY_LEVEL=2 ;;
+    epic) VIDEO_QUALITY_LEVEL=3 ;;
+    *)
+        echo "[ERROR] Invalid Matrix video quality preset: $VIDEO_QUALITY" >&2
+        exit 1
+        ;;
+esac
+case "$VIDEO_CAMERA_SMOOTHING" in
+    off)
+        VIDEO_CAMERA_LAG=false
+        VIDEO_CAMERA_LAG_SPEED=12
+        ;;
+    low)
+        VIDEO_CAMERA_LAG=true
+        VIDEO_CAMERA_LAG_SPEED=12
+        ;;
+    medium)
+        VIDEO_CAMERA_LAG=true
+        VIDEO_CAMERA_LAG_SPEED=8
+        ;;
+    high)
+        VIDEO_CAMERA_LAG=true
+        VIDEO_CAMERA_LAG_SPEED=4
+        ;;
+    *)
+        echo "[ERROR] Invalid Matrix camera smoothing preset:" \
+            "$VIDEO_CAMERA_SMOOTHING" >&2
+        exit 1
+        ;;
+esac
+UE_MAX_FPS="${MATRIX_VIDEO_APPLIED_FPS_LIMIT:-${MATRIX_UE_MAX_FPS:-30}}"
 if [[ ! "$UE_MAX_FPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] MATRIX_UE_MAX_FPS must be a non-negative number: $UE_MAX_FPS" >&2
     exit 1
 fi
+case "$UE_MAX_FPS" in
+    30|60|90|120) ;;
+    *)
+        echo "[ERROR] Matrix video FPS must be one of 30/60/90/120:" \
+            "$UE_MAX_FPS" >&2
+        exit 1
+        ;;
+esac
+VIDEO_REVISION="${MATRIX_VIDEO_APPLIED_REVISION:-0}"
+if [[ ! "$VIDEO_REVISION" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] Invalid Matrix video settings revision: $VIDEO_REVISION" >&2
+    exit 1
+fi
+if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
+    MATRIX_VIDEO_APPLIED_JSON="$(
+        printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+            "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+            "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
+            "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
+    )"
+    export MATRIX_VIDEO_APPLIED_JSON
+fi
 UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS,r.MotionBlurQuality 0"
+for group in ViewDistance AntiAliasing Shadow PostProcess Texture Effects Foliage Shading; do
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},sg.${group}Quality ${VIDEO_QUALITY_LEVEL}"
+done
 
 #######################################
 # 场景配置
@@ -980,8 +1075,10 @@ PY
                 ;;
         esac
     fi
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag False"
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag False"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag ${VIDEO_CAMERA_LAG}"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag ${VIDEO_CAMERA_LAG}"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent CameraLagSpeed ${VIDEO_CAMERA_LAG_SPEED}"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent CameraRotationLagSpeed ${VIDEO_CAMERA_LAG_SPEED}"
     UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bDoCollisionTest True"
     if $CENTERED_CAMERA_OVERLAY_ENABLED; then
         UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent TargetArmLength ${MATRIX_GAME_CAMERA_DISTANCE_CM}"
@@ -1279,6 +1376,9 @@ else
 fi
 UE_COMMAND+=(
     -game "$MAPNAME"
+    "-ResX=$VIDEO_WIDTH"
+    "-ResY=$VIDEO_HEIGHT"
+    "${VIDEO_WINDOW_ARGS[@]}"
     # The stock cooked package enables UE's legacy PlayerInput mouse
     # smoothing.  Override it in the Input config hierarchy so a released
     # drag has no interpolated tail; disabling FOV scaling also keeps one
@@ -1338,10 +1438,22 @@ if $MATRIX_SONIC_ENABLED; then
     if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         for required in \
             "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+            "$PROJECT_ROOT/scripts/matrix_external_control.py" \
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
             "$PROJECT_ROOT/scripts/matrix_ui_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_video_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_item_asset_pack.py" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_ephemeris.py" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" \
+            "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
             "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
+            "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
             "$PROJECT_ROOT/scripts/matrix_world_state.py" \
+            "$PROJECT_ROOT/config/universe/sol-2080.json" \
+            "$PROJECT_ROOT/config/universe/de440s-2080.lock.json" \
+            "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
             "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
             "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
             if [[ ! -f "$required" ]]; then
@@ -1349,6 +1461,30 @@ if $MATRIX_SONIC_ENABLED; then
                 exit 1
             fi
         done
+        CELESTIAL_PREFLIGHT_ARGS=(
+            validate
+            --catalog "$PROJECT_ROOT/config/universe/sol-2080.json"
+            --asset-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
+        )
+        if [[ -n "${MATRIX_CELESTIAL_SPK:-}" \
+            || -n "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+            if [[ -z "${MATRIX_CELESTIAL_SPK:-}" \
+                || -z "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+                echo "[ERROR] Matrix celestial assets are all-or-none" >&2
+                exit 1
+            fi
+            CELESTIAL_PREFLIGHT_ARGS+=(
+                --de440s-kernel "$MATRIX_CELESTIAL_SPK"
+                --jplephem-wheel "$MATRIX_CELESTIAL_JPLEPHEM_WHEEL"
+            )
+        fi
+        "$MATRIX_SONIC_PYTHON" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
+            "${CELESTIAL_PREFLIGHT_ARGS[@]}"
+        "$MATRIX_SONIC_PYTHON" \
+            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" validate \
+            --catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
+            --profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
     fi
     for required in \
         "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
@@ -1373,6 +1509,7 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_SPAWN_ARGS=()
     SONIC_WORLD_ARGS=()
     SONIC_SCENE_TRANSFORM_ARGS=()
+    SONIC_DYNAMIC_GROUND_ARGS=()
     SONIC_INVENTORY_ARGS=()
     if [[ -n "${MATRIX_CREATIVE_INVENTORY_CATALOG:-}" ]]; then
         if [[ ! -f "$MATRIX_CREATIVE_INVENTORY_CATALOG" ]]; then
@@ -1395,9 +1532,22 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
-            --scene-transform moon-dynamic-ground-static-v1
+            --scene-transform moon-dynamic-ground-mocap-v3
         )
-        echo "[INFO] MoonWorld dynamic ground blocks staticized in derived SONIC physics scene"
+        SONIC_DYNAMIC_GROUND_ARGS=(
+            --moon-dynamic-map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
+            --moon-dynamic-map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+        )
+        echo "[INFO] MoonWorld rolling collision tiles enabled from locked dynamic height map"
+    fi
+    if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
+        && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
+        SONIC_SPAWN_ARGS=(
+            --spawn-x "0"
+            --spawn-y "0"
+            --spawn-z "-0.1366965003013611"
+        )
+        echo "[INFO] MoonWorld map-default spawn aligned to locked terrain height"
     fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
@@ -1412,7 +1562,8 @@ if $MATRIX_SONIC_ENABLED; then
                 --native-scene "$NATIVE_SONIC_SCENE" \
                 --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
                 --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES" \
-                "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
+                "${SONIC_SCENE_TRANSFORM_ARGS[@]}" \
+                "${SONIC_INVENTORY_ARGS[@]}"
         )"
         GAME_WORLD_STATE_FILE="${MATRIX_GAME_WORLD_STATE_FILE:-}"
         if [[ -z "$GAME_WORLD_STATE_FILE" ]]; then
@@ -1427,19 +1578,26 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] MATRIX_GAME_WORLD_STATE_FILE must be absolute" >&2
             exit 1
         fi
+        GAME_CELESTIAL_CLOCK_STATE_FILE="${MATRIX_CELESTIAL_CLOCK_STATE_FILE:-$(dirname "$GAME_WORLD_STATE_FILE")/universe-sol-2080-clock.json}"
+        if [[ "$GAME_CELESTIAL_CLOCK_STATE_FILE" != /* ]]; then
+            echo "[ERROR] MATRIX_CELESTIAL_CLOCK_STATE_FILE must be absolute" >&2
+            exit 1
+        fi
         if ! GAME_WORLD_START_OUTPUT="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 resolve-start \
                 --file "$GAME_WORLD_STATE_FILE" \
                 --world-id "$GAME_WORLD_ID" \
-                --world-revision "$GAME_WORLD_REVISION"
+                --world-revision "$GAME_WORLD_REVISION" \
+                --include-checkpoint-meta
         )"; then
             echo "[ERROR] Could not resolve the Matrix world resume pose" >&2
             exit 1
         fi
         mapfile -t GAME_WORLD_START_LINES <<<"$GAME_WORLD_START_OUTPUT"
         if [[ "${GAME_WORLD_START_LINES[0]:-}" == "pose" ]]; then
-            if [[ "${#GAME_WORLD_START_LINES[@]}" != "7" ]]; then
+            if [[ "${#GAME_WORLD_START_LINES[@]}" != "9" \
+                || ! "${GAME_WORLD_START_LINES[8]}" =~ ^[0-9]+$ ]]; then
                 echo "[ERROR] Invalid Matrix world-state pose response" >&2
                 exit 1
             fi
@@ -1450,11 +1608,16 @@ if $MATRIX_SONIC_ENABLED; then
                 --spawn-yaw "${GAME_WORLD_START_LINES[4]}"
             )
             echo "[INFO] Matrix resume pose: ${GAME_WORLD_START_LINES[5]} " \
-                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]}"
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]} " \
+                "checkpoint=${GAME_WORLD_START_LINES[7]} " \
+                "generation=${GAME_WORLD_START_LINES[8]}"
         elif [[ "${GAME_WORLD_START_LINES[0]:-}" == "none" \
-            && "${#GAME_WORLD_START_LINES[@]}" == "2" ]]; then
+            && "${#GAME_WORLD_START_LINES[@]}" == "4" \
+            && "${GAME_WORLD_START_LINES[2]}" == "none" \
+            && "${GAME_WORLD_START_LINES[3]}" =~ ^[0-9]+$ ]]; then
             echo "[INFO] Matrix resume pose: map default " \
-                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]}"
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]} " \
+                "generation=${GAME_WORLD_START_LINES[3]}"
         else
             echo "[ERROR] Invalid Matrix world-state helper response" >&2
             exit 1
@@ -1463,8 +1626,16 @@ if $MATRIX_SONIC_ENABLED; then
             --game-world-id "$GAME_WORLD_ID"
             --game-world-revision "$GAME_WORLD_REVISION"
             --game-world-state-file "$GAME_WORLD_STATE_FILE"
+            --game-celestial-clock-state-file "$GAME_CELESTIAL_CLOCK_STATE_FILE"
             --game-world-checkpoint-seconds "${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
+            --game-resume-rollback-count "${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
         )
+        if [[ "${GAME_WORLD_START_LINES[7]:-none}" != "none" ]]; then
+            SONIC_WORLD_ARGS+=(
+                --game-world-resume-checkpoint-id "${GAME_WORLD_START_LINES[7]}"
+                --game-world-resume-generation "${GAME_WORLD_START_LINES[8]}"
+            )
+        fi
         case "${MATRIX_GAME_AUTO_RESPAWN:-0}" in
             1|true|yes|on) SONIC_WORLD_ARGS+=(--game-auto-respawn) ;;
             0|false|no|off|"") ;;
@@ -1551,6 +1722,10 @@ if $MATRIX_SONIC_ENABLED; then
             PHYSICAL_RECOVERY_AMP_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL:-}"
             PHYSICAL_RECOVERY_AMP_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256:-}"
             PHYSICAL_RECOVERY_AMP_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256:-}"
+            PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256:-}"
             PHYSICAL_RECOVERY_KUNGFU_MODEL="${MATRIX_KUNGFU_RECOVERY_MODEL:-}"
             PHYSICAL_RECOVERY_KUNGFU_MOTION="${MATRIX_KUNGFU_RECOVERY_MOTION:-}"
             PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256="${MATRIX_KUNGFU_RECOVERY_MODEL_SHA256:-}"
@@ -1561,9 +1736,9 @@ if $MATRIX_SONIC_ENABLED; then
             PHYSICAL_RECOVERY_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_CONTROL_SOCKET:-}"
             PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET:-}"
             case "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" in
-                host|amp|kungfu) ;;
+                host|amp|amp-flat-v3|kungfu) ;;
                 *)
-                    echo "[ERROR] Physical recovery initial controller must be host, amp, or kungfu" >&2
+                    echo "[ERROR] Physical recovery initial controller must be host, amp, amp-flat-v3, or kungfu" >&2
                     exit 1
                     ;;
             esac
@@ -1641,6 +1816,41 @@ PY
                     exit 1
                 fi
             done
+            flat_v3_present=0
+            for value in \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL" \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
+                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
+                if [[ -n "$value" ]]; then
+                    flat_v3_present=$((flat_v3_present + 1))
+                fi
+            done
+            if ((flat_v3_present != 0 && flat_v3_present != 4)); then
+                echo "[ERROR] AMP flat_v3 requires config, model, and both SHA256 values" >&2
+                exit 1
+            fi
+            if ((flat_v3_present == 4)); then
+                for flat_v3_file in \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"; do
+                    if [[ ! -f "$flat_v3_file" ]]; then
+                        echo "[ERROR] AMP flat_v3 artifact is missing: $flat_v3_file" >&2
+                        exit 1
+                    fi
+                done
+                for digest in \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
+                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
+                    if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+                        echo "[ERROR] AMP flat_v3 SHA256 is invalid" >&2
+                        exit 1
+                    fi
+                done
+            elif [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "amp-flat-v3" ]]; then
+                echo "[ERROR] amp-flat-v3 initial recovery requires its locked artifacts" >&2
+                exit 1
+            fi
             if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then
                 for kungfu_file in \
                     "$PHYSICAL_RECOVERY_KUNGFU_MODEL" \
@@ -1714,6 +1924,14 @@ PY
                     --physical-recovery-fallback-model "$PHYSICAL_RECOVERY_FALLBACK_MODEL"
                 )
             fi
+            if ((flat_v3_present == 4)); then
+                PHYSICAL_RECOVERY_ARGS+=(
+                    --physical-recovery-amp-flat-v3-config "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG"
+                    --physical-recovery-amp-flat-v3-model "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"
+                    --physical-recovery-amp-flat-v3-config-sha256 "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256"
+                    --physical-recovery-amp-flat-v3-model-sha256 "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"
+                )
+            fi
             if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then
                 PHYSICAL_RECOVERY_ARGS+=(
                     --physical-recovery-kungfu-model "$PHYSICAL_RECOVERY_KUNGFU_MODEL"
@@ -1753,8 +1971,59 @@ PY
         && "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         GAME_INPUT_PROVIDER_PYTHON="$MATRIX_SONIC_PYTHON"
     fi
+    GAME_INPUT_SOCKET_VALUE="${MATRIX_GAME_INPUT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}.sock}"
+    GAME_EXTERNAL_CONTROL_ARGS=()
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+        EXTERNAL_CONTROL_SOCKET="${MATRIX_GAME_EXTERNAL_CONTROL_SOCKET:-}"
+        EXTERNAL_CONTROL_CAPABILITY_FILE="${MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE:-}"
+        if [[ -n "$EXTERNAL_CONTROL_SOCKET" \
+            && -z "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]] \
+            || [[ -z "$EXTERNAL_CONTROL_SOCKET" \
+                && -n "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]]; then
+            echo "[ERROR] Matrix external-control socket/capability are all-or-none" >&2
+            exit 1
+        fi
+        if [[ -z "$EXTERNAL_CONTROL_SOCKET" ]]; then
+            EXTERNAL_CONTROL_PROFILE="${MATRIX_PROFILE:-local}"
+            if [[ ! "$EXTERNAL_CONTROL_PROFILE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+                echo "[ERROR] Invalid Matrix external-control profile: $EXTERNAL_CONTROL_PROFILE" >&2
+                exit 1
+            fi
+            EXTERNAL_CONTROL_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/matrix-external-control-${UID}"
+            if ! /usr/bin/python3 -I - "$EXTERNAL_CONTROL_RUNTIME_DIR" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+try:
+    path.mkdir(mode=0o700)
+except FileExistsError:
+    pass
+metadata = path.stat(follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+    raise SystemExit("external-control runtime path is not an owned directory")
+os.chmod(path, 0o700, follow_symlinks=False)
+PY
+            then
+                echo "[ERROR] Could not prepare private Matrix external-control runtime directory" >&2
+                exit 1
+            fi
+            EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.sock"
+            EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.cap"
+        fi
+        export MATRIX_GAME_EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_SOCKET"
+        export MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_CAPABILITY_FILE"
+        export MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS="${MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS:-0.15}"
+        GAME_EXTERNAL_CONTROL_ARGS=(
+            --game-external-control-socket "$MATRIX_GAME_EXTERNAL_CONTROL_SOCKET"
+            --game-external-control-capability-file "$MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE"
+            --game-external-control-deadman-seconds "$MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS"
+        )
+    fi
     GAME_INPUT_ARGS=(
-        --game-input-socket "${MATRIX_GAME_INPUT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}.sock}"
+        --game-input-socket "$GAME_INPUT_SOCKET_VALUE"
         --game-input-provider "$PROJECT_ROOT/scripts/matrix_game_control_input.py"
         --game-input-provider-python "$GAME_INPUT_PROVIDER_PYTHON"
         --game-input-source "${MATRIX_GAME_INPUT_SOURCE:-auto}"
@@ -1763,12 +2032,19 @@ PY
         --game-initial-camera-yaw-deg "${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
         --game-mouse-sensitivity-deg "${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
         --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+        --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-local}/motion-control.json}"
+        --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-local}/video-settings.json}"
+        --game-applied-video-settings-json "${MATRIX_VIDEO_APPLIED_JSON:-}"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
         --game-camera-yaw-offset-deg "${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
         --game-carla-host "${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
         --game-carla-port "${MATRIX_GAME_CARLA_PORT:-2000}"
+        --game-celestial-lighting-bridge "${MATRIX_CELESTIAL_LIGHTING_BRIDGE:-state-only}"
+        --game-celestial-assets-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
+        --game-celestial-visual-catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json"
+        --game-celestial-visual-profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
         --gamepad-look-yaw-rate-deg-s "${MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S:-120.0}"
         --gamepad-look-pitch-rate-deg-s "${MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S:-90.0}"
         --gamepad-look-deadzone "${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
@@ -1780,11 +2056,32 @@ PY
         --game-max-acceleration "${MATRIX_GAME_MAX_ACCELERATION:-1.20}"
         --game-max-deceleration "${MATRIX_GAME_MAX_DECELERATION:-2.40}"
         --game-max-turn-rate "${MATRIX_GAME_MAX_TURN_RATE:-2.50}"
+        --game-keyboard-slow-speed "${MATRIX_GAME_KEYBOARD_SLOW_SPEED:-0.10}"
+        --game-keyboard-slow-boost-speed "${MATRIX_GAME_KEYBOARD_SLOW_BOOST_SPEED:-0.20}"
+        --game-keyboard-walk-speed "${MATRIX_GAME_KEYBOARD_WALK_SPEED:-0.80}"
+        --game-keyboard-walk-boost-speed "${MATRIX_GAME_KEYBOARD_WALK_BOOST_SPEED:-1.00}"
+        --game-keyboard-run-speed "${MATRIX_GAME_KEYBOARD_RUN_SPEED:-2.50}"
+        --game-keyboard-run-boost-speed "${MATRIX_GAME_KEYBOARD_RUN_BOOST_SPEED:-2.75}"
+        --game-keyboard-double-tap-window "${MATRIX_GAME_KEYBOARD_DOUBLE_TAP_WINDOW:-0.30}"
         --game-stick-deadzone "${MATRIX_GAME_STICK_DEADZONE:-0.15}"
         --game-input-timeout "${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
         --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
+    GAME_INPUT_ARGS+=("${GAME_EXTERNAL_CONTROL_ARGS[@]}")
+    if [[ -n "${MATRIX_CELESTIAL_SPK:-}" \
+        || -n "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+        if [[ -z "${MATRIX_CELESTIAL_SPK:-}" \
+            || -z "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
+            echo "[ERROR] MATRIX_CELESTIAL_SPK and " \
+                "MATRIX_CELESTIAL_JPLEPHEM_WHEEL are all-or-none" >&2
+            exit 1
+        fi
+        GAME_INPUT_ARGS+=(
+            --game-celestial-de440s-kernel "$MATRIX_CELESTIAL_SPK"
+            --game-celestial-jplephem-wheel "$MATRIX_CELESTIAL_JPLEPHEM_WHEEL"
+        )
+    fi
     if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
         if [[ -z "$UE_CAMERA_STATE_FILE" ]]; then
             echo "[ERROR] UE final-POV state file was not initialized" >&2
@@ -1831,6 +2128,7 @@ PY
         --min-physics-hz "${MATRIX_SONIC_MIN_PHYSICS_HZ:-195}" \
         --min-rtf "${MATRIX_SONIC_MIN_RTF:-0.95}" \
         --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
+        "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
         "${PHYSICAL_RECOVERY_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \
@@ -1920,14 +2218,24 @@ PY
         then
             echo "[ERROR] Failed to merge the UE lifecycle failure into status" >&2
         fi
-        # Exit 75 is authority only for a clean, status-verified world reload.
-        # A UE failure observed at this late boundary must invalidate it just as
-        # it invalidates an otherwise-successful zero exit; otherwise the outer
-        # launcher can mistake a concurrent UE crash for an authorized teleport
-        # or fall respawn.
-        if [[ "$SONIC_EXIT_CODE" == "0" || "$SONIC_EXIT_CODE" == "75" ]]; then
+        # Exit 75 is authority only for a clean, status-verified world reload;
+        # exit 76 is only a proposal to quarantine one failed resume checkpoint.
+        # A UE failure observed at this late boundary invalidates both before the
+        # outer launcher can restart or commit the proposed state mutation.
+        if [[ "$SONIC_EXIT_CODE" == "0" \
+            || "$SONIC_EXIT_CODE" == "75" \
+            || "$SONIC_EXIT_CODE" == "76" ]]; then
             SONIC_EXIT_CODE=2
         fi
+    fi
+    # Privileged runner exits (75=verified world reload, 76=resume rollback
+    # proposal) are not allowed to cross the process-cleanup boundary on their
+    # own.  Run cleanup explicitly while its return value is still observable;
+    # Bash preserves an explicit exit status even when an EXIT trap later
+    # returns non-zero.  cleanup() is idempotent, so the EXIT trap becomes a
+    # no-op after this call.
+    if ! cleanup; then
+        SONIC_EXIT_CODE=2
     fi
     echo "[INFO] Matrix SONIC runtime exited with code $SONIC_EXIT_CODE"
     exit "$SONIC_EXIT_CODE"

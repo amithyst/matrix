@@ -1,0 +1,132 @@
+{
+  "schema": "matrix-celestial-visual-profiles/v1",
+  "source": {
+    "project": "carla-simulator/carla",
+    "url": "https://github.com/carla-simulator/carla",
+    "revision": "d7b45c1e159e6d13296f7a3a4e8b13e6c2d62c18",
+    "path": "LibCarla/source/carla/rpc/WeatherParameters.cpp",
+    "license": "MIT"
+  },
+  "default_profiles": {
+    "earth": "earth-wet-cloudy-v1",
+    "moon": "moon-vacuum-v1",
+    "mars": "mars-dust-v1"
+  },
+  "profiles": [
+    {
+      "id": "earth-clear-v1",
+      "display_name": "Earth Clear",
+      "body_id": "earth",
+      "atmosphere": "earth_nitrogen_oxygen",
+      "renderer": "carla-weather-v1",
+      "basis": "CARLA WeatherParameters ClearNoon with ephemeris Sun angles",
+      "derivation": "upstream-preset",
+      "weather_parameters": {
+        "cloudiness": 5.0,
+        "precipitation": 0.0,
+        "precipitation_deposits": 0.0,
+        "wind_intensity": 10.0,
+        "fog_density": 2.0,
+        "fog_distance": 0.75,
+        "fog_falloff": 0.1,
+        "wetness": 0.0,
+        "scattering_intensity": 1.0,
+        "mie_scattering_scale": 0.03,
+        "rayleigh_scattering_scale": 0.0331,
+        "dust_storm": 0.0
+      }
+    },
+    {
+      "id": "earth-wet-cloudy-v1",
+      "display_name": "Earth Wet Cloudy",
+      "body_id": "earth",
+      "atmosphere": "earth_nitrogen_oxygen",
+      "renderer": "carla-weather-v1",
+      "basis": "CARLA WeatherParameters WetCloudyNoon with ephemeris Sun angles",
+      "derivation": "upstream-preset",
+      "weather_parameters": {
+        "cloudiness": 60.0,
+        "precipitation": 0.0,
+        "precipitation_deposits": 50.0,
+        "wind_intensity": 10.0,
+        "fog_density": 3.0,
+        "fog_distance": 0.75,
+        "fog_falloff": 0.1,
+        "wetness": 0.0,
+        "scattering_intensity": 1.0,
+        "mie_scattering_scale": 0.03,
+        "rayleigh_scattering_scale": 0.0331,
+        "dust_storm": 0.0
+      }
+    },
+    {
+      "id": "earth-soft-rain-v1",
+      "display_name": "Earth Soft Rain",
+      "body_id": "earth",
+      "atmosphere": "earth_nitrogen_oxygen",
+      "renderer": "carla-weather-v1",
+      "basis": "CARLA WeatherParameters SoftRainNoon with ephemeris Sun angles",
+      "derivation": "upstream-preset",
+      "weather_parameters": {
+        "cloudiness": 20.0,
+        "precipitation": 30.0,
+        "precipitation_deposits": 50.0,
+        "wind_intensity": 30.0,
+        "fog_density": 3.0,
+        "fog_distance": 0.75,
+        "fog_falloff": 0.1,
+        "wetness": 0.0,
+        "scattering_intensity": 1.0,
+        "mie_scattering_scale": 0.03,
+        "rayleigh_scattering_scale": 0.0331,
+        "dust_storm": 0.0
+      }
+    },
+    {
+      "id": "moon-vacuum-v1",
+      "display_name": "Moon Vacuum",
+      "body_id": "moon",
+      "atmosphere": "vacuum",
+      "renderer": "carla-weather-v1",
+      "basis": "CARLA weather channels disabled for a vacuum renderer adapter",
+      "derivation": "physical-adapter",
+      "weather_parameters": {
+        "cloudiness": 0.0,
+        "precipitation": 0.0,
+        "precipitation_deposits": 0.0,
+        "wind_intensity": 0.0,
+        "fog_density": 0.0,
+        "fog_distance": 0.0,
+        "fog_falloff": 0.0,
+        "wetness": 0.0,
+        "scattering_intensity": 0.0,
+        "mie_scattering_scale": 0.0,
+        "rayleigh_scattering_scale": 0.0,
+        "dust_storm": 0.0
+      }
+    },
+    {
+      "id": "mars-dust-v1",
+      "display_name": "Mars Dust",
+      "body_id": "mars",
+      "atmosphere": "mars_carbon_dioxide_thin",
+      "renderer": "carla-weather-v1",
+      "basis": "CARLA WeatherParameters DustStorm compatibility profile",
+      "derivation": "upstream-preset",
+      "weather_parameters": {
+        "cloudiness": 100.0,
+        "precipitation": 0.0,
+        "precipitation_deposits": 0.0,
+        "wind_intensity": 100.0,
+        "fog_density": 2.0,
+        "fog_distance": 0.75,
+        "fog_falloff": 0.1,
+        "wetness": 0.0,
+        "scattering_intensity": 1.0,
+        "mie_scattering_scale": 0.03,
+        "rayleigh_scattering_scale": 0.0331,
+        "dust_storm": 100.0
+      }
+    }
+  ]
+}

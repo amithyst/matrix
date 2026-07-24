@@ -1,6 +1,14 @@
 {
   "schema_version": 2,
   "runtime_id": "matrix-sonic-native-v2",
+  "policy_slots": {
+    "manifests": [
+      {
+        "path": "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
+        "sha256": "8e53b2604cd0a8334144677522ae0c2da54daeff010efebd7c40a73e7a916d1b"
+      }
+    ]
+  },
   "source": {
     "repository": "https://github.com/amithyst/matrix",
     "base_commit": "6609ad59e65b8a360b0de288d126477ea6034c34"
@@ -170,7 +178,7 @@
   "source_revisions": {
     "gr00t_whole_body_control": {
       "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/GR00T-WholeBodyControl.git",
-      "commit": "de083d71af8346b0124ab1ae79fd3623b52c3c9b",
+      "commit": "e19b627f544b2f57bd245800d0e8e91c5a678bbd",
       "critical_source_paths": [
         "gear_sonic/scripts/run_sim_loop.py",
         "gear_sonic/utils/mujoco_sim/configs.py",
@@ -186,6 +194,8 @@
         "gear_sonic/trl/utils/rotation_conversion.py",
         "gear_sonic/trl/utils/torch_transform.py",
         "gear_sonic/scripts/pico_manager_thread_server.py",
+        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/localmotion_kplanner.hpp",
+        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
         "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
         "gear_sonic_deploy/policy/release/observation_config.yaml"
       ]
@@ -210,7 +220,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic/utils/mujoco_sim/base_sim.py",
-      "sha256": "675772ddf30f1e63dc69d5c02cbefaccb77013114422b057245054f5f6a5dfaf"
+      "sha256": "31b5518c4636bac7f62757ace09e211c9667d7f057aad055698c59787574a402"
     },
     {
       "root": "sonic",
@@ -220,7 +230,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic/utils/mujoco_sim/unitree_sdk2py_bridge.py",
-      "sha256": "b1f38bbaa584c4754a7d04384e08c469e1c2d167990ea920ad4e5384f7046359"
+      "sha256": "a2703452601fd21e36763afa8cd70110b35677b2f909a265f632bef52cefcef3"
     },
     {
       "root": "sonic",
@@ -269,6 +279,16 @@
     },
     {
       "root": "sonic",
+      "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/localmotion_kplanner.hpp",
+      "sha256": "cd7c46763d5cc13ba05fad5c421667ffceb256138faa5ac9e403938172cbeb93"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+      "sha256": "5188eac0de5989bdb5dbd7446475fb4cd4f4906b30f760135a0a2dbe1a301420"
+    },
+    {
+      "root": "sonic",
       "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
       "sha256": "00b4e3d74fcc4a63aae8cc26466a99c33eaa1e6683f2858b059486d9a0f147b5"
     },
@@ -280,7 +300,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
-      "sha256": "bf9b2362ed750b6b3f67c33197517474cd18a331d7e3d1c652cfdd740203c21e"
+      "sha256": "b70f1c78ef0547f8bd29823e65ea3910f3e8a31d50c3678e9eba4852071cf2a6"
     },
     {
       "root": "sonic",

@@ -25,10 +25,12 @@ import struct
 from typing import Any, Mapping, Sequence
 
 
-PROTOCOL_NAME = "matrix-game-input/v2"
+PROTOCOL_NAME = "matrix-game-input/v3"
 MAX_PACKET_BYTES = 4096
 _UNSET_SOCKET_TIMEOUT = object()
-_KEY_NAMES = frozenset(("w", "a", "s", "d", "q", "e", "v", "ctrl", "shift"))
+_KEY_NAMES = frozenset(
+    ("w", "a", "s", "d", "q", "e", "v", "ctrl", "alt", "shift")
+)
 _STICK_NAMES = frozenset(("right", "forward"))
 _TOP_LEVEL_NAMES = frozenset(
     (
@@ -37,6 +39,7 @@ _TOP_LEVEL_NAMES = frozenset(
         "timestamp_monotonic_s",
         "focused",
         "camera_yaw_rad",
+        "keyboard_boost",
         "keys",
         "move_stick",
     )
@@ -90,8 +93,8 @@ class KeySnapshot:
     """Current key state, including keyboard-only speed modifiers.
 
     Q/E are carried for future actions but never contribute to locomotion.
-    Ctrl/Shift select a digital-WASD speed tier; they do not quantize gamepad
-    input, whose magnitude remains continuous.
+    Ctrl/Alt/Shift select a digital-WASD speed tier; they do not quantize
+    gamepad input, whose magnitude remains continuous.
     """
 
     w: bool
@@ -102,6 +105,7 @@ class KeySnapshot:
     e: bool
     v: bool
     ctrl: bool = False
+    alt: bool = False
     shift: bool = False
 
     def __post_init__(self) -> None:
@@ -156,6 +160,7 @@ class InputSnapshot:
     camera_yaw_rad: float
     keys: KeySnapshot
     move_stick: MoveStickSnapshot
+    keyboard_boost: bool = False
     protocol: str = PROTOCOL_NAME
 
     def __post_init__(self) -> None:
@@ -175,10 +180,18 @@ class InputSnapshot:
         if type(self.focused) is not bool:
             raise InputProtocolError("focused must be a boolean")
         yaw = _finite_number(self.camera_yaw_rad, name="camera_yaw_rad")
+        if type(self.keyboard_boost) is not bool:
+            raise InputProtocolError("keyboard_boost must be a boolean")
         if not isinstance(self.keys, KeySnapshot):
             raise InputProtocolError("keys must be a KeySnapshot")
         if not isinstance(self.move_stick, MoveStickSnapshot):
             raise InputProtocolError("move_stick must be a MoveStickSnapshot")
+        if self.keyboard_boost and not any(
+            (self.keys.w, self.keys.a, self.keys.s, self.keys.d)
+        ):
+            raise InputProtocolError(
+                "keyboard_boost requires at least one pressed WASD key"
+            )
         object.__setattr__(self, "timestamp_monotonic_s", timestamp)
         object.__setattr__(self, "camera_yaw_rad", yaw)
 
@@ -192,6 +205,7 @@ class InputSnapshot:
             timestamp_monotonic_s=mapping["timestamp_monotonic_s"],
             focused=mapping["focused"],
             camera_yaw_rad=mapping["camera_yaw_rad"],
+            keyboard_boost=mapping["keyboard_boost"],
             keys=KeySnapshot.from_mapping(mapping["keys"]),
             move_stick=MoveStickSnapshot.from_mapping(mapping["move_stick"]),
         )
@@ -203,6 +217,7 @@ class InputSnapshot:
             "timestamp_monotonic_s": self.timestamp_monotonic_s,
             "focused": self.focused,
             "camera_yaw_rad": self.camera_yaw_rad,
+            "keyboard_boost": self.keyboard_boost,
             "keys": self.keys.to_mapping(),
             "move_stick": self.move_stick.to_mapping(),
         }
@@ -342,6 +357,11 @@ KEYBOARD_GAIT_TARGETS_MPS = {
     SONIC_WALK_MODE: 0.80,
     SONIC_RUN_MODE: 2.50,
 }
+KEYBOARD_GAIT_BOOST_TARGETS_MPS = {
+    SONIC_SLOW_WALK_MODE: 0.20,
+    SONIC_WALK_MODE: 1.00,
+    SONIC_RUN_MODE: 2.75,
+}
 DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
 # A feedback-backed facing target may lead the measured body by at most one
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
@@ -399,6 +419,20 @@ class ControlConfig:
     max_acceleration_mps2: float = 1.20
     max_deceleration_mps2: float = 2.40
     max_turn_rate_rad_s: float = 2.50
+    keyboard_slow_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[
+        SONIC_SLOW_WALK_MODE
+    ]
+    keyboard_slow_boost_speed_mps: float = KEYBOARD_GAIT_BOOST_TARGETS_MPS[
+        SONIC_SLOW_WALK_MODE
+    ]
+    keyboard_walk_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE]
+    keyboard_walk_boost_speed_mps: float = KEYBOARD_GAIT_BOOST_TARGETS_MPS[
+        SONIC_WALK_MODE
+    ]
+    keyboard_run_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE]
+    keyboard_run_boost_speed_mps: float = KEYBOARD_GAIT_BOOST_TARGETS_MPS[
+        SONIC_RUN_MODE
+    ]
     min_gait_speed_mps: float = 0.10
     gait_start_speed_mps: float = 0.10
     gait_stop_speed_mps: float = 0.08
@@ -417,6 +451,12 @@ class ControlConfig:
             "max_acceleration_mps2",
             "max_deceleration_mps2",
             "max_turn_rate_rad_s",
+            "keyboard_slow_speed_mps",
+            "keyboard_slow_boost_speed_mps",
+            "keyboard_walk_speed_mps",
+            "keyboard_walk_boost_speed_mps",
+            "keyboard_run_speed_mps",
+            "keyboard_run_boost_speed_mps",
             "min_gait_speed_mps",
             "gait_start_speed_mps",
             "gait_stop_speed_mps",
@@ -445,6 +485,33 @@ class ControlConfig:
             raise ValueError(
                 "max_speed_mps cannot exceed native SLOW_WALK maximum 0.80"
             )
+        keyboard_tiers = (
+            (
+                "slow",
+                self.keyboard_slow_speed_mps,
+                self.keyboard_slow_boost_speed_mps,
+                SONIC_SLOW_WALK_MODE,
+            ),
+            (
+                "walk",
+                self.keyboard_walk_speed_mps,
+                self.keyboard_walk_boost_speed_mps,
+                SONIC_WALK_MODE,
+            ),
+            (
+                "run",
+                self.keyboard_run_speed_mps,
+                self.keyboard_run_boost_speed_mps,
+                SONIC_RUN_MODE,
+            ),
+        )
+        for label, base, boost, mode in keyboard_tiers:
+            minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[mode]
+            if not minimum <= base < boost <= maximum:
+                raise ValueError(
+                    f"keyboard {label} speeds must satisfy native minimum "
+                    "<= base < boost <= native maximum"
+                )
         slow_walk_min = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][0]
         if not (
             self.gait_stop_speed_mps < self.min_gait_speed_mps
@@ -717,27 +784,42 @@ class GameControlCore:
     def _requested_locomotion(self, input_magnitude: float) -> tuple[float, int]:
         """Map keyboard tiers or analog travel onto a speed and native gait.
 
-        Keyboard movement follows the usual third-person convention: Ctrl is
-        held for a precise slow walk, unmodified WASD is ordinary walking, and
-        Shift is held to run. These map to SONIC modes 1, 2, and 3 at the lower
-        boundary of each native speed interval. Ctrl wins a Ctrl+Shift conflict
-        so an accidental overlap can only reduce speed. Gamepad magnitude stays
-        continuous in native SLOW_WALK and is never quantized into keyboard
-        tiers.
+        Keyboard movement follows the usual third-person convention: Ctrl or
+        Alt is held for a precise slow walk, unmodified WASD is ordinary
+        walking, and Shift is held to run. A provider-confirmed same-key double
+        tap selects that tier's separately validated boost target. Slow-walk
+        modifiers win conflicts so an accidental overlap can only reduce the
+        selected gait. Gamepad magnitude stays continuous in native SLOW_WALK.
         """
 
         assert self._snapshot is not None
         keys = self._snapshot.keys
         digital_movement = any((keys.w, keys.a, keys.s, keys.d))
         if digital_movement:
-            if keys.ctrl:
+            boosted = self._snapshot.keyboard_boost
+            if keys.ctrl or keys.alt:
                 requested_mode = SONIC_SLOW_WALK_MODE
-                return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
+                target = (
+                    self.config.keyboard_slow_boost_speed_mps
+                    if boosted
+                    else self.config.keyboard_slow_speed_mps
+                )
+                return (target, requested_mode)
             if keys.shift:
                 requested_mode = SONIC_RUN_MODE
-                return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
+                target = (
+                    self.config.keyboard_run_boost_speed_mps
+                    if boosted
+                    else self.config.keyboard_run_speed_mps
+                )
+                return (target, requested_mode)
             requested_mode = SONIC_WALK_MODE
-            return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
+            target = (
+                self.config.keyboard_walk_boost_speed_mps
+                if boosted
+                else self.config.keyboard_walk_speed_mps
+            )
+            return (target, requested_mode)
         # Treat the deadzone-remapped stick magnitude like a native analog
         # gait command: the first non-zero intent starts at SONIC's minimum
         # feasible gait, then the rest of the stick travel spans the full
@@ -972,14 +1054,11 @@ class GameControlCore:
         )
         moving = output_speed > 0.0
         turning_to_heading = input_magnitude > 1e-12 and not moving
-        if turning_to_heading:
-            # Keep turn-before-translation semantics while selecting SONIC's
-            # locomotion manifold immediately.  A stationary SLOW_WALK request
-            # lets the native planner rotate toward ``facing`` without first
-            # driving the post-recovery IDLE policy into a saturated waist
-            # pose.  Translation remains exactly zero until both command and
-            # measured heading pass the existing alignment gate.
-            locomotion_mode = SONIC_SLOW_WALK_MODE
+        # SONIC's own controller sends IDLE whenever translational stick input
+        # is inside the deadzone, while continuing to update ``facing`` from
+        # the look stick.  Keep turn-before-translation on that native
+        # contract: SLOW_WALK has a non-zero 0.10 m/s floor and must never be
+        # paired with zero speed/movement.
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=direction if moving else (0.0, 0.0, 0.0),

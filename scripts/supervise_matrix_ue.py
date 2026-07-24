@@ -50,6 +50,7 @@ class _CameraProbeRuntime:
         self.bound = False
         self.closed = False
         self.initialization_error = initialization_error
+        self._published_valid_sample = False
         self._last_diagnostic: str | None = None
         if initialization_error is not None:
             self._diagnose(initialization_error)
@@ -105,6 +106,8 @@ class _CameraProbeRuntime:
         except Exception as exc:
             self._diagnose(f"state_write_failed:{type(exc).__name__}:{exc}")
             return False
+        if bool(getattr(observation, "valid", False)):
+            self._published_valid_sample = True
         return True
 
     def invalidate(self, pid: int, *, identity: bool = False) -> bool:
@@ -150,6 +153,19 @@ class _CameraProbeRuntime:
             observation = self._invalid_observation(
                 pid, self._module.ProbeError.INTERNAL
             )
+        # A TORN_CAMERA_CACHE observation means UE updated its final POV
+        # between the probe's two full-cache reads.  Once one verified sample
+        # has been published, retain that record rather than replacing it with
+        # a one-frame invalid value.  Its monotonic timestamp is deliberately
+        # left unchanged, so CameraStateReader's freshness deadline still
+        # fails closed if valid sampling does not resume promptly.
+        if (
+            self._published_valid_sample
+            and not bool(getattr(observation, "valid", False))
+            and getattr(observation, "error_code", None)
+            == self._module.ProbeError.TORN_CAMERA_CACHE
+        ):
+            return True
         written = self._write(observation)
         if not written and bool(getattr(observation, "valid", False)):
             # If publishing a valid sample itself failed, make one immediate

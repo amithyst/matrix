@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -26,6 +27,7 @@ SPEC.loader.exec_module(MODULE)
 GAME_CONTROL = sys.modules["matrix_game_control"]
 MC_COMMANDS = sys.modules["matrix_mc_commands"]
 WORLD_STATE = sys.modules["matrix_world_state"]
+MOTION_SETTINGS = sys.modules["matrix_motion_settings"]
 
 
 class MatrixSonicRuntimeTest(unittest.TestCase):
@@ -62,6 +64,63 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             elastic_band_scale=elastic_band_scale,
         )
 
+    def test_moon_dynamic_map_and_model_manifest_are_bidirectionally_bound(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "scene.xml"
+            model.write_text("<mujoco/>", encoding="utf-8")
+            height_map = root / "moonworld.bin"
+            height_map.write_bytes(b"fixture")
+            manifest = root / "manifest.json"
+
+            MODULE._validate_moon_dynamic_ground_model_binding(
+                model,
+                map_path=None,
+                map_sha256=None,
+            )
+
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "scene_transform": (
+                            MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM
+                        )
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SystemExit,
+                "requires the locked MoonWorld dynamic map arguments",
+            ):
+                MODULE._validate_moon_dynamic_ground_model_binding(
+                    model,
+                    map_path=None,
+                    map_sha256=None,
+                )
+
+            MODULE._validate_moon_dynamic_ground_model_binding(
+                model,
+                map_path=height_map.resolve(),
+                map_sha256=MODULE.LOCKED_MOONWORLD_SHA256,
+            )
+
+            manifest.write_text(
+                json.dumps({"scene_transform": "none"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SystemExit,
+                "require a moon-dynamic-ground-mocap-v3",
+            ):
+                MODULE._validate_moon_dynamic_ground_model_binding(
+                    model,
+                    map_path=height_map.resolve(),
+                    map_sha256=MODULE.LOCKED_MOONWORLD_SHA256,
+                )
+
     @classmethod
     def snapshot_with_yaw(cls, yaw_rad: float, **kwargs) -> SimpleNamespace:
         snapshot = cls.snapshot(**kwargs)
@@ -84,6 +143,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 "timestamp_monotonic_s": timestamp_monotonic_s,
                 "focused": True,
                 "camera_yaw_rad": camera_yaw_rad,
+                "keyboard_boost": False,
                 "keys": {
                     "w": w,
                     "a": False,
@@ -94,6 +154,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "v": False,
                     "ctrl": False,
                     "shift": False,
+                    "alt": False,
                 },
                 "move_stick": {"right": 0.0, "forward": 0.0},
             }
@@ -123,6 +184,42 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             return False
         return state != "Z"
 
+    @staticmethod
+    def fake_physics_profile_runtime():
+        joint_names = tuple(MODULE.G1_BODY_JOINT_NAMES)
+        joint_by_name = {
+            name: index for index, name in enumerate(joint_names)
+        }
+        model = SimpleNamespace(
+            jnt_dofadr=[6 + index for index in range(len(joint_names))],
+            dof_armature=[0.0] * 6 + [0.01] * len(joint_names),
+        )
+        data = SimpleNamespace(
+            qpos=[float(index) / 100.0 for index in range(36)],
+            qvel=[float(index) / 200.0 for index in range(35)],
+            time=12.5,
+        )
+
+        class FakeMujoco:
+            mjtObj = SimpleNamespace(mjOBJ_JOINT=7)
+            forward_calls = 0
+            fail_forward_once = False
+
+            @staticmethod
+            def mj_name2id(_model, object_type, name):
+                if object_type != 7:
+                    raise AssertionError("unexpected object type")
+                return joint_by_name.get(name, -1)
+
+            @classmethod
+            def mj_forward(cls, _model, _data):
+                cls.forward_calls += 1
+                if cls.fail_forward_once:
+                    cls.fail_forward_once = False
+                    raise RuntimeError("injected forward failure")
+
+        return FakeMujoco, model, data, joint_by_name
+
     def test_planner_endpoint_requires_loopback_tcp(self) -> None:
         self.assertEqual(MODULE._loopback_zmq_port("tcp://127.0.0.1:5556"), 5556)
         self.assertEqual(MODULE._loopback_zmq_port("tcp://[::1]:6000"), 6000)
@@ -142,6 +239,247 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
 
+    def test_bfm_terrain_ray_skips_robot_and_keeps_world_fixed_step(self) -> None:
+        import numpy as np
+
+        model = SimpleNamespace(
+            # geom 0 is a dynamic robot body; 1 and 2 are world-fixed.
+            geom_bodyid=np.asarray((1, 0, 0), dtype=np.int32),
+            body_weldid=np.asarray((0, 1), dtype=np.int32),
+        )
+
+        def ray(
+            _model,
+            _data,
+            origin,
+            _direction,
+            _group,
+            _include_static,
+            _body_exclude,
+            geom_id,
+        ):
+            if float(origin[0]) > 0.3:
+                geom_id[0] = 2
+                return float(origin[2]) - 0.2
+            if float(origin[2]) > 1.0:
+                geom_id[0] = 0
+                return float(origin[2]) - 1.0
+            geom_id[0] = 1
+            return float(origin[2])
+
+        mujoco = SimpleNamespace(mj_ray=ray)
+
+        floor_height = MODULE._static_terrain_ray_height(
+            mujoco,
+            np,
+            model,
+            object(),
+            world_x=0.0,
+            world_y=0.0,
+            origin_z=2.0,
+            fallback_height=-1.0,
+            minimum_height=-2.0,
+            maximum_height=1.5,
+        )
+        step_height = MODULE._static_terrain_ray_height(
+            mujoco,
+            np,
+            model,
+            object(),
+            world_x=0.6,
+            world_y=0.0,
+            origin_z=2.0,
+            fallback_height=-1.0,
+            minimum_height=-2.0,
+            maximum_height=1.5,
+        )
+
+        self.assertAlmostEqual(floor_height, 0.0, places=6)
+        self.assertAlmostEqual(step_height, 0.2, places=6)
+
+    def test_locomotion_physics_profiles_switch_and_restore_without_pose_change(
+        self,
+    ) -> None:
+        mujoco, model, data, _joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        qpos_before = tuple(data.qpos)
+        qvel_before = tuple(data.qvel)
+        time_before = data.time
+        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+
+        self.assertEqual(
+            profiles.active_profile_id,
+            MODULE._LocomotionPhysicsProfiles.BASELINE_PROFILE_ID,
+        )
+        self.assertTrue(
+            profiles.apply(MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID)
+        )
+        actual = profiles.telemetry()["active_armatures"]
+        self.assertEqual(actual["left_hip_pitch_joint"], 0.025101925)
+        self.assertEqual(actual["left_hip_yaw_joint"], 0.010177520)
+        self.assertEqual(actual["left_ankle_pitch_joint"], 0.00721945)
+        self.assertEqual(actual["left_wrist_pitch_joint"], 0.00425)
+        self.assertEqual(actual["left_shoulder_pitch_joint"], 0.003609725)
+        self.assertEqual(tuple(data.qpos), qpos_before)
+        self.assertEqual(tuple(data.qvel), qvel_before)
+        self.assertEqual(data.time, time_before)
+        self.assertEqual(mujoco.forward_calls, 1)
+
+        self.assertFalse(
+            profiles.apply(MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID)
+        )
+        self.assertEqual(mujoco.forward_calls, 1)
+        self.assertTrue(
+            profiles.apply(
+                MODULE._LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+            )
+        )
+        self.assertEqual(mujoco.forward_calls, 2)
+        self.assertTrue(
+            all(
+                math.isclose(
+                    model.dof_armature[address],
+                    0.01,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                for address in profiles.dof_addresses
+            )
+        )
+        self.assertEqual(profiles.switch_count, 2)
+        profiles.verify_active()
+
+    def test_flat_v3_physics_profile_comes_from_locked_policy_config(self) -> None:
+        mujoco, model, data, _joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        flat_v3_armatures = tuple(
+            0.002 + index * 0.0001
+            for index in range(len(MODULE.G1_BODY_JOINT_NAMES))
+        )
+        profiles = MODULE._LocomotionPhysicsProfiles(
+            mujoco,
+            model,
+            data,
+            flat_v3_armatures=flat_v3_armatures,
+        )
+
+        self.assertTrue(
+            profiles.apply(
+                MODULE._LocomotionPhysicsProfiles.FLAT_V3_PROFILE_ID
+            )
+        )
+        self.assertEqual(
+            tuple(
+                model.dof_armature[address]
+                for address in profiles.dof_addresses
+            ),
+            flat_v3_armatures,
+        )
+        telemetry = profiles.telemetry()
+        self.assertEqual(
+            telemetry["active_profile_id"],
+            MODULE._LocomotionPhysicsProfiles.FLAT_V3_PROFILE_ID,
+        )
+        self.assertIsNotNone(telemetry["flat_v3_armature_sha256"])
+
+    def test_flat_v3_armature_config_is_hash_and_joint_order_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "flat-v3.json"
+            expected = [0.003 + index * 0.0001 for index in range(29)]
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "policy_joint_names": list(
+                            MODULE.G1_BODY_JOINT_NAMES
+                        ),
+                        "armature": expected,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+                MODULE._PhysicalRecoveryCoordinator
+            )
+            coordinator.amp_flat_v3_config = config_path
+            coordinator.amp_flat_v3_config_sha256 = MODULE._sha256_file(
+                config_path
+            )
+
+            self.assertEqual(
+                coordinator._load_amp_flat_v3_armatures(),
+                tuple(expected),
+            )
+            coordinator.amp_flat_v3_config_sha256 = "0" * 64
+            with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                coordinator._load_amp_flat_v3_armatures()
+
+    def test_selected_flat_v3_policy_selects_its_physics_profile(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.worker = SimpleNamespace(selected_policy_id="amp-flat-v3")
+        coordinator.initial_controller = "kungfu"
+        coordinator.amp_flat_v3_armatures = (0.01,) * 29
+        self.assertEqual(
+            coordinator._selected_recovery_physics_profile_id(),
+            MODULE._LocomotionPhysicsProfiles.FLAT_V3_PROFILE_ID,
+        )
+        coordinator.worker.selected_policy_id = "kungfu"
+        self.assertEqual(
+            coordinator._selected_recovery_physics_profile_id(),
+            MODULE._LocomotionPhysicsProfiles.BASELINE_PROFILE_ID,
+        )
+
+    def test_locomotion_physics_profiles_fail_closed_on_contract_drift(
+        self,
+    ) -> None:
+        mujoco, model, data, joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        missing_id = joint_by_name.pop("right_wrist_yaw_joint")
+        with self.assertRaisesRegex(ValueError, "missing G1 body joints"):
+            MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        joint_by_name["right_wrist_yaw_joint"] = missing_id
+
+        model.dof_armature[6] = 0.02
+        with self.assertRaisesRegex(ValueError, "contract drifted"):
+            MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+
+    def test_locomotion_physics_profile_switch_rolls_back_on_forward_failure(
+        self,
+    ) -> None:
+        mujoco, model, data, _joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        qpos_before = tuple(data.qpos)
+        qvel_before = tuple(data.qvel)
+        mujoco.fail_forward_once = True
+
+        with self.assertRaisesRegex(RuntimeError, "profile switch failed"):
+            profiles.apply(MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID)
+
+        self.assertEqual(
+            profiles.active_profile_id,
+            MODULE._LocomotionPhysicsProfiles.BASELINE_PROFILE_ID,
+        )
+        self.assertTrue(
+            all(
+                math.isclose(
+                    model.dof_armature[address],
+                    0.01,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                for address in profiles.dof_addresses
+            )
+        )
+        self.assertEqual(tuple(data.qpos), qpos_before)
+        self.assertEqual(tuple(data.qvel), qvel_before)
+        self.assertEqual(mujoco.forward_calls, 2)
+
     def test_world_safe_checkpoint_rejects_fall_motion_but_allows_horizontal_walk(self) -> None:
         def upright_snapshot() -> SimpleNamespace:
             snapshot = self.snapshot()
@@ -153,6 +491,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         walking.qvel[0] = 2.5
         walking.qvel[1] = -2.5
         self.assertTrue(MODULE._snapshot_world_upright(walking))
+        moon_walking = upright_snapshot()
+        moon_walking.qpos[2] = -0.13
+        self.assertTrue(
+            MODULE._snapshot_world_upright(
+                moon_walking,
+                ground_height_m=-0.93,
+            )
+        )
+        self.assertFalse(MODULE._snapshot_world_upright(moon_walking))
 
         unsafe_velocities = (
             (2, MODULE._WORLD_SAFE_MAX_VERTICAL_SPEED_M_S + 0.01),
@@ -174,6 +521,1693 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         tilted.qpos[4] = math.sin(tilt_radians / 2.0)
         self.assertFalse(MODULE._snapshot_world_upright(tilted))
 
+    def test_moon_fall_override_uses_local_ground_clearance(self) -> None:
+        dynamic_ground = mock.Mock()
+        dynamic_ground.sample_height.return_value = -0.93
+        environment = SimpleNamespace(
+            check_fall=lambda: None,
+            fall=False,
+            fall_detected=False,
+            mj_data=SimpleNamespace(qpos=[0.0, 0.0, -0.13]),
+            reset_on_fall=False,
+            reset=mock.Mock(),
+        )
+
+        MODULE._install_moon_relative_fall_check(
+            environment,
+            dynamic_ground,
+        )
+        environment.check_fall()
+        self.assertFalse(environment.fall)
+        self.assertFalse(environment.fall_detected)
+
+        environment.mj_data.qpos[2] = -0.75
+        environment.check_fall()
+        self.assertTrue(environment.fall)
+        self.assertTrue(environment.fall_detected)
+        environment.reset.assert_not_called()
+
+        environment.reset_on_fall = True
+        environment.check_fall()
+        environment.reset.assert_called_once_with(reason="fall")
+
+    def test_final_checkpoint_disposition_matches_persisted_resume_source(
+        self,
+    ) -> None:
+        safe = {"safe": True}
+        unsafe = {"safe": False}
+        self.assertEqual(
+            MODULE._final_checkpoint_disposition(
+                safe,
+                "upright_checkpoint",
+            ),
+            "saved_current_pose",
+        )
+        self.assertEqual(
+            MODULE._final_checkpoint_disposition(
+                safe,
+                "fallen_xy_last_safe_upright",
+            ),
+            "saved_recovered_safe_pose",
+        )
+        for audit, source in (
+            (unsafe, "upright_checkpoint"),
+            (safe, "fallen_outlier_last_safe"),
+            (None, "upright_checkpoint"),
+        ):
+            with self.subTest(audit=audit, source=source):
+                self.assertEqual(
+                    MODULE._final_checkpoint_disposition(audit, source),
+                    "retained_previous_safe",
+                )
+
+    @staticmethod
+    def resume_idle_command():
+        return GAME_CONTROL.RobotMotionCommand(
+            sequence=None,
+            movement=(0.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+            mode="deadman",
+            safe_stop=True,
+            reason="resume_checkpoint_probation",
+        )
+
+    @staticmethod
+    def user_move_command(*, sequence: int = 1):
+        return GAME_CONTROL.RobotMotionCommand(
+            sequence=sequence,
+            movement=(1.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.3,
+            locomotion_mode=GAME_CONTROL.SONIC_SLOW_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+
+    @staticmethod
+    def user_turn_command(*, sequence: int = 2):
+        return GAME_CONTROL.RobotMotionCommand(
+            sequence=sequence,
+            movement=(0.0, 0.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+            mode="turn",
+            safe_stop=False,
+            reason="aligning_heading",
+        )
+
+    @staticmethod
+    def safe_clearance_audit() -> dict[str, object]:
+        return {
+            "schema": "matrix-spawn-clearance-audit/v1",
+            "safe": True,
+            "reason": "clear",
+            "error": None,
+            "contacts_checked": 0,
+            "external_contact_count": 0,
+            "allowed_contact_count": 0,
+            "rejected_contact_count": 0,
+            "contacts": [],
+            "worst": None,
+        }
+
+    def upright_resume_snapshot(self, **kwargs) -> SimpleNamespace:
+        snapshot = self.snapshot(**kwargs)
+        snapshot.qpos[2] = 0.8
+        snapshot.qpos[3] = 1.0
+        return snapshot
+
+    def test_selected_resume_checkpoint_waits_for_post_lowcmd_stable_idle(
+        self,
+    ) -> None:
+        auditor = mock.Mock(side_effect=self.safe_clearance_audit)
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=auditor,
+            max_sim_sample_gap_seconds=2.0,
+        )
+        idle = self.resume_idle_command()
+
+        stale = self.upright_resume_snapshot(
+            low_cmd_fresh=False,
+            elastic_band_scale=1.0,
+        )
+        probation.observe(stale, idle, now_s=0.0)
+        probation.observe(stale, idle, now_s=20.0)
+        self.assertTrue(probation.active)
+        self.assertTrue(probation.telemetry()["checkpoint_writes_blocked"])
+        self.assertEqual(
+            probation.telemetry()["selected_checkpoint_id"],
+            "cp-1",
+        )
+
+        fading = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+            elastic_band_scale=0.25,
+            sim_time=0.005,
+        )
+        probation.observe(fading, idle, now_s=21.0)
+        self.assertTrue(probation.active)
+        self.assertTrue(probation.telemetry()["first_fresh_lowcmd_observed"])
+        self.assertFalse(probation.telemetry()["startup_band_released"])
+
+        ready = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+            elastic_band_scale=0.0,
+            sim_time=1.0,
+        )
+        probation.observe(ready, idle, now_s=28.0)
+        ready.sim_time = 2.499
+        probation.observe(ready, idle, now_s=29.499)
+        self.assertTrue(probation.active)
+        ready.sim_time = 2.5
+        probation.observe(ready, idle, now_s=29.5)
+        self.assertFalse(probation.active)
+        self.assertTrue(probation.completed)
+        telemetry = probation.telemetry()
+        self.assertTrue(telemetry["checkpoint_writes_blocked"])
+        self.assertEqual(
+            telemetry["checkpoint_write_arming"],
+            {
+                "required": True,
+                "armed": False,
+                "phase": "waiting_user_motion",
+                "waiting_for_user_motion": True,
+                "armed_by_mode": None,
+                "armed_by_sequence": None,
+            },
+        )
+
+        disabled = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id=None,
+            clearance_auditor=auditor,
+        )
+        self.assertFalse(disabled.active)
+        self.assertTrue(disabled.checkpoint_writes_armed)
+        self.assertIsNone(disabled.telemetry()["selected_checkpoint_id"])
+        self.assertEqual(
+            disabled.telemetry()["checkpoint_write_arming"]["phase"],
+            "disabled",
+        )
+        disabled.observe(stale, idle, now_s=0.0)
+
+    def test_resume_checkpoint_writes_arm_only_on_post_completion_user_motion(
+        self,
+    ) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+            stable_idle_seconds=0.1,
+            max_sim_sample_gap_seconds=2.0,
+        )
+        turn = self.user_turn_command(sequence=11)
+        move = self.user_move_command(sequence=12)
+        self.assertFalse(probation.observe_published_user_command(turn))
+        self.assertTrue(probation.checkpoint_writes_blocked)
+
+        ready = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+            elastic_band_scale=0.0,
+            sim_time=1.0,
+        )
+        idle = self.resume_idle_command()
+        probation.observe(ready, idle, now_s=1.0)
+        ready.sim_time = 1.1
+        probation.observe(ready, idle, now_s=1.1)
+        self.assertTrue(probation.completed)
+
+        rejected = (
+            idle,
+            replace(
+                turn,
+                mode="idle",
+                reason=None,
+            ),
+            replace(
+                turn,
+                safe_stop=True,
+                reason="physical_fall_recovery",
+            ),
+            replace(turn, reason="untrusted_turn_reason"),
+            replace(turn, sequence=None),
+            replace(move, speed_mps=0.0),
+            replace(move, locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE),
+        )
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertFalse(
+                    probation.observe_published_user_command(command)
+                )
+                self.assertTrue(probation.checkpoint_writes_blocked)
+
+        self.assertTrue(probation.observe_published_user_command(turn))
+        self.assertTrue(probation.checkpoint_writes_armed)
+        self.assertFalse(probation.checkpoint_writes_blocked)
+        telemetry = probation.telemetry()["checkpoint_write_arming"]
+        self.assertEqual(telemetry["phase"], "armed")
+        self.assertEqual(telemetry["armed_by_mode"], "turn")
+        self.assertEqual(telemetry["armed_by_sequence"], 11)
+        # The first genuine command latches authority for the rest of the run.
+        self.assertFalse(probation.observe_published_user_command(move))
+        self.assertTrue(probation.checkpoint_writes_armed)
+
+        move_probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-2",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        move_probation.completed = True
+        self.assertTrue(move_probation.observe_published_user_command(move))
+        self.assertEqual(
+            move_probation.telemetry()["checkpoint_write_arming"][
+                "armed_by_mode"
+            ],
+            "move",
+        )
+
+        recovery_turn_probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-3",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        recovery_turn_probation.completed = True
+        recovery_turn = replace(
+            turn,
+            reason="recovery_heading_slew_limited",
+        )
+        self.assertTrue(
+            recovery_turn_probation.observe_published_user_command(
+                recovery_turn
+            )
+        )
+        self.assertEqual(
+            recovery_turn_probation.telemetry()["checkpoint_write_arming"][
+                "armed_by_mode"
+            ],
+            "turn",
+        )
+
+    def test_requested_restart_reuses_only_exact_durable_unarmed_resume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            store = WORLD_STATE.WorldStateStore(
+                state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+            )
+            selected_state = store.state.checkpoint(
+                WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.25),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(selected_state)
+            selected = selected_state.resolve_start()
+            self.assertIsNotNone(selected.checkpoint_id)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id=selected.checkpoint_id,
+                selected_resume_generation=selected.generation,
+            )
+            probation = MODULE._GameWorldResumeProbation(
+                selected_checkpoint_id=selected.checkpoint_id,
+                clearance_auditor=self.safe_clearance_audit,
+            )
+            probation.completed = True
+            probation.audit_count = 1
+            probation.last_clearance_audit = self.safe_clearance_audit()
+            arguments = {
+                "run_id": "1" * 32,
+                "selected_checkpoint_id": selected.checkpoint_id,
+                "selected_generation": selected.generation,
+                "game_world": world,
+                "resume_probation": probation,
+                "termination_reason": "signal",
+                "termination_signal": signal.SIGTERM,
+                "child_failure": None,
+                "unstable": False,
+                "fall_detected": False,
+                "current_fall_detected": False,
+                "world_checkpoint_failed": False,
+            }
+
+            self.assertEqual(
+                MODULE._reused_selected_resume_checkpoint(**arguments),
+                {
+                    "schema": "matrix-reused-selected-world-checkpoint/v1",
+                    "run_id": "1" * 32,
+                    "checkpoint_id": selected.checkpoint_id,
+                    "generation": selected.generation,
+                    "disposition": "reused_selected_resume",
+                },
+            )
+            blockers = {
+                "checkpoint_id_mismatch": {
+                    "selected_checkpoint_id": "cp-" + "2" * 32,
+                },
+                "generation_mismatch": {
+                    "selected_generation": selected.generation + 1,
+                },
+                "wrong_signal": {"termination_signal": signal.SIGINT},
+                "child_failure": {"child_failure": ("ue", 2)},
+                "unstable": {"unstable": True},
+                "fall": {"fall_detected": True},
+                "recovery_fall": {"current_fall_detected": True},
+                "checkpoint_failure": {"world_checkpoint_failed": True},
+            }
+            for label, changes in blockers.items():
+                with self.subTest(label=label):
+                    self.assertIsNone(
+                        MODULE._reused_selected_resume_checkpoint(
+                            **{**arguments, **changes}
+                        )
+                    )
+
+            probation.failed = True
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            probation.failed = False
+            probation._checkpoint_writes_armed = True
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            probation._checkpoint_writes_armed = False
+            probation.completed = False
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            probation.completed = True
+
+            world.checkpoint_count = 1
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+            world.checkpoint_count = 0
+            state_path.unlink()
+            self.assertIsNone(
+                MODULE._reused_selected_resume_checkpoint(**arguments)
+            )
+
+    def test_resume_probation_audits_at_ten_hz_and_forces_completion_audit(
+        self,
+    ) -> None:
+        auditor = mock.Mock(side_effect=self.safe_clearance_audit)
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=auditor,
+            max_sim_sample_gap_seconds=2.0,
+        )
+        stale = self.upright_resume_snapshot(low_cmd_fresh=False)
+        idle = self.resume_idle_command()
+        probation.observe(stale, idle, now_s=0.0)
+        probation.observe(stale, idle, now_s=0.05)
+        probation.observe(stale, idle, now_s=0.1)
+        self.assertEqual(auditor.call_count, 2)
+
+        ready = self.upright_resume_snapshot(low_cmd_fresh=True, sim_time=1.0)
+        probation.observe(ready, idle, now_s=1.0)
+        ready.sim_time = 2.5
+        probation.observe(ready, idle, now_s=2.5)
+        self.assertTrue(probation.completed)
+        self.assertEqual(probation.audit_count, 4)
+
+    def test_resume_probation_requires_continuous_idle(self) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+            max_sim_sample_gap_seconds=2.0,
+        )
+        ready = self.upright_resume_snapshot(low_cmd_fresh=True)
+        idle = self.resume_idle_command()
+        moving = replace(
+            idle,
+            movement=(1.0, 0.0, 0.0),
+            speed_mps=0.8,
+            locomotion_mode=GAME_CONTROL.SONIC_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+        probation.observe(ready, idle, now_s=0.0)
+        ready.sim_time = 1.0
+        probation.observe(ready, idle, now_s=1.0)
+        ready.sim_time = 1.1
+        probation.observe(ready, moving, now_s=1.1)
+        ready.sim_time = 2.0
+        probation.observe(ready, idle, now_s=2.0)
+        ready.sim_time = 3.499
+        probation.observe(ready, idle, now_s=3.499)
+        self.assertTrue(probation.active)
+        ready.sim_time = 3.5
+        probation.observe(ready, idle, now_s=3.5)
+        self.assertTrue(probation.completed)
+
+    def test_resume_probation_accepts_actual_emergency_stop_contract(self) -> None:
+        core = GAME_CONTROL.GameControlCore()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = MODULE.GameInputRuntime(
+                Path(temp_dir) / "unused-input.sock",
+                core,
+            )
+            command = runtime.emergency_stop(
+                now_s=10.0,
+                reason="resume_checkpoint_probation",
+            )
+            self.assertEqual(command.mode, "deadman")
+            self.assertTrue(command.safe_stop)
+            self.assertTrue(MODULE._GameWorldResumeProbation._idle_command(command))
+            probation = MODULE._GameWorldResumeProbation(
+                selected_checkpoint_id="cp-1",
+                clearance_auditor=self.safe_clearance_audit,
+                max_sim_sample_gap_seconds=2.0,
+            )
+            ready = self.upright_resume_snapshot(low_cmd_fresh=True)
+            probation.observe(ready, command, now_s=0.0)
+            ready.sim_time = 1.5
+            probation.observe(ready, command, now_s=1.5)
+            self.assertTrue(probation.completed)
+
+        for rejected in (
+            replace(command, mode="idle"),
+            replace(command, safe_stop=False),
+            replace(command, locomotion_mode=GAME_CONTROL.SONIC_WALK_MODE),
+            replace(command, movement=(1.0, 0.0, 0.0)),
+            replace(command, speed_mps=0.1),
+        ):
+            with self.subTest(command=rejected):
+                self.assertFalse(
+                    MODULE._GameWorldResumeProbation._idle_command(rejected)
+                )
+
+    def test_game_commands_are_blocked_through_resume_probation(self) -> None:
+        stopped = self.resume_idle_command()
+        self.assertFalse(
+            MODULE._game_command_poll_allowed(
+                stopped,
+                resume_probation_active=True,
+            )
+        )
+        self.assertTrue(
+            MODULE._game_command_poll_allowed(
+                stopped,
+                resume_probation_active=False,
+            )
+        )
+
+    def test_locomotion_switch_accepts_zero_esc_stop_but_rejects_motion(
+        self,
+    ) -> None:
+        stopped = self.resume_idle_command()
+        self.assertTrue(MODULE._locomotion_switch_neutral(stopped))
+        self.assertTrue(
+            MODULE._locomotion_switch_neutral(
+                replace(
+                    stopped,
+                    mode="idle",
+                    safe_stop=False,
+                    reason=None,
+                )
+            )
+        )
+        for moving in (
+            replace(stopped, locomotion_mode=GAME_CONTROL.SONIC_WALK_MODE),
+            replace(stopped, movement=(0.01, 0.0, 0.0)),
+            replace(stopped, speed_mps=0.01),
+        ):
+            with self.subTest(command=moving):
+                self.assertFalse(
+                    MODULE._locomotion_switch_neutral(moving)
+                )
+
+    def test_resume_probation_requires_continuous_low_root_motion(self) -> None:
+        ready = self.upright_resume_snapshot(low_cmd_fresh=True)
+        idle = self.resume_idle_command()
+        for qvel_index, excessive_value, current_field, max_field in (
+            (
+                0,
+                MODULE._GAME_WORLD_RESUME_MAX_ROOT_PLANAR_SPEED_M_S + 0.001,
+                "current_root_planar_speed_m_s",
+                "max_root_planar_speed_m_s",
+            ),
+            (
+                2,
+                MODULE._GAME_WORLD_RESUME_MAX_ROOT_VERTICAL_SPEED_M_S
+                + 0.001,
+                "current_root_vertical_speed_m_s",
+                "max_root_vertical_speed_m_s",
+            ),
+            (
+                3,
+                MODULE._GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S
+                + 0.001,
+                "current_root_roll_rate_rad_s",
+                "max_root_roll_pitch_rate_rad_s",
+            ),
+            (
+                4,
+                MODULE._GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S
+                + 0.001,
+                "current_root_pitch_rate_rad_s",
+                "max_root_roll_pitch_rate_rad_s",
+            ),
+            (
+                5,
+                MODULE._GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S + 0.001,
+                "current_root_yaw_rate_rad_s",
+                "max_root_yaw_rate_rad_s",
+            ),
+            (
+                12,
+                MODULE._GAME_WORLD_RESUME_MAX_JOINT_SPEED_RAD_S + 0.001,
+                "current_max_joint_speed_rad_s",
+                "max_joint_speed_rad_s",
+            ),
+        ):
+            with self.subTest(qvel_index=qvel_index):
+                ready.sim_time = 0.0
+                probation = MODULE._GameWorldResumeProbation(
+                    selected_checkpoint_id="cp-1",
+                    clearance_auditor=self.safe_clearance_audit,
+                    max_sim_sample_gap_seconds=2.0,
+                )
+                probation.observe(ready, idle, now_s=0.0)
+                moving = self.upright_resume_snapshot(
+                    low_cmd_fresh=True,
+                    sim_time=1.499,
+                )
+                moving.qvel[qvel_index] = excessive_value
+                probation.observe(moving, idle, now_s=1.499)
+                telemetry = probation.telemetry()
+                self.assertTrue(telemetry["root_motion_valid"])
+                self.assertGreater(telemetry[current_field], telemetry[max_field])
+                self.assertEqual(telemetry["stable_idle_elapsed_s"], 0.0)
+                self.assertTrue(probation.active)
+
+                ready.sim_time = 2.0
+                probation.observe(ready, idle, now_s=2.0)
+                ready.sim_time = 3.499
+                probation.observe(ready, idle, now_s=3.499)
+                self.assertTrue(probation.active)
+                ready.sim_time = 3.5
+                probation.observe(ready, idle, now_s=3.5)
+                self.assertTrue(probation.completed)
+
+    def test_resume_probation_rejects_excessive_joint_rms_motion(self) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        moving = self.upright_resume_snapshot(low_cmd_fresh=True)
+        moving.qvel[6:] = [
+            MODULE._GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S + 0.001
+        ] * len(moving.qvel[6:])
+        probation.observe(moving, self.resume_idle_command(), now_s=0.0)
+
+        telemetry = probation.telemetry()
+        self.assertTrue(telemetry["root_motion_valid"])
+        self.assertGreater(
+            telemetry["current_joint_rms_speed_rad_s"],
+            telemetry["max_joint_rms_speed_rad_s"],
+        )
+        self.assertEqual(telemetry["stable_idle_sim_elapsed_s"], 0.0)
+        self.assertTrue(probation.active)
+
+    def test_resume_probation_ignores_creative_inventory_freejoint_velocity(
+        self,
+    ) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        inventory_snapshot = self.upright_resume_snapshot(low_cmd_fresh=True)
+        inventory_snapshot.qvel.extend([2500.0] * 48)
+        probation.observe(
+            inventory_snapshot,
+            self.resume_idle_command(),
+            now_s=0.0,
+        )
+
+        telemetry = probation.telemetry()
+        self.assertTrue(telemetry["root_motion_valid"])
+        self.assertEqual(telemetry["current_max_joint_speed_rad_s"], 0.0)
+        self.assertEqual(telemetry["current_joint_rms_speed_rad_s"], 0.0)
+
+    def test_resume_probation_uses_sim_time_across_wall_pause(self) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+        )
+        idle = self.resume_idle_command()
+        first = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            sim_time=1.0,
+        )
+        probation.observe(first, idle, now_s=1.0)
+        paused = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            sim_time=1.005,
+        )
+        probation.observe(paused, idle, now_s=2.5)
+
+        telemetry = probation.telemetry()
+        self.assertTrue(probation.active)
+        self.assertEqual(telemetry["stable_idle_clock"], "sim_time")
+        self.assertEqual(telemetry["stable_idle_sim_elapsed_s"], 0.005)
+        self.assertEqual(telemetry["stable_idle_elapsed_s"], 0.005)
+
+    def test_resume_probation_resets_on_invalid_sim_time_sequence(self) -> None:
+        idle = self.resume_idle_command()
+        cases = []
+        missing = self.upright_resume_snapshot(low_cmd_fresh=True)
+        del missing.sim_time
+        cases.append(("missing", missing))
+        cases.append(
+            (
+                "nonfinite",
+                self.upright_resume_snapshot(
+                    low_cmd_fresh=True,
+                    sim_time=math.nan,
+                ),
+            )
+        )
+        cases.append(
+            (
+                "regressing",
+                self.upright_resume_snapshot(low_cmd_fresh=True, sim_time=0.999),
+            )
+        )
+        cases.append(
+            (
+                "oversized_gap",
+                self.upright_resume_snapshot(low_cmd_fresh=True, sim_time=1.051),
+            )
+        )
+        for label, invalid in cases:
+            with self.subTest(case=label):
+                probation = MODULE._GameWorldResumeProbation(
+                    selected_checkpoint_id="cp-1",
+                    clearance_auditor=self.safe_clearance_audit,
+                )
+                start = self.upright_resume_snapshot(
+                    low_cmd_fresh=True,
+                    sim_time=1.0,
+                )
+                probation.observe(start, idle, now_s=0.0)
+                probation.observe(invalid, idle, now_s=0.1)
+                telemetry = probation.telemetry()
+                self.assertTrue(probation.active)
+                self.assertFalse(telemetry["sim_time_sample_valid"])
+                self.assertEqual(telemetry["stable_idle_sim_elapsed_s"], 0.0)
+
+    def test_resume_probation_completes_only_at_control_frame_boundary(
+        self,
+    ) -> None:
+        auditor = mock.Mock(side_effect=self.safe_clearance_audit)
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=auditor,
+        )
+        ready = self.upright_resume_snapshot(low_cmd_fresh=True)
+        idle = self.resume_idle_command()
+        for sample_index in range(301):
+            sample_time = sample_index * 0.005
+            ready.sim_time = sample_time
+            probation.observe(
+                ready,
+                idle,
+                now_s=sample_time,
+                control_frame_boundary=(sample_index != 300),
+            )
+        audit_count_before_boundary = probation.audit_count
+        self.assertTrue(probation.active)
+        self.assertEqual(
+            probation.telemetry()["stable_idle_sim_elapsed_s"],
+            1.5,
+        )
+
+        probation.observe(
+            ready,
+            idle,
+            now_s=1.5,
+            control_frame_boundary=True,
+        )
+        self.assertGreater(probation.audit_count, audit_count_before_boundary)
+        self.assertTrue(probation.completed)
+
+    def test_resume_probation_rejects_malformed_or_nonfinite_root_velocity(
+        self,
+    ) -> None:
+        idle = self.resume_idle_command()
+        malformed_snapshots = []
+        short = self.upright_resume_snapshot(low_cmd_fresh=True, qvel_len=5)
+        malformed_snapshots.append(("short", short))
+        missing = self.upright_resume_snapshot(low_cmd_fresh=True)
+        del missing.qvel
+        malformed_snapshots.append(("missing", missing))
+        for label, index, value in (
+            ("bad_value", 0, "bad"),
+            ("nonfinite_planar", 1, math.nan),
+            ("nonfinite_yaw", 5, math.inf),
+            ("nonfinite_joint", 12, math.nan),
+        ):
+            snapshot = self.upright_resume_snapshot(low_cmd_fresh=True)
+            snapshot.qvel[index] = value
+            malformed_snapshots.append((label, snapshot))
+
+        for label, snapshot in malformed_snapshots:
+            with self.subTest(case=label):
+                probation = MODULE._GameWorldResumeProbation(
+                    selected_checkpoint_id="cp-1",
+                    clearance_auditor=self.safe_clearance_audit,
+                )
+                probation.observe(snapshot, idle, now_s=0.0)
+                probation.observe(snapshot, idle, now_s=2.0)
+                telemetry = probation.telemetry()
+                self.assertTrue(probation.active)
+                self.assertFalse(telemetry["root_motion_valid"])
+                self.assertIsNone(telemetry["current_root_planar_speed_m_s"])
+                self.assertIsNone(telemetry["current_root_yaw_rate_rad_s"])
+                self.assertEqual(telemetry["stable_idle_elapsed_s"], 0.0)
+
+    def test_resume_probation_defers_fall_frame_body_contact_to_fall_path(
+        self,
+    ) -> None:
+        body_ground_contact = {
+            "schema": "matrix-spawn-clearance-audit/v1",
+            "safe": True,
+            "reason": "clear",
+            "error": None,
+            "contacts_checked": 1,
+            "external_contact_count": 1,
+            "allowed_contact_count": 1,
+            "rejected_contact_count": 0,
+            "contacts": [
+                {
+                    "allowed": True,
+                    "classification": "allowed_body_contact_tolerance",
+                    "distance_m": -0.001,
+                    "robot_body": {"name": "left_hand_link"},
+                }
+            ],
+            "worst": None,
+        }
+        auditor = mock.Mock(return_value=body_ground_contact)
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-good",
+            clearance_auditor=auditor,
+        )
+        failure = probation.observe(
+            self.upright_resume_snapshot(low_cmd_fresh=True),
+            self.resume_idle_command(),
+            now_s=21.0,
+            current_fall_detected=True,
+        )
+
+        self.assertIsNone(failure)
+        auditor.assert_not_called()
+        self.assertFalse(probation.failed)
+        self.assertTrue(probation.active)
+        rollback_ineligibility = MODULE._game_world_rollback_ineligibility(
+            selected_checkpoint_id="cp-good",
+            selected_generation=7,
+            rollback_count=0,
+            elapsed_s=21.0,
+            termination_reason="fall_detected",
+            numerical_error=None,
+            low_cmd_received=True,
+            active_lowcmd=True,
+            active_frames=250,
+            active_elapsed_s=1.25,
+            termination_signal=None,
+            child_failure=None,
+            fall_detected=True,
+            initial_reset_count=0,
+            final_reset_count=0,
+            resume_probation_active=True,
+        )
+        # Any non-None result blocks rollback/tombstoning.  The exact reason
+        # may be the bootstrap time bound or the explicit fall classification.
+        self.assertIsNotNone(rollback_ineligibility)
+
+    def test_resume_probation_rejects_any_live_body_contact_after_lowcmd(
+        self,
+    ) -> None:
+        body_contact = {
+            "schema": "matrix-spawn-clearance-audit/v1",
+            "safe": True,
+            "reason": "clear",
+            "error": None,
+            "contacts_checked": 1,
+            "external_contact_count": 1,
+            "allowed_contact_count": 1,
+            "rejected_contact_count": 0,
+            "contacts": [
+                {
+                    "allowed": True,
+                    "classification": "allowed_body_contact_tolerance",
+                    "distance_m": -0.0005,
+                    "robot_body": {"name": "left_hand_link"},
+                }
+            ],
+            "worst": None,
+        }
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=lambda: body_contact,
+        )
+        ready = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            low_cmd_received=True,
+        )
+        failure = probation.observe(
+            ready,
+            self.resume_idle_command(),
+            now_s=21.0,
+        )
+
+        self.assertIsNotNone(failure)
+        assert failure is not None
+        self.assertFalse(failure["safe"])
+        self.assertEqual(failure["reason"], "scene_penetration")
+        self.assertEqual(failure["worst"]["allowed"], False)
+        self.assertEqual(
+            failure["worst"]["original_classification"],
+            "allowed_body_contact_tolerance",
+        )
+        self.assertTrue(probation.active)
+        self.assertTrue(probation.failed)
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                selected_checkpoint_id="cp-1",
+                selected_generation=7,
+                rollback_count=0,
+                elapsed_s=21.0,
+                termination_reason="spawn_clearance_failed",
+                numerical_error="spawn_clearance:scene_penetration",
+                low_cmd_received=True,
+                active_lowcmd=True,
+                active_frames=250,
+                active_elapsed_s=1.25,
+                termination_signal=None,
+                child_failure=None,
+                fall_detected=False,
+                initial_reset_count=0,
+                final_reset_count=0,
+                spawn_clearance_audit=failure,
+                resume_probation_active=True,
+            )
+        )
+        self.assertEqual(
+            MODULE._game_world_rollback_ineligibility(
+                selected_checkpoint_id="cp-1",
+                selected_generation=7,
+                rollback_count=0,
+                elapsed_s=21.0,
+                termination_reason="spawn_clearance_failed",
+                numerical_error="spawn_clearance:scene_penetration",
+                low_cmd_received=True,
+                active_lowcmd=True,
+                active_frames=250,
+                active_elapsed_s=1.25,
+                termination_signal=None,
+                child_failure=None,
+                fall_detected=True,
+                initial_reset_count=0,
+                final_reset_count=0,
+                spawn_clearance_audit=failure,
+                resume_probation_active=True,
+            ),
+            "fall_detected",
+        )
+
+    def test_resume_probation_rejects_illegal_live_foot_contact(self) -> None:
+        foot_contact = {
+            "schema": "matrix-spawn-clearance-audit/v1",
+            "safe": False,
+            "reason": "unsafe_foot_contact",
+            "error": None,
+            "contacts_checked": 1,
+            "external_contact_count": 1,
+            "allowed_contact_count": 0,
+            "rejected_contact_count": 1,
+            "contacts": [],
+            "worst": {
+                "allowed": False,
+                "classification": "unsafe_foot_contact_normal",
+            },
+        }
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=lambda: foot_contact,
+        )
+        failure = probation.observe(
+            self.upright_resume_snapshot(low_cmd_fresh=True),
+            self.resume_idle_command(),
+            now_s=25.0,
+        )
+        self.assertIsNotNone(failure)
+        assert failure is not None
+        self.assertEqual(failure["reason"], "unsafe_foot_contact")
+        self.assertEqual(probation.failure_reason, "unsafe_foot_contact")
+
+    def test_resume_probation_keeps_positive_margin_body_contact_allowed(
+        self,
+    ) -> None:
+        audit = {
+            "schema": "matrix-spawn-clearance-audit/v1",
+            "safe": True,
+            "reason": "clear",
+            "error": None,
+            "contacts_checked": 1,
+            "external_contact_count": 1,
+            "allowed_contact_count": 1,
+            "rejected_contact_count": 0,
+            "contacts": [
+                {
+                    "allowed": True,
+                    "classification": "allowed_body_contact_tolerance",
+                    "distance_m": 0.001,
+                    "robot_body": {"name": "left_hand_link"},
+                }
+            ],
+            "worst": None,
+        }
+        auditor = mock.Mock(return_value=audit)
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=auditor,
+        )
+        failure = probation.observe(
+            self.upright_resume_snapshot(low_cmd_fresh=True),
+            self.resume_idle_command(),
+            now_s=0.0,
+        )
+
+        self.assertIsNone(failure)
+        self.assertFalse(probation.failed)
+        auditor.assert_called_once_with()
+        self.assertTrue(probation.last_clearance_audit["safe"])
+        self.assertEqual(
+            probation.last_clearance_audit["contacts"][0]["classification"],
+            "allowed_body_contact_tolerance",
+        )
+
+    def test_resume_probation_rejects_zero_or_negative_body_contact_distance(
+        self,
+    ) -> None:
+        for distance_m in (0.0, -0.0005):
+            with self.subTest(distance_m=distance_m):
+                audit = self.safe_clearance_audit()
+                audit.update(
+                    {
+                        "contacts_checked": 1,
+                        "external_contact_count": 1,
+                        "allowed_contact_count": 1,
+                        "contacts": [
+                            {
+                                "allowed": True,
+                                "classification": (
+                                    "allowed_body_contact_tolerance"
+                                ),
+                                "distance_m": distance_m,
+                            }
+                        ],
+                    }
+                )
+                result = MODULE._resume_probation_clearance_audit(lambda: audit)
+                self.assertFalse(result["safe"])
+                self.assertEqual(result["reason"], "scene_penetration")
+
+    def test_resume_probation_fails_closed_on_malformed_body_contact_distance(
+        self,
+    ) -> None:
+        for label, distance_present, distance_m in (
+            ("missing", False, None),
+            ("none", True, None),
+            ("string", True, "bad"),
+            ("numeric_string", True, "0.0"),
+            ("nan", True, math.nan),
+            ("infinite", True, math.inf),
+        ):
+            with self.subTest(case=label):
+                contact = {
+                    "allowed": True,
+                    "classification": "allowed_body_contact_tolerance",
+                }
+                if distance_present:
+                    contact["distance_m"] = distance_m
+                audit = self.safe_clearance_audit()
+                audit.update(
+                    {
+                        "contacts_checked": 1,
+                        "external_contact_count": 1,
+                        "allowed_contact_count": 1,
+                        "contacts": [contact],
+                    }
+                )
+                result = MODULE._resume_probation_clearance_audit(lambda: audit)
+                self.assertFalse(result["safe"])
+                self.assertEqual(result["reason"], "audit_error")
+
+    def test_auto_respawn_fall_is_read_only_until_checkpoint_writes_arm(
+        self,
+    ) -> None:
+        world = mock.Mock()
+        game_input = mock.Mock()
+        planner = mock.Mock()
+        emergency_command = SimpleNamespace(mode="idle", safe_stop=True)
+        game_input.emergency_stop.return_value = emergency_command
+        snapshot = self.snapshot(fall_detected=True)
+
+        termination_reason, command = MODULE._handle_game_auto_respawn_fall(
+            game_world=world,
+            game_input=game_input,
+            planner=planner,
+            snapshot=snapshot,
+            checkpoint_writes_blocked=True,
+            now_s=10.0,
+        )
+
+        self.assertEqual(termination_reason, "fall_detected")
+        self.assertIs(command, emergency_command)
+        game_input.emergency_stop.assert_called_once_with(
+            now_s=10.0,
+            reason="fall_respawn_reload",
+        )
+        planner.send_game_command.assert_called_once_with(emergency_command)
+        world.checkpoint.assert_not_called()
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=False,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=[],
+                resume_rollback_requested=False,
+            ),
+            2,
+        )
+        self.assertEqual(
+            MODULE._game_world_rollback_ineligibility(
+                selected_checkpoint_id="cp-selected",
+                selected_generation=7,
+                rollback_count=0,
+                elapsed_s=5.0,
+                termination_reason=termination_reason,
+                numerical_error=None,
+                low_cmd_received=False,
+                active_lowcmd=False,
+                active_frames=0,
+                active_elapsed_s=0.0,
+                termination_signal=None,
+                child_failure=None,
+                fall_detected=True,
+                initial_reset_count=0,
+                final_reset_count=0,
+            ),
+            "fall_detected",
+        )
+
+    def test_auto_respawn_fall_after_checkpoint_write_arming_keeps_reload(
+        self,
+    ) -> None:
+        world = mock.Mock()
+        game_input = mock.Mock()
+        planner = mock.Mock()
+        emergency_command = SimpleNamespace(mode="idle", safe_stop=True)
+        game_input.emergency_stop.return_value = emergency_command
+        snapshot = self.snapshot(fall_detected=True)
+
+        termination_reason, command = MODULE._handle_game_auto_respawn_fall(
+            game_world=world,
+            game_input=game_input,
+            planner=planner,
+            snapshot=snapshot,
+            checkpoint_writes_blocked=False,
+            now_s=10.0,
+            ground_height_m=-0.93,
+        )
+
+        self.assertEqual(termination_reason, "game_fall_respawn")
+        self.assertIs(command, emergency_command)
+        planner.send_game_command.assert_called_once_with(emergency_command)
+        world.checkpoint.assert_called_once_with(
+            snapshot,
+            now_s=10.0,
+            force=True,
+            required=False,
+            ground_height_m=-0.93,
+        )
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=True,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=[],
+                resume_rollback_requested=False,
+            ),
+            75,
+        )
+
+    def test_auto_respawn_no_ground_retains_previous_safe_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            clearance = {"safe": True, "reason": "clear"}
+            world = MODULE._GameWorldStateRuntime(
+                path=Path(temporary) / "world.json",
+                world_id="moon:test",
+                world_revision="c" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: dict(clearance),
+            )
+            safe = self.snapshot()
+            safe.qpos[:7] = [0.0, 0.0, -0.14, 1.0, 0.0, 0.0, 0.0]
+            self.assertTrue(
+                world.checkpoint(
+                    safe,
+                    now_s=1.0,
+                    force=True,
+                    ground_height_m=-0.93,
+                )
+            )
+            selected = world.state.resolve_start()
+            clearance.update(
+                {
+                    "safe": False,
+                    "reason": "no_ground_support",
+                }
+            )
+            fallen = self.snapshot(fall_detected=True)
+            fallen.qpos[:7] = [20.0, 0.0, -4.0, 1.0, 0.0, 0.0, 0.0]
+            game_input = mock.Mock()
+            game_input.emergency_stop.return_value = SimpleNamespace(
+                mode="idle",
+                safe_stop=True,
+            )
+            planner = mock.Mock()
+
+            reason, _ = MODULE._handle_game_auto_respawn_fall(
+                game_world=world,
+                game_input=game_input,
+                planner=planner,
+                snapshot=fallen,
+                checkpoint_writes_blocked=False,
+                now_s=2.0,
+                ground_height_m=-4.8,
+            )
+
+            self.assertEqual(reason, "game_fall_respawn")
+            self.assertEqual(
+                world.state.resolve_start().checkpoint_id,
+                selected.checkpoint_id,
+            )
+            self.assertEqual(world.state.last_observed.x, 20.0)
+            self.assertEqual(
+                world.telemetry()["last_clearance_audit"]["reason"],
+                "no_ground_support",
+            )
+
+    def test_resume_metadata_accepts_rollback_counts_through_limit(self) -> None:
+        for rollback_count in (1, 16):
+            with self.subTest(rollback_count=rollback_count):
+                MODULE._validate_game_world_resume_metadata(
+                    selected_checkpoint_id=None,
+                    selected_generation=None,
+                    rollback_count=rollback_count,
+                    world_state_configured=True,
+                )
+        with self.assertRaisesRegex(ValueError, "world-state persistence"):
+            MODULE._validate_game_world_resume_metadata(
+                selected_checkpoint_id=None,
+                selected_generation=None,
+                rollback_count=1,
+                world_state_configured=False,
+            )
+        for rollback_count in (-1, 17):
+            with self.subTest(invalid_rollback_count=rollback_count):
+                with self.assertRaisesRegex(ValueError, r"\[0, 16\]"):
+                    MODULE._validate_game_world_resume_metadata(
+                        selected_checkpoint_id=None,
+                        selected_generation=None,
+                        rollback_count=rollback_count,
+                        world_state_configured=True,
+                    )
+
+    def test_resume_rollback_eligibility_is_narrow_and_allowlisted(self) -> None:
+        baseline = {
+            "selected_checkpoint_id": "cp-1",
+            "selected_generation": 7,
+            "rollback_count": 0,
+            "elapsed_s": 5.0,
+            "termination_reason": "numerical_instability",
+            "numerical_error": "snapshot_non_finite:qpos[2]=nan",
+            "low_cmd_received": False,
+            "active_lowcmd": False,
+            "active_frames": 0,
+            "active_elapsed_s": 0.0,
+            "termination_signal": None,
+            "child_failure": None,
+            "fall_detected": False,
+            "initial_reset_count": 0,
+            "final_reset_count": 0,
+        }
+        self.assertIsNone(MODULE._game_world_rollback_ineligibility(**baseline))
+        coincident_fall = {**baseline, "fall_detected": True}
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(**coincident_fall)
+        )
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **coincident_fall,
+                    "numerical_error": (
+                        "snapshot_sim_time_not_increasing:0.0,previous=0.0"
+                    ),
+                }
+            )
+        )
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **baseline,
+                    "termination_reason": "spawn_clearance_failed",
+                    "numerical_error": "spawn_clearance:scene_penetration",
+                    "spawn_clearance_audit": {
+                        "schema": "matrix-spawn-clearance-audit/v1",
+                        "safe": False,
+                        "reason": "scene_penetration",
+                        "error": None,
+                        "rejected_contact_count": 1,
+                        "worst": {
+                            "allowed": False,
+                            "classification": "scene_penetration",
+                        },
+                    },
+                }
+            )
+        )
+        no_ground_audit = {
+            "schema": "matrix-spawn-clearance-audit/v1",
+            "safe": False,
+            "reason": "no_ground_support",
+            "error": None,
+            "rejected_contact_count": 0,
+            "worst": None,
+            "support": {
+                "schema": "matrix-ground-support-probe/v1",
+                "supported": False,
+                "method": "downward_foot_geom_rays",
+                "required_hits": 1,
+                "accepted_hits": 0,
+                "maximum_drop_m": 0.12,
+                "minimum_normal_z": 0.8,
+                "ray_direction": [0.0, 0.0, -1.0],
+                "probes": [
+                    {
+                        "foot_body": {"id": body_id, "name": name},
+                        "origins": [
+                            {
+                                "geom_id": body_id + 100,
+                                "geom_name": f"foot_{body_id}",
+                                "position_m": [float(body_id), 0.0, 0.5],
+                            }
+                        ],
+                        "accepted": False,
+                        "distance_m": None,
+                        "normal": None,
+                        "probe_geom": None,
+                        "ray_origin_m": None,
+                        "scene_geom": None,
+                    }
+                    for body_id, name in (
+                        (7, "left_ankle_roll_link"),
+                        (13, "right_ankle_roll_link"),
+                    )
+                ],
+            },
+        }
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **baseline,
+                    "termination_reason": "spawn_clearance_failed",
+                    "numerical_error": "spawn_clearance:no_ground_support",
+                    "spawn_clearance_audit": no_ground_audit,
+                }
+            )
+        )
+        from tests.test_matrix_spawn_clearance import (
+            FakeData,
+            FakeModel,
+            FakeMujoco,
+        )
+
+        produced_no_ground = MODULE.audit_spawn_safety(
+            FakeMujoco(default_support=False),
+            FakeModel(),
+            FakeData(),
+        )
+        self.assertEqual(
+            MODULE._spawn_clearance_rollback_reason(produced_no_ground),
+            "no_ground_support",
+        )
+        for invalid_audit in (
+            {
+                "schema": "matrix-spawn-clearance-audit/v1",
+                "safe": False,
+                "reason": "audit_error",
+                "error": {"type": "RuntimeError", "message": "no model"},
+                "rejected_contact_count": 0,
+                "worst": None,
+            },
+            {
+                "schema": "matrix-spawn-clearance-audit/v1",
+                "safe": False,
+                "reason": "scene_penetration",
+                "error": None,
+                "rejected_contact_count": 1,
+                "worst": {
+                    "allowed": False,
+                    "classification": "unsafe_foot_penetration",
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "accepted_hits": 1,
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "required_hits": True,
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "accepted_hits": False,
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "ray_direction": [False, False, -1.0],
+                },
+            },
+            {
+                **no_ground_audit,
+                "support": {
+                    **no_ground_audit["support"],
+                    "ray_direction": [0.0, 0.0, 1.0],
+                },
+            },
+        ):
+            with self.subTest(invalid_audit=invalid_audit):
+                self.assertEqual(
+                    MODULE._game_world_rollback_ineligibility(
+                        **{
+                            **baseline,
+                            "termination_reason": "spawn_clearance_failed",
+                            "numerical_error": (
+                                f"spawn_clearance:{invalid_audit['reason']}"
+                            ),
+                            "spawn_clearance_audit": invalid_audit,
+                        }
+                    ),
+                    "spawn_clearance_evidence_missing",
+                )
+        self.assertEqual(
+            MODULE._game_world_rollback_ineligibility(
+                **{
+                    **baseline,
+                    "termination_reason": "spawn_clearance_failed",
+                    "numerical_error": None,
+                }
+            ),
+            "spawn_clearance_evidence_missing",
+        )
+        for rollback_count in (1, 15):
+            with self.subTest(eligible_rollback_count=rollback_count):
+                self.assertIsNone(
+                    MODULE._game_world_rollback_ineligibility(
+                        **{**coincident_fall, "rollback_count": rollback_count}
+                    )
+                )
+        self.assertEqual(
+            MODULE._game_world_rollback_ineligibility(
+                **{**coincident_fall, "rollback_count": 16}
+            ),
+            "rollback_limit_reached",
+        )
+
+        disqualifiers = {
+            "late": {"elapsed_s": 5.000001},
+            "signal": {"termination_signal": signal.SIGTERM},
+            "child": {"child_failure": ("deploy", 7)},
+            "reset": {"final_reset_count": 1},
+            "received_lowcmd": {"low_cmd_received": True},
+            "fresh_lowcmd": {"active_lowcmd": True},
+            "active_frame": {"active_frames": 1},
+            "ordinary_fall": {
+                "termination_reason": "fall_detected",
+                "numerical_error": None,
+            },
+            "wrong_termination": {"termination_reason": "child_exit"},
+            "abi_error": {
+                "numerical_error": "snapshot_dimension:qpos=35,expected=36"
+            },
+        }
+        for name, changes in disqualifiers.items():
+            with self.subTest(name=name):
+                self.assertIsNotNone(
+                    MODULE._game_world_rollback_ineligibility(
+                        **{**coincident_fall, **changes}
+                    )
+                )
+
+    def test_internal_restart_exit_is_75_even_with_acceptance_failure(self) -> None:
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=True,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=["numerical_instability"],
+            ),
+            75,
+        )
+
+    def test_resume_rollback_proposal_uses_dedicated_exit_76(self) -> None:
+        self.assertEqual(
+            MODULE._runtime_exit_code(
+                internal_restart_requested=False,
+                passed=False,
+                qualification_attempted=False,
+                interrupted=False,
+                acceptance_failures=["numerical_instability"],
+                resume_rollback_requested=True,
+            ),
+            76,
+        )
+
+    def test_failure_frame_lowcmd_and_reset_evidence_blocks_resume_rollback(
+        self,
+    ) -> None:
+        previous = self.snapshot(step_index=0, sim_time=0.0)
+        cases = {
+            "lowcmd": (
+                {"low_cmd_received": True, "low_cmd_fresh": True},
+                "lowcmd_observed",
+            ),
+            "reset": ({"reset_count": 1}, "reset_detected"),
+        }
+        for name, (changes, expected_reason) in cases.items():
+            with self.subTest(name=name):
+                failed = self.snapshot(step_index=1, sim_time=0.005, **changes)
+                failed.qpos[2] = math.nan
+                evidence = MODULE._ResumeRollbackEvidence(initial_reset_count=0)
+                evidence.observe(previous)
+                # Production samples this evidence before rejecting the frame.
+                evidence.observe(failed)
+                validation_error = MODULE._snapshot_validation_error(
+                    failed, previous
+                )
+                self.assertTrue(validation_error.startswith("snapshot_non_finite:"))
+                ineligibility = MODULE._game_world_rollback_ineligibility(
+                    selected_checkpoint_id="cp-1",
+                    selected_generation=7,
+                    rollback_count=0,
+                    elapsed_s=1.0,
+                    termination_reason="numerical_instability",
+                    numerical_error=validation_error,
+                    low_cmd_received=evidence.low_cmd_received,
+                    active_lowcmd=evidence.active_lowcmd,
+                    active_frames=evidence.active_frames,
+                    active_elapsed_s=0.0,
+                    termination_signal=None,
+                    child_failure=None,
+                    fall_detected=evidence.fall_detected,
+                    initial_reset_count=0,
+                    final_reset_count=evidence.max_reset_count,
+                    reset_observed=evidence.reset_observed,
+                )
+                self.assertEqual(ineligibility, expected_reason)
+
+    def test_failure_frame_fall_allows_exact_startup_numerical_rollback(
+        self,
+    ) -> None:
+        previous = self.snapshot(step_index=0, sim_time=0.0)
+        failed = self.snapshot(
+            step_index=1,
+            sim_time=0.005,
+            fall_detected=True,
+        )
+        failed.qpos[2] = math.nan
+        evidence = MODULE._ResumeRollbackEvidence(initial_reset_count=0)
+        evidence.observe(previous)
+        evidence.observe(failed)
+        validation_error = MODULE._snapshot_validation_error(failed, previous)
+
+        self.assertTrue(validation_error.startswith("snapshot_non_finite:"))
+        self.assertTrue(evidence.fall_detected)
+        self.assertIsNone(
+            MODULE._game_world_rollback_ineligibility(
+                selected_checkpoint_id="cp-1",
+                selected_generation=7,
+                rollback_count=0,
+                elapsed_s=1.0,
+                termination_reason="numerical_instability",
+                numerical_error=validation_error,
+                low_cmd_received=evidence.low_cmd_received,
+                active_lowcmd=evidence.active_lowcmd,
+                active_frames=evidence.active_frames,
+                active_elapsed_s=0.0,
+                termination_signal=None,
+                child_failure=None,
+                fall_detected=evidence.fall_detected,
+                initial_reset_count=0,
+                final_reset_count=evidence.max_reset_count,
+                reset_observed=evidence.reset_observed,
+            )
+        )
+
+    def test_late_signal_or_child_boundary_cancels_rollback_proposal(self) -> None:
+        baseline = {
+            "selected_checkpoint_id": "cp-1",
+            "selected_generation": 7,
+            "rollback_count": 0,
+            "elapsed_s": 1.0,
+            "termination_reason": "numerical_instability",
+            "numerical_error": "snapshot_non_finite:qpos[2]=nan",
+            "low_cmd_received": False,
+            "active_lowcmd": False,
+            "active_frames": 0,
+            "active_elapsed_s": 0.0,
+            "termination_signal": None,
+            "child_failure": None,
+            "fall_detected": False,
+            "initial_reset_count": 0,
+            "final_reset_count": 0,
+        }
+        for name, changes in (
+            ("signal", {"termination_signal": signal.SIGTERM}),
+            ("child", {"child_failure": ("deploy", 0)}),
+        ):
+            with self.subTest(name=name):
+                ineligibility = MODULE._game_world_rollback_ineligibility(
+                    **{**baseline, **changes}
+                )
+                self.assertIsNotNone(ineligibility)
+                self.assertEqual(
+                    MODULE._runtime_exit_code(
+                        internal_restart_requested=False,
+                        passed=False,
+                        qualification_attempted=False,
+                        interrupted=False,
+                        acceptance_failures=["numerical_instability"],
+                        resume_rollback_requested=False,
+                    ),
+                    2,
+                )
+
+    def test_main_proposes_only_after_expected_stop_and_never_rejects(self) -> None:
+        source = inspect.getsource(MODULE.main)
+        self.assertNotIn("reject_selected_resume_checkpoint(", source)
+        self.assertLess(
+            source.index("processes.begin_expected_stop()"),
+            source.index("propose_selected_resume_rollback("),
+        )
+
+    def test_main_handles_fall_before_resume_clearance_audit(self) -> None:
+        source = inspect.getsource(MODULE.main)
+        self.assertLess(
+            source.index("snapshot_fall_detected = bool(snapshot.fall_detected)"),
+            source.index("probation_audit = resume_probation.observe("),
+        )
+        self.assertIn(
+            "if resume_probation.active and not snapshot_fall_detected:",
+            source,
+        )
+
+    def test_main_arms_resume_checkpoint_writes_only_after_user_publish(
+        self,
+    ) -> None:
+        source = inspect.getsource(MODULE.main)
+        publication = source.index("if command_published:")
+        record = source.index(
+            "game_input.record_published_command(game_command)",
+            publication,
+        )
+        provenance_gate = source.index("if user_command_selected:", record)
+        arming = source.index(
+            "resume_probation.observe_published_user_command(",
+            provenance_gate,
+        )
+        periodic_checkpoint = source.index(
+            "game_world.checkpoint(",
+            arming,
+        )
+        self.assertLess(publication, record)
+        self.assertLess(record, provenance_gate)
+        self.assertLess(provenance_gate, arming)
+        self.assertLess(arming, periodic_checkpoint)
+        self.assertIn(
+            "and resume_probation.checkpoint_writes_armed",
+            source,
+        )
+        self.assertIn(
+            "resume_probation.checkpoint_writes_blocked",
+            source,
+        )
+
+    def test_main_installs_signal_cleanup_boundary_before_simulator_creation(
+        self,
+    ) -> None:
+        source = inspect.getsource(MODULE.main)
+        self.assertLess(
+            source.index("signal.signal(signum, request_stop)"),
+            source.index("simulator = create_simulator(config)"),
+        )
+        self.assertLess(
+            source.index("started_wall = time.perf_counter()"),
+            source.index("simulator = create_simulator(config)"),
+        )
+
     def test_root_yaw_uses_normalized_mujoco_wxyz_quaternion(self) -> None:
         half = math.pi / 4.0
         qpos = [
@@ -188,6 +2222,40 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(MODULE._root_yaw_rad(qpos), math.pi / 2.0)
         with self.assertRaisesRegex(ValueError, "zero"):
             MODULE._root_yaw_rad([0.0] * 7)
+
+    def test_world_checkpoint_uses_live_recovery_state_not_sticky_fall_latch(
+        self,
+    ) -> None:
+        recovered = self.snapshot_with_yaw(0.25, fall_detected=True)
+        recovered.qpos[2] = 0.8
+        self.assertFalse(MODULE._snapshot_world_upright(recovered))
+        self.assertTrue(
+            MODULE._snapshot_world_upright(
+                recovered,
+                current_fall_detected=False,
+            )
+        )
+
+        physical = SimpleNamespace(
+            current_fall_detected=False,
+            fsm=SimpleNamespace(state=MODULE.ResidentRecoveryState.GAME_SONIC),
+            last_output=SimpleNamespace(inhibit_game_input=False),
+        )
+        self.assertFalse(
+            MODULE._game_world_current_fall_detected(
+                recovered,
+                game_fall_recovery=None,
+                physical_recovery=physical,
+            )
+        )
+        physical.fsm.state = MODULE.ResidentRecoveryState.KUNGFU_RECOVERING
+        self.assertTrue(
+            MODULE._game_world_current_fall_detected(
+                recovered,
+                game_fall_recovery=None,
+                physical_recovery=physical,
+            )
+        )
 
     def test_heading_anchor_captures_only_first_fresh_lowcmd_edge(self) -> None:
         initial = self.snapshot_with_yaw(
@@ -306,6 +2374,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "timestamp_monotonic_s": timestamp,
                     "focused": True,
                     "camera_yaw_rad": 0.4,
+                    "keyboard_boost": False,
                     "keys": {
                         "w": w,
                         "a": False,
@@ -316,6 +2385,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                         "v": False,
                         "ctrl": False,
                         "shift": False,
+                        "alt": False,
                     },
                     "move_stick": {"right": 0.0, "forward": 0.0},
                 }
@@ -632,6 +2702,36 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(gate.episodes, 2)
 
+    def test_sonic_fall_recovery_uses_terrain_relative_height(self) -> None:
+        gate = MODULE._GameFallRecoveryGate(timeout_s=5.0)
+        upright = self.snapshot(
+            fall_detected=True,
+            low_cmd_fresh=True,
+            elastic_band_scale=0.0,
+        )
+        upright.qpos[2] = -0.21
+        upright.qpos[3] = 1.0
+        self.assertIsNone(
+            gate.observe(
+                upright,
+                now_s=1.0,
+                ground_height_m=-0.93,
+            )
+        )
+        self.assertFalse(gate.current_fallen)
+
+        upright.qpos[2] = -0.75
+        upright.qpos[3] = 0.0
+        upright.qpos[4] = 1.0
+        self.assertEqual(
+            gate.observe(
+                upright,
+                now_s=2.0,
+                ground_height_m=-0.93,
+            ),
+            "entered",
+        )
+
     def test_sonic_fall_recovery_timeout_is_telemetry_not_runtime_exit(self) -> None:
         gate = MODULE._GameFallRecoveryGate(timeout_s=2.0)
         fallen = self.snapshot(
@@ -924,6 +3024,117 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             Path("/run/user/1000/camera-state.bin"),
         )
 
+    def test_parse_args_exposes_external_control_endpoint_and_deadman(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--game-external-control-socket",
+                "/run/user/1000/matrix-external/trna.sock",
+                "--game-external-control-capability-file",
+                "/run/user/1000/matrix-external/trna.cap",
+                "--game-external-control-deadman-seconds",
+                "0.12",
+            ],
+        ):
+            parsed = MODULE._parse_args()
+
+        self.assertEqual(
+            parsed.game_external_control_socket,
+            Path("/run/user/1000/matrix-external/trna.sock"),
+        )
+        self.assertEqual(
+            parsed.game_external_control_capability_file,
+            Path("/run/user/1000/matrix-external/trna.cap"),
+        )
+        self.assertEqual(parsed.game_external_control_deadman_seconds, 0.12)
+
+    def test_external_control_validation_is_all_or_none_bounded_and_disjoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = {
+                "input_socket": root / "input.sock",
+                "external_socket": root / "external.sock",
+                "external_capability_file": root / "external.cap",
+                "external_deadman_seconds": 0.15,
+                "restart_request_file": root / "restart.json",
+                "restart_capability_file": root / "restart.cap",
+                "require_external_parents": True,
+            }
+            MODULE._validate_game_external_control(**values)
+
+            incomplete = dict(values)
+            incomplete["external_capability_file"] = None
+            with self.assertRaisesRegex(ValueError, "all-or-none"):
+                MODULE._validate_game_external_control(**incomplete)
+
+            slow = dict(values)
+            slow["external_deadman_seconds"] = 0.151
+            with self.assertRaisesRegex(ValueError, r"\[0.01, 0.15\]"):
+                MODULE._validate_game_external_control(**slow)
+
+            aliased = dict(values)
+            aliased["external_socket"] = values["input_socket"]
+            with self.assertRaisesRegex(ValueError, "strictly distinct"):
+                MODULE._validate_game_external_control(**aliased)
+
+            relative = dict(values)
+            relative["external_socket"] = Path("external.sock")
+            with self.assertRaisesRegex(ValueError, "must be absolute"):
+                MODULE._validate_game_external_control(**relative)
+
+    def test_game_cli_rejects_external_endpoint_aliased_to_input_socket(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--control-source",
+                "game",
+                "--game-input-socket",
+                "/tmp/matrix-shared.sock",
+                "--game-external-control-socket",
+                "/tmp/matrix-shared.sock",
+                "--game-external-control-capability-file",
+                "/tmp/matrix-external.cap",
+                "--no-game-input-provider",
+            ],
+        ), self.assertRaisesRegex(SystemExit, "strictly distinct"):
+            MODULE.main()
+
+    def test_parse_args_exposes_exact_world_resume_rollback_metadata(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--game-world-resume-checkpoint-id",
+                "cp-123",
+                "--game-world-resume-generation",
+                "17",
+                "--game-resume-rollback-count",
+                "1",
+            ],
+        ):
+            parsed = MODULE._parse_args()
+
+        self.assertEqual(parsed.game_world_resume_checkpoint_id, "cp-123")
+        self.assertEqual(parsed.game_world_resume_generation, 17)
+        self.assertEqual(parsed.game_resume_rollback_count, 1)
+
     def test_qualified_acceptance_rejects_weaker_lock_gates(self) -> None:
         lock = json.loads(
             (REPO_ROOT / "config/runtime/matrix-sonic.lock.json").read_text(
@@ -1045,7 +3256,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         status = MODULE._game_control_status_fields(args)
 
         self.assertEqual(status["input_source_requested"], "auto")
-        self.assertEqual(status["input_protocol"], "matrix-game-input/v2")
+        self.assertEqual(status["input_protocol"], "matrix-game-input/v3")
         self.assertEqual(status["input_source_effective"], "keyboard")
         self.assertEqual(status["camera_yaw_source"], "x11-mirror")
         self.assertEqual(status["camera_look_button"], "right")
@@ -1067,11 +3278,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             {"IDLE": 0, "SLOW_WALK": 1, "WALK": 2, "RUN": 3},
         )
         self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
+        self.assertEqual(status["keyboard_slow_boost_speed_mps"], 0.20)
         self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
+        self.assertEqual(status["keyboard_walk_boost_speed_mps"], 1.00)
         self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
+        self.assertEqual(status["keyboard_run_boost_speed_mps"], 2.75)
+        self.assertEqual(status["keyboard_double_tap_window_s"], 0.30)
         self.assertEqual(status["maximum_speed_mps"], 0.30)
         self.assertEqual(status["analog_maximum_speed_mps"], 0.30)
-        self.assertEqual(status["keyboard_maximum_target_speed_mps"], 2.50)
+        self.assertEqual(status["keyboard_maximum_target_speed_mps"], 2.75)
         self.assertEqual(status["maximum_acceleration_mps2"], 1.20)
         self.assertEqual(status["maximum_deceleration_mps2"], 2.40)
         self.assertEqual(status["maximum_turn_rate_rad_s"], 2.50)
@@ -1578,6 +3793,35 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "snapshot_expected_dimensions_invalid",
         )
 
+    def test_render_projection_hides_inventory_tail_from_canonical_ue(self) -> None:
+        snapshot = self.snapshot(qpos_len=92, qvel_len=83)
+        snapshot.qpos = [float(index) for index in range(92)]
+        snapshot.qvel = [float(index) for index in range(83)]
+        snapshot.ctrl = [float(index) for index in range(29)]
+
+        qpos, qvel, ctrl = MODULE._canonical_render_vectors(snapshot)
+
+        self.assertEqual(qpos, tuple(snapshot.qpos[:36]))
+        self.assertEqual(qvel, tuple(snapshot.qvel[:35]))
+        self.assertEqual(ctrl, tuple(snapshot.ctrl))
+        self.assertEqual((len(qpos), len(qvel), len(ctrl)), (36, 35, 29))
+        self.assertNotIn(snapshot.qpos[36], qpos)
+        self.assertNotIn(snapshot.qvel[35], qvel)
+
+    def test_render_projection_fails_closed_on_short_or_non_finite_state(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "qpos must contain 36"):
+            MODULE._canonical_render_vectors(self.snapshot(qpos_len=35))
+        non_finite = self.snapshot(qpos_len=92, qvel_len=83)
+        non_finite.qvel[7] = math.nan
+        with self.assertRaisesRegex(ValueError, "qvel contains non-finite"):
+            MODULE._canonical_render_vectors(non_finite)
+        extra_ctrl = self.snapshot(qpos_len=92, qvel_len=83)
+        extra_ctrl.ctrl.append(0.0)
+        with self.assertRaisesRegex(ValueError, "ctrl source must contain exactly 29"):
+            MODULE._canonical_render_vectors(extra_ctrl)
+
     @mock.patch.dict(
         sys.modules,
         {"mujoco": SimpleNamespace(mjtJoint=SimpleNamespace(mjJNT_FREE=0))},
@@ -2080,24 +4324,78 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[4]["movement"], [0.0, 0.0, 0.0])
         self.assertEqual(planners[4]["speed"], -1.0)
 
+        turn_command = MODULE.RobotMotionCommand(
+            sequence=121,
+            movement=(0.0, 0.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=MODULE.SONIC_IDLE_MODE,
+            mode="turn",
+            safe_stop=False,
+            reason="aligning_heading",
+        )
+        client.send_game_command(turn_command)
+        self.assertEqual(planners[5]["mode"], MODULE.SONIC_WALK_MODE)
+        self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[5]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[5]["speed"], -1.0)
+
+        invalid_turns = (
+            (
+                replace(turn_command, reason="untrusted_turn_reason"),
+                "approved turn reason",
+            ),
+            (
+                replace(turn_command, safe_stop=True),
+                "cannot be a safe stop",
+            ),
+            (
+                replace(turn_command, movement=(0.0, 0.0, 0.01)),
+                "zero speed and movement",
+            ),
+            (
+                replace(
+                    turn_command,
+                    locomotion_mode=MODULE.SONIC_WALK_MODE,
+                ),
+                "must use native IDLE",
+            ),
+            (
+                replace(
+                    turn_command,
+                    movement=(1.0, 0.0, 0.0),
+                    speed_mps=0.8,
+                ),
+                "must not translate",
+            ),
+        )
+        for invalid_turn, message in invalid_turns:
+            with self.subTest(invalid_turn=invalid_turn), self.assertRaisesRegex(
+                ValueError,
+                message,
+            ):
+                client.send_game_command(invalid_turn)
+            self.assertEqual(len(planners), 6)
+            self.assertEqual(len(socket.sent), 15)
+
         client.send_recovery_posture(
             locomotion_mode=5,
             height=0.4,
             facing=(0.0, 1.0, 0.0),
         )
-        self.assertEqual(planners[5]["mode"], 5)
-        self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
-        self.assertEqual(planners[5]["facing"], [0.0, 1.0, 0.0])
-        self.assertEqual(planners[5]["speed"], -1.0)
-        self.assertEqual(planners[5]["height"], 0.4)
+        self.assertEqual(planners[6]["mode"], 5)
+        self.assertEqual(planners[6]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[6]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[6]["speed"], -1.0)
+        self.assertEqual(planners[6]["height"], 0.4)
 
         client.send_recovery_posture(
             locomotion_mode=0,
             height=-1.0,
             facing=(1.0, 0.0, 0.0),
         )
-        self.assertEqual(planners[6]["mode"], 0)
-        self.assertEqual(planners[6]["height"], -1.0)
+        self.assertEqual(planners[7]["mode"], 0)
+        self.assertEqual(planners[7]["height"], -1.0)
         with self.assertRaisesRegex(ValueError, "IDLE or KNEEL"):
             client.send_recovery_posture(
                 locomotion_mode=7,
@@ -2212,6 +4510,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                         "timestamp_monotonic_s": 10.0,
                         "focused": True,
                         "camera_yaw_rad": math.pi / 2.0,
+                        "keyboard_boost": False,
                         "keys": {
                             "w": False,
                             "a": False,
@@ -2222,6 +4521,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                             "v": False,
                             "ctrl": False,
                             "shift": False,
+                            "alt": False,
                         },
                         "move_stick": {"right": 0.0, "forward": 0.0},
                     }
@@ -2273,6 +4573,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 client.close()
                 runtime.close()
             self.assertFalse(path.exists())
+
+    def test_game_command_runtime_routes_input_mutation_to_external_api_first(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        runtime = MODULE.GameCommandRuntime(runtime_socket, None)
+        request = self.game_command_request(
+            "/data modify entity @s control.input.keyboard.w set value true",
+            sequence=1,
+            request_character="e",
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(0.0, 0.0, 0.8, 0.0),
+                    command_allowed=False,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertFalse(response.ok)
+            self.assertEqual(response.code, "E_EXTERNAL_API_REQUIRED")
+            self.assertIn("provider-side external control API", response.message)
+            self.assertEqual(runtime.rejected_commands, 1)
+            self.assertEqual(runtime.commands_executed, 0)
+        finally:
+            provider_socket.close()
+            runtime.close()
 
     def test_game_command_runtime_persists_summon_and_teleport_response(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2354,6 +4686,135 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_game_command_runtime_rejects_teleport_target_that_fails_clearance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            audited: list[WORLD_STATE.WorldPose] = []
+
+            def reject_target(pose):
+                audited.append(pose)
+                return {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": "scene_penetration",
+                    "worst": {"robot_body": {"name": "left_hand_link"}},
+                }
+
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                world,
+                pose_clearance_auditor=reject_target,
+            )
+            current = WORLD_STATE.WorldPose(10.0, 20.0, 0.8, 0.5)
+            request = self.game_command_request(
+                "/tp @s ~1 ~2 ~",
+                sequence=1,
+                request_character="9",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(current_pose=current, command_allowed=True)
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertFalse(response.ok)
+                self.assertEqual(response.code, "E_SPAWN_CLEARANCE")
+                self.assertFalse(response.restart_required)
+                self.assertEqual(
+                    audited,
+                    [WORLD_STATE.WorldPose(11.0, 22.0, 0.8, 0.5)],
+                )
+                self.assertFalse(state_path.exists())
+                self.assertIsNone(world.state.last_exit)
+                self.assertFalse(runtime.restart_requested)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
+    def test_game_command_runtime_teleport_list_is_strictly_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            state, point = world.state.add_teleport_point(
+                WORLD_STATE.WorldPose(160.0, 117.0, 1.2, 0.0),
+                ("home",),
+                entity_id="tp-" + "d" * 32,
+                now_unix_ns=2,
+            )
+            world.state = state
+            world.last_error = "existing diagnostic"
+            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            current_pose = WORLD_STATE.WorldPose(160.0, 117.0, 1.2, 0.0)
+            request = self.game_command_request(
+                "/teleport list home moon.tranquility mars.utopia",
+                sequence=1,
+                request_character="e",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                with mock.patch.object(world.store, "save") as save:
+                    self.assertFalse(
+                        runtime.poll(
+                            current_pose=current_pose,
+                            command_allowed=True,
+                        )
+                    )
+                    save.assert_not_called()
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_TELEPORT_LIST")
+                self.assertFalse(response.restart_required)
+                self.assertEqual(
+                    response.data,
+                    {
+                        "world_id": "town10:test",
+                        "teleport_points": [
+                            {
+                                "tag": "home",
+                                "found": True,
+                                "entity_id": point.entity_id,
+                                "position": [160.0, 117.0, 1.2],
+                                "yaw_rad": 0.0,
+                            },
+                            {"tag": "moon.tranquility", "found": False},
+                            {"tag": "mars.utopia", "found": False},
+                        ],
+                    },
+                )
+                self.assertIs(world.state, state)
+                self.assertEqual(world.last_error, "existing diagnostic")
+                self.assertEqual(runtime.commands_executed, 1)
+                self.assertFalse(state_path.exists())
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_required_world_checkpoint_surfaces_durable_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             world = MODULE._GameWorldStateRuntime(
@@ -2382,6 +4843,433 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(world.last_error, "simulated fsync failure")
             self.assertEqual(world.checkpoint_count, 0)
             self.assertIsNone(world.state.last_exit)
+
+    def test_required_world_checkpoint_rejects_clearance_audit_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            world = MODULE._GameWorldStateRuntime(
+                path=Path(temporary) / "world-state.json",
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": "audit_error",
+                    "error": {"type": "RuntimeError", "message": "no model"},
+                },
+            )
+            snapshot = self.snapshot()
+            snapshot.qpos[2] = 0.8
+            snapshot.qpos[3] = 1.0
+
+            with self.assertRaisesRegex(
+                WORLD_STATE.WorldStateError,
+                "required checkpoint spawn-clearance audit failed: audit_error",
+            ):
+                world.checkpoint(
+                    snapshot,
+                    now_s=1.0,
+                    force=True,
+                    required=True,
+                )
+
+            self.assertFalse(world.store.path.exists())
+            self.assertEqual(world.checkpoint_count, 0)
+            self.assertIsNone(world.state.last_exit)
+            self.assertIn("audit_error", world.last_error)
+
+    def test_world_checkpoint_filters_scene_penetration_without_rebasing_xy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            safe_snapshot = self.snapshot()
+            safe_snapshot.qpos[:7] = [1.0, 2.0, 0.8, 1.0, 0.0, 0.0, 0.0]
+            clearance = {"safe": True, "reason": "clear"}
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: dict(clearance),
+            )
+            self.assertTrue(
+                world.checkpoint(safe_snapshot, now_s=1.0, force=True)
+            )
+            selected = world.state.resolve_start()
+
+            penetrating = self.snapshot()
+            penetrating.qpos[:7] = [
+                1.8,
+                2.2,
+                0.66,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            ]
+            clearance.update(
+                {
+                    "safe": False,
+                    "reason": "scene_penetration",
+                    "worst": {"robot_body": {"name": "left_hand_link"}},
+                }
+            )
+            self.assertTrue(
+                world.checkpoint(penetrating, now_s=2.0, force=True)
+            )
+
+            self.assertEqual(world.state.resolve_start().checkpoint_id, selected.checkpoint_id)
+            self.assertEqual(world.state.resolve_start().pose, selected.pose)
+            self.assertEqual(world.state.last_observed.x, 1.8)
+            self.assertEqual(world.clearance_rejection_count, 1)
+            self.assertEqual(
+                world.telemetry()["last_clearance_audit"]["reason"],
+                "scene_penetration",
+            )
+
+    def test_world_checkpoint_skips_unsupported_pose_and_keeps_active_slot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            clearance = {"safe": True, "reason": "clear"}
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="moon:test",
+                world_revision="b" * 64,
+                checkpoint_seconds=0.75,
+                clearance_auditor=lambda: dict(clearance),
+            )
+            supported = self.snapshot()
+            supported.qpos[:7] = [0.0, 0.0, -0.14, 1.0, 0.0, 0.0, 0.0]
+            self.assertTrue(
+                world.checkpoint(
+                    supported,
+                    now_s=1.0,
+                    force=True,
+                    ground_height_m=-0.93,
+                )
+            )
+            selected = world.state.resolve_start()
+
+            unsupported = self.snapshot()
+            unsupported.qpos[:7] = [10.0, 0.0, -0.14, 1.0, 0.0, 0.0, 0.0]
+            clearance.update(
+                {
+                    "safe": False,
+                    "reason": "no_ground_support",
+                    "support": {
+                        "schema": "matrix-ground-support-probe/v1",
+                        "supported": False,
+                        "accepted_hits": 0,
+                    },
+                }
+            )
+            self.assertTrue(
+                world.checkpoint(
+                    unsupported,
+                    now_s=2.0,
+                    force=True,
+                    ground_height_m=-0.93,
+                )
+            )
+
+            self.assertEqual(
+                world.state.resolve_start().checkpoint_id,
+                selected.checkpoint_id,
+            )
+            self.assertEqual(world.state.resolve_start().pose, selected.pose)
+            self.assertEqual(world.state.last_observed.x, 10.0)
+            self.assertEqual(world.clearance_rejection_count, 1)
+            self.assertEqual(
+                world.telemetry()["last_clearance_audit"]["reason"],
+                "no_ground_support",
+            )
+
+    def test_game_command_runtime_atomically_updates_live_motion_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "motion-control.json"
+            store = MOTION_SETTINGS.MotionSettingsStore(settings_path)
+            core = GAME_CONTROL.GameControlCore(GAME_CONTROL.ControlConfig())
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                None,
+                motion_settings=store,
+                control_core=core,
+            )
+            pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+            try:
+                update = self.game_command_request(
+                    "/data modify entity @s "
+                    "control.motion.gears.walk.double_tap_speed_mps "
+                    "set value 1.2",
+                    sequence=1,
+                    request_character="d",
+                )
+                provider_socket.send(MC_COMMANDS.encode_command_request(update))
+
+                self.assertFalse(
+                    runtime.poll(current_pose=pose, command_allowed=True)
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_DATA_MODIFIED")
+                self.assertEqual(core.config.keyboard_walk_boost_speed_mps, 1.2)
+                self.assertEqual(store.settings.revision, 1)
+                self.assertEqual(
+                    MOTION_SETTINGS.load_settings(settings_path).settings,
+                    store.settings,
+                )
+
+                invalid = self.game_command_request(
+                    "/data modify entity @s "
+                    "control.motion.gears.walk.speed_mps set value 1.3",
+                    sequence=2,
+                    request_character="e",
+                )
+                provider_socket.send(MC_COMMANDS.encode_command_request(invalid))
+                self.assertFalse(
+                    runtime.poll(current_pose=pose, command_allowed=True)
+                )
+                rejected = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertFalse(rejected.ok)
+                self.assertEqual(rejected.code, "E_DATA_CONSTRAINT")
+                self.assertEqual(core.config.keyboard_walk_speed_mps, 0.8)
+                self.assertEqual(store.settings.revision, 1)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
+    def test_world_runtime_rejects_exact_selected_checkpoint_with_tombstone_evidence(self) -> None:
+        selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
+        replacement_pose = WORLD_STATE.WorldPose(0.5, 1.5, 0.8, 0.0)
+
+        def state(*, checkpoint_id: str, generation: int, source: str):
+            return SimpleNamespace(
+                generation=generation,
+                last_exit=selected_pose,
+                home=None,
+                resume_source=source,
+                teleport_points=(),
+                resolve_start=lambda: SimpleNamespace(
+                    checkpoint_id=checkpoint_id,
+                    generation=generation,
+                    source=source,
+                    pose=(
+                        selected_pose
+                        if checkpoint_id == "cp-selected"
+                        else replacement_pose
+                    ),
+                ),
+            )
+
+        initial_state = state(
+            checkpoint_id="cp-selected", generation=7, source="last_exit"
+        )
+        committed_state = state(
+            checkpoint_id="cp-previous", generation=8, source="resume_history"
+        )
+        store = mock.Mock(
+            path=Path("/tmp/world-state.json"),
+            world_id="town10:test",
+            world_revision="a" * 64,
+            load_status="loaded",
+            load_error=None,
+        )
+        store.load.return_value = initial_state
+        tombstone = mock.Mock()
+        tombstone.to_mapping.return_value = {
+            "checkpoint": {"checkpoint_id": "cp-selected"},
+            "reason": "startup_numerical_instability",
+            "run_id": "run-1",
+        }
+        store.reject_active_checkpoint.return_value = SimpleNamespace(
+            state=committed_state,
+            tombstone=tombstone,
+            rejected_checkpoint=SimpleNamespace(checkpoint_id="cp-selected"),
+            replacement_checkpoint=SimpleNamespace(
+                checkpoint_id="cp-previous", source="resume_history"
+            ),
+            idempotent=False,
+        )
+
+        with mock.patch.object(MODULE, "WorldStateStore", return_value=store):
+            world = MODULE._GameWorldStateRuntime(
+                path=Path("/tmp/world-state.json"),
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id="cp-selected",
+                selected_resume_generation=7,
+            )
+            rollback = world.reject_selected_resume_checkpoint(
+                reason="startup_numerical_instability",
+                run_id="run-1",
+            )
+
+        store.reject_active_checkpoint.assert_called_once_with(
+            expected_id="cp-selected",
+            expected_generation=7,
+            reason="startup_numerical_instability",
+            run_id="run-1",
+        )
+        self.assertTrue(rollback["applied"])
+        self.assertEqual(rollback["rejected_checkpoint_id"], "cp-selected")
+        self.assertEqual(rollback["rejected_generation"], 7)
+        self.assertEqual(rollback["replacement_checkpoint_id"], "cp-previous")
+        self.assertEqual(rollback["replacement_source"], "resume_history")
+        self.assertEqual(rollback["committed_generation"], 8)
+        self.assertEqual(
+            rollback["tombstone"]["reason"], "startup_numerical_instability"
+        )
+        telemetry = world.telemetry()
+        self.assertEqual(
+            telemetry["selected_resume_checkpoint_id"], "cp-selected"
+        )
+        self.assertEqual(telemetry["selected_resume_generation"], 7)
+        self.assertEqual(telemetry["resume_rollback"], rollback)
+
+    def test_world_runtime_proposal_preserves_active_checkpoint_and_never_writes(self) -> None:
+        selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
+        initial_state = SimpleNamespace(
+            generation=7,
+            last_exit=selected_pose,
+            home=None,
+            resume_source="last_exit",
+            resume_checkpoints=(SimpleNamespace(checkpoint_id="cp-selected"),),
+            invalid_checkpoints=(),
+            teleport_points=(),
+            resolve_start=lambda: SimpleNamespace(
+                checkpoint_id="cp-selected",
+                generation=7,
+                source="last_exit",
+                pose=selected_pose,
+            ),
+        )
+        store = mock.Mock(
+            path=Path("/tmp/world-state.json"),
+            world_id="town10:test",
+            world_revision="a" * 64,
+            load_status="loaded",
+            load_error=None,
+        )
+        store.load.return_value = initial_state
+
+        with mock.patch.object(MODULE, "WorldStateStore", return_value=store):
+            world = MODULE._GameWorldStateRuntime(
+                path=Path("/tmp/world-state.json"),
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id="cp-selected",
+                selected_resume_generation=7,
+            )
+            proposal = world.propose_selected_resume_rollback(
+                reason="startup_numerical_instability",
+                run_id="run-1",
+            )
+
+        store.save.assert_not_called()
+        store.reject_active_checkpoint.assert_not_called()
+        self.assertIs(world.state, initial_state)
+        self.assertTrue(proposal["requested"])
+        self.assertFalse(proposal["applied"])
+        self.assertEqual(proposal["rejected_checkpoint_id"], "cp-selected")
+        self.assertEqual(proposal["rejected_generation"], 7)
+        self.assertEqual(proposal["reason"], "startup_numerical_instability")
+        self.assertEqual(proposal["run_id"], "run-1")
+        telemetry = world.telemetry()
+        self.assertEqual(telemetry["active_resume_checkpoint_id"], "cp-selected")
+        self.assertEqual(telemetry["generation"], 7)
+        self.assertEqual(telemetry["resume_rollback"], proposal)
+        world.cancel_resume_rollback_proposal("termination_signal")
+        cancelled = world.telemetry()
+        self.assertFalse(cancelled["resume_rollback"]["requested"])
+        self.assertFalse(cancelled["resume_rollback"]["applied"])
+        self.assertEqual(
+            cancelled["resume_rollback_ineligibility"], "termination_signal"
+        )
+        self.assertEqual(cancelled["active_resume_checkpoint_id"], "cp-selected")
+        self.assertEqual(cancelled["generation"], 7)
+        store.save.assert_not_called()
+        store.reject_active_checkpoint.assert_not_called()
+
+    def test_world_runtime_allows_rollback_to_map_default(self) -> None:
+        selected_pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.1)
+        initial_state = SimpleNamespace(
+            generation=3,
+            last_exit=selected_pose,
+            home=None,
+            resume_source="last_exit",
+            teleport_points=(),
+            resolve_start=lambda: SimpleNamespace(
+                checkpoint_id="cp-selected",
+                generation=3,
+                source="last_exit",
+                pose=selected_pose,
+            ),
+        )
+        committed_state = SimpleNamespace(
+            generation=4,
+            last_exit=None,
+            home=None,
+            resume_source=None,
+            teleport_points=(),
+            resolve_start=lambda: SimpleNamespace(
+                checkpoint_id=None,
+                generation=4,
+                source="none",
+                pose=None,
+            ),
+        )
+        store = mock.Mock(
+            path=Path("/tmp/world-state.json"),
+            world_id="town10:test",
+            world_revision="a" * 64,
+            load_status="loaded",
+            load_error=None,
+        )
+        store.load.return_value = initial_state
+        tombstone = mock.Mock()
+        tombstone.to_mapping.return_value = {
+            "checkpoint": {"checkpoint_id": "cp-selected"},
+            "reason": "startup_numerical_instability",
+            "run_id": "run-2",
+        }
+        store.reject_active_checkpoint.return_value = SimpleNamespace(
+            state=committed_state,
+            tombstone=tombstone,
+            rejected_checkpoint=SimpleNamespace(checkpoint_id="cp-selected"),
+            replacement_checkpoint=None,
+            idempotent=False,
+        )
+
+        with mock.patch.object(MODULE, "WorldStateStore", return_value=store):
+            world = MODULE._GameWorldStateRuntime(
+                path=Path("/tmp/world-state.json"),
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+                selected_resume_checkpoint_id="cp-selected",
+                selected_resume_generation=3,
+            )
+            rollback = world.reject_selected_resume_checkpoint(
+                reason="startup_numerical_instability",
+                run_id="run-2",
+            )
+
+        self.assertTrue(rollback["applied"])
+        self.assertIsNone(rollback["replacement_checkpoint_id"])
+        self.assertEqual(rollback["replacement_source"], "none")
+        self.assertEqual(rollback["committed_generation"], 4)
 
     def test_game_command_runtime_waits_for_policy_writer_ack(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
@@ -2454,6 +5342,269 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         finally:
             provider_socket.close()
             runtime.close()
+
+    def test_policy_response_projects_large_provenance_to_packet_bound(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.setblocking(False)
+        loadout = {
+            "version": 1,
+            "available": True,
+            "status": "ready",
+            "active_slot": "locomotion",
+            "pending": None,
+            "slots": [
+                {
+                    "slot": "locomotion",
+                    "selected_policy_id": "sonic",
+                    "locked": False,
+                    "candidates": [
+                        {
+                            "policy_id": "sonic",
+                            "name": "SONIC",
+                            "resident": True,
+                            "available": True,
+                        },
+                        {
+                            "policy_id": "bfm-sonic-teacher50k",
+                            "name": "BFM SONIC Teacher50k",
+                            "resident": True,
+                            "available": True,
+                            "unavailable_reason": None,
+                            "provenance": {
+                                "immutable_evidence": "x"
+                                * MC_COMMANDS.MAX_COMMAND_PACKET_BYTES
+                            },
+                            "unavailable_reasons": [],
+                        },
+                    ],
+                },
+                {
+                    "slot": "recovery",
+                    "selected_policy_id": "amp-flat-v3",
+                    "locked": False,
+                    "candidates": [
+                        {
+                            "policy_id": "amp-flat-v3",
+                            "resident": True,
+                            "available": True,
+                        }
+                    ],
+                },
+            ],
+            "resident_models": [
+                {
+                    "policy_id": "bfm-sonic-teacher50k",
+                    "name": "BFM SONIC Teacher50k",
+                    "resident": True,
+                    "available": True,
+                    "provenance": {"immutable_evidence": "y" * 4096},
+                }
+            ],
+        }
+
+        class PolicySlots:
+            def request_policy_slot_assignment(self, _command, *, transition_id):
+                self.transition_id = transition_id
+                return loadout
+
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            policy_slots=PolicySlots(),
+        )
+        request = self.game_command_request(
+            "/policy recovery amp-flat-v3",
+            sequence=1,
+            request_character="e",
+        )
+        pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(runtime.poll(current_pose=pose, command_allowed=True))
+            payload = provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+            self.assertLessEqual(
+                len(payload),
+                MC_COMMANDS.MAX_COMMAND_PACKET_BYTES,
+            )
+            response = MC_COMMANDS.decode_command_response(payload)
+            self.assertTrue(response.ok)
+            projected = response.data["strategy_loadout"]
+            bfm = projected["slots"][0]["candidates"][1]
+            self.assertEqual(
+                bfm,
+                {
+                    "policy_id": "bfm-sonic-teacher50k",
+                    "name": "BFM SONIC Teacher50k",
+                    "resident": True,
+                    "available": True,
+                    "unavailable_reason": None,
+                },
+            )
+            self.assertNotIn("provenance", projected["resident_models"][0])
+            self.assertEqual(runtime.response_errors, 0)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
+    def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.fsm = SimpleNamespace(state=MODULE.RecoveryState.GAME_SONIC)
+        coordinator.resident_policies = True
+        coordinator.worker = mock.Mock()
+        coordinator.worker.ready = True
+        coordinator.worker.models_loaded_once = True
+        coordinator.worker.models_warmed = True
+        coordinator.worker.selected_policy_id = "kungfu"
+        coordinator.worker.registered_policy_ids = ("kungfu", "host", "amp")
+        coordinator.initial_controller = "kungfu"
+        coordinator.kungfu_model = Path("kungfu.onnx")
+        coordinator.kungfu_motion = Path("motion.pkl")
+        coordinator._policy_selection_pending = None
+        reason = "artifact_sha256_unlocked:runtime_adapter"
+        coordinator.locomotion_policy_candidates = (
+            MODULE.PolicyCandidateState(
+                policy_id="bfm-sonic-teacher50k",
+                display_name="BFM SONIC Teacher50k",
+                slot="locomotion",
+                resident=False,
+                available=False,
+                provenance_verified=False,
+                unavailable_reasons=(reason, "runtime_adapter_not_registered"),
+                provenance={"source_commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25"},
+            ),
+        )
+
+        loadout = coordinator.strategy_loadout_mapping()
+        locomotion = next(
+            slot for slot in loadout["slots"] if slot["slot"] == "locomotion"
+        )
+        self.assertEqual(
+            [candidate["policy_id"] for candidate in locomotion["candidates"]],
+            ["sonic", "bfm-sonic-teacher50k"],
+        )
+        bfm = locomotion["candidates"][1]
+        self.assertFalse(bfm["available"])
+        self.assertFalse(bfm["resident"])
+        self.assertEqual(bfm["unavailable_reason"], reason)
+
+        coordinator.worker.reset_mock()
+        with mock.patch.object(MODULE.subprocess, "Popen") as popen:
+            with self.assertRaises(MODULE.CommandExecutionError) as raised:
+                coordinator.request_policy_slot_assignment(
+                    MODULE.PolicySlotAssignment(
+                        "locomotion", "bfm-sonic-teacher50k"
+                    ),
+                    transition_id="transition-bfm",
+                )
+        self.assertEqual(raised.exception.code, "E_POLICY_UNAVAILABLE")
+        self.assertIn(reason, raised.exception.message)
+        coordinator.worker.select_policy.assert_not_called()
+        coordinator.worker.send.assert_not_called()
+        popen.assert_not_called()
+
+        # A provenance-verified, warmed resident adapter begins by fencing the
+        # currently active SONIC writer.  BFM is authorized only after the
+        # asynchronous WRITER_PAUSED acknowledgement.
+        coordinator.locomotion_policy_candidates = (
+            MODULE.PolicyCandidateState(
+                policy_id="bfm-sonic-teacher50k",
+                display_name="BFM SONIC Teacher50k",
+                slot="locomotion",
+                resident=True,
+                available=True,
+                provenance_verified=True,
+                unavailable_reasons=(),
+                provenance={
+                    "source_commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25"
+                },
+            ),
+        )
+        coordinator.fsm.state = MODULE.ResidentRecoveryState.GAME_SONIC
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.bfm_switch_admission_ready = True
+        coordinator.bfm_switch_admission_reason = "ready"
+        coordinator.bfm_control = mock.Mock(
+            ready=True,
+            warmed=True,
+            paused=True,
+            current_first_write=False,
+        )
+        coordinator.sonic_writer = mock.Mock(
+            current_first_write=True,
+            paused=False,
+        )
+        coordinator.physics_profiles = mock.Mock()
+        coordinator.bfm_switch_timeout_s = 10.0
+        coordinator._policy_selection_results = {}
+        result = coordinator.request_policy_slot_assignment(
+            MODULE.PolicySlotAssignment(
+                "locomotion", "bfm-sonic-teacher50k"
+            ),
+            transition_id="transition-bfm-ready",
+        )
+        self.assertIsNone(result)
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "pause_sonic",
+        )
+
+        events: list[str] = []
+        coordinator.physics_profiles.apply.side_effect = (
+            lambda profile_id: events.append(f"physics:{profile_id}")
+        )
+        coordinator.bfm_control.activate.side_effect = (
+            lambda: events.append("activate_bfm")
+        )
+        coordinator.sonic_writer.paused = True
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            events,
+            [
+                "physics:bfm-sonic-teacher50k",
+                "activate_bfm",
+            ],
+        )
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "activate_bfm",
+        )
+
+        events.clear()
+        coordinator.selected_locomotion_policy_id = (
+            MODULE.BFM_TEACHER50K_POLICY_ID
+        )
+        coordinator.bfm_control.paused = True
+        coordinator.sonic_writer.send.reset_mock()
+        coordinator.sonic_writer.send.side_effect = (
+            lambda command: events.append(f"sonic:{command}")
+        )
+        coordinator._policy_selection_pending = {
+            "slot": "locomotion",
+            "policy_id": "sonic",
+            "transition_id": "transition-sonic-ready",
+            "phase": "pause_bfm",
+            "requested_monotonic_s": time.monotonic(),
+        }
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            events,
+            [
+                "physics:sonic-recovery",
+                "sonic:RESUME",
+            ],
+        )
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "resume_sonic",
+        )
 
     def test_game_command_runtime_rejects_commands_until_panel_safe_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2573,6 +5724,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "exec_with_parent_death_signal.py",
         )
         self.assertIn("--exec-command", guarded_command[: guarded_command.index("--")])
+        self.assertEqual(
+            guarded_command[
+                guarded_command.index("--argv0") + 1
+            ],
+            "matrix-sonic-native-deploy",
+        )
         command = guarded_command[guarded_command.index("--") + 1 :]
         self.assertEqual(command[0], "/sonic/gear_sonic_deploy/target/release/g1_deploy_onnx_ref")
         self.assertNotIn("deploy.sh", command)
@@ -2695,6 +5852,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             amp_model=Path("/models/amp.onnx"),
             amp_config_sha256="1" * 64,
             amp_model_sha256="2" * 64,
+            amp_flat_v3_config=Path("/models/flat-v3.json"),
+            amp_flat_v3_model=Path("/models/flat-v3.onnx"),
+            amp_flat_v3_config_sha256="3" * 64,
+            amp_flat_v3_model_sha256="4" * 64,
             initial_controller="amp",
         )
 
@@ -2720,6 +5881,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--fallback-model") + 1],
             "/models/prone-v2.onnx",
+        )
+        self.assertEqual(
+            command[command.index("--amp-flat-v3-config") + 1],
+            "/models/flat-v3.json",
+        )
+        self.assertEqual(
+            command[command.index("--amp-flat-v3-model") + 1],
+            "/models/flat-v3.onnx",
         )
         self.assertEqual(
             command[command.index("--amp-hold-config") + 1],
@@ -2973,6 +6142,46 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             finally:
                 peer.close()
                 control.close()
+
+    @unittest.skipUnless(
+        hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
+        "Linux Unix seqpacket credentials are required",
+    )
+    def test_managed_control_disconnect_identifies_exact_child(self) -> None:
+        controls = (
+            (
+                MODULE._RecoveryWorkerControl,
+                "recovery-policy",
+                "recovery policy control disconnected",
+            ),
+            (
+                MODULE._SonicWriterControl,
+                "deploy",
+                "SONIC writer gate control disconnected",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, (control_type, child_name, message) in enumerate(controls):
+                with self.subTest(child_name=child_name):
+                    path = Path(temporary) / f"managed-{index}.sock"
+                    control = control_type(path)
+                    control.open()
+                    control.bind_expected_peer_pid(os.getpid())
+                    peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    try:
+                        peer.connect(str(path))
+                        control.poll()
+                        self.assertEqual(control.peer_pid, os.getpid())
+                        peer.close()
+                        with self.assertRaises(MODULE._ManagedControlDisconnect) as caught:
+                            control.poll()
+                        self.assertEqual(caught.exception.child_name, child_name)
+                        self.assertEqual(caught.exception.peer_pid, os.getpid())
+                        self.assertIn(message, str(caught.exception))
+                        self.assertEqual(control.error, str(caught.exception))
+                    finally:
+                        peer.close()
+                        control.close()
 
     @unittest.skipUnless(
         hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
@@ -3379,12 +6588,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator._maybe_authorize_policy_advance = mock.Mock()
         coordinator._fall_level = mock.Mock(return_value=False)
         snapshot = self.snapshot(
+            qvel_len=83,
             low_cmd_fresh=True,
             low_cmd_received=True,
             low_cmd_age_s=0.01,
         )
         snapshot.qpos[2] = 0.7
         snapshot.qpos[3] = 1.0
+        snapshot.qvel[35:] = [2500.0] * 48
         processes = SimpleNamespace(
             deploy_generation=8,
             deploy_alive=lambda: True,
@@ -3404,6 +6615,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(observation.deploy_safe_idle_hold)
         self.assertFalse(observation.deploy_policy_full_control)
         self.assertTrue(observation.deploy_first_write)
+        self.assertEqual(observation.joint_velocity_rms_rad_s, 0.0)
 
     def test_stabilizing_to_wait_neutral_reanchors_game_core_once(self) -> None:
         core = mock.Mock(spec=GAME_CONTROL.GameControlCore)
@@ -3734,6 +6946,83 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             measured_heading,
         )
 
+    def test_resident_game_sonic_bypasses_replacement_deploy_turn_limiter(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.command_frame_rotation_rad = 0.0
+        coordinator.last_wire_facing_heading_rad = None
+        coordinator.last_reframe_limited = True
+        coordinator.last_reframe_heading_error_rad = 1.0
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=10,
+            movement=(0.0, 1.0, 0.0),
+            facing=(0.0, 1.0, 0.0),
+            speed_mps=1.0,
+            locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.SONIC_STABILIZING,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            inhibit_game_input=False,
+        )
+
+        wire_command = coordinator.recovery_wire_command(
+            command,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+
+        self.assertIs(wire_command, command)
+        self.assertEqual(wire_command.mode, "move")
+        self.assertEqual(wire_command.speed_mps, 1.0)
+        self.assertEqual(wire_command.movement, (0.0, 1.0, 0.0))
+        self.assertFalse(coordinator.last_reframe_limited)
+        self.assertEqual(coordinator.last_reframe_heading_error_rad, 0.0)
+        self.assertAlmostEqual(
+            coordinator.last_wire_facing_heading_rad,
+            math.pi / 2.0,
+        )
+
+    def test_resident_game_sonic_rejects_impossible_rotated_command_frame(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.command_frame_rotation_rad = 0.25
+        coordinator.last_wire_facing_heading_rad = None
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=11,
+            movement=(1.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.8,
+            locomotion_mode=GAME_CONTROL.SONIC_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.SONIC_STABILIZING,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            inhibit_game_input=False,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "unexpectedly rotated"):
+            coordinator.recovery_wire_command(
+                command,
+                output,
+                measured_heading_rad=0.0,
+                dt_s=0.02,
+            )
+
     def test_policy_fallback_uses_full_pose_grace_and_low_dynamics(self) -> None:
         coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
             MODULE._PhysicalRecoveryCoordinator
@@ -3821,6 +7110,85 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator._maybe_authorize_policy_advance(now_s=20.51, **arguments)
 
         coordinator.worker.send.assert_called_once_with("ADVANCE_POLICY")
+
+    def test_bfm_recovery_handoff_switches_physics_inside_writer_fences(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.locomotion_policy_candidates = ()
+        coordinator.resident_policies = True
+        coordinator._resident_worker_attested = mock.Mock(return_value=True)
+        coordinator.initial_sonic_gate_pending = False
+        coordinator.selected_locomotion_policy_id = (
+            MODULE.BFM_TEACHER50K_POLICY_ID
+        )
+        coordinator.current_recovery_worker_episode_id = None
+        coordinator.physics_profiles = mock.Mock()
+        coordinator.worker = mock.Mock()
+        coordinator.worker.begin_resident_episode.return_value = 17
+        coordinator.sonic_writer = mock.Mock(
+            paused=True,
+            pause_pending=False,
+            stop_sent=False,
+            resume_pending=False,
+        )
+        coordinator.bfm_control = mock.Mock(
+            paused=True,
+            pause_pending=False,
+            stop_sent=False,
+            activation_pending=False,
+        )
+        processes = mock.Mock()
+        processes.recovery_policy_alive.return_value = True
+        planner = mock.Mock()
+        events: list[str] = []
+        coordinator.physics_profiles.apply.side_effect = (
+            lambda profile_id: events.append(f"physics:{profile_id}")
+        )
+        coordinator.worker.send.side_effect = (
+            lambda command: events.append(f"worker:{command}")
+        )
+
+        coordinator.execute(
+            MODULE.ResidentRecoveryOutput(
+                previous_state=MODULE.ResidentRecoveryState.SONIC_QUIET,
+                state=MODULE.ResidentRecoveryState.POLICY_STARTING,
+                authorize_policy_writer=True,
+            ),
+            processes=processes,
+            planner=planner,
+        )
+        self.assertEqual(
+            events,
+            [
+                "physics:sonic-recovery",
+                "worker:GO",
+            ],
+        )
+        self.assertEqual(coordinator.current_recovery_worker_episode_id, 17)
+
+        events.clear()
+        coordinator.bfm_control.activate.side_effect = (
+            lambda: events.append("activate_bfm")
+        )
+        coordinator.execute(
+            MODULE.ResidentRecoveryOutput(
+                previous_state=MODULE.ResidentRecoveryState.POLICY_QUIET,
+                state=MODULE.ResidentRecoveryState.SONIC_RESUME_REQUESTED,
+                resume_sonic_writer=True,
+            ),
+            processes=processes,
+            planner=planner,
+        )
+        self.assertEqual(
+            events,
+            [
+                "physics:bfm-sonic-teacher50k",
+                "activate_bfm",
+            ],
+        )
 
     def test_initial_sonic_uses_writer_gate_and_goes_only_after_ready(self) -> None:
         coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
@@ -4099,6 +7467,13 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 restart_request_file=Path("/run/user/1000/matrix/restart.json"),
                 restart_capability_file=Path("/run/user/1000/matrix/capability"),
                 restart_launcher_pid=4000,
+                external_control_socket=Path(
+                    "/run/user/1000/matrix-external/trna.sock"
+                ),
+                external_control_capability_file=Path(
+                    "/run/user/1000/matrix-external/trna.cap"
+                ),
+                external_control_deadman_seconds=0.12,
                 camera_yaw_sign=-1,
                 camera_yaw_offset_deg=90.0,
                 carla_host="127.0.0.2",
@@ -4106,12 +7481,29 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 gamepad_look_yaw_rate_deg_s=140.0,
                 gamepad_look_pitch_rate_deg_s=95.0,
                 gamepad_look_deadzone=0.13,
+                gamepad_move_deadzone=0.17,
                 gamepad_look_min_pitch_deg=-70.0,
                 gamepad_look_max_pitch_deg=50.0,
                 focus_title="matrix",
                 expected_ue_pid=4242,
                 status_file=Path("/matrix/outputs/game-input.json"),
                 command_fd=command_fd,
+                motion_settings_json='{"settings":"runtime-owned"}',
+                celestial_clock_state_file=Path(
+                    "/matrix/state/celestial-clock.json"
+                ),
+                celestial_lighting_bridge="carla-weather",
+                celestial_assets_manifest=Path(
+                    "/matrix/config/universe/de440s-2080.lock.json"
+                ),
+                celestial_visual_catalog=Path(
+                    "/matrix/config/universe/celestial-visual-profiles-v1.json"
+                ),
+                celestial_visual_profile="earth-clear-v1",
+                celestial_de440s_kernel=Path("/matrix/assets/de440s.bsp"),
+                celestial_jplephem_wheel=Path(
+                    "/matrix/assets/jplephem-2.24-py3-none-any.whl"
+                ),
             )
         finally:
             command_parent.close()
@@ -4142,6 +7534,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             command[command.index("--game-command-fd") + 1],
             str(command_fd),
         )
+        self.assertEqual(
+            command[command.index("--motion-settings-json") + 1],
+            '{"settings":"runtime-owned"}',
+        )
+        self.assertEqual(
+            command[command.index("--celestial-clock-state-file") + 1],
+            "/matrix/state/celestial-clock.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-lighting-bridge") + 1],
+            "carla-weather",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-assets-manifest") + 1],
+            "/matrix/config/universe/de440s-2080.lock.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-catalog") + 1],
+            "/matrix/config/universe/celestial-visual-profiles-v1.json",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-visual-profile") + 1],
+            "earth-clear-v1",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-de440s-kernel") + 1],
+            "/matrix/assets/de440s.bsp",
+        )
+        self.assertEqual(
+            command[command.index("--celestial-jplephem-wheel") + 1],
+            "/matrix/assets/jplephem-2.24-py3-none-any.whl",
+        )
         self.assertNotIn("--ue-camera-state-file", command)
         self.assertEqual(
             command[command.index("--mouse-settings-file") + 1],
@@ -4155,6 +7579,18 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(
             command[command.index("--restart-launcher-pid") + 1], "4000"
+        )
+        self.assertEqual(
+            command[command.index("--external-control-socket") + 1],
+            "/run/user/1000/matrix-external/trna.sock",
+        )
+        self.assertEqual(
+            command[command.index("--external-control-capability-file") + 1],
+            "/run/user/1000/matrix-external/trna.cap",
+        )
+        self.assertEqual(
+            command[command.index("--external-control-deadman-seconds") + 1],
+            "0.12",
         )
         self.assertEqual(command[command.index("--carla-host") + 1], "127.0.0.2")
         self.assertEqual(command[command.index("--carla-port") + 1], "2100")
@@ -4170,6 +7606,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             command[command.index("--gamepad-look-deadzone") + 1], "0.13"
         )
         self.assertEqual(
+            command[command.index("--gamepad-move-deadzone") + 1], "0.17"
+        )
+        self.assertEqual(
             command[command.index("--gamepad-look-min-pitch-deg") + 1],
             "-70.0",
         )
@@ -4179,6 +7618,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(popen.call_args.kwargs["cwd"], Path("/matrix"))
         self.assertEqual(popen.call_args.kwargs["pass_fds"], (command_fd,))
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_native_process_group_rejects_partial_celestial_ephemeris_assets(
+        self,
+        popen,
+    ) -> None:
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+
+        with self.assertRaisesRegex(ValueError, "all-or-none"):
+            group.start_game_input(
+                "/runtime/python",
+                Path("/matrix/scripts/matrix_game_control_input.py"),
+                input_socket=Path("/run/user/1000/matrix-game.sock"),
+                input_source="auto",
+                camera_yaw_source="x11-mirror",
+                look_button="left",
+                initial_camera_yaw_deg=0.0,
+                mouse_sensitivity_deg=0.12,
+                camera_yaw_sign=1,
+                camera_yaw_offset_deg=0.0,
+                carla_host="127.0.0.1",
+                carla_port=2000,
+                gamepad_look_yaw_rate_deg_s=120.0,
+                gamepad_look_pitch_rate_deg_s=90.0,
+                gamepad_look_deadzone=0.1,
+                gamepad_move_deadzone=0.1,
+                gamepad_look_min_pitch_deg=-70.0,
+                gamepad_look_max_pitch_deg=50.0,
+                focus_title="matrix",
+                expected_ue_pid=4242,
+                status_file=None,
+                celestial_de440s_kernel=Path("/matrix/assets/de440s.bsp"),
+            )
+
+        popen.assert_not_called()
 
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_native_process_group_forwards_final_pov_state_file(self, popen) -> None:
@@ -4203,6 +7677,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             gamepad_look_yaw_rate_deg_s=120.0,
             gamepad_look_pitch_rate_deg_s=90.0,
             gamepad_look_deadzone=0.12,
+            gamepad_move_deadzone=0.15,
             gamepad_look_min_pitch_deg=-80.0,
             gamepad_look_max_pitch_deg=60.0,
             focus_title="matrix",
@@ -4366,6 +7841,42 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5.0)
+
+    def test_parent_death_guardian_exec_mode_can_override_argv0(self) -> None:
+        guardian = REPO_ROOT / "scripts/exec_with_parent_death_signal.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            cmdline_file = Path(temporary) / "cmdline"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    os.fspath(guardian),
+                    "--expected-parent",
+                    str(os.getpid()),
+                    "--exec-command",
+                    "--argv0",
+                    "matrix-sonic-native-deploy",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        "Path(__import__('sys').argv[1]).write_bytes("
+                        "Path('/proc/self/cmdline').read_bytes())"
+                    ),
+                    os.fspath(cmdline_file),
+                ],
+                start_new_session=True,
+            )
+            try:
+                self.assertEqual(process.wait(timeout=5.0), 0)
+                self.assertEqual(
+                    cmdline_file.read_bytes().split(b"\0", 1)[0],
+                    b"matrix-sonic-native-deploy",
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5.0)
 
     def test_parent_death_guardian_exec_mode_hard_kills_stuck_leaf(self) -> None:
         guardian = REPO_ROOT / "scripts/exec_with_parent_death_signal.py"
@@ -4622,6 +8133,44 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertIsNone(group.failed_child())
         finally:
             group.close()
+
+    def test_process_group_waits_nonreaping_for_named_disconnect_peer(self) -> None:
+        deploy = mock.Mock(pid=4321)
+        recovery = mock.Mock(pid=4322)
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        group.children.extend(
+            (("deploy", deploy), ("recovery-policy", recovery))
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_peek_child_returncode",
+                side_effect=(None, None, -11),
+            ) as peek,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            self.assertEqual(
+                group.wait_for_unexpected_child("deploy", timeout=0.1),
+                ("deploy", -11),
+            )
+
+        self.assertEqual(peek.call_args_list, [mock.call(deploy)] * 3)
+        sleep.assert_called()
+        deploy.wait.assert_not_called()
+        recovery.wait.assert_not_called()
+
+    @mock.patch.object(MODULE, "_peek_child_returncode", return_value=None)
+    def test_process_group_named_disconnect_wait_can_time_out(self, peek) -> None:
+        deploy = mock.Mock(pid=4321)
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+        group.children.append(("deploy", deploy))
+
+        self.assertIsNone(
+            group.wait_for_unexpected_child("deploy", timeout=0.0)
+        )
+        peek.assert_called_once_with(deploy)
+        deploy.wait.assert_not_called()
 
     def test_process_group_close_kills_term_ignoring_descendant_before_reap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

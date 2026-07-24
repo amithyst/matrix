@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -19,21 +20,36 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from compose_custom_scene import compose_custom_scene, freejoint_body_names  # noqa: E402
 from inject_creative_inventory import (  # noqa: E402
+    INVENTORY_STORAGE_CONTRACT_VERSION,
     InventoryCatalogError,
     inject_catalog,
     load_catalog,
 )
 
 
-PIPELINE_VERSION = 7
+PIPELINE_VERSION = 8
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
-MOON_DYNAMIC_GROUND_STATIC_TRANSFORM = "moon-dynamic-ground-static-v1"
+MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
 MOON_DYNAMIC_GROUND_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
 MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256 = (
     "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
 )
 MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT = 256
+MOON_DYNAMIC_GROUND_BODY_PATTERN = re.compile(
+    r"gb_(?:[0-9]|1[0-5])_(?:[0-9]|1[0-5])\Z"
+)
+MOON_DYNAMIC_MAP_SIZE_BYTES = 144_000_000
+MOON_DYNAMIC_MAP_SHA256 = (
+    "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+)
+MOON_DYNAMIC_MAP_SIDE_SAMPLES = 6000
+MOON_DYNAMIC_MAP_RESOLUTION_M = 0.1
+MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M = -0.9296965003013611
+MOON_DEFAULT_ROOT_CLEARANCE_M = 0.793
+MOON_DEFAULT_SPAWN_Z_M = (
+    MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M + MOON_DEFAULT_ROOT_CLEARANCE_M
+)
 TOWN10_SOURCE_SCENE_SHA256 = (
     "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
 )
@@ -245,7 +261,7 @@ def _scene_transform_removals(
     transform = scene_transform or SCENE_TRANSFORM_NONE
     if transform == SCENE_TRANSFORM_NONE:
         return transform, (), ()
-    if transform == MOON_DYNAMIC_GROUND_STATIC_TRANSFORM:
+    if transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         if native_scene.name != MOON_DYNAMIC_GROUND_SCENE_NAME:
             raise SonicPhysicsModelError(
                 f"{transform} requires {MOON_DYNAMIC_GROUND_SCENE_NAME}, got {native_scene.name}"
@@ -268,6 +284,16 @@ def _scene_transform_removals(
             raise SonicPhysicsModelError(
                 f"{transform} freejoint body count drifted: "
                 f"expected={MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT} actual={len(names)}"
+            )
+        if (
+            len(set(names)) != len(names)
+            or any(
+                MOON_DYNAMIC_GROUND_BODY_PATTERN.fullmatch(name) is None
+                for name in names
+            )
+        ):
+            raise SonicPhysicsModelError(
+                f"{transform} tile body names drifted"
             )
         return transform, (), names
     if transform != TOWN10_OPEN_BOUNDARY_TRANSFORM:
@@ -339,6 +365,85 @@ def _scene_transform_removals(
     return transform, TOWN10_PERIMETER_WALL_NAMES, ()
 
 
+def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
+    if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        return None
+    return {
+        "dynamic_ground": {
+            "schema": "matrix-moon-dynamic-ground/v1",
+            "body_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
+            "body_name_pattern": MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern,
+            "body_mode": "mocap",
+            "map_dtype": "little-endian-float32",
+            "map_shape": [
+                MOON_DYNAMIC_MAP_SIDE_SAMPLES,
+                MOON_DYNAMIC_MAP_SIDE_SAMPLES,
+            ],
+            "map_size_bytes": MOON_DYNAMIC_MAP_SIZE_BYTES,
+            "map_sha256": MOON_DYNAMIC_MAP_SHA256,
+            "resolution_m": MOON_DYNAMIC_MAP_RESOLUTION_M,
+            "height_mode": "absolute_world_z",
+            "update_timing": "before_each_mj_step",
+            "fallback_support_plane": False,
+        }
+    }
+
+
+def _apply_scene_transform_additions(
+    scene_path: Path, scene_transform: str
+) -> None:
+    if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        return
+    try:
+        tree = ET.parse(scene_path)
+    except ET.ParseError as exc:
+        raise SonicPhysicsModelError(
+            f"invalid derived Matrix scene {scene_path}: {exc}"
+        ) from exc
+    root = tree.getroot()
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise SonicPhysicsModelError("MoonWorld derived scene has no worldbody")
+    tile_bodies = [
+        body
+        for body in worldbody.iter("body")
+        if isinstance(body.get("name"), str)
+        and body.get("name", "").startswith("gb_")
+    ]
+    if (
+        len(tile_bodies) != MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT
+        or len({body.get("name") for body in tile_bodies}) != len(tile_bodies)
+        or any(
+            MOON_DYNAMIC_GROUND_BODY_PATTERN.fullmatch(body.get("name", ""))
+            is None
+            for body in tile_bodies
+        )
+    ):
+        raise SonicPhysicsModelError(
+            "MoonWorld derived mocap tile body set drifted"
+        )
+    for body in tile_bodies:
+        if any(
+            child.tag == "freejoint"
+            or (child.tag == "joint" and child.get("type") == "free")
+            for child in list(body)
+        ):
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body.get('name')} still owns a free joint"
+            )
+        body.set("mocap", "true")
+    root.insert(
+        0,
+        ET.Comment(
+            " converted official MoonWorld rolling tiles to runtime-updated mocap bodies "
+        ),
+    )
+    ET.indent(tree, space="  ")
+    tree.write(scene_path, encoding="utf-8", xml_declaration=False)
+    with scene_path.open("ab") as stream:
+        stream.write(b"\n")
+
+
 def _native_scene_asset_inventory(native_scene: Path) -> list[dict[str, object]]:
     """Resolve every native scene file input, including assets/../ siblings."""
     try:
@@ -396,7 +501,7 @@ def _source_contract(
     creative_inventory_catalog: Path | None,
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
-    return {
+    contract = {
         "pipeline_version": PIPELINE_VERSION,
         "canonical_model": str(canonical_model.resolve()),
         "canonical_model_sha256": _file_sha256(canonical_model),
@@ -419,6 +524,10 @@ def _source_contract(
             creative_inventory_catalog
         ),
     }
+    scene_transform_contract = _scene_transform_contract(scene_transform)
+    if scene_transform_contract is not None:
+        contract["scene_transform_contract"] = scene_transform_contract
+    return contract
 
 
 def _creative_inventory_source_contract(
@@ -435,6 +544,7 @@ def _creative_inventory_source_contract(
         key=lambda path: path.as_posix(),
     )
     return {
+        "storage_contract_version": INVENTORY_STORAGE_CONTRACT_VERSION,
         "catalog": str(catalog.resolve()),
         "catalog_sha256": _file_sha256(catalog),
         "meshes": [
@@ -455,6 +565,7 @@ def physics_revision_payload(
     *,
     body_joint_names: tuple[str, ...] = G1_BODY_JOINT_NAMES,
     scene_transform: str | None = None,
+    creative_inventory_catalog: Path | None = None,
 ) -> dict[str, object]:
     """Return the location-independent source contract for save isolation.
 
@@ -483,7 +594,7 @@ def physics_revision_payload(
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
         staticized_freejoint_bodies=staticized_freejoint_bodies,
-        creative_inventory_catalog=None,
+        creative_inventory_catalog=creative_inventory_catalog,
     )
     native_scene_assets = []
     for asset in contract["native_scene_assets"]:
@@ -496,7 +607,31 @@ def physics_revision_payload(
                 "sha256": asset["sha256"],
             }
         )
-    return {
+    creative_inventory = contract["creative_inventory"]
+    inventory_revision = None
+    if creative_inventory is not None:
+        if not isinstance(creative_inventory, dict):
+            raise SonicPhysicsModelError("creative inventory contract is invalid")
+        meshes = creative_inventory.get("meshes")
+        if not isinstance(meshes, list):
+            raise SonicPhysicsModelError("creative inventory mesh contract is invalid")
+        inventory_revision = {
+            "storage_contract_version": creative_inventory[
+                "storage_contract_version"
+            ],
+            "catalog_sha256": creative_inventory["catalog_sha256"],
+            "meshes": [
+                {
+                    "size": mesh["size"],
+                    "sha256": mesh["sha256"],
+                }
+                for mesh in meshes
+                if isinstance(mesh, dict)
+            ],
+        }
+        if len(inventory_revision["meshes"]) != len(meshes):
+            raise SonicPhysicsModelError("creative inventory mesh entry is invalid")
+    payload = {
         "schema": "matrix-sonic-physics-source/v1",
         "pipeline_version": contract["pipeline_version"],
         "canonical_model_sha256": contract["canonical_model_sha256"],
@@ -506,9 +641,13 @@ def physics_revision_payload(
         "native_scene_assets": native_scene_assets,
         "body_joint_names": contract["body_joint_names"],
         "scene_transform": contract["scene_transform"],
+        "creative_inventory": inventory_revision,
         "removed_environment_geoms": contract["removed_environment_geoms"],
         "staticized_freejoint_bodies": contract["staticized_freejoint_bodies"],
     }
+    if "scene_transform_contract" in contract:
+        payload["scene_transform_contract"] = contract["scene_transform_contract"]
+    return payload
 
 
 def _strip_non_body_joints(
@@ -783,6 +922,10 @@ def prepare_sonic_physics_model(
             remove_geoms=removed_environment_geoms,
             staticize_freejoint_bodies=bool(staticized_freejoint_bodies),
         )
+        _apply_scene_transform_additions(
+            temporary_dir / native_scene.name,
+            normalized_scene_transform,
+        )
         contract["body_joint_names"] = list(body_joint_names)
         contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")
         contract["derived_scene_sha256"] = _file_sha256(
@@ -819,7 +962,7 @@ def _parse_args() -> argparse.Namespace:
         choices=(
             SCENE_TRANSFORM_NONE,
             TOWN10_OPEN_BOUNDARY_TRANSFORM,
-            MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+            MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
         ),
         default=SCENE_TRANSFORM_NONE,
     )

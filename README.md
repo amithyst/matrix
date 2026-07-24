@@ -52,6 +52,16 @@ backup profiles, use the
 [multi-host runbook](docs/runbook.md). Matrix calls the pinned original
 `gear_sonic` simulator/DDS stack directly; Git-managed source is separated from
 SHA-verified private runtime artifacts behind one bootstrap/preflight path.
+SOL-2080 celestial navigation optionally uses a separately locked 31.3 MiB
+DE440s bundle; provision it with `bash scripts/bootstrap_matrix_celestial.sh`.
+Its deterministic CARLA visual profiles and renderer acceptance boundary are
+documented in [Matrix SOL-2080 Celestial Visuals](docs/MATRIX_CELESTIAL_VISUALS_CN.md).
+The current SOL-2080 product direction is box-world first: bounded, verified
+scenes such as the city and MoonWorld are linked through ESC teleport
+destinations while preserving one session/state/provenance model. Seamless
+planet-scale streaming is a later renderer track, not a cooked-PAK promise.
+MoonWorld V1 bootstrap and screenshot acceptance are documented in
+[Matrix MoonWorld Box-World V1](docs/MOON_V1_CN.md).
 
 ### 3. Run Simulation
 ```bash
@@ -84,6 +94,7 @@ To keep this README concise, detailed guides have been organized into the `docs/
 - [Matrix House/Furniture V1](docs/HOUSE_FURNITURE_V1_CN.md) - Official HouseWorld indoor furniture box-world launcher and smoke acceptance
 - [Matrix SONIC Video Capture](docs/MATRIX_VIDEO_CAPTURE_CN.md) - Native-resolution main-launcher recording with provenance and quality gates
 - [Matrix Urban V1](docs/URBAN_V1_CN.md) - Native Town10 city baseline and URDF-preserved G1 materials
+- [Matrix SOL-2080 Celestial Visuals](docs/MATRIX_CELESTIAL_VISUALS_CN.md) - Versioned CARLA weather profiles, OSS audit, and UE pixel gate
 - [Matrix + SONIC Multi-Host Runbook](docs/runbook.md) - Git sync, locked artifacts, bootstrap, and host profiles
 
 **Advanced Features**

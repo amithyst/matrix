@@ -1,12 +1,16 @@
 import hashlib
+import inspect
 import json
 import math
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -65,7 +69,7 @@ class MatrixWorldStateTest(unittest.TestCase):
             resumed.startup_pose(self.default), (last_exit, "last_exit")
         )
 
-    def test_fallen_checkpoint_keeps_observed_xy_but_last_safe_upright_pose(self) -> None:
+    def test_fallen_checkpoint_keeps_complete_last_safe_pose_on_terrain(self) -> None:
         safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
         state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
         fallen = MODULE.WorldPose(10.8, 19.7, 0.18, -2.2)
@@ -74,11 +78,29 @@ class MatrixWorldStateTest(unittest.TestCase):
 
         self.assertEqual(state.last_observed, fallen)
         self.assertEqual(state.last_safe, safe)
-        self.assertEqual(
-            state.last_exit,
-            MODULE.WorldPose(fallen.x, fallen.y, safe.z, safe.yaw_rad),
-        )
+        self.assertEqual(state.last_exit, safe)
+        self.assertEqual(state.resolve_start().pose, safe)
         self.assertEqual(state.resume_source, "fallen_xy_last_safe_upright")
+
+    def test_scene_penetrating_observation_never_replaces_or_rebases_resume(self) -> None:
+        safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
+        state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
+        checkpoint = state.resolve_start()
+        penetrating = MODULE.WorldPose(10.8, 19.7, 0.66, -2.2)
+
+        observed = state.checkpoint(
+            penetrating,
+            upright=True,
+            clearance_safe=False,
+            now_unix_ns=2,
+        )
+
+        self.assertEqual(observed.last_observed, penetrating)
+        self.assertEqual(observed.last_safe, safe)
+        self.assertEqual(observed.last_exit, safe)
+        self.assertEqual(observed.resolve_start().checkpoint_id, checkpoint.checkpoint_id)
+        self.assertEqual(observed.resolve_start().pose, safe)
+        self.assertEqual(observed.resume_checkpoints, state.resume_checkpoints)
 
     def test_fallen_outlier_checkpoint_preserves_last_safe_resume_pose(self) -> None:
         safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
@@ -93,6 +115,130 @@ class MatrixWorldStateTest(unittest.TestCase):
         self.assertEqual(state.resume_source, "fallen_outlier_last_safe")
         self.assertEqual(state.startup_pose(self.default), (safe, "last_exit"))
         self.assertEqual(MODULE.MatrixWorldState.from_mapping(state.to_mapping()), state)
+
+    def test_fallen_outlier_replaces_stale_speculative_slot_with_last_safe(self) -> None:
+        safe = MODULE.WorldPose(0.0, 0.0, 0.8, 0.0)
+        state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
+        state = state.checkpoint(
+            MODULE.WorldPose(10.0, 0.0, 0.2, 1.0),
+            upright=False,
+            now_unix_ns=2,
+        )
+        speculative_id = state.resume_checkpoints[-1].checkpoint_id
+
+        state = state.checkpoint(
+            MODULE.WorldPose(30.0, 0.0, 0.2, 1.0),
+            upright=False,
+            now_unix_ns=3,
+        )
+
+        active = state.resume_checkpoints[-1]
+        self.assertEqual(active.checkpoint_id, speculative_id)
+        self.assertEqual(active.source, "fallen_outlier_last_safe")
+        self.assertEqual(active.pose, safe)
+        self.assertEqual(state.last_exit, safe)
+        self.assertEqual(state.resume_source, "fallen_outlier_last_safe")
+        resolved = state.resolve_start(self.default)
+        self.assertEqual(resolved.pose, safe)
+        self.assertEqual(resolved.checkpoint_id, speculative_id)
+
+    def test_fall_cascade_uses_one_speculative_slot_without_evicting_safe_chain(
+        self,
+    ) -> None:
+        state = self.state
+        for index in range(MODULE.MAX_RESUME_CHECKPOINTS):
+            state = state.checkpoint(
+                MODULE.WorldPose(float(index * 2), 0.0, 0.8, 0.0),
+                upright=True,
+                now_unix_ns=index + 1,
+            )
+        original_safe_ids = {
+            checkpoint.checkpoint_id for checkpoint in state.resume_checkpoints
+        }
+        speculative_id = None
+        for index in range(40):
+            state = state.checkpoint(
+                MODULE.WorldPose(30.0 + (0.5 * index), 1.0, 0.2, 1.5),
+                upright=False,
+                now_unix_ns=100 + index,
+            )
+            current = state.resume_checkpoints[-1]
+            if speculative_id is None:
+                speculative_id = current.checkpoint_id
+            self.assertEqual(current.checkpoint_id, speculative_id)
+            self.assertEqual(
+                current.source,
+                "fallen_xy_last_safe_upright",
+            )
+
+        trusted = [
+            checkpoint
+            for checkpoint in state.resume_checkpoints
+            if checkpoint.source not in MODULE._SPECULATIVE_RESUME_SOURCES
+        ]
+        speculative = [
+            checkpoint
+            for checkpoint in state.resume_checkpoints
+            if checkpoint.source in MODULE._SPECULATIVE_RESUME_SOURCES
+        ]
+        self.assertEqual(len(state.resume_checkpoints), MODULE.MAX_RESUME_CHECKPOINTS)
+        self.assertEqual(len(trusted), MODULE.MAX_RESUME_CHECKPOINTS - 1)
+        self.assertEqual(len(speculative), 1)
+        self.assertTrue(
+            {checkpoint.checkpoint_id for checkpoint in trusted}.issubset(
+                original_safe_ids
+            )
+        )
+        self.assertEqual(state.last_safe, MODULE.WorldPose(30.0, 0.0, 0.8, 0.0))
+
+    def test_legacy_all_fallen_ring_restores_trusted_anchor_and_tombstones_old(
+        self,
+    ) -> None:
+        safe = MODULE.WorldPose(17.98, 80.62, 0.784, -1.15)
+        fallen = tuple(
+            MODULE.ResumeCheckpoint(
+                checkpoint_id=f"cp-{index:032x}",
+                pose=MODULE.WorldPose(float(index), 60.0, 0.784, -1.15),
+                source="fallen_xy_last_safe_upright",
+                created_at_unix_ns=index + 1,
+            )
+            for index in range(MODULE.MAX_RESUME_CHECKPOINTS)
+        )
+        legacy = MODULE.MatrixWorldState(
+            world_id=self.state.world_id,
+            world_revision=self.state.world_revision,
+            last_observed=fallen[-1].pose,
+            last_safe=safe,
+            last_exit=fallen[-1].pose,
+            resume_source="fallen_xy_last_safe_upright",
+            generation=99,
+            resume_checkpoints=fallen,
+            updated_at_unix_ns=100,
+        )
+
+        migrated = MODULE.MatrixWorldState.from_mapping(legacy.to_mapping())
+
+        self.assertEqual(len(migrated.resume_checkpoints), 2)
+        self.assertEqual(
+            [checkpoint.source for checkpoint in migrated.resume_checkpoints],
+            ["upright_checkpoint", "fallen_xy_last_safe_upright"],
+        )
+        self.assertEqual(migrated.resume_checkpoints[0].pose, safe)
+        self.assertEqual(migrated.resume_checkpoints[-1], fallen[-1])
+        self.assertEqual(len(migrated.invalid_checkpoints), 15)
+        self.assertEqual(migrated.generation, 99)
+
+        rejected = migrated.reject_active_checkpoint(
+            expected_id=fallen[-1].checkpoint_id,
+            expected_generation=migrated.generation,
+            reason="recovery_drift",
+            run_id="run-4663c84e",
+            now_unix_ns=101,
+        )
+        self.assertEqual(rejected.replacement_checkpoint.pose, safe)
+        self.assertEqual(rejected.state.last_safe, safe)
+        self.assertEqual(rejected.state.last_exit, safe)
+        self.assertEqual(rejected.state.resolve_start().pose, safe)
 
     def test_startup_rejects_legacy_exit_outlier_from_last_safe(self) -> None:
         safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
@@ -175,6 +321,188 @@ class MatrixWorldStateTest(unittest.TestCase):
             ):
                 MODULE._decode_state_bytes(payload)
 
+    def test_resume_checkpoint_ring_is_bounded_and_deduplicates_adjacent_poses(self) -> None:
+        first = MODULE.WorldPose(0.0, 0.0, 0.8, 0.0)
+        state = self.state.checkpoint(first, upright=True, now_unix_ns=1)
+        first_id = state.resume_checkpoints[-1].checkpoint_id
+
+        adjacent = MODULE.WorldPose(
+            0.99,
+            0.0,
+            0.8,
+            math.radians(29.0),
+        )
+        state = state.checkpoint(adjacent, upright=True, now_unix_ns=2)
+
+        self.assertEqual(len(state.resume_checkpoints), 1)
+        self.assertEqual(state.resume_checkpoints[-1].checkpoint_id, first_id)
+        self.assertEqual(state.resume_checkpoints[-1].anchor_pose, first)
+        self.assertEqual(state.resume_checkpoints[-1].pose, adjacent)
+        self.assertEqual(state.resume_checkpoints[-1].created_at_unix_ns, 2)
+        self.assertEqual(state.generation, 2)
+        self.assertEqual(state.last_exit, adjacent)
+        self.assertEqual(state.resolve_start().pose, adjacent)
+
+        outside_yaw_threshold = MODULE.WorldPose(
+            0.99,
+            0.0,
+            0.8,
+            math.radians(31.0),
+        )
+        state = state.checkpoint(
+            outside_yaw_threshold,
+            upright=True,
+            now_unix_ns=3,
+        )
+        self.assertEqual(len(state.resume_checkpoints), 2)
+
+        distance_state = self.state.checkpoint(
+            first,
+            upright=True,
+            now_unix_ns=1,
+        )
+        distance_state = distance_state.checkpoint(
+            MODULE.WorldPose(0.6, 0.0, 0.8, 0.0),
+            upright=True,
+            now_unix_ns=2,
+        )
+        distance_state = distance_state.checkpoint(
+            MODULE.WorldPose(1.1, 0.0, 0.8, 0.0),
+            upright=True,
+            now_unix_ns=3,
+        )
+        self.assertEqual(len(distance_state.resume_checkpoints), 2)
+        self.assertEqual(
+            distance_state.resume_checkpoints[0].pose,
+            MODULE.WorldPose(0.6, 0.0, 0.8, 0.0),
+        )
+        self.assertEqual(distance_state.resume_checkpoints[0].anchor_pose, first)
+
+        for index in range(20):
+            state = state.checkpoint(
+                MODULE.WorldPose(3.0 + 2.0 * index, 0.0, 0.8, 0.0),
+                upright=True,
+                now_unix_ns=4 + index,
+            )
+        self.assertEqual(len(state.resume_checkpoints), MODULE.MAX_RESUME_CHECKPOINTS)
+        self.assertNotIn(first_id, {item.checkpoint_id for item in state.resume_checkpoints})
+        self.assertEqual(state.resolve_start().pose, state.resume_checkpoints[-1].pose)
+
+    def test_explicit_resume_pose_always_creates_a_new_checkpoint(self) -> None:
+        pose = MODULE.WorldPose(1.0, 2.0, 0.8, 0.25)
+        state = self.state.set_resume_pose(pose, now_unix_ns=1)
+        state = state.set_resume_pose(pose, now_unix_ns=2)
+
+        self.assertEqual(len(state.resume_checkpoints), 2)
+        self.assertNotEqual(
+            state.resume_checkpoints[0].checkpoint_id,
+            state.resume_checkpoints[1].checkpoint_id,
+        )
+        self.assertEqual(state.generation, 2)
+
+    def test_v1_load_migrates_one_deterministic_checkpoint_in_memory(self) -> None:
+        pose = MODULE.WorldPose(12.0, -3.0, 0.8, 0.5)
+        v2_state = self.state.set_resume_pose(pose, now_unix_ns=123)
+        legacy = v2_state.to_mapping()
+        legacy["schema"] = MODULE.WORLD_STATE_SCHEMA_V1
+        legacy.pop("generation")
+        legacy.pop("resume_checkpoints")
+        legacy.pop("invalid_checkpoints")
+
+        first = MODULE.MatrixWorldState.from_mapping(legacy)
+        second = MODULE.MatrixWorldState.from_mapping(legacy)
+
+        self.assertEqual(first.generation, 0)
+        self.assertEqual(len(first.resume_checkpoints), 1)
+        self.assertEqual(first.resume_checkpoints, second.resume_checkpoints)
+        self.assertEqual(first.resolve_start().pose, pose)
+        self.assertRegex(
+            first.resolve_start().checkpoint_id or "",
+            r"^cp-[0-9a-f]{32}$",
+        )
+        self.assertEqual(first.to_mapping()["schema"], MODULE.WORLD_STATE_SCHEMA)
+        self.assertEqual(MODULE.MatrixWorldState.from_mapping(first.to_mapping()), first)
+
+    def test_reject_active_checkpoint_is_exact_and_idempotent(self) -> None:
+        state = self.state
+        for index in range(3):
+            state = state.checkpoint(
+                MODULE.WorldPose(2.0 * index, 0.0, 0.8, 0.0),
+                upright=True,
+                now_unix_ns=index + 1,
+            )
+        selected = state.resume_checkpoints[-1]
+        replacement = state.resume_checkpoints[-2]
+        selected_generation = state.generation
+
+        result = state.reject_active_checkpoint(
+            expected_id=selected.checkpoint_id,
+            expected_generation=selected_generation,
+            reason="startup_pose_divergence",
+            run_id="run-123",
+            now_unix_ns=10,
+        )
+
+        self.assertFalse(result.idempotent)
+        self.assertEqual(result.rejected_checkpoint, selected)
+        self.assertEqual(result.replacement_checkpoint, replacement)
+        self.assertEqual(result.state.generation, selected_generation + 1)
+        self.assertEqual(result.state.resume_checkpoints[-1], replacement)
+        self.assertEqual(result.state.invalid_checkpoints[-1], result.tombstone)
+        self.assertEqual(result.tombstone.checkpoint, selected)
+
+        repeated = result.state.reject_active_checkpoint(
+            expected_id=selected.checkpoint_id,
+            expected_generation=selected_generation,
+            reason="startup_pose_divergence",
+            run_id="run-123",
+            now_unix_ns=11,
+        )
+        self.assertTrue(repeated.idempotent)
+        self.assertEqual(repeated.state, result.state)
+        self.assertEqual(repeated.replacement_checkpoint, replacement)
+
+        with self.assertRaisesRegex(MODULE.WorldStateError, "different audit event"):
+            result.state.reject_active_checkpoint(
+                expected_id=selected.checkpoint_id,
+                expected_generation=selected_generation,
+                reason="startup_pose_divergence",
+                run_id="other-run",
+            )
+        with self.assertRaisesRegex(MODULE.WorldStateError, "generation changed"):
+            result.state.reject_active_checkpoint(
+                expected_id=replacement.checkpoint_id,
+                expected_generation=selected_generation,
+                reason="startup_pose_divergence",
+                run_id="run-124",
+            )
+
+    def test_invalid_checkpoint_tombstones_are_bounded(self) -> None:
+        state = self.state
+        rejected_ids: list[str] = []
+        for index in range(MODULE.MAX_INVALID_CHECKPOINTS + 1):
+            state = state.set_resume_pose(
+                MODULE.WorldPose(float(index), 0.0, 0.8, 0.0),
+                now_unix_ns=2 * index + 1,
+            )
+            selected = state.resume_checkpoints[-1]
+            rejected_ids.append(selected.checkpoint_id)
+            result = state.reject_active_checkpoint(
+                expected_id=selected.checkpoint_id,
+                expected_generation=state.generation,
+                reason="operator_reject",
+                run_id=f"run-{index}",
+                now_unix_ns=2 * index + 2,
+            )
+            state = result.state
+
+        self.assertEqual(len(state.invalid_checkpoints), MODULE.MAX_INVALID_CHECKPOINTS)
+        self.assertNotIn(
+            rejected_ids[0],
+            {item.checkpoint_id for item in state.invalid_checkpoints},
+        )
+        self.assertEqual(state.invalid_checkpoints[-1].checkpoint_id, rejected_ids[-1])
+
 
 class WorldStateStoreTest(unittest.TestCase):
     def test_atomic_round_trip_permissions_and_backup_recovery(self) -> None:
@@ -215,6 +543,323 @@ class WorldStateStoreTest(unittest.TestCase):
             self.assertEqual(recovered.load(), first)
             self.assertEqual(recovered.load_status, "backup")
             self.assertIn("primary", recovered.load_error or "")
+
+    def test_save_rejects_direct_generation_zero_over_existing_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            current = store.state.set_resume_pose(
+                MODULE.WorldPose(1.0, 2.0, 0.8, 0.1),
+                now_unix_ns=1,
+            )
+            store.save(current)
+            before = path.read_bytes()
+            direct_generation_zero = MODULE.MatrixWorldState(
+                world_id="town10",
+                world_revision="revision",
+                last_exit=MODULE.WorldPose(9.0, 9.0, 0.8, 0.0),
+                resume_source="teleport_command",
+                updated_at_unix_ns=2,
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.WorldStateError,
+                "stale world-state generation",
+            ):
+                store.save(direct_generation_zero)
+
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse(path.with_name(f"{path.name}.bak").exists())
+
+    def test_store_rejection_quarantines_exact_head_in_primary_and_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            first = store.state.checkpoint(
+                MODULE.WorldPose(1.0, 0.0, 0.8, 0.0),
+                upright=True,
+                now_unix_ns=1,
+            )
+            store.save(first)
+            second = first.checkpoint(
+                MODULE.WorldPose(3.0, 0.0, 0.8, 0.0),
+                upright=True,
+                now_unix_ns=2,
+            )
+            store.save(second)
+            selected = second.resume_checkpoints[-1]
+            replacement = second.resume_checkpoints[-2]
+
+            result = store.reject_active_checkpoint(
+                expected_id=selected.checkpoint_id,
+                expected_generation=second.generation,
+                reason="startup_pose_divergence",
+                run_id="run-a",
+                now_unix_ns=3,
+            )
+
+            backup = path.with_name(f"{path.name}.bak")
+            self.assertEqual(path.read_bytes(), backup.read_bytes())
+            self.assertEqual(result.replacement_checkpoint, replacement)
+            self.assertEqual(result.state.resolve_start().checkpoint_id, replacement.checkpoint_id)
+            self.assertEqual(result.state.invalid_checkpoints[-1].checkpoint, selected)
+
+            path.write_text("{truncated", encoding="utf-8")
+            recovered = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            recovered_state = recovered.load()
+            self.assertEqual(recovered.load_status, "backup")
+            self.assertEqual(
+                recovered_state.resolve_start().checkpoint_id,
+                replacement.checkpoint_id,
+            )
+            self.assertIn(
+                selected.checkpoint_id,
+                {item.checkpoint_id for item in recovered_state.invalid_checkpoints},
+            )
+
+    def test_store_can_reject_the_deterministic_checkpoint_migrated_from_v1(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy-state.json"
+            pose = MODULE.WorldPose(42.1, 61.36, 0.94, 0.25)
+            legacy_state = MODULE.MatrixWorldState(
+                world_id="town10",
+                world_revision="revision",
+                last_observed=pose,
+                last_safe=pose,
+                last_exit=pose,
+                resume_source="upright_checkpoint",
+                updated_at_unix_ns=123,
+            ).to_mapping()
+            legacy_state["schema"] = MODULE.WORLD_STATE_SCHEMA_V1
+            legacy_state.pop("generation")
+            legacy_state.pop("resume_checkpoints")
+            legacy_state.pop("invalid_checkpoints")
+            path.write_text(
+                json.dumps(legacy_state, allow_nan=False),
+                encoding="utf-8",
+            )
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            migrated = store.load()
+            selected = migrated.resolve_start()
+
+            result = store.reject_active_checkpoint(
+                expected_id=selected.checkpoint_id,
+                expected_generation=selected.generation,
+                reason="startup_numerical_instability",
+                run_id="legacy-run",
+                now_unix_ns=124,
+            )
+
+            self.assertIsNone(result.replacement_checkpoint)
+            self.assertEqual(result.state.resume_checkpoints, ())
+            self.assertEqual(
+                result.state.invalid_checkpoints[-1].checkpoint_id,
+                selected.checkpoint_id,
+            )
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["schema"],
+                MODULE.WORLD_STATE_SCHEMA,
+            )
+            self.assertEqual(
+                path.read_bytes(),
+                path.with_name(f"{path.name}.bak").read_bytes(),
+            )
+
+    def test_store_rejection_retry_is_idempotent_and_does_not_pop_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            state = store.state
+            for index in range(3):
+                state = state.checkpoint(
+                    MODULE.WorldPose(2.0 * index, 0.0, 0.8, 0.0),
+                    upright=True,
+                    now_unix_ns=index + 1,
+                )
+            store.save(state)
+            selected = state.resume_checkpoints[-1]
+            replacement = state.resume_checkpoints[-2]
+
+            first = store.reject_active_checkpoint(
+                expected_id=selected.checkpoint_id,
+                expected_generation=state.generation,
+                reason="startup_numerical_instability",
+                run_id="run-b",
+                now_unix_ns=10,
+            )
+            repeated = store.reject_active_checkpoint(
+                expected_id=selected.checkpoint_id,
+                expected_generation=state.generation,
+                reason="startup_numerical_instability",
+                run_id="run-b",
+                now_unix_ns=11,
+            )
+
+            self.assertFalse(first.idempotent)
+            self.assertTrue(repeated.idempotent)
+            self.assertEqual(repeated.state.generation, first.state.generation)
+            self.assertEqual(repeated.replacement_checkpoint, replacement)
+            self.assertEqual(len(repeated.state.resume_checkpoints), 2)
+            self.assertEqual(len(repeated.state.invalid_checkpoints), 1)
+
+    def test_store_rejection_cas_failure_preserves_both_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            state = store.state
+            for index in range(2):
+                state = state.checkpoint(
+                    MODULE.WorldPose(2.0 * index, 0.0, 0.8, 0.0),
+                    upright=True,
+                    now_unix_ns=index + 1,
+                )
+            store.save(state)
+            # Produce a normal backup without changing the semantic state.
+            store.save(state)
+            before_primary = path.read_bytes()
+            backup = path.with_name(f"{path.name}.bak")
+            before_backup = backup.read_bytes()
+
+            with self.assertRaisesRegex(MODULE.WorldStateError, "generation changed"):
+                store.reject_active_checkpoint(
+                    expected_id=state.resume_checkpoints[-1].checkpoint_id,
+                    expected_generation=state.generation - 1,
+                    reason="startup_pose_divergence",
+                    run_id="run-c",
+                )
+
+            self.assertEqual(path.read_bytes(), before_primary)
+            self.assertEqual(backup.read_bytes(), before_backup)
+
+    def test_save_failure_preserves_newer_tombstoned_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            backup = path.with_name(f"{path.name}.bak")
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            primary_state = store.state.set_resume_pose(
+                MODULE.WorldPose(1.0, 0.0, 0.8, 0.0),
+                now_unix_ns=1,
+            )
+            primary_state = primary_state.set_resume_pose(
+                MODULE.WorldPose(9.0, 0.0, 0.8, 0.0),
+                now_unix_ns=2,
+            )
+            store.save(primary_state)
+            bad_checkpoint = primary_state.resume_checkpoints[-1]
+            quarantined = primary_state.reject_active_checkpoint(
+                expected_id=bad_checkpoint.checkpoint_id,
+                expected_generation=primary_state.generation,
+                reason="startup_pose_divergence",
+                run_id="run-backup-newer",
+                now_unix_ns=3,
+            ).state
+            MODULE._atomic_write(backup, MODULE._serialize_state(quarantined))
+            candidate, _point = quarantined.add_teleport_point(
+                MODULE.WorldPose(2.0, 0.0, 0.8, 0.0),
+                ("recovery",),
+                now_unix_ns=4,
+            )
+            backup_before = backup.read_bytes()
+
+            real_atomic_write = MODULE._atomic_write
+
+            def fail_primary(target: Path, payload: bytes) -> None:
+                if target == path:
+                    raise MODULE.WorldStateError("simulated primary write failure")
+                real_atomic_write(target, payload)
+
+            with mock.patch.object(
+                MODULE,
+                "_atomic_write",
+                side_effect=fail_primary,
+            ), self.assertRaisesRegex(
+                MODULE.WorldStateError,
+                "simulated primary write failure",
+            ):
+                store.save(candidate)
+
+            persisted_primary = MODULE._decode_state_bytes(path.read_bytes())
+            persisted_backup = MODULE._decode_state_bytes(backup.read_bytes())
+            self.assertEqual(persisted_primary.generation, primary_state.generation)
+            self.assertGreaterEqual(
+                persisted_backup.generation,
+                primary_state.generation + 1,
+            )
+            self.assertEqual(backup.read_bytes(), backup_before)
+            recovered = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            ).load()
+            self.assertNotIn(
+                bad_checkpoint.checkpoint_id,
+                {item.checkpoint_id for item in recovered.resume_checkpoints},
+            )
+            self.assertIn(
+                bad_checkpoint.checkpoint_id,
+                {item.checkpoint_id for item in recovered.invalid_checkpoints},
+            )
+
+    def test_rejection_lock_failure_preserves_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "state.json"
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            state = store.state
+            for index in range(2):
+                state = state.checkpoint(
+                    MODULE.WorldPose(2.0 * index, 0.0, 0.8, 0.0),
+                    upright=True,
+                    now_unix_ns=index + 1,
+                )
+            store.save(state)
+            before = path.read_bytes()
+
+            with mock.patch.object(
+                MODULE.fcntl,
+                "flock",
+                side_effect=OSError("simulated lock failure"),
+            ):
+                with self.assertRaisesRegex(MODULE.WorldStateError, "cannot lock"):
+                    store.reject_active_checkpoint(
+                        expected_id=state.resume_checkpoints[-1].checkpoint_id,
+                        expected_generation=state.generation,
+                        reason="operator_reject",
+                        run_id="run-d",
+                    )
+            self.assertEqual(path.read_bytes(), before)
 
     def test_revision_mismatch_is_preserved_as_invalid_and_falls_back_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -370,7 +1015,9 @@ class WorldStateStoreTest(unittest.TestCase):
                 descriptor = real_open(item, flags, mode, dir_fd=dir_fd)
                 if item == "stable" and flags & os.O_DIRECTORY:
                     stable_open_count += 1
-                    if stable_open_count == 2:
+                    # save reads both primary and backup predecessors before
+                    # opening the destination for its atomic replacement.
+                    if stable_open_count == 3:
                         stable_parent.rename(moved_parent)
                         stable_parent.symlink_to(
                             attacker_target,
@@ -381,7 +1028,7 @@ class WorldStateStoreTest(unittest.TestCase):
             with mock.patch.object(MODULE.os, "open", side_effect=racing_open):
                 store.save()
 
-            self.assertEqual(stable_open_count, 2)
+            self.assertEqual(stable_open_count, 3)
             self.assertFalse((attacker_target / "state.json").exists())
             persisted = MODULE._decode_state_bytes(
                 (moved_parent / "state.json").read_bytes()
@@ -592,16 +1239,22 @@ class WorldStateStoreTest(unittest.TestCase):
 
             safe = MODULE.WorldPose(10.0, 20.0, 0.81, 0.6)
             outlier = MODULE.WorldPose(4_000.0, -3_000.0, 0.81, 0.6)
-            store.save(
-                MODULE.MatrixWorldState(
-                    world_id="g1:town10",
-                    world_revision=revision,
-                    last_observed=outlier,
-                    last_safe=safe,
-                    last_exit=outlier,
-                    resume_source="fallen_xy_last_safe_upright",
-                    updated_at_unix_ns=2,
-                )
+            legacy_outlier = MODULE.MatrixWorldState(
+                world_id="g1:town10",
+                world_revision=revision,
+                last_observed=outlier,
+                last_safe=safe,
+                last_exit=outlier,
+                resume_source="fallen_xy_last_safe_upright",
+                updated_at_unix_ns=2,
+            ).to_mapping()
+            legacy_outlier["schema"] = MODULE.WORLD_STATE_SCHEMA_V1
+            legacy_outlier.pop("generation")
+            legacy_outlier.pop("resume_checkpoints")
+            legacy_outlier.pop("invalid_checkpoints")
+            path.write_text(
+                json.dumps(legacy_outlier, allow_nan=False),
+                encoding="utf-8",
             )
             outlier_lines = subprocess.run(
                 [
@@ -627,8 +1280,119 @@ class WorldStateStoreTest(unittest.TestCase):
             )
             self.assertEqual(
                 outlier_lines[5:],
-                ["last_safe_outlier_fallback", "loaded"],
+                ["last_exit", "loaded"],
             )
+
+    def test_resolve_start_meta_and_reject_cli_protocols_are_bounded(self) -> None:
+        script = SCRIPTS / "matrix_world_state.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="g1:town10",
+                world_revision="revision",
+            )
+            state = store.state.set_resume_pose(
+                MODULE.WorldPose(1.0, 2.0, 0.8, 0.1),
+                now_unix_ns=1,
+            )
+            state = state.set_resume_pose(
+                MODULE.WorldPose(3.0, 4.0, 0.8, 0.2),
+                now_unix_ns=2,
+            )
+            store.save(state)
+            selected = state.resume_checkpoints[-1]
+            replacement = state.resume_checkpoints[-2]
+
+            base_command = [
+                sys.executable,
+                str(script),
+                "resolve-start",
+                "--file",
+                str(path),
+                "--world-id",
+                "g1:town10",
+                "--world-revision",
+                "revision",
+            ]
+            legacy_lines = subprocess.run(
+                base_command,
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.splitlines()
+            meta_lines = subprocess.run(
+                [*base_command, "--include-checkpoint-meta"],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.splitlines()
+
+            self.assertEqual(len(legacy_lines), 7)
+            self.assertEqual(meta_lines[:7], legacy_lines)
+            self.assertEqual(meta_lines[7], selected.checkpoint_id)
+            self.assertEqual(meta_lines[8], str(state.generation))
+
+            rejection = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "reject-checkpoint",
+                    "--file",
+                    str(path),
+                    "--world-id",
+                    "g1:town10",
+                    "--world-revision",
+                    "revision",
+                    "--checkpoint-id",
+                    selected.checkpoint_id,
+                    "--expected-generation",
+                    str(state.generation),
+                    "--reason",
+                    "operator_reject",
+                    "--run-id",
+                    "cli-run",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            payload = json.loads(rejection.stdout)
+            self.assertEqual(payload["rejected_checkpoint_id"], selected.checkpoint_id)
+            self.assertEqual(
+                payload["replacement_checkpoint_id"], replacement.checkpoint_id
+            )
+            self.assertEqual(payload["generation"], state.generation + 1)
+            self.assertFalse(payload["idempotent"])
+
+            after_lines = subprocess.run(
+                [*base_command, "--include-checkpoint-meta"],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.splitlines()
+            self.assertEqual(after_lines[7], replacement.checkpoint_id)
+            self.assertEqual(after_lines[8], str(state.generation + 1))
+
+            missing_path = Path(temporary) / "missing.json"
+            none_lines = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "resolve-start",
+                    "--file",
+                    str(missing_path),
+                    "--world-id",
+                    "g1:town10",
+                    "--world-revision",
+                    "revision",
+                    "--include-checkpoint-meta",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.splitlines()
+            self.assertEqual(none_lines, ["none", "missing", "none", "0"])
 
     def test_revision_covers_location_independent_physics_source_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -751,6 +1515,623 @@ class WorldStateStoreTest(unittest.TestCase):
             self.assertEqual(
                 payload["removed_environment_geoms"],
                 list(PHYSICS.TOWN10_PERIMETER_WALL_NAMES),
+            )
+
+    def test_revision_changes_with_inventory_topology_and_not_its_location(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def source(name: str, pool_size: int) -> tuple[Path, Path, Path, Path]:
+                base = root / name
+                meshes = base / "meshes"
+                native = base / "native"
+                meshes.mkdir(parents=True)
+                native.mkdir()
+                model = base / "robot.xml"
+                scene = native / "scene.xml"
+                prop = base / "prop.stl"
+                catalog = base / "inventory.json"
+                model.write_text("<mujoco/>", encoding="utf-8")
+                scene.write_text("<mujoco/>", encoding="utf-8")
+                (meshes / "body.stl").write_bytes(b"body")
+                prop.write_bytes(b"prop")
+                catalog.write_text(
+                    json.dumps(
+                        {
+                            "schema": "matrix-creative-inventory/v1",
+                            "items": [
+                                {
+                                    "item_id": "prop",
+                                    "label": "Prop",
+                                    "pool_size": pool_size,
+                                    "mass_kg": 1.0,
+                                    "collision_half_size": [0.1, 0.1, 0.1],
+                                    "spawn_distance_m": 1.0,
+                                    "spawn_height_m": 1.0,
+                                    "spawn_quat": [1.0, 0.0, 0.0, 0.0],
+                                    "visuals": [
+                                        {
+                                            "mesh": "prop.stl",
+                                            "rgba": [1.0, 1.0, 1.0, 1.0],
+                                            "scale": [1.0, 1.0, 1.0],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return model, meshes, scene, catalog
+
+            model_a, meshes_a, scene_a, catalog_a = source("a", 2)
+            model_b, meshes_b, scene_b, catalog_b = source("b", 2)
+            revision_a = MODULE.world_revision_for_files(
+                world_id="g1:inventory",
+                native_scene=scene_a,
+                canonical_model=model_a,
+                canonical_meshes=meshes_a,
+                creative_inventory_catalog=catalog_a,
+            )
+            revision_b = MODULE.world_revision_for_files(
+                world_id="g1:inventory",
+                native_scene=scene_b,
+                canonical_model=model_b,
+                canonical_meshes=meshes_b,
+                creative_inventory_catalog=catalog_b,
+            )
+            self.assertEqual(revision_a, revision_b)
+
+            changed_model, changed_meshes, changed_scene, changed_catalog = source(
+                "changed",
+                3,
+            )
+            self.assertNotEqual(
+                revision_a,
+                MODULE.world_revision_for_files(
+                    world_id="g1:inventory",
+                    native_scene=changed_scene,
+                    canonical_model=changed_model,
+                    canonical_meshes=changed_meshes,
+                    creative_inventory_catalog=changed_catalog,
+                ),
+            )
+
+
+class RejectCheckpointCommitGateTest(unittest.TestCase):
+    def _make_state(
+        self,
+        root: Path,
+    ) -> tuple[Path, MODULE.MatrixWorldState]:
+        path = root / "state.json"
+        store = MODULE.WorldStateStore(
+            path,
+            world_id="town10",
+            world_revision="revision",
+        )
+        state = store.state.set_resume_pose(
+            MODULE.WorldPose(1.0, 0.0, 0.8, 0.0),
+            now_unix_ns=1,
+        )
+        state = state.set_resume_pose(
+            MODULE.WorldPose(3.0, 0.0, 0.8, 0.0),
+            now_unix_ns=2,
+        )
+        store.save(state)
+        # Materialize a normal predecessor replica so abort assertions cover
+        # both durable files byte-for-byte.
+        store.save(state)
+        return path, state
+
+    def _gate_paths(self, root: Path) -> tuple[Path, Path, Path]:
+        return (
+            root / "reject.ready",
+            root / "reject.authorize",
+            root / "reject.cancel",
+        )
+
+    def _gate_command(
+        self,
+        *,
+        path: Path,
+        state: MODULE.MatrixWorldState,
+        ready: Path,
+        authorize: Path,
+        cancel: Path,
+        timeout_seconds: float,
+    ) -> list[str]:
+        return [
+            sys.executable,
+            str(SCRIPTS / "matrix_world_state.py"),
+            "reject-checkpoint",
+            "--file",
+            str(path),
+            "--world-id",
+            "town10",
+            "--world-revision",
+            "revision",
+            "--checkpoint-id",
+            state.resume_checkpoints[-1].checkpoint_id,
+            "--expected-generation",
+            str(state.generation),
+            "--reason",
+            "startup_numerical_instability",
+            "--run-id",
+            "gate-test-run",
+            "--commit-ready-file",
+            str(ready),
+            "--commit-authorize-file",
+            str(authorize),
+            "--commit-cancel-file",
+            str(cancel),
+            "--commit-timeout-seconds",
+            str(timeout_seconds),
+        ]
+
+    def _wait_for_ready(self, process: subprocess.Popen[str], ready: Path) -> None:
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if ready.exists():
+                self.assertEqual(
+                    ready.read_bytes(),
+                    MODULE.REJECT_COMMIT_READY_PAYLOAD,
+                )
+                self.assertEqual(stat.S_IMODE(ready.stat().st_mode), 0o600)
+                return
+            return_code = process.poll()
+            if return_code is not None:
+                stdout, stderr = process.communicate()
+                self.fail(
+                    "commit-gate helper exited before readiness: "
+                    f"rc={return_code} stdout={stdout!r} stderr={stderr!r}"
+                )
+            time.sleep(0.01)
+        process.kill()
+        stdout, stderr = process.communicate()
+        self.fail(
+            "timed out waiting for commit-ready marker: "
+            f"stdout={stdout!r} stderr={stderr!r}"
+        )
+
+    def _publish_marker(self, path: Path, payload: bytes) -> None:
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_bytes(payload)
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+
+    def test_authorize_marker_commits_prepared_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            backup = path.with_name(f"{path.name}.bak")
+            before = (path.read_bytes(), backup.read_bytes())
+            ready, authorize, cancel = self._gate_paths(root)
+            process = subprocess.Popen(
+                self._gate_command(
+                    path=path,
+                    state=state,
+                    ready=ready,
+                    authorize=authorize,
+                    cancel=cancel,
+                    timeout_seconds=2.0,
+                ),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._wait_for_ready(process, ready)
+            self.assertEqual((path.read_bytes(), backup.read_bytes()), before)
+
+            self._publish_marker(
+                authorize,
+                MODULE.REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+            )
+            stdout, stderr = process.communicate(timeout=3.0)
+
+            self.assertEqual(process.returncode, 0, stderr)
+            payload = json.loads(stdout)
+            self.assertEqual(
+                payload["rejected_checkpoint_id"],
+                state.resume_checkpoints[-1].checkpoint_id,
+            )
+            self.assertEqual(payload["generation"], state.generation + 1)
+            self.assertEqual(path.read_bytes(), backup.read_bytes())
+            persisted = MODULE._decode_state_bytes(path.read_bytes())
+            self.assertEqual(
+                persisted.invalid_checkpoints[-1].checkpoint_id,
+                state.resume_checkpoints[-1].checkpoint_id,
+            )
+
+    def _assert_gate_abort_preserves_state(
+        self,
+        *,
+        trigger: str,
+        signal_number: int | None = None,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            backup = path.with_name(f"{path.name}.bak")
+            before = (path.read_bytes(), backup.read_bytes())
+            ready, authorize, cancel = self._gate_paths(root)
+            process = subprocess.Popen(
+                self._gate_command(
+                    path=path,
+                    state=state,
+                    ready=ready,
+                    authorize=authorize,
+                    cancel=cancel,
+                    timeout_seconds=0.15 if trigger == "timeout" else 2.0,
+                ),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._wait_for_ready(process, ready)
+            if trigger == "cancel":
+                self._publish_marker(cancel, MODULE.REJECT_COMMIT_CANCEL_PAYLOAD)
+            elif trigger == "authorize_cancel":
+                os.kill(process.pid, signal.SIGSTOP)
+                stopped_pid, stopped_status = os.waitpid(process.pid, os.WUNTRACED)
+                self.assertEqual(stopped_pid, process.pid)
+                self.assertTrue(os.WIFSTOPPED(stopped_status))
+                self._publish_marker(
+                    authorize,
+                    MODULE.REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+                )
+                self._publish_marker(cancel, MODULE.REJECT_COMMIT_CANCEL_PAYLOAD)
+                os.kill(process.pid, signal.SIGCONT)
+            elif trigger == "invalid_authorize":
+                self._publish_marker(authorize, b"partial-or-wrong\n")
+            elif trigger == "signal":
+                assert signal_number is not None
+                os.kill(process.pid, signal_number)
+            elif trigger != "timeout":
+                self.fail(f"unsupported test trigger {trigger!r}")
+
+            stdout, stderr = process.communicate(timeout=3.0)
+
+            self.assertNotEqual(process.returncode, 0)
+            self.assertEqual(stdout, "")
+            expected_error = {
+                "timeout": "timed out",
+                "invalid_authorize": "invalid protocol payload",
+            }.get(trigger, "canceled")
+            self.assertIn(expected_error, stderr)
+            self.assertEqual((path.read_bytes(), backup.read_bytes()), before)
+
+    def test_cancel_and_timeout_abort_without_durable_write(self) -> None:
+        self._assert_gate_abort_preserves_state(trigger="cancel")
+        self._assert_gate_abort_preserves_state(trigger="authorize_cancel")
+        self._assert_gate_abort_preserves_state(trigger="invalid_authorize")
+        self._assert_gate_abort_preserves_state(trigger="timeout")
+
+    def test_int_term_and_hup_abort_without_durable_write(self) -> None:
+        for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal_number=signal_number):
+                self._assert_gate_abort_preserves_state(
+                    trigger="signal",
+                    signal_number=signal_number,
+                )
+
+    def test_precommit_wait_keeps_exact_cas_under_store_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            selected = state.resume_checkpoints[-1]
+            ready = threading.Event()
+            authorize = threading.Event()
+            first_done = threading.Event()
+            second_done = threading.Event()
+            first_errors: list[BaseException] = []
+            second_errors: list[BaseException] = []
+
+            def gate(_result: MODULE.RejectActiveCheckpointResult) -> None:
+                ready.set()
+                if not authorize.wait(2.0):
+                    raise AssertionError("test authorization was not published")
+
+            def first_rejection() -> None:
+                try:
+                    MODULE.WorldStateStore(
+                        path,
+                        world_id="town10",
+                        world_revision="revision",
+                    ).reject_active_checkpoint(
+                        expected_id=selected.checkpoint_id,
+                        expected_generation=state.generation,
+                        reason="startup_numerical_instability",
+                        run_id="first-run",
+                        precommit=gate,
+                    )
+                except BaseException as exc:
+                    first_errors.append(exc)
+                finally:
+                    first_done.set()
+
+            def competing_rejection() -> None:
+                try:
+                    MODULE.WorldStateStore(
+                        path,
+                        world_id="town10",
+                        world_revision="revision",
+                    ).reject_active_checkpoint(
+                        expected_id=selected.checkpoint_id,
+                        expected_generation=state.generation,
+                        reason="startup_numerical_instability",
+                        run_id="competing-run",
+                    )
+                except BaseException as exc:
+                    second_errors.append(exc)
+                finally:
+                    second_done.set()
+
+            first = threading.Thread(target=first_rejection)
+            first.start()
+            self.assertTrue(ready.wait(1.0))
+            second = threading.Thread(target=competing_rejection)
+            second.start()
+
+            self.assertFalse(second_done.wait(0.1))
+            authorize.set()
+            first.join(2.0)
+            second.join(2.0)
+
+            self.assertTrue(first_done.is_set())
+            self.assertTrue(second_done.is_set())
+            self.assertEqual(first_errors, [])
+            self.assertEqual(len(second_errors), 1)
+            self.assertIsInstance(second_errors[0], MODULE.WorldStateError)
+            self.assertIn("different audit event", str(second_errors[0]))
+            persisted = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            ).load()
+            self.assertEqual(
+                persisted.invalid_checkpoints[-1].run_id,
+                "first-run",
+            )
+
+    def _gate_line(self, marker: str) -> int:
+        source, first_line = inspect.getsourcelines(
+            MODULE._RejectCheckpointCommitGate.await_authorization
+        )
+        matches = [
+            first_line + index
+            for index, line in enumerate(source)
+            if marker in line
+        ]
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
+    def test_signal_immediately_before_commit_mask_cancels_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            backup = path.with_name(f"{path.name}.bak")
+            before = (path.read_bytes(), backup.read_bytes())
+            ready, authorize, cancel = self._gate_paths(root)
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            gate = MODULE._RejectCheckpointCommitGate(
+                state_path=store.path,
+                backup_path=store.backup_path,
+                ready_path=ready,
+                authorize_path=authorize,
+                cancel_path=cancel,
+                timeout_seconds=2.0,
+            )
+            publisher_errors: list[BaseException] = []
+
+            def publish_authorize() -> None:
+                try:
+                    deadline = time.monotonic() + 1.0
+                    while not ready.exists():
+                        if time.monotonic() >= deadline:
+                            raise AssertionError("ready marker was not published")
+                        time.sleep(0.005)
+                    self._publish_marker(
+                        authorize,
+                        MODULE.REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+                    )
+                except BaseException as exc:
+                    publisher_errors.append(exc)
+
+            publisher = threading.Thread(target=publish_authorize)
+            publisher.start()
+            mask_line = self._gate_line("previous_mask = signal.pthread_sigmask(")
+            injected = False
+
+            def inject_before_mask(frame, event, _argument):
+                nonlocal injected
+                if (
+                    not injected
+                    and event == "line"
+                    and frame.f_code
+                    is MODULE._RejectCheckpointCommitGate.await_authorization.__code__
+                    and frame.f_lineno == mask_line
+                ):
+                    injected = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return inject_before_mask
+
+            try:
+                with gate.signal_handlers(), self.assertRaisesRegex(
+                    MODULE.WorldStateError,
+                    "canceled by signal",
+                ):
+                    sys.settrace(inject_before_mask)
+                    try:
+                        store.reject_active_checkpoint(
+                            expected_id=state.resume_checkpoints[-1].checkpoint_id,
+                            expected_generation=state.generation,
+                            reason="startup_numerical_instability",
+                            run_id="pre-mask-signal",
+                            precommit=gate.await_authorization,
+                        )
+                    finally:
+                        sys.settrace(None)
+            finally:
+                publisher.join(1.0)
+
+            self.assertTrue(injected)
+            self.assertEqual(publisher_errors, [])
+            self.assertFalse(gate._commit_started)
+            self.assertEqual((path.read_bytes(), backup.read_bytes()), before)
+
+    def test_signal_after_commit_mask_finishes_both_replicas(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            ready, authorize, cancel = self._gate_paths(root)
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            gate = MODULE._RejectCheckpointCommitGate(
+                state_path=store.path,
+                backup_path=store.backup_path,
+                ready_path=ready,
+                authorize_path=authorize,
+                cancel_path=cancel,
+                timeout_seconds=2.0,
+            )
+            publisher_errors: list[BaseException] = []
+
+            def publish_authorize() -> None:
+                try:
+                    deadline = time.monotonic() + 1.0
+                    while not ready.exists():
+                        if time.monotonic() >= deadline:
+                            raise AssertionError("ready marker was not published")
+                        time.sleep(0.005)
+                    self._publish_marker(
+                        authorize,
+                        MODULE.REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+                    )
+                except BaseException as exc:
+                    publisher_errors.append(exc)
+
+            publisher = threading.Thread(target=publish_authorize)
+            publisher.start()
+            commit_line = self._gate_line("self._commit_started = True")
+            injected = False
+
+            def inject_after_mask(frame, event, _argument):
+                nonlocal injected
+                if (
+                    not injected
+                    and event == "line"
+                    and frame.f_code
+                    is MODULE._RejectCheckpointCommitGate.await_authorization.__code__
+                    and frame.f_lineno == commit_line
+                ):
+                    injected = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return inject_after_mask
+
+            with gate.signal_handlers():
+                sys.settrace(inject_after_mask)
+                try:
+                    result = store.reject_active_checkpoint(
+                        expected_id=state.resume_checkpoints[-1].checkpoint_id,
+                        expected_generation=state.generation,
+                        reason="startup_numerical_instability",
+                        run_id="post-mask-signal",
+                        precommit=gate.await_authorization,
+                    )
+                finally:
+                    sys.settrace(None)
+            publisher.join(1.0)
+
+            self.assertTrue(injected)
+            self.assertEqual(publisher_errors, [])
+            self.assertTrue(gate._commit_started)
+            self.assertEqual(
+                path.read_bytes(),
+                path.with_name(f"{path.name}.bak").read_bytes(),
+            )
+            self.assertEqual(
+                result.state.invalid_checkpoints[-1].run_id,
+                "post-mask-signal",
+            )
+
+    def test_signal_after_helper_commit_point_cannot_interrupt_replication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path, state = self._make_state(root)
+            ready, authorize, cancel = self._gate_paths(root)
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            gate = MODULE._RejectCheckpointCommitGate(
+                state_path=store.path,
+                backup_path=store.backup_path,
+                ready_path=ready,
+                authorize_path=authorize,
+                cancel_path=cancel,
+                timeout_seconds=2.0,
+            )
+            publisher_errors: list[BaseException] = []
+
+            def publish_authorize() -> None:
+                try:
+                    deadline = time.monotonic() + 1.0
+                    while not ready.exists():
+                        if time.monotonic() >= deadline:
+                            raise AssertionError("ready marker was not published")
+                        time.sleep(0.005)
+                    self._publish_marker(
+                        authorize,
+                        MODULE.REJECT_COMMIT_AUTHORIZE_PAYLOAD,
+                    )
+                except BaseException as exc:
+                    publisher_errors.append(exc)
+
+            publisher = threading.Thread(target=publish_authorize)
+            publisher.start()
+            real_atomic_write = MODULE._atomic_write
+            write_count = 0
+
+            def signal_then_write(target: Path, payload: bytes) -> None:
+                nonlocal write_count
+                write_count += 1
+                if write_count == 1:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                real_atomic_write(target, payload)
+
+            with mock.patch.object(
+                MODULE,
+                "_atomic_write",
+                side_effect=signal_then_write,
+            ), gate.signal_handlers():
+                result = store.reject_active_checkpoint(
+                    expected_id=state.resume_checkpoints[-1].checkpoint_id,
+                    expected_generation=state.generation,
+                    reason="startup_numerical_instability",
+                    run_id="post-commit-signal",
+                    precommit=gate.await_authorization,
+                )
+            publisher.join(1.0)
+
+            self.assertEqual(publisher_errors, [])
+            self.assertEqual(write_count, 2)
+            self.assertEqual(
+                path.read_bytes(),
+                path.with_name(f"{path.name}.bak").read_bytes(),
+            )
+            self.assertEqual(
+                result.state.invalid_checkpoints[-1].run_id,
+                "post-commit-signal",
             )
 
 

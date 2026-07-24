@@ -247,11 +247,11 @@ material="demo_ground_material" /></worldbody>
                 worldbody_names,
                 ["pelvis", "creative_item__prop__0"],
             )
-            self.assertIsNotNone(
-                robot.find(
-                    ".//weld[@name='creative_item__prop__0__storage_weld']"
-                )
+            storage_weld = robot.find(
+                ".//weld[@name='creative_item__prop__0__storage_weld']"
             )
+            self.assertIsNotNone(storage_weld)
+            self.assertNotIn("relpose", storage_weld.attrib)
             retained_assets = {
                 item.get("name") for item in robot.find("asset")
             }
@@ -265,11 +265,44 @@ material="demo_ground_material" /></worldbody>
             self.assertTrue(
                 all("class" not in geom.attrib for geom in inventory_geoms)
             )
+            collision_geom = robot.find(
+                ".//geom[@name='creative_item__prop__0__collision']"
+            )
+            self.assertIsNotNone(collision_geom)
+            self.assertEqual(collision_geom.get("contype"), "0")
+            self.assertEqual(collision_geom.get("conaffinity"), "0")
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(
                 manifest["creative_inventory"]["catalog_sha256"],
                 MODULE._file_sha256(catalog),
             )
+            self.assertEqual(
+                manifest["creative_inventory"]["storage_contract_version"],
+                MODULE.INVENTORY_STORAGE_CONTRACT_VERSION,
+            )
+
+            with mock.patch.object(
+                MODULE,
+                "INVENTORY_STORAGE_CONTRACT_VERSION",
+                MODULE.INVENTORY_STORAGE_CONTRACT_VERSION + 1,
+            ):
+                MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    output,
+                    body_joint_names=("joint_a",),
+                    creative_inventory_catalog=catalog,
+                )
+                rebuilt_manifest = json.loads(
+                    (output / "manifest.json").read_text()
+                )
+                self.assertEqual(
+                    rebuilt_manifest["creative_inventory"][
+                        "storage_contract_version"
+                    ],
+                    MODULE.INVENTORY_STORAGE_CONTRACT_VERSION,
+                )
 
     def test_town10_open_boundary_removes_four_walls_and_retains_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -321,11 +354,12 @@ material="demo_ground_material" /></worldbody>
             for wall in MODULE.TOWN10_PERIMETER_WALL_NAMES:
                 self.assertNotIn(wall, names)
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(manifest["pipeline_version"], 7)
+            self.assertEqual(manifest["pipeline_version"], 8)
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
             )
+            self.assertNotIn("scene_transform_contract", manifest)
             self.assertEqual(
                 manifest["removed_environment_geoms"],
                 list(MODULE.TOWN10_PERIMETER_WALL_NAMES),
@@ -355,7 +389,7 @@ material="demo_ground_material" /></worldbody>
                     scene_transform=MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
                 )
 
-    def test_moon_dynamic_ground_transform_staticizes_freejoints(self) -> None:
+    def test_moon_dynamic_ground_transform_converts_freejoints_to_mocap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             canonical = root / "canonical.xml"
@@ -404,7 +438,7 @@ material="demo_ground_material" /></worldbody>
                     scene,
                     output,
                     body_joint_names=("joint_a",),
-                    scene_transform=MODULE.MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+                    scene_transform=MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
                 )
 
             scene_root = ET.parse(output_scene).getroot()
@@ -417,11 +451,36 @@ material="demo_ground_material" /></worldbody>
                 [geom.get("name") for geom in scene_root.iter("geom")],
                 ["soil_0_0", "soil_0_1"],
             )
+            self.assertEqual(
+                [body.get("mocap") for body in scene_root.iter("body")],
+                ["true", "true"],
+            )
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(manifest["pipeline_version"], 7)
+            self.assertEqual(manifest["pipeline_version"], 8)
             self.assertEqual(
                 manifest["scene_transform"],
-                MODULE.MOON_DYNAMIC_GROUND_STATIC_TRANSFORM,
+                MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+            )
+            self.assertEqual(
+                manifest["scene_transform_contract"],
+                {
+                    "dynamic_ground": {
+                        "schema": "matrix-moon-dynamic-ground/v1",
+                        "body_count": 2,
+                        "body_name_pattern": (
+                            MODULE.MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern
+                        ),
+                        "body_mode": "mocap",
+                        "map_dtype": "little-endian-float32",
+                        "map_shape": [6000, 6000],
+                        "map_size_bytes": 144000000,
+                        "map_sha256": MODULE.MOON_DYNAMIC_MAP_SHA256,
+                        "resolution_m": 0.1,
+                        "height_mode": "absolute_world_z",
+                        "update_timing": "before_each_mj_step",
+                        "fallback_support_plane": False,
+                    }
+                },
             )
             self.assertEqual(manifest["removed_environment_geoms"], [])
             self.assertEqual(

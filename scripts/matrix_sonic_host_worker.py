@@ -7,12 +7,13 @@ LowState and loads every ONNX model before announcing ``READY_NO_WRITER``;
 the LowCmd publisher is constructed only after a supervisor sends ``GO``.
 
 The first controller can be KungFuAthleteBot recovery, AMP
-``walk_run_getup``, or HoST ``prone_v1``.  In
-AMP-first mode the zero-command AMP policy physically performs both get-up and
-the subsequent dynamic hold.  In HoST-first mode, if the parent has not judged
-the robot stable and sent ``STOP`` by ``--fallback-after-seconds``, the worker
-physically continues from the current LowState with ``prone_v2``.  Switching
-only resets policy observation history; it never changes simulated state.
+``walk_run_getup``, AMP ``flat_v3_m14000``, or HoST ``prone_v1``.  In
+AMP-first mode the selected zero-command AMP policy physically performs both
+get-up and the subsequent dynamic hold.  In HoST-first mode, if the parent has
+not judged the robot stable and sent ``STOP`` by
+``--fallback-after-seconds``, the worker physically continues from the current
+LowState with ``prone_v2``.  Switching only resets policy observation history;
+it never changes simulated state.
 
 When all AMP-hold artifacts are supplied, ``ENTER_AMP_HOLD`` atomically drops
 the cached HoST target and cold-enters the preloaded AMP policy from the latest
@@ -78,6 +79,7 @@ CONTROL_SCHEMA = "matrix.sonic_host_worker.control.v1"
 HOST_GETUP_CONTROLLER = "HOST_GETUP"
 KUNGFU_GETUP_CONTROLLER = "KUNGFU_GETUP"
 AMP_GETUP_CONTROLLER = "AMP_GETUP"
+AMP_FLAT_V3_GETUP_CONTROLLER = "AMP_FLAT_V3_GETUP"
 AMP_ZERO_COMMAND_HOLD_CONTROLLER = "AMP_ZERO_COMMAND_HOLD"
 JOINT_POSE_HOLD_CONTROLLER = "JOINT_POSE_HOLD"
 POLICY_SWITCH_BLEND_S = 0.4
@@ -560,6 +562,7 @@ def build_resident_policy_registry(
     amp_hold_policy: AmpPolicyCore | None,
     kungfu_policy: KungFuRecoveryPolicy | None,
     execution_provider: str,
+    amp_flat_v3_policy: AmpPolicyCore | None = None,
 ) -> ResidentPolicyRegistry:
     """Register every loaded controller behind one policy-id dispatch API."""
 
@@ -606,6 +609,27 @@ def build_resident_policy_registry(
                 },
             )
         )
+    if amp_flat_v3_policy is not None:
+        registry.register(
+            ResidentPolicyAdapter(
+                policy_id="amp-flat-v3",
+                controller=AMP_FLAT_V3_GETUP_CONTROLLER,
+                execution_provider=provider_name,
+                command_config=amp_flat_v3_policy.config,
+                start_episode_fn=lambda state, _now: (
+                    amp_flat_v3_policy.reset_history(state)
+                ),
+                infer_target_fn=lambda state, _now: amp_flat_v3_policy.infer(
+                    state
+                ).target_joint_pos,
+                status_fields_fn=lambda now, started: {
+                    "policy_index": None,
+                    "policy": "amp_flat_v3_m14000",
+                    "policy_elapsed_s": now - started,
+                    "command": [0.0, 0.0, 0.0],
+                },
+            )
+        )
     if kungfu_policy is not None:
         registry.register(
             ResidentPolicyAdapter(
@@ -647,6 +671,7 @@ def run_worker(
     publish_hz: float,
     lowstate_timeout_s: float,
     status_hz: float,
+    amp_flat_v3_policy: AmpPolicyCore | None = None,
     initial_controller: str = "host",
     resident_policies: Sequence[Mapping[str, Any]] = (),
     execution_provider: str = "cpu",
@@ -671,6 +696,7 @@ def run_worker(
         amp_hold_policy=amp_hold_policy,
         kungfu_policy=kungfu_policy,
         execution_provider=execution_provider,
+        amp_flat_v3_policy=amp_flat_v3_policy,
     )
     selected_policy = policy_registry.require(initial_controller)
     resident_manifest = [dict(item) for item in resident_policies]
@@ -755,7 +781,10 @@ def run_worker(
         active_policy.start_episode(state, start_now)
         if controller == KUNGFU_GETUP_CONTROLLER:
             kungfu_started_monotonic = start_now
-        elif controller == AMP_GETUP_CONTROLLER:
+        elif controller in {
+            AMP_GETUP_CONTROLLER,
+            AMP_FLAT_V3_GETUP_CONTROLLER,
+        }:
             amp_started_monotonic = start_now
 
     try:
@@ -1445,7 +1474,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fallback-after-seconds", type=float, default=8.0)
     parser.add_argument(
         "--initial-controller",
-        choices=("host", "amp", "kungfu"),
+        choices=("host", "amp", "amp-flat-v3", "kungfu"),
         default=os.environ.get(
             "MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER", "host"
         ),
@@ -1487,6 +1516,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--amp-hold-model-sha256",
         default=os.environ.get("MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256", ""),
+    )
+    parser.add_argument("--amp-flat-v3-config", type=Path)
+    parser.add_argument("--amp-flat-v3-model", type=Path)
+    parser.add_argument(
+        "--amp-flat-v3-config-sha256",
+        default=os.environ.get(
+            "MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256", ""
+        ),
+    )
+    parser.add_argument(
+        "--amp-flat-v3-model-sha256",
+        default=os.environ.get(
+            "MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256", ""
+        ),
     )
     parser.add_argument("--publish-hz", type=float, default=500.0)
     parser.add_argument("--status-hz", type=float, default=5.0)
@@ -1563,6 +1606,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"invalid AMP hold artifacts: {exc}") from exc
     if args.initial_controller == "amp" and amp_hold_policy is None:
         raise SystemExit("AMP-first recovery requires valid AMP artifacts")
+    amp_flat_v3_arguments = (
+        args.amp_flat_v3_config,
+        args.amp_flat_v3_model,
+        args.amp_flat_v3_config_sha256,
+        args.amp_flat_v3_model_sha256,
+    )
+    if any(bool(value) for value in amp_flat_v3_arguments) and not all(
+        bool(value) for value in amp_flat_v3_arguments
+    ):
+        raise SystemExit(
+            "AMP flat_v3 recovery requires --amp-flat-v3-config, "
+            "--amp-flat-v3-model, --amp-flat-v3-config-sha256, and "
+            "--amp-flat-v3-model-sha256"
+        )
+    amp_flat_v3_policy = None
+    if all(bool(value) for value in amp_flat_v3_arguments):
+        try:
+            amp_flat_v3_policy = load_amp_hold_policy(
+                config_path=args.amp_flat_v3_config,
+                model_path=args.amp_flat_v3_model,
+                config_sha256=args.amp_flat_v3_config_sha256,
+                model_sha256=args.amp_flat_v3_model_sha256,
+                execution_provider=args.execution_provider,
+            )
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"invalid AMP flat_v3 artifacts: {exc}") from exc
+    if (
+        args.initial_controller == "amp-flat-v3"
+        and amp_flat_v3_policy is None
+    ):
+        raise SystemExit(
+            "AMP flat_v3-first recovery requires valid flat_v3 artifacts"
+        )
     kungfu_policy = None
     kungfu_arguments = (
         args.kungfu_model,
@@ -1615,6 +1691,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "warmed": True,
             }
         )
+    if amp_flat_v3_policy is not None:
+        resident_policies.append(
+            {
+                "name": "amp-flat-v3:flat_v3_m14000",
+                "execution_provider": getattr(
+                    amp_flat_v3_policy.runner, "execution_provider", None
+                ),
+                "warmed": True,
+            }
+        )
     if kungfu_policy is not None:
         resident_policies.append(
             {
@@ -1629,6 +1715,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_worker(
             cascade=cascade,
             amp_hold_policy=amp_hold_policy,
+            amp_flat_v3_policy=amp_flat_v3_policy,
             kungfu_policy=kungfu_policy,
             dds=dds,
             state_store=state_store,

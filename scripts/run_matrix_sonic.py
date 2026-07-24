@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -48,10 +49,13 @@ from matrix_mc_commands import (
     CommandExecutionError,
     CommandProtocolError,
     CreativeSpawnItem,
+    DataModifyInput,
+    DataModifyNumber,
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
     PolicySlotAssignment,
+    TeleportList,
     decode_command_request,
     encode_command_response,
     execute_command,
@@ -61,8 +65,36 @@ from matrix_creative_inventory import (
     CreativeInventoryRuntime,
 )
 from inject_creative_inventory import InventoryCatalogError, load_catalog
+from matrix_motion_settings import (
+    MotionSettings,
+    MotionSettingsError,
+    MotionSettingsPersistenceError,
+    MotionSettingsStore,
+)
 from matrix_mouse_settings import canonical_remote_speed_scale
+from matrix_moon_dynamic_ground import (
+    LOCKED_MOONWORLD_SHA256,
+    MoonDynamicGround,
+    MoonDynamicGroundError,
+)
+from matrix_policy_slots import (
+    BFM_TEACHER50K_POLICY_ID,
+    PolicyCandidateState,
+    evaluate_policy_candidate,
+)
+from prepare_sonic_physics_model import (
+    G1_BODY_JOINT_NAMES,
+    MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+)
+from matrix_spawn_clearance import (
+    AUDIT_SCHEMA as SPAWN_CLEARANCE_AUDIT_SCHEMA,
+    GROUND_SUPPORT_SCHEMA,
+    apply_root_pose_and_audit,
+    audit_spawn_clearance,
+    audit_spawn_safety,
+)
 from matrix_world_state import (
+    MAX_RESUME_CHECKPOINTS,
     WorldPose,
     WorldStateError,
     WorldStateStore,
@@ -70,13 +102,61 @@ from matrix_world_state import (
 
 
 _GAME_INTERNAL_RESTART_EXIT_CODE = 75
+_GAME_RESUME_ROLLBACK_EXIT_CODE = 76
 _GAME_INTERNAL_RESTART_REASONS = frozenset(
     {"game_fall_respawn", "game_teleport"}
+)
+_GAME_TURN_COMMAND_REASONS = frozenset(
+    {
+        "aligning_heading",
+        "recovery_heading_slew_limited",
+    }
+)
+_GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
+    {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
+)
+# The short wall-clock window remains only for failures that happen before
+# native LowCmd has ever become observable.  Durable checkpoint writes use the
+# dynamic probation state below, because deploy startup can legitimately take
+# much longer than five seconds.
+_GAME_WORLD_RESUME_BOOTSTRAP_ROLLBACK_SECONDS = 5.0
+_GAME_WORLD_RESUME_STABLE_IDLE_SECONDS = 1.5
+_GAME_WORLD_RESUME_CLEARANCE_AUDIT_SECONDS = 0.1
+# A resumed policy must be physically settled, not merely publishing IDLE.
+# These limits cap residual motion during the 1.5-second qualification window
+# to roughly 3 cm of planar travel and 4.3 degrees of yaw in the worst case.
+_GAME_WORLD_RESUME_MAX_ROOT_PLANAR_SPEED_M_S = 0.02
+_GAME_WORLD_RESUME_MAX_ROOT_VERTICAL_SPEED_M_S = 0.02
+_GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S = 0.05
+_GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S = 0.05
+_GAME_WORLD_RESUME_MAX_JOINT_SPEED_RAD_S = 0.10
+_GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S = 0.03
+# The runtime observes every 200 Hz native step.  A gap larger than ten
+# expected samples means the interval was not continuously audited and must
+# restart qualification rather than being credited as stable simulation time.
+_GAME_WORLD_RESUME_MAX_SIM_SAMPLE_GAP_SECONDS = 0.05
+_GAME_MAX_RESUME_ROLLBACKS = MAX_RESUME_CHECKPOINTS
+_GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES = (
+    "snapshot_non_finite:",
+    "snapshot_sim_time_not_increasing:",
+)
+_GAME_WORLD_ROLLBACK_CLEARANCE_REASONS = frozenset(
+    {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
 )
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
+_CANONICAL_ROOT_POSITION_DOF_COUNT = 7
+_CANONICAL_ROOT_VELOCITY_DOF_COUNT = 6
+_CANONICAL_BODY_JOINT_DOF_COUNT = 29
+_CANONICAL_BODY_QPOS_STOP = (
+    _CANONICAL_ROOT_POSITION_DOF_COUNT + _CANONICAL_BODY_JOINT_DOF_COUNT
+)
+_CANONICAL_BODY_QVEL_STOP = (
+    _CANONICAL_ROOT_VELOCITY_DOF_COUNT + _CANONICAL_BODY_JOINT_DOF_COUNT
+)
+_CANONICAL_RENDER_CTRL_COUNT = _CANONICAL_BODY_JOINT_DOF_COUNT
 from matrix_mujoco_contacts import (
     has_external_foot_support,
     has_external_ground_support,
@@ -102,10 +182,71 @@ def _remote_speed_scale_argument(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _validate_game_external_control(
+    *,
+    input_socket: Path,
+    external_socket: Path | None,
+    external_capability_file: Path | None,
+    external_deadman_seconds: float,
+    restart_request_file: Path | None,
+    restart_capability_file: Path | None,
+    require_external_parents: bool = False,
+) -> None:
+    """Validate the provider-facing external API without opening its endpoints."""
+
+    external_values = (external_socket, external_capability_file)
+    if any(value is not None for value in external_values) and not all(
+        value is not None for value in external_values
+    ):
+        raise ValueError("game external-control socket/capability are all-or-none")
+    if (
+        isinstance(external_deadman_seconds, bool)
+        or not math.isfinite(external_deadman_seconds)
+        or not 0.01 <= external_deadman_seconds <= 0.15
+    ):
+        raise ValueError("game external-control deadman must be in [0.01, 0.15]")
+    if external_socket is None or external_capability_file is None:
+        return
+    for label, path in (
+        ("--game-external-control-socket", external_socket),
+        ("--game-external-control-capability-file", external_capability_file),
+    ):
+        if not path.is_absolute():
+            raise ValueError(f"{label} must be absolute")
+        if require_external_parents and not path.parent.is_dir():
+            raise ValueError(f"{label} parent does not exist: {path.parent}")
+
+    # Resolve existing parent symlinks as well as lexical aliases.  The
+    # provider must never be able to replace its input/restart IPC objects by
+    # opening the externally addressable endpoint or capability path.
+    paths = [
+        ("--game-input-socket", input_socket),
+        ("--game-external-control-socket", external_socket),
+        ("--game-external-control-capability-file", external_capability_file),
+    ]
+    if restart_request_file is not None:
+        paths.append(("--game-restart-request-file", restart_request_file))
+    if restart_capability_file is not None:
+        paths.append(
+            ("--game-restart-capability-file", restart_capability_file)
+        )
+    seen: dict[Path, str] = {}
+    for label, path in paths:
+        canonical = path.resolve(strict=False)
+        previous = seen.get(canonical)
+        if previous is not None:
+            raise ValueError(
+                f"game IPC paths must be strictly distinct: {label} aliases {previous}"
+            )
+        seen[canonical] = label
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--sonic-root", type=Path, required=True)
+    parser.add_argument("--moon-dynamic-map", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--moon-dynamic-map-sha256", help=argparse.SUPPRESS)
     parser.add_argument(
         "--control-source",
         choices=("planner", "game", "pico", "external"),
@@ -119,15 +260,38 @@ def _parse_args() -> argparse.Namespace:
         / f"matrix-game-control-{os.getuid()}-{os.getpid()}.sock",
         help="User-local Unix socket for camera-relative input snapshots",
     )
+    parser.add_argument("--game-external-control-socket", type=Path)
+    parser.add_argument("--game-external-control-capability-file", type=Path)
+    parser.add_argument(
+        "--game-external-control-deadman-seconds",
+        type=float,
+        default=0.15,
+        help="Provider-side external-input lease deadline (maximum 0.15 seconds)",
+    )
     parser.add_argument(
         "--game-max-speed",
         type=float,
         default=0.30,
-        help="Analog SLOW_WALK cap (default 0.30, maximum 0.80); keyboard targets are fixed",
+        help="Analog SLOW_WALK cap (default 0.30, maximum 0.80)",
     )
     parser.add_argument("--game-max-acceleration", type=float, default=1.20)
     parser.add_argument("--game-max-deceleration", type=float, default=2.40)
     parser.add_argument("--game-max-turn-rate", type=float, default=2.50)
+    parser.add_argument("--game-keyboard-slow-speed", type=float, default=0.10)
+    parser.add_argument(
+        "--game-keyboard-slow-boost-speed", type=float, default=0.20
+    )
+    parser.add_argument("--game-keyboard-walk-speed", type=float, default=0.80)
+    parser.add_argument(
+        "--game-keyboard-walk-boost-speed", type=float, default=1.00
+    )
+    parser.add_argument("--game-keyboard-run-speed", type=float, default=2.50)
+    parser.add_argument(
+        "--game-keyboard-run-boost-speed", type=float, default=2.75
+    )
+    parser.add_argument(
+        "--game-keyboard-double-tap-window", type=float, default=0.30
+    )
     parser.add_argument("--game-stick-deadzone", type=float, default=0.15)
     parser.add_argument("--game-input-timeout", type=float, default=0.15)
     parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
@@ -156,7 +320,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--physical-recovery-initial-controller",
-        choices=("host", "amp", "kungfu"),
+        choices=("host", "amp", "amp-flat-v3", "kungfu"),
         default=os.environ.get(
             "MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER", "host"
         ),
@@ -181,6 +345,124 @@ def _parse_args() -> argparse.Namespace:
         ).strip().lower()
         in {"1", "true", "yes", "on"},
         help="Keep SONIC and every recovery policy loaded; switch writer authority only",
+    )
+    parser.add_argument(
+        "--locomotion-policy-manifest",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "MATRIX_BFM_SONIC_MANIFEST",
+                _SCRIPT_DIR.parent
+                / "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
+            )
+        ),
+        help=(
+            "Locked optional locomotion-policy declaration; incomplete or "
+            "unverified candidates remain visible but unavailable"
+        ),
+    )
+    parser.add_argument(
+        "--bfm-teacher-worker",
+        type=Path,
+        default=_SCRIPT_DIR / "matrix_bfm_teacher_adapter.py",
+        help="Writer-gated resident BFM-Teacher50k adapter",
+    )
+    parser.add_argument(
+        "--bfm-teacher-python",
+        default=os.environ.get(
+            "MATRIX_BFM_SONIC_PYTHON",
+            os.environ.get("MATRIX_PHYSICAL_RECOVERY_PYTHON", sys.executable),
+        ),
+        help="Python interpreter containing NumPy, MuJoCo, ONNX Runtime, and DDS",
+    )
+    parser.add_argument(
+        "--bfm-teacher-model",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_BFM_SONIC_TEACHER_ONNX"])
+            if os.environ.get("MATRIX_BFM_SONIC_TEACHER_ONNX")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-teacher-config",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_BFM_SONIC_CONFIG"])
+            if os.environ.get("MATRIX_BFM_SONIC_CONFIG")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-source-root",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_BFM_SONIC_SOURCE_ROOT"])
+            if os.environ.get("MATRIX_BFM_SONIC_SOURCE_ROOT")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-realscan-source-root",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_BFM_RESCAN_SOURCE_ROOT"])
+            if os.environ.get("MATRIX_BFM_RESCAN_SOURCE_ROOT")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-robo-pfnn-root",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_ROBO_PFNN_SOURCE_ROOT"])
+            if os.environ.get("MATRIX_ROBO_PFNN_SOURCE_ROOT")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-pfnn-weights",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_BFM_SONIC_PFNN_WEIGHTS"])
+            if os.environ.get("MATRIX_BFM_SONIC_PFNN_WEIGHTS")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-g1-xml",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_BFM_SONIC_G1_XML"])
+            if os.environ.get("MATRIX_BFM_SONIC_G1_XML")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-formal-ik",
+        type=Path,
+        default=(
+            Path(os.environ["MATRIX_BFM_SONIC_FORMAL_IK"])
+            if os.environ.get("MATRIX_BFM_SONIC_FORMAL_IK")
+            else None
+        ),
+    )
+    parser.add_argument(
+        "--bfm-teacher-control-socket",
+        type=Path,
+        default=Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+        / f"matrix-bfm-teacher-{os.getuid()}-{os.getpid()}.sock",
+    )
+    parser.add_argument(
+        "--bfm-teacher-activation-blend-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "MATRIX_BFM_SONIC_ACTIVATION_BLEND_SECONDS",
+                "0.10",
+            )
+        ),
+        help="No-teleport BFM hot-switch blend duration",
     )
     parser.add_argument(
         "--physical-recovery-execution-provider",
@@ -260,6 +542,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--physical-recovery-amp-config-sha256")
     parser.add_argument("--physical-recovery-amp-model-sha256")
+    parser.add_argument(
+        "--physical-recovery-amp-flat-v3-config",
+        type=Path,
+        help="Optional AMP flat_v3 m14000 recovery JSON",
+    )
+    parser.add_argument(
+        "--physical-recovery-amp-flat-v3-model",
+        type=Path,
+        help="Optional normalized AMP flat_v3 m14000 ONNX",
+    )
+    parser.add_argument("--physical-recovery-amp-flat-v3-config-sha256")
+    parser.add_argument("--physical-recovery-amp-flat-v3-model-sha256")
     parser.add_argument(
         "--physical-recovery-fallback-after-seconds", type=float, default=10.0
     )
@@ -346,6 +640,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--game-mouse-sensitivity-deg", type=float, default=0.12)
     parser.add_argument("--game-mouse-settings-file", type=Path)
+    parser.add_argument("--game-motion-settings-file", type=Path)
+    parser.add_argument("--game-video-settings-file", type=Path)
+    parser.add_argument("--game-applied-video-settings-json")
     parser.add_argument(
         "--game-applied-mouse-profile",
         choices=("local", "remote"),
@@ -380,6 +677,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-world-id")
     parser.add_argument("--game-world-revision")
     parser.add_argument("--game-world-state-file", type=Path)
+    parser.add_argument("--game-celestial-clock-state-file", type=Path)
+    parser.add_argument(
+        "--game-celestial-assets-manifest",
+        type=Path,
+        default=_SCRIPT_DIR.parent / "config/universe/de440s-2080.lock.json",
+    )
+    parser.add_argument(
+        "--game-celestial-visual-catalog",
+        type=Path,
+        default=(
+            _SCRIPT_DIR.parent
+            / "config/universe/celestial-visual-profiles-v1.json"
+        ),
+    )
+    parser.add_argument("--game-celestial-visual-profile", default="auto")
+    parser.add_argument("--game-celestial-de440s-kernel", type=Path)
+    parser.add_argument("--game-celestial-jplephem-wheel", type=Path)
+    parser.add_argument(
+        "--game-celestial-lighting-bridge",
+        choices=("state-only", "carla-weather"),
+        default="state-only",
+    )
+    parser.add_argument("--game-world-resume-checkpoint-id")
+    parser.add_argument("--game-world-resume-generation", type=int)
+    parser.add_argument("--game-resume-rollback-count", type=int, default=0)
     parser.add_argument(
         "--game-world-checkpoint-seconds",
         type=float,
@@ -815,6 +1137,74 @@ def _regular_json(path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
+def _validate_moon_dynamic_ground_model_binding(
+    model_path: Path,
+    *,
+    map_path: Path | None,
+    map_sha256: str | None,
+) -> None:
+    """Bind the rolling-height-map runtime to its exact derived model contract."""
+
+    dynamic_values = (map_path, map_sha256)
+    if any(value is not None for value in dynamic_values) and not all(
+        value is not None for value in dynamic_values
+    ):
+        raise SystemExit("MoonWorld dynamic map arguments are all-or-none")
+
+    dynamic_enabled = all(value is not None for value in dynamic_values)
+    if map_path is not None:
+        if (
+            not map_path.is_absolute()
+            or map_path.is_symlink()
+            or not map_path.is_file()
+        ):
+            raise SystemExit(
+                "--moon-dynamic-map must be an absolute regular non-symlink file"
+            )
+        if map_sha256 != LOCKED_MOONWORLD_SHA256:
+            raise SystemExit(
+                "--moon-dynamic-map-sha256 does not match the locked MoonWorld map"
+            )
+
+    manifest_path = model_path.parent / "manifest.json"
+    scene_transform = None
+    if manifest_path.exists() or manifest_path.is_symlink():
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise SystemExit(
+                f"physics model manifest must be a regular non-symlink file: "
+                f"{manifest_path}"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise SystemExit(
+                f"invalid physics model manifest {manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise SystemExit(
+                f"invalid physics model manifest object: {manifest_path}"
+            )
+        scene_transform = manifest.get("scene_transform")
+        if scene_transform is not None and (
+            not isinstance(scene_transform, str) or not scene_transform
+        ):
+            raise SystemExit("physics model manifest has an invalid scene transform")
+
+    model_requires_dynamic_ground = (
+        scene_transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM
+    )
+    if model_requires_dynamic_ground and not dynamic_enabled:
+        raise SystemExit(
+            "moon-dynamic-ground-mocap-v3 physics model requires the locked "
+            "MoonWorld dynamic map arguments"
+        )
+    if dynamic_enabled and not model_requires_dynamic_ground:
+        raise SystemExit(
+            "MoonWorld dynamic map arguments require a "
+            "moon-dynamic-ground-mocap-v3 physics model manifest"
+        )
+
+
 def _validate_qualified_model(
     args: argparse.Namespace,
     model_path: Path,
@@ -1072,6 +1462,7 @@ def _validate_qualified_model(
         for field in (
             "pipeline_version",
             "scene_transform",
+            "scene_transform_contract",
             "removed_environment_geoms",
             "staticized_freejoint_bodies",
         ):
@@ -1177,9 +1568,10 @@ def _validate_game_fall_recovery(args: argparse.Namespace) -> None:
     initial_controller = str(
         getattr(args, "physical_recovery_initial_controller", "host")
     )
-    if initial_controller not in {"host", "amp", "kungfu"}:
+    if initial_controller not in {"host", "amp", "amp-flat-v3", "kungfu"}:
         raise SystemExit(
-            "--physical-recovery-initial-controller must be host, amp, or kungfu"
+            "--physical-recovery-initial-controller must be host, amp, "
+            "amp-flat-v3, or kungfu"
         )
     handoff = str(getattr(args, "physical_recovery_handoff", "amp"))
     if handoff not in {"amp", "sonic"}:
@@ -1230,6 +1622,44 @@ def _validate_game_fall_recovery(args: argparse.Namespace) -> None:
         digest = str(getattr(args, name, "") or "")
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise SystemExit(f"--{name.replace('_', '-')} must be 64 lowercase hex")
+    flat_v3_artifacts = (
+        getattr(args, "physical_recovery_amp_flat_v3_config", None),
+        getattr(args, "physical_recovery_amp_flat_v3_model", None),
+    )
+    flat_v3_digests = (
+        getattr(args, "physical_recovery_amp_flat_v3_config_sha256", None),
+        getattr(args, "physical_recovery_amp_flat_v3_model_sha256", None),
+    )
+    flat_v3_values = (*flat_v3_artifacts, *flat_v3_digests)
+    if any(value is not None and str(value) != "" for value in flat_v3_values):
+        if not all(value is not None and str(value) != "" for value in flat_v3_values):
+            raise SystemExit(
+                "AMP flat_v3 recovery requires config, model, and both SHA256 values"
+            )
+        for label, artifact in zip(
+            ("AMP flat_v3 config", "AMP flat_v3 model"),
+            flat_v3_artifacts,
+        ):
+            if not isinstance(artifact, Path) or not artifact.is_file():
+                raise SystemExit(f"physical recovery {label} is missing: {artifact}")
+        for name, digest_value in zip(
+            (
+                "physical_recovery_amp_flat_v3_config_sha256",
+                "physical_recovery_amp_flat_v3_model_sha256",
+            ),
+            flat_v3_digests,
+        ):
+            digest = str(digest_value)
+            if len(digest) != 64 or any(
+                char not in "0123456789abcdef" for char in digest
+            ):
+                raise SystemExit(
+                    f"--{name.replace('_', '-')} must be 64 lowercase hex"
+                )
+    elif initial_controller == "amp-flat-v3":
+        raise SystemExit(
+            "amp-flat-v3 initial recovery requires its config, model, and SHA256 values"
+        )
     if initial_controller == "kungfu":
         kungfu_model = getattr(args, "physical_recovery_kungfu_model", None)
         kungfu_motion = getattr(args, "physical_recovery_kungfu_motion", None)
@@ -1430,6 +1860,93 @@ def _root_yaw_rad(qpos) -> float:
     return math.atan2(sine, cosine)
 
 
+def _static_terrain_ray_height(
+    mujoco_module: Any,
+    numpy_module: Any,
+    model: Any,
+    data: Any,
+    *,
+    world_x: float,
+    world_y: float,
+    origin_z: float,
+    fallback_height: float,
+    minimum_height: float,
+    maximum_height: float,
+    max_dynamic_hits: int = 64,
+) -> float:
+    """Return the first world-fixed surface below a terrain probe.
+
+    ``mj_ray``'s ``bodyexclude`` argument excludes exactly one body, not an
+    articulated subtree.  A probe through the G1 can therefore hit its torso,
+    arms, or hands and turn the robot itself into a metre-high terrain sample.
+    Walk through dynamic hits until a geom welded to the world is reached.
+    """
+
+    values = (
+        world_x,
+        world_y,
+        origin_z,
+        fallback_height,
+        minimum_height,
+        maximum_height,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("terrain ray inputs must be finite")
+    if minimum_height > maximum_height:
+        raise ValueError("terrain ray minimum exceeds maximum")
+    if max_dynamic_hits <= 0:
+        raise ValueError("terrain ray max_dynamic_hits must be positive")
+
+    probe_z = float(origin_z)
+    direction = numpy_module.asarray(
+        (0.0, 0.0, -1.0),
+        dtype=numpy_module.float64,
+    )
+    for _ in range(max_dynamic_hits):
+        origin = numpy_module.asarray(
+            (float(world_x), float(world_y), probe_z),
+            dtype=numpy_module.float64,
+        )
+        geom_id = numpy_module.asarray((-1,), dtype=numpy_module.int32)
+        try:
+            distance = float(
+                mujoco_module.mj_ray(
+                    model,
+                    data,
+                    origin,
+                    direction,
+                    None,
+                    1,
+                    -1,
+                    geom_id,
+                )
+            )
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return float(fallback_height)
+        hit_id = int(geom_id[0])
+        if not math.isfinite(distance) or distance < 0.0 or hit_id < 0:
+            return float(fallback_height)
+        hit_height = probe_z - distance
+        if hit_height < minimum_height:
+            return float(fallback_height)
+        try:
+            body_id = int(model.geom_bodyid[hit_id])
+            weld_id = int(model.body_weldid[body_id])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return float(fallback_height)
+        if weld_id == 0:
+            if hit_height <= maximum_height:
+                return float(hit_height)
+            return float(fallback_height)
+
+        # Move through the dynamic geom.  When the new origin is still inside
+        # it, the next ray returns its lower exit surface; the strictly
+        # decreasing origin guarantees progress through nested robot geoms.
+        probe_z = min(hit_height - 1.0e-4, probe_z - 1.0e-4)
+
+    return float(fallback_height)
+
+
 def _snapshot_world_pose(snapshot: Any) -> WorldPose:
     try:
         qpos = snapshot.qpos
@@ -1443,15 +1960,96 @@ def _snapshot_world_pose(snapshot: Any) -> WorldPose:
         raise WorldStateError(f"snapshot does not contain a valid root pose: {exc}") from exc
 
 
-def _snapshot_world_upright(snapshot: Any) -> bool:
+def _final_checkpoint_disposition(
+    clearance_audit: object,
+    resume_source: object,
+) -> str:
+    if isinstance(clearance_audit, dict) and clearance_audit.get("safe") is True:
+        if resume_source == "upright_checkpoint":
+            return "saved_current_pose"
+        if resume_source == "fallen_xy_last_safe_upright":
+            return "saved_recovered_safe_pose"
+    return "retained_previous_safe"
+
+
+def _install_moon_relative_fall_check(
+    environment: Any,
+    dynamic_ground: MoonDynamicGround,
+) -> None:
+    """Replace SONIC's sea-level fall test with terrain-relative clearance."""
+
+    for name in (
+        "check_fall",
+        "fall",
+        "fall_detected",
+        "mj_data",
+        "reset_on_fall",
+    ):
+        if not hasattr(environment, name):
+            raise MoonDynamicGroundError(
+                f"SONIC environment is missing MoonWorld fall field {name!r}"
+            )
+    if not callable(getattr(environment, "reset", None)):
+        raise MoonDynamicGroundError(
+            "SONIC environment has no callable reset for MoonWorld fall handling"
+        )
+
+    def check_relative_fall() -> None:
+        try:
+            qpos = environment.mj_data.qpos
+            root_x = float(qpos[0])
+            root_y = float(qpos[1])
+            root_z = float(qpos[2])
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise MoonDynamicGroundError(
+                "SONIC MoonWorld fall check cannot read root qpos"
+            ) from exc
+        ground_z = dynamic_ground.sample_height(root_x, root_y)
+        root_clearance = root_z - ground_z
+        if not math.isfinite(root_clearance):
+            raise MoonDynamicGroundError(
+                "SONIC MoonWorld root clearance is non-finite"
+            )
+        environment.fall = root_clearance < 0.2
+        if environment.fall:
+            environment.fall_detected = True
+            print(
+                "Warning: Robot has fallen, terrain-relative height: "
+                f"{root_clearance:.3f} m "
+                f"(root_z={root_z:.3f}, ground_z={ground_z:.3f})",
+                flush=True,
+            )
+            if bool(environment.reset_on_fall):
+                environment.reset(reason="fall")
+
+    environment.check_fall = check_relative_fall
+
+
+def _snapshot_world_upright(
+    snapshot: Any,
+    *,
+    current_fall_detected: bool | None = None,
+    ground_height_m: float = 0.0,
+) -> bool:
     try:
+        if current_fall_detected is not None and type(current_fall_detected) is not bool:
+            raise TypeError("current fall flag must be boolean")
+        current_fall = (
+            bool(snapshot.fall_detected)
+            if current_fall_detected is None
+            else current_fall_detected
+        )
         qvel = snapshot.qvel
+        ground_height = float(ground_height_m)
+        if not math.isfinite(ground_height):
+            raise ValueError("ground height must be finite")
         vertical_speed = float(qvel[2])
         roll_rate = float(qvel[3])
         pitch_rate = float(qvel[4])
         return bool(
-            not bool(snapshot.fall_detected)
-            and float(snapshot.qpos[2]) >= _WORLD_SAFE_MIN_ROOT_Z
+            not current_fall
+            and float(snapshot.qpos[2]) - ground_height
+            >= _WORLD_SAFE_MIN_ROOT_Z
             and _root_up_z(snapshot.qpos) >= _WORLD_SAFE_MIN_ROOT_UP_Z
             and math.isfinite(vertical_speed)
             and abs(vertical_speed) <= _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S
@@ -1464,6 +2062,31 @@ def _snapshot_world_upright(snapshot: Any) -> bool:
         return False
 
 
+def _game_world_current_fall_detected(
+    snapshot: Any,
+    *,
+    game_fall_recovery: Any | None,
+    physical_recovery: Any | None,
+) -> bool:
+    """Separate SONIC's historical fall latch from the live recovery state."""
+
+    if physical_recovery is not None:
+        state = getattr(getattr(physical_recovery, "fsm", None), "state", None)
+        output = getattr(physical_recovery, "last_output", None)
+        return bool(
+            getattr(physical_recovery, "current_fall_detected", False)
+            or state
+            not in {RecoveryState.GAME_SONIC, ResidentRecoveryState.GAME_SONIC}
+            or getattr(output, "inhibit_game_input", False)
+        )
+    if game_fall_recovery is not None:
+        return bool(
+            getattr(game_fall_recovery, "current_fallen", False)
+            or getattr(game_fall_recovery, "recovering", False)
+        )
+    return bool(getattr(snapshot, "fall_detected", False))
+
+
 class _GameWorldStateRuntime:
     """Checkpoint semantic root poses without serializing dynamic MuJoCo state."""
 
@@ -1474,6 +2097,9 @@ class _GameWorldStateRuntime:
         world_id: str,
         world_revision: str,
         checkpoint_seconds: float,
+        selected_resume_checkpoint_id: str | None = None,
+        selected_resume_generation: int | None = None,
+        clearance_auditor: Callable[[], dict[str, object]] | None = None,
     ) -> None:
         interval = float(checkpoint_seconds)
         if not math.isfinite(interval) or not 0.1 <= interval <= 60.0:
@@ -1486,11 +2112,40 @@ class _GameWorldStateRuntime:
             world_revision=world_revision,
         )
         self.state = self.store.load()
+        self.selected_resume_checkpoint_id = selected_resume_checkpoint_id
+        self.selected_resume_generation = selected_resume_generation
+        self.resume_rollback: dict[str, object] = {
+            "requested": False,
+            "applied": False,
+            "rejected_checkpoint_id": selected_resume_checkpoint_id,
+            "rejected_generation": selected_resume_generation,
+            "replacement_checkpoint_id": None,
+            "replacement_source": None,
+            "committed_generation": None,
+            "reason": None,
+            "run_id": None,
+            "tombstone": None,
+            "idempotent": False,
+        }
+        self.resume_rollback_ineligibility: str | None = None
+        if selected_resume_checkpoint_id is not None:
+            resolved = self.state.resolve_start()
+            if resolved.checkpoint_id != selected_resume_checkpoint_id:
+                raise WorldStateError(
+                    "selected resume checkpoint does not match the active world state"
+                )
+            if resolved.generation != selected_resume_generation:
+                raise WorldStateError(
+                    "selected resume generation does not match the active world state"
+                )
         self.checkpoint_seconds = interval
         self.next_checkpoint_s = 0.0
         self.checkpoint_count = 0
         self.last_error: str | None = self.store.load_error
         self.last_checkpoint_monotonic_s: float | None = None
+        self.clearance_auditor = clearance_auditor
+        self.last_clearance_audit: dict[str, object] | None = None
+        self.clearance_rejection_count = 0
 
     def checkpoint(
         self,
@@ -1499,6 +2154,8 @@ class _GameWorldStateRuntime:
         now_s: float,
         force: bool = False,
         required: bool = False,
+        current_fall_detected: bool | None = None,
+        ground_height_m: float = 0.0,
     ) -> bool:
         now = float(now_s)
         if not math.isfinite(now) or now < 0.0:
@@ -1507,9 +2164,50 @@ class _GameWorldStateRuntime:
             return False
         try:
             pose = _snapshot_world_pose(snapshot)
+            clearance_safe = True
+            if self.clearance_auditor is not None:
+                try:
+                    clearance = self.clearance_auditor()
+                except Exception as exc:
+                    clearance = {
+                        "schema": "matrix-spawn-clearance-audit/v1",
+                        "safe": False,
+                        "reason": "audit_error",
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc) or type(exc).__name__,
+                        },
+                    }
+                if not isinstance(clearance, dict):
+                    clearance = {
+                        "schema": "matrix-spawn-clearance-audit/v1",
+                        "safe": False,
+                        "reason": "audit_error",
+                        "error": {
+                            "type": "TypeError",
+                            "message": "clearance auditor returned a non-object",
+                        },
+                    }
+                self.last_clearance_audit = clearance
+                clearance_safe = clearance.get("safe") is True
+                if not clearance_safe:
+                    self.clearance_rejection_count += 1
+                    if required:
+                        reason = clearance.get("reason")
+                        if not isinstance(reason, str) or not reason:
+                            reason = "audit_error"
+                        raise WorldStateError(
+                            "required checkpoint spawn-clearance audit failed: "
+                            f"{reason}"
+                        )
             state = self.state.checkpoint(
                 pose,
-                upright=_snapshot_world_upright(snapshot),
+                upright=_snapshot_world_upright(
+                    snapshot,
+                    current_fall_detected=current_fall_detected,
+                    ground_height_m=ground_height_m,
+                ),
+                clearance_safe=clearance_safe,
             )
             self.store.save(state)
         except WorldStateError as exc:
@@ -1525,7 +2223,115 @@ class _GameWorldStateRuntime:
         self.next_checkpoint_s = now + self.checkpoint_seconds
         return True
 
+    def reject_selected_resume_checkpoint(
+        self,
+        *,
+        reason: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        checkpoint_id = self.selected_resume_checkpoint_id
+        generation = self.selected_resume_generation
+        if checkpoint_id is None or generation is None:
+            raise WorldStateError("cannot reject an unselected resume checkpoint")
+        try:
+            result = self.store.reject_active_checkpoint(
+                expected_id=checkpoint_id,
+                expected_generation=generation,
+                reason=reason,
+                run_id=run_id,
+            )
+        except WorldStateError as exc:
+            self.last_error = str(exc)
+            self.resume_rollback["reason"] = f"rollback_error:{exc}"
+            raise
+        self.state = result.state
+        replacement = result.replacement_checkpoint
+        resolved = self.state.resolve_start()
+        if replacement is not None and resolved.checkpoint_id != replacement.checkpoint_id:
+            raise WorldStateError("checkpoint rejection selected an unexpected replacement")
+        tombstone = result.tombstone
+        if hasattr(tombstone, "to_mapping"):
+            tombstone_evidence: object = tombstone.to_mapping()
+        else:
+            tombstone_evidence = {
+                "checkpoint_id": getattr(tombstone, "checkpoint_id", checkpoint_id),
+                "reason": getattr(tombstone, "reason", reason),
+            }
+        self.resume_rollback = {
+            "requested": True,
+            "applied": True,
+            "rejected_checkpoint_id": result.rejected_checkpoint.checkpoint_id,
+            "rejected_generation": generation,
+            "replacement_checkpoint_id": (
+                replacement.checkpoint_id if replacement is not None else None
+            ),
+            "replacement_source": (
+                replacement.source if replacement is not None else resolved.source
+            ),
+            "committed_generation": result.state.generation,
+            "reason": reason,
+            "run_id": run_id,
+            "tombstone": tombstone_evidence,
+            "idempotent": bool(result.idempotent),
+        }
+        self.last_error = None
+        return dict(self.resume_rollback)
+
+    def propose_selected_resume_rollback(
+        self,
+        *,
+        reason: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        """Publish rollback intent without mutating either world-state copy."""
+
+        checkpoint_id = self.selected_resume_checkpoint_id
+        generation = self.selected_resume_generation
+        if checkpoint_id is None or generation is None:
+            raise WorldStateError("cannot propose rollback for an unselected checkpoint")
+        resolved = self.state.resolve_start()
+        if (
+            resolved.checkpoint_id != checkpoint_id
+            or resolved.generation != generation
+        ):
+            raise WorldStateError(
+                "selected resume checkpoint changed before rollback proposal"
+            )
+        if not isinstance(reason, str) or not reason:
+            raise WorldStateError("rollback proposal reason must be non-empty")
+        if not isinstance(run_id, str) or not run_id:
+            raise WorldStateError("rollback proposal run ID must be non-empty")
+        self.resume_rollback = {
+            "requested": True,
+            "applied": False,
+            "rejected_checkpoint_id": checkpoint_id,
+            "rejected_generation": generation,
+            "replacement_checkpoint_id": None,
+            "replacement_source": None,
+            "committed_generation": None,
+            "reason": reason,
+            "run_id": run_id,
+            "tombstone": None,
+            "idempotent": False,
+        }
+        self.resume_rollback_ineligibility = None
+        return dict(self.resume_rollback)
+
+    def cancel_resume_rollback_proposal(self, reason: str) -> None:
+        """Fail closed when a late boundary invalidates a published proposal."""
+
+        self.resume_rollback.update(
+            {
+                "requested": False,
+                "applied": False,
+                "reason": None,
+                "run_id": None,
+            }
+        )
+        self.resume_rollback_ineligibility = reason
+
     def telemetry(self) -> dict[str, object]:
+        resolved = self.state.resolve_start()
         return {
             "enabled": True,
             "path": str(self.store.path),
@@ -1533,8 +2339,23 @@ class _GameWorldStateRuntime:
             "world_revision": self.store.world_revision,
             "load_status": self.store.load_status,
             "load_error": self.store.load_error,
+            "generation": self.state.generation,
+            "active_resume_checkpoint_id": resolved.checkpoint_id,
+            "active_resume_source": resolved.source,
+            "resume_checkpoint_count": len(
+                getattr(self.state, "resume_checkpoints", ())
+            ),
+            "invalid_checkpoint_count": len(
+                getattr(self.state, "invalid_checkpoints", ())
+            ),
+            "selected_resume_checkpoint_id": self.selected_resume_checkpoint_id,
+            "selected_resume_generation": self.selected_resume_generation,
+            "resume_rollback": dict(self.resume_rollback),
+            "resume_rollback_ineligibility": self.resume_rollback_ineligibility,
             "checkpoint_count": self.checkpoint_count,
             "checkpoint_seconds": self.checkpoint_seconds,
+            "clearance_rejection_count": self.clearance_rejection_count,
+            "last_clearance_audit": self.last_clearance_audit,
             "last_checkpoint_monotonic_s": self.last_checkpoint_monotonic_s,
             "last_error": self.last_error,
             "resume_source": self.state.resume_source,
@@ -1785,14 +2606,20 @@ class _GameFallRecoveryGate:
         self.native_mode = SONIC_IDLE_MODE
         self.target_height = -1.0
 
-    def observe(self, snapshot: Any, *, now_s: float) -> str | None:
+    def observe(
+        self,
+        snapshot: Any,
+        *,
+        now_s: float,
+        ground_height_m: float = 0.0,
+    ) -> str | None:
         """Observe one control-frame snapshot and return a transition name."""
 
         now = float(now_s)
         if not math.isfinite(now) or now < 0.0:
             raise ValueError("fall recovery time must be non-negative and finite")
         try:
-            root_z = float(snapshot.qpos[2])
+            root_z = float(snapshot.qpos[2]) - float(ground_height_m)
             root_up_z = _root_up_z(snapshot.qpos)
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
             raise ValueError("fall recovery requires a valid root pose") from exc
@@ -1953,6 +2780,1136 @@ def _pace_absolute_deadline(deadline_s: float, period_s: float) -> float:
     if now - deadline_s > 2.0 * period_s:
         return now + period_s
     return deadline_s + period_s
+
+
+def _resume_probation_audit_error(error: BaseException) -> dict[str, object]:
+    return {
+        "schema": SPAWN_CLEARANCE_AUDIT_SCHEMA,
+        "safe": False,
+        "reason": "audit_error",
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error) or type(error).__name__,
+        },
+        "contacts_checked": 0,
+        "external_contact_count": 0,
+        "allowed_contact_count": 0,
+        "rejected_contact_count": 0,
+        "contacts": [],
+        "worst": None,
+        "policy": "resume_probation_no_body_contact",
+    }
+
+
+def _resume_probation_clearance_audit(
+    clearance_auditor: Callable[[], dict[str, object]],
+) -> dict[str, object]:
+    """Audit the live pose with stricter contact rules during resume startup.
+
+    The shared spawn classifier permits up to 2 mm of non-foot penetration to
+    absorb contact-solver noise.  That tolerance is useful for one-shot spawn
+    validation but is too permissive for a restored hand resting on a wall: a
+    policy can push that shallow contact deeper after LowCmd begins.  During
+    probation every external non-foot contact is therefore converted into a
+    typed clearance rejection, while valid floor support remains allowed.
+    """
+
+    try:
+        raw = clearance_auditor()
+    except Exception as exc:
+        return _resume_probation_audit_error(exc)
+    if not isinstance(raw, dict):
+        return _resume_probation_audit_error(
+            TypeError("clearance auditor returned a non-object")
+        )
+    result = dict(raw)
+    result["policy"] = "resume_probation_no_body_contact"
+    if (
+        result.get("schema") != SPAWN_CLEARANCE_AUDIT_SCHEMA
+        or type(result.get("safe")) is not bool
+    ):
+        return _resume_probation_audit_error(
+            ValueError("clearance auditor returned malformed metadata")
+        )
+    if result["safe"] is False:
+        return result
+    contacts = result.get("contacts")
+    if result.get("error") is not None or not isinstance(contacts, list):
+        return _resume_probation_audit_error(
+            ValueError("clearance auditor returned malformed safe evidence")
+        )
+
+    strict_contacts: list[dict[str, object]] = []
+    body_contact_indices: list[int] = []
+    for index, item in enumerate(contacts):
+        if not isinstance(item, dict):
+            return _resume_probation_audit_error(
+                ValueError("clearance contact evidence is malformed")
+            )
+        strict_item = dict(item)
+        if strict_item.get("classification") == "allowed_body_contact_tolerance":
+            try:
+                raw_distance = strict_item["distance_m"]
+                if isinstance(raw_distance, bool) or not isinstance(
+                    raw_distance, (int, float)
+                ):
+                    raise ValueError("contact distance is not numeric")
+                distance_m = float(raw_distance)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return _resume_probation_audit_error(
+                    ValueError("body contact distance is malformed")
+                )
+            if not math.isfinite(distance_m):
+                return _resume_probation_audit_error(
+                    ValueError("body contact distance is non-finite")
+                )
+            # MuJoCo may emit a positive-distance margin contact before the
+            # shapes touch.  Keep auditing it, but only touching/penetrating
+            # body contacts are evidence of unsafe restored clearance.
+            if distance_m > 0.0:
+                strict_contacts.append(strict_item)
+                continue
+            strict_item["original_classification"] = (
+                "allowed_body_contact_tolerance"
+            )
+            strict_item["classification"] = "scene_penetration"
+            strict_item["allowed"] = False
+            body_contact_indices.append(index)
+        strict_contacts.append(strict_item)
+    if not body_contact_indices:
+        return result
+
+    worst = strict_contacts[body_contact_indices[0]]
+    result.update(
+        {
+            "safe": False,
+            "reason": "scene_penetration",
+            "contacts": strict_contacts,
+            "allowed_contact_count": max(
+                0,
+                int(result.get("allowed_contact_count", 0))
+                - len(body_contact_indices),
+            ),
+            "rejected_contact_count": int(
+                result.get("rejected_contact_count", 0)
+            )
+            + len(body_contact_indices),
+            "worst": worst,
+        }
+    )
+    return result
+
+
+class _GameWorldResumeProbation:
+    """Keep one selected resume checkpoint read-only until policy stability.
+
+    Completion is tied to observable native readiness, not process wall time:
+    fresh LowCmd, a fully released startup band, an upright live pose, and a
+    continuously published IDLE command must all hold for the configured
+    interval.  Live MuJoCo contacts are audited throughout the active window.
+    """
+
+    def __init__(
+        self,
+        *,
+        selected_checkpoint_id: str | None,
+        clearance_auditor: Callable[[], dict[str, object]],
+        stable_idle_seconds: float = _GAME_WORLD_RESUME_STABLE_IDLE_SECONDS,
+        audit_interval_seconds: float = (
+            _GAME_WORLD_RESUME_CLEARANCE_AUDIT_SECONDS
+        ),
+        max_root_planar_speed_m_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_PLANAR_SPEED_M_S
+        ),
+        max_root_vertical_speed_m_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_VERTICAL_SPEED_M_S
+        ),
+        max_root_roll_pitch_rate_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S
+        ),
+        max_root_yaw_rate_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S
+        ),
+        max_joint_speed_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_JOINT_SPEED_RAD_S
+        ),
+        max_joint_rms_speed_rad_s: float = (
+            _GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S
+        ),
+        max_sim_sample_gap_seconds: float = (
+            _GAME_WORLD_RESUME_MAX_SIM_SAMPLE_GAP_SECONDS
+        ),
+    ) -> None:
+        stable_seconds = float(stable_idle_seconds)
+        audit_seconds = float(audit_interval_seconds)
+        max_planar_speed = float(max_root_planar_speed_m_s)
+        max_vertical_speed = float(max_root_vertical_speed_m_s)
+        max_roll_pitch_rate = float(max_root_roll_pitch_rate_rad_s)
+        max_yaw_rate = float(max_root_yaw_rate_rad_s)
+        max_joint_speed = float(max_joint_speed_rad_s)
+        max_joint_rms_speed = float(max_joint_rms_speed_rad_s)
+        max_sim_gap = float(max_sim_sample_gap_seconds)
+        if not math.isfinite(stable_seconds) or stable_seconds <= 0.0:
+            raise ValueError("resume stable IDLE duration must be positive")
+        if not math.isfinite(audit_seconds) or audit_seconds <= 0.0:
+            raise ValueError("resume clearance audit interval must be positive")
+        if not math.isfinite(max_planar_speed) or max_planar_speed < 0.0:
+            raise ValueError("resume planar-speed limit must be nonnegative")
+        if not math.isfinite(max_vertical_speed) or max_vertical_speed < 0.0:
+            raise ValueError("resume vertical-speed limit must be nonnegative")
+        if not math.isfinite(max_roll_pitch_rate) or max_roll_pitch_rate < 0.0:
+            raise ValueError("resume roll/pitch-rate limit must be nonnegative")
+        if not math.isfinite(max_yaw_rate) or max_yaw_rate < 0.0:
+            raise ValueError("resume yaw-rate limit must be nonnegative")
+        if not math.isfinite(max_joint_speed) or max_joint_speed < 0.0:
+            raise ValueError("resume joint-speed limit must be nonnegative")
+        if not math.isfinite(max_joint_rms_speed) or max_joint_rms_speed < 0.0:
+            raise ValueError("resume joint RMS-speed limit must be nonnegative")
+        if not math.isfinite(max_sim_gap) or max_sim_gap <= 0.0:
+            raise ValueError("resume sim sample gap must be positive")
+        if not callable(clearance_auditor):
+            raise TypeError("resume clearance auditor must be callable")
+        self.selected_checkpoint_id = selected_checkpoint_id
+        self.clearance_auditor = clearance_auditor
+        self.stable_idle_seconds = stable_seconds
+        self.audit_interval_seconds = audit_seconds
+        self.max_root_planar_speed_m_s = max_planar_speed
+        self.max_root_vertical_speed_m_s = max_vertical_speed
+        self.max_root_roll_pitch_rate_rad_s = max_roll_pitch_rate
+        self.max_root_yaw_rate_rad_s = max_yaw_rate
+        self.max_joint_speed_rad_s = max_joint_speed
+        self.max_joint_rms_speed_rad_s = max_joint_rms_speed
+        self.max_sim_sample_gap_seconds = max_sim_gap
+        self.completed = False
+        self.failed = False
+        self.failure_reason: str | None = None
+        # A selected checkpoint remains the durable resume target after the
+        # native startup probation has completed.  SONIC can move the body a
+        # small amount while settling even though Matrix publishes only IDLE;
+        # persisting that pose would accumulate the same startup displacement
+        # on every restart.  Only a subsequently published user move/turn may
+        # arm checkpoint writes for the rest of this run.
+        self._checkpoint_writes_armed = False
+        self.checkpoint_write_armed_by_mode: str | None = None
+        self.checkpoint_write_armed_by_sequence: int | None = None
+        self.first_fresh_lowcmd_s: float | None = None
+        self.band_released_s: float | None = None
+        self.stable_idle_started_sim_s: float | None = None
+        self.completed_s: float | None = None
+        self.completed_sim_s: float | None = None
+        self.last_observed_s: float | None = None
+        self.last_sim_time_s: float | None = None
+        self.current_sim_time_s: float | None = None
+        self.sim_time_sample_valid = False
+        self.next_audit_s: float | None = None
+        self.audit_count = 0
+        self.last_clearance_audit: dict[str, object] | None = None
+        self.current_root_planar_speed_m_s: float | None = None
+        self.current_root_vertical_speed_m_s: float | None = None
+        self.current_root_roll_rate_rad_s: float | None = None
+        self.current_root_pitch_rate_rad_s: float | None = None
+        self.current_root_yaw_rate_rad_s: float | None = None
+        self.current_max_joint_speed_rad_s: float | None = None
+        self.current_joint_rms_speed_rad_s: float | None = None
+        self.root_motion_valid = False
+        self.root_motion_within_limits = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.selected_checkpoint_id is not None
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and not self.completed
+
+    @property
+    def checkpoint_writes_armed(self) -> bool:
+        """Return whether ordinary game-world checkpoints may be persisted."""
+
+        return not self.enabled or self._checkpoint_writes_armed
+
+    @property
+    def checkpoint_writes_blocked(self) -> bool:
+        return not self.checkpoint_writes_armed
+
+    @staticmethod
+    def _user_motion_command(command: RobotMotionCommand | None) -> bool:
+        """Recognize user move/turn forms admitted by the wire pipeline."""
+
+        if not isinstance(command, RobotMotionCommand) or command.safe_stop:
+            return False
+        sequence = command.sequence
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 0
+        ):
+            return False
+        try:
+            movement = tuple(float(component) for component in command.movement)
+            facing = tuple(float(component) for component in command.facing)
+            speed_mps = float(command.speed_mps)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            len(movement) != 3
+            or len(facing) != 3
+            or not all(math.isfinite(value) for value in (*movement, *facing))
+            or not math.isfinite(speed_mps)
+        ):
+            return False
+        movement_zero = all(
+            math.isclose(value, 0.0, rel_tol=0.0, abs_tol=1e-9)
+            for value in movement
+        )
+        if command.mode == "move":
+            return bool(
+                speed_mps > 0.0
+                and not movement_zero
+                and command.locomotion_mode != SONIC_IDLE_MODE
+            )
+        if command.mode == "turn":
+            return bool(
+                math.isclose(speed_mps, 0.0, rel_tol=0.0, abs_tol=1e-9)
+                and movement_zero
+                and command.locomotion_mode == SONIC_IDLE_MODE
+                and command.reason in _GAME_TURN_COMMAND_REASONS
+            )
+        return False
+
+    def observe_published_user_command(
+        self,
+        command: RobotMotionCommand | None,
+    ) -> bool:
+        """Latch writes after one real post-probation user motion publish.
+
+        The caller supplies only commands that actually crossed the planner
+        publication boundary from the interactive-input path.  Recovery,
+        startup, command-panel, and policy/config actions never call this
+        method, and the wire contract is checked again here before arming.
+        """
+
+        if (
+            not self.enabled
+            or not self.completed
+            or self.failed
+            or self._checkpoint_writes_armed
+            or not self._user_motion_command(command)
+        ):
+            return False
+        assert isinstance(command, RobotMotionCommand)
+        assert isinstance(command.sequence, int)
+        self._checkpoint_writes_armed = True
+        self.checkpoint_write_armed_by_mode = command.mode
+        self.checkpoint_write_armed_by_sequence = command.sequence
+        return True
+
+    @staticmethod
+    def _idle_command(command: RobotMotionCommand | None) -> bool:
+        if not isinstance(command, RobotMotionCommand):
+            return False
+        try:
+            movement_zero = all(
+                math.isclose(
+                    float(component),
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                for component in command.movement
+            )
+            speed_zero = math.isclose(
+                float(command.speed_mps),
+                0.0,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return bool(
+            # The runtime deliberately calls emergency_stop() throughout
+            # probation.  GameControlCore represents that hard-zero as a
+            # deadman command, so it is the only command mode that can qualify.
+            command.mode == "deadman"
+            and command.safe_stop is True
+            and command.locomotion_mode == SONIC_IDLE_MODE
+            and movement_zero
+            and speed_zero
+        )
+
+    def _root_motion_stable(self, snapshot: Any) -> bool:
+        """Record finite free-joint motion and enforce settle thresholds."""
+
+        self.current_root_planar_speed_m_s = None
+        self.current_root_vertical_speed_m_s = None
+        self.current_root_roll_rate_rad_s = None
+        self.current_root_pitch_rate_rad_s = None
+        self.current_root_yaw_rate_rad_s = None
+        self.current_max_joint_speed_rad_s = None
+        self.current_joint_rms_speed_rad_s = None
+        self.root_motion_valid = False
+        self.root_motion_within_limits = False
+        try:
+            qvel = snapshot.qvel
+            planar_x = float(qvel[0])
+            planar_y = float(qvel[1])
+            vertical_speed = float(qvel[2])
+            roll_rate = float(qvel[3])
+            pitch_rate = float(qvel[4])
+            yaw_rate = float(qvel[5])
+            joint_velocities = _canonical_body_joint_velocities(qvel)
+        except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+            return False
+        all_velocities = (
+            planar_x,
+            planar_y,
+            vertical_speed,
+            roll_rate,
+            pitch_rate,
+            yaw_rate,
+            *joint_velocities,
+        )
+        if not joint_velocities or not all(
+            math.isfinite(value) for value in all_velocities
+        ):
+            return False
+        planar_speed = math.hypot(planar_x, planar_y)
+        vertical_speed_magnitude = abs(vertical_speed)
+        roll_rate_magnitude = abs(roll_rate)
+        pitch_rate_magnitude = abs(pitch_rate)
+        yaw_rate_magnitude = abs(yaw_rate)
+        max_joint_speed = max(abs(value) for value in joint_velocities)
+        joint_rms_speed = math.sqrt(
+            sum(value * value for value in joint_velocities)
+            / len(joint_velocities)
+        )
+        if not (
+            math.isfinite(planar_speed)
+            and math.isfinite(vertical_speed_magnitude)
+            and math.isfinite(roll_rate_magnitude)
+            and math.isfinite(pitch_rate_magnitude)
+            and math.isfinite(yaw_rate_magnitude)
+            and math.isfinite(max_joint_speed)
+            and math.isfinite(joint_rms_speed)
+        ):
+            return False
+        self.current_root_planar_speed_m_s = planar_speed
+        self.current_root_vertical_speed_m_s = vertical_speed_magnitude
+        self.current_root_roll_rate_rad_s = roll_rate_magnitude
+        self.current_root_pitch_rate_rad_s = pitch_rate_magnitude
+        self.current_root_yaw_rate_rad_s = yaw_rate_magnitude
+        self.current_max_joint_speed_rad_s = max_joint_speed
+        self.current_joint_rms_speed_rad_s = joint_rms_speed
+        self.root_motion_valid = True
+        self.root_motion_within_limits = bool(
+            planar_speed <= self.max_root_planar_speed_m_s
+            and vertical_speed_magnitude <= self.max_root_vertical_speed_m_s
+            and roll_rate_magnitude <= self.max_root_roll_pitch_rate_rad_s
+            and pitch_rate_magnitude <= self.max_root_roll_pitch_rate_rad_s
+            and yaw_rate_magnitude <= self.max_root_yaw_rate_rad_s
+            and max_joint_speed <= self.max_joint_speed_rad_s
+            and joint_rms_speed <= self.max_joint_rms_speed_rad_s
+        )
+        return self.root_motion_within_limits
+
+    def _observe_sim_time(self, snapshot: Any) -> bool:
+        """Record one finite, monotonic, continuously sampled sim timestamp."""
+
+        self.current_sim_time_s = None
+        self.sim_time_sample_valid = False
+        try:
+            raw_sim_time = snapshot.sim_time
+            if isinstance(raw_sim_time, bool):
+                raise ValueError("boolean sim time")
+            sim_time = float(raw_sim_time)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            self.last_sim_time_s = None
+            return False
+        if not math.isfinite(sim_time) or sim_time < 0.0:
+            self.last_sim_time_s = None
+            return False
+        self.current_sim_time_s = sim_time
+        previous = self.last_sim_time_s
+        self.last_sim_time_s = sim_time
+        if previous is not None:
+            sample_gap = sim_time - previous
+            if (
+                sample_gap < 0.0
+                or (
+                    sample_gap > self.max_sim_sample_gap_seconds
+                    and not math.isclose(
+                        sample_gap,
+                        self.max_sim_sample_gap_seconds,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                )
+            ):
+                return False
+        self.sim_time_sample_valid = True
+        return True
+
+    def observe(
+        self,
+        snapshot: Any,
+        command: RobotMotionCommand | None,
+        *,
+        now_s: float,
+        current_fall_detected: bool | None = None,
+        control_frame_boundary: bool = True,
+        ground_height_m: float = 0.0,
+    ) -> dict[str, object] | None:
+        """Advance probation and return the first fail-closed audit, if any."""
+
+        if not self.active or self.failed:
+            return self.last_clearance_audit if self.failed else None
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("resume probation time must be nonnegative and finite")
+        if self.last_observed_s is not None and now < self.last_observed_s:
+            raise ValueError("resume probation time regressed")
+        if type(control_frame_boundary) is not bool:
+            raise TypeError("control-frame boundary flag must be boolean")
+        self.last_observed_s = now
+
+        fresh = bool(getattr(snapshot, "low_cmd_fresh", False))
+        if fresh and self.first_fresh_lowcmd_s is None:
+            self.first_fresh_lowcmd_s = now
+        native_ready = _GameSonicReadinessGate.snapshot_ready(snapshot)
+        if native_ready and self.band_released_s is None:
+            self.band_released_s = now
+        root_motion_stable = self._root_motion_stable(snapshot)
+        sim_time_sample_valid = self._observe_sim_time(snapshot)
+        stable_idle = bool(
+            native_ready
+            and self._idle_command(command)
+            and root_motion_stable
+            and sim_time_sample_valid
+            and _snapshot_world_upright(
+                snapshot,
+                current_fall_detected=current_fall_detected,
+                ground_height_m=ground_height_m,
+            )
+        )
+        if stable_idle:
+            if self.stable_idle_started_sim_s is None:
+                self.stable_idle_started_sim_s = self.current_sim_time_s
+        else:
+            self.stable_idle_started_sim_s = None
+        stable_elapsed = (
+            self.current_sim_time_s - self.stable_idle_started_sim_s
+            if self.current_sim_time_s is not None
+            and self.stable_idle_started_sim_s is not None
+            else 0.0
+        )
+        completion_candidate = stable_elapsed >= self.stable_idle_seconds
+
+        if current_fall_detected is True:
+            # A falling body commonly creates body-ground contacts.  The fall
+            # handler below owns this frame and keeps the selected checkpoint
+            # read-only; treating the same contact as bad-spawn evidence here
+            # would incorrectly authorize rollback/tombstoning.
+            return None
+
+        audit_due = self.next_audit_s is None or now >= self.next_audit_s
+        if audit_due or completion_candidate:
+            audit = _resume_probation_clearance_audit(self.clearance_auditor)
+            self.audit_count += 1
+            self.last_clearance_audit = audit
+            self.next_audit_s = now + self.audit_interval_seconds
+            if audit.get("safe") is not True:
+                self.failed = True
+                reason = audit.get("reason")
+                self.failure_reason = (
+                    reason if isinstance(reason, str) and reason else "audit_error"
+                )
+                return audit
+        if completion_candidate and control_frame_boundary:
+            self.completed = True
+            self.completed_s = now
+            self.completed_sim_s = self.current_sim_time_s
+        return None
+
+    def telemetry(self, *, now_s: float | None = None) -> dict[str, object]:
+        stable_elapsed = 0.0
+        if (
+            self.stable_idle_started_sim_s is not None
+            and self.current_sim_time_s is not None
+        ):
+            stable_elapsed = max(
+                0.0,
+                self.current_sim_time_s - self.stable_idle_started_sim_s,
+            )
+        if not self.enabled:
+            phase = "disabled"
+        elif self.failed:
+            phase = "failed"
+        elif self.completed:
+            phase = "completed"
+        elif self.first_fresh_lowcmd_s is None:
+            phase = "waiting_lowcmd"
+        elif self.band_released_s is None:
+            phase = "startup_band"
+        elif self.stable_idle_started_sim_s is None:
+            phase = "waiting_idle"
+        else:
+            phase = "stable_idle"
+        if not self.enabled:
+            checkpoint_write_phase = "disabled"
+        elif self.checkpoint_writes_armed:
+            checkpoint_write_phase = "armed"
+        elif self.active:
+            checkpoint_write_phase = "resume_probation"
+        else:
+            checkpoint_write_phase = "waiting_user_motion"
+        return {
+            "enabled": self.enabled,
+            "selected_checkpoint_id": self.selected_checkpoint_id,
+            "active": self.active,
+            "completed": self.completed,
+            "failed": self.failed,
+            "phase": phase,
+            "checkpoint_writes_blocked": self.checkpoint_writes_blocked,
+            "checkpoint_write_arming": {
+                "required": self.enabled,
+                "armed": self.checkpoint_writes_armed,
+                "phase": checkpoint_write_phase,
+                "waiting_for_user_motion": bool(
+                    self.enabled
+                    and self.completed
+                    and not self.checkpoint_writes_armed
+                ),
+                "armed_by_mode": self.checkpoint_write_armed_by_mode,
+                "armed_by_sequence": self.checkpoint_write_armed_by_sequence,
+            },
+            "stable_idle_required_s": self.stable_idle_seconds,
+            "stable_idle_elapsed_s": round(stable_elapsed, 3),
+            "stable_idle_clock": "sim_time",
+            "stable_idle_sim_elapsed_s": round(stable_elapsed, 3),
+            "current_sim_time_s": (
+                round(self.current_sim_time_s, 6)
+                if self.current_sim_time_s is not None
+                else None
+            ),
+            "sim_time_sample_valid": self.sim_time_sample_valid,
+            "max_sim_sample_gap_s": self.max_sim_sample_gap_seconds,
+            "root_motion_valid": self.root_motion_valid,
+            "root_motion_within_limits": self.root_motion_within_limits,
+            "current_root_planar_speed_m_s": (
+                round(self.current_root_planar_speed_m_s, 6)
+                if self.current_root_planar_speed_m_s is not None
+                else None
+            ),
+            "max_root_planar_speed_m_s": self.max_root_planar_speed_m_s,
+            "current_root_vertical_speed_m_s": (
+                round(self.current_root_vertical_speed_m_s, 6)
+                if self.current_root_vertical_speed_m_s is not None
+                else None
+            ),
+            "max_root_vertical_speed_m_s": self.max_root_vertical_speed_m_s,
+            "current_root_roll_rate_rad_s": (
+                round(self.current_root_roll_rate_rad_s, 6)
+                if self.current_root_roll_rate_rad_s is not None
+                else None
+            ),
+            "current_root_pitch_rate_rad_s": (
+                round(self.current_root_pitch_rate_rad_s, 6)
+                if self.current_root_pitch_rate_rad_s is not None
+                else None
+            ),
+            "max_root_roll_pitch_rate_rad_s": (
+                self.max_root_roll_pitch_rate_rad_s
+            ),
+            "current_root_yaw_rate_rad_s": (
+                round(self.current_root_yaw_rate_rad_s, 6)
+                if self.current_root_yaw_rate_rad_s is not None
+                else None
+            ),
+            "max_root_yaw_rate_rad_s": self.max_root_yaw_rate_rad_s,
+            "current_max_joint_speed_rad_s": (
+                round(self.current_max_joint_speed_rad_s, 6)
+                if self.current_max_joint_speed_rad_s is not None
+                else None
+            ),
+            "max_joint_speed_rad_s": self.max_joint_speed_rad_s,
+            "current_joint_rms_speed_rad_s": (
+                round(self.current_joint_rms_speed_rad_s, 6)
+                if self.current_joint_rms_speed_rad_s is not None
+                else None
+            ),
+            "max_joint_rms_speed_rad_s": self.max_joint_rms_speed_rad_s,
+            "audit_interval_s": self.audit_interval_seconds,
+            "audit_count": self.audit_count,
+            "failure_reason": self.failure_reason,
+            "first_fresh_lowcmd_observed": self.first_fresh_lowcmd_s is not None,
+            "startup_band_released": self.band_released_s is not None,
+            "last_clearance_audit": self.last_clearance_audit,
+        }
+
+
+def _reused_selected_resume_checkpoint(
+    *,
+    run_id: str,
+    selected_checkpoint_id: str | None,
+    selected_generation: int | None,
+    game_world: _GameWorldStateRuntime | None,
+    resume_probation: _GameWorldResumeProbation,
+    termination_reason: str | None,
+    termination_signal: int | None,
+    child_failure: tuple[str, int] | None,
+    unstable: bool,
+    fall_detected: bool,
+    current_fall_detected: bool,
+    world_checkpoint_failed: bool,
+) -> dict[str, object] | None:
+    """Prove that a requested restart may reuse the selected checkpoint.
+
+    A selected resume remains read-only after startup probation until one real
+    user move/turn is published.  A UI/F9 restart in that interval must not
+    save SONIC's startup settling pose.  It may, however, reuse the exact
+    checkpoint that was durably loaded for this generation.  Re-read the
+    world-state file and bind the evidence to both the selected and active
+    identity; every ambiguous or failure state returns no authority.
+    """
+
+    if (
+        termination_reason != "signal"
+        or termination_signal != signal.SIGTERM
+        or child_failure is not None
+        or unstable
+        or fall_detected
+        or current_fall_detected
+        or world_checkpoint_failed
+        or game_world is None
+        or not resume_probation.enabled
+        or resume_probation.active
+        or not resume_probation.completed
+        or resume_probation.failed
+        or resume_probation.checkpoint_writes_armed
+    ):
+        return None
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", run_id) is None
+        or not isinstance(selected_checkpoint_id, str)
+        or re.fullmatch(r"cp-[0-9a-f]{32}", selected_checkpoint_id) is None
+        or isinstance(selected_generation, bool)
+        or not isinstance(selected_generation, int)
+        or selected_generation < 0
+    ):
+        return None
+    last_audit = resume_probation.last_clearance_audit
+    if (
+        resume_probation.audit_count <= 0
+        or not isinstance(last_audit, dict)
+        or last_audit.get("safe") is not True
+    ):
+        return None
+    world = game_world.telemetry()
+    rollback = world.get("resume_rollback")
+    if (
+        world.get("selected_resume_checkpoint_id") != selected_checkpoint_id
+        or world.get("selected_resume_generation") != selected_generation
+        or world.get("active_resume_checkpoint_id") != selected_checkpoint_id
+        or world.get("generation") != selected_generation
+        or world.get("has_last_exit") is not True
+        or world.get("last_error") is not None
+        or world.get("load_error") is not None
+        or world.get("checkpoint_count") != 0
+        or world.get("last_checkpoint_monotonic_s") is not None
+        or not isinstance(rollback, dict)
+        or rollback.get("requested") is not False
+        or rollback.get("applied") is not False
+    ):
+        return None
+    try:
+        durable_state = game_world.store.load()
+        durable = durable_state.resolve_start()
+    except (OSError, RuntimeError, ValueError, WorldStateError):
+        return None
+    if (
+        game_world.store.load_error is not None
+        or game_world.store.load_status not in {"loaded", "backup"}
+        or durable_state != game_world.state
+        or durable.checkpoint_id != selected_checkpoint_id
+        or durable.generation != selected_generation
+    ):
+        return None
+    return {
+        "schema": "matrix-reused-selected-world-checkpoint/v1",
+        "run_id": run_id,
+        "checkpoint_id": selected_checkpoint_id,
+        "generation": selected_generation,
+        "disposition": "reused_selected_resume",
+    }
+
+
+def _handle_game_auto_respawn_fall(
+    *,
+    game_world: _GameWorldStateRuntime,
+    game_input: GameInputRuntime,
+    planner: NativePlannerClient,
+    snapshot: Any,
+    checkpoint_writes_blocked: bool,
+    now_s: float,
+    ground_height_m: float = 0.0,
+) -> tuple[str, RobotMotionCommand]:
+    """Stop every fall, but persist/reload only after writes are armed."""
+
+    game_command = game_input.emergency_stop(
+        now_s=now_s,
+        reason="fall_respawn_reload",
+    )
+    planner.send_game_command(game_command)
+    if checkpoint_writes_blocked:
+        return "fall_detected", game_command
+    saved = game_world.checkpoint(
+        snapshot,
+        now_s=now_s,
+        force=True,
+        required=False,
+        ground_height_m=ground_height_m,
+    )
+    if not saved:
+        raise WorldStateError(
+            game_world.last_error or "cannot retain fall observation"
+        )
+    return "game_fall_respawn", game_command
+
+
+def _validate_game_world_resume_metadata(
+    *,
+    selected_checkpoint_id: str | None,
+    selected_generation: int | None,
+    rollback_count: int,
+    world_state_configured: bool,
+) -> None:
+    selected_values = (selected_checkpoint_id, selected_generation)
+    if any(value is not None for value in selected_values) and not all(
+        value is not None for value in selected_values
+    ):
+        raise ValueError("game world resume checkpoint arguments are all-or-none")
+    if selected_checkpoint_id is not None and not selected_checkpoint_id:
+        raise ValueError("game world resume checkpoint ID must be non-empty")
+    if any(value is not None for value in selected_values) and not world_state_configured:
+        raise ValueError("game world resume checkpoint requires world-state persistence")
+    if (
+        isinstance(rollback_count, bool)
+        or not isinstance(rollback_count, int)
+        or not 0 <= rollback_count <= _GAME_MAX_RESUME_ROLLBACKS
+    ):
+        raise ValueError(
+            "game resume rollback count must be in "
+            f"[0, {_GAME_MAX_RESUME_ROLLBACKS}]"
+        )
+    if rollback_count != 0 and not world_state_configured:
+        raise ValueError("game resume rollback count requires world-state persistence")
+    if selected_generation is not None and selected_generation < 0:
+        raise ValueError("game world resume generation must be non-negative")
+
+
+class _ResumeRollbackEvidence:
+    """Sticky, fail-closed evidence sampled before snapshot validation."""
+
+    def __init__(self, *, initial_reset_count: int) -> None:
+        self.initial_reset_count = int(initial_reset_count)
+        self.low_cmd_received = False
+        self.active_lowcmd = False
+        self.active_frames = 0
+        self.fall_detected = False
+        self.reset_observed = False
+        self.max_reset_count = self.initial_reset_count
+
+    def observe(self, snapshot: Any) -> None:
+        # These fields are monotonic evidence only. Validation remains the
+        # authority for schema correctness, while an invalid failure frame can
+        # never erase evidence already seen on an earlier frame.
+        try:
+            low_cmd_received = getattr(snapshot, "low_cmd_received", None)
+        except Exception:
+            low_cmd_received = None
+        try:
+            low_cmd_fresh = getattr(snapshot, "low_cmd_fresh", None)
+        except Exception:
+            low_cmd_fresh = None
+        if low_cmd_received is True:
+            self.low_cmd_received = True
+        if low_cmd_fresh is True:
+            self.low_cmd_received = True
+            self.active_lowcmd = True
+            self.active_frames += 1
+
+        try:
+            native_fall = getattr(snapshot, "fall_detected", None)
+        except Exception:
+            native_fall = None
+        if native_fall is True:
+            self.fall_detected = True
+
+        try:
+            raw_reset_count = getattr(snapshot, "reset_count")
+            if isinstance(raw_reset_count, bool):
+                raise ValueError("boolean reset count")
+            reset_count = int(raw_reset_count)
+            if reset_count != raw_reset_count or reset_count < 0:
+                raise ValueError("invalid reset count")
+        except Exception:
+            # Invalid reset metadata is rejected by snapshot validation. Keep
+            # this gate sticky too, so an earlier allowlisted field failure can
+            # never mask malformed reset evidence on the same frame.
+            self.reset_observed = True
+        else:
+            self.max_reset_count = max(self.max_reset_count, reset_count)
+            if reset_count != self.initial_reset_count:
+                self.reset_observed = True
+
+
+def _game_world_rollback_ineligibility(
+    *,
+    selected_checkpoint_id: str | None,
+    selected_generation: int | None,
+    rollback_count: int,
+    elapsed_s: float,
+    termination_reason: str | None,
+    numerical_error: str | None,
+    low_cmd_received: bool,
+    active_lowcmd: bool,
+    active_frames: int,
+    active_elapsed_s: float,
+    termination_signal: int | None,
+    child_failure: tuple[str, int] | None,
+    fall_detected: bool,
+    initial_reset_count: int,
+    final_reset_count: int,
+    reset_observed: bool = False,
+    spawn_clearance_audit: dict[str, object] | None = None,
+    resume_probation_active: bool | None = None,
+) -> str | None:
+    """Return why a failed resume cannot authorize another bounded rollback."""
+
+    if selected_checkpoint_id is None or selected_generation is None:
+        return "no_selected_checkpoint"
+    if rollback_count >= _GAME_MAX_RESUME_ROLLBACKS:
+        return "rollback_limit_reached"
+    if termination_signal is not None:
+        return "termination_signal"
+    if child_failure is not None:
+        return "child_failure"
+    if reset_observed or final_reset_count != initial_reset_count:
+        return "reset_detected"
+    if termination_reason == "spawn_clearance_failed" and bool(
+        resume_probation_active
+    ):
+        # A live full-body audit remains authoritative after LowCmd begins.
+        # Dynamic probation proves checkpoint writes were still blocked, so
+        # observed LowCmd cannot disqualify this exact collision.
+        if fall_detected:
+            # Aggregate fall evidence means this frame belongs to the fall
+            # path.  Never reinterpret its body-ground contacts as evidence
+            # that the selected checkpoint itself was malformed.
+            return "fall_detected"
+        clearance_reason = _spawn_clearance_rollback_reason(
+            spawn_clearance_audit
+        )
+        if clearance_reason is None or numerical_error != (
+            f"spawn_clearance:{clearance_reason}"
+        ):
+            return "spawn_clearance_evidence_missing"
+        return None
+    elapsed = float(elapsed_s)
+    if (
+        not math.isfinite(elapsed)
+        or elapsed < 0.0
+        or elapsed > _GAME_WORLD_RESUME_BOOTSTRAP_ROLLBACK_SECONDS
+    ):
+        return "outside_resume_probation"
+    # A restored pose can already be marked fallen when its first native step
+    # exposes the allowlisted numerical failure below.  That aggregate flag is
+    # therefore not sufficient to distinguish a bad resume from an ordinary
+    # fall.  A validated ordinary fall is stopped earlier with this explicit
+    # termination reason and must never authorize checkpoint rollback.
+    if termination_reason == "fall_detected":
+        return "fall_detected"
+    if low_cmd_received or active_lowcmd or active_frames != 0 or active_elapsed_s > 0.0:
+        return "lowcmd_observed"
+    if termination_reason == "spawn_clearance_failed":
+        clearance_reason = _spawn_clearance_rollback_reason(
+            spawn_clearance_audit
+        )
+        if clearance_reason is None or numerical_error != (
+            f"spawn_clearance:{clearance_reason}"
+        ):
+            return "spawn_clearance_evidence_missing"
+        return None
+    if termination_reason != "numerical_instability":
+        return "not_numerical_instability"
+    if not isinstance(numerical_error, str) or not numerical_error.startswith(
+        _GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES
+    ):
+        return "numerical_error_not_allowlisted"
+    return None
+
+
+def _spawn_clearance_rollback_reason(
+    audit: dict[str, object] | None,
+) -> str | None:
+    """Return the typed rollback reason for a trusted collision audit.
+
+    Parser/model failures deliberately stay outside the rollback allowlist:
+    only classified scene collision or exact no-ground evidence may quarantine
+    a checkpoint.
+    """
+
+    if not isinstance(audit, dict):
+        return None
+    reason = audit.get("reason")
+    if (
+        audit.get("schema") != SPAWN_CLEARANCE_AUDIT_SCHEMA
+        or audit.get("safe") is not False
+        or audit.get("error") is not None
+        or reason not in _GAME_WORLD_ROLLBACK_CLEARANCE_REASONS
+    ):
+        return None
+    if reason == "no_ground_support":
+        support = audit.get("support")
+        rejected_count = audit.get("rejected_contact_count")
+        required_hits = (
+            support.get("required_hits") if isinstance(support, dict) else None
+        )
+        accepted_hits = (
+            support.get("accepted_hits") if isinstance(support, dict) else None
+        )
+        ray_direction = (
+            support.get("ray_direction") if isinstance(support, dict) else None
+        )
+        if (
+            not isinstance(support, dict)
+            or support.get("schema") != GROUND_SUPPORT_SCHEMA
+            or support.get("supported") is not False
+            or isinstance(required_hits, bool)
+            or not isinstance(required_hits, int)
+            or required_hits != 1
+            or isinstance(accepted_hits, bool)
+            or not isinstance(accepted_hits, int)
+            or accepted_hits != 0
+            or support.get("method") != "downward_foot_geom_rays"
+            or support.get("maximum_drop_m") != 0.12
+            or support.get("minimum_normal_z") != 0.8
+            or not isinstance(ray_direction, list)
+            or len(ray_direction) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in ray_direction
+            )
+            or [float(value) for value in ray_direction]
+            != [0.0, 0.0, -1.0]
+            or isinstance(rejected_count, bool)
+            or rejected_count != 0
+        ):
+            return None
+        probes = support.get("probes")
+        if not isinstance(probes, list) or len(probes) != 2:
+            return None
+        expected_names = {
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+        }
+        observed_names: set[str] = set()
+        for probe in probes:
+            if not isinstance(probe, dict):
+                return None
+            foot_body = probe.get("foot_body")
+            origins = probe.get("origins")
+            if (
+                not isinstance(foot_body, dict)
+                or isinstance(foot_body.get("id"), bool)
+                or not isinstance(foot_body.get("id"), int)
+                or int(foot_body["id"]) <= 0
+                or foot_body.get("name") not in expected_names
+                or not isinstance(origins, list)
+                or not 1 <= len(origins) <= 32
+                or probe.get("accepted") is not False
+                or probe.get("distance_m") is not None
+                or probe.get("normal") is not None
+                or probe.get("probe_geom") is not None
+                or probe.get("ray_origin_m") is not None
+                or probe.get("scene_geom") is not None
+            ):
+                return None
+            observed_geom_ids: set[int] = set()
+            for origin in origins:
+                if not isinstance(origin, dict):
+                    return None
+                geom_id = origin.get("geom_id")
+                geom_name = origin.get("geom_name")
+                position = origin.get("position_m")
+                if (
+                    isinstance(geom_id, bool)
+                    or not isinstance(geom_id, int)
+                    or geom_id < 0
+                    or geom_id in observed_geom_ids
+                    or (
+                        geom_name is not None
+                        and (
+                            not isinstance(geom_name, str)
+                            or not geom_name
+                            or len(geom_name) > 256
+                        )
+                    )
+                    or not isinstance(position, list)
+                    or len(position) != 3
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        for value in position
+                    )
+                ):
+                    return None
+                observed_geom_ids.add(geom_id)
+            observed_names.add(str(foot_body["name"]))
+        return str(reason) if observed_names == expected_names else None
+    rejected_count = audit.get("rejected_contact_count")
+    worst = audit.get("worst")
+    if (
+        isinstance(rejected_count, bool)
+        or not isinstance(rejected_count, int)
+        or rejected_count <= 0
+        or not isinstance(worst, dict)
+        or worst.get("allowed") is not False
+    ):
+        return None
+    classification = worst.get("classification")
+    expected_classifications = (
+        {"scene_penetration"}
+        if reason == "scene_penetration"
+        else {"unsafe_foot_contact_normal", "unsafe_foot_penetration"}
+    )
+    if classification not in expected_classifications:
+        return None
+    return str(reason)
+
+
+def _runtime_exit_code(
+    *,
+    internal_restart_requested: bool,
+    passed: bool,
+    qualification_attempted: bool,
+    interrupted: bool,
+    acceptance_failures: list[str],
+    resume_rollback_requested: bool = False,
+) -> int:
+    if resume_rollback_requested:
+        return _GAME_RESUME_ROLLBACK_EXIT_CODE
+    if internal_restart_requested:
+        return _GAME_INTERNAL_RESTART_EXIT_CODE
+    if passed or (
+        not qualification_attempted and interrupted and not acceptance_failures
+    ):
+        return 0
+    return 2
 
 
 def _acceptance_failures(
@@ -2149,19 +4106,46 @@ def _game_control_status_fields(
         "native_gait_modes": {
             SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
         },
-        "keyboard_slow_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
-            SONIC_SLOW_WALK_MODE
-        ],
-        "keyboard_walk_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE],
-        "keyboard_run_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE],
+        "keyboard_slow_speed_mps": getattr(
+            args, "game_keyboard_slow_speed", 0.10
+        ),
+        "keyboard_slow_boost_speed_mps": (
+            getattr(args, "game_keyboard_slow_boost_speed", 0.20)
+        ),
+        "keyboard_walk_speed_mps": getattr(
+            args, "game_keyboard_walk_speed", 0.80
+        ),
+        "keyboard_walk_boost_speed_mps": (
+            getattr(args, "game_keyboard_walk_boost_speed", 1.00)
+        ),
+        "keyboard_run_speed_mps": getattr(
+            args, "game_keyboard_run_speed", 2.50
+        ),
+        "keyboard_run_boost_speed_mps": getattr(
+            args, "game_keyboard_run_boost_speed", 2.75
+        ),
+        "keyboard_double_tap_window_s": getattr(
+            args, "game_keyboard_double_tap_window", 0.30
+        ),
+        "motion_settings_file": (
+            os.fspath(args.game_motion_settings_file)
+            if getattr(args, "game_motion_settings_file", None) is not None
+            else None
+        ),
+        "motion_settings_load_status": getattr(
+            args, "game_motion_settings_load_status", "disabled"
+        ),
+        "motion_settings_revision": getattr(
+            args, "game_motion_settings_revision", None
+        ),
         # Preserve the historical status contract: maximum_speed_mps is the
         # configurable analog SLOW_WALK ceiling.  Keyboard tiers now have a
         # separate native RUN target and must not silently change that field.
         "maximum_speed_mps": args.game_max_speed,
         "analog_maximum_speed_mps": args.game_max_speed,
-        "keyboard_maximum_target_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
-            SONIC_RUN_MODE
-        ],
+        "keyboard_maximum_target_speed_mps": (
+            getattr(args, "game_keyboard_run_boost_speed", 2.75)
+        ),
         "maximum_acceleration_mps2": args.game_max_acceleration,
         "maximum_deceleration_mps2": args.game_max_deceleration,
         "maximum_turn_rate_rad_s": args.game_max_turn_rate,
@@ -2229,12 +4213,93 @@ def _game_control_status_fields(
     }
 
 
+def _control_config_with_motion_settings(
+    config: ControlConfig,
+    settings: MotionSettings,
+) -> ControlConfig:
+    """Return one validated config with all six keyboard gear values replaced."""
+
+    return replace(
+        config,
+        keyboard_slow_speed_mps=settings.slow_speed_mps,
+        keyboard_slow_boost_speed_mps=settings.slow_double_tap_speed_mps,
+        keyboard_walk_speed_mps=settings.walk_speed_mps,
+        keyboard_walk_boost_speed_mps=settings.walk_double_tap_speed_mps,
+        keyboard_run_speed_mps=settings.run_speed_mps,
+        keyboard_run_boost_speed_mps=settings.run_double_tap_speed_mps,
+    )
+
+
 _EXPECTED_SNAPSHOT_DIMS = {
     "qpos": 36,
     "qvel": 35,
     "ctrl": 29,
     "applied_torque": 29,
 }
+
+
+def _canonical_body_joint_velocities(qvel: Any) -> tuple[float, ...]:
+    """Return only G1's 29 actuated joint velocities from an extended model."""
+
+    try:
+        values = tuple(
+            float(value)
+            for value in qvel[
+                _CANONICAL_ROOT_VELOCITY_DOF_COUNT:_CANONICAL_BODY_QVEL_STOP
+            ]
+        )
+    except (IndexError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("canonical body qvel is invalid") from exc
+    if len(values) != _CANONICAL_BODY_JOINT_DOF_COUNT:
+        raise ValueError(
+            "canonical body qvel must contain "
+            f"{_CANONICAL_BODY_JOINT_DOF_COUNT} values"
+        )
+    return values
+
+
+def _canonical_render_vectors(
+    snapshot: Any,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[float, ...]]:
+    """Project an extended physics snapshot onto the canonical G1 UE ABI."""
+
+    try:
+        ctrl_count = len(snapshot.ctrl)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("canonical UE render ctrl source is invalid") from exc
+    if ctrl_count != _CANONICAL_RENDER_CTRL_COUNT:
+        raise ValueError(
+            "canonical UE render ctrl source must contain exactly "
+            f"{_CANONICAL_RENDER_CTRL_COUNT} values"
+        )
+    try:
+        qpos = tuple(
+            float(value)
+            for value in snapshot.qpos[:_CANONICAL_BODY_QPOS_STOP]
+        )
+        qvel = tuple(
+            float(value)
+            for value in snapshot.qvel[:_CANONICAL_BODY_QVEL_STOP]
+        )
+        ctrl = tuple(
+            float(value)
+            for value in snapshot.ctrl[:_CANONICAL_RENDER_CTRL_COUNT]
+        )
+    except (AttributeError, IndexError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("canonical UE render state is invalid") from exc
+    dimensions = (
+        (qpos, _CANONICAL_BODY_QPOS_STOP, "qpos"),
+        (qvel, _CANONICAL_BODY_QVEL_STOP, "qvel"),
+        (ctrl, _CANONICAL_RENDER_CTRL_COUNT, "ctrl"),
+    )
+    for values, expected, name in dimensions:
+        if len(values) != expected:
+            raise ValueError(
+                f"canonical UE render {name} must contain {expected} values"
+            )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError(f"canonical UE render {name} contains non-finite values")
+    return qpos, qvel, ctrl
 
 
 def _snapshot_validation_error(
@@ -2622,7 +4687,33 @@ class NativePlannerClient:
         locomotion_mode: int = 2,
         start: bool = True,
     ) -> None:
-        """Send an absolute planner direction in SONIC's normalized XY frame."""
+        """Send an absolute planner direction in SONIC's normalized XY frame.
+
+        Generic stationary directions deliberately serialize as native IDLE.
+        The game-command adapter is the only path allowed to request SONIC's
+        WALK-backed in-place turn contract.
+        """
+
+        self._send_direction(
+            movement=movement,
+            facing=facing,
+            speed=speed,
+            locomotion_mode=locomotion_mode,
+            start=start,
+            in_place_turn=False,
+        )
+
+    def _send_direction(
+        self,
+        *,
+        movement,
+        facing,
+        speed: float,
+        locomotion_mode: int,
+        start: bool,
+        in_place_turn: bool,
+    ) -> None:
+        """Validate and serialize one native planner direction frame."""
 
         movement_values = [float(value) for value in movement]
         facing_values = [float(value) for value in facing]
@@ -2640,11 +4731,17 @@ class NativePlannerClient:
             raise ValueError("locomotion_mode must be a native SONIC motion in [0, 26]")
         if moving and locomotion_mode == SONIC_IDLE_MODE:
             raise ValueError("moving planner command cannot use native IDLE")
-        turning = (
-            not moving
-            and locomotion_mode == SONIC_SLOW_WALK_MODE
-            and speed_value <= 1e-6
-            and math.hypot(movement_values[0], movement_values[1]) <= 1e-6
+        if in_place_turn:
+            if locomotion_mode != SONIC_IDLE_MODE:
+                raise ValueError("in-place turn must use semantic native IDLE")
+            if speed_value > 1e-6 or any(
+                abs(value) > 1e-6 for value in movement_values
+            ):
+                raise ValueError("in-place turn must have zero speed and movement")
+        planner_mode = (
+            SONIC_WALK_MODE
+            if in_place_turn
+            else locomotion_mode if moving else SONIC_IDLE_MODE
         )
         self._socket.send(
             self._build_command_message(
@@ -2656,10 +4753,10 @@ class NativePlannerClient:
         )
         self._socket.send(
             self._build_planner_message(
-                mode=locomotion_mode if moving or turning else 0,
+                mode=planner_mode,
                 movement=movement_values if moving else [0.0, 0.0, 0.0],
                 facing=facing_values,
-                speed=(speed_value if moving else 0.0 if turning else -1.0),
+                speed=(speed_value if moving else -1.0),
                 height=-1.0,
             )
         )
@@ -2685,10 +4782,14 @@ class NativePlannerClient:
         if turning:
             if has_speed or has_direction:
                 raise ValueError("turn-only game command must not translate")
-            if command.locomotion_mode != SONIC_SLOW_WALK_MODE:
-                raise ValueError("turn-only game command must use native SLOW_WALK")
+            if command.locomotion_mode != SONIC_IDLE_MODE:
+                raise ValueError("turn-only game command must use native IDLE")
             if command.safe_stop:
                 raise ValueError("turn-only game command cannot be a safe stop")
+            if command.reason not in _GAME_TURN_COMMAND_REASONS:
+                raise ValueError(
+                    "turn-only game command must use an approved turn reason"
+                )
         elif not moving:
             if command.locomotion_mode != SONIC_IDLE_MODE:
                 raise ValueError("stationary game command must use native IDLE")
@@ -2704,11 +4805,13 @@ class NativePlannerClient:
                     f"game command speed is outside native {gait_name} "
                     f"range {minimum:.1f}-{maximum:.1f} m/s"
                 )
-        self.send_direction(
+        self._send_direction(
             movement=command.movement,
             facing=command.facing,
             speed=command.speed_mps,
             locomotion_mode=command.locomotion_mode,
+            start=True,
+            in_place_turn=turning,
         )
 
     def send_recovery_posture(
@@ -2994,6 +5097,45 @@ class GameInputRuntime:
         self.server.close()
 
 
+def _game_command_poll_allowed(
+    command: RobotMotionCommand,
+    *,
+    resume_probation_active: bool,
+) -> bool:
+    """Return whether a queued world/policy command may mutate this frame."""
+
+    if not isinstance(command, RobotMotionCommand):
+        raise TypeError("game command gate requires a RobotMotionCommand")
+    if type(resume_probation_active) is not bool:
+        raise TypeError("resume probation activity must be boolean")
+    return bool(
+        not resume_probation_active
+        and command.safe_stop
+        and command.speed_mps == 0.0
+        and command.mode != "move"
+    )
+
+
+def _locomotion_switch_neutral(
+    command: RobotMotionCommand,
+) -> bool:
+    """Accept either normal IDLE or a hard-zero ESC/API safety stop.
+
+    Runtime commands are deliberately executed only while the ESC path has
+    published a safety stop.  Requiring ``safe_stop == False`` for the writer
+    handoff would therefore make every real ``/policy locomotion`` request
+    impossible even though its wire command is strictly zero.
+    """
+
+    if not isinstance(command, RobotMotionCommand):
+        raise TypeError("locomotion switch gate requires a RobotMotionCommand")
+    return bool(
+        command.locomotion_mode == SONIC_IDLE_MODE
+        and command.speed_mps == 0.0
+        and all(component == 0.0 for component in command.movement)
+    )
+
+
 class GameCommandRuntime:
     """Execute typed ESC-panel commands over one inherited private socketpair."""
 
@@ -3004,6 +5146,9 @@ class GameCommandRuntime:
         *,
         policy_slots: Any | None = None,
         creative_inventory: CreativeInventoryRuntime | None = None,
+        motion_settings: MotionSettingsStore | None = None,
+        control_core: GameControlCore | None = None,
+        pose_clearance_auditor: Callable[[WorldPose], dict[str, object]] | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -3020,9 +5165,118 @@ class GameCommandRuntime:
         self.last_response: dict[str, object] | None = None
         self.policy_slots = policy_slots
         self.creative_inventory = creative_inventory
+        self.inventory_spawns_executed = 0
+        self.motion_settings = motion_settings
+        self.control_core = control_core
+        self.pose_clearance_auditor = pose_clearance_auditor
         self.pending_policy_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
-        self.inventory_spawns_executed = 0
+        self.motion_settings_changes_executed = 0
+
+    @staticmethod
+    def _command_strategy_loadout(
+        loadout: dict[str, object],
+    ) -> dict[str, object]:
+        """Project runtime policy state onto the bounded command/UI schema.
+
+        The runtime status intentionally carries immutable policy provenance,
+        including every artifact hash.  Echoing that evidence through the
+        4 KiB command socket can exceed the protocol packet limit after the
+        policy has already switched.  Command clients need only the live slot
+        state; provenance remains available in the runtime status and lock.
+        """
+
+        projected: dict[str, object] = {
+            key: loadout[key]
+            for key in (
+                "version",
+                "available",
+                "status",
+                "active_slot",
+            )
+            if key in loadout
+        }
+        pending = loadout.get("pending")
+        if isinstance(pending, dict):
+            projected["pending"] = {
+                key: pending[key]
+                for key in (
+                    "slot",
+                    "policy_id",
+                    "transition_id",
+                    "phase",
+                )
+                if key in pending
+            }
+        else:
+            projected["pending"] = None
+
+        slots: list[dict[str, object]] = []
+        raw_slots = loadout.get("slots")
+        if isinstance(raw_slots, list):
+            for raw_slot in raw_slots:
+                if not isinstance(raw_slot, dict):
+                    continue
+                slot = {
+                    key: raw_slot[key]
+                    for key in (
+                        "slot",
+                        "selected_policy_id",
+                        "locked",
+                    )
+                    if key in raw_slot
+                }
+                candidates: list[dict[str, object]] = []
+                raw_candidates = raw_slot.get("candidates")
+                if isinstance(raw_candidates, list):
+                    for raw_candidate in raw_candidates:
+                        if not isinstance(raw_candidate, dict):
+                            continue
+                        candidates.append(
+                            {
+                                key: raw_candidate[key]
+                                for key in (
+                                    "policy_id",
+                                    "name",
+                                    "resident",
+                                    "available",
+                                    "unavailable_reason",
+                                )
+                                if key in raw_candidate
+                            }
+                        )
+                slot["candidates"] = candidates
+                slots.append(slot)
+        projected["slots"] = slots
+
+        resident_models: list[dict[str, object]] = []
+        raw_models = loadout.get("resident_models")
+        if isinstance(raw_models, list):
+            for raw_model in raw_models:
+                if not isinstance(raw_model, dict):
+                    continue
+                resident_models.append(
+                    {
+                        key: raw_model[key]
+                        for key in (
+                            "policy_id",
+                            "name",
+                            "resident",
+                            "available",
+                            "unavailable_reason",
+                        )
+                        if key in raw_model
+                    }
+                )
+        projected["resident_models"] = resident_models
+        return projected
+
+    @classmethod
+    def _policy_response_data(
+        cls,
+        loadout: dict[str, object],
+    ) -> dict[str, object]:
+        return {"strategy_loadout": cls._command_strategy_loadout(loadout)}
 
     def _send(self, response: GameCommandResponse) -> None:
         payload = encode_command_response(response)
@@ -3100,7 +5354,7 @@ class GameCommandRuntime:
                     ok=ok,
                     code=code,
                     message=message,
-                    data={"strategy_loadout": loadout},
+                    data=self._policy_response_data(loadout),
                 )
             )
             return False
@@ -3140,6 +5394,20 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, DataModifyInput):
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_EXTERNAL_API_REQUIRED",
+                        message=(
+                            "control.input mutations require the provider-side "
+                            "external control API"
+                        ),
+                    )
+                )
+                continue
             if not command_allowed:
                 self.rejected_commands += 1
                 self._send(
@@ -3176,11 +5444,9 @@ class GameCommandRuntime:
                             ok=False,
                             code=exc.code,
                             message=exc.message,
-                            data={
-                                "strategy_loadout": (
-                                    self.policy_slots.strategy_loadout_mapping()
-                                )
-                            },
+                            data=self._policy_response_data(
+                                self.policy_slots.strategy_loadout_mapping()
+                            ),
                         )
                     )
                     continue
@@ -3198,7 +5464,7 @@ class GameCommandRuntime:
                             f"Assigned {request.command.policy_id} to "
                             f"{request.command.slot}"
                         ),
-                        data={"strategy_loadout": loadout},
+                        data=self._policy_response_data(loadout),
                     )
                 )
                 continue
@@ -3253,6 +5519,70 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, DataModifyNumber):
+                if self.motion_settings is None or self.control_core is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_DATA_UNAVAILABLE",
+                            message="Motion settings are unavailable for this run",
+                        )
+                    )
+                    continue
+                try:
+                    modification = self.motion_settings.modify(
+                        request.command.path,
+                        request.command.value,
+                    )
+                    self.control_core.config = _control_config_with_motion_settings(
+                        self.control_core.config,
+                        modification.settings,
+                    )
+                except MotionSettingsError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={"motion_settings": self.motion_settings.mapping()},
+                        )
+                    )
+                    continue
+                except MotionSettingsPersistenceError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={"motion_settings": self.motion_settings.mapping()},
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                if modification.changed:
+                    self.motion_settings_changes_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=(
+                            "OK_DATA_MODIFIED"
+                            if modification.changed
+                            else "OK_DATA_UNCHANGED"
+                        ),
+                        message=(
+                            f"Set {modification.path} to {modification.value:.6g}"
+                        ),
+                        data={"motion_settings": self.motion_settings.mapping()},
+                    )
+                )
+                continue
             if self.world is None:
                 self.rejected_commands += 1
                 self._send(
@@ -3271,7 +5601,33 @@ class GameCommandRuntime:
                     current_pose=current_pose,
                     now_unix_ns=time.time_ns(),
                 )
-                self.world.store.save(effect.state)
+                if not isinstance(request.command, TeleportList):
+                    if (
+                        effect.restart_required
+                        and self.pose_clearance_auditor is not None
+                    ):
+                        target = effect.state.resolve_start().pose
+                        if target is None:
+                            raise CommandExecutionError(
+                                "E_SPAWN_CLEARANCE",
+                                "Teleport did not produce a resumable target",
+                            )
+                        clearance = self.pose_clearance_auditor(target)
+                        if clearance.get("safe") is not True:
+                            self.rejected_commands += 1
+                            self._send(
+                                self._response(
+                                    request,
+                                    ok=False,
+                                    code="E_SPAWN_CLEARANCE",
+                                    message=(
+                                        "Teleport target is not a safe supported spawn pose"
+                                    ),
+                                    data={"spawn_clearance": clearance},
+                                )
+                            )
+                            continue
+                    self.world.store.save(effect.state)
             except CommandExecutionError as exc:
                 self.rejected_commands += 1
                 self._send(
@@ -3295,8 +5651,9 @@ class GameCommandRuntime:
                     )
                 )
                 continue
-            self.world.state = effect.state
-            self.world.last_error = None
+            if not isinstance(request.command, TeleportList):
+                self.world.state = effect.state
+                self.world.last_error = None
             self.commands_executed += 1
             self._send(
                 self._response(
@@ -3322,6 +5679,14 @@ class GameCommandRuntime:
             "commands_executed": self.commands_executed,
             "policy_changes_executed": self.policy_changes_executed,
             "inventory_spawns_executed": self.inventory_spawns_executed,
+            "motion_settings_changes_executed": (
+                self.motion_settings_changes_executed
+            ),
+            "motion_settings": (
+                self.motion_settings.mapping()
+                if self.motion_settings is not None
+                else None
+            ),
             "policy_change_pending": self.pending_policy_request is not None,
             "protocol_errors": self.protocol_errors,
             "rejected_commands": self.rejected_commands,
@@ -3395,6 +5760,7 @@ class NativeProcessGroup:
         self._expected_exit_pids: set[int] = set()
         self._active_deploy: subprocess.Popen[bytes] | None = None
         self._active_recovery_policy: subprocess.Popen[bytes] | None = None
+        self._active_bfm_teacher: subprocess.Popen[bytes] | None = None
         self._deploy_generation = 0
         self._stopping = False
         self._boundary_failure: tuple[str, int] | None = None
@@ -3407,6 +5773,7 @@ class NativeProcessGroup:
         cwd: Path,
         *,
         exec_command: bool = False,
+        process_argv0: str | None = None,
         extra_pass_fds: tuple[int, ...] = (),
     ) -> int:
         guarded_command = [
@@ -3417,6 +5784,12 @@ class NativeProcessGroup:
         ]
         if exec_command:
             guarded_command.append("--exec-command")
+        if process_argv0 is not None:
+            if not exec_command:
+                raise ValueError("process argv0 override requires exec mode")
+            if not process_argv0 or "\0" in process_argv0:
+                raise ValueError("process argv0 override is invalid")
+            guarded_command.extend(("--argv0", process_argv0))
         guarded_command.extend(("--", *command))
         pass_fds = tuple(dict.fromkeys((*self.pass_fds, *extra_pass_fds)))
         for descriptor in pass_fds:
@@ -3463,21 +5836,36 @@ class NativeProcessGroup:
         gamepad_look_yaw_rate_deg_s: float,
         gamepad_look_pitch_rate_deg_s: float,
         gamepad_look_deadzone: float,
+        gamepad_move_deadzone: float,
         gamepad_look_min_pitch_deg: float,
         gamepad_look_max_pitch_deg: float,
         focus_title: str,
         expected_ue_pid: int,
         status_file: Path | None,
+        keyboard_double_tap_window_s: float = 0.30,
         ue_camera_state_file: Path | None = None,
         mouse_settings_file: Path | None = None,
+        video_settings_file: Path | None = None,
+        applied_video_settings_json: str | None = None,
         applied_mouse_profile: str = "local",
         applied_mouse_speed_scale: float = 1.0,
         restart_request_file: Path | None = None,
         restart_capability_file: Path | None = None,
         restart_launcher_pid: int | None = None,
+        external_control_socket: Path | None = None,
+        external_control_capability_file: Path | None = None,
+        external_control_deadman_seconds: float = 0.15,
         command_fd: int | None = None,
         strategy_loadout_json: str | None = None,
         creative_inventory_json: str | None = None,
+        motion_settings_json: str | None = None,
+        celestial_clock_state_file: Path | None = None,
+        celestial_lighting_bridge: str = "state-only",
+        celestial_assets_manifest: Path | None = None,
+        celestial_visual_catalog: Path | None = None,
+        celestial_visual_profile: str = "auto",
+        celestial_de440s_kernel: Path | None = None,
+        celestial_jplephem_wheel: Path | None = None,
     ) -> int:
         command = [
             python,
@@ -3495,6 +5883,8 @@ class NativeProcessGroup:
             str(initial_camera_yaw_deg),
             "--mouse-sensitivity-deg",
             str(mouse_sensitivity_deg),
+            "--keyboard-double-tap-window-s",
+            str(keyboard_double_tap_window_s),
             "--applied-mouse-profile",
             applied_mouse_profile,
             "--applied-mouse-speed-scale",
@@ -3513,6 +5903,8 @@ class NativeProcessGroup:
             str(gamepad_look_pitch_rate_deg_s),
             "--gamepad-look-deadzone",
             str(gamepad_look_deadzone),
+            "--gamepad-move-deadzone",
+            str(gamepad_move_deadzone),
             "--gamepad-look-min-pitch-deg",
             str(gamepad_look_min_pitch_deg),
             "--gamepad-look-max-pitch-deg",
@@ -3522,8 +5914,36 @@ class NativeProcessGroup:
             "--expected-ue-pid",
             str(expected_ue_pid),
         ]
+        _validate_game_external_control(
+            input_socket=input_socket,
+            external_socket=external_control_socket,
+            external_capability_file=external_control_capability_file,
+            external_deadman_seconds=external_control_deadman_seconds,
+            restart_request_file=restart_request_file,
+            restart_capability_file=restart_capability_file,
+        )
+        if (
+            external_control_socket is not None
+            and external_control_capability_file is not None
+        ):
+            command.extend(
+                (
+                    "--external-control-socket",
+                    str(external_control_socket),
+                    "--external-control-capability-file",
+                    str(external_control_capability_file),
+                    "--external-control-deadman-seconds",
+                    str(external_control_deadman_seconds),
+                )
+            )
         if mouse_settings_file is not None:
             command.extend(("--mouse-settings-file", str(mouse_settings_file)))
+        if video_settings_file is not None:
+            command.extend(("--video-settings-file", str(video_settings_file)))
+        if applied_video_settings_json is not None:
+            command.extend(
+                ("--applied-video-settings-json", applied_video_settings_json)
+            )
         if ue_camera_state_file is not None:
             command.extend(("--ue-camera-state-file", str(ue_camera_state_file)))
         restart_values = (
@@ -3548,6 +5968,44 @@ class NativeProcessGroup:
             command.extend(("--strategy-loadout-json", strategy_loadout_json))
         if creative_inventory_json is not None:
             command.extend(("--creative-inventory-json", creative_inventory_json))
+        if motion_settings_json is not None:
+            command.extend(("--motion-settings-json", motion_settings_json))
+        if celestial_clock_state_file is not None:
+            command.extend(
+                (
+                    "--celestial-clock-state-file",
+                    str(celestial_clock_state_file),
+                )
+            )
+        if celestial_lighting_bridge not in {"state-only", "carla-weather"}:
+            raise ValueError("celestial lighting bridge is invalid")
+        command.extend(
+            ("--celestial-lighting-bridge", celestial_lighting_bridge)
+        )
+        if celestial_assets_manifest is not None:
+            command.extend(
+                ("--celestial-assets-manifest", str(celestial_assets_manifest))
+            )
+        if celestial_visual_catalog is not None:
+            command.extend(
+                ("--celestial-visual-catalog", str(celestial_visual_catalog))
+            )
+        command.extend(("--celestial-visual-profile", celestial_visual_profile))
+        ephemeris_assets = (celestial_de440s_kernel, celestial_jplephem_wheel)
+        if any(value is not None for value in ephemeris_assets) and not all(
+            value is not None for value in ephemeris_assets
+        ):
+            raise ValueError("celestial ephemeris assets are all-or-none")
+        if celestial_de440s_kernel is not None:
+            assert celestial_jplephem_wheel is not None
+            command.extend(
+                (
+                    "--celestial-de440s-kernel",
+                    str(celestial_de440s_kernel),
+                    "--celestial-jplephem-wheel",
+                    str(celestial_jplephem_wheel),
+                )
+            )
         extra_pass_fds: tuple[int, ...] = ()
         if command_fd is not None:
             if isinstance(command_fd, bool) or not isinstance(command_fd, int):
@@ -3579,6 +6037,9 @@ class NativeProcessGroup:
 
     def recovery_policy_alive(self) -> bool:
         return self._alive(self._active_recovery_policy)
+
+    def bfm_teacher_alive(self) -> bool:
+        return self._alive(self._active_bfm_teacher)
 
     def begin_deploy_stop(self) -> None:
         """Authorize only the active deploy's expected exit; send no signal."""
@@ -3663,6 +6124,12 @@ class NativeProcessGroup:
             command,
             deploy_root,
             exec_command=True,
+            # TRNA also hosts the independent g1_wuji operator stack.  Its
+            # cleanup targets the real robot binary by argv pattern.  Preserve
+            # the locked executable path while giving this supervised Matrix
+            # leaf a disjoint process identity, so an operator cleanup cannot
+            # terminate the simulator's writer.
+            process_argv0="matrix-sonic-native-deploy",
         )
         self._active_deploy = self.children[-1][1]
         self._deploy_generation += 1
@@ -3682,6 +6149,10 @@ class NativeProcessGroup:
         amp_model: Path,
         amp_config_sha256: str,
         amp_model_sha256: str,
+        amp_flat_v3_config: Path | None = None,
+        amp_flat_v3_model: Path | None = None,
+        amp_flat_v3_config_sha256: str | None = None,
+        amp_flat_v3_model_sha256: str | None = None,
         kungfu_model: Path | None = None,
         kungfu_motion: Path | None = None,
         kungfu_model_sha256: str | None = None,
@@ -3721,6 +6192,29 @@ class NativeProcessGroup:
         ]
         for fallback in fallback_models:
             command.extend(("--fallback-model", str(fallback)))
+        amp_flat_v3_arguments = (
+            amp_flat_v3_config,
+            amp_flat_v3_model,
+            amp_flat_v3_config_sha256,
+            amp_flat_v3_model_sha256,
+        )
+        if any(value is not None for value in amp_flat_v3_arguments):
+            if not all(value is not None for value in amp_flat_v3_arguments):
+                raise RuntimeError(
+                    "incomplete AMP flat_v3 recovery worker arguments"
+                )
+            command.extend(
+                (
+                    "--amp-flat-v3-config",
+                    str(amp_flat_v3_config),
+                    "--amp-flat-v3-model",
+                    str(amp_flat_v3_model),
+                    "--amp-flat-v3-config-sha256",
+                    str(amp_flat_v3_config_sha256),
+                    "--amp-flat-v3-model-sha256",
+                    str(amp_flat_v3_model_sha256),
+                )
+            )
         kungfu_arguments = (
             kungfu_model,
             kungfu_motion,
@@ -3758,6 +6252,64 @@ class NativeProcessGroup:
         self._active_recovery_policy = self.children[-1][1]
         return pid
 
+    def start_bfm_teacher(
+        self,
+        python: str,
+        worker: Path,
+        *,
+        interface: str,
+        control_socket: Path,
+        model: Path,
+        config: Path,
+        bfm_source_root: Path,
+        realscan_source_root: Path,
+        robo_pfnn_root: Path,
+        weights: Path,
+        g1_xml: Path,
+        formal_ik: Path,
+        execution_provider: str,
+        activation_blend_seconds: float,
+    ) -> int:
+        if self.bfm_teacher_alive():
+            raise RuntimeError("BFM Teacher locomotion worker is already alive")
+        command = [
+            python,
+            "-u",
+            str(worker),
+            "--model",
+            str(model),
+            "--config",
+            str(config),
+            "--bfm-source-root",
+            str(bfm_source_root),
+            "--realscan-source-root",
+            str(realscan_source_root),
+            "--robo-pfnn-root",
+            str(robo_pfnn_root),
+            "--weights",
+            str(weights),
+            "--g1-xml",
+            str(g1_xml),
+            "--formal-ik",
+            str(formal_ik),
+            "--interface",
+            interface,
+            "--control-socket",
+            str(control_socket),
+            "--execution-provider",
+            execution_provider,
+            "--activation-blend-seconds",
+            str(activation_blend_seconds),
+        ]
+        pid = self._start(
+            "bfm-locomotion-policy",
+            command,
+            worker.parent.parent,
+            exec_command=True,
+        )
+        self._active_bfm_teacher = self.children[-1][1]
+        return pid
+
     def failed_child(self) -> tuple[str, int] | None:
         if self._stopping:
             return None
@@ -3768,6 +6320,42 @@ class NativeProcessGroup:
             if code is not None:
                 return name, code
         return None
+
+    def wait_for_unexpected_child(
+        self,
+        name: str,
+        *,
+        timeout: float = 0.1,
+    ) -> tuple[str, int] | None:
+        """Briefly preserve one named child's exit before teardown can mask it.
+
+        A managed control socket can reach EOF a few scheduler ticks before its
+        direct child becomes waitable.  Poll with ``WNOWAIT`` so the original
+        exit code or signal remains authoritative for the normal stop boundary;
+        never reap, signal, or broaden the lookup to another process group.
+        """
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("managed child name must be non-empty")
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError("managed child wait timeout must be finite and nonnegative")
+        matching = [
+            process
+            for child_name, process in self.children
+            if child_name == name and process.pid not in self._expected_exit_pids
+        ]
+        if not matching or self._stopping:
+            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            for process in matching:
+                code = _peek_child_returncode(process)
+                if code is not None:
+                    return name, code
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            time.sleep(min(0.005, remaining))
 
     def begin_expected_stop(self) -> tuple[str, int] | None:
         """Set the authoritative stop boundary after one final non-reaping peek."""
@@ -3845,9 +6433,30 @@ class NativeProcessGroup:
             raise RuntimeError("; ".join(cleanup_errors))
 
 
+class _ManagedControlDisconnect(RuntimeError):
+    """A PID-authenticated child closed its authority-control endpoint."""
+
+    def __init__(
+        self,
+        *,
+        child_name: str,
+        endpoint: str,
+        peer_pid: int | None,
+    ) -> None:
+        self.child_name = child_name
+        self.endpoint = endpoint
+        self.peer_pid = peer_pid
+        peer_detail = "unknown" if peer_pid is None else str(peer_pid)
+        super().__init__(
+            f"{endpoint} control disconnected peer_pid={peer_detail}"
+        )
+
+
 class _RecoveryWorkerControl:
     """Own the local writer-gate socket; the worker owns only policy/DDS I/O."""
 
+    MANAGED_CHILD_NAME = "recovery-policy"
+    ENDPOINT_LABEL = "recovery policy"
     SCHEMAS = {
         "matrix.sonic_host_worker.control.v1",
         "matrix.sonic_amp_worker.control.v1",
@@ -4391,12 +7000,18 @@ class _RecoveryWorkerControl:
             except BlockingIOError:
                 break
             if not packet:
+                disconnected_peer_pid = self.peer_pid
                 self.connection.close()
                 self.connection = None
                 self.peer_pid = None
                 if not self.stopped:
-                    self.error = "recovery worker control disconnected"
-                    raise RuntimeError(self.error)
+                    disconnect = _ManagedControlDisconnect(
+                        child_name=self.MANAGED_CHILD_NAME,
+                        endpoint=self.ENDPOINT_LABEL,
+                        peer_pid=disconnected_peer_pid,
+                    )
+                    self.error = str(disconnect)
+                    raise disconnect
                 break
             self._handle_packet(packet)
 
@@ -4646,6 +7261,8 @@ class _RecoveryWorkerControl:
 class _SonicWriterControl(_RecoveryWorkerControl):
     """Authenticate and drive one native SONIC rt/lowcmd startup gate."""
 
+    MANAGED_CHILD_NAME = "deploy"
+    ENDPOINT_LABEL = "SONIC writer gate"
     SCHEMA = "matrix.sonic_deploy.control.v1"
 
     def __init__(
@@ -4973,6 +7590,537 @@ class _SonicWriterControl(_RecoveryWorkerControl):
         return result
 
 
+class _BfmTeacherControl(_RecoveryWorkerControl):
+    """Authenticate one resident BFM locomotion worker and its writer epochs."""
+
+    MANAGED_CHILD_NAME = "bfm-locomotion-policy"
+    ENDPOINT_LABEL = "BFM Teacher writer gate"
+    SCHEMA = "matrix.bfm_teacher_worker.control.v1"
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.warmed = False
+        self.activation_pending = False
+        self.pause_pending = False
+        self.authority_epoch = 0
+        self.requested_authority_epoch = 0
+        self.epoch_first_write = False
+        self.dropped_state_packets = 0
+        self.last_state_sequence: int | None = None
+
+    @property
+    def current_first_write(self) -> bool:
+        return (
+            self.ready
+            and self.warmed
+            and self.epoch_first_write
+            and not self.paused
+            and not self.pause_pending
+            and not self.stopped
+        )
+
+    def _handle_packet(self, packet: bytes) -> None:
+        try:
+            payload = json.loads(packet.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid BFM Teacher packet: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("schema") != self.SCHEMA:
+            raise RuntimeError("BFM Teacher packet has an unsupported schema")
+        if payload.get("policy_id") != BFM_TEACHER50K_POLICY_ID:
+            raise RuntimeError("BFM Teacher packet has an invalid policy id")
+        event = payload.get("event")
+        if not isinstance(event, str):
+            raise RuntimeError("BFM Teacher packet has no event")
+        epoch = payload.get("authority_epoch")
+        if type(epoch) is not int or epoch < 0:
+            raise RuntimeError("BFM Teacher packet has an invalid authority epoch")
+        self.last_packet_monotonic = time.monotonic()
+        self.events_received += 1
+        self.last_event = event
+        if event == "READY_NO_WRITER":
+            if payload.get("writer_created") is not False:
+                raise RuntimeError("BFM Teacher READY already owns a writer")
+            if payload.get("models_loaded_once") is not True:
+                raise RuntimeError("BFM Teacher models were not loaded")
+            if payload.get("model_input_dim") != 1790:
+                raise RuntimeError("BFM Teacher input ABI is not 1790")
+            if payload.get("action_dim") != 29:
+                raise RuntimeError("BFM Teacher action ABI is not 29")
+            if epoch != 0:
+                raise RuntimeError("BFM Teacher READY has a nonzero authority epoch")
+            self.ready = True
+            self.paused = True
+            self.execution_provider = str(payload.get("execution_provider"))
+            self.models_loaded_once = True
+        elif event == "WARMED_NO_WRITER":
+            if not self.ready or payload.get("writer_created") is not False:
+                raise RuntimeError("BFM Teacher warmup violated writer-free startup")
+            if payload.get("models_warmed") is not True:
+                raise RuntimeError("BFM Teacher did not attest warmup")
+            self.warmed = True
+            self.models_warmed = True
+        elif event == "FIRST_WRITE":
+            if not self.activation_pending:
+                raise RuntimeError("BFM Teacher wrote without supervisor activation")
+            if epoch != self.requested_authority_epoch:
+                raise RuntimeError("BFM Teacher first-write epoch mismatch")
+            if payload.get("writer_created") is not True:
+                raise RuntimeError("BFM Teacher first write has no writer")
+            self.authority_epoch = epoch
+            self.epoch_first_write = True
+            self.first_write = True
+            self.paused = False
+            self.activation_pending = False
+        elif event == "PAUSED_RESIDENT_WRITER":
+            if not self.pause_pending:
+                raise RuntimeError("BFM Teacher paused without supervisor request")
+            if epoch != self.authority_epoch:
+                raise RuntimeError("BFM Teacher pause epoch mismatch")
+            if payload.get("writer_created") is not True:
+                raise RuntimeError("BFM Teacher pause lost its resident writer")
+            if payload.get("write_authorized") is not False:
+                raise RuntimeError("BFM Teacher pause retained write authority")
+            self.paused = True
+            self.pause_pending = False
+            self.epoch_first_write = False
+        elif event == "STATUS":
+            if epoch not in {
+                self.authority_epoch,
+                self.requested_authority_epoch,
+            }:
+                raise RuntimeError("BFM Teacher STATUS epoch mismatch")
+            self.last_status = dict(payload)
+            if payload.get("models_warmed") is True:
+                self.warmed = True
+                self.models_warmed = True
+        elif event == "ERROR":
+            self.error = str(payload.get("message", "BFM Teacher worker error"))
+        elif event == "STOPPED":
+            self.stopped = True
+            self.paused = False
+            self.activation_pending = False
+            self.pause_pending = False
+        else:
+            raise RuntimeError(f"unsupported BFM Teacher event: {event}")
+
+    def activate(self) -> None:
+        if self.connection is None or not self.ready or not self.warmed:
+            raise RuntimeError("BFM Teacher is not connected and warmed")
+        if not self.paused or self.pause_pending or self.activation_pending:
+            raise RuntimeError("BFM Teacher is not in writer-fenced standby")
+        if self.stopped:
+            raise RuntimeError("BFM Teacher was stopped")
+        requested_epoch = self.authority_epoch + 1
+        payload = {
+            "schema": self.SCHEMA,
+            "command": "GO",
+            "authority_epoch": requested_epoch,
+        }
+        self._send_payload(payload)
+        self.requested_authority_epoch = requested_epoch
+        self.activation_pending = True
+        self.paused = False
+        self.epoch_first_write = False
+
+    def pause(self) -> None:
+        if self.connection is None or not self.current_first_write:
+            raise RuntimeError("BFM Teacher does not own an active writer epoch")
+        if self.pause_pending or self.stopped:
+            raise RuntimeError("BFM Teacher PAUSE is not valid in current state")
+        self._send_payload(
+            {
+                "schema": self.SCHEMA,
+                "command": "PAUSE",
+                "authority_epoch": self.authority_epoch,
+            }
+        )
+        self.pause_pending = True
+
+    def stop(self) -> None:
+        if self.connection is None or self.stopped or self.stop_sent:
+            return
+        self._send_payload(
+            {
+                "schema": self.SCHEMA,
+                "command": "STOP",
+                "authority_epoch": self.authority_epoch,
+            }
+        )
+        self.stop_sent = True
+
+    def _send_payload(self, payload: Mapping[str, Any]) -> None:
+        if self.connection is None:
+            raise RuntimeError("BFM Teacher is not connected")
+        packet = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        written = self.connection.send(packet)
+        if written != len(packet):
+            raise RuntimeError("short BFM Teacher control packet")
+
+    def send_state(
+        self,
+        snapshot: Any,
+        command: RobotMotionCommand,
+        *,
+        root_yaw: float,
+        height_map_z: Any,
+    ) -> bool:
+        """Send one newest-wins 50 Hz world sample without blocking physics."""
+
+        if self.connection is None or not self.ready or self.stopped:
+            return False
+        reshape = getattr(height_map_z, "reshape", None)
+        if callable(reshape):
+            flattened_heights = reshape(-1)
+        else:
+            flattened_heights = [
+                value for row in height_map_z for value in row
+            ]
+        payload = {
+            "schema": self.SCHEMA,
+            "command": "STATE",
+            "sequence": int(snapshot.step_index),
+            "reset_count": int(snapshot.reset_count),
+            "root_position": [float(value) for value in snapshot.qpos[:3]],
+            "root_yaw": float(root_yaw),
+            "height_map_z": [
+                float(value) for value in flattened_heights
+            ],
+            "movement": [float(value) for value in command.movement],
+            "facing": [float(value) for value in command.facing],
+            "desired_facing": [
+                float(value)
+                for value in (
+                    command.desired_facing
+                    if command.desired_facing is not None
+                    else command.facing
+                )
+            ],
+            "speed_mps": float(command.speed_mps),
+            "locomotion_mode": int(command.locomotion_mode),
+            "mode": command.mode,
+            "safe_stop": bool(command.safe_stop),
+        }
+        packet = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        try:
+            written = self.connection.send(packet)
+        except BlockingIOError:
+            self.dropped_state_packets += 1
+            return False
+        if written != len(packet):
+            raise RuntimeError("short BFM Teacher STATE packet")
+        self.last_state_sequence = int(snapshot.step_index)
+        return True
+
+    def telemetry(self) -> dict[str, object]:
+        result = super().telemetry()
+        result.update(
+            {
+                "schema": self.SCHEMA,
+                "warmed": self.warmed,
+                "activation_pending": self.activation_pending,
+                "pause_pending": self.pause_pending,
+                "authority_epoch": self.authority_epoch,
+                "requested_authority_epoch": self.requested_authority_epoch,
+                "authority_epoch_first_write": self.epoch_first_write,
+                "current_first_write": self.current_first_write,
+                "dropped_state_packets": self.dropped_state_packets,
+                "last_state_sequence": self.last_state_sequence,
+            }
+        )
+        return result
+
+
+class _LocomotionPhysicsProfiles:
+    """Transactionally switch policy-specific G1 MuJoCo armatures.
+
+    Native SONIC and the legacy resident recovery policies use the canonical
+    Matrix model's uniform 0.01 armature.  BFM Teacher50k and AMP flat_v3 were
+    qualified with policy-specific per-joint G1 armatures.  All policy families
+    drive the same live MuJoCo model, so writer handoff must also hand off this
+    small part of the physics contract while every writer is fenced.
+    """
+
+    BASELINE_PROFILE_ID = "sonic-recovery"
+    BFM_PROFILE_ID = BFM_TEACHER50K_POLICY_ID
+    FLAT_V3_PROFILE_ID = "amp-flat-v3"
+    EXPECTED_BASELINE_ARMATURE = 0.01
+    VALUE_ABS_TOL = 1e-12
+
+    def __init__(
+        self,
+        mujoco_module: Any,
+        model: Any,
+        data: Any,
+        *,
+        flat_v3_armatures: tuple[float, ...] | None = None,
+    ) -> None:
+        if mujoco_module is None or model is None or data is None:
+            raise ValueError(
+                "locomotion physics profiles require live MuJoCo model/data"
+            )
+        self.mujoco = mujoco_module
+        self.model = model
+        self.data = data
+        joint_object = self.mujoco.mjtObj.mjOBJ_JOINT
+        joint_ids: list[int] = []
+        missing: list[str] = []
+        for name in G1_BODY_JOINT_NAMES:
+            joint_id = int(
+                self.mujoco.mj_name2id(self.model, joint_object, name)
+            )
+            if joint_id < 0:
+                missing.append(name)
+            joint_ids.append(joint_id)
+        if missing:
+            raise ValueError(
+                "live MuJoCo model is missing G1 body joints: "
+                + ", ".join(missing)
+            )
+        self.dof_addresses = tuple(
+            int(self.model.jnt_dofadr[joint_id]) for joint_id in joint_ids
+        )
+        if (
+            len(set(self.dof_addresses)) != len(G1_BODY_JOINT_NAMES)
+            or any(
+                address < 0 or address >= len(self.model.dof_armature)
+                for address in self.dof_addresses
+            )
+        ):
+            raise ValueError(
+                "live MuJoCo model has an invalid G1 joint-to-DoF mapping"
+            )
+
+        baseline = self._read_armatures()
+        invalid_baseline = [
+            (name, value)
+            for name, value in zip(G1_BODY_JOINT_NAMES, baseline)
+            if (
+                not math.isfinite(value)
+                or value <= 0.0
+                or not math.isclose(
+                    value,
+                    self.EXPECTED_BASELINE_ARMATURE,
+                    rel_tol=0.0,
+                    abs_tol=self.VALUE_ABS_TOL,
+                )
+            )
+        ]
+        if invalid_baseline:
+            raise ValueError(
+                "canonical SONIC armature contract drifted: "
+                f"{invalid_baseline}"
+            )
+        self.profile_values = {
+            self.BASELINE_PROFILE_ID: baseline,
+            self.BFM_PROFILE_ID: tuple(
+                self._bfm_armature(name) for name in G1_BODY_JOINT_NAMES
+            ),
+        }
+        if flat_v3_armatures is not None:
+            if len(flat_v3_armatures) != len(G1_BODY_JOINT_NAMES) or any(
+                not math.isfinite(value) or value <= 0.0
+                for value in flat_v3_armatures
+            ):
+                raise ValueError(
+                    "AMP flat_v3 armature profile must contain one positive "
+                    "finite value per G1 body joint"
+                )
+            self.profile_values[self.FLAT_V3_PROFILE_ID] = tuple(
+                float(value) for value in flat_v3_armatures
+            )
+        self.active_profile_id = self.BASELINE_PROFILE_ID
+        self.switch_count = 0
+        self.last_transition: dict[str, object] | None = None
+        self.last_error: str | None = None
+        self.verify_active()
+
+    @staticmethod
+    def _bfm_armature(name: str) -> float:
+        if any(token in name for token in ("hip_pitch", "hip_roll", "knee")):
+            return 0.025101925
+        if "hip_yaw" in name or name == "waist_yaw_joint":
+            return 0.010177520
+        if "ankle_" in name or name in {
+            "waist_roll_joint",
+            "waist_pitch_joint",
+        }:
+            return 2.0 * 0.003609725
+        if "wrist_pitch" in name or "wrist_yaw" in name:
+            return 0.00425
+        return 0.003609725
+
+    @staticmethod
+    def _values_sha256(values: tuple[float, ...]) -> str:
+        return hashlib.sha256(
+            struct.pack(f"<{len(values)}d", *values)
+        ).hexdigest()
+
+    def _read_armatures(self) -> tuple[float, ...]:
+        return tuple(
+            float(self.model.dof_armature[address])
+            for address in self.dof_addresses
+        )
+
+    def _write_armatures(self, values: tuple[float, ...]) -> None:
+        if len(values) != len(self.dof_addresses):
+            raise ValueError("armature profile has the wrong joint count")
+        for address, value in zip(self.dof_addresses, values):
+            self.model.dof_armature[address] = value
+
+    def _matches(
+        self,
+        actual: tuple[float, ...],
+        expected: tuple[float, ...],
+    ) -> bool:
+        return len(actual) == len(expected) and all(
+            math.isclose(
+                left,
+                right,
+                rel_tol=0.0,
+                abs_tol=self.VALUE_ABS_TOL,
+            )
+            for left, right in zip(actual, expected)
+        )
+
+    def verify_active(self) -> None:
+        expected = self.profile_values[self.active_profile_id]
+        actual = self._read_armatures()
+        if not self._matches(actual, expected):
+            raise RuntimeError(
+                "live MuJoCo armatures drifted from active locomotion "
+                f"physics profile {self.active_profile_id}"
+            )
+
+    def apply(self, profile_id: str) -> bool:
+        """Apply one profile without changing qpos, qvel, or simulation time."""
+
+        if profile_id not in self.profile_values:
+            raise ValueError(
+                f"unsupported locomotion physics profile: {profile_id}"
+            )
+        target = self.profile_values[profile_id]
+        current = self._read_armatures()
+        qpos_before = tuple(float(value) for value in self.data.qpos)
+        qvel_before = tuple(float(value) for value in self.data.qvel)
+        time_before = float(self.data.time)
+        if self._matches(current, target):
+            previous_profile = self.active_profile_id
+            self.active_profile_id = profile_id
+            self.last_error = None
+            if previous_profile != profile_id:
+                self.switch_count += 1
+                self.last_transition = {
+                    "from": previous_profile,
+                    "to": profile_id,
+                    "changed_dofs": 0,
+                    "monotonic_s": time.monotonic(),
+                }
+            return previous_profile != profile_id
+
+        previous_profile = self.active_profile_id
+        changed_dofs = sum(
+            not math.isclose(
+                left,
+                right,
+                rel_tol=0.0,
+                abs_tol=self.VALUE_ABS_TOL,
+            )
+            for left, right in zip(current, target)
+        )
+        try:
+            self._write_armatures(target)
+            if not self._matches(self._read_armatures(), target):
+                raise RuntimeError("MuJoCo armature write did not read back")
+            self.mujoco.mj_forward(self.model, self.data)
+            if (
+                tuple(float(value) for value in self.data.qpos) != qpos_before
+                or tuple(float(value) for value in self.data.qvel) != qvel_before
+                or float(self.data.time) != time_before
+            ):
+                raise RuntimeError(
+                    "MuJoCo physics profile switch changed live simulator state"
+                )
+            if not self._matches(self._read_armatures(), target):
+                raise RuntimeError(
+                    "MuJoCo armature changed during forward recomputation"
+                )
+        except Exception as exc:
+            rollback_error: Exception | None = None
+            try:
+                self._write_armatures(current)
+                for index, value in enumerate(qpos_before):
+                    self.data.qpos[index] = value
+                for index, value in enumerate(qvel_before):
+                    self.data.qvel[index] = value
+                self.data.time = time_before
+                self.mujoco.mj_forward(self.model, self.data)
+                if not self._matches(self._read_armatures(), current):
+                    raise RuntimeError("armature rollback did not read back")
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
+            self.last_error = str(exc)
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "locomotion physics profile switch failed and rollback "
+                    f"failed: switch={exc}; rollback={rollback_error}"
+                ) from exc
+            raise RuntimeError(
+                f"locomotion physics profile switch failed: {exc}"
+            ) from exc
+
+        self.active_profile_id = profile_id
+        self.switch_count += 1
+        self.last_error = None
+        self.last_transition = {
+            "from": previous_profile,
+            "to": profile_id,
+            "changed_dofs": changed_dofs,
+            "monotonic_s": time.monotonic(),
+        }
+        return True
+
+    def telemetry(self) -> dict[str, object]:
+        actual = self._read_armatures()
+        expected = self.profile_values[self.active_profile_id]
+        return {
+            "available": True,
+            "active_profile_id": self.active_profile_id,
+            "profile_matches_live_model": self._matches(actual, expected),
+            "joint_count": len(self.dof_addresses),
+            "switch_count": self.switch_count,
+            "active_armature_sha256": self._values_sha256(actual),
+            "baseline_armature_sha256": self._values_sha256(
+                self.profile_values[self.BASELINE_PROFILE_ID]
+            ),
+            "bfm_armature_sha256": self._values_sha256(
+                self.profile_values[self.BFM_PROFILE_ID]
+            ),
+            "flat_v3_armature_sha256": (
+                self._values_sha256(
+                    self.profile_values[self.FLAT_V3_PROFILE_ID]
+                )
+                if self.FLAT_V3_PROFILE_ID in self.profile_values
+                else None
+            ),
+            "active_armatures": {
+                name: value
+                for name, value in zip(G1_BODY_JOINT_NAMES, actual)
+            },
+            "last_transition": self.last_transition,
+            "last_error": self.last_error,
+        }
+
+
 class _PhysicalRecoveryCoordinator:
     """Translate snapshots/FSM actions without stopping input or rendering."""
 
@@ -4981,6 +8129,7 @@ class _PhysicalRecoveryCoordinator:
     # the normal constructor explicitly enables residency.
     resident_policies = False
     execution_provider = "cpu"
+    physics_profiles: _LocomotionPhysicsProfiles | None = None
 
     POSE_TRIGGER_HEIGHT_M = 0.45
     POSE_TRIGGER_UP_Z = 0.5
@@ -5088,6 +8237,39 @@ class _PhysicalRecoveryCoordinator:
         self.amp_model = args.physical_recovery_amp_model.resolve()
         self.amp_config_sha256 = str(args.physical_recovery_amp_config_sha256)
         self.amp_model_sha256 = str(args.physical_recovery_amp_model_sha256)
+        amp_flat_v3_config_arg = getattr(
+            args, "physical_recovery_amp_flat_v3_config", None
+        )
+        amp_flat_v3_model_arg = getattr(
+            args, "physical_recovery_amp_flat_v3_model", None
+        )
+        self.amp_flat_v3_config = (
+            amp_flat_v3_config_arg.resolve()
+            if isinstance(amp_flat_v3_config_arg, Path)
+            else None
+        )
+        self.amp_flat_v3_model = (
+            amp_flat_v3_model_arg.resolve()
+            if isinstance(amp_flat_v3_model_arg, Path)
+            else None
+        )
+        amp_flat_v3_config_sha256_arg = getattr(
+            args, "physical_recovery_amp_flat_v3_config_sha256", None
+        )
+        amp_flat_v3_model_sha256_arg = getattr(
+            args, "physical_recovery_amp_flat_v3_model_sha256", None
+        )
+        self.amp_flat_v3_config_sha256 = (
+            str(amp_flat_v3_config_sha256_arg)
+            if amp_flat_v3_config_sha256_arg
+            else None
+        )
+        self.amp_flat_v3_model_sha256 = (
+            str(amp_flat_v3_model_sha256_arg)
+            if amp_flat_v3_model_sha256_arg
+            else None
+        )
+        self.amp_flat_v3_armatures = self._load_amp_flat_v3_armatures()
         kungfu_model_arg = getattr(args, "physical_recovery_kungfu_model", None)
         kungfu_motion_arg = getattr(args, "physical_recovery_kungfu_motion", None)
         self.kungfu_model = (
@@ -5162,6 +8344,115 @@ class _PhysicalRecoveryCoordinator:
         self._policy_selection_results: dict[
             str, tuple[bool, str, str, dict[str, object]]
         ] = {}
+        manifest_path = Path(
+            getattr(
+                args,
+                "locomotion_policy_manifest",
+                _SCRIPT_DIR.parent
+                / "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
+            )
+        )
+        self.locomotion_policy_candidates: tuple[PolicyCandidateState, ...] = (
+            evaluate_policy_candidate(
+                manifest_path,
+                _SCRIPT_DIR.parent / "config/runtime/matrix-sonic.lock.json",
+                project_root=_SCRIPT_DIR.parent,
+            ),
+        )
+        self.selected_locomotion_policy_id = "sonic"
+        self.bfm_control = _BfmTeacherControl(
+            Path(args.bfm_teacher_control_socket)
+        )
+        self.bfm_python = str(args.bfm_teacher_python)
+        self.bfm_worker_script = Path(args.bfm_teacher_worker).resolve()
+
+        def optional_path(name: str) -> Path | None:
+            value = getattr(args, name, None)
+            return value.resolve() if isinstance(value, Path) else None
+
+        self.bfm_model = optional_path("bfm_teacher_model")
+        self.bfm_config = optional_path("bfm_teacher_config")
+        self.bfm_source_root = optional_path("bfm_source_root")
+        self.bfm_realscan_source_root = optional_path(
+            "bfm_realscan_source_root"
+        )
+        self.bfm_robo_pfnn_root = optional_path("bfm_robo_pfnn_root")
+        self.bfm_pfnn_weights = optional_path("bfm_pfnn_weights")
+        self.bfm_g1_xml = optional_path("bfm_g1_xml")
+        self.bfm_formal_ik = optional_path("bfm_formal_ik")
+        self.bfm_activation_blend_seconds = float(
+            args.bfm_teacher_activation_blend_seconds
+        )
+        if (
+            not math.isfinite(self.bfm_activation_blend_seconds)
+            or self.bfm_activation_blend_seconds <= 0.0
+        ):
+            raise ValueError(
+                "BFM Teacher activation blend seconds must be finite and positive"
+            )
+        self.bfm_process_started = False
+        self.bfm_switch_timeout_s = 10.0
+        self.bfm_switch_admission_ready = False
+        self.bfm_switch_admission_reason = "awaiting_runtime_observation"
+        self.physics_profiles = None
+
+    def _load_amp_flat_v3_armatures(self) -> tuple[float, ...] | None:
+        config_path = getattr(self, "amp_flat_v3_config", None)
+        if config_path is None:
+            return None
+        expected_sha256 = getattr(self, "amp_flat_v3_config_sha256", None)
+        if not expected_sha256:
+            raise ValueError("AMP flat_v3 config SHA256 is missing")
+        actual_sha256 = _sha256_file(config_path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                "AMP flat_v3 config SHA256 mismatch: "
+                f"expected={expected_sha256} actual={actual_sha256}"
+            )
+        with config_path.open("r", encoding="utf-8") as stream:
+            config = json.load(stream)
+        if not isinstance(config, dict):
+            raise ValueError("AMP flat_v3 config must be a JSON object")
+        if tuple(config.get("policy_joint_names", ())) != G1_BODY_JOINT_NAMES:
+            raise ValueError(
+                "AMP flat_v3 armatures do not match the Matrix G1 joint order"
+            )
+        raw_armatures = config.get("armature")
+        if not isinstance(raw_armatures, list) or len(raw_armatures) != len(
+            G1_BODY_JOINT_NAMES
+        ):
+            raise ValueError(
+                "AMP flat_v3 config must provide 29 policy-ordered armatures"
+            )
+        armatures = tuple(float(value) for value in raw_armatures)
+        if any(
+            not math.isfinite(value) or value <= 0.0 for value in armatures
+        ):
+            raise ValueError(
+                "AMP flat_v3 armatures must be positive and finite"
+            )
+        return armatures
+
+    def bind_locomotion_physics_profiles(
+        self,
+        mujoco_module: Any,
+        model: Any,
+        data: Any,
+    ) -> None:
+        if self.physics_profiles is not None:
+            raise RuntimeError("locomotion physics profiles are already bound")
+        self.physics_profiles = _LocomotionPhysicsProfiles(
+            mujoco_module,
+            model,
+            data,
+            flat_v3_armatures=self.amp_flat_v3_armatures,
+        )
+
+    def _apply_locomotion_physics_profile(self, profile_id: str) -> None:
+        profiles = getattr(self, "physics_profiles", None)
+        if profiles is None:
+            raise RuntimeError("locomotion physics profiles are not bound")
+        profiles.apply(profile_id)
 
     def _configured_recovery_policy_ids(self) -> tuple[str, ...]:
         configured = ["kungfu", "host", "amp"]
@@ -5170,6 +8461,11 @@ class _PhysicalRecoveryCoordinator:
             or getattr(self, "kungfu_motion", None) is None
         ):
             configured.remove("kungfu")
+        if (
+            getattr(self, "amp_flat_v3_config", None) is not None
+            and getattr(self, "amp_flat_v3_model", None) is not None
+        ):
+            configured.append("amp-flat-v3")
         initial_controller = str(getattr(self, "initial_controller", "host"))
         if initial_controller not in configured:
             configured.append(initial_controller)
@@ -5178,6 +8474,66 @@ class _PhysicalRecoveryCoordinator:
             registered = set(worker.registered_policy_ids)
             configured = [policy for policy in configured if policy in registered]
         return tuple(dict.fromkeys(configured))
+
+    def _selected_recovery_physics_profile_id(self) -> str:
+        selected_policy_id = getattr(
+            getattr(self, "worker", None),
+            "selected_policy_id",
+            None,
+        )
+        if selected_policy_id is None:
+            selected_policy_id = getattr(self, "initial_controller", "host")
+        if selected_policy_id == "amp-flat-v3":
+            if getattr(self, "amp_flat_v3_armatures", None) is None:
+                raise RuntimeError(
+                    "AMP flat_v3 is selected without its physics profile"
+                )
+            return _LocomotionPhysicsProfiles.FLAT_V3_PROFILE_ID
+        return _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+
+    def _bfm_candidate_verified(self) -> bool:
+        return any(
+            candidate.policy_id == BFM_TEACHER50K_POLICY_ID
+            and candidate.provenance_verified
+            for candidate in getattr(self, "locomotion_policy_candidates", ())
+        )
+
+    def _validate_bfm_runtime_paths(self) -> None:
+        if not self._bfm_candidate_verified():
+            return
+        python = Path(self.bfm_python)
+        if not python.is_file():
+            raise RuntimeError(f"BFM Teacher Python is missing: {python}")
+        file_paths = {
+            "worker": self.bfm_worker_script,
+            "model": self.bfm_model,
+            "config": self.bfm_config,
+            "G1 XML": self.bfm_g1_xml,
+            "formal IK": self.bfm_formal_ik,
+        }
+        for label, path in file_paths.items():
+            if not isinstance(path, Path) or not path.is_file():
+                raise RuntimeError(f"BFM Teacher {label} is missing: {path}")
+        directory_paths = {
+            "BFM source": self.bfm_source_root,
+            "RealScan source": self.bfm_realscan_source_root,
+            "Robo-PFNN source": self.bfm_robo_pfnn_root,
+            "PFNN weights": self.bfm_pfnn_weights,
+        }
+        for label, path in directory_paths.items():
+            if not isinstance(path, Path) or not path.is_dir():
+                raise RuntimeError(f"BFM Teacher {label} is missing: {path}")
+        configured_adapter = os.environ.get(
+            "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
+            "",
+        ).strip()
+        if (
+            not configured_adapter
+            or Path(configured_adapter).resolve() != self.bfm_worker_script
+        ):
+            raise RuntimeError(
+                "BFM Teacher worker does not match the locked runtime adapter"
+            )
 
     def strategy_loadout_mapping(self) -> dict[str, object]:
         """Return the game-facing two-slot view over resident policy sessions."""
@@ -5206,6 +8562,47 @@ class _PhysicalRecoveryCoordinator:
             if getattr(worker, "selected_policy_id", None) in recovery_ids
             else str(getattr(self, "initial_controller", "host"))
         )
+        bfm_control = getattr(self, "bfm_control", None)
+        locomotion_candidates = [
+            {
+                "policy_id": "sonic",
+                "name": "SONIC",
+                "resident": True,
+                "available": True,
+                "provenance_verified": True,
+                "unavailable_reason": None,
+            },
+            *[
+                {
+                    **candidate.to_mapping(),
+                    "resident": bool(
+                        candidate.provenance_verified
+                        and bfm_control is not None
+                        and bfm_control.ready
+                    ),
+                    "available": bool(
+                        candidate.provenance_verified
+                        and bfm_control is not None
+                        and bfm_control.ready
+                        and bfm_control.warmed
+                    ),
+                    "unavailable_reason": (
+                        candidate.unavailable_reason
+                        if not candidate.provenance_verified
+                        else (
+                            "runtime_worker_loading"
+                            if bfm_control is None or not bfm_control.ready
+                            else (
+                                "runtime_shadow_warmup_pending"
+                                if not bfm_control.warmed
+                                else None
+                            )
+                        )
+                    ),
+                }
+                for candidate in getattr(self, "locomotion_policy_candidates", ())
+            ],
+        ]
         return {
             "version": 1,
             "available": bool(self.resident_policies),
@@ -5223,15 +8620,17 @@ class _PhysicalRecoveryCoordinator:
             "slots": [
                 {
                     "slot": "locomotion",
-                    "selected_policy_id": "sonic",
-                    "locked": True,
-                    "candidates": [
-                        {
-                            "policy_id": "sonic",
-                            "resident": True,
-                            "available": True,
-                        }
-                    ],
+                    "selected_policy_id": getattr(
+                        self,
+                        "selected_locomotion_policy_id",
+                        "sonic",
+                    ),
+                    "locked": not any(
+                        candidate.get("available") is True
+                        and candidate.get("policy_id") != "sonic"
+                        for candidate in locomotion_candidates
+                    ),
+                    "candidates": locomotion_candidates,
                 },
                 {
                     "slot": "recovery",
@@ -5249,6 +8648,39 @@ class _PhysicalRecoveryCoordinator:
             ],
             "resident_models": [
                 {"policy_id": "sonic", "name": "sonic", "resident": True},
+                *[
+                    {
+                        "policy_id": candidate.policy_id,
+                        "name": candidate.display_name,
+                        "resident": bool(
+                            candidate.provenance_verified
+                            and bfm_control is not None
+                            and bfm_control.ready
+                        ),
+                        "available": bool(
+                            candidate.provenance_verified
+                            and bfm_control is not None
+                            and bfm_control.ready
+                            and bfm_control.warmed
+                        ),
+                        "unavailable_reason": (
+                            candidate.unavailable_reason
+                            if not candidate.provenance_verified
+                            else (
+                                "runtime_worker_loading"
+                                if bfm_control is None or not bfm_control.ready
+                                else (
+                                    "runtime_shadow_warmup_pending"
+                                    if not bfm_control.warmed
+                                    else None
+                                )
+                            )
+                        ),
+                    }
+                    for candidate in getattr(
+                        self, "locomotion_policy_candidates", ()
+                    )
+                ],
                 *[
                     {
                         "policy_id": policy_id,
@@ -5269,12 +8701,112 @@ class _PhysicalRecoveryCoordinator:
         """Begin one writer-free slot assignment, or return an idempotent result."""
 
         if command.slot == "locomotion":
-            if command.policy_id != "sonic":
+            selected = getattr(
+                self,
+                "selected_locomotion_policy_id",
+                "sonic",
+            )
+            if command.policy_id == selected:
+                return self.strategy_loadout_mapping()
+            if self._policy_selection_pending is not None:
+                raise CommandExecutionError(
+                    "E_POLICY_SWITCH_BUSY",
+                    "A policy selection is already pending",
+                )
+            if self.fsm.state not in {
+                RecoveryState.GAME_SONIC,
+                ResidentRecoveryState.GAME_SONIC,
+            }:
+                raise CommandExecutionError(
+                    "E_POLICY_SLOT_ACTIVE",
+                    "Locomotion policy can change only while game locomotion owns control",
+                )
+            if command.policy_id == "sonic":
+                if not getattr(self, "bfm_switch_admission_ready", False):
+                    raise CommandExecutionError(
+                        "E_POLICY_SWITCH_UNSAFE",
+                        "Locomotion switch requires neutral, upright, stable "
+                        "robot state: "
+                        f"{getattr(self, 'bfm_switch_admission_reason', 'unknown')}",
+                    )
+                if selected != BFM_TEACHER50K_POLICY_ID:
+                    raise CommandExecutionError(
+                        "E_POLICY_NOT_REGISTERED",
+                        f"Locomotion policy is not switchable: {selected}",
+                    )
+                if not self.bfm_control.current_first_write:
+                    raise CommandExecutionError(
+                        "E_POLICY_WORKER_NOT_READY",
+                        "BFM Teacher does not own a confirmed writer epoch",
+                    )
+                if not self.sonic_writer.paused:
+                    raise CommandExecutionError(
+                        "E_POLICY_SWITCH_UNSAFE",
+                        "Native SONIC is not writer-fenced before return",
+                    )
+                self.bfm_control.pause()
+                self._policy_selection_pending = {
+                    "slot": "locomotion",
+                    "policy_id": "sonic",
+                    "transition_id": transition_id,
+                    "phase": "pause_bfm",
+                    "requested_monotonic_s": time.monotonic(),
+                }
+                return None
+            candidate = next(
+                (
+                    item
+                    for item in getattr(self, "locomotion_policy_candidates", ())
+                    if item.policy_id == command.policy_id
+                ),
+                None,
+            )
+            if candidate is None:
                 raise CommandExecutionError(
                     "E_POLICY_NOT_REGISTERED",
-                    "The locomotion slot currently accepts only sonic",
+                    f"Locomotion policy is not registered: {command.policy_id}",
                 )
-            return self.strategy_loadout_mapping()
+            if not candidate.provenance_verified:
+                reason = candidate.unavailable_reason or "provenance_not_verified"
+                raise CommandExecutionError(
+                    "E_POLICY_UNAVAILABLE",
+                    f"Locomotion policy is unavailable: {candidate.policy_id}: {reason}",
+                )
+            if command.policy_id == BFM_TEACHER50K_POLICY_ID:
+                if not getattr(self, "bfm_switch_admission_ready", False):
+                    raise CommandExecutionError(
+                        "E_POLICY_SWITCH_UNSAFE",
+                        "Locomotion switch requires neutral, upright, stable "
+                        "robot state: "
+                        f"{getattr(self, 'bfm_switch_admission_reason', 'unknown')}",
+                    )
+                if (
+                    not self.bfm_control.ready
+                    or not self.bfm_control.warmed
+                    or not self.bfm_control.paused
+                ):
+                    raise CommandExecutionError(
+                        "E_POLICY_WORKER_NOT_READY",
+                        "BFM Teacher resident shadow is not ready and writer-fenced",
+                    )
+                if not self.sonic_writer.current_first_write:
+                    raise CommandExecutionError(
+                        "E_POLICY_SWITCH_UNSAFE",
+                        "Native SONIC does not own a confirmed writer epoch",
+                    )
+                self.sonic_writer.send("PAUSE")
+                self._policy_selection_pending = {
+                    "slot": "locomotion",
+                    "policy_id": BFM_TEACHER50K_POLICY_ID,
+                    "transition_id": transition_id,
+                    "phase": "pause_sonic",
+                    "requested_monotonic_s": time.monotonic(),
+                }
+                return None
+            raise CommandExecutionError(
+                "E_POLICY_NOT_REGISTERED",
+                f"Locomotion policy is not switchable: {command.policy_id}",
+            )
         if not self.resident_policies:
             raise CommandExecutionError(
                 "E_POLICY_UNAVAILABLE",
@@ -5329,6 +8861,59 @@ class _PhysicalRecoveryCoordinator:
         if pending is None:
             return
         transition_id = str(pending["transition_id"])
+        if pending.get("slot") == "locomotion":
+            requested_at = float(pending["requested_monotonic_s"])
+            if time.monotonic() - requested_at > self.bfm_switch_timeout_s:
+                raise RuntimeError(
+                    "locomotion policy writer handoff exceeded its safety timeout"
+                )
+            phase = str(pending.get("phase"))
+            target = str(pending["policy_id"])
+            if target == BFM_TEACHER50K_POLICY_ID:
+                if phase == "pause_sonic" and self.sonic_writer.paused:
+                    self._apply_locomotion_physics_profile(
+                        _LocomotionPhysicsProfiles.BFM_PROFILE_ID
+                    )
+                    self.bfm_control.activate()
+                    pending["phase"] = "activate_bfm"
+                    return
+                if (
+                    phase == "activate_bfm"
+                    and self.bfm_control.current_first_write
+                ):
+                    self.selected_locomotion_policy_id = target
+                    self._policy_selection_pending = None
+                    self._policy_selection_results[transition_id] = (
+                        True,
+                        "OK_POLICY_SLOT_ASSIGNED",
+                        f"Assigned {target} to locomotion",
+                        self.strategy_loadout_mapping(),
+                    )
+                return
+            if target == "sonic":
+                if phase == "pause_bfm" and self.bfm_control.paused:
+                    self._apply_locomotion_physics_profile(
+                        _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+                    )
+                    self.sonic_writer.send("RESUME")
+                    pending["phase"] = "resume_sonic"
+                    return
+                if (
+                    phase == "resume_sonic"
+                    and self.sonic_writer.current_first_write
+                ):
+                    self.selected_locomotion_policy_id = "sonic"
+                    self._policy_selection_pending = None
+                    self._policy_selection_results[transition_id] = (
+                        True,
+                        "OK_POLICY_SLOT_ASSIGNED",
+                        "Assigned sonic to locomotion",
+                        self.strategy_loadout_mapping(),
+                    )
+                return
+            raise RuntimeError(
+                f"unsupported pending locomotion policy: {target}"
+            )
         rejection = self.worker.last_policy_selection_rejection
         if (
             rejection is not None
@@ -5384,6 +8969,9 @@ class _PhysicalRecoveryCoordinator:
         self.zmq_port = int(zmq_port)
         self.worker.open()
         self.sonic_writer.open()
+        if self._bfm_candidate_verified():
+            self._validate_bfm_runtime_paths()
+            self.bfm_control.open()
 
     def prepare_initial_sonic_gate(self) -> Path:
         self.sonic_writer.reset_for_start()
@@ -5396,8 +8984,56 @@ class _PhysicalRecoveryCoordinator:
             raise RuntimeError("initial gated SONIC has no process PID")
         self.sonic_writer.bind_expected_peer_pid(deploy_pid)
 
-    def _fall_level(self, snapshot: Any, now_s: float) -> bool:
-        root_z = float(snapshot.qpos[2])
+    def publish_bfm_shadow_state(
+        self,
+        snapshot: Any,
+        command: RobotMotionCommand,
+        *,
+        height_map_z: Any,
+    ) -> bool:
+        """Keep the resident terrain policy warm in the physical world frame."""
+
+        if not self.bfm_process_started:
+            return False
+        angle = self.initial_root_yaw_rad
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+
+        def rotate(
+            vector: tuple[float, float, float],
+        ) -> tuple[float, float, float]:
+            x, y, z = vector
+            return (
+                cosine * x - sine * y,
+                sine * x + cosine * y,
+                z,
+            )
+
+        world_command = replace(
+            command,
+            movement=rotate(command.movement),
+            facing=rotate(command.facing),
+            desired_facing=(
+                rotate(command.desired_facing)
+                if command.desired_facing is not None
+                else None
+            ),
+        )
+        return self.bfm_control.send_state(
+            snapshot,
+            world_command,
+            root_yaw=_root_yaw_rad(snapshot.qpos),
+            height_map_z=height_map_z,
+        )
+
+    def _fall_level(
+        self,
+        snapshot: Any,
+        now_s: float,
+        *,
+        ground_height_m: float = 0.0,
+    ) -> bool:
+        root_z = float(snapshot.qpos[2]) - float(ground_height_m)
         root_up_z = _root_up_z(snapshot.qpos)
         pose_candidate = (
             root_z < self.POSE_TRIGGER_HEIGHT_M
@@ -5522,10 +9158,14 @@ class _PhysicalRecoveryCoordinator:
             for item in self.worker.resident_policies
             if isinstance(item, dict)
         }
-        required_loaded = (
-            "kungfu:1307_recovery" in names
-            and "amp:walk_run_getup" in names
-            and any(name.startswith("host:") for name in names)
+        required_names = {
+            "kungfu:1307_recovery",
+            "amp:walk_run_getup",
+        }
+        if getattr(self, "amp_flat_v3_model", None) is not None:
+            required_names.add("amp-flat-v3:flat_v3_m14000")
+        required_loaded = required_names.issubset(names) and any(
+            name.startswith("host:") for name in names
         )
         return (
             policy_alive
@@ -5544,12 +9184,19 @@ class _PhysicalRecoveryCoordinator:
         *,
         now_s: float,
         neutral_confirmed: bool,
+        locomotion_switch_neutral_confirmed: bool | None = None,
         foot_contact: bool,
         grounded_contact: bool,
         processes: NativeProcessGroup,
+        ground_height_m: float = 0.0,
     ) -> RecoveryOutput | ResidentRecoveryOutput:
+        physics_profiles = getattr(self, "physics_profiles", None)
+        if physics_profiles is not None:
+            physics_profiles.verify_active()
         self.worker.poll()
         self.sonic_writer.poll()
+        if getattr(self, "bfm_process_started", False):
+            self.bfm_control.poll()
         self._reconcile_policy_slot_assignment()
         if self.fsm.state not in {
             RecoveryState.GAME_SONIC,
@@ -5565,17 +9212,58 @@ class _PhysicalRecoveryCoordinator:
             raise RuntimeError(
                 f"replacement SONIC writer gate: {self.sonic_writer.error}"
             )
+        if (
+            getattr(self, "bfm_control", None) is not None
+            and self.bfm_control.error is not None
+        ):
+            raise RuntimeError(f"BFM Teacher worker: {self.bfm_control.error}")
         if self.sonic_writer.ready and self.replacement_sonic_ready_s is None:
             self.replacement_sonic_ready_s = now_s
         qvel = tuple(float(value) for value in snapshot.qvel)
         root_linear_speed = math.sqrt(sum(value * value for value in qvel[:3]))
         root_angular_speed = math.sqrt(sum(value * value for value in qvel[3:6]))
-        joint_values = qvel[6:]
+        joint_values = _canonical_body_joint_velocities(qvel)
         joint_rms = math.sqrt(
             sum(value * value for value in joint_values) / len(joint_values)
         )
-        root_z = float(snapshot.qpos[2])
+        root_z = float(snapshot.qpos[2]) - float(ground_height_m)
         root_up_z = _root_up_z(snapshot.qpos)
+        switch_neutral_confirmed = (
+            bool(neutral_confirmed)
+            if locomotion_switch_neutral_confirmed is None
+            else bool(locomotion_switch_neutral_confirmed)
+        )
+        admission_checks = (
+            (
+                self.fsm.state is ResidentRecoveryState.GAME_SONIC,
+                "recovery_slot_active",
+            ),
+            (switch_neutral_confirmed, "input_not_neutral"),
+            (
+                not self._fall_level(
+                    snapshot,
+                    now_s,
+                    ground_height_m=ground_height_m,
+                ),
+                "fall_detected",
+            ),
+            (root_z >= 0.62 and root_up_z >= 0.85, "pose_not_upright"),
+            (root_linear_speed <= 0.15, "root_linear_motion"),
+            (root_angular_speed <= 0.35, "root_angular_motion"),
+            (joint_rms <= 0.75, "joint_motion"),
+        )
+        failed_admission = next(
+            (
+                reason
+                for passed, reason in admission_checks
+                if not passed
+            ),
+            None,
+        )
+        self.bfm_switch_admission_ready = failed_admission is None
+        self.bfm_switch_admission_reason = (
+            "ready" if failed_admission is None else failed_admission
+        )
         policy_alive = processes.recovery_policy_alive()
         worker_controller = (
             str(self.worker.last_status.get("controller"))
@@ -5587,9 +9275,38 @@ class _PhysicalRecoveryCoordinator:
             policy_ready = self._resident_worker_attested(
                 policy_alive=policy_alive
             )
+            selected_bfm = (
+                getattr(self, "selected_locomotion_policy_id", "sonic")
+                == BFM_TEACHER50K_POLICY_ID
+            )
+            game_writer_active = (
+                self.bfm_control.current_first_write
+                if selected_bfm
+                else self.sonic_writer.current_first_write
+            )
+            game_writer_paused = (
+                self.bfm_control.paused
+                if selected_bfm
+                else self.sonic_writer.paused
+            )
+            game_writer_resume_first_write = (
+                (
+                    self.bfm_control.authority_epoch > 1
+                    and self.bfm_control.epoch_first_write
+                )
+                if selected_bfm
+                else (
+                    self.sonic_writer.resume_count > 0
+                    and self.sonic_writer.epoch_first_write
+                )
+            )
             resident_observation = ResidentRecoveryInput(
                 now_s=now_s,
-                fall_detected=self._fall_level(snapshot, now_s),
+                fall_detected=self._fall_level(
+                    snapshot,
+                    now_s,
+                    ground_height_m=ground_height_m,
+                ),
                 root_z_m=root_z,
                 root_up_z=root_up_z,
                 root_linear_speed_m_s=root_linear_speed,
@@ -5608,12 +9325,9 @@ class _PhysicalRecoveryCoordinator:
                     and self.sonic_writer.ready
                     and not self.sonic_writer.writer_failed_closed
                 ),
-                sonic_writer_active=self.sonic_writer.current_first_write,
-                sonic_writer_paused=self.sonic_writer.paused,
-                sonic_resume_first_write=(
-                    self.sonic_writer.resume_count > 0
-                    and self.sonic_writer.epoch_first_write
-                ),
+                sonic_writer_active=game_writer_active,
+                sonic_writer_paused=game_writer_paused,
+                sonic_resume_first_write=game_writer_resume_first_write,
                 policy_alive=policy_alive,
                 policy_resident_ready=policy_ready,
                 policy_writer_active=(
@@ -5665,7 +9379,11 @@ class _PhysicalRecoveryCoordinator:
         gated_deploy = self.sonic_writer.expected_peer_pid is not None
         observation = RecoveryInput(
             now_s=now_s,
-            fall_detected=self._fall_level(snapshot, now_s),
+            fall_detected=self._fall_level(
+                snapshot,
+                now_s,
+                ground_height_m=ground_height_m,
+            ),
             root_z_m=root_z,
             root_up_z=root_up_z,
             root_linear_speed_m_s=root_linear_speed,
@@ -5919,7 +9637,7 @@ class _PhysicalRecoveryCoordinator:
                 if mode == "turn" or limited:
                     rotated_movement = (0.0, 0.0, 0.0)
                     speed_mps = 0.0
-                    locomotion_mode = SONIC_SLOW_WALK_MODE
+                    locomotion_mode = SONIC_IDLE_MODE
                     mode = "turn"
                     if limited:
                         reason = "recovery_heading_slew_limited"
@@ -6047,8 +9765,34 @@ class _PhysicalRecoveryCoordinator:
         if (
             output is not None
             and isinstance(output.state, ResidentRecoveryState)
-            and output.state is not ResidentRecoveryState.GAME_SONIC
         ):
+            if output.state is ResidentRecoveryState.GAME_SONIC:
+                # Resident recovery returns authority to the same SONIC
+                # process and therefore never creates a new deploy yaw frame.
+                # Applying the replacement-deploy 1 rad/s wire limiter here
+                # double-limits the core's already feedback-bounded 2.5 rad/s
+                # turn, forcing ordinary camera-relative running into long
+                # turn-only (zero-translation) intervals.
+                if not math.isclose(
+                    self.command_frame_rotation_rad,
+                    0.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise RuntimeError(
+                        "resident SONIC command frame unexpectedly rotated"
+                    )
+                facing_norm = math.hypot(command.facing[0], command.facing[1])
+                if facing_norm <= 1e-12:
+                    raise ValueError(
+                        "resident SONIC command has zero horizontal facing"
+                    )
+                self.last_wire_facing_heading_rad = math.atan2(
+                    command.facing[1], command.facing[0]
+                )
+                self.last_reframe_limited = False
+                self.last_reframe_heading_error_rad = 0.0
+                return command
             # The resident deploy keeps consuming planner frames while KungFu
             # owns LowCmd. Track the live body yaw so RESUME cannot inherit a
             # stale camera-facing turn request during the fragile handoff.
@@ -6087,6 +9831,11 @@ class _PhysicalRecoveryCoordinator:
         processes: NativeProcessGroup,
         planner: NativePlannerClient,
     ) -> None:
+        if (
+            self._bfm_candidate_verified()
+            and not self.bfm_process_started
+        ):
+            self.start_bfm_shadow(processes=processes)
         game_state = output.state in {
             RecoveryState.GAME_SONIC,
             ResidentRecoveryState.GAME_SONIC,
@@ -6110,14 +9859,40 @@ class _PhysicalRecoveryCoordinator:
         if output.start_policy_process:
             self.start_writer_free_policy(processes=processes)
         if self.resident_policies:
+            selected_bfm = (
+                getattr(self, "selected_locomotion_policy_id", "sonic")
+                == BFM_TEACHER50K_POLICY_ID
+            )
             if output.request_sonic_pause:
-                if not (
+                if selected_bfm:
+                    if not (
+                        self.bfm_control.paused
+                        or self.bfm_control.pause_pending
+                        or self.bfm_control.stop_sent
+                    ):
+                        self.bfm_control.pause()
+                elif not (
                     self.sonic_writer.paused
                     or self.sonic_writer.pause_pending
                     or self.sonic_writer.stop_sent
                 ):
                     self.sonic_writer.send("PAUSE")
+            if (
+                selected_bfm
+                and output.state
+                is ResidentRecoveryState.SONIC_QUIET
+                and self.bfm_control.paused
+            ):
+                # The active BFM writer is now fenced.  Restore the recovery
+                # policies' qualified plant before assessing takeover or
+                # authorizing their writer.
+                self._apply_locomotion_physics_profile(
+                    self._selected_recovery_physics_profile_id()
+                )
             if output.authorize_policy_writer:
+                self._apply_locomotion_physics_profile(
+                    self._selected_recovery_physics_profile_id()
+                )
                 episode_id = self.worker.begin_resident_episode()
                 self.current_recovery_worker_episode_id = episode_id
                 self.worker.send("GO")
@@ -6125,7 +9900,19 @@ class _PhysicalRecoveryCoordinator:
                 if not self.worker.paused and not self.worker.pause_sent:
                     self.worker.send("PAUSE")
             if output.resume_sonic_writer:
-                if self.sonic_writer.paused and not self.sonic_writer.resume_pending:
+                if selected_bfm:
+                    if (
+                        self.bfm_control.paused
+                        and not self.bfm_control.activation_pending
+                    ):
+                        self._apply_locomotion_physics_profile(
+                            _LocomotionPhysicsProfiles.BFM_PROFILE_ID
+                        )
+                        self.bfm_control.activate()
+                elif self.sonic_writer.paused and not self.sonic_writer.resume_pending:
+                    self._apply_locomotion_physics_profile(
+                        _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+                    )
                     self.sonic_writer.send("RESUME")
             return
         if output.request_sonic_stop:
@@ -6208,6 +9995,10 @@ class _PhysicalRecoveryCoordinator:
             amp_model=self.amp_model,
             amp_config_sha256=self.amp_config_sha256,
             amp_model_sha256=self.amp_model_sha256,
+            amp_flat_v3_config=self.amp_flat_v3_config,
+            amp_flat_v3_model=self.amp_flat_v3_model,
+            amp_flat_v3_config_sha256=self.amp_flat_v3_config_sha256,
+            amp_flat_v3_model_sha256=self.amp_flat_v3_model_sha256,
             kungfu_model=self.kungfu_model,
             kungfu_motion=self.kungfu_motion,
             kungfu_model_sha256=self.kungfu_model_sha256,
@@ -6219,6 +10010,38 @@ class _PhysicalRecoveryCoordinator:
             execution_provider=self.execution_provider,
         )
         self.worker.bind_expected_peer_pid(worker_pid)
+        return worker_pid
+
+    def start_bfm_shadow(self, *, processes: NativeProcessGroup) -> int:
+        """Start the provenance-locked terrain policy without writer authority."""
+
+        self._validate_bfm_runtime_paths()
+        assert self.bfm_model is not None
+        assert self.bfm_config is not None
+        assert self.bfm_source_root is not None
+        assert self.bfm_realscan_source_root is not None
+        assert self.bfm_robo_pfnn_root is not None
+        assert self.bfm_pfnn_weights is not None
+        assert self.bfm_g1_xml is not None
+        assert self.bfm_formal_ik is not None
+        worker_pid = processes.start_bfm_teacher(
+            self.bfm_python,
+            self.bfm_worker_script,
+            interface=self.interface,
+            control_socket=self.bfm_control.path,
+            model=self.bfm_model,
+            config=self.bfm_config,
+            bfm_source_root=self.bfm_source_root,
+            realscan_source_root=self.bfm_realscan_source_root,
+            robo_pfnn_root=self.bfm_robo_pfnn_root,
+            weights=self.bfm_pfnn_weights,
+            g1_xml=self.bfm_g1_xml,
+            formal_ik=self.bfm_formal_ik,
+            execution_provider=self.execution_provider,
+            activation_blend_seconds=self.bfm_activation_blend_seconds,
+        )
+        self.bfm_control.bind_expected_peer_pid(worker_pid)
+        self.bfm_process_started = True
         return worker_pid
 
     def verify_writer_free_prewarm_start(
@@ -6262,8 +10085,17 @@ class _PhysicalRecoveryCoordinator:
             "resident_policies_enabled": self.resident_policies,
             "execution_provider": self.execution_provider,
             "state": self.fsm.state.value,
+            "selected_locomotion_policy_id": (
+                self.selected_locomotion_policy_id
+            ),
             "authority_policy_id": (
-                output.authority_policy_id if output is not None else "sonic"
+                self.selected_locomotion_policy_id
+                if self.fsm.state is ResidentRecoveryState.GAME_SONIC
+                else (
+                    output.authority_policy_id
+                    if output is not None
+                    else self.selected_locomotion_policy_id
+                )
             ),
             "recovery_policy_id": (
                 output.recovery_policy_id
@@ -6279,6 +10111,13 @@ class _PhysicalRecoveryCoordinator:
             "deploy_generation": processes.deploy_generation,
             "sonic_pid": self.sonic_writer.expected_peer_pid,
             "recovery_policy_pid": self.worker.expected_peer_pid,
+            "bfm_teacher_pid": self.bfm_control.expected_peer_pid,
+            "locomotion_switch_admission_ready": bool(
+                self.bfm_switch_admission_ready
+            ),
+            "locomotion_switch_admission_reason": (
+                self.bfm_switch_admission_reason
+            ),
             "resident_process_identity_stable": (
                 self.resident_policies
                 and processes.deploy_alive()
@@ -6317,6 +10156,12 @@ class _PhysicalRecoveryCoordinator:
             ),
             "worker": self.worker.telemetry(),
             "sonic_writer_gate": self.sonic_writer.telemetry(),
+            "bfm_teacher_writer_gate": self.bfm_control.telemetry(),
+            "locomotion_physics_profiles": (
+                self.physics_profiles.telemetry()
+                if getattr(self, "physics_profiles", None) is not None
+                else {"available": False}
+            ),
             "replacement_sonic_writer_gate": self.sonic_writer.telemetry(),
             "initial_sonic_gate_pending": self.initial_sonic_gate_pending,
             "previous_sonic_writer_revoked": (
@@ -6397,6 +10242,7 @@ class _PhysicalRecoveryCoordinator:
     def close(self) -> None:
         self.worker.close()
         self.sonic_writer.close()
+        self.bfm_control.close()
 
 
 def _reanchor_game_heading_after_recovery_transition(
@@ -6464,7 +10310,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ("game_world_revision", None),
         ("game_world_state_file", None),
         ("game_world_checkpoint_seconds", 0.75),
+        ("game_world_resume_checkpoint_id", None),
+        ("game_world_resume_generation", None),
+        ("game_resume_rollback_count", 0),
         ("game_auto_respawn", False),
+        ("game_video_settings_file", None),
+        ("game_applied_video_settings_json", None),
+        ("moon_dynamic_map", None),
+        ("moon_dynamic_map_sha256", None),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -6474,6 +10327,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     model_path = args.model.resolve()
     if not model_path.is_file():
         raise SystemExit(f"composed Matrix model is missing: {model_path}")
+    _validate_moon_dynamic_ground_model_binding(
+        model_path,
+        map_path=args.moon_dynamic_map,
+        map_sha256=args.moon_dynamic_map_sha256,
+    )
     if args.physics_hz <= 0.0 or args.control_hz <= 0.0:
         raise SystemExit("--physics-hz and --control-hz must be positive")
     if not math.isfinite(args.max_seconds) or args.max_seconds < 0.0:
@@ -6493,15 +10351,83 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     if args.ue_pid is not None and args.ue_pid <= 1:
         raise SystemExit("--ue-pid must identify a live UE process")
     game_config = None
+    motion_settings_store: MotionSettingsStore | None = None
     if args.control_source == "game":
+        motion_settings_path = getattr(args, "game_motion_settings_file", None)
+        if motion_settings_path is not None:
+            if not motion_settings_path.is_absolute():
+                raise SystemExit("--game-motion-settings-file must be absolute")
+            try:
+                configured_motion_defaults = MotionSettings(
+                    revision=0,
+                    slow_speed_mps=args.game_keyboard_slow_speed,
+                    slow_double_tap_speed_mps=(
+                        args.game_keyboard_slow_boost_speed
+                    ),
+                    walk_speed_mps=args.game_keyboard_walk_speed,
+                    walk_double_tap_speed_mps=(
+                        args.game_keyboard_walk_boost_speed
+                    ),
+                    run_speed_mps=args.game_keyboard_run_speed,
+                    run_double_tap_speed_mps=(
+                        args.game_keyboard_run_boost_speed
+                    ),
+                )
+            except MotionSettingsError as exc:
+                raise SystemExit(
+                    f"invalid configured keyboard motion defaults: {exc.message}"
+                ) from exc
+            motion_settings_store = MotionSettingsStore(
+                motion_settings_path,
+                fallback=configured_motion_defaults,
+            )
+            motion = motion_settings_store.settings
+            args.game_keyboard_slow_speed = motion.slow_speed_mps
+            args.game_keyboard_slow_boost_speed = (
+                motion.slow_double_tap_speed_mps
+            )
+            args.game_keyboard_walk_speed = motion.walk_speed_mps
+            args.game_keyboard_walk_boost_speed = (
+                motion.walk_double_tap_speed_mps
+            )
+            args.game_keyboard_run_speed = motion.run_speed_mps
+            args.game_keyboard_run_boost_speed = (
+                motion.run_double_tap_speed_mps
+            )
+            args.game_motion_settings_load_status = (
+                motion_settings_store.load_status
+            )
+            args.game_motion_settings_revision = motion.revision
+        else:
+            args.game_motion_settings_load_status = "disabled"
+            args.game_motion_settings_revision = None
         if args.game_max_speed > 0.8:
             raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
+        if (
+            not math.isfinite(args.game_keyboard_double_tap_window)
+            or not 0.15 <= args.game_keyboard_double_tap_window <= 0.50
+        ):
+            raise SystemExit(
+                "--game-keyboard-double-tap-window must be in [0.15, 0.50]"
+            )
         try:
             game_config = ControlConfig(
                 max_speed_mps=args.game_max_speed,
                 max_acceleration_mps2=args.game_max_acceleration,
                 max_deceleration_mps2=args.game_max_deceleration,
                 max_turn_rate_rad_s=args.game_max_turn_rate,
+                keyboard_slow_speed_mps=args.game_keyboard_slow_speed,
+                keyboard_slow_boost_speed_mps=(
+                    args.game_keyboard_slow_boost_speed
+                ),
+                keyboard_walk_speed_mps=args.game_keyboard_walk_speed,
+                keyboard_walk_boost_speed_mps=(
+                    args.game_keyboard_walk_boost_speed
+                ),
+                keyboard_run_speed_mps=args.game_keyboard_run_speed,
+                keyboard_run_boost_speed_mps=(
+                    args.game_keyboard_run_boost_speed
+                ),
                 stick_deadzone=args.game_stick_deadzone,
                 input_timeout_s=args.game_input_timeout,
                 max_snapshot_age_s=args.game_max_snapshot_age,
@@ -6557,6 +10483,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             and not args.game_mouse_settings_file.is_absolute()
         ):
             raise SystemExit("--game-mouse-settings-file must be absolute")
+        if (
+            args.game_video_settings_file is not None
+            and not args.game_video_settings_file.is_absolute()
+        ):
+            raise SystemExit("--game-video-settings-file must be absolute")
         if args.game_camera_yaw_source == "ue-final-pov":
             if args.game_ue_camera_state_file is None:
                 raise SystemExit(
@@ -6585,6 +10516,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             and args.game_restart_launcher_pid <= 1
         ):
             raise SystemExit("--game-restart-launcher-pid must be greater than one")
+        try:
+            _validate_game_external_control(
+                input_socket=args.game_input_socket,
+                external_socket=args.game_external_control_socket,
+                external_capability_file=(
+                    args.game_external_control_capability_file
+                ),
+                external_deadman_seconds=(
+                    args.game_external_control_deadman_seconds
+                ),
+                restart_request_file=args.game_restart_request_file,
+                restart_capability_file=args.game_restart_capability_file,
+                require_external_parents=True,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
         if not args.no_game_input_provider:
             if args.ue_pid is None:
                 raise SystemExit(
@@ -6608,6 +10555,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         value is not None for value in world_values
     ):
         raise SystemExit("game world-state arguments are all-or-none")
+    try:
+        _validate_game_world_resume_metadata(
+            selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+            selected_generation=args.game_world_resume_generation,
+            rollback_count=args.game_resume_rollback_count,
+            world_state_configured=all(value is not None for value in world_values),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if all(value is not None for value in world_values):
         if args.control_source != "game":
             raise SystemExit("game world-state persistence requires game control")
@@ -6633,6 +10589,57 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             raise SystemExit(
                 "bounded qualification rejects persistent game world state"
             )
+    game_celestial_clock_state_file = getattr(
+        args, "game_celestial_clock_state_file", None
+    )
+    if game_celestial_clock_state_file is not None:
+        if args.control_source != "game":
+            raise SystemExit("celestial clock persistence requires game control")
+        if not all(value is not None for value in world_values):
+            raise SystemExit(
+                "celestial clock persistence requires persistent game world state"
+            )
+        if not game_celestial_clock_state_file.is_absolute():
+            raise SystemExit("--game-celestial-clock-state-file must be absolute")
+        if (
+            game_celestial_clock_state_file.exists()
+            and (
+                game_celestial_clock_state_file.is_symlink()
+                or not game_celestial_clock_state_file.is_file()
+            )
+        ):
+            raise SystemExit(
+                "--game-celestial-clock-state-file must be a regular file when present"
+            )
+    celestial_assets_manifest = getattr(
+        args, "game_celestial_assets_manifest", None
+    )
+    celestial_assets = (
+        getattr(args, "game_celestial_de440s_kernel", None),
+        getattr(args, "game_celestial_jplephem_wheel", None),
+    )
+    if args.control_source == "game" and celestial_assets_manifest is not None:
+        if (
+            not celestial_assets_manifest.is_absolute()
+            or celestial_assets_manifest.is_symlink()
+            or not celestial_assets_manifest.is_file()
+        ):
+            raise SystemExit(
+                "--game-celestial-assets-manifest must be an absolute regular file"
+            )
+    if any(value is not None for value in celestial_assets) and not all(
+        value is not None for value in celestial_assets
+    ):
+        raise SystemExit("game celestial ephemeris assets are all-or-none")
+    if any(value is not None for value in celestial_assets):
+        if args.control_source != "game":
+            raise SystemExit("celestial ephemeris assets require game control")
+        for path in celestial_assets:
+            assert path is not None
+            if not path.is_absolute() or path.is_symlink() or not path.is_file():
+                raise SystemExit(
+                    "game celestial ephemeris assets must be absolute regular files"
+                )
     if args.game_auto_respawn:
         if not all(value is not None for value in world_values):
             raise SystemExit("--game-auto-respawn requires game world-state persistence")
@@ -6711,28 +10718,111 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             raise SystemExit(f"cannot load creative inventory catalog: {exc}") from exc
 
     config = SimLoopConfig(**_native_config_kwargs(args, model_path))
-    if creative_items is None:
-        simulator = create_simulator(config)
-    else:
-        simulator = _create_simulator_with_creative_inventory_contract(
-            create_simulator,
-            config,
-            _creative_inventory_joint_names(creative_items),
-        )
+    simulator = None
     creative_inventory = None
-    if creative_items is not None:
+    moon_dynamic_ground: MoonDynamicGround | None = None
+    expected_snapshot_dims = _EXPECTED_SNAPSHOT_DIMS
+    mujoco_module = sys.modules.get("mujoco")
+
+    def pose_clearance_audit(pose: WorldPose) -> dict[str, object]:
+        model = getattr(getattr(simulator, "sim_env", None), "mj_model", None)
+        return apply_root_pose_and_audit(
+            mujoco_module,
+            model,
+            pose,
+            data_preparer=(
+                moon_dynamic_ground.update_mocap
+                if moon_dynamic_ground is not None
+                else None
+            ),
+        )
+
+    def local_ground_height(snapshot: Any) -> float:
+        if moon_dynamic_ground is None:
+            return 0.0
         try:
-            creative_inventory = CreativeInventoryRuntime(
-                simulator,
-                Path(creative_catalog_value),
+            return moon_dynamic_ground.sample_height(
+                snapshot.qpos[0],
+                snapshot.qpos[1],
             )
-        except (CreativeInventoryError, OSError, ValueError) as exc:
-            raise SystemExit(f"cannot initialize creative inventory: {exc}") from exc
-    expected_snapshot_dims = (
-        creative_inventory.expected_snapshot_dimensions
-        if creative_inventory is not None
-        else _EXPECTED_SNAPSHOT_DIMS
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise MoonDynamicGroundError(
+                "MoonWorld snapshot has no finite root x/y"
+            ) from exc
+
+    def bfm_height_map(snapshot: Any) -> Any:
+        """Sample the Teacher's heading-aligned 11x11 terrain grid."""
+
+        root_x = float(snapshot.qpos[0])
+        root_y = float(snapshot.qpos[1])
+        root_z = float(snapshot.qpos[2])
+        root_yaw = _root_yaw_rad(snapshot.qpos)
+        center_height = local_ground_height(snapshot)
+        offsets = np.linspace(-0.75, 0.75, 11, dtype=np.float64)
+        result = np.empty((11, 11), dtype=np.float32)
+        cosine = math.cos(root_yaw)
+        sine = math.sin(root_yaw)
+        environment = getattr(simulator, "sim_env", None)
+        model = getattr(environment, "mj_model", None)
+        data = getattr(environment, "mj_data", None)
+
+        for row, local_x in enumerate(offsets):
+            for column, local_y in enumerate(offsets):
+                world_x = root_x + cosine * local_x - sine * local_y
+                world_y = root_y + sine * local_x + cosine * local_y
+                if moon_dynamic_ground is not None:
+                    height = moon_dynamic_ground.sample_height(
+                        world_x,
+                        world_y,
+                    )
+                elif (
+                    mujoco_module is not None
+                    and model is not None
+                    and data is not None
+                ):
+                    height = _static_terrain_ray_height(
+                        mujoco_module,
+                        np,
+                        model,
+                        data,
+                        world_x=world_x,
+                        world_y=world_y,
+                        origin_z=root_z + 2.0,
+                        fallback_height=center_height,
+                        minimum_height=center_height - 3.0,
+                        maximum_height=root_z + 1.5,
+                    )
+                else:
+                    height = center_height
+                if (
+                    not math.isfinite(float(height))
+                    or float(height) < center_height - 3.0
+                    or float(height) > root_z + 1.5
+                ):
+                    height = center_height
+                result[row, column] = float(height)
+        return result
+
+    def live_clearance_audit() -> dict[str, object]:
+        environment = getattr(simulator, "sim_env", None)
+        return audit_spawn_clearance(
+            getattr(environment, "mj_model", None),
+            getattr(environment, "mj_data", None),
+        )
+
+    def live_checkpoint_audit() -> dict[str, object]:
+        environment = getattr(simulator, "sim_env", None)
+        return audit_spawn_safety(
+            mujoco_module,
+            getattr(environment, "mj_model", None),
+            getattr(environment, "mj_data", None),
+        )
+
+    resume_probation = _GameWorldResumeProbation(
+        selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+        clearance_auditor=live_clearance_audit,
     )
+
     renderer = None
     planner = None
     game_input = None
@@ -6744,6 +10834,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     physical_recovery = None
     game_command = None
     processes = None
+    resume_probation_selected = resume_probation.enabled
+    resume_rollback_ineligibility: str | None = None
+    resume_rollback_requested = False
+    resume_checkpoint_read_only_fall_stop = False
     previous_signal_handlers: dict[int, Any] = {}
     running = True
     termination_reason: str | None = None
@@ -6753,8 +10847,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     world_checkpoint_failed = False
     proposed_exit_code = 2
     final_status: dict[str, Any] | None = None
+    spawn_clearance_audit: dict[str, object] | None = None
+    final_checkpoint_identity: dict[str, object] | None = None
+    reused_resume_checkpoint_identity: dict[str, object] | None = None
     termination_boundary_previous_mask: set[signal.Signals] | None = None
     termination_boundary_safe = False
+    # Keep every cleanup/status time calculation bound even if simulator
+    # construction or the first snapshot fails.  A successful startup resets
+    # this baseline immediately before entering the runtime loop below.
+    started_wall = time.perf_counter()
 
     def request_stop(signum, _frame) -> None:
         nonlocal running, termination_reason, termination_signal
@@ -6764,14 +10865,59 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             termination_reason = "signal"
 
     try:
-        # Install handlers before any child is started. Everything after the
-        # simulator construction is inside this cleanup boundary.
+        # Install handlers before constructing any runtime resource.  A
+        # simulator that is successfully returned, including one constructed
+        # while a termination signal is handled, is therefore owned by the
+        # same finally/cleanup boundary as every child process.
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handler = signal.getsignal(signum)
             signal.signal(signum, request_stop)
             previous_signal_handlers[int(signum)] = previous_handler
 
+        if creative_items is None:
+            simulator = create_simulator(config)
+        else:
+            simulator = _create_simulator_with_creative_inventory_contract(
+                create_simulator,
+                config,
+                _creative_inventory_joint_names(creative_items),
+            )
+            try:
+                creative_inventory = CreativeInventoryRuntime(
+                    simulator,
+                    Path(creative_catalog_value),
+                )
+            except (CreativeInventoryError, OSError, ValueError) as exc:
+                raise SystemExit(
+                    f"cannot initialize creative inventory: {exc}"
+                ) from exc
+            expected_snapshot_dims = creative_inventory.expected_snapshot_dimensions
+        if args.moon_dynamic_map is not None:
+            environment = getattr(simulator, "sim_env", None)
+            model = getattr(environment, "mj_model", None)
+            data = getattr(environment, "mj_data", None)
+            if mujoco_module is None or model is None or data is None:
+                raise SystemExit(
+                    "MoonWorld dynamic ground requires live MuJoCo model/data"
+                )
+            try:
+                moon_dynamic_ground = MoonDynamicGround(
+                    args.moon_dynamic_map,
+                    model,
+                    expected_sha256=args.moon_dynamic_map_sha256,
+                )
+                moon_dynamic_ground.update_mocap(data)
+                mujoco_module.mj_forward(model, data)
+                _install_moon_relative_fall_check(
+                    environment,
+                    moon_dynamic_ground,
+                )
+            except (MoonDynamicGroundError, OSError, ValueError) as exc:
+                raise SystemExit(
+                    f"cannot initialize MoonWorld dynamic ground: {exc}"
+                ) from exc
         snapshot = simulator.get_state_snapshot()
+        initial_ground_height_m = local_ground_height(snapshot)
         initial_snapshot_error = _snapshot_validation_error(
             snapshot,
             expected_dims=expected_snapshot_dims,
@@ -6780,6 +10926,26 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             raise SystemExit(
                 f"invalid native SONIC initial snapshot: {initial_snapshot_error}"
             )
+        if args.control_source == "game":
+            spawn_clearance_audit = pose_clearance_audit(
+                _snapshot_world_pose(snapshot)
+            )
+        if (
+            spawn_clearance_audit is not None
+            and spawn_clearance_audit.get("safe") is not True
+        ):
+            running = False
+            termination_reason = "spawn_clearance_failed"
+            numerical_error = (
+                "spawn_clearance:"
+                f"{spawn_clearance_audit.get('reason', 'audit_error')}"
+            )
+            worst = spawn_clearance_audit.get("worst")
+            print(
+                "matrix-sonic-runtime ERROR unsafe spawn clearance: "
+                f"reason={spawn_clearance_audit.get('reason')} worst={worst}",
+                flush=True,
+            )
         if args.game_world_state_file is not None:
             try:
                 game_world = _GameWorldStateRuntime(
@@ -6787,13 +10953,26 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     world_id=args.game_world_id,
                     world_revision=args.game_world_revision,
                     checkpoint_seconds=args.game_world_checkpoint_seconds,
+                    selected_resume_checkpoint_id=(
+                        args.game_world_resume_checkpoint_id
+                    ),
+                    selected_resume_generation=args.game_world_resume_generation,
+                    clearance_auditor=live_checkpoint_audit,
                 )
-                if _snapshot_world_upright(snapshot):
+                if (
+                    running
+                    and resume_probation.checkpoint_writes_armed
+                    and _snapshot_world_upright(
+                        snapshot,
+                        ground_height_m=initial_ground_height_m,
+                    )
+                ):
                     game_world.checkpoint(
                         snapshot,
                         now_s=time.perf_counter(),
                         force=True,
                         required=bool(args.game_auto_respawn),
+                        ground_height_m=initial_ground_height_m,
                     )
             except WorldStateError as exc:
                 raise SystemExit(f"cannot initialize game world state: {exc}") from exc
@@ -6861,6 +11040,36 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 failure = processes.failed_child()
             return register_child_failure(failure)
 
+        def stop_for_physical_recovery_exception(
+            exc: BaseException,
+            *,
+            action: bool,
+        ) -> None:
+            """Fail closed while retaining an EOF peer's original exit status."""
+
+            nonlocal unstable, running, termination_reason, numerical_error
+            unstable = True
+            running = False
+            context = "physical_recovery_action" if action else "physical_recovery"
+            numerical_error = f"{context}:{exc}"
+            classified_child = False
+            if isinstance(exc, _ManagedControlDisconnect):
+                classified_child = register_child_failure(
+                    processes.wait_for_unexpected_child(
+                        exc.child_name,
+                        timeout=0.1,
+                    )
+                )
+            if not classified_child:
+                classified_child = poll_failed_child()
+            if not classified_child:
+                termination_reason = "physical_recovery_failed"
+            label = "physical recovery action" if action else "physical recovery"
+            print(
+                f"matrix-sonic-runtime ERROR {label}: {exc}",
+                flush=True,
+            )
+
         # The parent shell supervises UE from the instant it is spawned. A UE
         # failure during the historical seven-second startup window is already
         # present here and must prevent deploy/PICO from starting.
@@ -6874,9 +11083,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             )
             if args.control_source == "game":
                 assert game_config is not None
+                game_control_core = GameControlCore(game_config)
                 game_input = GameInputRuntime(
                     args.game_input_socket,
-                    GameControlCore(game_config),
+                    game_control_core,
                 )
                 game_readiness = _GameSonicReadinessGate(snapshot)
                 if getattr(args, "game_fall_recovery", "off") == "sonic":
@@ -6888,6 +11098,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         args,
                         initial_root_yaw_rad=initial_root_yaw_rad,
                     )
+                    if physical_recovery.resident_policies:
+                        environment = getattr(simulator, "sim_env", None)
+                        physical_recovery.bind_locomotion_physics_profiles(
+                            mujoco_module,
+                            getattr(environment, "mj_model", None),
+                            getattr(environment, "mj_data", None),
+                        )
                     physical_recovery.open(zmq_port=planner_port)
                 if not args.no_game_input_provider and (
                     game_world is not None
@@ -6903,6 +11120,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         game_world,
                         policy_slots=physical_recovery,
                         creative_inventory=creative_inventory,
+                        motion_settings=motion_settings_store,
+                        control_core=game_control_core,
+                        pose_clearance_auditor=pose_clearance_audit,
                     )
                 try:
                     game_input.open()
@@ -6920,7 +11140,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         look_button=args.game_look_button,
                         initial_camera_yaw_deg=args.game_initial_camera_yaw_deg,
                         mouse_sensitivity_deg=args.game_mouse_sensitivity_deg,
+                        keyboard_double_tap_window_s=(
+                            args.game_keyboard_double_tap_window
+                        ),
                         mouse_settings_file=args.game_mouse_settings_file,
+                        video_settings_file=args.game_video_settings_file,
+                        applied_video_settings_json=(
+                            args.game_applied_video_settings_json
+                        ),
                         applied_mouse_profile=args.game_applied_mouse_profile,
                         applied_mouse_speed_scale=(
                             args.game_applied_mouse_speed_scale
@@ -6930,6 +11157,15 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             args.game_restart_capability_file
                         ),
                         restart_launcher_pid=args.game_restart_launcher_pid,
+                        external_control_socket=(
+                            args.game_external_control_socket
+                        ),
+                        external_control_capability_file=(
+                            args.game_external_control_capability_file
+                        ),
+                        external_control_deadman_seconds=(
+                            args.game_external_control_deadman_seconds
+                        ),
                         camera_yaw_sign=args.game_camera_yaw_sign,
                         camera_yaw_offset_deg=(
                             applied_game_camera_yaw_offset_deg
@@ -6943,6 +11179,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             args.gamepad_look_pitch_rate_deg_s
                         ),
                         gamepad_look_deadzone=args.gamepad_look_deadzone,
+                        gamepad_move_deadzone=args.game_stick_deadzone,
                         gamepad_look_min_pitch_deg=(
                             args.gamepad_look_min_pitch_deg
                         ),
@@ -6976,6 +11213,48 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             if creative_inventory is not None
                             else None
                         ),
+                        motion_settings_json=(
+                            json.dumps(
+                                motion_settings_store.mapping(),
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            if motion_settings_store is not None
+                            else None
+                        ),
+                        celestial_clock_state_file=(
+                            getattr(args, "game_celestial_clock_state_file", None)
+                        ),
+                        celestial_lighting_bridge=getattr(
+                            args,
+                            "game_celestial_lighting_bridge",
+                            "state-only",
+                        ),
+                        celestial_assets_manifest=getattr(
+                            args,
+                            "game_celestial_assets_manifest",
+                            None,
+                        ),
+                        celestial_visual_catalog=getattr(
+                            args,
+                            "game_celestial_visual_catalog",
+                            None,
+                        ),
+                        celestial_visual_profile=getattr(
+                            args,
+                            "game_celestial_visual_profile",
+                            "auto",
+                        ),
+                        celestial_de440s_kernel=getattr(
+                            args,
+                            "game_celestial_de440s_kernel",
+                            None,
+                        ),
+                        celestial_jplephem_wheel=getattr(
+                            args,
+                            "game_celestial_jplephem_wheel",
+                            None,
+                        ),
                     )
                     if game_command_child_socket is not None:
                         game_command_child_socket.close()
@@ -6999,8 +11278,31 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             if physical_recovery is not None:
                 physical_recovery.bind_initial_sonic_gate(processes=processes)
 
+        try:
+            render_qpos, render_qvel, render_ctrl = _canonical_render_vectors(
+                snapshot
+            )
+        except ValueError as exc:
+            raise SystemExit(f"cannot project canonical UE render state: {exc}") from exc
+        render_dimensions = {
+            "qpos": len(render_qpos),
+            "qvel": len(render_qvel),
+            "ctrl": len(render_ctrl),
+        }
+        physics_dimensions = {
+            "qpos": len(snapshot.qpos),
+            "qvel": len(snapshot.qvel),
+            "ctrl": len(snapshot.ctrl),
+        }
+        render_projection = (
+            "identity"
+            if render_dimensions == physics_dimensions
+            else "canonical_g1_robot_prefix"
+        )
         expected_packet_size = packet_size(
-            nq=len(snapshot.qpos), nv=len(snapshot.qvel), nu=len(snapshot.ctrl)
+            nq=render_dimensions["qpos"],
+            nv=render_dimensions["qvel"],
+            nu=render_dimensions["ctrl"],
         )
         render_target = (
             "disabled"
@@ -7013,7 +11315,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             f"model={model_path} nq={len(snapshot.qpos)} nv={len(snapshot.qvel)} "
             f"nu={len(snapshot.ctrl)} physics_hz={physics_hz:.1f} "
             f"control_hz={args.control_hz:.1f} substeps={substeps} "
-            f"render={render_target} packet_bytes={expected_packet_size} "
+            f"render={render_target} "
+            f"render_dims={render_dimensions['qpos']}/"
+            f"{render_dimensions['qvel']}/{render_dimensions['ctrl']} "
+            f"render_projection={render_projection} "
+            f"packet_bytes={expected_packet_size} "
             f"control_source={args.control_source}",
             flush=True,
         )
@@ -7033,10 +11339,17 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         control_frames = 0
         active_frames = 0
         physics_steps = 0
-        instability_resets = int(snapshot.reset_count)
+        initial_reset_count = int(snapshot.reset_count)
+        resume_rollback_evidence = _ResumeRollbackEvidence(
+            initial_reset_count=initial_reset_count
+        )
+        resume_rollback_evidence.observe(snapshot)
+        instability_resets = initial_reset_count
         unstable = False
         fall_detected = bool(snapshot.fall_detected)
         min_root_z = float(snapshot.qpos[2])
+        min_root_clearance_m = min_root_z - initial_ground_height_m
+        snapshot_ground_height_m = initial_ground_height_m
         active_started_wall = None
         longest_active_elapsed_s = 0.0
         walking = False
@@ -7046,6 +11359,18 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             if poll_failed_child():
                 break
             frame_wall = time.perf_counter()
+            try:
+                frame_ground_height_m = local_ground_height(snapshot)
+            except MoonDynamicGroundError as exc:
+                unstable = True
+                running = False
+                termination_reason = "numerical_instability"
+                numerical_error = f"moon_dynamic_ground:{exc}"
+                print(
+                    f"matrix-sonic-runtime ERROR MoonWorld ground sample: {exc}",
+                    flush=True,
+                )
+                break
             elapsed_wall = frame_wall - started_wall
             if args.max_seconds > 0.0 and elapsed_wall >= args.max_seconds:
                 if termination_reason is None:
@@ -7078,6 +11403,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             recovery_transition = game_fall_recovery.observe(
                                 snapshot,
                                 now_s=frame_wall,
+                                ground_height_m=frame_ground_height_m,
                             )
                         except ValueError as exc:
                             unstable = True
@@ -7141,24 +11467,28 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             candidate_game_command.mode == "idle"
                             and not candidate_game_command.safe_stop
                         )
+                        locomotion_switch_neutral_confirmed = (
+                            _locomotion_switch_neutral(
+                                candidate_game_command
+                            )
+                        )
                         try:
                             physical_output = physical_recovery.observe(
                                 snapshot,
                                 now_s=frame_wall,
                                 neutral_confirmed=neutral_confirmed,
+                                locomotion_switch_neutral_confirmed=(
+                                    locomotion_switch_neutral_confirmed
+                                ),
                                 foot_contact=foot_contact,
                                 grounded_contact=grounded_contact,
                                 processes=processes,
+                                ground_height_m=frame_ground_height_m,
                             )
                         except (OSError, RuntimeError, ValueError) as exc:
-                            unstable = True
-                            running = False
-                            termination_reason = "physical_recovery_failed"
-                            numerical_error = f"physical_recovery:{exc}"
-                            print(
-                                "matrix-sonic-runtime ERROR physical recovery: "
-                                f"{exc}",
-                                flush=True,
+                            stop_for_physical_recovery_exception(
+                                exc,
+                                action=False,
                             )
                             break
                         if _reanchor_game_heading_after_recovery_transition(
@@ -7187,6 +11517,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         game_fall_recovery is not None
                         and game_fall_recovery.recovering
                     ):
+                        user_command_selected = False
                         game_command = game_input.emergency_stop(
                             now_s=frame_wall,
                             reason=(
@@ -7195,7 +11526,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 else "fall_recovery"
                             ),
                         )
+                    elif resume_probation.active:
+                        # Attribute every probation pose to the selected
+                        # checkpoint under a deterministic native IDLE.  Input
+                        # remains neutral-gated after probation completes, so
+                        # a key held through startup cannot move immediately on
+                        # the release frame.
+                        user_command_selected = False
+                        game_command = game_input.emergency_stop(
+                            now_s=frame_wall,
+                            reason="resume_checkpoint_probation",
+                        )
                     else:
+                        user_command_selected = True
                         game_command = ready_game_command
                     if physical_recovery is not None:
                         game_command = physical_recovery.recovery_wire_command(
@@ -7260,6 +11603,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     foot_contact=foot_contact,
                                     grounded_contact=grounded_contact,
                                     processes=processes,
+                                    ground_height_m=frame_ground_height_m,
                                 )
                                 physical_recovery.verify_writer_free_prewarm_start(
                                     physical_output,
@@ -7270,14 +11614,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     planner.send_game_command(game_command)
                                     command_published = True
                         except (OSError, RuntimeError, ValueError) as exc:
-                            unstable = True
-                            running = False
-                            termination_reason = "physical_recovery_failed"
-                            numerical_error = f"physical_recovery_action:{exc}"
-                            print(
-                                "matrix-sonic-runtime ERROR physical recovery "
-                                f"action: {exc}",
-                                flush=True,
+                            stop_for_physical_recovery_exception(
+                                exc,
+                                action=True,
                             )
                             break
                         if physical_output.fail_closed:
@@ -7304,12 +11643,48 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         command_published = True
                     if command_published:
                         game_input.record_published_command(game_command)
+                        if user_command_selected:
+                            writes_newly_armed = (
+                                resume_probation.observe_published_user_command(
+                                    game_command
+                                )
+                            )
+                            if writes_newly_armed:
+                                print(
+                                    "matrix-sonic-runtime resume checkpoint "
+                                    "writes armed by published user "
+                                    f"{game_command.mode} command "
+                                    f"sequence={game_command.sequence}",
+                                    flush=True,
+                                )
+                    if (
+                        physical_recovery is not None
+                        and physical_recovery.bfm_process_started
+                        and physical_recovery.bfm_control.ready
+                    ):
+                        try:
+                            physical_recovery.publish_bfm_shadow_state(
+                                snapshot,
+                                game_command,
+                                height_map_z=bfm_height_map(snapshot),
+                            )
+                        except (
+                            MoonDynamicGroundError,
+                            OSError,
+                            RuntimeError,
+                            TypeError,
+                            ValueError,
+                        ) as exc:
+                            stop_for_physical_recovery_exception(
+                                exc,
+                                action=False,
+                            )
+                            break
                     walking = game_command.mode == "move"
                     if game_commands is not None:
-                        command_allowed = bool(
-                            game_command.safe_stop
-                            and game_command.speed_mps == 0.0
-                            and game_command.mode != "move"
+                        command_allowed = _game_command_poll_allowed(
+                            game_command,
+                            resume_probation_active=resume_probation.active,
                         )
                         try:
                             command_restart = game_commands.poll(
@@ -7346,15 +11721,34 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         dt=1.0 / args.control_hz,
                     )
 
-            for _ in range(substeps):
+            for substep_index in range(substeps):
                 if not running:
                     break
                 # Keep native DDS lowstate and MuJoCo cadence at 200 Hz instead
                 # of emitting four back-to-back steps once per 50 Hz frame.
                 # Matrix owns the absolute deadline because SONIC's relative
                 # per-step sleep otherwise accumulates scheduler overshoot.
+                if moon_dynamic_ground is not None:
+                    try:
+                        moon_dynamic_ground.update_mocap(
+                            simulator.sim_env.mj_data
+                        )
+                    except MoonDynamicGroundError as exc:
+                        unstable = True
+                        running = False
+                        termination_reason = "numerical_instability"
+                        numerical_error = f"moon_dynamic_ground:{exc}"
+                        print(
+                            "matrix-sonic-runtime ERROR MoonWorld tile update: "
+                            f"{exc}",
+                            flush=True,
+                        )
+                        break
                 next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
+                # Record fail-closed resume evidence before validating the
+                # frame, while retaining creative-inventory snapshot sizes.
+                resume_rollback_evidence.observe(next_snapshot)
                 step_error = _snapshot_validation_error(
                     next_snapshot,
                     snapshot,
@@ -7372,6 +11766,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     )
                     break
                 snapshot = next_snapshot
+                try:
+                    snapshot_ground_height_m = local_ground_height(snapshot)
+                except MoonDynamicGroundError as exc:
+                    unstable = True
+                    running = False
+                    termination_reason = "numerical_instability"
+                    numerical_error = f"moon_dynamic_ground:{exc}"
+                    print(
+                        "matrix-sonic-runtime ERROR MoonWorld ground sample: "
+                        f"{exc}",
+                        flush=True,
+                    )
+                    break
                 if heading_anchor_telemetry is not None:
                     try:
                         heading_anchor_telemetry.observe(
@@ -7392,24 +11799,27 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         )
                         break
                 instability_resets = int(snapshot.reset_count)
-                if bool(snapshot.fall_detected):
+                snapshot_fall_detected = bool(snapshot.fall_detected)
+                if snapshot_fall_detected:
                     fall_detected = True
                     if args.game_auto_respawn:
                         assert game_world is not None
                         assert game_input is not None
                         assert planner is not None
-                        game_command = game_input.emergency_stop(
-                            now_s=time.perf_counter(),
-                            reason="fall_respawn_reload",
-                        )
-                        planner.send_game_command(game_command)
-                        walking = False
+                        fall_wall = time.perf_counter()
                         try:
-                            game_world.checkpoint(
-                                snapshot,
-                                now_s=time.perf_counter(),
-                                force=True,
-                                required=True,
+                            termination_reason, game_command = (
+                                _handle_game_auto_respawn_fall(
+                                    game_world=game_world,
+                                    game_input=game_input,
+                                    planner=planner,
+                                    snapshot=snapshot,
+                                    checkpoint_writes_blocked=(
+                                        resume_probation.checkpoint_writes_blocked
+                                    ),
+                                    now_s=fall_wall,
+                                    ground_height_m=snapshot_ground_height_m,
+                                )
                             )
                         except WorldStateError as exc:
                             running = False
@@ -7421,17 +11831,63 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 flush=True,
                             )
                             break
+                        walking = False
                         running = False
-                        termination_reason = "game_fall_respawn"
-                        print(
-                            "matrix-sonic-runtime fall detected; saved an "
-                            "upright cold-respawn checkpoint",
-                            flush=True,
-                        )
+                        if termination_reason == "fall_detected":
+                            resume_checkpoint_read_only_fall_stop = True
+                            print(
+                                "matrix-sonic-runtime fall detected before "
+                                "resume checkpoint writes were armed; stopped "
+                                "without checkpoint",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                "matrix-sonic-runtime fall detected; saved an "
+                                "upright cold-respawn checkpoint",
+                                flush=True,
+                            )
                         break
                     if args.fail_on_fall:
                         running = False
                         termination_reason = "fall_detected"
+                        break
+                if resume_probation.active and not snapshot_fall_detected:
+                    probation_audit = resume_probation.observe(
+                        snapshot,
+                        game_command,
+                        now_s=time.perf_counter(),
+                        current_fall_detected=(
+                            _game_world_current_fall_detected(
+                                snapshot,
+                                game_fall_recovery=game_fall_recovery,
+                                physical_recovery=physical_recovery,
+                            )
+                        ),
+                        control_frame_boundary=(
+                            substep_index == substeps - 1
+                        ),
+                        ground_height_m=snapshot_ground_height_m,
+                    )
+                    if probation_audit is not None:
+                        spawn_clearance_audit = probation_audit
+                        if game_world is not None:
+                            game_world.last_clearance_audit = probation_audit
+                            game_world.clearance_rejection_count += 1
+                        unstable = True
+                        running = False
+                        termination_reason = "spawn_clearance_failed"
+                        numerical_error = (
+                            "spawn_clearance:"
+                            f"{probation_audit.get('reason', 'audit_error')}"
+                        )
+                        print(
+                            "matrix-sonic-runtime ERROR unsafe live resume "
+                            "clearance: "
+                            f"reason={probation_audit.get('reason')} "
+                            f"worst={probation_audit.get('worst')}",
+                            flush=True,
+                        )
                         break
                 if instability_resets > args.max_resets:
                     running = False
@@ -7449,8 +11905,20 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             active_lowcmd = bool(snapshot.low_cmd_fresh)
             low_cmd_age_s = snapshot.low_cmd_age_s
             freshness_sample_wall = time.perf_counter()
-            if game_world is not None:
-                game_world.checkpoint(snapshot, now_s=freshness_sample_wall)
+            if (
+                game_world is not None
+                and resume_probation.checkpoint_writes_armed
+            ):
+                game_world.checkpoint(
+                    snapshot,
+                    now_s=freshness_sample_wall,
+                    current_fall_detected=_game_world_current_fall_detected(
+                        snapshot,
+                        game_fall_recovery=game_fall_recovery,
+                        physical_recovery=physical_recovery,
+                    ),
+                    ground_height_m=snapshot_ground_height_m,
+                )
             if active_lowcmd:
                 if active_started_wall is None:
                     active_started_wall = freshness_sample_wall
@@ -7464,18 +11932,26 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 active_elapsed = 0.0
 
             root_z = float(snapshot.qpos[2])
+            root_clearance_m = root_z - snapshot_ground_height_m
             root_up_z = _root_up_z(snapshot.qpos)
             min_root_z = min(min_root_z, root_z)
+            min_root_clearance_m = min(
+                min_root_clearance_m,
+                root_clearance_m,
+            )
             # SONIC is the sole fall authority. Height and orientation remain
             # diagnostics only, so Matrix cannot disagree with its snapshot.
             fall_detected = fall_detected or bool(snapshot.fall_detected)
 
             if renderer is not None:
+                render_qpos, render_qvel, render_ctrl = (
+                    _canonical_render_vectors(snapshot)
+                )
                 renderer.send(
                     snapshot.sim_time,
-                    snapshot.qpos,
-                    snapshot.qvel,
-                    snapshot.ctrl,
+                    render_qpos,
+                    render_qvel,
+                    render_ctrl,
                 )
             control_frames += 1
 
@@ -7511,14 +11987,23 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "min_final_x": args.min_final_x,
                     "min_forward_x_m": args.min_forward_x_m,
                     "min_root_z": round(min_root_z, 5),
+                    "min_root_clearance_m": round(
+                        min_root_clearance_m,
+                        5,
+                    ),
                     "physics_hz_target": physics_hz,
                     "physics_step_hz": round(window_physics_steps / window_wall, 3),
                     "render_hz": round(window_render / window_wall, 3),
                     "render_packet_bytes": expected_packet_size,
+                    "render_dimensions": render_dimensions,
+                    "render_projection": render_projection,
                     "render_sync_enabled": renderer is not None,
+                    "physics_dimensions": physics_dimensions,
                     "ue_state_sync_hz": round(window_render / window_wall, 3),
                     "ue_pid": args.ue_pid,
                     "root_xyz": [round(float(value), 5) for value in snapshot.qpos[:3]],
+                    "local_ground_z_m": round(snapshot_ground_height_m, 6),
+                    "root_clearance_m": round(root_clearance_m, 6),
                     "root_displacement_xy_m": round(
                         float(
                             np.linalg.norm(
@@ -7578,6 +12063,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 if game_world is not None:
                     status["game_world_state"] = game_world.telemetry()
                     status["game_auto_respawn"] = bool(args.game_auto_respawn)
+                if moon_dynamic_ground is not None:
+                    status["moon_dynamic_ground"] = (
+                        moon_dynamic_ground.telemetry()
+                    )
+                if resume_probation.enabled:
+                    status["resume_probation"] = resume_probation.telemetry(
+                        now_s=now
+                    )
                 if game_commands is not None:
                     status["game_commands"] = game_commands.telemetry()
                     if game_fall_recovery is not None:
@@ -7604,6 +12097,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 last_render_count = render_count
                 last_physics_steps = physics_steps
                 next_print = now + max(args.print_every, 0.1)
+
+        resume_probation_stop_wall = time.perf_counter()
+        resume_probation_elapsed_s = max(
+            resume_probation_stop_wall - started_wall, 0.0
+        )
 
         # Drain packets already queued at the exact acceptance boundary.  The
         # duration gate can otherwise break before observing a final focus-loss,
@@ -7665,14 +12163,52 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         if (
             game_world is not None
             and termination_reason not in _GAME_INTERNAL_RESTART_REASONS
+            and not resume_checkpoint_read_only_fall_stop
+            and resume_probation.checkpoint_writes_armed
         ):
             try:
-                game_world.checkpoint(
+                checkpoint_saved = game_world.checkpoint(
                     snapshot,
                     now_s=time.perf_counter(),
                     force=True,
-                    required=True,
+                    required=False,
+                    current_fall_detected=_game_world_current_fall_detected(
+                        snapshot,
+                        game_fall_recovery=game_fall_recovery,
+                        physical_recovery=physical_recovery,
+                    ),
+                    ground_height_m=snapshot_ground_height_m,
                 )
+                if not checkpoint_saved:
+                    raise WorldStateError(
+                        game_world.last_error or "cannot retain final observation"
+                    )
+                final_world = game_world.telemetry()
+                final_checkpoint_id = final_world.get(
+                    "active_resume_checkpoint_id"
+                )
+                final_generation = final_world.get("generation")
+                if (
+                    not isinstance(final_checkpoint_id, str)
+                    or not final_checkpoint_id.startswith("cp-")
+                    or isinstance(final_generation, bool)
+                    or not isinstance(final_generation, int)
+                    or final_generation < 0
+                ):
+                    raise WorldStateError(
+                        "required checkpoint has no resumable identity"
+                    )
+                final_checkpoint_identity = {
+                    "schema": "matrix-final-world-checkpoint/v1",
+                    "run_id": run_id,
+                    "checkpoint_id": final_checkpoint_id,
+                    "generation": final_generation,
+                    "resume_source": final_world.get("active_resume_source"),
+                    "disposition": _final_checkpoint_disposition(
+                        game_world.last_clearance_audit,
+                        final_world.get("active_resume_source"),
+                    ),
+                }
             except WorldStateError as exc:
                 world_checkpoint_failed = True
                 numerical_error = f"final_checkpoint:{exc}"
@@ -7691,6 +12227,103 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         # channel after committing the native boundary so neither child class
         # can hide in the handoff between loop completion and acceptance.
         poll_failed_child()
+
+        if final_checkpoint_identity is None:
+            reused_resume_checkpoint_identity = (
+                _reused_selected_resume_checkpoint(
+                    run_id=run_id,
+                    selected_checkpoint_id=(
+                        args.game_world_resume_checkpoint_id
+                    ),
+                    selected_generation=args.game_world_resume_generation,
+                    game_world=game_world,
+                    resume_probation=resume_probation,
+                    termination_reason=termination_reason,
+                    termination_signal=termination_signal,
+                    child_failure=child_failure,
+                    unstable=unstable,
+                    fall_detected=fall_detected,
+                    current_fall_detected=(
+                        _game_world_current_fall_detected(
+                            snapshot,
+                            game_fall_recovery=game_fall_recovery,
+                            physical_recovery=physical_recovery,
+                        )
+                    ),
+                    world_checkpoint_failed=world_checkpoint_failed,
+                )
+            )
+
+        # The runtime never deletes a durable checkpoint. After both child
+        # failure boundaries are closed, it may publish one exact proposal for
+        # the outer supervisor to validate against UE lifecycle evidence and
+        # apply atomically. Until then the active ID/generation remain intact.
+        if resume_probation_selected and game_world is not None:
+            resume_rollback_ineligibility = _game_world_rollback_ineligibility(
+                selected_checkpoint_id=args.game_world_resume_checkpoint_id,
+                selected_generation=args.game_world_resume_generation,
+                rollback_count=args.game_resume_rollback_count,
+                elapsed_s=resume_probation_elapsed_s,
+                termination_reason=termination_reason,
+                numerical_error=numerical_error,
+                low_cmd_received=(
+                    resume_rollback_evidence.low_cmd_received
+                    or bool(snapshot.low_cmd_received)
+                ),
+                active_lowcmd=(
+                    resume_rollback_evidence.active_lowcmd
+                    or bool(snapshot.low_cmd_fresh)
+                ),
+                active_frames=max(
+                    active_frames, resume_rollback_evidence.active_frames
+                ),
+                active_elapsed_s=longest_active_elapsed_s,
+                termination_signal=termination_signal,
+                child_failure=child_failure,
+                fall_detected=(
+                    resume_rollback_evidence.fall_detected
+                    or fall_detected
+                    or bool(snapshot.fall_detected)
+                ),
+                initial_reset_count=initial_reset_count,
+                final_reset_count=max(
+                    int(snapshot.reset_count),
+                    resume_rollback_evidence.max_reset_count,
+                ),
+                reset_observed=resume_rollback_evidence.reset_observed,
+                spawn_clearance_audit=spawn_clearance_audit,
+                resume_probation_active=resume_probation.active,
+            )
+            game_world.resume_rollback_ineligibility = resume_rollback_ineligibility
+            if resume_rollback_ineligibility is None:
+                try:
+                    proposal = game_world.propose_selected_resume_rollback(
+                        reason=(
+                            "spawn_clearance:"
+                            f"{_spawn_clearance_rollback_reason(spawn_clearance_audit)}"
+                            if termination_reason == "spawn_clearance_failed"
+                            else "startup_numerical_instability"
+                        ),
+                        run_id=run_id,
+                    )
+                except WorldStateError as exc:
+                    resume_rollback_ineligibility = "rollback_proposal_failed"
+                    game_world.resume_rollback_ineligibility = (
+                        resume_rollback_ineligibility
+                    )
+                    print(
+                        "matrix-sonic-runtime ERROR cannot propose resume "
+                        f"rollback: {exc}",
+                        flush=True,
+                    )
+                else:
+                    resume_rollback_requested = True
+                    print(
+                        "matrix-sonic-runtime proposed failed resume checkpoint "
+                        f"rollback id={proposal['rejected_checkpoint_id']} "
+                        f"generation={proposal['rejected_generation']}",
+                        flush=True,
+                    )
         if termination_reason is None:
             termination_reason = "signal" if not running else "unknown"
 
@@ -7706,8 +12339,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         render_count = renderer.packet_count if renderer is not None else 0
         render_hz_aggregate = render_count / max(elapsed_wall_s, 1e-9)
         root_z = float(snapshot.qpos[2])
+        root_clearance_m = root_z - snapshot_ground_height_m
         root_up_z = _root_up_z(snapshot.qpos)
         min_root_z = min(min_root_z, root_z)
+        min_root_clearance_m = min(
+            min_root_clearance_m,
+            root_clearance_m,
+        )
         fall_detected = fall_detected or bool(snapshot.fall_detected)
         instability_resets = int(snapshot.reset_count)
         root_displacement_xy_m = float(
@@ -7784,6 +12422,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "failed_child_exit_code": failed_child_code,
             "failed_child_name": failed_child_name,
             "fall_detected": fall_detected,
+            "final_checkpoint": final_checkpoint_identity,
+            "reused_resume_checkpoint": reused_resume_checkpoint_identity,
             "instability_resets": instability_resets,
             "interrupted": interrupted,
             "last_reset_reason": snapshot.last_reset_reason,
@@ -7799,6 +12439,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "min_final_x": args.min_final_x,
             "min_forward_x_m": args.min_forward_x_m,
             "min_root_z": round(min_root_z, 5),
+            "min_root_clearance_m": round(min_root_clearance_m, 5),
             "min_rtf": args.min_rtf,
             "max_resets": args.max_resets,
             "matrix_commit": args.matrix_commit,
@@ -7823,7 +12464,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "qualification_profile": args.qualification_profile,
             "render_hz": round(render_hz_aggregate, 3),
             "render_packet_bytes": expected_packet_size,
+            "render_dimensions": render_dimensions,
+            "render_projection": render_projection,
             "render_sync_enabled": renderer is not None,
+            "physics_dimensions": physics_dimensions,
             "root_displacement_xy_m": round(root_displacement_xy_m, 5),
             "root_final_x": round(float(snapshot.qpos[0]), 5),
             "root_displacement_x_m": round(
@@ -7831,6 +12475,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             ),
             "root_up_z": round(root_up_z, 5),
             "root_xyz": [round(float(value), 5) for value in snapshot.qpos[:3]],
+            "local_ground_z_m": round(snapshot_ground_height_m, 6),
+            "root_clearance_m": round(root_clearance_m, 6),
             "rtf": round(rtf_aggregate, 4),
             "rtf_aggregate": round(rtf_aggregate, 4),
             "run_id": run_id,
@@ -7840,6 +12486,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "sim_time_s": round(float(snapshot.sim_time), 4),
             "sonic_commit": sonic_commit,
             "sonic_step_index": int(snapshot.step_index),
+            "spawn_clearance": spawn_clearance_audit,
             "startup_band_enabled": bool(args.startup_band),
             "startup_band_fade_s": args.startup_band_fade,
             "startup_band_hold_s": args.startup_band_hold,
@@ -7889,6 +12536,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         final_status["game_auto_respawn"] = bool(args.game_auto_respawn)
         if game_world is not None:
             final_status["game_world_state"] = game_world.telemetry()
+        if moon_dynamic_ground is not None:
+            final_status["moon_dynamic_ground"] = (
+                moon_dynamic_ground.telemetry()
+            )
+        if resume_probation.enabled:
+            final_status["resume_probation"] = resume_probation.telemetry(
+                now_s=finished_wall
+            )
         if game_commands is not None:
             final_status["game_commands"] = game_commands.telemetry()
             if game_fall_recovery is not None:
@@ -7915,17 +12570,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             f"failures={acceptance_failures}",
             flush=True,
         )
-        if internal_restart_requested:
-            proposed_exit_code = _GAME_INTERNAL_RESTART_EXIT_CODE
-        elif passed or (
-            not qualification_attempted
-            and interrupted
-            and not acceptance_failures
-        ):
-            proposed_exit_code = 0
-        else:
-            proposed_exit_code = 2
-        return 0 if passed else 2
+        proposed_exit_code = _runtime_exit_code(
+            internal_restart_requested=internal_restart_requested,
+            passed=passed,
+            qualification_attempted=qualification_attempted,
+            interrupted=interrupted,
+            acceptance_failures=acceptance_failures,
+            resume_rollback_requested=resume_rollback_requested,
+        )
     finally:
         active_exception = sys.exc_info()[0] is not None
         cleanup_errors = []
@@ -7957,6 +12609,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             ("physical recovery", physical_recovery),
             ("native processes", processes),
             ("renderer", renderer),
+            ("MoonWorld dynamic ground", moon_dynamic_ground),
             ("simulator", simulator),
         ):
             error = _close_runtime_resource(name, resource)
@@ -7964,8 +12617,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 cleanup_errors.append(error)
         if (
             not active_exception
-            and not cleanup_errors
-            and proposed_exit_code == _GAME_INTERNAL_RESTART_EXIT_CODE
+            and proposed_exit_code in _GAME_SIGNAL_BOUNDARY_EXIT_CODES
         ):
             try:
                 termination_boundary_previous_mask = signal.pthread_sigmask(
@@ -7975,10 +12627,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 termination_boundary_safe = True
             except (AttributeError, OSError, ValueError) as exc:
                 print(
-                    "matrix-sonic-runtime ERROR cannot close the internal "
-                    f"restart signal boundary: {exc}",
+                    "matrix-sonic-runtime ERROR cannot close the runtime "
+                    f"handoff signal boundary: {exc}",
                     flush=True,
                 )
+                if proposed_exit_code == _GAME_RESUME_ROLLBACK_EXIT_CODE:
+                    resume_rollback_requested = False
+                    if game_world is not None:
+                        game_world.cancel_resume_rollback_proposal(
+                            "signal_boundary_unavailable"
+                        )
+                    if final_status is not None and game_world is not None:
+                        final_status["game_world_state"] = game_world.telemetry()
+                        _atomic_json(args.status_file, final_status)
         for signum, previous_handler in previous_signal_handlers.items():
             try:
                 signal.signal(signum, previous_handler)
@@ -7992,13 +12653,40 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     f"signal handler {signum}: {exc}"
                 )
         if cleanup_errors:
+            resume_rollback_cleanup_downgrade = (
+                proposed_exit_code == _GAME_RESUME_ROLLBACK_EXIT_CODE
+                and not active_exception
+            )
+            if resume_rollback_cleanup_downgrade:
+                proposed_exit_code = 2
+                resume_rollback_requested = False
+                if game_world is not None:
+                    game_world.cancel_resume_rollback_proposal("cleanup_failure")
+                if final_status is not None:
+                    failures = final_status.get("acceptance_failures")
+                    if not isinstance(failures, list):
+                        failures = []
+                    if "cleanup_failure" not in failures:
+                        failures.append("cleanup_failure")
+                    final_status["acceptance_failures"] = failures
+                    final_status["cleanup_errors"] = cleanup_errors
+                    final_status["passed"] = False
+                    final_status["pre_cleanup_termination_reason"] = (
+                        final_status.get("termination_reason")
+                    )
+                    final_status["termination_reason"] = "cleanup_failure"
+                    if game_world is not None:
+                        final_status["game_world_state"] = game_world.telemetry()
+                    _atomic_json(args.status_file, final_status)
+            else:
+                _record_cleanup_failure(args.status_file, cleanup_errors)
             if termination_boundary_previous_mask is not None:
                 signal.pthread_sigmask(
                     signal.SIG_SETMASK,
                     termination_boundary_previous_mask,
                 )
-            _record_cleanup_failure(args.status_file, cleanup_errors)
-            if not active_exception:
+                termination_boundary_previous_mask = None
+            if not active_exception and not resume_rollback_cleanup_downgrade:
                 raise RuntimeError(
                     "native cleanup failed: " + "; ".join(cleanup_errors)
                 )
@@ -8038,6 +12726,22 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "requested": False,
                     "reason": None,
                 }
+                status_changed = True
+        elif proposed_exit_code == _GAME_RESUME_ROLLBACK_EXIT_CODE and (
+            termination_signal is not None or not termination_boundary_safe
+        ):
+            proposed_exit_code = 2
+            resume_rollback_requested = False
+            cancellation_reason = (
+                "termination_signal"
+                if termination_signal is not None
+                else "signal_boundary_unavailable"
+            )
+            if game_world is not None:
+                game_world.cancel_resume_rollback_proposal(cancellation_reason)
+            if final_status is not None:
+                if game_world is not None:
+                    final_status["game_world_state"] = game_world.telemetry()
                 status_changed = True
         if status_changed:
             _atomic_json(args.status_file, final_status)

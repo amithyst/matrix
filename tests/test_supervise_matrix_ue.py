@@ -26,6 +26,7 @@ SPEC.loader.exec_module(MODULE)
 class FakeProbeError:
     NONE = 0
     IDENTITY_MISMATCH = 1
+    TORN_CAMERA_CACHE = 6
     INTERNAL = 9
 
 
@@ -82,6 +83,15 @@ def valid_observation(pid: int, yaw: float = 30.0):
         valid=True,
         error_code=FakeProbeError.NONE,
         yaw_deg=yaw,
+    )
+
+
+def invalid_observation(pid: int, error_code: int):
+    return SimpleNamespace(
+        ue_pid=pid,
+        monotonic_ns=1_000_000_000,
+        valid=False,
+        error_code=error_code,
     )
 
 
@@ -195,6 +205,48 @@ class CameraProbeRuntimeTest(unittest.TestCase):
         self.assertEqual(
             writer.observations[-1].error_code,
             FakeProbeError.INTERNAL,
+        )
+
+    def test_torn_camera_cache_retains_last_verified_record_until_freshness_expires(
+        self,
+    ) -> None:
+        probe = FakeProbe(
+            bind_results=(None,),
+            sample_results=(
+                valid_observation(4242, yaw=30.0),
+                invalid_observation(4242, FakeProbeError.TORN_CAMERA_CACHE),
+                valid_observation(4242, yaw=31.0),
+            ),
+        )
+        writer = FakeWriter()
+        runtime = self.runtime(probe, writer)
+
+        self.assertTrue(runtime.try_bind(4242))
+        self.assertTrue(runtime.sample(4242))
+        self.assertTrue(runtime.sample(4242))
+        self.assertEqual(len(writer.observations), 1)
+        self.assertTrue(writer.observations[0].valid)
+        self.assertTrue(runtime.sample(4242))
+        self.assertEqual(len(writer.observations), 2)
+        self.assertEqual(writer.observations[-1].yaw_deg, 31.0)
+
+    def test_initial_torn_camera_cache_remains_fail_closed(self) -> None:
+        probe = FakeProbe(
+            bind_results=(None,),
+            sample_results=(
+                invalid_observation(4242, FakeProbeError.TORN_CAMERA_CACHE),
+            ),
+        )
+        writer = FakeWriter()
+        runtime = self.runtime(probe, writer)
+
+        self.assertTrue(runtime.try_bind(4242))
+        self.assertTrue(runtime.sample(4242))
+        self.assertEqual(len(writer.observations), 1)
+        self.assertFalse(writer.observations[0].valid)
+        self.assertEqual(
+            writer.observations[0].error_code,
+            FakeProbeError.TORN_CAMERA_CACHE,
         )
 
     def test_valid_write_failure_attempts_an_invalid_replacement(self) -> None:

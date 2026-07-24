@@ -35,7 +35,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from matrix_mouse_settings import (
     PROFILE_LOCAL,
@@ -54,6 +54,14 @@ from matrix_ui_settings import (
     load_settings as load_ui_settings,
     step_font_scale,
 )
+from matrix_motion_settings import MotionSettings, MotionSettingsError
+from matrix_video_settings import (
+    VideoSettings,
+    VideoSettingsError,
+    VideoSettingsPersistenceError,
+    VideoSettingsStore,
+    default_settings_file as default_video_settings_file,
+)
 from matrix_restart_request import (
     RestartRequest,
     atomic_write_request,
@@ -68,14 +76,44 @@ from matrix_game_control import (
     encode_input_packet,
     wrap_angle_rad,
 )
+from matrix_external_control import (
+    ExternalCommand,
+    ExternalControlBroker,
+    ExternalInputState,
+    ExternalInputToken,
+    ProviderGateTelemetry,
+)
+from matrix_celestial_navigation import (
+    CelestialCatalog,
+    CelestialNavigationError,
+    DEFAULT_ASSET_MANIFEST_PATH,
+    DEFAULT_CATALOG_PATH,
+    load_catalog,
+    probes_from_response,
+)
+from matrix_celestial_ephemeris import (
+    CelestialEphemerisError,
+    PersistentSimulationClock,
+)
+from matrix_celestial_visuals import (
+    CarlaWeatherSample,
+    CelestialVisualCatalog,
+    CelestialVisualError,
+    DEFAULT_VISUAL_CATALOG_PATH,
+    load_visual_catalog,
+)
 from matrix_mc_commands import (
     CommandParseError,
     CommandProtocolError,
     CreativeSpawnItem,
+    DataModifyInput,
+    DataModifyNumber,
     GameCommandRequest,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
     PolicySlotAssignment,
+    TeleportList,
+    TeleportSelector,
     decode_command_response,
     encode_command_request,
     parse_mc_command,
@@ -146,6 +184,7 @@ class KeyboardMouseSample:
     e: bool = False
     v: bool = False
     ctrl: bool = False
+    alt: bool = False
     shift: bool = False
     escape: bool = False
     mouse_mode: bool = False
@@ -171,6 +210,7 @@ class KeyboardMouseSample:
             e=self.e,
             v=self.v,
             ctrl=self.ctrl and movement_enabled,
+            alt=self.alt and movement_enabled,
             shift=self.shift and movement_enabled,
         )
 
@@ -181,7 +221,675 @@ class GamepadSample:
     right: float = 0.0
     look_yaw: float = 0.0
     look_pitch: float = 0.0
+    buttons_pressed: bool = False
     connected: bool = False
+
+
+def physical_external_override_reason(
+    keyboard: KeyboardMouseSample,
+    gamepad: GamepadSample,
+    *,
+    move_deadzone: float = 0.15,
+    look_deadzone: float = 0.12,
+) -> str | None:
+    """Return the local safety event that must revoke external authority."""
+
+    for name, value in (
+        ("move_deadzone", move_deadzone),
+        ("look_deadzone", look_deadzone),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            raise ValueError(f"{name} must be finite and in [0, 1)")
+
+    if not keyboard.focused:
+        return "focus_lost"
+    if keyboard.escape:
+        return "physical_escape"
+    if any(
+        bool(getattr(keyboard, name))
+        for name in (
+            "w",
+            "a",
+            "s",
+            "d",
+            "q",
+            "e",
+            "v",
+            "ctrl",
+            "alt",
+            "shift",
+            "mouse_mode",
+            "mouse_speed_down",
+            "mouse_speed_up",
+            "apply_restart",
+            "apply_return",
+        )
+    ):
+        return "physical_keyboard"
+    if (
+        keyboard.camera_dragging
+        or abs(keyboard.mouse_dx) > 1e-12
+        or abs(keyboard.mouse_dy) > 1e-12
+    ):
+        return "physical_mouse"
+    if gamepad.connected and (
+        gamepad.buttons_pressed
+        or abs(gamepad.forward) > move_deadzone
+        or abs(gamepad.right) > move_deadzone
+        or abs(gamepad.look_yaw) > look_deadzone
+        or abs(gamepad.look_pitch) > look_deadzone
+    ):
+        return "physical_gamepad"
+    return None
+
+
+def external_input_samples(
+    state: ExternalInputState,
+    *,
+    focus: KeyboardMouseSample,
+    look_button: str,
+) -> tuple[KeyboardMouseSample, GamepadSample]:
+    """Convert a validated virtual full-state snapshot into provider samples."""
+
+    if not isinstance(state, ExternalInputState):
+        raise TypeError("external state must be ExternalInputState")
+    if look_button not in {"left", "middle", "right"}:
+        raise ValueError("external look button is invalid")
+    keys = state.keyboard
+    keyboard = KeyboardMouseSample(
+        **{name: keys[name] for name in (
+            "w", "a", "s", "d", "q", "e", "v", "ctrl", "alt", "shift"
+        )},
+        escape=keys["escape"],
+        mouse_mode=keys["mouse_mode"],
+        mouse_speed_down=keys["mouse_speed_down"],
+        mouse_speed_up=keys["mouse_speed_up"],
+        apply_restart=keys["apply_restart"],
+        apply_return=keys["apply_return"],
+        mouse_dx=state.mouse_dx,
+        mouse_dy=state.mouse_dy,
+        camera_dragging=state.mouse_buttons[look_button],
+        focused=focus.focused,
+        focus_title=focus.focus_title,
+        focus_pid=focus.focus_pid,
+    )
+    axes = state.gamepad_axes
+    gamepad = GamepadSample(
+        forward=axes["forward"],
+        right=axes["right"],
+        look_yaw=axes["look_yaw"],
+        look_pitch=axes["look_pitch"],
+        buttons_pressed=any(state.gamepad_buttons.values()),
+        connected=state.gamepad_connected,
+    )
+    return keyboard, gamepad
+
+
+def external_active_input_device(state: ExternalInputState) -> str | None:
+    """Classify the virtual device claim used by gate and final arbitration."""
+
+    if not isinstance(state, ExternalInputState):
+        raise TypeError("external input state is invalid")
+    keyboard_active = bool(
+        any(state.keyboard.values())
+        or any(state.mouse_buttons.values())
+        or abs(state.mouse_dx) > 1e-12
+        or abs(state.mouse_dy) > 1e-12
+    )
+    gamepad_active = bool(
+        state.gamepad_connected
+        and (
+            any(abs(value) > 1e-12 for value in state.gamepad_axes.values())
+            or any(state.gamepad_buttons.values())
+        )
+    )
+    if keyboard_active and gamepad_active:
+        return "mixed"
+    if keyboard_active:
+        # A merely connected, neutral pad is warmup intent only when the
+        # keyboard/mouse side is also neutral.
+        return "keyboard"
+    if gamepad_active or state.gamepad_connected:
+        return "gamepad"
+    return None
+
+
+def external_frame_input_source(
+    state: ExternalInputState,
+    *,
+    configured_source: str,
+) -> str:
+    """Choose a virtual device without bypassing the configured source gate."""
+
+    if configured_source not in {"auto", "keyboard", "gamepad"}:
+        raise ValueError("configured external input source is invalid")
+    if configured_source != "auto":
+        return configured_source
+
+    device = external_active_input_device(state)
+    if device in {"keyboard", "gamepad"}:
+        return device
+    # Mixed input is rejected by the provider source gate before publish.  Do
+    # not pick a winner here and accidentally hide one half of the request.
+    return configured_source
+
+
+@dataclass(frozen=True)
+class ExternalProviderGateFrame:
+    token: ExternalInputToken
+    requested_neutral: bool
+    requested_device: str | None
+    locomotion_admitted: bool
+
+
+class ExternalLocomotionProviderGate:
+    """Qualify exact external revisions before exposing locomotion intent."""
+
+    def __init__(self, broker: ExternalControlBroker) -> None:
+        if not isinstance(broker, ExternalControlBroker):
+            raise TypeError("external provider gate requires its broker")
+        self.broker = broker
+
+    def prepare(
+        self,
+        state: ExternalInputState,
+        token: ExternalInputToken | None,
+    ) -> tuple[ExternalInputState, ExternalProviderGateFrame | None]:
+        if token is None:
+            return state.without_locomotion(), None
+        telemetry = self.broker.provider_gate
+        exact_ready = bool(
+            telemetry.ready and telemetry.input_token == token
+        )
+        requested_neutral = state.locomotion_neutral
+        requested_device = external_active_input_device(state)
+        source_admitted = requested_device != "mixed"
+        effective = (
+            state
+            if source_admitted and (requested_neutral or exact_ready)
+            else state.without_locomotion()
+        )
+        return effective, ExternalProviderGateFrame(
+            token=token,
+            requested_neutral=requested_neutral,
+            requested_device=requested_device,
+            locomotion_admitted=bool(
+                source_admitted and (requested_neutral or exact_ready)
+            ),
+        )
+
+    def observe_published(
+        self,
+        frame: ExternalProviderGateFrame,
+        *,
+        sequence: int,
+        published: bool,
+        interlock_reason: str | None,
+    ) -> bool:
+        if not isinstance(frame, ExternalProviderGateFrame):
+            raise TypeError("provider gate frame is invalid")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise ValueError("provider gate sequence is invalid")
+        if type(published) is not bool:
+            raise ValueError("provider gate publish result must be boolean")
+        if interlock_reason is not None and (
+            not isinstance(interlock_reason, str) or not interlock_reason
+        ):
+            raise ValueError("provider gate interlock reason is invalid")
+
+        current_token = self.broker.input_token
+        current = self.broker.provider_gate
+        same_authority_current_or_predecessor = bool(
+            current_token is not None
+            and frame.token.lease_id == current_token.lease_id
+            and frame.token.authority_epoch == current_token.authority_epoch
+            and frame.token.input_revision <= current_token.input_revision
+        )
+        if (
+            interlock_reason == "physical_focus_lost"
+            and same_authority_current_or_predecessor
+        ):
+            self.broker.latch_fatal_authority(interlock_reason)
+            current_token = self.broker.input_token
+            current = self.broker.provider_gate
+        # A command/data-modify request may bump the revision after this frame
+        # was sampled but before its socket write completed.  Never let that
+        # stale success qualify the replacement revision.  A stale failure or
+        # final-publish interlock from the same authority is different: the
+        # successor may have inherited the old proof, so it must be invalidated
+        # fail-closed even though the callback names the predecessor revision.
+        if frame.token != current_token or current.input_token != frame.token:
+            strict_same_authority_successor = bool(
+                current_token is not None
+                and current.input_token == current_token
+                and frame.token.lease_id == current_token.lease_id
+                and frame.token.authority_epoch == current_token.authority_epoch
+                and frame.token.input_revision < current_token.input_revision
+            )
+            stale_frame_invalidates_successor = bool(
+                strict_same_authority_successor
+                and (not published or interlock_reason is not None)
+            )
+            if stale_frame_invalidates_successor:
+                # Never weaken an already-sticky gate because an older frame
+                # completed later.  It is already in the required fail-closed
+                # state and its newer diagnostic remains authoritative.
+                if current.phase == "interlocked":
+                    return False
+                sticky_interlock = bool(
+                    interlock_reason is not None
+                    and interlock_reason != "gamepad_connected_edge"
+                )
+                reason = (
+                    interlock_reason
+                    if interlock_reason is not None
+                    else "publisher_send_failed"
+                )
+                last_sequence = current.last_sequence
+                if published and (
+                    last_sequence is None or sequence > last_sequence
+                ):
+                    last_sequence = sequence
+                assert current_token is not None
+                return self.broker.update_provider_gate(
+                    ProviderGateTelemetry(
+                        authority_epoch=current_token.authority_epoch,
+                        lease_id=current_token.lease_id,
+                        input_revision=current_token.input_revision,
+                        phase=(
+                            "interlocked"
+                            if sticky_interlock
+                            else "awaiting_neutral"
+                        ),
+                        ready=False,
+                        neutral_sent_count=0,
+                        last_interlock_reason=reason,
+                        last_sequence=last_sequence,
+                    )
+                )
+            return False
+        # Consecutive means distinct, monotonically published provider frames.
+        # A duplicate callback or regressed sequence must not increment the
+        # neutral proof counter a second time.
+        if current.last_sequence is not None and sequence <= current.last_sequence:
+            return False
+
+        last_sequence = sequence if published else current.last_sequence
+        if current.phase == "interlocked":
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="interlocked",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason=(
+                        current.last_interlock_reason or "input_interlock"
+                    ),
+                    last_sequence=last_sequence,
+                )
+            )
+
+        if not published:
+            # A failed socket write proves nothing about what the core saw.
+            # Drop the consecutive-frame count and require a fresh neutral
+            # sequence, while allowing a later neutral frame to rearm.
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="awaiting_neutral",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason="publisher_send_failed",
+                    last_sequence=current.last_sequence,
+                )
+            )
+
+        if interlock_reason is not None:
+            expected_connect_edge = interlock_reason == "gamepad_connected_edge"
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase=(
+                        "awaiting_neutral"
+                        if expected_connect_edge
+                        else "interlocked"
+                    ),
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason=interlock_reason,
+                    last_sequence=last_sequence,
+                )
+            )
+
+        if current.ready:
+            assert current.qualified_from_revision is not None
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="ready",
+                    ready=True,
+                    neutral_sent_count=current.neutral_sent_count,
+                    qualified_from_revision=current.qualified_from_revision,
+                    last_interlock_reason=None,
+                    last_sequence=last_sequence,
+                )
+            )
+
+        if not frame.requested_neutral:
+            return self.broker.update_provider_gate(
+                ProviderGateTelemetry(
+                    authority_epoch=frame.token.authority_epoch,
+                    lease_id=frame.token.lease_id,
+                    input_revision=frame.token.input_revision,
+                    phase="awaiting_neutral",
+                    ready=False,
+                    neutral_sent_count=0,
+                    last_interlock_reason="locomotion_requested_before_ready",
+                    last_sequence=last_sequence,
+                )
+            )
+
+        neutral_count = current.neutral_sent_count + 1
+        ready = neutral_count >= current.required_neutral_frames
+        return self.broker.update_provider_gate(
+            ProviderGateTelemetry(
+                authority_epoch=frame.token.authority_epoch,
+                lease_id=frame.token.lease_id,
+                input_revision=frame.token.input_revision,
+                phase="ready" if ready else "awaiting_neutral",
+                ready=ready,
+                neutral_sent_count=neutral_count,
+                qualified_from_revision=(
+                    frame.token.input_revision if ready else None
+                ),
+                last_interlock_reason=(
+                    None if ready else current.last_interlock_reason
+                ),
+                last_sequence=last_sequence,
+            )
+        )
+
+
+def external_provider_source_interlock_reason(
+    frame: ExternalProviderGateFrame,
+    *,
+    configured_source: str,
+) -> str | None:
+    """Reject a virtual device that final source arbitration would discard."""
+
+    if not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if configured_source not in {"auto", "keyboard", "gamepad"}:
+        raise ValueError("configured external input source is invalid")
+    if frame.requested_device == "mixed":
+        return "input_source_mixed"
+    if configured_source == "auto" or frame.requested_device is None:
+        return None
+    if configured_source == "keyboard" and frame.requested_device in {
+        "gamepad",
+        "mixed",
+    }:
+        return "input_source_rejects_gamepad"
+    if configured_source == "gamepad" and frame.requested_device in {
+        "keyboard",
+        "mixed",
+    }:
+        return "input_source_rejects_keyboard"
+    return None
+
+
+def apply_external_source_gate(
+    state: ExternalInputState,
+    frame: ExternalProviderGateFrame,
+    *,
+    configured_source: str,
+) -> tuple[ExternalInputState, str | None]:
+    """Remove all virtual side effects before a rejected source is sampled."""
+
+    if not isinstance(state, ExternalInputState):
+        raise TypeError("external input state is invalid")
+    reason = external_provider_source_interlock_reason(
+        frame,
+        configured_source=configured_source,
+    )
+    return (
+        ExternalInputState.neutral() if reason is not None else state,
+        reason,
+    )
+
+
+def external_provider_interlock_reason(
+    *,
+    physical_focused: bool,
+    camera_dragging: bool,
+    camera_available: bool,
+    input_available: bool,
+    gamepad_connected_edge: bool,
+    calibration_interlock_active: bool,
+) -> str | None:
+    """Name the final publish precondition that invalidates provider proof."""
+
+    flags = (
+        physical_focused,
+        camera_dragging,
+        camera_available,
+        input_available,
+        gamepad_connected_edge,
+        calibration_interlock_active,
+    )
+    if any(type(value) is not bool for value in flags):
+        raise TypeError("provider interlock flags must be boolean")
+    if not physical_focused:
+        return "physical_focus_lost"
+    if calibration_interlock_active:
+        return "calibration_interlock"
+    if camera_dragging:
+        return "camera_dragging"
+    if not camera_available:
+        return "camera_unavailable"
+    if gamepad_connected_edge:
+        return "gamepad_connected_edge"
+    if not input_available:
+        return "input_unavailable"
+    return None
+
+
+def external_provider_publish_interlock_reason(
+    frame: ExternalProviderGateFrame,
+    *,
+    configured_source: str,
+    physical_focused: bool,
+    camera_dragging: bool,
+    camera_available: bool,
+    input_available: bool,
+    gamepad_connected_edge: bool,
+    calibration_interlock_active: bool,
+) -> str | None:
+    """Combine source and final-snapshot gates without hiding fatal focus."""
+
+    if not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if configured_source not in {"auto", "keyboard", "gamepad"}:
+        raise ValueError("configured external input source is invalid")
+    final_reason = external_provider_interlock_reason(
+        physical_focused=physical_focused,
+        camera_dragging=camera_dragging,
+        camera_available=camera_available,
+        input_available=input_available,
+        gamepad_connected_edge=gamepad_connected_edge,
+        calibration_interlock_active=calibration_interlock_active,
+    )
+    if final_reason == "physical_focus_lost":
+        return final_reason
+    return (
+        external_provider_source_interlock_reason(
+            frame,
+            configured_source=configured_source,
+        )
+        or final_reason
+    )
+
+
+class KeyboardDoubleTapDetector:
+    """Derive one held same-key double-tap boost from sampled WASD levels."""
+
+    _DIRECTIONS = ("w", "a", "s", "d")
+
+    def __init__(self, window_s: float = 0.30) -> None:
+        window = float(window_s)
+        if not math.isfinite(window) or not 0.15 <= window <= 0.50:
+            raise ValueError("keyboard double-tap window must be in [0.15, 0.50]s")
+        self.window_s = window
+        self._previous = {name: False for name in self._DIRECTIONS}
+        self._first_press_at: dict[str, float] = {}
+        self._released: set[str] = set()
+        self._boost_key: str | None = None
+        self._source_id: str | None = None
+        self._tier: str | None = None
+        self.activations = 0
+        self.resets = 0
+        self.last_reset_reason: str | None = None
+
+    @staticmethod
+    def _speed_tier(keyboard: KeyboardMouseSample) -> str:
+        # Keep this precedence identical to GameControlCore: either precision
+        # modifier wins over Shift, while unmodified WASD selects walk.
+        if keyboard.ctrl or keyboard.alt:
+            return "slow"
+        if keyboard.shift:
+            return "run"
+        return "walk"
+
+    def _reset(
+        self,
+        current: dict[str, bool],
+        *,
+        reason: str,
+        source_id: str | None,
+        tier: str,
+    ) -> None:
+        self._previous = dict(current)
+        self._first_press_at.clear()
+        self._released.clear()
+        self._boost_key = None
+        self._source_id = source_id
+        self._tier = tier
+        self.resets += 1
+        self.last_reset_reason = reason
+
+    def update(
+        self,
+        keyboard: KeyboardMouseSample,
+        *,
+        now_s: float,
+        enabled: bool,
+        source_id: str = "physical",
+    ) -> bool:
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise ValueError("double-tap monotonic time must be finite and nonnegative")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("double-tap source_id must be non-empty")
+        current = {
+            name: bool(getattr(keyboard, name)) for name in self._DIRECTIONS
+        }
+        tier = self._speed_tier(keyboard)
+        if self._source_id is not None and source_id != self._source_id:
+            self._reset(
+                current,
+                reason="source_changed",
+                source_id=source_id,
+                tier=tier,
+            )
+            return False
+        self._source_id = source_id
+        if not enabled:
+            self._reset(
+                current,
+                reason="input_interlock",
+                source_id=source_id,
+                tier=tier,
+            )
+            return False
+        if self._tier is None:
+            self._tier = tier
+        elif tier != self._tier:
+            self._reset(
+                current,
+                reason="tier_changed",
+                source_id=source_id,
+                tier=tier,
+            )
+            return False
+        if (current["w"] and current["s"]) or (
+            current["a"] and current["d"]
+        ):
+            self._reset(
+                current,
+                reason="opposing_directions",
+                source_id=source_id,
+                tier=tier,
+            )
+            return False
+
+        if self._boost_key is not None:
+            if current[self._boost_key]:
+                self._previous = dict(current)
+                return True
+            self._boost_key = None
+
+        for name in self._DIRECTIONS:
+            first_at = self._first_press_at.get(name)
+            if first_at is not None and now - first_at > self.window_s:
+                self._first_press_at.pop(name, None)
+                self._released.discard(name)
+
+            rising = current[name] and not self._previous[name]
+            falling = not current[name] and self._previous[name]
+            if rising:
+                first_at = self._first_press_at.get(name)
+                if (
+                    first_at is not None
+                    and name in self._released
+                    and now - first_at <= self.window_s
+                ):
+                    self._boost_key = name
+                    self._first_press_at.clear()
+                    self._released.clear()
+                    self.activations += 1
+                    break
+                self._first_press_at[name] = now
+                self._released.discard(name)
+            elif falling:
+                first_at = self._first_press_at.get(name)
+                if first_at is not None and now - first_at <= self.window_s:
+                    self._released.add(name)
+                else:
+                    self._first_press_at.pop(name, None)
+                    self._released.discard(name)
+
+        self._previous = dict(current)
+        return self._boost_key is not None and current[self._boost_key]
+
+    @property
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "window_s": self.window_s,
+            "active": self._boost_key is not None,
+            "boost_key": self._boost_key,
+            "activations": self.activations,
+            "resets": self.resets,
+            "last_reset_reason": self.last_reset_reason,
+            "source_id": self._source_id,
+        }
 
 
 class CalibrationModeController:
@@ -405,6 +1113,88 @@ class UiSettingsController:
             "load_status": self.load_status,
             "persistence_error": self.persistence_error,
             "change_count": self.change_count,
+        }
+
+
+class VideoSettingsController:
+    """Persist fixed video presets; the running UE keeps its applied snapshot."""
+
+    def __init__(
+        self,
+        *,
+        store: VideoSettingsStore,
+        applied: VideoSettings,
+    ) -> None:
+        self.store = store
+        self.applied = applied
+        self.persistence_error = store.load_error
+        self.change_count = 0
+
+    @staticmethod
+    def _values(settings: VideoSettings) -> dict[str, object]:
+        mapping = settings.to_mapping()
+        return {
+            key: value
+            for key, value in mapping.items()
+            if key not in {"version", "revision"}
+        }
+
+    def apply_intent(
+        self,
+        field: str,
+        value: object,
+        *,
+        expected_revision: int,
+        active: bool,
+    ) -> bool:
+        if not active:
+            return False
+        try:
+            modification = self.store.modify(
+                field,
+                value,
+                expected_revision=expected_revision,
+            )
+        except VideoSettingsError as exc:
+            if exc.code == "E_VIDEO_REVISION_CONFLICT":
+                try:
+                    self.store.reload()
+                except (VideoSettingsPersistenceError, OSError) as reload_exc:
+                    self.persistence_error = str(reload_exc)
+                    return False
+                # A fast duplicate click or another authenticated writer may
+                # legitimately advance the revision before this intent is
+                # handled. Reconcile to the durable snapshot and let the
+                # overlay retry from its next revision instead of deadlocking
+                # the restart gate on a stale intent.
+                self.persistence_error = None
+                return False
+            self.persistence_error = str(exc)
+            return False
+        except (VideoSettingsPersistenceError, OSError) as exc:
+            self.persistence_error = str(exc)
+            return False
+        self.persistence_error = None
+        if modification.changed:
+            self.change_count += 1
+        return modification.changed
+
+    def pending_restart(self) -> bool:
+        return self._values(self.store.settings) != self._values(self.applied)
+
+    def live_mapping(self) -> dict[str, object]:
+        desired = self.store.settings
+        return {
+            "available": True,
+            "settings_file": os.fspath(self.store.path),
+            "revision": desired.revision,
+            "current": self._values(self.applied),
+            "next_launch": self._values(desired),
+            "pending_restart": self.pending_restart(),
+            "load_status": self.store.load_status,
+            "persistence_error": self.persistence_error,
+            "change_count": self.change_count,
+            "apply_mode": "whole_runtime_restart",
         }
 
 
@@ -1251,6 +2041,224 @@ _XI_RAW_BUTTON_PRESS = 15
 _XI_RAW_BUTTON_RELEASE = 16
 _XI_RAW_MOTION = 17
 _MAX_XI2_EVENTS_PER_POLL = 4096
+
+
+class CarlaCelestialLightingBridge:
+    """Apply a complete, versioned visual profile through CARLA weather RPC."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        timeout_seconds: float = 0.2,
+        retry_seconds: float = 1.0,
+        apply_interval_seconds: float = 0.5,
+        readback_tolerance_deg: float = 0.5,
+        weather_readback_tolerance: float = 1e-4,
+        carla_module: Any | None = None,
+    ) -> None:
+        for name, value in (
+            ("timeout_seconds", timeout_seconds),
+            ("retry_seconds", retry_seconds),
+            ("apply_interval_seconds", apply_interval_seconds),
+            ("readback_tolerance_deg", readback_tolerance_deg),
+            ("weather_readback_tolerance", weather_readback_tolerance),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
+        if not 1 <= port <= 65535:
+            raise ValueError("CARLA lighting port must be in [1, 65535]")
+        self._host = host
+        self._port = port
+        self._timeout = timeout_seconds
+        self._retry = retry_seconds
+        self._interval = apply_interval_seconds
+        self._tolerance = readback_tolerance_deg
+        self._weather_tolerance = weather_readback_tolerance
+        self._carla_module = carla_module
+        self._client: Any | None = None
+        self._world: Any | None = None
+        self._state_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._latest_sample: CarlaWeatherSample | None = None
+        self._applied_sample: CarlaWeatherSample | None = None
+        self._generation = 0
+        self._next_attempt = 0.0
+        self._status = "pending"
+        self._error: str | None = None
+
+    def _connect(self) -> None:
+        carla = self._carla_module or importlib.import_module("carla")
+        client = carla.Client(self._host, self._port)
+        client.set_timeout(self._timeout)
+        self._world = client.get_world()
+        self._client = client
+
+    def _disconnect(self) -> None:
+        self._client = None
+        self._world = None
+
+    @staticmethod
+    def _angle_delta_deg(left: float, right: float) -> float:
+        return abs((left - right + 180.0) % 360.0 - 180.0)
+
+    def _parameter_matches(self, name: str, expected: float, actual: float) -> bool:
+        if name in {"sun_altitude_angle", "sun_azimuth_angle"}:
+            if name == "sun_azimuth_angle":
+                return self._angle_delta_deg(actual, expected) <= self._tolerance
+            return abs(actual - expected) <= self._tolerance
+        return math.isclose(
+            actual,
+            expected,
+            rel_tol=self._weather_tolerance,
+            abs_tol=self._weather_tolerance,
+        )
+
+    def _samples_match(
+        self,
+        expected: CarlaWeatherSample,
+        applied: CarlaWeatherSample,
+    ) -> bool:
+        if expected.profile_sha256 != applied.profile_sha256:
+            return False
+        return all(
+            expected_name == applied_name
+            and self._parameter_matches(expected_name, expected_value, applied_value)
+            for (expected_name, expected_value), (applied_name, applied_value) in zip(
+                expected.parameters,
+                applied.parameters,
+                strict=True,
+            )
+        )
+
+    def _apply_weather(self, sample: CarlaWeatherSample) -> None:
+        if self._world is None:
+            self._connect()
+        assert self._world is not None
+        weather = self._world.get_weather()
+        for name, value in sample.parameters:
+            if not hasattr(weather, name):
+                raise RuntimeError(f"CARLA weather does not expose {name}")
+            setattr(weather, name, value)
+        self._world.set_weather(weather)
+        readback = self._world.get_weather()
+        for name, expected in sample.parameters:
+            if not hasattr(readback, name):
+                raise RuntimeError(f"CARLA weather readback does not expose {name}")
+            actual = float(getattr(readback, name))
+            if not math.isfinite(actual) or not self._parameter_matches(
+                name, expected, actual
+            ):
+                raise RuntimeError(f"CARLA weather readback did not match {name}")
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(timeout=0.25)
+            if self._stop.is_set():
+                return
+            with self._state_lock:
+                sample = self._latest_sample
+                generation = self._generation
+                next_attempt = self._next_attempt
+            if sample is None:
+                self._wake.clear()
+                continue
+            delay = max(0.0, next_attempt - time.monotonic())
+            if delay > 0.0 and self._stop.wait(delay):
+                return
+            try:
+                self._apply_weather(sample)
+            except Exception:
+                self._disconnect()
+                with self._state_lock:
+                    self._status = "unavailable"
+                    self._error = "carla-weather-unavailable"
+                    self._next_attempt = time.monotonic() + self._retry
+                # Keep the wake flag set so the latest sample is retried.
+                continue
+            with self._state_lock:
+                self._status = "applied"
+                self._error = None
+                self._applied_sample = sample
+                self._next_attempt = time.monotonic() + self._interval
+                if generation == self._generation:
+                    self._wake.clear()
+
+    def _ensure_worker(self) -> None:
+        if self._thread is not None:
+            return
+        with self._state_lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._worker,
+                    name="matrix-celestial-lighting",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def apply(
+        self,
+        lighting: Mapping[str, object],
+        sample: CarlaWeatherSample,
+        *,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        if now is not None and (not math.isfinite(now) or now < 0.0):
+            raise ValueError("CARLA lighting time must be finite and non-negative")
+        if not isinstance(sample, CarlaWeatherSample):
+            raise ValueError("CARLA lighting requires a typed weather sample")
+        parameters = sample.parameters_mapping()
+        altitude = lighting.get("sun_altitude_deg")
+        azimuth = lighting.get("sun_azimuth_deg")
+        if (
+            isinstance(altitude, bool)
+            or not isinstance(altitude, (int, float))
+            or isinstance(azimuth, bool)
+            or not isinstance(azimuth, (int, float))
+            or not self._parameter_matches(
+                "sun_altitude_angle",
+                float(altitude),
+                parameters["sun_altitude_angle"],
+            )
+            or not self._parameter_matches(
+                "sun_azimuth_angle",
+                float(azimuth),
+                parameters["sun_azimuth_angle"],
+            )
+        ):
+            raise ValueError("visual profile Sun angles do not match celestial truth")
+        with self._state_lock:
+            self._latest_sample = sample
+            self._generation += 1
+            if self._status == "applied" and self._applied_sample is not None:
+                if not self._samples_match(sample, self._applied_sample):
+                    self._status = "pending"
+                    self._error = None
+            status = self._status
+            error = self._error
+        self._ensure_worker()
+        self._wake.set()
+        result = dict(lighting)
+        result["render_authority"] = (
+            "carla-weather" if status == "applied" else "state-only"
+        )
+        result["render_status"] = status
+        result["render_error"] = error
+        return result
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=max(1.0, self._timeout + 0.5))
+        writer_alive = thread is not None and thread.is_alive()
+        self._disconnect()
+        if writer_alive:
+            raise RuntimeError("CARLA celestial lighting worker did not stop")
 
 
 class _XGenericEventCookie(ctypes.Structure):
@@ -2305,6 +3313,8 @@ class X11KeyboardMouse:
         "v": 0x0076,
         "ctrl_left": 0xFFE3,
         "ctrl_right": 0xFFE4,
+        "alt_left": 0xFFE9,
+        "alt_right": 0xFFEA,
         "shift_left": 0xFFE1,
         "shift_right": 0xFFE2,
         "escape": 0xFF1B,
@@ -2773,6 +3783,8 @@ class X11KeyboardMouse:
             },
             ctrl=pressed.get("ctrl_left", False)
             or pressed.get("ctrl_right", False),
+            alt=pressed.get("alt_left", False)
+            or pressed.get("alt_right", False),
             shift=pressed.get("shift_left", False)
             or pressed.get("shift_right", False),
             escape=pressed.get("escape", False),
@@ -2792,12 +3804,15 @@ class X11KeyboardMouse:
 
     def close(self) -> None:
         raw_motion = getattr(self, "_raw_motion", None)
-        if raw_motion is not None:
-            raw_motion.close()
+        try:
+            if raw_motion is not None:
+                raw_motion.close()
+        finally:
             self._raw_motion = None
-        if getattr(self, "_display", None):
-            self._x11.XCloseDisplay(self._display)
+            display = getattr(self, "_display", None)
             self._display = None
+            if display:
+                self._x11.XCloseDisplay(display)
 
 
 class LinuxJoystick:
@@ -2826,6 +3841,7 @@ class LinuxJoystick:
         self._fd: int | None = None
         self._path: str | None = None
         self._axes: dict[int, float] = {}
+        self._buttons: dict[int, bool] = {}
         self._next_open = 0.0
 
     @property
@@ -2849,21 +3865,24 @@ class LinuxJoystick:
             self._fd = self._opener(path, os.O_RDONLY | os.O_NONBLOCK)
             self._path = path
             self._axes.clear()
+            self._buttons.clear()
         except OSError:
             self._fd = None
             self._path = None
             self._next_open = now + 1.0
 
     def _disconnect(self, now: float) -> None:
-        if self._fd is not None:
-            try:
-                self._closer(self._fd)
-            except OSError:
-                pass
+        descriptor = self._fd
         self._fd = None
         self._path = None
         self._axes.clear()
+        self._buttons.clear()
         self._next_open = now + 1.0
+        if descriptor is not None:
+            try:
+                self._closer(descriptor)
+            except OSError:
+                pass
 
     def poll(self, now: float) -> GamepadSample:
         self._open_if_due(now)
@@ -2887,12 +3906,13 @@ class LinuxJoystick:
             if event_type == _JS_EVENT_AXIS:
                 self._axes[number] = _clamp(value / 32767.0, -1.0, 1.0)
             elif event_type == _JS_EVENT_BUTTON:
-                continue
+                self._buttons[number] = bool(value)
         return GamepadSample(
             forward=-self._axes.get(self._left_y, 0.0),
             right=self._axes.get(self._left_x, 0.0),
             look_yaw=self._axes.get(self._right_x, 0.0),
             look_pitch=-self._axes.get(self._right_y, 0.0),
+            buttons_pressed=any(self._buttons.values()),
             connected=True,
         )
 
@@ -2969,9 +3989,10 @@ class UnixSeqpacketPublisher:
         return True
 
     def close(self) -> None:
-        if self._socket is not None:
-            self._socket.close()
-            self._socket = None
+        connection = self._socket
+        self._socket = None
+        if connection is not None:
+            connection.close()
 
 
 def build_snapshot(
@@ -2984,6 +4005,7 @@ def build_snapshot(
     camera_yaw_rad: float,
     camera_available: bool,
     input_available: bool = True,
+    keyboard_boost: bool = False,
 ) -> InputSnapshot:
     keys, move_stick, _look_yaw = select_physical_inputs(
         keyboard, gamepad, source=input_source
@@ -3002,9 +4024,171 @@ def build_snapshot(
             and input_available
         ),
         camera_yaw_rad=camera_yaw_rad,
+        keyboard_boost=bool(keyboard_boost),
         keys=keys,
         move_stick=move_stick,
     )
+
+
+def fail_closed_external_snapshot(snapshot: InputSnapshot) -> InputSnapshot:
+    """Preserve frame identity while removing every externally authored input."""
+
+    if not isinstance(snapshot, InputSnapshot):
+        raise TypeError("external publish snapshot is invalid")
+    return InputSnapshot(
+        sequence=snapshot.sequence,
+        timestamp_monotonic_s=snapshot.timestamp_monotonic_s,
+        focused=False,
+        camera_yaw_rad=snapshot.camera_yaw_rad,
+        keyboard_boost=False,
+        keys=KeySnapshot(
+            w=False,
+            a=False,
+            s=False,
+            d=False,
+            q=False,
+            e=False,
+            v=False,
+            ctrl=False,
+            alt=False,
+            shift=False,
+        ),
+        move_stick=MoveStickSnapshot(right=0.0, forward=0.0),
+        protocol=snapshot.protocol,
+    )
+
+
+def apply_external_publish_interlock(
+    snapshot: InputSnapshot,
+    frame: ExternalProviderGateFrame | None,
+    interlock_reason: str | None,
+) -> InputSnapshot:
+    """Guarantee that an interlocked external frame writes no side effects."""
+
+    if not isinstance(snapshot, InputSnapshot):
+        raise TypeError("external publish snapshot is invalid")
+    if frame is not None and not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if interlock_reason is not None and (
+        not isinstance(interlock_reason, str) or not interlock_reason
+    ):
+        raise ValueError("external input interlock reason is invalid")
+    if frame is None or interlock_reason is None:
+        return snapshot
+    return fail_closed_external_snapshot(snapshot)
+
+
+@dataclass(frozen=True)
+class ExternalPublishBoundary:
+    snapshot: InputSnapshot
+    current_token: ExternalInputToken | None
+    exact_revision: bool
+
+
+def external_publish_boundary(
+    broker: ExternalControlBroker,
+    frame: ExternalProviderGateFrame | None,
+    snapshot: InputSnapshot,
+    *,
+    now: float,
+) -> ExternalPublishBoundary:
+    """Freeze the final authority decision immediately before socket send."""
+
+    if not isinstance(broker, ExternalControlBroker):
+        raise TypeError("external publish boundary requires its broker")
+    if frame is not None and not isinstance(frame, ExternalProviderGateFrame):
+        raise TypeError("external provider gate frame is invalid")
+    if not isinstance(snapshot, InputSnapshot):
+        raise TypeError("external publish snapshot is invalid")
+    current_token = broker.publish_boundary_token(now=now)
+    exact_revision = bool(frame is not None and frame.token == current_token)
+    return ExternalPublishBoundary(
+        snapshot=(
+            snapshot
+            if frame is None or exact_revision
+            else fail_closed_external_snapshot(snapshot)
+        ),
+        current_token=current_token,
+        exact_revision=exact_revision,
+    )
+
+
+class _CleanupCoordinator:
+    """Run every provider cleanup step even when earlier steps fail."""
+
+    def __init__(self) -> None:
+        self.failures: list[dict[str, str]] = []
+
+    def run(
+        self,
+        label: str,
+        operation: Callable[[], Any],
+        *,
+        default: Any = None,
+    ) -> Any:
+        try:
+            return operation()
+        except BaseException as exc:
+            failure = {
+                "step": label,
+                "type": type(exc).__name__,
+                "message": str(exc) or type(exc).__name__,
+            }
+            self.failures.append(failure)
+            try:
+                print(
+                    "matrix-game-control-input cleanup ERROR "
+                    f"{label}: {failure['type']}: {failure['message']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except BaseException:
+                # stderr itself can be closed or broken during teardown.  A
+                # diagnostic sink must never become a cleanup dependency.
+                pass
+            return default
+
+
+def _close_provider_resources(
+    cleanup: _CleanupCoordinator,
+    *,
+    gamepad: Any,
+    overlay: Any | None,
+    x11: Any,
+    publisher: Any | None,
+    external_control: Any | None,
+    previous_handlers: dict[int, Any],
+) -> None:
+    """Attempt every owned-resource close and every handler restoration."""
+
+    cleanup.run("gamepad_close", gamepad.close)
+    if overlay is not None:
+        cleanup.run("overlay_close", overlay.close)
+    cleanup.run("x11_close", x11.close)
+    if publisher is not None:
+        cleanup.run("publisher_close", publisher.close)
+    if external_control is not None:
+        cleanup.run("external_control_close", external_control.close)
+    for signum, handler in previous_handlers.items():
+        cleanup.run(
+            f"signal_restore_{signal.Signals(signum).name}",
+            lambda signum=signum, handler=handler: signal.signal(
+                signum, handler
+            ),
+        )
+
+
+def _cleanup_outcome(
+    cleanup: _CleanupCoordinator,
+    *,
+    return_code: int,
+    exit_reason: str,
+) -> tuple[int, str]:
+    if not cleanup.failures:
+        return return_code, exit_reason
+    if not exit_reason.startswith("error:"):
+        exit_reason = f"cleanup_error:{cleanup.failures[0]['step']}"
+    return 1, exit_reason
 
 
 def _atomic_json(path: Path | None, payload: dict[str, object]) -> None:
@@ -3032,6 +4216,59 @@ def _read_json_object(path: Path) -> dict[str, object] | None:
     return value if isinstance(value, dict) else None
 
 
+def decode_applied_video_settings(value: str) -> VideoSettings:
+    """Decode the launcher's structured runtime mapping without free-form text."""
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate applied video setting {key!r}")
+            result[key] = item
+        return result
+
+    try:
+        raw = json.loads(
+            value,
+            object_pairs_hook=strict_object,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"invalid applied video constant {token}")
+            ),
+        )
+        if not isinstance(raw, dict):
+            raise ValueError("applied video settings must be an object")
+        expected = {
+            "revision",
+            "resolution",
+            "resolution_width",
+            "resolution_height",
+            "window_mode",
+            "fps_limit",
+            "quality",
+            "camera_smoothing",
+        }
+        if set(raw) != expected:
+            raise ValueError("applied video settings have an invalid schema")
+        settings = VideoSettings(
+            revision=raw.get("revision"),
+            resolution=raw.get("resolution"),
+            window_mode=raw.get("window_mode"),
+            fps_limit=raw.get("fps_limit"),
+            quality=raw.get("quality"),
+            camera_smoothing=raw.get("camera_smoothing"),
+        )
+        if settings.runtime_mapping() != raw:
+            raise ValueError("applied video settings runtime fields disagree")
+        return settings
+    except (
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        VideoSettingsError,
+    ) as exc:
+        raise ValueError(f"invalid applied video settings: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class OverlayIntent:
     """One authenticated action emitted by the supervised overlay child."""
@@ -3043,6 +4280,20 @@ class OverlayIntent:
     slot: str | None = None
     policy_id: str | None = None
     item_id: str | None = None
+    destination_id: str | None = None
+    video_field: str | None = None
+    video_value: object = None
+    expected_revision: int | None = None
+
+
+@dataclass(frozen=True)
+class PendingExternalInputPublish:
+    """One data-modify mutation waiting for its exact provider-frame write."""
+
+    token: ExternalInputToken
+    path: str
+    warning: str | None
+    data: dict[str, object] | None
 
 
 class GameCommandClient:
@@ -3060,12 +4311,19 @@ class GameCommandClient:
         *,
         initial_strategy_loadout: object = None,
         initial_creative_inventory: object = None,
+        initial_motion_settings: object = None,
+        celestial_catalog: CelestialCatalog | None = None,
+        celestial_clock: PersistentSimulationClock | None = None,
+        celestial_visual_catalog: CelestialVisualCatalog | None = None,
+        celestial_visual_profile: str = "auto",
+        celestial_lighting_bridge: CarlaCelestialLightingBridge | None = None,
     ) -> None:
         self._connection: socket.socket | None = None
         self._session = os.urandom(16).hex()
         self._sequence = 0
         self._result_revision = 0
         self._pending: GameCommandRequest | None = None
+        self._pending_external_input: PendingExternalInputPublish | None = None
         self._pending_warning: str | None = None
         self._outcome_unknown = False
         self.editing = False
@@ -3088,6 +4346,34 @@ class GameCommandClient:
         self._creative_inventory = self._validate_creative_inventory(
             initial_creative_inventory
         )
+        self._motion_settings = (
+            None
+            if initial_motion_settings is None
+            else validate_motion_settings_telemetry(initial_motion_settings)
+        )
+        self._celestial_catalog = celestial_catalog
+        if celestial_clock is not None and celestial_catalog is None:
+            raise ValueError("celestial clock requires a celestial catalog")
+        if celestial_visual_catalog is not None and celestial_catalog is None:
+            raise ValueError("celestial visuals require a celestial catalog")
+        if (
+            celestial_lighting_bridge is not None
+            and celestial_visual_catalog is None
+        ):
+            raise ValueError("celestial lighting bridge requires visual profiles")
+        self._celestial_clock = (
+            celestial_clock
+            if celestial_clock is not None
+            else (
+                celestial_catalog.create_clock()
+                if celestial_catalog is not None
+                else None
+            )
+        )
+        self._celestial_visual_catalog = celestial_visual_catalog
+        self._celestial_visual_profile = celestial_visual_profile
+        self._celestial_lighting_bridge = celestial_lighting_bridge
+        self._teleport_probes = {}
         if file_descriptor is None:
             return
         if (
@@ -3250,13 +4536,73 @@ class GameCommandClient:
     def creative_inventory_mapping(self) -> dict[str, object]:
         return json.loads(json.dumps(self._creative_inventory, allow_nan=False))
 
+    def motion_settings_mapping(self) -> dict[str, object] | None:
+        return (
+            json.loads(json.dumps(self._motion_settings, allow_nan=False))
+            if self._motion_settings is not None
+            else None
+        )
+
+    def celestial_navigation_mapping(self) -> dict[str, object]:
+        catalog = self._celestial_catalog
+        clock = self._celestial_clock
+        if catalog is None or clock is None:
+            return {
+                "version": 2,
+                "available": False,
+                "status": "unavailable",
+                "universe_id": "unavailable",
+                "display_name": "Universe unavailable",
+                "reference_epoch_utc": None,
+                "time_scale": None,
+                "frame": None,
+                "ephemeris": None,
+                "simulation_time": None,
+                "origin_rebasing": True,
+                "simulation_local_bound_m": 100000.0,
+                "current_body_id": None,
+                "bodies": [],
+                "lighting": None,
+                "destinations": [],
+            }
+        snapshot = clock.snapshot()
+        mapping = catalog.navigation_mapping(
+            self._teleport_probes,
+            command_available=self.available,
+            in_flight=self.in_flight,
+            restart_required=self.restart_required,
+            outcome_unknown=self.outcome_unknown,
+            simulation_time=snapshot,
+        )
+        lighting = mapping.get("lighting")
+        visual_catalog = self._celestial_visual_catalog
+        if visual_catalog is not None and isinstance(lighting, dict):
+            sample = visual_catalog.sample(
+                lighting,
+                profile_id=self._celestial_visual_profile,
+            )
+            profiled_lighting = dict(lighting)
+            profiled_lighting["visual_profile"] = sample.profile_mapping()
+            if self._celestial_lighting_bridge is not None:
+                profiled_lighting = self._celestial_lighting_bridge.apply(
+                    profiled_lighting,
+                    sample,
+                )
+            mapping["lighting"] = profiled_lighting
+        clock.checkpoint()
+        return mapping
+
+    def checkpoint_celestial_clock(self) -> bool:
+        clock = self._celestial_clock
+        return clock.checkpoint() if clock is not None else False
+
     @property
     def available(self) -> bool:
         return self._connection is not None
 
     @property
     def in_flight(self) -> bool:
-        return self._pending is not None
+        return self._pending is not None or self._pending_external_input is not None
 
     @property
     def outcome_unknown(self) -> bool:
@@ -3402,10 +4748,57 @@ class GameCommandClient:
                 "Wait for the ESC panel to deliver a neutral frame",
             )
             return False
-        if not self.editing:
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        try:
+            parsed = parse_mc_command(command_text)
+        except CommandParseError as exc:
+            message = exc.message
+            if exc.column is not None:
+                message = f"{message} (column {exc.column})"
+            self._local_error(exc.code, message)
+            return False
+        if isinstance(parsed.command, DataModifyInput):
+            self._local_error(
+                "E_EXTERNAL_API_REQUIRED",
+                "control.input data modify requires an active external-control lease",
+            )
+            return False
+        if not self.editing and not isinstance(parsed.command, DataModifyNumber):
             self._local_error(
                 "E_COMMAND_EDIT_REQUIRED", "Activate the command input first"
             )
+            return False
+        return self._send_typed_command(
+            parsed.command,
+            warning=parsed.warning,
+            pending_message="Command submitted; waiting for the runtime",
+        )
+
+    def submit_external(
+        self,
+        command_text: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+        input_modifier: Callable[
+            [DataModifyInput],
+            tuple[ExternalInputToken, dict[str, object] | None],
+        ],
+    ) -> bool:
+        """Submit one capability-authenticated API command.
+
+        Input data modifications stay provider-side and can drive normal
+        gameplay.  World/policy/settings commands retain the ESC neutral-frame
+        gate, while the visual text-editor gate is unnecessary for an already
+        authenticated external client.
+        """
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
             return False
         if restart_requested:
             self._local_error(
@@ -3420,11 +4813,167 @@ class GameCommandClient:
                 message = f"{message} (column {exc.column})"
             self._local_error(exc.code, message)
             return False
+        if isinstance(parsed.command, DataModifyInput):
+            try:
+                modified = input_modifier(parsed.command)
+            except Exception as exc:
+                code = getattr(exc, "code", "E_EXTERNAL_INPUT")
+                message = getattr(exc, "message", str(exc) or type(exc).__name__)
+                self._local_error(str(code), str(message))
+                return False
+            if (
+                not isinstance(modified, tuple)
+                or len(modified) != 2
+                or not isinstance(modified[0], ExternalInputToken)
+                or (modified[1] is not None and not isinstance(modified[1], dict))
+            ):
+                self._local_error(
+                    "E_EXTERNAL_INPUT",
+                    "input modifier did not return an exact input token",
+                )
+                return False
+            token, data = modified
+            self._pending_external_input = PendingExternalInputPublish(
+                token=token,
+                path=parsed.command.path,
+                warning=parsed.warning,
+                data=data,
+            )
+            self._result_revision += 1
+            self._outcome_unknown = False
+            self.status = "pending"
+            self.ok = None
+            self.code = None
+            self.message = (
+                "Input modified; waiting for its exact provider-frame publish"
+            )
+            self.warning = parsed.warning
+            self.restart_required = False
+            self.data = data
+            self.last_request_id = None
+            return True
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before commands")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
         return self._send_typed_command(
             parsed.command,
             warning=parsed.warning,
-            pending_message="Command submitted; waiting for the runtime",
+            pending_message="External command submitted; waiting for the runtime",
         )
+
+    def resolve_external_input_publish(
+        self,
+        *,
+        sampled_token: ExternalInputToken | None,
+        current_token: ExternalInputToken | None,
+        authority_active: bool,
+        published: bool,
+        locomotion_admitted: bool,
+        interlock_reason: str | None,
+        data: dict[str, object] | None = None,
+    ) -> bool:
+        """Resolve a provider-side input command from one final frame outcome."""
+
+        pending = self._pending_external_input
+        if pending is None:
+            return False
+        if (
+            type(authority_active) is not bool
+            or type(published) is not bool
+            or type(locomotion_admitted) is not bool
+        ):
+            raise TypeError("external input publish outcome flags must be boolean")
+        if sampled_token is not None and not isinstance(
+            sampled_token, ExternalInputToken
+        ):
+            raise TypeError("sampled external input token is invalid")
+        if current_token is not None and not isinstance(
+            current_token, ExternalInputToken
+        ):
+            raise TypeError("current external input token is invalid")
+        if interlock_reason is not None and (
+            not isinstance(interlock_reason, str) or not interlock_reason
+        ):
+            raise ValueError("external input interlock reason is invalid")
+        if data is not None and not isinstance(data, dict):
+            raise TypeError("external input result data must be a mapping")
+
+        if not authority_active or current_token is None:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_AUTHORITY_REVOKED",
+                message="External input authority was revoked before publish",
+                data=data,
+            )
+        if current_token != pending.token:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_SUPERSEDED",
+                message="External input revision changed before publish",
+                data=data,
+            )
+        # The provider may have sampled the predecessor immediately before the
+        # command was admitted in this same loop iteration.  That frame cannot
+        # prove or reject the pending mutation; wait for the exact revision.
+        if sampled_token != pending.token:
+            return False
+        if interlock_reason is not None:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_INTERLOCK",
+                message=f"External input publish interlocked: {interlock_reason}",
+                data=data,
+            )
+        if not published:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_PUBLISH_FAILED",
+                message="External input provider frame was not published",
+                data=data,
+            )
+        if not locomotion_admitted:
+            return self._finish_external_input_publish(
+                ok=False,
+                code="E_INPUT_INTERLOCK",
+                message="External input provider gate did not admit locomotion",
+                data=data,
+            )
+        return self._finish_external_input_publish(
+            ok=True,
+            code="OK_DATA_INPUT_MODIFIED",
+            message=f"Set {pending.path}",
+            data=data,
+        )
+
+    def _finish_external_input_publish(
+        self,
+        *,
+        ok: bool,
+        code: str,
+        message: str,
+        data: dict[str, object] | None,
+    ) -> bool:
+        pending = self._pending_external_input
+        if pending is None:
+            return False
+        self._pending_external_input = None
+        self._result_revision += 1
+        self._outcome_unknown = False
+        self.status = "success" if ok else "error"
+        self.ok = ok
+        self.code = code
+        self.message = message
+        self.warning = pending.warning
+        self.restart_required = False
+        self.data = pending.data if data is None else data
+        self.last_request_id = None
+        return True
 
     def _send_typed_command(
         self,
@@ -3549,6 +5098,111 @@ class GameCommandClient:
             pending_message="Taking item from creative inventory",
         )
 
+    def refresh_celestial_navigation(
+        self,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Query only catalog tags over the existing typed command channel."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        catalog = self._celestial_catalog
+        if catalog is None:
+            self._local_error(
+                "E_NAVIGATION_UNAVAILABLE", "Celestial navigation is unavailable"
+            )
+            return False
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before refreshing")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        command = TeleportList(
+            tuple(destination.teleport_tag for destination in catalog.destinations)
+        )
+        sent = self._send_typed_command(
+            command,
+            warning=None,
+            pending_message="Refreshing celestial teleport points",
+        )
+        if sent:
+            self._teleport_probes = {}
+        return sent
+
+    def select_celestial_destination(
+        self,
+        destination_id: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Resolve one catalog destination to a typed teleport selector."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before teleporting")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        catalog = self._celestial_catalog
+        if catalog is None:
+            self._local_error(
+                "E_NAVIGATION_UNAVAILABLE", "Celestial navigation is unavailable"
+            )
+            return False
+        if not isinstance(destination_id, str):
+            self._local_error(
+                "E_DESTINATION_INVALID", "Celestial destination id is invalid"
+            )
+            return False
+        try:
+            destination = catalog.destination(destination_id)
+            body = catalog.body(destination.body_id)
+        except CelestialNavigationError as exc:
+            self._local_error("E_DESTINATION_INVALID", str(exc))
+            return False
+        probe = self._teleport_probes.get(destination.teleport_tag)
+        if not body.runtime_ready:
+            self._local_error(
+                "E_WORLD_UNAVAILABLE",
+                f"{body.display_name} runtime is not deployed on this build",
+            )
+            return False
+        if probe is None or not probe.found:
+            self._local_error(
+                "E_SELECTOR_NO_TARGET",
+                f"Teleport point {destination.teleport_tag!r} is not discovered",
+            )
+            return False
+        return self._send_typed_command(
+            TeleportSelector(tag=destination.teleport_tag),
+            warning=None,
+            pending_message=f"Routing to {destination.display_name}",
+        )
+
     def poll(self) -> bool:
         """Receive at most one exact response; never resend a pending request."""
 
@@ -3587,6 +5241,7 @@ class GameCommandClient:
         response_data = dict(response.data) if response.data is not None else None
         validated_loadout: dict[str, object] | None = None
         validated_inventory: dict[str, object] | None = None
+        validated_motion_settings: dict[str, object] | None = None
         if response_data is not None and "strategy_loadout" in response_data:
             try:
                 validated_loadout = self._validate_strategy_loadout(
@@ -3607,6 +5262,32 @@ class GameCommandClient:
                     f"Invalid creative inventory in command response: {exc}"
                 )
                 return True
+        if response_data is not None and "motion_settings" in response_data:
+            try:
+                validated_motion_settings = validate_motion_settings_telemetry(
+                    response_data["motion_settings"]
+                )
+            except ValueError as exc:
+                self._protocol_failure(
+                    f"Invalid motion settings in command response: {exc}"
+                )
+                return True
+        teleport_probes = None
+        if (
+            response.ok
+            and isinstance(pending.command, TeleportList)
+            and self._celestial_catalog is not None
+        ):
+            try:
+                teleport_probes = probes_from_response(
+                    response_data,
+                    catalog=self._celestial_catalog,
+                )
+            except CelestialNavigationError as exc:
+                self._protocol_failure(
+                    f"Invalid celestial navigation response: {exc}"
+                )
+                return True
         self._pending = None
         warning = self._pending_warning
         self._pending_warning = None
@@ -3622,6 +5303,10 @@ class GameCommandClient:
             self._strategy_loadout = validated_loadout
         if validated_inventory is not None:
             self._creative_inventory = validated_inventory
+        if validated_motion_settings is not None:
+            self._motion_settings = validated_motion_settings
+        if teleport_probes is not None:
+            self._teleport_probes = teleport_probes
         self.last_request_id = response.request_id
         if response.ok and response.restart_required:
             self.status = "restarting"
@@ -3660,8 +5345,100 @@ class GameCommandClient:
                 "Game command provider stopped before the runtime response"
             )
             return
+        pending_external = self._pending_external_input
+        if pending_external is not None:
+            self._pending_external_input = None
+            self._result_revision += 1
+            self._outcome_unknown = True
+            self.status = "error"
+            self.ok = None
+            self.code = "E_COMMAND_OUTCOME_UNKNOWN"
+            self.message = (
+                "External input publish outcome unknown; do not retry blindly"
+            )
+            self.warning = pending_external.warning
+            self.restart_required = False
+            self.data = pending_external.data
+            self.last_request_id = None
         self._pending_warning = None
         self._close_channel()
+
+    def finalize_celestial_resources(self) -> None:
+        """Close providers after the final status mapping has been serialized."""
+
+        first_error: BaseException | None = None
+        operations = (
+            (
+                self._celestial_clock.close
+                if self._celestial_clock is not None
+                else None
+            ),
+            (
+                self._celestial_lighting_bridge.close
+                if self._celestial_lighting_bridge is not None
+                else None
+            ),
+            (
+                self._celestial_catalog.ephemeris.close
+                if self._celestial_catalog is not None
+                else None
+            ),
+        )
+        for operation in operations:
+            if operation is None:
+                continue
+            try:
+                operation()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
+def validate_motion_settings_telemetry(value: object) -> dict[str, object]:
+    """Validate and clone one runtime-owned motion-settings status snapshot."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "settings_file",
+        "load_status",
+        "load_error",
+        "settings",
+    }:
+        raise ValueError("motion settings telemetry has an invalid schema")
+    settings_file = value.get("settings_file")
+    if not isinstance(settings_file, str) or not Path(settings_file).is_absolute():
+        raise ValueError("motion settings telemetry file must be absolute")
+    if value.get("load_status") not in {
+        "loaded",
+        "missing",
+        "invalid",
+        "provided",
+        "saved",
+    }:
+        raise ValueError("motion settings telemetry load status is invalid")
+    load_error = value.get("load_error")
+    if load_error is not None and not isinstance(load_error, str):
+        raise ValueError("motion settings telemetry load error is invalid")
+    try:
+        MotionSettings.from_mapping(value.get("settings"))
+    except (MotionSettingsError, TypeError, ValueError) as exc:
+        raise ValueError(f"motion settings telemetry values are invalid: {exc}") from exc
+    return json.loads(json.dumps(value, allow_nan=False))
+
+
+def live_motion_settings_telemetry(
+    initial: dict[str, object] | None,
+    command_client: GameCommandClient,
+) -> dict[str, object] | None:
+    """Prefer the latest acknowledged settings, retaining the launch snapshot."""
+
+    candidate: object = command_client.motion_settings_mapping()
+    if candidate is None:
+        candidate = initial
+    if candidate is None:
+        return None
+    return validate_motion_settings_telemetry(candidate)
 
 
 class CalibrationOverlaySupervisor:
@@ -3922,6 +5699,63 @@ class CalibrationOverlaySupervisor:
                     kind="creative_spawn",
                     item_id=item.item_id,
                 )
+            elif kind == "navigation_refresh":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                }:
+                    raise RuntimeError("invalid navigation-refresh intent schema")
+                intent = OverlayIntent(kind="navigation_refresh")
+            elif kind == "navigation_select":
+                destination_id = value.get("destination_id")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "destination_id",
+                    }
+                    or not isinstance(destination_id, str)
+                    or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", destination_id)
+                    is None
+                ):
+                    raise RuntimeError("invalid navigation-selection intent schema")
+                intent = OverlayIntent(
+                    kind="navigation_select",
+                    destination_id=destination_id,
+                )
+            elif kind == "video_setting":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "field",
+                    "value",
+                    "expected_revision",
+                }:
+                    raise RuntimeError("invalid video-setting intent schema")
+                expected_revision = value.get("expected_revision")
+                if (
+                    type(expected_revision) is not int
+                    or not 0 <= expected_revision < 2**63
+                ):
+                    raise RuntimeError("invalid video-setting intent revision")
+                field = value.get("field")
+                try:
+                    VideoSettings().with_patch({field: value.get("value")})
+                except (TypeError, ValueError, VideoSettingsError) as exc:
+                    raise RuntimeError("invalid video-setting intent value") from exc
+                intent = OverlayIntent(
+                    kind="video_setting",
+                    video_field=field,
+                    video_value=value.get("value"),
+                    expected_revision=expected_revision,
+                )
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -3933,24 +5767,24 @@ class CalibrationOverlaySupervisor:
         self.process = None
         action_socket = self._action_socket
         self._action_socket = None
-        if process is None:
+        try:
+            if process is None:
+                return
+            try:
+                current = _read_json_object(self.state_file) or {}
+                _atomic_json(self.state_file, {**current, "active": False})
+            except OSError:
+                pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2.0)
+        finally:
             if action_socket is not None:
                 action_socket.close()
-            return
-        try:
-            current = _read_json_object(self.state_file) or {}
-            _atomic_json(self.state_file, {**current, "active": False})
-        except OSError:
-            pass
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2.0)
-        if action_socket is not None:
-            action_socket.close()
 
 
 def _wait_until_frame(
@@ -3972,6 +5806,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
     parser.add_argument("--rate-hz", type=float, default=50.0)
+    parser.add_argument(
+        "--keyboard-double-tap-window-s",
+        type=float,
+        default=0.30,
+        help="Same-key press-release-press boost window in seconds",
+    )
     parser.add_argument(
         "--input-source", choices=("auto", "keyboard", "gamepad"), default="auto"
     )
@@ -4061,6 +5901,7 @@ def _parse_args() -> argparse.Namespace:
         help="CARLA spectator pitch rate at full right-stick deflection",
     )
     parser.add_argument("--gamepad-look-deadzone", type=float, default=0.12)
+    parser.add_argument("--gamepad-move-deadzone", type=float, default=0.15)
     parser.add_argument("--gamepad-look-min-pitch-deg", type=float, default=-80.0)
     parser.add_argument("--gamepad-look-max-pitch-deg", type=float, default=60.0)
     parser.add_argument("--status-file", type=Path)
@@ -4076,6 +5917,16 @@ def _parse_args() -> argparse.Namespace:
         "--mouse-settings-file",
         type=Path,
         default=default_settings_file(),
+    )
+    parser.add_argument(
+        "--video-settings-file",
+        type=Path,
+        default=None,
+        help="Host-scoped next-launch video settings",
+    )
+    parser.add_argument(
+        "--applied-video-settings-json",
+        help="Validated video settings snapshot frozen by the launcher",
     )
     parser.add_argument(
         "--applied-mouse-profile",
@@ -4099,6 +5950,55 @@ def _parse_args() -> argparse.Namespace:
         "--creative-inventory-json",
         help="Initial creative inventory state supplied by the physics runtime",
     )
+    parser.add_argument(
+        "--motion-settings-json",
+        help="Initial runtime-owned six-gear settings telemetry",
+    )
+    parser.add_argument(
+        "--external-control-socket",
+        type=Path,
+        help="Same-UID authenticated AF_UNIX automation endpoint",
+    )
+    parser.add_argument(
+        "--external-control-capability-file",
+        type=Path,
+        help="Private 32-byte capability file for external-control clients",
+    )
+    parser.add_argument(
+        "--external-control-deadman-seconds",
+        type=float,
+        default=0.15,
+    )
+    parser.add_argument(
+        "--celestial-catalog",
+        type=Path,
+        default=DEFAULT_CATALOG_PATH,
+        help="Strict SOL universe/body/destination catalog",
+    )
+    parser.add_argument(
+        "--celestial-clock-state-file",
+        type=Path,
+        help="Optional persistent TAI clock state shared across cold reloads",
+    )
+    parser.add_argument(
+        "--celestial-assets-manifest",
+        type=Path,
+        default=DEFAULT_ASSET_MANIFEST_PATH,
+    )
+    parser.add_argument("--celestial-de440s-kernel", type=Path)
+    parser.add_argument("--celestial-jplephem-wheel", type=Path)
+    parser.add_argument(
+        "--celestial-lighting-bridge",
+        choices=("state-only", "carla-weather"),
+        default="state-only",
+        help="Optional readback-verified CARLA visual-profile bridge",
+    )
+    parser.add_argument(
+        "--celestial-visual-catalog",
+        type=Path,
+        default=DEFAULT_VISUAL_CATALOG_PATH,
+    )
+    parser.add_argument("--celestial-visual-profile", default="auto")
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print canonical packets; do not connect"
@@ -4143,6 +6043,11 @@ def _validate_args(args: argparse.Namespace) -> None:
         or not 0.0 <= args.gamepad_look_deadzone < 1.0
     ):
         raise SystemExit("--gamepad-look-deadzone must be finite and in [0, 1)")
+    if (
+        not math.isfinite(args.gamepad_move_deadzone)
+        or not 0.0 <= args.gamepad_move_deadzone < 1.0
+    ):
+        raise SystemExit("--gamepad-move-deadzone must be finite and in [0, 1)")
     if args.gamepad_look_min_pitch_deg >= args.gamepad_look_max_pitch_deg:
         raise SystemExit("gamepad camera pitch limits must be ordered")
     if args.max_seconds < 0.0 or not math.isfinite(args.max_seconds):
@@ -4170,6 +6075,13 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
     if not args.mouse_settings_file.is_absolute():
         raise SystemExit("--mouse-settings-file must be absolute")
+    if args.video_settings_file is not None and not args.video_settings_file.is_absolute():
+        raise SystemExit("--video-settings-file must be absolute")
+    if args.applied_video_settings_json is not None:
+        try:
+            decode_applied_video_settings(args.applied_video_settings_json)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     try:
         AppliedMouseSettings(
             profile=args.applied_mouse_profile,
@@ -4200,6 +6112,98 @@ def _validate_args(args: argparse.Namespace) -> None:
             os.fstat(game_command_fd)
         except OSError as exc:
             raise SystemExit(f"--game-command-fd is not open: {exc}") from exc
+    external_values = (
+        args.external_control_socket,
+        args.external_control_capability_file,
+    )
+    if any(value is not None for value in external_values) and not all(
+        value is not None for value in external_values
+    ):
+        raise SystemExit("external control socket and capability file are all-or-none")
+    for name in ("external_control_socket", "external_control_capability_file"):
+        path = getattr(args, name)
+        if path is not None and not path.is_absolute():
+            raise SystemExit(f"--{name.replace('_', '-')} must be absolute")
+    if args.external_control_socket is not None:
+        assert args.external_control_capability_file is not None
+        external_paths = {
+            args.external_control_socket.resolve(strict=False),
+            args.external_control_capability_file.resolve(strict=False),
+        }
+        if len(external_paths) != 2:
+            raise SystemExit("external control socket and capability must be distinct")
+        calibration_path = args.calibration_state_file or args.socket.with_name(
+            f"{args.socket.name}.calibration.json"
+        )
+        reserved_paths = (
+            args.socket,
+            calibration_path,
+            args.mouse_settings_file,
+            args.status_file,
+            args.restart_request_file,
+            args.restart_capability_file,
+            args.ue_camera_state_file,
+        )
+        for reserved in reserved_paths:
+            if (
+                reserved is not None
+                and reserved.resolve(strict=False) in external_paths
+            ):
+                raise SystemExit(
+                    "external control paths must be distinct from provider IPC/state paths"
+                )
+    if (
+        not math.isfinite(args.external_control_deadman_seconds)
+        or not 0.01 <= args.external_control_deadman_seconds <= 0.15
+    ):
+        raise SystemExit("--external-control-deadman-seconds must be in [0.01, 0.15]")
+    if not args.celestial_catalog.is_absolute():
+        raise SystemExit("--celestial-catalog must be an absolute path")
+    if not args.celestial_catalog.is_file() or args.celestial_catalog.is_symlink():
+        raise SystemExit(
+            f"--celestial-catalog must be a regular file: {args.celestial_catalog}"
+        )
+    if args.celestial_clock_state_file is not None:
+        if not args.celestial_clock_state_file.is_absolute():
+            raise SystemExit("--celestial-clock-state-file must be an absolute path")
+        if (
+            args.celestial_clock_state_file.exists()
+            and (
+                args.celestial_clock_state_file.is_symlink()
+                or not args.celestial_clock_state_file.is_file()
+            )
+        ):
+            raise SystemExit(
+                "--celestial-clock-state-file must be a regular file when present"
+            )
+    if (
+        not args.celestial_assets_manifest.is_absolute()
+        or args.celestial_assets_manifest.is_symlink()
+        or not args.celestial_assets_manifest.is_file()
+    ):
+        raise SystemExit("--celestial-assets-manifest must be an absolute regular file")
+    if (
+        not args.celestial_visual_catalog.is_absolute()
+        or args.celestial_visual_catalog.is_symlink()
+        or not args.celestial_visual_catalog.is_file()
+    ):
+        raise SystemExit("--celestial-visual-catalog must be an absolute regular file")
+    ephemeris_assets = (
+        args.celestial_de440s_kernel,
+        args.celestial_jplephem_wheel,
+    )
+    if any(value is not None for value in ephemeris_assets) and not all(
+        value is not None for value in ephemeris_assets
+    ):
+        raise SystemExit("DE440s kernel and jplephem wheel are all-or-none")
+    for name in ("celestial_de440s_kernel", "celestial_jplephem_wheel"):
+        path = getattr(args, name)
+        if path is not None and (
+            not path.is_absolute() or path.is_symlink() or not path.is_file()
+        ):
+            raise SystemExit(
+                f"--{name.replace('_', '-')} must be an absolute regular file"
+            )
 
 
 def main() -> int:
@@ -4223,6 +6227,19 @@ def main() -> int:
         desired=loaded_ui.settings,
         load_status=loaded_ui.status,
         load_error=loaded_ui.error,
+    )
+    video_settings_path = args.video_settings_file or default_video_settings_file(
+        os.environ.get("MATRIX_HOST_PROFILE", "local")
+    )
+    video_store = VideoSettingsStore(video_settings_path)
+    applied_video = (
+        decode_applied_video_settings(args.applied_video_settings_json)
+        if args.applied_video_settings_json is not None
+        else video_store.settings
+    )
+    video_settings = VideoSettingsController(
+        store=video_store,
+        applied=applied_video,
     )
     restart_requester = RuntimeRestartRequester(
         request_file=args.restart_request_file,
@@ -4327,11 +6344,56 @@ def main() -> int:
             raise SystemExit(
                 f"Matrix game-control input received invalid creative inventory: {exc}"
             ) from exc
+    initial_motion_settings: dict[str, object] | None = None
+    if args.motion_settings_json is not None:
+        try:
+            decoded_motion_settings = json.loads(args.motion_settings_json)
+            initial_motion_settings = validate_motion_settings_telemetry(
+                decoded_motion_settings
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise SystemExit(
+                f"Matrix game-control input received invalid motion settings: {exc}"
+            ) from exc
+    try:
+        celestial_catalog = load_catalog(
+            args.celestial_catalog,
+            de440s_kernel=args.celestial_de440s_kernel,
+            jplephem_wheel=args.celestial_jplephem_wheel,
+            asset_manifest=args.celestial_assets_manifest,
+        )
+        celestial_clock = celestial_catalog.create_clock(
+            args.celestial_clock_state_file
+        )
+        celestial_visual_catalog = load_visual_catalog(
+            args.celestial_visual_catalog
+        )
+        if args.celestial_visual_profile != "auto":
+            celestial_visual_catalog.profile(args.celestial_visual_profile)
+        celestial_lighting_bridge = (
+            CarlaCelestialLightingBridge(args.carla_host, args.carla_port)
+            if args.celestial_lighting_bridge == "carla-weather"
+            else None
+        )
+    except (
+        CelestialNavigationError,
+        CelestialEphemerisError,
+        CelestialVisualError,
+    ) as exc:
+        raise SystemExit(
+            f"Matrix game-control input cannot load celestial catalog: {exc}"
+        ) from exc
     try:
         game_command_client = GameCommandClient(
             getattr(args, "game_command_fd", None),
             initial_strategy_loadout=initial_strategy_loadout,
             initial_creative_inventory=initial_creative_inventory,
+            initial_motion_settings=initial_motion_settings,
+            celestial_catalog=celestial_catalog,
+            celestial_clock=celestial_clock,
+            celestial_visual_catalog=celestial_visual_catalog,
+            celestial_visual_profile=args.celestial_visual_profile,
+            celestial_lighting_bridge=celestial_lighting_bridge,
         )
     except (OSError, ValueError) as exc:
         raise SystemExit(
@@ -4339,6 +6401,18 @@ def main() -> int:
         ) from exc
     calibration = CalibrationModeController()
     shortcut_arming = StartupShortcutArming()
+    double_tap = KeyboardDoubleTapDetector(args.keyboard_double_tap_window_s)
+    external_control: ExternalControlBroker | None = None
+    external_provider_gate: ExternalLocomotionProviderGate | None = None
+    external_inflight_command: ExternalCommand | None = None
+    if args.external_control_socket is not None:
+        assert args.external_control_capability_file is not None
+        external_control = ExternalControlBroker(
+            args.external_control_socket,
+            args.external_control_capability_file,
+            deadman_seconds=args.external_control_deadman_seconds,
+        )
+        external_provider_gate = ExternalLocomotionProviderGate(external_control)
 
     running = True
 
@@ -4365,6 +6439,12 @@ def main() -> int:
     previous_gamepad_connected: bool | None = None
     next_overlay_heartbeat = started
     last_teleport_rejections = 0
+    external_telemetry = (
+        external_control.telemetry(now=started)
+        if external_control is not None
+        else None
+    )
+    external_telemetry_signature: tuple[object, ...] | None = None
     calibration_neutral_frames = 0
     final_pov_observation: UeFinalPovObservation | None = None
     provider_yaw = tracker.yaw
@@ -4383,16 +6463,25 @@ def main() -> int:
     )
     source_claim = camera_source_claim(args.camera_yaw_source)
     try:
+        if external_control is not None:
+            external_control.open()
         if overlay is not None:
             overlay.start(
                 {
                     **source_claim,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "ui_settings": ui_settings.live_mapping(),
+                    "video_settings": video_settings.live_mapping(),
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "command_console": game_command_client.mapping(),
+                    "motion_settings": live_motion_settings_telemetry(
+                        initial_motion_settings, game_command_client
+                    ),
                     "strategy_loadout": game_command_client.strategy_loadout_mapping(),
+                    "celestial_navigation": (
+                        game_command_client.celestial_navigation_mapping()
+                    ),
                     "mirror_sensitivity": sensitivity_telemetry,
                     "pointer": x11.pointer_telemetry,
                     "camera_yaw": camera_yaw_telemetry(
@@ -4401,6 +6490,7 @@ def main() -> int:
                         sonic_yaw_rad=camera_yaw,
                     ),
                     "ue_final_pov": ue_final_pov_telemetry(None),
+                    "external_control": external_telemetry,
                 }
             )
         while running:
@@ -4420,11 +6510,82 @@ def main() -> int:
             previous_frame = now
             next_frame = max(next_frame + 1.0 / args.rate_hz, now)
 
-            command_state_changed = game_command_client.poll()
-            raw_keyboard = x11.poll()
-            last_keyboard = raw_keyboard
-            raw_pad = gamepad.poll(now)
+            command_state_changed = False
+            video_settings_changed = False
+            game_command_client.checkpoint_celestial_clock()
+            physical_keyboard = x11.poll()
+            last_keyboard = physical_keyboard
+            physical_pad = gamepad.poll(now)
             panel_intents = overlay.drain_intents() if overlay is not None else ()
+            external_control_changed = False
+            frame_input_source = input_source
+            input_source_id = "physical"
+            raw_keyboard = physical_keyboard
+            raw_pad = physical_pad
+            external_gate_frame: ExternalProviderGateFrame | None = None
+            if external_control is not None:
+                external_control.poll(now=now)
+                override_reason = physical_external_override_reason(
+                    physical_keyboard,
+                    physical_pad,
+                    move_deadzone=args.gamepad_move_deadzone,
+                    look_deadzone=args.gamepad_look_deadzone,
+                )
+                if override_reason is None and panel_intents:
+                    override_reason = "physical_panel"
+                # Focus is one of the provider's final snapshot interlocks.  It
+                # keeps the lease alive just long enough for the client to read
+                # typed gate telemetry; actual physical key/mouse/gamepad input
+                # still revokes external authority immediately.
+                if (
+                    override_reason is not None
+                    and override_reason != "focus_lost"
+                    and external_control.lease_active
+                ):
+                    external_control.local_override(override_reason)
+                    external_control_changed = True
+                if external_control.lease_active:
+                    external_state, external_token = (
+                        external_control.sample_with_token(now=now)
+                    )
+                    assert external_provider_gate is not None
+                    external_state, external_gate_frame = (
+                        external_provider_gate.prepare(
+                            external_state,
+                            external_token,
+                        )
+                    )
+                    if external_gate_frame is not None:
+                        external_state, _source_interlock = (
+                            apply_external_source_gate(
+                                external_state,
+                                external_gate_frame,
+                                configured_source=input_source,
+                            )
+                        )
+                    raw_keyboard, raw_pad = external_input_samples(
+                        external_state,
+                        focus=physical_keyboard,
+                        look_button=args.look_button,
+                    )
+                    frame_input_source = external_frame_input_source(
+                        external_state,
+                        configured_source=input_source,
+                    )
+                    input_source_id = "external"
+            command_state_changed = game_command_client.poll()
+            if (
+                external_control is not None
+                and external_inflight_command is not None
+                and command_state_changed
+                and not game_command_client.in_flight
+            ):
+                external_control.complete_command(
+                    external_inflight_command,
+                    game_command_client.mapping(),
+                )
+                external_inflight_command = None
+                external_control_changed = True
             shortcuts_armed = shortcut_arming.update(
                 escape_pressed=raw_keyboard.escape,
                 restart_pressed=raw_keyboard.apply_restart,
@@ -4497,6 +6658,47 @@ def main() -> int:
                     command_state_changed = True
                     apply_return.cancel_pending()
                     continue
+                if intent.kind == "navigation_refresh":
+                    game_command_client.refresh_celestial_navigation(
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    apply_return.cancel_pending()
+                    continue
+                if intent.kind == "navigation_select":
+                    assert intent.destination_id is not None
+                    game_command_client.select_celestial_destination(
+                        intent.destination_id,
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    apply_return.cancel_pending()
+                    continue
+                if intent.kind == "video_setting":
+                    assert intent.video_field is not None
+                    assert intent.expected_revision is not None
+                    video_settings_changed = bool(
+                        video_settings.apply_intent(
+                            intent.video_field,
+                            intent.video_value,
+                            expected_revision=intent.expected_revision,
+                            active=(
+                                calibration.active
+                                and not restart_requester.requested
+                                and not game_command_client.editing
+                                and not game_command_client.in_flight
+                                and not game_command_client.restart_required
+                                and not game_command_client.outcome_unknown
+                            ),
+                        )
+                        or video_settings_changed
+                    )
+                    apply_return.cancel_pending()
+                    continue
                 assert intent.kind == "command_submit"
                 assert intent.command is not None
                 command_submitted = game_command_client.submit(
@@ -4509,6 +6711,53 @@ def main() -> int:
                 command_state_changed = True
                 if command_submitted:
                     apply_return.cancel_pending()
+            if (
+                external_control is not None
+                and external_control.lease_active
+                and not game_command_client.in_flight
+                and not game_command_client.restart_required
+                and not game_command_client.outcome_unknown
+            ):
+                external_commands = external_control.drain_commands(limit=1)
+                if external_commands:
+                    external_command = external_commands[0]
+
+                    def modify_external_input(
+                        command: DataModifyInput,
+                    ) -> tuple[ExternalInputToken, dict[str, object] | None]:
+                        assert external_control is not None
+                        modified_token = external_control.apply_data_modify(
+                            command.path,
+                            command.value,
+                            now=now,
+                        )
+                        return (
+                            modified_token,
+                            {
+                                "request_sequence": external_command.request_sequence,
+                                "peer_pid": external_command.peer_pid,
+                                "external_control": external_control.telemetry(now=now),
+                            },
+                        )
+
+                    external_submitted = game_command_client.submit_external(
+                        external_command.command,
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                        input_modifier=modify_external_input,
+                    )
+                    command_state_changed = True
+                    external_control_changed = True
+                    if external_submitted:
+                        apply_return.cancel_pending()
+                    if game_command_client.in_flight:
+                        external_inflight_command = external_command
+                    else:
+                        external_control.complete_command(
+                            external_command,
+                            game_command_client.mapping(),
+                        )
             command_controls_blocked = bool(
                 game_command_client.editing
                 or game_command_client.in_flight
@@ -4526,6 +6775,9 @@ def main() -> int:
                         "command_submit",
                         "strategy_select",
                         "creative_spawn",
+                        "navigation_refresh",
+                        "navigation_select",
+                        "video_setting",
                     }
                     for intent in panel_intents
                 )
@@ -4570,8 +6822,14 @@ def main() -> int:
                 pressed=raw_keyboard.apply_restart,
                 calibration_active=keyboard_panel_active,
                 neutral_frame_ready=neutral_frame_ready,
-                pending_restart=mouse_settings.pending_restart(applied_mouse),
-                persistence_ok=mouse_settings.persistence_error is None,
+                pending_restart=bool(
+                    mouse_settings.pending_restart(applied_mouse)
+                    or video_settings.pending_restart()
+                ),
+                persistence_ok=bool(
+                    mouse_settings.persistence_error is None
+                    and video_settings.persistence_error is None
+                ),
                 requester=restart_requester,
             )
             left_calibration, ui_restart_requested = apply_return.update(
@@ -4587,8 +6845,14 @@ def main() -> int:
                     neutral_frame_ready
                     and not command_controls_blocked
                 ),
-                pending_restart=mouse_settings.pending_restart(applied_mouse),
-                persistence_error=mouse_settings.persistence_error,
+                pending_restart=bool(
+                    mouse_settings.pending_restart(applied_mouse)
+                    or video_settings.pending_restart()
+                ),
+                persistence_error=(
+                    mouse_settings.persistence_error
+                    or video_settings.persistence_error
+                ),
                 requester=restart_requester,
             )
             restart_requested = restart_requested or ui_restart_requested
@@ -4611,8 +6875,12 @@ def main() -> int:
             )
             pointer_telemetry = x11.pointer_telemetry
             teleport_rejections = int(pointer_telemetry["teleport_rejections"])
+            gamepad_connected_edge = bool(
+                previous_gamepad_connected is not None
+                and pad.connected != previous_gamepad_connected
+            )
             input_available = gamepad_input_available(
-                input_source,
+                frame_input_source,
                 connected=pad.connected,
                 previous_connected=previous_gamepad_connected,
             )
@@ -4622,7 +6890,7 @@ def main() -> int:
                 and keyboard.focused
                 and input_available
                 and pad.connected
-                and input_source in {"auto", "gamepad"}
+                and frame_input_source in {"auto", "gamepad"}
             )
             observed_yaw = (
                 carla_reader.drive(
@@ -4645,13 +6913,40 @@ def main() -> int:
                 args.camera_yaw_source not in {"carla", "ue-final-pov"}
                 or observed_yaw is not None
             )
+            if external_gate_frame is not None:
+                external_gate_interlock_reason = (
+                    external_provider_publish_interlock_reason(
+                        external_gate_frame,
+                        configured_source=input_source,
+                        physical_focused=physical_keyboard.focused,
+                        camera_dragging=keyboard.camera_dragging,
+                        camera_available=camera_available,
+                        input_available=input_available,
+                        gamepad_connected_edge=gamepad_connected_edge,
+                        calibration_interlock_active=calibration_interlock_active,
+                    )
+                )
+            else:
+                external_gate_interlock_reason = None
+            keyboard_boost = double_tap.update(
+                keyboard,
+                now_s=now,
+                enabled=bool(
+                    frame_input_source in {"auto", "keyboard"}
+                    and keyboard.focused
+                    and not keyboard.camera_dragging
+                    and camera_available
+                    and input_available
+                ),
+                source_id=input_source_id,
+            )
             provider_yaw = tracker.update(
                 dt=dt,
                 mouse_dx=(
                     keyboard.mouse_dx
                     if args.camera_yaw_source
                     in {"x11-mirror", "x11-core-gated", "x11-absolute"}
-                    and args.input_source != "gamepad"
+                    and frame_input_source != "gamepad"
                     else 0.0
                 ),
                 gamepad_look_yaw=0.0,
@@ -4662,6 +6957,29 @@ def main() -> int:
                 sign=args.camera_yaw_sign,
                 offset_rad=math.radians(args.camera_yaw_offset_deg),
             )
+            if external_control is not None:
+                external_telemetry = external_control.telemetry(now=now)
+                next_external_signature = (
+                    external_telemetry["connected_clients"],
+                    external_telemetry["lease_active"],
+                    external_telemetry["lease_owner_pid"],
+                    external_telemetry["command_queue_depth"],
+                    external_telemetry["deadman_stops"],
+                    external_telemetry["local_overrides"],
+                    external_telemetry["commands_queued"],
+                    external_telemetry["last_override_reason"],
+                    json.dumps(
+                        external_telemetry["input_token"],
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        external_telemetry["provider_gate"],
+                        sort_keys=True,
+                    ),
+                )
+                if next_external_signature != external_telemetry_signature:
+                    external_control_changed = True
+                    external_telemetry_signature = next_external_signature
             # Publish input counters and the yaw produced from that exact same
             # poll.  Telemetry stays downstream of every safety decision and
             # never feeds the tracker or snapshot interlocks.
@@ -4674,7 +6992,9 @@ def main() -> int:
                     or command_state_changed
                     or mouse_settings_changed
                     or ui_settings_changed
+                    or video_settings_changed
                     or restart_requested
+                    or external_control_changed
                     or teleport_rejections != last_teleport_rejections
                     or now >= next_overlay_heartbeat
                 ):
@@ -4693,14 +7013,21 @@ def main() -> int:
                                 applied_mouse
                             ),
                             "ui_settings": ui_settings.live_mapping(),
+                            "video_settings": video_settings.live_mapping(),
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
                             "command_console": game_command_client.mapping(),
+                            "motion_settings": live_motion_settings_telemetry(
+                                initial_motion_settings, game_command_client
+                            ),
                             "strategy_loadout": (
                                 game_command_client.strategy_loadout_mapping()
                             ),
                             "creative_inventory": (
                                 game_command_client.creative_inventory_mapping()
+                            ),
+                            "celestial_navigation": (
+                                game_command_client.celestial_navigation_mapping()
                             ),
                             "mirror_sensitivity": sensitivity_telemetry,
                             "camera_yaw": camera_yaw_telemetry(
@@ -4712,6 +7039,8 @@ def main() -> int:
                                 final_pov_observation
                             ),
                             "pointer": pointer_telemetry,
+                            "keyboard_double_tap": double_tap.telemetry,
+                            "external_control": external_telemetry,
                         }
                     )
                     next_overlay_heartbeat = now + 1.0
@@ -4721,20 +7050,103 @@ def main() -> int:
                 timestamp_monotonic_s=now,
                 keyboard=keyboard,
                 gamepad=pad,
-                input_source=input_source,
+                input_source=frame_input_source,
                 camera_yaw_rad=camera_yaw,
                 camera_available=camera_available,
                 input_available=input_available,
+                keyboard_boost=keyboard_boost,
             )
+            snapshot = apply_external_publish_interlock(
+                snapshot,
+                external_gate_frame,
+                external_gate_interlock_reason,
+            )
+            publish_now = time.monotonic()
+            publish_boundary_token: ExternalInputToken | None = None
+            publish_boundary_exact = False
+            if external_control is not None:
+                boundary = external_publish_boundary(
+                    external_control,
+                    external_gate_frame,
+                    snapshot,
+                    now=publish_now,
+                )
+                snapshot = boundary.snapshot
+                publish_boundary_token = boundary.current_token
+                publish_boundary_exact = boundary.exact_revision
             last_snapshot = snapshot
             neutral_delivered = False
             if publisher is None:
                 print(encode_input_packet(snapshot).decode("ascii"), flush=True)
                 sent_frames += 1
                 neutral_delivered = True
-            elif publisher.send(snapshot, now=now):
+            elif publisher.send(snapshot, now=publish_now):
                 sent_frames += 1
                 neutral_delivered = True
+            provider_packet_published = bool(
+                publisher is not None and neutral_delivered
+            )
+            exact_external_published = bool(
+                provider_packet_published and publish_boundary_exact
+            )
+            if external_gate_frame is not None:
+                assert external_provider_gate is not None
+                external_provider_gate.observe_published(
+                    external_gate_frame,
+                    sequence=snapshot.sequence,
+                    # Printing a dry-run packet is useful diagnostics, but it
+                    # is not proof that the core accepted a provider frame.
+                    # A successfully sent boundary-neutral packet also counts
+                    # as a stale-frame send success here, so same-loop R1->R2
+                    # cannot invalidate R2's inherited proof.  It still cannot
+                    # resolve the pending R2 command below.
+                    published=provider_packet_published,
+                    interlock_reason=external_gate_interlock_reason,
+                )
+            if (
+                external_control is not None
+                and external_inflight_command is not None
+            ):
+                persistent_gate_interlock = (
+                    external_control.provider_gate.last_interlock_reason
+                    if external_control.provider_gate.phase == "interlocked"
+                    else None
+                )
+                publish_resolved = game_command_client.resolve_external_input_publish(
+                    sampled_token=(
+                        external_gate_frame.token
+                        if external_gate_frame is not None
+                        else None
+                    ),
+                    current_token=publish_boundary_token,
+                    authority_active=publish_boundary_token is not None,
+                    published=exact_external_published,
+                    locomotion_admitted=bool(
+                        external_gate_frame is not None
+                        and external_gate_frame.locomotion_admitted
+                    ),
+                    interlock_reason=(
+                        external_gate_interlock_reason
+                        or persistent_gate_interlock
+                    ),
+                    data={
+                        "request_sequence": (
+                            external_inflight_command.request_sequence
+                        ),
+                        "peer_pid": external_inflight_command.peer_pid,
+                        "external_control": external_control.telemetry(
+                            now=publish_now
+                        ),
+                    },
+                )
+                if publish_resolved:
+                    external_control.complete_command(
+                        external_inflight_command,
+                        game_command_client.mapping(),
+                    )
+                    external_inflight_command = None
+                    command_state_changed = True
+                    external_control_changed = True
             if calibration.active:
                 calibration_neutral_frames = (
                     calibration_neutral_frames + 1 if neutral_delivered else 0
@@ -4748,25 +7160,47 @@ def main() -> int:
         print(f"matrix-game-control-input ERROR {exc}", file=sys.stderr, flush=True)
         return_code = 1
     finally:
+        cleanup = _CleanupCoordinator()
+
         # A focused=false release is immediate; the core's independent 0.15 s
         # deadman threshold remains authoritative if the connection is gone.
         if publisher is not None and last_snapshot is not None:
-            release = InputSnapshot(
-                sequence=sequence,
-                timestamp_monotonic_s=time.monotonic(),
-                focused=False,
-                camera_yaw_rad=last_snapshot.camera_yaw_rad,
-                keys=KeySnapshot(False, False, False, False, False, False, False),
-                move_stick=MoveStickSnapshot(0.0, 0.0),
-            )
-            publisher.send(release, now=time.monotonic())
+            def publish_release() -> None:
+                release = InputSnapshot(
+                    sequence=sequence,
+                    timestamp_monotonic_s=time.monotonic(),
+                    focused=False,
+                    camera_yaw_rad=last_snapshot.camera_yaw_rad,
+                    keyboard_boost=False,
+                    keys=KeySnapshot(
+                        False, False, False, False, False, False, False
+                    ),
+                    move_stick=MoveStickSnapshot(0.0, 0.0),
+                )
+                publisher.send(release, now=time.monotonic())
+
+            cleanup.run("publisher_release", publish_release)
         # Resolve a response already queued at the shutdown boundary, or mark
         # a successfully sent but unacknowledged command outcome-unknown.  This
         # must happen before the final status snapshot is serialized.
-        game_command_client.close()
-        _atomic_json(
-            args.status_file,
-            {
+        cleanup.run("command_receipt", game_command_client.close)
+        if external_control is not None and external_inflight_command is not None:
+            cleanup.run(
+                "external_command_receipt",
+                lambda: external_control.complete_command(
+                    external_inflight_command,
+                    game_command_client.mapping(),
+                ),
+            )
+            external_inflight_command = None
+            external_telemetry = cleanup.run(
+                "external_telemetry",
+                external_control.telemetry,
+                default=external_telemetry,
+            )
+
+        def build_final_status() -> dict[str, object]:
+            return {
                 **source_claim,
                 "completed": return_code == 0,
                 "exit_reason": exit_reason,
@@ -4777,6 +7211,7 @@ def main() -> int:
                 "effective_input_source": input_source,
                 "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                 "ui_settings": ui_settings.live_mapping(),
+                "video_settings": video_settings.live_mapping(),
                 "mirror_sensitivity": sensitivity_telemetry,
                 "camera_yaw": camera_yaw_telemetry(
                     args.camera_yaw_source,
@@ -4789,7 +7224,13 @@ def main() -> int:
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),
                 "command_console": game_command_client.mapping(),
+                "motion_settings": live_motion_settings_telemetry(
+                    initial_motion_settings, game_command_client
+                ),
                 "strategy_loadout": game_command_client.strategy_loadout_mapping(),
+                "celestial_navigation": (
+                    game_command_client.celestial_navigation_mapping()
+                ),
                 "gamepad_camera": {
                     "driver": "carla-spectator"
                     if args.camera_yaw_source == "carla"
@@ -4825,19 +7266,55 @@ def main() -> int:
                     else None,
                 },
                 "pointer": x11.pointer_telemetry,
+                "keyboard_double_tap": double_tap.telemetry,
+                "external_control": external_telemetry,
                 "last_snapshot": last_snapshot.to_mapping()
                 if last_snapshot is not None
                 else None,
-            },
+            }
+
+        # Capture telemetry while the underlying resources are still intact.
+        # Serialization is deliberately delayed until every close and signal
+        # restoration attempt has run, so a status write failure cannot strand
+        # provider-owned resources.
+        final_status = cleanup.run(
+            "status_prepare",
+            build_final_status,
+            default=None,
         )
-        gamepad.close()
-        if overlay is not None:
-            overlay.close()
-        x11.close()
-        if publisher is not None:
-            publisher.close()
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+        cleanup.run(
+            "celestial_resources",
+            game_command_client.finalize_celestial_resources,
+        )
+        _close_provider_resources(
+            cleanup,
+            gamepad=gamepad,
+            overlay=overlay,
+            x11=x11,
+            publisher=publisher,
+            external_control=external_control,
+            previous_handlers=previous_handlers,
+        )
+        return_code, exit_reason = _cleanup_outcome(
+            cleanup,
+            return_code=return_code,
+            exit_reason=exit_reason,
+        )
+        if final_status is not None:
+            final_status["completed"] = return_code == 0
+            final_status["exit_reason"] = exit_reason
+            final_status["cleanup_errors"] = list(cleanup.failures)
+            failures_before_status = len(cleanup.failures)
+            cleanup.run(
+                "status_write",
+                lambda: _atomic_json(args.status_file, final_status),
+            )
+            if len(cleanup.failures) != failures_before_status:
+                return_code, exit_reason = _cleanup_outcome(
+                    cleanup,
+                    return_code=return_code,
+                    exit_reason=exit_reason,
+                )
     return return_code
 
 
