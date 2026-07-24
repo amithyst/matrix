@@ -42,13 +42,16 @@ from matrix_mouse_settings import (
 from matrix_mc_commands import MAX_COMMAND_CHARS
 from matrix_ui_settings import (
     DEFAULT_FONT_SCALE,
-    MAX_FONT_SCALE,
-    MIN_FONT_SCALE,
+    MAX_FONT_SIZE,
+    MIN_FONT_SIZE,
     canonical_font_scale,
+    canonical_font_size,
 )
 from matrix_motion_settings import (
     DOUBLE_TAP_SPEED_FIELD,
     GEARS,
+    MAX_TURN_RATE_FIELD,
+    MAX_TURN_RATE_PATH,
     MotionSettings,
     MotionSettingsError,
     SPEED_FIELD,
@@ -538,7 +541,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     motion_bottom = speed_y - motion_outer_gap
     motion_row_height = max(
         1,
-        (motion_bottom - motion_top - 2 * motion_row_gap) // 3,
+        (motion_bottom - motion_top - 3 * motion_row_gap) // 4,
     )
     motion_left_x = panel_x + margin
     motion_left_width = max(
@@ -778,6 +781,28 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
                 button_width,
                 motion_row_height,
             )
+    turn_y = motion_top + 3 * (motion_row_height + motion_row_gap)
+    turn_width = max(1, panel_width - 2 * margin)
+    turn_button_width = 24 if compact else max(32, min(52, turn_width // 8))
+    turn_value_width = max(1, turn_width - 2 * turn_button_width)
+    result["motion_turn_rate_down"] = (
+        panel_x + margin,
+        turn_y,
+        turn_button_width,
+        motion_row_height,
+    )
+    result["motion_turn_rate_value"] = (
+        panel_x + margin + turn_button_width,
+        turn_y,
+        turn_value_width,
+        motion_row_height,
+    )
+    result["motion_turn_rate_up"] = (
+        panel_x + margin + turn_button_width + turn_value_width,
+        turn_y,
+        turn_button_width,
+        motion_row_height,
+    )
     for index in range(3):
         result[f"navigation_destination_{index}"] = (
             panel_x
@@ -875,6 +900,12 @@ _MOTION_STEP_ACTION_DETAILS = {
     for gear, field in _MOTION_CONTROL_SPECS
     for suffix, direction in (("down", -1), ("up", 1))
 }
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_turn_rate_{suffix}": (None, MAX_TURN_RATE_FIELD, direction)
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
 _MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
 
 _VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
@@ -1056,6 +1087,7 @@ class CreativeInventoryModel:
     available: bool
     spawn_count: int
     items: tuple[CreativeItemModel, ...]
+    unavailable_reason: str | None = None
 
     def item_enabled(self, index: int) -> bool:
         return bool(
@@ -1097,6 +1129,11 @@ def creative_inventory_model(state: dict[str, object]) -> CreativeInventoryModel
         available=raw.get("available") is True,
         spawn_count=spawn_count,
         items=tuple(items),
+        unavailable_reason=(
+            raw.get("unavailable_reason")
+            if isinstance(raw.get("unavailable_reason"), str)
+            else None
+        ),
     )
 
 
@@ -2080,6 +2117,7 @@ class SettingsPanelModel:
     status: str
     error: str | None
     font_scale: float
+    font_size: int
 
     @property
     def apply_label(self) -> str:
@@ -2108,9 +2146,9 @@ class SettingsPanelModel:
                 and self.next_scale < MAX_REMOTE_SPEED_SCALE
             )
         if action == "font_down":
-            return bool(not controls_disabled and self.font_scale > MIN_FONT_SCALE)
+            return bool(not controls_disabled and self.font_size > MIN_FONT_SIZE)
         if action == "font_up":
-            return bool(not controls_disabled and self.font_scale < MAX_FONT_SCALE)
+            return bool(not controls_disabled and self.font_size < MAX_FONT_SIZE)
         if action == "apply_return":
             return bool(
                 not controls_disabled
@@ -2127,6 +2165,8 @@ class MotionSettingsPanelModel:
     error: str | None
 
     def value(self, gear: str, field: str) -> float:
+        if gear == "turn" and field == MAX_TURN_RATE_FIELD:
+            return self.settings.value_for_path(MAX_TURN_RATE_PATH)
         return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
 
     def action_enabled(self, action: str) -> bool:
@@ -2275,7 +2315,11 @@ def motion_step_target(
     if not model.available:
         return None
     gear, field, direction = details
-    path = f"control.motion.gears.{gear}.{field}"
+    path = (
+        MAX_TURN_RATE_PATH
+        if gear is None
+        else f"control.motion.gears.{gear}.{field}"
+    )
     current = model.settings.value_for_path(path)
     target = step_motion_speed(model.settings, path, direction)
     return None if math.isclose(target, current, rel_tol=0.0, abs_tol=1e-12) else target
@@ -2291,6 +2335,11 @@ def motion_step_command(
     if target is None:
         return None
     gear, field, _direction = _MOTION_STEP_ACTION_DETAILS[action]
+    if gear is None:
+        return (
+            f"/data modify entity @s {MAX_TURN_RATE_PATH} "
+            f"set value {target:.2f}"
+        )
     return (
         f"/data modify entity @s control.motion.gears.{gear}.{field} "
         f"set value {target:.2f}"
@@ -2306,6 +2355,8 @@ def motion_value_label(
 ) -> str:
     """Return a bounded label for one of the six visible motion values."""
 
+    if gear == "turn" and field == MAX_TURN_RATE_FIELD:
+        return f"转向上限 {model.value(gear, field):.2f} rad/s"
     if (gear, field) not in _MOTION_CONTROL_SPECS:
         raise ValueError("unsupported motion value label")
     value = model.value(gear, field)
@@ -2711,6 +2762,13 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         font_scale = canonical_font_scale(ui_settings.get("font_scale", 1.0))
     except ValueError:
         font_scale = 1.0
+    try:
+        fallback_font_size = _font_size_for_scale(font_scale)
+        font_size = canonical_font_size(
+            ui_settings.get("font_size", fallback_font_size)
+        )
+    except ValueError:
+        font_size = fallback_font_size
     return SettingsPanelModel(
         current_profile=profile(current.get("profile")),
         current_scale=current_scale,
@@ -2733,6 +2791,7 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         status=status,
         error=error_value,
         font_scale=font_scale,
+        font_size=font_size,
     )
 
 
@@ -2907,6 +2966,9 @@ class PointerActionPublisher:
             },
         )
 
+    def publish_font_size(self, font_size: int) -> None:
+        self._publish("font_size", {"font_size": canonical_font_size(font_size)})
+
     def close(self) -> None:
         self._socket.close()
 
@@ -2958,6 +3020,7 @@ class X11CalibrationOverlay:
         display_name: str | None,
         expected_ue_pid: int,
         font_scale: float = 1.0,
+        font_size: int | None = None,
         x11: Any | None = None,
         xfixes: Any | None = None,
         xft: Any | None = None,
@@ -3023,6 +3086,11 @@ class X11CalibrationOverlay:
             raise RuntimeError("XFixes extension is unavailable")
         self.expected_ue_pid = expected_ue_pid
         self._font_scale = canonical_font_scale(font_scale)
+        self._initial_font_size = (
+            _font_size_for_scale(self._font_scale)
+            if font_size is None
+            else canonical_font_size(font_size)
+        )
         self._windows: dict[str, int] = {}
         self._panel_gc: int | None = None
         self._body_font: ctypes.POINTER(XFontStruct) | None = None
@@ -3035,9 +3103,11 @@ class X11CalibrationOverlay:
         self._xft_body_font_name: str | None = None
         self._xft_large_font_name: str | None = None
         self._xft_colours: dict[int, XftColor] = {}
-        self._font_size = _font_size_for_scale(self._font_scale)
+        self._font_size = self._initial_font_size
         self._last_rendered_font_size: int | None = None
         self._font_slider_dragging = False
+        self._pending_font_slider_action: str | None = None
+        self._pending_font_slider_size: int | None = None
         self._colours: dict[str, int] = {}
         self._visible = False
         self._cursor_visible = False
@@ -3843,10 +3913,13 @@ class X11CalibrationOverlay:
             raise RuntimeError("cannot create the UTF-8 Xft drawing context")
         self._xft_draw = int(draw)
         self._xft_body_font, self._xft_body_font_name = self._load_xft_font(
-            xft_font_candidates(self._font_scale, large=False)
+            _xft_font_candidates(self._font_size, bold=False)
         )
         self._xft_large_font, self._xft_large_font_name = self._load_xft_font(
-            xft_font_candidates(self._font_scale, large=True)
+            _xft_font_candidates(
+                self._font_size + _LARGE_FONT_SIZE_DELTA,
+                bold=True,
+            )
         )
         for key, pixel in self._colours.items():
             colour = XftColor()
@@ -3871,7 +3944,7 @@ class X11CalibrationOverlay:
             raise ValueError("overlay font size is outside the supported range")
         if font_size == getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE):
             return False
-        if self._xft is None or getattr(self, "_xft_draw", None) is None:
+        if getattr(self, "_xft", None) is None or getattr(self, "_xft_draw", None) is None:
             return False
         try:
             body_font, body_name = self._load_xft_font(
@@ -3942,10 +4015,13 @@ class X11CalibrationOverlay:
         try:
             if self._xft_draw is not None:
                 new_xft_body, new_xft_body_name = self._load_xft_font(
-                    xft_font_candidates(scale, large=False)
+                    _xft_font_candidates(_font_size_for_scale(scale), bold=False)
                 )
                 new_xft_large, new_xft_large_name = self._load_xft_font(
-                    xft_font_candidates(scale, large=True)
+                    _xft_font_candidates(
+                        _font_size_for_scale(scale) + _LARGE_FONT_SIZE_DELTA,
+                        bold=True,
+                    )
                 )
         except Exception:
             if self._xft is not None:
@@ -4945,7 +5021,7 @@ class X11CalibrationOverlay:
             ),
         )
         self._draw_text(
-            f"{round(model.font_scale * 100):d}%",
+            f"{model.font_size:d}px",
             x=0,
             y=0,
             colour=self._colours["white"],
@@ -4998,6 +5074,32 @@ class X11CalibrationOverlay:
                 ],
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
+        for action in ("motion_turn_rate_down", "motion_turn_rate_up"):
+            suffix = action.rsplit("_", 1)[1]
+            disabled = bool(
+                controls_disabled
+                or command_blocked
+                or not motion_model.action_enabled(action)
+            )
+            self._draw_button(
+                layout,
+                action,
+                "-" if suffix == "down" else "+",
+                fill=self._colours["disabled" if disabled else "button"],
+                disabled=disabled,
+            )
+        self._draw_text(
+            motion_value_label(
+                motion_model,
+                "turn",
+                MAX_TURN_RATE_FIELD,
+                compact=compact_motion_labels,
+            ),
+            x=0,
+            y=0,
+            colour=self._colours["white" if motion_model.available else "muted"],
+            centred_in=self._panel_rectangle(layout, "motion_turn_rate_value"),
+        )
         if layout["panel"][3] >= 500:
             status = (
                 "正在重载 Matrix"
@@ -5035,13 +5137,28 @@ class X11CalibrationOverlay:
         model: CreativeInventoryModel,
     ) -> None:
         first_slot = self._panel_rectangle(layout, "creative_item_0")
+        unavailable_labels = {
+            "packaged_ue_creative_prop_consumer_missing": "UE 物品可视插件未安装",
+            "runtime_creative_prop_transform_transport_unimplemented": (
+                "UE 物品变换通道未接通"
+            ),
+            "render_sync_disabled": "UE 画面同步未启用",
+        }
+        heading = (
+            "点击物品会在机器人前方放置独立刚体"
+            if model.available
+            else unavailable_labels.get(
+                model.unavailable_reason,
+                "本次运行无法显示创造物品",
+            )
+        )
         self._draw_text(
-            "点击物品会在机器人前方放置独立刚体",
+            heading,
             x=first_slot[0],
             y=max(18, first_slot[1] - 18),
-            colour=self._colours["muted"],
+            colour=self._colours["muted" if model.available else "pending"],
         )
-        if not model.available or not model.items:
+        if not model.items:
             self._draw_text(
                 "本次运行未加载创造物品目录",
                 x=0,
@@ -5497,9 +5614,12 @@ class X11CalibrationOverlay:
             or getattr(self, "_active_page", "loadout") != "settings"
         ):
             return False
-        return self._set_font_size(
-            font_size_from_slider(layout["font_size_slider"], root_x)
-        )
+        target_size = font_size_from_slider(layout["font_size_slider"], root_x)
+        changed = self._set_font_size(target_size)
+        if changed:
+            self._pending_font_slider_action = None
+            self._pending_font_slider_size = target_size
+        return changed
 
     def drain_pointer_actions(self, publisher: PointerActionPublisher) -> int:
         """Drain bounded keyboard intents and completed left-button clicks."""
@@ -5556,6 +5676,21 @@ class X11CalibrationOverlay:
                     if self._font_slider_dragging and self._visible:
                         self._set_font_size_from_root_x(button.x_root)
                     self._font_slider_dragging = False
+                    action = self._pending_font_slider_action
+                    font_size = getattr(self, "_pending_font_slider_size", None)
+                    self._pending_font_slider_action = None
+                    self._pending_font_slider_size = None
+                    if type(font_size) is int:
+                        publisher.publish_font_size(font_size)
+                        emitted += 1
+                        continue
+                    if (
+                        action in {"font_down", "font_up"}
+                        and self._last_panel_model is not None
+                        and self._last_panel_model.action_enabled(action)
+                    ):
+                        publisher.publish(action)
+                        emitted += 1
                     continue
                 if (
                     pressed is None
@@ -5749,6 +5884,7 @@ class X11CalibrationOverlay:
         geometry_changed = geometry != self._last_geometry
         model = settings_panel_model(state)
         font_changed = self._set_font_scale(model.font_scale)
+        size_changed = self._set_font_size(model.font_size)
         motion_model = motion_settings_panel_model(state)
         strategy_model = strategy_loadout_model(state)
         inventory_model = creative_inventory_model(state)
@@ -5758,6 +5894,7 @@ class X11CalibrationOverlay:
         self._command_editor.reconcile(command_status)
         model_changed = bool(
             font_changed
+            or size_changed
             or model != self._last_panel_model
             or motion_model != getattr(self, "_last_motion_model", None)
             or strategy_model != getattr(self, "_last_strategy_model", None)
@@ -5881,6 +6018,8 @@ class X11CalibrationOverlay:
         self._pressed_action = None
         self._pressed_window = None
         self._font_slider_dragging = False
+        self._pending_font_slider_action = None
+        self._pending_font_slider_size = None
         self._last_rendered_font_size = None
         self._active_page = "loadout"
 
@@ -5945,6 +6084,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-session", required=True)
     parser.add_argument("--display", default=os.environ.get("DISPLAY"))
     parser.add_argument("--font-scale", type=float, default=1.0)
+    parser.add_argument("--font-size", type=int)
     parser.add_argument("--poll-hz", type=float, default=30.0)
     return parser.parse_args()
 
@@ -5970,6 +6110,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--poll-hz must be finite and in [1, 120]")
     try:
         canonical_font_scale(args.font_scale)
+        if args.font_size is not None:
+            canonical_font_size(args.font_size)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -6003,6 +6145,7 @@ def main() -> int:
             display_name=args.display,
             expected_ue_pid=args.expected_ue_pid,
             font_scale=args.font_scale,
+            font_size=args.font_size,
         )
         font_diagnostics = overlay.font_diagnostics
         x11_diagnostics = overlay.x11_diagnostics

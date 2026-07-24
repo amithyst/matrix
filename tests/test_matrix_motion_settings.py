@@ -36,7 +36,8 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(settings.walk_double_tap_speed_mps, 1.00)
         self.assertEqual(settings.run_speed_mps, 2.50)
         self.assertEqual(settings.run_double_tap_speed_mps, 2.75)
-        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 6)
+        self.assertEqual(settings.max_turn_rate_rad_s, 2.50)
+        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 7)
 
     def test_strict_mapping_round_trip(self) -> None:
         settings = MODULE.MotionSettings(
@@ -49,7 +50,10 @@ class MotionSettingsValueTest(unittest.TestCase):
             run_double_tap_speed_mps=3.50,
         )
         mapping = settings.to_mapping()
-        self.assertEqual(set(mapping), {"version", "revision", "gears"})
+        self.assertEqual(
+            set(mapping),
+            {"version", "revision", "gears", "max_turn_rate_rad_s"},
+        )
         self.assertEqual(set(mapping["gears"]), {"slow", "walk", "run"})
         for gear in MODULE.GEARS:
             self.assertEqual(
@@ -105,6 +109,8 @@ class MotionSettingsValueTest(unittest.TestCase):
             {"slow_speed_mps": True},
             {"walk_speed_mps": float("nan")},
             {"run_speed_mps": float("inf")},
+            {"max_turn_rate_rad_s": 2.75},
+            {"max_turn_rate_rad_s": True},
         )
         for values in cases:
             with self.subTest(values=values), self.assertRaises(
@@ -130,10 +136,21 @@ class MotionSettingsValueTest(unittest.TestCase):
         settings = MODULE.MotionSettings()
         slow = path("slow", "speed_mps")
         self.assertEqual(settings.value_for_path(slow), 0.10)
+        self.assertEqual(
+            settings.value_for_path(MODULE.MAX_TURN_RATE_PATH),
+            MODULE.DEFAULT_MAX_TURN_RATE_RAD_S,
+        )
         replacement = settings.with_value(slow, 0.15, revision=3)
         self.assertEqual(replacement.slow_speed_mps, 0.15)
         self.assertEqual(replacement.revision, 3)
         self.assertEqual(settings.slow_speed_mps, 0.10)
+        turn_replacement = settings.with_value(
+            MODULE.MAX_TURN_RATE_PATH,
+            2.25,
+            revision=4,
+        )
+        self.assertEqual(turn_replacement.max_turn_rate_rad_s, 2.25)
+        self.assertEqual(turn_replacement.revision, 4)
         for invalid in (
             "control.motion.gears.slow.unknown",
             "control.motion.gears.crawl.speed_mps",
@@ -278,6 +295,7 @@ class MotionSettingsStepTest(unittest.TestCase):
             # The base speed cannot step onto the current boost preset.
             (path("run", "speed_mps"), 1, 2.50),
             (path("run", "double_tap_speed_mps"), 1, 3.00),
+            (MODULE.MAX_TURN_RATE_PATH, -1, 2.25),
         )
         for setting_path, direction, expected in cases:
             with self.subTest(path=setting_path, direction=direction):
@@ -340,6 +358,10 @@ class MotionSettingsStepTest(unittest.TestCase):
                 pair_limited, path("run", "double_tap_speed_mps"), -1
             ),
             3.25,
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(pair_limited, MODULE.MAX_TURN_RATE_PATH, 1),
+            2.50,
         )
 
         sub_step_gap = MODULE.MotionSettings(
@@ -475,6 +497,39 @@ class MotionSettingsStoreTest(unittest.TestCase):
             self.assertEqual(result.value, 0.15)
             self.assertEqual(result.settings.revision, 1)
             self.assertEqual(store.mapping()["settings"]["revision"], 1)
+
+    def test_turn_rate_modify_is_persisted_revisioned_and_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            file_path = Path(temporary) / "motion.json"
+            store = MODULE.MotionSettingsStore(
+                file_path,
+                initial=MODULE.MotionSettings(max_turn_rate_rad_s=2.25),
+            )
+            modified = store.step(
+                MODULE.MAX_TURN_RATE_PATH,
+                1,
+                expected_revision=0,
+            )
+            self.assertTrue(modified.changed)
+            self.assertEqual(modified.value, 2.50)
+            self.assertEqual(store.settings.revision, 1)
+            self.assertEqual(
+                MODULE.load_settings(file_path).settings.max_turn_rate_rad_s,
+                2.50,
+            )
+            self.assertFalse(
+                store.step(
+                    MODULE.MAX_TURN_RATE_PATH,
+                    1,
+                    expected_revision=1,
+                ).changed
+            )
+            with self.assertRaises(MODULE.MotionSettingsError):
+                store.modify(
+                    MODULE.MAX_TURN_RATE_PATH,
+                    2.75,
+                    expected_revision=1,
+                )
 
     def test_store_loads_missing_or_invalid_state_safely(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

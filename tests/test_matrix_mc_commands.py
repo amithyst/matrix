@@ -546,6 +546,76 @@ class McCommandExecutionTest(unittest.TestCase):
             },
         )
 
+    def test_routed_selector_is_authoritative_over_local_points(self) -> None:
+        route = MODULE.TeleportRoute(
+            tag="moon.tranquility",
+            target_scene_id=15,
+            target_world_id="g1_29dof:scene_terrain_moon_dynamic",
+            entry_pose=WorldPose(0.0, 0.0, -0.1366965003013611, 0.0),
+            entity_id="tp-" + "d" * 32,
+            destination_id="moon-tranquility-outpost",
+        )
+
+        listed = MODULE.execute_command(
+            MODULE.TeleportList(("moon.tranquility",)),
+            state=self.state,
+            current_pose=self.origin,
+            teleport_routes={route.tag: route},
+        )
+
+        self.assertFalse(listed.restart_required)
+        self.assertEqual(
+            listed.data["teleport_points"],
+            [
+                {
+                    "tag": "moon.tranquility",
+                    "found": True,
+                    "entity_id": route.entity_id,
+                    "position": [0.0, 0.0, -0.1366965003013611],
+                    "yaw_rad": 0.0,
+                }
+            ],
+        )
+
+        effect = MODULE.execute_command(
+            MODULE.TeleportSelector("moon.tranquility"),
+            state=self.state,
+            current_pose=self.origin,
+            now_unix_ns=4,
+            teleport_routes={route.tag: route},
+        )
+
+        self.assertTrue(effect.restart_required)
+        self.assertEqual(effect.code, "OK_TELEPORT_ROUTE_RESTART")
+        self.assertEqual(effect.state.last_exit, self.origin)
+        self.assertNotEqual(effect.state.last_exit, route.entry_pose)
+        self.assertEqual(effect.data["launch_route"], route.to_mapping())
+
+        shadowed_state, _point = self.state.add_teleport_point(
+            WorldPose(12.0, 34.0, 1.0, 0.0),
+            ("moon.tranquility",),
+            now_unix_ns=3,
+        )
+        routed = MODULE.execute_command(
+            MODULE.TeleportSelector("moon.tranquility"),
+            state=shadowed_state,
+            current_pose=self.origin,
+            now_unix_ns=4,
+            teleport_routes={route.tag: route},
+        )
+        listed = MODULE.execute_command(
+            MODULE.TeleportList(("moon.tranquility",)),
+            state=shadowed_state,
+            current_pose=self.origin,
+            teleport_routes={route.tag: route},
+        )
+        self.assertEqual(routed.code, "OK_TELEPORT_ROUTE_RESTART")
+        self.assertEqual(routed.data["entity_id"], route.entity_id)
+        self.assertEqual(
+            listed.data["teleport_points"][0]["entity_id"],
+            route.entity_id,
+        )
+
     def test_resolved_out_of_world_coordinate_fails_before_mutation(self) -> None:
         command = MODULE.parse_mc_command("/tp @s 100001 0 1").command
         with self.assertRaises(MODULE.CommandExecutionError) as context:

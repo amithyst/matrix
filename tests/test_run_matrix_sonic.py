@@ -3808,6 +3808,70 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertNotIn(snapshot.qpos[36], qpos)
         self.assertNotIn(snapshot.qvel[35], qvel)
 
+    def test_creative_inventory_is_disabled_without_exiting_runtime(self) -> None:
+        items = (
+            SimpleNamespace(
+                item_id="training_blaster",
+                label="Training Blaster",
+                pool_size=8,
+            ),
+        )
+
+        mapping = MODULE._creative_inventory_disabled_mapping(
+            items,
+            reason="packaged_ue_creative_prop_consumer_missing",
+        )
+
+        self.assertEqual(
+            mapping,
+            {
+                "version": 1,
+                "available": False,
+                "unavailable_reason": (
+                    "packaged_ue_creative_prop_consumer_missing"
+                ),
+                "spawn_count": 0,
+                "items": [
+                    {
+                        "item_id": "training_blaster",
+                        "label": "Training Blaster",
+                        "pool_size": 8,
+                        "remaining": 8,
+                    }
+                ],
+            },
+        )
+
+    def test_celestial_route_requires_every_local_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+
+            self.assertNotIn(
+                "moon.tranquility",
+                MODULE._load_celestial_teleport_routes(
+                    project_root=project_root,
+                ),
+            )
+
+            catalog = MODULE.load_celestial_catalog(
+                MODULE.DEFAULT_CELESTIAL_CATALOG_PATH
+            )
+            moon = catalog.destination("moon-tranquility-outpost")
+            assert moon.launch_route is not None
+            for relative in moon.launch_route.required_assets:
+                asset = project_root / relative
+                asset.parent.mkdir(parents=True, exist_ok=True)
+                asset.write_bytes(b"installed")
+
+            route = MODULE._load_celestial_teleport_routes(
+                project_root=project_root,
+            )["moon.tranquility"]
+            self.assertEqual(route.target_scene_id, 15)
+            self.assertEqual(
+                route.target_world_id,
+                "g1_29dof:scene_terrain_moon_dynamic",
+            )
+
     def test_render_projection_fails_closed_on_short_or_non_finite_state(
         self,
     ) -> None:

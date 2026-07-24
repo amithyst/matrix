@@ -142,7 +142,7 @@ Legacy/Zen 精确 round trip。移动机器人 orbit、墙面/地面碰撞恢复
 0.01x–0.10x 每次增加 0.01，接着直接进入 0.20x–1.00x、每次增加 0.10
 （`0.10 +` 是 `0.20`，`0.20 -` 是 `0.10`）。键盘和面板点击遍历完全相同的档位表，
 原有 0.40x 档继续保留。选择会立即原子保存到
-`~/.config/matrix/mouse-control.json`，但当前 UE 进程的拖动速度不会在运行中改变。
+`~/.config/matrix/hosts/<profile>/mouse-control.json`，但当前 UE 进程的拖动速度不会在运行中改变。
 点击英文 `RETURN TO GAME & APPLY` 或按 Enter 后，provider 会等待一帧已成功送达的
 安全中立输入，再通过既有私有重启通道让最外层 launcher 重启**整条**运行链。旧进程
 会停留在安全页面并显示加载状态；保存或请求失败时仍留在页面并显示错误。F9 复用同一

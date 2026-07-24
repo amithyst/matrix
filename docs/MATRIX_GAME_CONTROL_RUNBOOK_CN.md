@@ -7,12 +7,9 @@
 是第三顺位备份；无论普通改动还是大版本，都只有在项目负责人明确要求时才向对应备份机
 同步源码或私有运行资产。
 
-## TRNA 当前开发版验收入口（2026-07-22）
+## TRNA 当前验收入口（2026-07-24）
 
-当前运控、面板、续玩安全和外置控制 API 在
-`feature/trna-control-font-tuning-20260721` 上联调。负责人完成 TRNA 实测并明确通过前，
-继续在该 feature 分支修正，不合入 `main`。`trna` profile 已保存固定选择和六档速度默认值，
-正常启动只需：
+`trna` profile 已保存固定选择和运控默认值，正常启动只需：
 
 ```bash
 cd /home/trna/matrix
@@ -22,8 +19,15 @@ bash scripts/run_matrix_sonic.sh --profile trna --scene 2
 当前键盘语义：Ctrl 或 Alt 为 slow，无修饰为 walk，Shift 为 run；同一个 WASD 键在
 0.30 s 内完成“按下、松开、再次按下”会进入该档 boost，松键立即退出 boost。切换
 slow/walk/run 档位会清除双击候选和已激活 boost，避免 Alt+W 首击被 Shift+W 误判。
-六个 base/boost 速度均可在 ESC 运控面板用 -/+ 调整，持久化到
+六个 base/boost 速度和转向速度上限均可在 ESC 运控面板用 -/+ 调整，持久化到
 `~/.config/matrix/hosts/trna/motion-control.json`，仓库 profile 只保存跨机器共享默认值。
+字号、鼠标和视频设置也分别保存到同一 host 目录下的 `ui-settings.json`、
+`mouse-control.json` 和 `video-settings.json`。旧的 `~/.config/matrix/ui-settings.json`
+与 `~/.config/matrix/mouse-control.json` 只在对应 host 文件尚不存在时作为兼容来源读取。
+
+创造物品只有在 packaged UE 已安装命名物品变换桥时才开放。当前公开 Matrix PAK 没有该
+consumer；面板会显示目录但禁用按钮，命令层返回 `E_INVENTORY_UNAVAILABLE`，不会扣库存或
+在 MuJoCo 中偷偷生成 UE 看不见的物体。
 
 外置调试协议为严格 `matrix-external-control/v2`，使用同 UID、0600 权限的
 `AF_UNIX/SOCK_SEQPACKET`，每个 profile 只有一个租约，150 ms 内没有刷新就自动归零。

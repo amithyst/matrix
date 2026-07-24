@@ -814,7 +814,38 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertEqual(inventory["spawn_count"], 1)
         self.assertEqual(inventory["items"][0]["remaining"], 7)
 
-    def test_celestial_refresh_discovers_home_and_blocks_planned_worlds(self) -> None:
+    def test_disabled_creative_inventory_never_sends_or_decrements(self) -> None:
+        disabled = self.creative_inventory()
+        disabled["available"] = False
+        disabled["unavailable_reason"] = (
+            "packaged_ue_creative_prop_consumer_missing"
+        )
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            initial_creative_inventory=disabled,
+        )
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertFalse(
+            client.spawn_creative_item(
+                "training_blaster",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+        self.assertEqual(client.code, "E_INVENTORY_UNAVAILABLE")
+        inventory = client.creative_inventory_mapping()
+        self.assertEqual(inventory["spawn_count"], 0)
+        self.assertEqual(inventory["items"][0]["remaining"], 8)
+
+    def test_celestial_refresh_discovers_home_and_routes_active_moon(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
         client = MODULE.GameCommandClient(
@@ -870,7 +901,13 @@ class GameCommandClientTest(unittest.TestCase):
                                 "position": [160.0, 117.0, 1.2],
                                 "yaw_rad": 0.0,
                             },
-                            {"tag": "moon.tranquility", "found": False},
+                            {
+                                "tag": "moon.tranquility",
+                                "found": True,
+                                "entity_id": "tp-" + "c" * 32,
+                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "yaw_rad": 0.0,
+                            },
                             {"tag": "mars.utopia", "found": False},
                         ],
                     },
@@ -887,9 +924,9 @@ class GameCommandClientTest(unittest.TestCase):
         earth, moon, mars = navigation["destinations"]
         self.assertEqual(earth["status"], "ready")
         self.assertTrue(earth["enabled"])
-        self.assertEqual(moon["status"], "world_unavailable")
+        self.assertEqual(moon["status"], "ready")
         self.assertEqual(mars["status"], "world_unavailable")
-        self.assertFalse(
+        self.assertTrue(
             client.select_celestial_destination(
                 "moon-tranquility-outpost",
                 calibration_active=True,
@@ -897,9 +934,43 @@ class GameCommandClientTest(unittest.TestCase):
                 restart_requested=False,
             )
         )
-        self.assertEqual(client.code, "E_WORLD_UNAVAILABLE")
+        moon_teleport = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            moon_teleport.command,
+            MC_COMMANDS.TeleportSelector("moon.tranquility"),
+        )
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=moon_teleport.session,
+                    sequence=moon_teleport.sequence,
+                    request_id=moon_teleport.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_ROUTE_RESTART",
+                    message="Routing to MoonWorld",
+                    restart_required=True,
+                    data={
+                        "launch_route": {
+                            "schema": "matrix-celestial-launch-route/v1",
+                            "destination_id": "moon-tranquility-outpost",
+                            "teleport_tag": "moon.tranquility",
+                            "target_scene_id": 15,
+                            "target_world_id": "g1_29dof:scene_terrain_moon_dynamic",
+                            "entry_pose": {
+                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "yaw_rad": 0.0,
+                            },
+                            "entity_id": "tp-" + "d" * 32,
+                        }
+                    },
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertTrue(client.restart_required)
+        self.assertEqual(client.code, "OK_TELEPORT_ROUTE_RESTART")
 
-        self.assertTrue(
+        self.assertFalse(
             client.select_celestial_destination(
                 "earth-overworld-home",
                 calibration_active=True,
@@ -907,33 +978,7 @@ class GameCommandClientTest(unittest.TestCase):
                 restart_requested=False,
             )
         )
-        teleport = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(teleport.command, MC_COMMANDS.TeleportSelector("home"))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=teleport.session,
-                    sequence=teleport.sequence,
-                    request_id=teleport.request_id,
-                    ok=True,
-                    code="OK_TELEPORT_RESTART",
-                    message="Teleporting home",
-                    restart_required=True,
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertTrue(client.restart_required)
-        self.assertFalse(
-            client.select_celestial_destination(
-                "moon-tranquility-outpost",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertTrue(client.restart_required)
-        self.assertEqual(client.code, "OK_TELEPORT_RESTART")
+        self.assertEqual(client.code, "OK_TELEPORT_ROUTE_RESTART")
 
     def test_final_celestial_mapping_precedes_provider_resource_close(self) -> None:
         class LightingBridge:
@@ -3943,9 +3988,9 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             self.assertFalse(keyboard_step(slower=True))
             self.assertFalse(panel.apply_panel_action("speed_down", active=True))
 
-    def test_ui_font_scale_click_persists_and_restores(self) -> None:
+    def test_ui_font_size_click_and_slider_persist_and_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "config/matrix/ui-settings.json"
+            path = Path(temporary) / "config/matrix/hosts/trna/ui-settings.json"
             controller = MODULE.UiSettingsController(
                 path=path,
                 desired=MODULE.UiSettings(),
@@ -3956,15 +4001,23 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
                 controller.apply_panel_action("font_up", active=False)
             )
             self.assertTrue(controller.apply_panel_action("font_up", active=True))
-            self.assertEqual(controller.desired.font_scale, 1.1)
+            self.assertEqual(controller.desired.font_scale, 1.0)
+            self.assertEqual(controller.desired.font_size, 14)
+            self.assertTrue(controller.apply_font_size(20, active=True))
+            self.assertEqual(controller.desired.font_size, 20)
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
-                {"font_scale": 1.1, "version": 1},
+                {
+                    "font_scale": 1.0,
+                    "font_size": 20,
+                    "version": 2,
+                },
             )
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             restored = MODULE.load_ui_settings(path)
             self.assertEqual(restored.status, "loaded")
-            self.assertEqual(restored.settings.font_scale, 1.1)
+            self.assertEqual(restored.settings.font_scale, 1.0)
+            self.assertEqual(restored.settings.font_size, 20)
 
     @staticmethod
     def requester(*, available: bool = True, succeeds: bool = True):

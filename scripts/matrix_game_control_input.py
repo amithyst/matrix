@@ -44,15 +44,15 @@ from matrix_mouse_settings import (
     atomic_save_settings,
     canonical_remote_speed_scale,
     default_settings_file,
-    load_settings,
+    load_settings_with_legacy_fallback as load_mouse_settings,
     step_remote_speed_scale,
 )
 from matrix_ui_settings import (
     UiSettings,
     atomic_save_settings as atomic_save_ui_settings,
     default_settings_file as default_ui_settings_file,
-    load_settings as load_ui_settings,
-    step_font_scale,
+    load_settings_with_legacy_fallback as load_ui_settings,
+    step_font_size,
 )
 from matrix_motion_settings import MotionSettings, MotionSettingsError
 from matrix_video_settings import (
@@ -1116,8 +1116,21 @@ class UiSettingsController:
             return False
         direction = -1 if action == "font_down" else 1
         replacement = UiSettings(
-            font_scale=step_font_scale(self.desired.font_scale, direction)
+            font_scale=self.desired.font_scale,
+            font_size=step_font_size(self.desired.font_size, direction),
         )
+        return self._replace(replacement)
+
+    def apply_font_size(self, font_size: object, *, active: bool) -> bool:
+        if not active:
+            return False
+        replacement = UiSettings(
+            font_scale=self.desired.font_scale,
+            font_size=font_size,
+        )
+        return self._replace(replacement)
+
+    def _replace(self, replacement: UiSettings) -> bool:
         if replacement == self.desired:
             return False
         self.desired = replacement
@@ -1134,6 +1147,7 @@ class UiSettingsController:
         return {
             "settings_file": os.fspath(self.path),
             "font_scale": self.desired.font_scale,
+            "font_size": self.desired.font_size,
             "load_status": self.load_status,
             "persistence_error": self.persistence_error,
             "change_count": self.change_count,
@@ -4445,6 +4459,7 @@ class OverlayIntent:
     policy_id: str | None = None
     item_id: str | None = None
     destination_id: str | None = None
+    font_size: int | None = None
     video_field: str | None = None
     video_value: object = None
     expected_revision: int | None = None
@@ -4651,8 +4666,21 @@ class GameCommandClient:
             }
         if not isinstance(value, dict) or value.get("version") != 1:
             raise ValueError("creative inventory has an invalid version")
-        if type(value.get("available")) is not bool:
+        expected_keys = {"version", "available", "spawn_count", "items"}
+        allowed_keys = expected_keys | {"unavailable_reason"}
+        if not expected_keys.issubset(value) or not set(value).issubset(allowed_keys):
+            raise ValueError("creative inventory has an invalid schema")
+        available = value.get("available")
+        if type(available) is not bool:
             raise ValueError("creative inventory availability is invalid")
+        unavailable_reason = value.get("unavailable_reason")
+        if unavailable_reason is not None and (
+            available is True
+            or not isinstance(unavailable_reason, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_]{0,95}", unavailable_reason)
+            is None
+        ):
+            raise ValueError("creative inventory unavailable reason is invalid")
         spawn_count = value.get("spawn_count")
         items = value.get("items")
         if (
@@ -5251,10 +5279,32 @@ class GameCommandClient:
                 "E_RESTART_PENDING", "A whole-runtime restart is already pending"
             )
             return False
+        if self._creative_inventory.get("available") is not True:
+            reason = self._creative_inventory.get("unavailable_reason")
+            suffix = f": {reason}" if isinstance(reason, str) else ""
+            self._local_error(
+                "E_INVENTORY_UNAVAILABLE",
+                f"Creative inventory is unavailable{suffix}",
+            )
+            return False
         try:
             command = CreativeSpawnItem(item_id=item_id)
         except CommandParseError as exc:
             self._local_error(exc.code, exc.message)
+            return False
+        matching_item = next(
+            (
+                item
+                for item in self._creative_inventory.get("items", [])
+                if isinstance(item, dict) and item.get("item_id") == command.item_id
+            ),
+            None,
+        )
+        if matching_item is None or matching_item.get("remaining") == 0:
+            self._local_error(
+                "E_INVENTORY_ITEM",
+                f"Creative item {command.item_id!r} is unavailable",
+            )
             return False
         return self._send_typed_command(
             command,
@@ -5628,6 +5678,7 @@ class CalibrationOverlaySupervisor:
         display_name: str | None,
         expected_ue_pid: int,
         font_scale: float = 1.0,
+        font_size: int | None = None,
         script: Path | None = None,
         python: str = sys.executable,
         startup_timeout_s: float = 3.0,
@@ -5636,7 +5687,9 @@ class CalibrationOverlaySupervisor:
         self.ready_file = state_file.with_name(f".{state_file.name}.overlay-status.json")
         self.display_name = display_name
         self.expected_ue_pid = expected_ue_pid
-        self.font_scale = UiSettings(font_scale=font_scale).font_scale
+        ui = UiSettings(font_scale=font_scale, font_size=font_size)
+        self.font_scale = ui.font_scale
+        self.font_size = ui.font_size
         self.script = script or Path(__file__).with_name(
             "matrix_calibration_overlay.py"
         )
@@ -5691,6 +5744,8 @@ class CalibrationOverlaySupervisor:
             self._action_session,
             "--font-scale",
             f"{self.font_scale:.2f}",
+            "--font-size",
+            str(self.font_size),
         ]
         if self.display_name:
             command.extend(("--display", self.display_name))
@@ -5892,6 +5947,25 @@ class CalibrationOverlaySupervisor:
                     kind="navigation_select",
                     destination_id=destination_id,
                 )
+            elif kind == "font_size":
+                font_size = value.get("font_size")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "font_size",
+                    }
+                    or type(font_size) is not int
+                ):
+                    raise RuntimeError("invalid font-size intent schema")
+                try:
+                    UiSettings(font_size=font_size)
+                except ValueError as exc:
+                    raise RuntimeError("invalid font-size intent value") from exc
+                intent = OverlayIntent(kind="font_size", font_size=font_size)
             elif kind == "video_setting":
                 if set(value) != {
                     "version",
@@ -6377,7 +6451,7 @@ def main() -> int:
         profile=args.applied_mouse_profile,
         effective_scale=args.applied_mouse_speed_scale,
     )
-    loaded_mouse = load_settings(args.mouse_settings_file)
+    loaded_mouse = load_mouse_settings(args.mouse_settings_file)
     mouse_settings = MouseSettingsController(
         path=args.mouse_settings_file,
         desired=loaded_mouse.settings,
@@ -6451,6 +6525,7 @@ def main() -> int:
             display_name=args.display,
             expected_ue_pid=args.expected_ue_pid,
             font_scale=ui_settings.desired.font_scale,
+            font_size=ui_settings.desired.font_size,
         )
     gamepad = LinuxJoystick(
         args.gamepad,
@@ -6680,6 +6755,7 @@ def main() -> int:
 
             command_state_changed = False
             video_settings_changed = False
+            ui_settings_changed = False
             game_command_client.checkpoint_celestial_clock()
             physical_keyboard = x11.poll()
             last_keyboard = physical_keyboard
@@ -6846,6 +6922,23 @@ def main() -> int:
                     command_state_changed = True
                     apply_return.cancel_pending()
                     continue
+                if intent.kind == "font_size":
+                    assert intent.font_size is not None
+                    ui_settings_changed = bool(
+                        ui_settings.apply_font_size(
+                            intent.font_size,
+                            active=(
+                                calibration.active
+                                and not restart_requester.requested
+                                and not game_command_client.editing
+                                and not game_command_client.in_flight
+                                and not game_command_client.restart_required
+                                and not game_command_client.outcome_unknown
+                            ),
+                        )
+                        or ui_settings_changed
+                    )
+                    continue
                 if intent.kind == "video_setting":
                     assert intent.video_field is not None
                     assert intent.expected_revision is not None
@@ -6943,6 +7036,7 @@ def main() -> int:
                         "command_submit",
                         "strategy_select",
                         "creative_spawn",
+                        "font_size",
                         "navigation_refresh",
                         "navigation_select",
                         "video_setting",
@@ -6962,7 +7056,6 @@ def main() -> int:
                 slower_pressed=raw_keyboard.mouse_speed_down,
                 faster_pressed=raw_keyboard.mouse_speed_up,
             )
-            ui_settings_changed = False
             for panel_action in panel_actions:
                 mouse_settings_changed = bool(
                     mouse_settings.apply_panel_action(

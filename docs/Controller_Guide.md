@@ -174,7 +174,7 @@ exact presets: 0.01x through 0.10x in 0.01 increments, followed directly by
 0.20x through 1.00x in 0.10 increments (`0.10 +` becomes `0.20`, and
 `0.20 -` becomes `0.10`). Keyboard and panel clicks traverse this same table,
 including the existing 0.40x preset. Changes are atomically persisted to
-`~/.config/matrix/mouse-control.json`, but they do not mutate the current UE
+`~/.config/matrix/hosts/<profile>/mouse-control.json`, but they do not mutate the current UE
 process. Apply/Enter waits for a successfully delivered neutral frame, then
 asks the existing private restart channel to reload the **whole** runtime. The
 old generation remains in the safe panel and displays reload progress; a
