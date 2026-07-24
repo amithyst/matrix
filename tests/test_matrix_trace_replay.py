@@ -35,10 +35,28 @@ REPLAY = load_module(
 STAGE = load_module(
     "stage_matrix_trace_model", SCRIPTS / "stage_matrix_trace_model.py"
 )
+CAMERA = load_module(
+    "matrix_scene6_camera_receipt", SCRIPTS / "matrix_scene6_camera_receipt.py"
+)
 POSTFLIGHT = load_module(
     "verify_matrix_scene6_task_video",
     SCRIPTS / "verify_matrix_scene6_task_video.py",
 )
+
+
+def write_camera_receipt_fixture(root: Path) -> tuple[Path, str]:
+    path = root / "camera-receipt.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_id": "matrix.scene6_camera_receipt.v1",
+                "mode": "robot",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path.resolve(), REPLAY._sha256(path)
 
 
 def write_fixture(root: Path, *, frame_count: int = 2) -> tuple[Path, Path, Path]:
@@ -237,6 +255,7 @@ class TraceReplayTest(unittest.TestCase):
             fake_socket = FakeSocket()
             status = root / "status.json"
             summary = root / "summary.json"
+            camera_receipt, camera_sha256 = write_camera_receipt_fixture(root)
 
             with mock.patch.object(REPLAY.socket, "socket", return_value=fake_socket):
                 result = REPLAY.replay(
@@ -246,6 +265,8 @@ class TraceReplayTest(unittest.TestCase):
                     pre_roll_s=0.0,
                     final_hold_s=0.0,
                     ue_pid=None,
+                    camera_receipt_path=camera_receipt,
+                    expected_camera_receipt_sha256=camera_sha256,
                 )
 
             self.assertTrue(result["passed"])
@@ -272,6 +293,37 @@ class TraceReplayTest(unittest.TestCase):
             self.assertEqual(
                 written_summary["scene_model"]["sha256"], validated.model_sha256
             )
+            self.assertEqual(
+                written_summary["camera_receipt"]["sha256"], camera_sha256
+            )
+            self.assertEqual(written_status["camera_receipt"], result["camera_receipt"])
+
+    def test_camera_receipt_digest_mismatch_fails_before_status_or_packets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace, _scene, _robot = write_fixture(root, frame_count=1)
+            validated = REPLAY.validate_trace(trace)
+            camera_receipt, _camera_sha256 = write_camera_receipt_fixture(root)
+            status = root / "status.json"
+            summary = root / "summary.json"
+
+            with self.assertRaisesRegex(
+                REPLAY.TraceValidationError, "changed before replay startup"
+            ), mock.patch.object(REPLAY.socket, "socket") as socket_factory:
+                REPLAY.replay(
+                    validated,
+                    status_path=status,
+                    summary_path=summary,
+                    pre_roll_s=0.0,
+                    final_hold_s=0.0,
+                    ue_pid=None,
+                    camera_receipt_path=camera_receipt,
+                    expected_camera_receipt_sha256="0" * 64,
+                )
+
+            socket_factory.assert_not_called()
+            self.assertFalse(status.exists())
+            self.assertFalse(summary.exists())
 
     def test_sigterm_during_final_hold_is_clean_after_all_trace_frames(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -279,6 +331,7 @@ class TraceReplayTest(unittest.TestCase):
             trace, _scene, _robot = write_fixture(root, frame_count=1)
             status = root / "status.json"
             summary = root / "summary.json"
+            camera_receipt, camera_sha256 = write_camera_receipt_fixture(root)
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -289,6 +342,10 @@ class TraceReplayTest(unittest.TestCase):
                     os.fspath(status),
                     "--summary",
                     os.fspath(summary),
+                    "--camera-receipt",
+                    os.fspath(camera_receipt),
+                    "--camera-receipt-sha256",
+                    camera_sha256,
                     "--pre-roll",
                     "0",
                     "--final-hold",
@@ -327,6 +384,7 @@ class TraceReplayTest(unittest.TestCase):
             trace, _scene, _robot = write_fixture(root, frame_count=1)
             status = root / "status.json"
             summary = root / "summary.json"
+            camera_receipt, camera_sha256 = write_camera_receipt_fixture(root)
             child = r'''
 import importlib.util
 import os
@@ -334,7 +392,7 @@ from pathlib import Path
 import signal
 import sys
 
-script, trace, status, summary = map(Path, sys.argv[1:])
+script, trace, status, summary, camera = map(Path, sys.argv[1:])
 spec = importlib.util.spec_from_file_location("matrix_replay_signal_test", script)
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
@@ -355,6 +413,8 @@ result = module.replay(
     pre_roll_s=0.0,
     final_hold_s=0.0,
     ue_pid=None,
+    camera_receipt_path=camera,
+    expected_camera_receipt_sha256=module._sha256(camera),
 )
 raise SystemExit(0 if result["passed"] else 2)
 '''
@@ -367,6 +427,7 @@ raise SystemExit(0 if result["passed"] else 2)
                     os.fspath(trace),
                     os.fspath(status),
                     os.fspath(summary),
+                    os.fspath(camera_receipt),
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -500,6 +561,201 @@ class ModelStageTest(unittest.TestCase):
                 self.assertFalse((target / "current.xml").exists())
 
 
+class CameraReceiptTest(unittest.TestCase):
+    def test_robot_receipt_binds_actual_commands_and_fresh_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            ready = root / "ready.json"
+            CAMERA.confirm_ready(
+                output=ready,
+                mode="robot",
+                framing_label="front-review",
+            )
+            receipt_path = root / "camera.json"
+            exec_cmds = (
+                "t.MaxFPS 25,"
+                "set Engine.SpringArmComponent TargetArmLength 180,"
+                "viewclass MujocoSim_Custom_C"
+            )
+            payload = CAMERA.write_receipt(
+                output=receipt_path,
+                mode="robot",
+                spring_arm_cm=180.0,
+                ue_exec_cmds=exec_cmds,
+                project_root=root,
+                contract=None,
+                bundle=None,
+                ue_log=None,
+                log_offset=None,
+                ready_file=ready,
+            )
+
+            self.assertEqual(CAMERA.load_receipt(receipt_path), payload)
+            self.assertEqual(payload["camera_ready"]["framing_label"], "front-review")
+            self.assertEqual(payload["camera_commands"][-1], "viewclass MujocoSim_Custom_C")
+
+            rejected_commands = (
+                (exec_cmds + ",ViewClass Spectator_C", "viewclass differs"),
+                (
+                    exec_cmds
+                    + ",SET engine.springarmcomponent TARGETARMLENGTH 500",
+                    "arm differs",
+                ),
+                (exec_cmds + "; ViewClass Spectator_C", "command separator"),
+            )
+            for bad_commands, expected_error in rejected_commands:
+                with self.subTest(commands=bad_commands), self.assertRaisesRegex(
+                    CAMERA.CameraReceiptError, expected_error
+                ):
+                    CAMERA.write_receipt(
+                        output=root / "bad.json",
+                        mode="robot",
+                        spring_arm_cm=180.0,
+                        ue_exec_cmds=bad_commands,
+                        project_root=root,
+                        contract=None,
+                        bundle=None,
+                        ue_log=None,
+                        log_offset=None,
+                        ready_file=ready,
+                    )
+
+            final_write_wins = (
+                "ViewClass Spectator_C,"
+                "SET Engine.SpringArmComponent TargetArmLength 500,"
+                "viewclass mujocosim_custom_c,"
+                "set engine.springarmcomponent targetarmlength 180"
+            )
+            accepted = CAMERA.write_receipt(
+                output=root / "last-write-wins.json",
+                mode="robot",
+                spring_arm_cm=180.0,
+                ue_exec_cmds=final_write_wins,
+                project_root=root,
+                contract=None,
+                bundle=None,
+                ue_log=None,
+                log_offset=None,
+                ready_file=ready,
+            )
+            self.assertEqual(accepted["ue_exec_cmds"], final_write_wins)
+
+    def test_spectator_receipt_pins_active_bundle_and_exact_mount_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            contract_path = root / "contract.json"
+            contract_path.write_text("{}\n", encoding="utf-8")
+            bundle = root / "bundle"
+            bundle.mkdir()
+            active = root / CAMERA.overlay.RUNTIME_DIRECTORY
+            active.mkdir(parents=True)
+            ue_log = root / "src/UeSim/Linux/zsibot_mujoco_ue.log"
+            ue_log.parent.mkdir(parents=True, exist_ok=True)
+            ue_log.write_text(
+                "LogPakFile: Display: Found Pak file "
+                "../../../zsibot_mujoco_ue/Saved/Paks/"
+                "MatrixCenteredCameraActive/"
+                "pakchunk99-MatrixCentered-Linux_P.pak attempting to mount.\n"
+                "LogPakFile: Display: Mounted IoStore container "
+                '"../../../zsibot_mujoco_ue/Saved/Paks/'
+                "MatrixCenteredCameraActive/"
+                'pakchunk99-MatrixCentered-Linux_P.utoc"\n',
+                encoding="utf-8",
+            )
+            artifacts = tuple(
+                CAMERA.overlay.Artifact(name=name, size=size, sha256=digest)
+                for name, (size, digest) in sorted(
+                    CAMERA.overlay.PINNED_ARTIFACTS.items()
+                )
+            )
+            contract = CAMERA.overlay.Contract(
+                path=contract_path,
+                artifacts=artifacts,
+            )
+            receipt_path = root / "camera.json"
+            with mock.patch.object(
+                CAMERA.overlay, "load_contract", return_value=contract
+            ), mock.patch.object(
+                CAMERA.overlay, "verify_bundle", return_value=bundle
+            ), mock.patch.object(CAMERA.overlay, "_verify_directory"):
+                payload = CAMERA.write_receipt(
+                    output=receipt_path,
+                    mode="spectator-overlay",
+                    spring_arm_cm=180.0,
+                    ue_exec_cmds=(
+                        "t.MaxFPS 25,"
+                        "set Engine.SpringArmComponent TargetArmLength 180,"
+                        "viewclass Spectator_C"
+                    ),
+                    project_root=root,
+                    contract=contract_path,
+                    bundle=bundle,
+                    ue_log=ue_log,
+                    log_offset=0,
+                    ready_file=None,
+                )
+
+            mount = payload["overlay"]["mount"]
+            self.assertEqual(mount["start_offset"], 0)
+            self.assertEqual(mount["end_offset"], ue_log.stat().st_size)
+            self.assertEqual(mount["segment_size"], ue_log.stat().st_size)
+            self.assertEqual(
+                payload["overlay"]["bundle"]["artifacts"],
+                [
+                    {"name": artifact.name, "size": artifact.size, "sha256": artifact.sha256}
+                    for artifact in artifacts
+                ],
+            )
+            self.assertEqual(CAMERA.load_receipt(receipt_path), payload)
+            active.rmdir()
+            with ue_log.open("a", encoding="utf-8") as stream:
+                stream.write("LogTemp: later UE output\n")
+            with mock.patch.object(
+                CAMERA.overlay, "load_contract", return_value=contract
+            ), mock.patch.object(
+                CAMERA.overlay, "verify_bundle", return_value=bundle
+            ):
+                self.assertEqual(
+                    CAMERA.revalidate_receipt_evidence(payload, project_root=root),
+                    payload,
+                )
+            active.mkdir()
+            with mock.patch.object(
+                CAMERA.overlay, "load_contract", return_value=contract
+            ), mock.patch.object(
+                CAMERA.overlay, "verify_bundle", return_value=bundle
+            ), self.assertRaisesRegex(
+                CAMERA.CameraReceiptError, "remains after cleanup"
+            ):
+                CAMERA.revalidate_receipt_evidence(payload, project_root=root)
+            active.rmdir()
+
+            forged = json.loads(json.dumps(payload))
+            forged["overlay"]["contract"]["path"] = os.fspath(
+                root / "missing-contract.json"
+            )
+            forged["overlay"]["bundle"]["path"] = os.fspath(
+                root / "missing-bundle"
+            )
+            forged["overlay"]["mount"]["ue_log"] = os.fspath(root / "missing.log")
+            self.assertEqual(CAMERA.validate_receipt_payload(forged), forged)
+            with self.assertRaisesRegex(
+                CAMERA.CameraReceiptError, "no longer verifies"
+            ):
+                CAMERA.revalidate_receipt_evidence(forged, project_root=root)
+
+            original_log = ue_log.read_bytes()
+            ue_log.write_bytes(b"X" + original_log[1:])
+            with mock.patch.object(
+                CAMERA.overlay, "load_contract", return_value=contract
+            ), mock.patch.object(
+                CAMERA.overlay, "verify_bundle", return_value=bundle
+            ), self.assertRaisesRegex(
+                CAMERA.CameraReceiptError, "segment SHA256"
+            ):
+                CAMERA.revalidate_receipt_evidence(payload, project_root=root)
+
+
 class ShellIntegrationContractTest(unittest.TestCase):
     def test_run_sim_external_replay_is_exclusive_and_supervised(self) -> None:
         source = (SCRIPTS / "run_sim.sh").read_text(encoding="utf-8")
@@ -541,6 +797,13 @@ class ShellIntegrationContractTest(unittest.TestCase):
             source,
         )
         self.assertIn("Staged Matrix replay robot XML not found", source)
+        self.assertIn("MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA", source)
+        self.assertIn("External replay centered camera requires", source)
+        self.assertIn('CAMERA_CONFIGURATION_CONTEXT="external replay"', source)
+        self.assertIn('GAME_CAMERA_VIEW_CLASS="Spectator_C"', source)
+        self.assertIn('trap \'finalize_exit "$?"\' EXIT', source)
+        self.assertIn("cleanup || cleanup_exit=$?", source)
+        self.assertIn("trap '' SIGINT SIGTERM SIGHUP", source)
 
     def test_recording_contract_uses_status_and_fixed_25_fps(self) -> None:
         source = (SCRIPTS / "record_matrix_scene6_task_video.sh").read_text(
@@ -560,8 +823,142 @@ class ShellIntegrationContractTest(unittest.TestCase):
         self.assertIn("/tmp/matrix-sonic-${UID}.lock", launcher)
         self.assertNotIn("matrix-scene6-trace-replay.lock", launcher)
         self.assertIn("Recovering prior Matrix scene6 stage journal", launcher)
-        self.assertIn("TargetArmLength 180", launcher)
+        self.assertIn("MATRIX_SCENE6_CAMERA_DISTANCE_CM:-180", launcher)
+        self.assertIn("TargetArmLength ${CAMERA_DISTANCE_CM}", launcher)
         self.assertIn("viewclass MujocoSim_Custom_C", launcher)
+        self.assertIn("--camera-mode robot|spectator-overlay", launcher)
+        self.assertIn("MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA=1", launcher)
+        self.assertIn("requested_viewclass=$CAMERA_VIEW_CLASS", launcher)
+        self.assertIn("matrix_ue_overlay.py\" purge-stale", launcher)
+        self.assertIn("matrix_ue_overlay.py\" verify-bundle", launcher)
+        self.assertLess(
+            launcher.index("matrix_ue_overlay.py\" purge-stale"),
+            launcher.index('"${STAGE_COMMAND[@]}"'),
+        )
+        self.assertIn("matrix_scene6_camera", source)
+        self.assertIn("matrix.scene6_video_metadata.v2", source)
+        self.assertIn("--camera-receipt", source)
+
+    def test_scene6_camera_arguments_fail_closed_before_staging(self) -> None:
+        launcher = SCRIPTS / "run_matrix_scene6_trace_replay.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trace = root / "trace.json"
+            trace.write_text("{}\n", encoding="utf-8")
+
+            cases = (
+                (
+                    ["--camera-mode", "sideways"],
+                    "--camera-mode must be robot or spectator-overlay",
+                ),
+                (
+                    ["--camera-distance-cm", "79"],
+                    "--camera-distance-cm must be within 80..500",
+                ),
+                (
+                    ["--camera-mode", "spectator-overlay"],
+                    "--overlay-bundle is required for spectator-overlay",
+                ),
+            )
+            for arguments, expected in cases:
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(launcher),
+                            "--trace",
+                            os.fspath(trace),
+                            *arguments,
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(expected, result.stderr)
+
+            bundle = root / "bundle"
+            bundle.mkdir()
+            linked_bundle = root / "bundle-link"
+            linked_bundle.symlink_to(bundle, target_is_directory=True)
+            linked = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(launcher),
+                    "--trace",
+                    os.fspath(trace),
+                    "--camera-mode",
+                    "spectator-overlay",
+                    "--overlay-bundle",
+                    os.fspath(linked_bundle),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 2)
+            self.assertIn("--overlay-bundle must not be a symlink", linked.stderr)
+
+    def test_scene6_outputs_cannot_alias_overlay_contract_or_bundle(self) -> None:
+        launcher = SCRIPTS / "run_matrix_scene6_trace_replay.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            matrix = root / "matrix"
+            contract = matrix / "config/runtime/matrix-centered-camera-overlay-v3.json"
+            contract.parent.mkdir(parents=True)
+            contract_bytes = b'{"protected":true}\n'
+            contract.write_bytes(contract_bytes)
+            trace = root / "trace.json"
+            trace.write_text("{}\n", encoding="utf-8")
+            bundle = root / "bundle"
+            bundle.mkdir()
+            bundle_file = bundle / "pakchunk99-MatrixCentered-Linux_P.pak"
+            bundle_file.write_bytes(b"protected-pak")
+            active = (
+                matrix
+                / "src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/MatrixCenteredCameraActive"
+            )
+
+            cases = (
+                (["--status-file", os.fspath(contract)], os.fspath(contract)),
+                (
+                    [
+                        "--camera-mode",
+                        "spectator-overlay",
+                        "--overlay-bundle",
+                        os.fspath(bundle),
+                        "--camera-receipt",
+                        os.fspath(bundle / "new.json"),
+                    ],
+                    os.fspath(bundle / "new.json"),
+                ),
+                (
+                    ["--camera-receipt", os.fspath(active / "receipt.json")],
+                    os.fspath(active / "receipt.json"),
+                ),
+            )
+            for arguments, protected_path in cases:
+                with self.subTest(path=protected_path):
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            os.fspath(launcher),
+                            "--matrix-root",
+                            os.fspath(matrix),
+                            "--trace",
+                            os.fspath(trace),
+                            *arguments,
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("protected camera input", result.stderr)
+                    self.assertEqual(contract.read_bytes(), contract_bytes)
+                    self.assertEqual(bundle_file.read_bytes(), b"protected-pak")
+                    self.assertFalse((bundle / "new.json").exists())
+                    self.assertFalse(active.exists())
 
 
 class VideoPostflightTest(unittest.TestCase):
@@ -598,7 +995,7 @@ class VideoPostflightTest(unittest.TestCase):
             summary.write_text(
                 json.dumps(
                     {
-                        "schema_id": "matrix.physics_trace_replay.summary.v1",
+                        "schema_id": "matrix.physics_trace_replay.summary.v2",
                         "passed": True,
                         "failure": None,
                         "completion": "scheduled_replay_complete",
@@ -632,6 +1029,36 @@ class VideoPostflightTest(unittest.TestCase):
                 encoding="utf-8",
             )
             metadata = root / "metadata.json"
+            camera_payload = {
+                "schema_id": "matrix.scene6_camera_receipt.v1",
+                "mode": "robot",
+                "requested_view_class": "MujocoSim_Custom_C",
+                "spring_arm_cm": 180.0,
+                "ue_exec_cmds": (
+                    "t.MaxFPS 25,"
+                    "set Engine.SpringArmComponent TargetArmLength 180,"
+                    "viewclass MujocoSim_Custom_C"
+                ),
+                "camera_commands": [
+                    "set Engine.SpringArmComponent TargetArmLength 180",
+                    "viewclass MujocoSim_Custom_C",
+                ],
+                "overlay": None,
+                "camera_ready": None,
+                "created_unix_ns": 1,
+            }
+            camera_receipt = root / "camera.json"
+            camera_receipt.write_text(json.dumps(camera_payload), encoding="utf-8")
+            camera_binding = {
+                "schema_id": "matrix.physics_trace_replay.camera_binding.v1",
+                "path": str(camera_receipt.resolve()),
+                "sha256": POSTFLIGHT._sha256(camera_receipt),
+                "size_bytes": camera_receipt.stat().st_size,
+                "receipt_schema_id": "matrix.scene6_camera_receipt.v1",
+            }
+            summary_payload = json.loads(summary.read_text(encoding="utf-8"))
+            summary_payload["camera_receipt"] = camera_binding
+            summary.write_text(json.dumps(summary_payload), encoding="utf-8")
             metadata.write_text(
                 json.dumps(
                     {
@@ -648,13 +1075,16 @@ class VideoPostflightTest(unittest.TestCase):
                         },
                         "sonic_status": {
                             "before": {
+                                "schema_id": "matrix.physics_trace_replay.status.v2",
                                 "active_lowcmd": True,
                                 "active_lowcmd_semantics": (
                                     "legacy_recorder_readiness_gate_no_dds_lowcmd"
                                 ),
                                 "dds_lowcmd_active": False,
+                                "camera_receipt": camera_binding,
                             },
                             "after": {
+                                "schema_id": "matrix.physics_trace_replay.status.v2",
                                 "active_lowcmd": False,
                                 "active_lowcmd_semantics": (
                                     "legacy_recorder_readiness_gate_no_dds_lowcmd"
@@ -662,12 +1092,17 @@ class VideoPostflightTest(unittest.TestCase):
                                 "dds_lowcmd_active": False,
                                 "completed": True,
                                 "passed": True,
+                                "camera_receipt": camera_binding,
                             },
                         },
                         "launcher": {
                             "return_code": 0,
                             "stopped_by_recorder": False,
                         },
+                        "matrix_scene6_extension_schema": (
+                            "matrix.scene6_video_metadata.v2"
+                        ),
+                        "matrix_scene6_camera": camera_payload,
                     }
                 ),
                 encoding="utf-8",
@@ -678,9 +1113,48 @@ class VideoPostflightTest(unittest.TestCase):
                 metadata_path=metadata,
                 summary_path=summary,
                 restore_path=restore,
+                camera_receipt_path=camera_receipt,
                 matrix_root=matrix,
             )
             self.assertTrue(receipt["passed"])
+            self.assertEqual(receipt["camera"]["mode"], "robot")
+
+            metadata_payload = json.loads(metadata.read_text(encoding="utf-8"))
+            forged_camera = dict(camera_payload)
+            forged_camera["created_unix_ns"] = 2
+            camera_receipt.write_text(json.dumps(forged_camera), encoding="utf-8")
+            metadata_payload["matrix_scene6_camera"] = forged_camera
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                POSTFLIGHT.PostflightError, "summary.*camera receipt"
+            ):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    camera_receipt_path=camera_receipt,
+                    matrix_root=matrix,
+                )
+            camera_receipt.write_text(json.dumps(camera_payload), encoding="utf-8")
+            metadata_payload["matrix_scene6_camera"] = camera_payload
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
+
+            camera_provenance = metadata_payload.pop("matrix_scene6_camera")
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
+            with self.assertRaisesRegex(
+                POSTFLIGHT.PostflightError, "camera receipt"
+            ):
+                POSTFLIGHT.verify(
+                    output=output,
+                    metadata_path=metadata,
+                    summary_path=summary,
+                    restore_path=restore,
+                    camera_receipt_path=camera_receipt,
+                    matrix_root=matrix,
+                )
+            metadata_payload["matrix_scene6_camera"] = camera_provenance
+            metadata.write_text(json.dumps(metadata_payload), encoding="utf-8")
 
             summary_payload = json.loads(summary.read_text(encoding="utf-8"))
             summary_payload["completion"] = (
@@ -693,6 +1167,7 @@ class VideoPostflightTest(unittest.TestCase):
                     metadata_path=metadata,
                     summary_path=summary,
                     restore_path=restore,
+                    camera_receipt_path=camera_receipt,
                     matrix_root=matrix,
                 )
             summary_payload["completion"] = "scheduled_replay_complete"
@@ -707,6 +1182,7 @@ class VideoPostflightTest(unittest.TestCase):
                     metadata_path=metadata,
                     summary_path=summary,
                     restore_path=restore,
+                    camera_receipt_path=camera_receipt,
                     matrix_root=matrix,
                 )
             metadata_payload["launcher"]["return_code"] = 0
@@ -718,6 +1194,7 @@ class VideoPostflightTest(unittest.TestCase):
                     metadata_path=metadata,
                     summary_path=summary,
                     restore_path=restore,
+                    camera_receipt_path=camera_receipt,
                     matrix_root=matrix,
                 )
             metadata_payload["launcher"]["stopped_by_recorder"] = False
@@ -729,6 +1206,7 @@ class VideoPostflightTest(unittest.TestCase):
                     metadata_path=metadata,
                     summary_path=summary,
                     restore_path=restore,
+                    camera_receipt_path=camera_receipt,
                     matrix_root=matrix,
                 )
             metadata_payload["sonic_status"]["after"]["completed"] = True
@@ -743,6 +1221,7 @@ class VideoPostflightTest(unittest.TestCase):
                     metadata_path=metadata,
                     summary_path=summary,
                     restore_path=restore,
+                    camera_receipt_path=camera_receipt,
                     matrix_root=matrix,
                 )
 

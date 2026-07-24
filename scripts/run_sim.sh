@@ -22,6 +22,7 @@ CUSTOM_NAME="${7:-}"
 MATRIX_DISABLE_MC="${MATRIX_DISABLE_MC:-0}"
 MATRIX_SONIC="${MATRIX_SONIC:-0}"
 MATRIX_EXTERNAL_REPLAY="${MATRIX_EXTERNAL_REPLAY:-0}"
+MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA="${MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA:-0}"
 MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
 MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
@@ -634,6 +635,67 @@ PY
     return 1
 }
 
+wait_for_external_camera_ready() {
+    local ready_file="$1"
+    local camera_mode="$2"
+    if [[ -z "$ready_file" ]]; then
+        return 0
+    fi
+    local timeout="${MATRIX_EXTERNAL_REPLAY_CAMERA_READY_TIMEOUT_SECONDS:-120}"
+    local settle="${MATRIX_EXTERNAL_REPLAY_CAMERA_SETTLE_SECONDS:-0.5}"
+    if [[ ! "$timeout" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+        || [[ ! "$settle" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "[ERROR] Camera-ready timeout/settle must be non-negative numbers" >&2
+        return 1
+    fi
+    local attempts
+    attempts="$(/usr/bin/python3 -I - "$timeout" <<'PY'
+import math
+import sys
+
+timeout = float(sys.argv[1])
+if not math.isfinite(timeout) or timeout <= 0.0:
+    raise SystemExit("camera-ready timeout must be positive and finite")
+print(max(1, math.ceil(timeout / 0.05) + 1))
+PY
+)" || return 1
+    echo "[INFO] Waiting for Matrix scene6 camera confirmation: $ready_file"
+    local attempt
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        if [[ -e "$UE_FAILURE_FILE" ]] || ! kill -0 "$UE_PID" 2>/dev/null; then
+            echo "[ERROR] UE exited before camera confirmation" >&2
+            return 1
+        fi
+        if [[ -L "$ready_file" || -d "$ready_file" ]]; then
+            echo "[ERROR] Camera-ready path must be a regular non-symlink file:" \
+                "$ready_file" >&2
+            return 1
+        fi
+        if [[ -f "$ready_file" ]]; then
+            if ! /usr/bin/python3 -I \
+                "$PROJECT_ROOT/scripts/matrix_scene6_camera_receipt.py" \
+                inspect-ready --file "$ready_file" --mode "$camera_mode" \
+                >/dev/null; then
+                echo "[ERROR] Camera-ready confirmation is invalid: $ready_file" >&2
+                return 1
+            fi
+            sleep "$settle"
+            echo "[INFO] Matrix scene6 camera confirmation accepted:" \
+                "mode=$camera_mode settle=${settle}s"
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "[ERROR] Matrix scene6 camera confirmation timed out after ${timeout}s" >&2
+    return 1
+}
+
+path_is_equal_or_within() {
+    local candidate="$1"
+    local directory="$2"
+    [[ "$candidate" == "$directory" || "$candidate" == "$directory/"* ]]
+}
+
 schedule_forced_cleanup() {
     (
         trap '' HUP
@@ -834,14 +896,22 @@ cleanup() {
 
 handle_signal() {
     local exit_code="$1"
-    if [[ "$CLEANUP_STARTED" == "1" ]]; then
-        return
-    fi
-    cleanup
-    exit "$exit_code"
+    finalize_exit "$exit_code"
 }
 
-trap cleanup EXIT
+finalize_exit() {
+    local incoming_exit="$1"
+    local cleanup_exit=0
+    trap - EXIT
+    trap '' SIGINT SIGTERM SIGHUP
+    cleanup || cleanup_exit=$?
+    if [[ "$incoming_exit" == "0" && "$cleanup_exit" != "0" ]]; then
+        incoming_exit="$cleanup_exit"
+    fi
+    exit "$incoming_exit"
+}
+
+trap 'finalize_exit "$?"' EXIT
 trap 'handle_signal 130' SIGINT
 trap 'handle_signal 143' SIGTERM
 trap 'handle_signal 129' SIGHUP
@@ -1086,6 +1156,35 @@ case "${MATRIX_EXTERNAL_REPLAY,,}" in
         ;;
 esac
 
+case "${MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA,,}" in
+    1|true|yes|on)
+        EXTERNAL_REPLAY_CENTERED_CAMERA_ENABLED=true
+        if ! $MATRIX_EXTERNAL_REPLAY_ENABLED; then
+            echo "[ERROR] MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA requires" \
+                "MATRIX_EXTERNAL_REPLAY=1" >&2
+            exit 1
+        fi
+        if [[ "$ROBOTTYPE" != "custom" ]]; then
+            echo "[ERROR] External replay centered camera supports only the" \
+                "custom robot; got $ROBOTTYPE" >&2
+            exit 1
+        fi
+        if [[ -z "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" ]]; then
+            echo "[ERROR] External replay centered camera requires" \
+                "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" >&2
+            exit 1
+        fi
+        ;;
+    0|false|no|off|"")
+        EXTERNAL_REPLAY_CENTERED_CAMERA_ENABLED=false
+        ;;
+    *)
+        echo "[ERROR] MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA must be a" \
+            "boolean: $MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA" >&2
+        exit 1
+        ;;
+esac
+
 case "${MATRIX_SONIC,,}" in
     1|true|yes|on)
         if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
@@ -1112,12 +1211,27 @@ esac
 # The stock cooked package already contains a camera-bearing SpringArm on each
 # robot Blueprint.  In interactive SONIC game mode, select the real rendered
 # robot as the UE view target and make that native arm direct/collision-aware.
+# External trace replay may explicitly opt into the verified Spectator overlay;
+# that overlay follows the custom robot while preserving an operator-selected
+# orbit, so a replay can use a non-occluded review angle without changing the
+# recorded physics trajectory.
 # These are startup console commands, not the Python camera-bridge contract.
 # `set Engine.SpringArmComponent` intentionally affects every live spring arm;
 # an operator can append a narrower/newer command via MATRIX_UE_EXTRA_EXEC_CMDS.
+CAMERA_CONFIGURATION_ENABLED=false
+CAMERA_CONFIGURATION_CONTEXT=""
 if $MATRIX_SONIC_ENABLED \
     && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]] \
     && $GAME_CENTERED_CAMERA_ENABLED; then
+    CAMERA_CONFIGURATION_ENABLED=true
+    CAMERA_CONFIGURATION_CONTEXT="SONIC game"
+elif $MATRIX_EXTERNAL_REPLAY_ENABLED \
+    && $EXTERNAL_REPLAY_CENTERED_CAMERA_ENABLED; then
+    CAMERA_CONFIGURATION_ENABLED=true
+    CAMERA_CONFIGURATION_CONTEXT="external replay"
+fi
+
+if $CAMERA_CONFIGURATION_ENABLED; then
     if [[ "$ROBOTTYPE" == "custom" \
         && -n "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" ]]; then
         if [[ -n "$MATRIX_GAME_CAMERA_VIEW_CLASS" \
@@ -1179,7 +1293,9 @@ PY
     UE_EXEC_CMDS="${UE_EXEC_CMDS},viewclass ${GAME_CAMERA_VIEW_CLASS}"
     if $CENTERED_CAMERA_OVERLAY_ENABLED; then
         echo "[INFO] Persistent centered-camera overlay enabled:" \
-            "robot=MujocoSim_Custom_C viewclass=$GAME_CAMERA_VIEW_CLASS"
+            "context=$CAMERA_CONFIGURATION_CONTEXT" \
+            "robot=MujocoSim_Custom_C viewclass=$GAME_CAMERA_VIEW_CLASS" \
+            "spring_arm_cm=$MATRIX_GAME_CAMERA_DISTANCE_CM"
     else
         echo "[INFO] Native centered game-camera startup enabled: viewclass=$GAME_CAMERA_VIEW_CLASS"
     fi
@@ -1586,6 +1702,8 @@ if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
     TRACE_REPLAY_SUMMARY="${MATRIX_EXTERNAL_REPLAY_SUMMARY:-$PROJECT_ROOT/outputs/matrix_trace_replay_summary.json}"
     TRACE_REPLAY_PRE_ROLL="${MATRIX_EXTERNAL_REPLAY_PRE_ROLL_SECONDS:-2}"
     TRACE_REPLAY_FINAL_HOLD="${MATRIX_EXTERNAL_REPLAY_FINAL_HOLD_SECONDS:-6}"
+    TRACE_REPLAY_CAMERA_RECEIPT="${MATRIX_EXTERNAL_REPLAY_CAMERA_RECEIPT:-}"
+    TRACE_REPLAY_CAMERA_READY_FILE="${MATRIX_EXTERNAL_REPLAY_CAMERA_READY_FILE:-}"
     if [[ -z "$TRACE_REPLAY_TRACE" ]]; then
         echo "[ERROR] MATRIX_EXTERNAL_REPLAY_TRACE is required" >&2
         exit 1
@@ -1593,20 +1711,76 @@ if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
     TRACE_REPLAY_TRACE="$(realpath -- "$TRACE_REPLAY_TRACE")"
     TRACE_REPLAY_STATUS_FILE="$(realpath -m -- "$TRACE_REPLAY_STATUS_FILE")"
     TRACE_REPLAY_SUMMARY="$(realpath -m -- "$TRACE_REPLAY_SUMMARY")"
+    if [[ -z "$TRACE_REPLAY_CAMERA_RECEIPT" ]]; then
+        echo "[ERROR] MATRIX_EXTERNAL_REPLAY_CAMERA_RECEIPT is required" >&2
+        exit 1
+    fi
+    TRACE_REPLAY_CAMERA_RECEIPT="$(realpath -m -- "$TRACE_REPLAY_CAMERA_RECEIPT")"
+    if [[ -n "$TRACE_REPLAY_CAMERA_READY_FILE" ]]; then
+        TRACE_REPLAY_CAMERA_READY_FILE="$(realpath -m -- "$TRACE_REPLAY_CAMERA_READY_FILE")"
+    fi
     if [[ -n "$TRACE_REPLAY_MODEL" ]]; then
         TRACE_REPLAY_MODEL="$(realpath -- "$TRACE_REPLAY_MODEL")"
     fi
+    TRACE_REPLAY_PROTECTED_CONTRACT="$(realpath -- "$MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT")"
+    TRACE_REPLAY_PROTECTED_ACTIVE="$(realpath -m -- \
+        "$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/MatrixCenteredCameraActive")"
+    TRACE_REPLAY_PROTECTED_BUNDLE=""
+    if $EXTERNAL_REPLAY_CENTERED_CAMERA_ENABLED; then
+        TRACE_REPLAY_PROTECTED_BUNDLE="$(realpath -- \
+            "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE")"
+        if path_is_equal_or_within \
+            "$TRACE_REPLAY_PROTECTED_BUNDLE" "$PROJECT_ROOT"; then
+            echo "[ERROR] External replay camera bundle must be outside Matrix:" \
+                "$TRACE_REPLAY_PROTECTED_BUNDLE" >&2
+            exit 1
+        fi
+    fi
+    for replay_mutable_path in \
+        "$TRACE_REPLAY_STATUS_FILE" "$TRACE_REPLAY_SUMMARY" \
+        "$TRACE_REPLAY_CAMERA_RECEIPT" "$TRACE_REPLAY_CAMERA_READY_FILE"; do
+        [[ -z "$replay_mutable_path" ]] && continue
+        if [[ "$replay_mutable_path" == "$TRACE_REPLAY_PROTECTED_CONTRACT" ]] \
+            || path_is_equal_or_within \
+                "$replay_mutable_path" "$TRACE_REPLAY_PROTECTED_ACTIVE" \
+            || { [[ -n "$TRACE_REPLAY_PROTECTED_BUNDLE" ]] \
+                && path_is_equal_or_within \
+                    "$replay_mutable_path" "$TRACE_REPLAY_PROTECTED_BUNDLE"; }; then
+            echo "[ERROR] Matrix trace replay output aliases protected camera input:" \
+                "$replay_mutable_path" >&2
+            exit 1
+        fi
+    done
     if [[ "$TRACE_REPLAY_STATUS_FILE" == "$TRACE_REPLAY_SUMMARY" \
+        || "$TRACE_REPLAY_CAMERA_RECEIPT" == "$TRACE_REPLAY_STATUS_FILE" \
+        || "$TRACE_REPLAY_CAMERA_RECEIPT" == "$TRACE_REPLAY_SUMMARY" \
         || "$TRACE_REPLAY_STATUS_FILE" == "$TRACE_REPLAY_TRACE" \
         || "$TRACE_REPLAY_SUMMARY" == "$TRACE_REPLAY_TRACE" \
+        || "$TRACE_REPLAY_CAMERA_RECEIPT" == "$TRACE_REPLAY_TRACE" \
+        || "$TRACE_REPLAY_STATUS_FILE" == "$UE_LOG" \
+        || "$TRACE_REPLAY_SUMMARY" == "$UE_LOG" \
+        || "$TRACE_REPLAY_CAMERA_RECEIPT" == "$UE_LOG" \
         || ( -n "$TRACE_REPLAY_MODEL" \
             && ( "$TRACE_REPLAY_STATUS_FILE" == "$TRACE_REPLAY_MODEL" \
-                || "$TRACE_REPLAY_SUMMARY" == "$TRACE_REPLAY_MODEL" ) ) ]]; then
+                || "$TRACE_REPLAY_SUMMARY" == "$TRACE_REPLAY_MODEL" \
+                || "$TRACE_REPLAY_CAMERA_RECEIPT" == "$TRACE_REPLAY_MODEL" ) ) ]]; then
         echo "[ERROR] Matrix trace replay source and output paths must be distinct" >&2
         exit 1
     fi
+    if [[ -n "$TRACE_REPLAY_CAMERA_READY_FILE" \
+        && ( "$TRACE_REPLAY_CAMERA_READY_FILE" == "$TRACE_REPLAY_TRACE" \
+            || "$TRACE_REPLAY_CAMERA_READY_FILE" == "$TRACE_REPLAY_STATUS_FILE" \
+            || "$TRACE_REPLAY_CAMERA_READY_FILE" == "$TRACE_REPLAY_SUMMARY" \
+            || "$TRACE_REPLAY_CAMERA_READY_FILE" == "$TRACE_REPLAY_CAMERA_RECEIPT" \
+            || "$TRACE_REPLAY_CAMERA_READY_FILE" == "$UE_LOG" \
+            || ( -n "$TRACE_REPLAY_MODEL" \
+                && "$TRACE_REPLAY_CAMERA_READY_FILE" == "$TRACE_REPLAY_MODEL" ) ) ]]; then
+        echo "[ERROR] Matrix camera-ready path aliases replay input/output" >&2
+        exit 1
+    fi
     for stale_replay_output in \
-        "$TRACE_REPLAY_STATUS_FILE" "$TRACE_REPLAY_SUMMARY"; do
+        "$TRACE_REPLAY_STATUS_FILE" "$TRACE_REPLAY_SUMMARY" \
+        "$TRACE_REPLAY_CAMERA_RECEIPT"; do
         if [[ -L "$stale_replay_output" || -d "$stale_replay_output" ]]; then
             echo "[ERROR] Matrix trace replay output must not be a symlink or directory:" \
                 "$stale_replay_output" >&2
@@ -1618,12 +1792,55 @@ if $MATRIX_EXTERNAL_REPLAY_ENABLED; then
         echo "[ERROR] Matrix physics-trace replay script is missing" >&2
         exit 1
     fi
+    if [[ ! -f "$PROJECT_ROOT/scripts/matrix_scene6_camera_receipt.py" ]]; then
+        echo "[ERROR] Matrix scene6 camera receipt script is missing" >&2
+        exit 1
+    fi
+    if $EXTERNAL_REPLAY_CENTERED_CAMERA_ENABLED; then
+        TRACE_REPLAY_CAMERA_MODE="spectator-overlay"
+    else
+        TRACE_REPLAY_CAMERA_MODE="robot"
+    fi
+    wait_for_external_camera_ready \
+        "$TRACE_REPLAY_CAMERA_READY_FILE" "$TRACE_REPLAY_CAMERA_MODE"
+    CAMERA_RECEIPT_COMMAND=(
+        /usr/bin/python3 -I
+        "$PROJECT_ROOT/scripts/matrix_scene6_camera_receipt.py"
+        write
+        --output "$TRACE_REPLAY_CAMERA_RECEIPT"
+        --mode "$TRACE_REPLAY_CAMERA_MODE"
+        --spring-arm-cm "$MATRIX_GAME_CAMERA_DISTANCE_CM"
+        --ue-exec-cmds "$UE_EXEC_CMDS"
+        --project-root "$PROJECT_ROOT"
+    )
+    if $EXTERNAL_REPLAY_CENTERED_CAMERA_ENABLED; then
+        CAMERA_RECEIPT_COMMAND+=(
+            --contract "$MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT"
+            --bundle "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE"
+            --ue-log "$UE_LOG"
+            --ue-log-start-offset "$UE_LOG_START_OFFSET"
+        )
+    fi
+    if [[ -n "$TRACE_REPLAY_CAMERA_READY_FILE" ]]; then
+        CAMERA_RECEIPT_COMMAND+=(--ready-file "$TRACE_REPLAY_CAMERA_READY_FILE")
+    fi
+    "${CAMERA_RECEIPT_COMMAND[@]}"
+    TRACE_REPLAY_CAMERA_RECEIPT_SHA256="$(
+        /usr/bin/sha256sum -- "$TRACE_REPLAY_CAMERA_RECEIPT"
+    )"
+    TRACE_REPLAY_CAMERA_RECEIPT_SHA256="${TRACE_REPLAY_CAMERA_RECEIPT_SHA256%% *}"
+    if [[ ! "$TRACE_REPLAY_CAMERA_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "[ERROR] Could not bind the current-run camera receipt SHA256" >&2
+        exit 1
+    fi
     TRACE_REPLAY_COMMAND=(
         "$TRACE_REPLAY_PYTHON"
         "$PROJECT_ROOT/scripts/replay_matrix_physics_trace.py"
         --trace "$TRACE_REPLAY_TRACE"
         --status-file "$TRACE_REPLAY_STATUS_FILE"
         --summary "$TRACE_REPLAY_SUMMARY"
+        --camera-receipt "$TRACE_REPLAY_CAMERA_RECEIPT"
+        --camera-receipt-sha256 "$TRACE_REPLAY_CAMERA_RECEIPT_SHA256"
         --pre-roll "$TRACE_REPLAY_PRE_ROLL"
         --final-hold "$TRACE_REPLAY_FINAL_HOLD"
         --ue-pid "$UE_PID"

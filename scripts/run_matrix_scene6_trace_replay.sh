@@ -13,11 +13,29 @@ SUMMARY_FILE="$PROJECT_ROOT/outputs/matrix_scene6_trace_replay_summary.json"
 PRE_ROLL_SECONDS="2"
 FINAL_HOLD_SECONDS="6"
 RESTORE_RECEIPT=""
+CAMERA_MODE="${MATRIX_SCENE6_CAMERA_MODE:-robot}"
+CAMERA_DISTANCE_CM="${MATRIX_SCENE6_CAMERA_DISTANCE_CM:-180}"
+OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
+OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-}"
+CAMERA_RECEIPT=""
+CAMERA_READY_FILE=""
+CAMERA_READY_TIMEOUT_SECONDS="120"
+CAMERA_SETTLE_SECONDS="0.5"
 
 usage() {
     echo "Usage: $0 --trace FILE [--model FILE] [--matrix-root DIR]" \
         "[--status-file FILE] [--summary FILE] [--pre-roll SECONDS]" \
-        "[--final-hold SECONDS]" >&2
+        "[--final-hold SECONDS] [--camera-mode robot|spectator-overlay]" \
+        "[--camera-distance-cm CM] [--overlay-bundle DIR]" \
+        "[--overlay-contract FILE] [--camera-receipt FILE]" \
+        "[--camera-ready-file FILE] [--camera-ready-timeout SECONDS]" \
+        "[--camera-settle SECONDS]" >&2
+}
+
+path_is_equal_or_within() {
+    local candidate="$1"
+    local directory="$2"
+    [[ "$candidate" == "$directory" || "$candidate" == "$directory/"* ]]
 }
 
 while (($#)); do
@@ -58,6 +76,38 @@ while (($#)); do
             FINAL_HOLD_SECONDS="${2:-}"
             shift 2
             ;;
+        --camera-mode)
+            CAMERA_MODE="${2:-}"
+            shift 2
+            ;;
+        --camera-distance-cm)
+            CAMERA_DISTANCE_CM="${2:-}"
+            shift 2
+            ;;
+        --overlay-bundle)
+            OVERLAY_BUNDLE="${2:-}"
+            shift 2
+            ;;
+        --overlay-contract)
+            OVERLAY_CONTRACT="${2:-}"
+            shift 2
+            ;;
+        --camera-receipt)
+            CAMERA_RECEIPT="${2:-}"
+            shift 2
+            ;;
+        --camera-ready-file)
+            CAMERA_READY_FILE="${2:-}"
+            shift 2
+            ;;
+        --camera-ready-timeout)
+            CAMERA_READY_TIMEOUT_SECONDS="${2:-}"
+            shift 2
+            ;;
+        --camera-settle)
+            CAMERA_SETTLE_SECONDS="${2:-}"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -75,28 +125,130 @@ if [[ -z "$TRACE" ]]; then
     usage
     exit 2
 fi
-for timing_value in "$PRE_ROLL_SECONDS" "$FINAL_HOLD_SECONDS"; do
+for timing_value in \
+    "$PRE_ROLL_SECONDS" "$FINAL_HOLD_SECONDS" \
+    "$CAMERA_READY_TIMEOUT_SECONDS" "$CAMERA_SETTLE_SECONDS"; do
     if [[ ! "$timing_value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         echo "[ERROR] Replay timing values must be non-negative numbers:" \
             "$timing_value" >&2
         exit 2
     fi
 done
+case "$CAMERA_MODE" in
+    robot|spectator-overlay) ;;
+    *)
+        echo "[ERROR] --camera-mode must be robot or spectator-overlay:" \
+            "$CAMERA_MODE" >&2
+        exit 2
+        ;;
+esac
+if [[ ! "$CAMERA_DISTANCE_CM" =~ ^(0|[1-9][0-9]*)([.][0-9]+)?$ ]] \
+    || ! awk -v value="$CAMERA_DISTANCE_CM" \
+        'BEGIN { exit !(value >= 80.0 && value <= 500.0) }'; then
+    echo "[ERROR] --camera-distance-cm must be within 80..500:" \
+        "$CAMERA_DISTANCE_CM" >&2
+    exit 2
+fi
+while [[ "$CAMERA_DISTANCE_CM" == *.* && "$CAMERA_DISTANCE_CM" == *0 ]]; do
+    CAMERA_DISTANCE_CM="${CAMERA_DISTANCE_CM%0}"
+done
+CAMERA_DISTANCE_CM="${CAMERA_DISTANCE_CM%.}"
 MATRIX_ROOT="$(realpath -- "$MATRIX_ROOT")"
 TRACE="$(realpath -- "$TRACE")"
 if [[ -n "$MODEL" ]]; then
     MODEL="$(realpath -- "$MODEL")"
 fi
+if [[ -n "$STATE_DIR" ]]; then
+    STATE_DIR="$(realpath -m -- "$STATE_DIR")"
+fi
+if [[ -z "$OVERLAY_CONTRACT" ]]; then
+    OVERLAY_CONTRACT="$MATRIX_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json"
+fi
+if [[ -L "$OVERLAY_CONTRACT" ]]; then
+    echo "[ERROR] --overlay-contract must not be a symlink:" \
+        "$OVERLAY_CONTRACT" >&2
+    exit 2
+fi
+OVERLAY_CONTRACT="$(realpath -- "$OVERLAY_CONTRACT")"
+if [[ ! -f "$OVERLAY_CONTRACT" ]]; then
+    echo "[ERROR] --overlay-contract must be a real file:" \
+        "$OVERLAY_CONTRACT" >&2
+    exit 2
+fi
+if [[ "$CAMERA_MODE" == "spectator-overlay" ]]; then
+    if [[ -z "$OVERLAY_BUNDLE" ]]; then
+        echo "[ERROR] --overlay-bundle is required for spectator-overlay" >&2
+        exit 2
+    fi
+    if [[ -L "$OVERLAY_BUNDLE" ]]; then
+        echo "[ERROR] --overlay-bundle must not be a symlink:" \
+            "$OVERLAY_BUNDLE" >&2
+        exit 2
+    fi
+    OVERLAY_BUNDLE="$(realpath -- "$OVERLAY_BUNDLE")"
+    if [[ ! -d "$OVERLAY_BUNDLE" ]]; then
+        echo "[ERROR] --overlay-bundle must be a real directory:" \
+            "$OVERLAY_BUNDLE" >&2
+        exit 2
+    fi
+    if path_is_equal_or_within "$OVERLAY_BUNDLE" "$MATRIX_ROOT"; then
+        echo "[ERROR] --overlay-bundle must be external to the Matrix checkout:" \
+            "$OVERLAY_BUNDLE" >&2
+        exit 2
+    fi
+fi
 STATUS_FILE="$(realpath -m -- "$STATUS_FILE")"
 SUMMARY_FILE="$(realpath -m -- "$SUMMARY_FILE")"
+if [[ -z "$CAMERA_RECEIPT" ]]; then
+    CAMERA_RECEIPT="${SUMMARY_FILE%.json}.camera.json"
+fi
+CAMERA_RECEIPT="$(realpath -m -- "$CAMERA_RECEIPT")"
+if [[ -n "$CAMERA_READY_FILE" ]]; then
+    CAMERA_READY_FILE="$(realpath -m -- "$CAMERA_READY_FILE")"
+fi
 if [[ -z "$RESTORE_RECEIPT" ]]; then
     RESTORE_RECEIPT="${SUMMARY_FILE%.json}.restore.json"
 fi
 RESTORE_RECEIPT="$(realpath -m -- "$RESTORE_RECEIPT")"
+PROTECTED_ACTIVE="$(realpath -m -- \
+    "$MATRIX_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Saved/Paks/MatrixCenteredCameraActive")"
+PROTECTED_UE_LOG="$(realpath -m -- \
+    "$MATRIX_ROOT/src/UeSim/Linux/zsibot_mujoco_ue.log")"
+MUTABLE_REPLAY_PATHS=(
+    "$STATUS_FILE" "$SUMMARY_FILE" "$RESTORE_RECEIPT" "$CAMERA_RECEIPT"
+)
+if [[ -n "$CAMERA_READY_FILE" ]]; then
+    MUTABLE_REPLAY_PATHS+=("$CAMERA_READY_FILE")
+fi
+for mutable_path in "${MUTABLE_REPLAY_PATHS[@]}"; do
+    if [[ "$mutable_path" == "$OVERLAY_CONTRACT" \
+        || "$mutable_path" == "$PROTECTED_UE_LOG" ]] \
+        || path_is_equal_or_within "$mutable_path" "$PROTECTED_ACTIVE" \
+        || { [[ "$CAMERA_MODE" == "spectator-overlay" ]] \
+            && path_is_equal_or_within "$mutable_path" "$OVERLAY_BUNDLE"; }; then
+        echo "[ERROR] Replay output aliases protected camera input:" \
+            "$mutable_path" >&2
+        exit 2
+    fi
+done
+if [[ -n "$STATE_DIR" ]]; then
+    if path_is_equal_or_within "$STATE_DIR" "$PROTECTED_ACTIVE" \
+        || path_is_equal_or_within "$PROTECTED_ACTIVE" "$STATE_DIR" \
+        || path_is_equal_or_within "$OVERLAY_CONTRACT" "$STATE_DIR" \
+        || { [[ "$CAMERA_MODE" == "spectator-overlay" ]] \
+            && { path_is_equal_or_within "$STATE_DIR" "$OVERLAY_BUNDLE" \
+                || path_is_equal_or_within "$OVERLAY_BUNDLE" "$STATE_DIR"; }; }; then
+        echo "[ERROR] Replay state directory overlaps protected camera input:" \
+            "$STATE_DIR" >&2
+        exit 2
+    fi
+fi
 for required in \
     "$MATRIX_ROOT/scripts/run_sim.sh" \
     "$MATRIX_ROOT/scripts/replay_matrix_physics_trace.py" \
-    "$MATRIX_ROOT/scripts/stage_matrix_trace_model.py"; do
+    "$MATRIX_ROOT/scripts/stage_matrix_trace_model.py" \
+    "$MATRIX_ROOT/scripts/matrix_ue_overlay.py" \
+    "$MATRIX_ROOT/scripts/matrix_scene6_camera_receipt.py"; do
     if [[ ! -f "$required" ]]; then
         echo "[ERROR] Required Matrix replay component is missing: $required" >&2
         exit 2
@@ -136,6 +288,19 @@ else
 fi
 export MATRIX_SONIC_HOST_LOCK_FD=9
 
+# The host lock proves no live Matrix launcher owns the active PAK directory.
+# Purge only a fully verified stale overlay before every replay mode: otherwise
+# a prior SIGKILL could make a nominal robot-camera run mount an undisclosed
+# Spectator overlay, or block the next atomic install.
+"$PYTHON" -I "$MATRIX_ROOT/scripts/matrix_ue_overlay.py" purge-stale \
+    --contract "$OVERLAY_CONTRACT" \
+    --project-root "$MATRIX_ROOT"
+if [[ "$CAMERA_MODE" == "spectator-overlay" ]]; then
+    "$PYTHON" -I "$MATRIX_ROOT/scripts/matrix_ue_overlay.py" verify-bundle \
+        --contract "$OVERLAY_CONTRACT" \
+        --bundle "$OVERLAY_BUNDLE"
+fi
+
 # Recover a journal left by a SIGKILL/power-loss boundary before creating a new
 # one.  The shared host lock proves no live Matrix launcher can still own these
 # active files; restore itself remains hash-gated and fails closed on drift.
@@ -154,7 +319,8 @@ for stale_state_path in \
 done
 shopt -u nullglob
 
-for stale in "$STATUS_FILE" "$SUMMARY_FILE" "$RESTORE_RECEIPT"; do
+for stale in \
+    "$STATUS_FILE" "$SUMMARY_FILE" "$RESTORE_RECEIPT" "$CAMERA_RECEIPT"; do
     if [[ "$stale" == "$TRACE" \
         || ( -n "$MODEL" && "$stale" == "$MODEL" ) ]]; then
         echo "[ERROR] Replay output path aliases a source artifact: $stale" >&2
@@ -168,10 +334,31 @@ for stale in "$STATUS_FILE" "$SUMMARY_FILE" "$RESTORE_RECEIPT"; do
 done
 if [[ "$STATUS_FILE" == "$SUMMARY_FILE" \
     || "$STATUS_FILE" == "$RESTORE_RECEIPT" \
-    || "$SUMMARY_FILE" == "$RESTORE_RECEIPT" ]]; then
-    echo "[ERROR] Replay status, summary, and restore receipt must be distinct" >&2
+    || "$SUMMARY_FILE" == "$RESTORE_RECEIPT" \
+    || "$CAMERA_RECEIPT" == "$STATUS_FILE" \
+    || "$CAMERA_RECEIPT" == "$SUMMARY_FILE" \
+    || "$CAMERA_RECEIPT" == "$RESTORE_RECEIPT" ]]; then
+    echo "[ERROR] Replay status, summary, camera, and restore receipts must be distinct" >&2
     exit 2
 fi
+if [[ -n "$CAMERA_READY_FILE" ]]; then
+    if [[ "$CAMERA_READY_FILE" == "$TRACE" \
+        || ( -n "$MODEL" && "$CAMERA_READY_FILE" == "$MODEL" ) \
+        || "$CAMERA_READY_FILE" == "$STATUS_FILE" \
+        || "$CAMERA_READY_FILE" == "$SUMMARY_FILE" \
+        || "$CAMERA_READY_FILE" == "$RESTORE_RECEIPT" \
+        || "$CAMERA_READY_FILE" == "$CAMERA_RECEIPT" ]]; then
+        echo "[ERROR] Camera-ready path must be distinct from replay artifacts" >&2
+        exit 2
+    fi
+    if [[ -L "$CAMERA_READY_FILE" || -d "$CAMERA_READY_FILE" ]]; then
+        echo "[ERROR] Camera-ready path must not be a symlink or directory:" \
+            "$CAMERA_READY_FILE" >&2
+        exit 2
+    fi
+    rm -f -- "$CAMERA_READY_FILE"
+fi
+mkdir -p -- "$(dirname -- "$CAMERA_RECEIPT")"
 
 REMOVE_STATE_DIR=0
 if [[ -z "$STATE_DIR" ]]; then
@@ -223,18 +410,35 @@ export MATRIX_EXTERNAL_REPLAY_STATUS_FILE="$STATUS_FILE"
 export MATRIX_EXTERNAL_REPLAY_SUMMARY="$SUMMARY_FILE"
 export MATRIX_EXTERNAL_REPLAY_PRE_ROLL_SECONDS="$PRE_ROLL_SECONDS"
 export MATRIX_EXTERNAL_REPLAY_FINAL_HOLD_SECONDS="$FINAL_HOLD_SECONDS"
+export MATRIX_EXTERNAL_REPLAY_CAMERA_RECEIPT="$CAMERA_RECEIPT"
+export MATRIX_EXTERNAL_REPLAY_CAMERA_READY_FILE="$CAMERA_READY_FILE"
+export MATRIX_EXTERNAL_REPLAY_CAMERA_READY_TIMEOUT_SECONDS="$CAMERA_READY_TIMEOUT_SECONDS"
+export MATRIX_EXTERNAL_REPLAY_CAMERA_SETTLE_SECONDS="$CAMERA_SETTLE_SECONDS"
 export MATRIX_DISABLE_MC=1
 export MATRIX_SONIC=0
 export MATRIX_UE_MAX_FPS=25
 export SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=1
-if [[ -z "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
-    MATRIX_UE_EXTRA_EXEC_CMDS="set Engine.SpringArmComponent bEnableCameraLag False"
-    MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent bEnableCameraRotationLag False"
-    MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent bDoCollisionTest True"
-    MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent TargetArmLength 180"
-    MATRIX_UE_EXTRA_EXEC_CMDS+=",viewclass MujocoSim_Custom_C"
-    export MATRIX_UE_EXTRA_EXEC_CMDS
-fi
+export MATRIX_GAME_CAMERA_DISTANCE_CM="$CAMERA_DISTANCE_CM"
+case "$CAMERA_MODE" in
+    robot)
+        export MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA=0
+        if [[ -z "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+            MATRIX_UE_EXTRA_EXEC_CMDS="set Engine.SpringArmComponent bEnableCameraLag False"
+            MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent bEnableCameraRotationLag False"
+            MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent bDoCollisionTest True"
+            MATRIX_UE_EXTRA_EXEC_CMDS+=",set Engine.SpringArmComponent TargetArmLength ${CAMERA_DISTANCE_CM}"
+            MATRIX_UE_EXTRA_EXEC_CMDS+=",viewclass MujocoSim_Custom_C"
+            export MATRIX_UE_EXTRA_EXEC_CMDS
+        fi
+        CAMERA_VIEW_CLASS="MujocoSim_Custom_C"
+        ;;
+    spectator-overlay)
+        export MATRIX_EXTERNAL_REPLAY_CENTERED_CAMERA=1
+        export MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="$OVERLAY_BUNDLE"
+        export MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="$OVERLAY_CONTRACT"
+        CAMERA_VIEW_CLASS="Spectator_C"
+        ;;
+esac
 if [[ -n "$MODEL" ]]; then
     export MATRIX_EXTERNAL_REPLAY_MODEL="$MODEL"
 else
@@ -244,7 +448,9 @@ fi
 echo "[INFO] physics_execution=offline_mujoco_persistent_world"
 echo "[INFO] render_mode=matrix_ue_trace_replay"
 echo "[INFO] manipulation=contact-gated constrained grasp + anchored stance"
-echo "[INFO] replay_camera=MujocoSim_Custom_C spring_arm_cm=180"
+echo "[INFO] replay_camera_mode=$CAMERA_MODE requested_viewclass=$CAMERA_VIEW_CLASS" \
+    "spring_arm_cm=$CAMERA_DISTANCE_CM"
+echo "[INFO] replay_camera_extra_exec_cmds=${MATRIX_UE_EXTRA_EXEC_CMDS:-none}"
 
 cd "$MATRIX_ROOT"
 bash scripts/run_sim.sh custom 6 0 0 1 "" twinbot_scene6_trace_replay

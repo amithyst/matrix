@@ -13,6 +13,8 @@ import subprocess
 import tempfile
 from typing import Any, Sequence
 
+import matrix_scene6_camera_receipt as camera_evidence
+
 
 class PostflightError(RuntimeError):
     pass
@@ -159,15 +161,37 @@ def verify(
     metadata_path: Path,
     summary_path: Path,
     restore_path: Path,
+    camera_receipt_path: Path,
     matrix_root: Path,
 ) -> dict[str, Any]:
     output = _file(output, label="accepted MP4")
     metadata_path, metadata = _json(metadata_path, label="video metadata")
     summary_path, summary = _json(summary_path, label="replay summary")
     restore_path, restore = _json(restore_path, label="model restore receipt")
+    camera_receipt_path = _file(camera_receipt_path, label="camera receipt")
+    try:
+        camera = camera_evidence.load_receipt(camera_receipt_path)
+        camera_evidence.revalidate_receipt_evidence(
+            camera, project_root=matrix_root.expanduser().resolve()
+        )
+    except camera_evidence.CameraReceiptError as exc:
+        raise PostflightError(f"invalid camera receipt: {exc}") from exc
+    if camera.get("mode") == "spectator-overlay" and camera.get("camera_ready") is None:
+        raise PostflightError(
+            "spectator-overlay video lacks an explicit camera-ready confirmation"
+        )
 
-    if summary.get("schema_id") != "matrix.physics_trace_replay.summary.v1":
+    camera_binding = {
+        "schema_id": "matrix.physics_trace_replay.camera_binding.v1",
+        "path": str(camera_receipt_path),
+        "sha256": _sha256(camera_receipt_path),
+        "size_bytes": camera_receipt_path.stat().st_size,
+        "receipt_schema_id": "matrix.scene6_camera_receipt.v1",
+    }
+    if summary.get("schema_id") != "matrix.physics_trace_replay.summary.v2":
         raise PostflightError("unexpected replay summary schema")
+    if summary.get("camera_receipt") != camera_binding:
+        raise PostflightError("replay summary is not bound to the camera receipt")
     if summary.get("passed") is not True:
         raise PostflightError(f"trace replay did not pass: {summary.get('failure')}")
     if summary.get("completion") != "scheduled_replay_complete":
@@ -235,6 +259,12 @@ def verify(
         raise PostflightError("video quality gates did not pass")
     if not isinstance(video, dict) or not isinstance(capture, dict):
         raise PostflightError("video metadata is incomplete")
+    if (
+        metadata.get("matrix_scene6_extension_schema")
+        != "matrix.scene6_video_metadata.v2"
+        or metadata.get("matrix_scene6_camera") != camera
+    ):
+        raise PostflightError("video metadata is not bound to the camera receipt")
     if Path(str(video.get("path"))).resolve() != output:
         raise PostflightError("video metadata does not reference the accepted MP4")
     output_sha = _sha256(output)
@@ -265,10 +295,12 @@ def verify(
         raise PostflightError("video duration must be positive and finite")
     status_before = ((metadata.get("sonic_status") or {}).get("before") or {})
     if (
-        status_before.get("active_lowcmd") is not True
+        status_before.get("schema_id") != "matrix.physics_trace_replay.status.v2"
+        or status_before.get("active_lowcmd") is not True
         or status_before.get("active_lowcmd_semantics")
         != "legacy_recorder_readiness_gate_no_dds_lowcmd"
         or status_before.get("dds_lowcmd_active") is not False
+        or status_before.get("camera_receipt") != camera_binding
     ):
         raise PostflightError("video readiness lacks the explicit no-DDS replay boundary")
     launcher = metadata.get("launcher")
@@ -284,12 +316,14 @@ def verify(
         raise PostflightError("Matrix launcher did not finish naturally with code 0")
     status_after = ((metadata.get("sonic_status") or {}).get("after") or {})
     if (
-        status_after.get("active_lowcmd") is not False
+        status_after.get("schema_id") != "matrix.physics_trace_replay.status.v2"
+        or status_after.get("active_lowcmd") is not False
         or status_after.get("completed") is not True
         or status_after.get("passed") is not True
         or status_after.get("active_lowcmd_semantics")
         != "legacy_recorder_readiness_gate_no_dds_lowcmd"
         or status_after.get("dds_lowcmd_active") is not False
+        or status_after.get("camera_receipt") != camera_binding
     ):
         raise PostflightError("Matrix replay final status is not complete and inactive")
 
@@ -310,7 +344,7 @@ def verify(
         )
 
     return {
-        "schema_id": "matrix.scene6_twinbot_video_postflight.v1",
+        "schema_id": "matrix.scene6_twinbot_video_postflight.v2",
         "passed": True,
         "physics_execution": "offline_mujoco_persistent_world",
         "render_mode": "matrix_ue_trace_replay",
@@ -345,6 +379,11 @@ def verify(
             "path": str(metadata_path),
             "sha256": _sha256(metadata_path),
         },
+        "camera_receipt": {
+            "path": str(camera_receipt_path),
+            "sha256": _sha256(camera_receipt_path),
+        },
+        "camera": camera,
     }
 
 
@@ -354,6 +393,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--metadata", type=Path, required=True)
     parser.add_argument("--replay-summary", type=Path, required=True)
     parser.add_argument("--restore-receipt", type=Path, required=True)
+    parser.add_argument("--camera-receipt", type=Path, required=True)
     parser.add_argument("--matrix-root", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     return parser.parse_args(argv)
@@ -367,6 +407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             metadata_path=args.metadata,
             summary_path=args.replay_summary,
             restore_path=args.restore_receipt,
+            camera_receipt_path=args.camera_receipt,
             matrix_root=args.matrix_root,
         )
         _atomic_json(args.receipt.expanduser().resolve(), receipt)

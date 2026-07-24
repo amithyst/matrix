@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import struct
 import tempfile
 import time
@@ -21,8 +22,8 @@ from typing import Any, Sequence
 
 
 TRACE_SCHEMA = "twinbot.physics_trace.mujoco.v0"
-STATUS_SCHEMA = "matrix.physics_trace_replay.status.v1"
-SUMMARY_SCHEMA = "matrix.physics_trace_replay.summary.v1"
+STATUS_SCHEMA = "matrix.physics_trace_replay.status.v2"
+SUMMARY_SCHEMA = "matrix.physics_trace_replay.summary.v2"
 PHYSICS_EXECUTION = "offline_mujoco_persistent_world"
 RENDER_MODE = "matrix_ue_trace_replay"
 EXPECTED_DIMS = (57, 55, 43)
@@ -100,6 +101,59 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _camera_receipt_binding(path: Path, *, expected_sha256: str) -> dict[str, Any]:
+    if (
+        len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise TraceValidationError("camera receipt expected SHA256 is invalid")
+    path = path.expanduser()
+    if not path.is_absolute():
+        raise TraceValidationError("camera receipt path must be absolute")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise TraceValidationError(f"cannot open camera receipt: {path}: {exc}") from exc
+    digest = hashlib.sha256()
+    contents = bytearray()
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise TraceValidationError("camera receipt must be a regular file")
+        if metadata.st_size <= 0 or metadata.st_size > 512 * 1024:
+            raise TraceValidationError("camera receipt size is outside the accepted bound")
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            contents.extend(block)
+    finally:
+        os.close(descriptor)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise TraceValidationError("camera receipt changed before replay startup")
+    try:
+        payload = json.loads(contents.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise TraceValidationError(f"camera receipt JSON is invalid: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_id") != "matrix.scene6_camera_receipt.v1"
+    ):
+        raise TraceValidationError("camera receipt schema is invalid")
+    return {
+        "schema_id": "matrix.physics_trace_replay.camera_binding.v1",
+        "path": os.fspath(path.resolve()),
+        "sha256": actual_sha256,
+        "size_bytes": len(contents),
+        "receipt_schema_id": payload["schema_id"],
+    }
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -438,11 +492,17 @@ def replay(
     pre_roll_s: float,
     final_hold_s: float,
     ue_pid: int | None,
+    camera_receipt_path: Path,
+    expected_camera_receipt_sha256: str,
 ) -> dict[str, Any]:
     if pre_roll_s < 0.0 or not math.isfinite(pre_roll_s):
         raise ValueError("pre-roll must be a non-negative finite number")
     if final_hold_s < 0.0 or not math.isfinite(final_hold_s):
         raise ValueError("final hold must be a non-negative finite number")
+    camera_receipt = _camera_receipt_binding(
+        camera_receipt_path,
+        expected_sha256=expected_camera_receipt_sha256,
+    )
     ue_start_ticks = _process_start_ticks(ue_pid) if ue_pid is not None else None
     pre_roll_packets = round(pre_roll_s * REPLAY_FPS)
     final_hold_packets = round(final_hold_s * REPLAY_FPS)
@@ -502,6 +562,7 @@ def replay(
             "model": inspection["render_robot_model"]["path"],
             "model_provenance": inspection["render_robot_model"],
             "scene_model_provenance": inspection["model"],
+            "camera_receipt": camera_receipt,
             "manipulation_assistance": (
                 "contact_gated_wrist_cube_weld_and_anchored_stance"
             ),
@@ -617,6 +678,7 @@ def replay(
             "trace": inspection["trace"],
             "model": inspection["render_robot_model"],
             "scene_model": inspection["model"],
+            "camera_receipt": camera_receipt,
             "dimensions": inspection["dimensions"],
             "source_frame_count": trace_packets,
             "source_duration_s": inspection["source_duration_s"],
@@ -659,6 +721,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     inspection.add_argument("--inspect-frame-count", action="store_true")
     parser.add_argument("--status-file", type=Path)
     parser.add_argument("--summary", type=Path)
+    parser.add_argument("--camera-receipt", type=Path)
+    parser.add_argument("--camera-receipt-sha256")
     parser.add_argument("--pre-roll", type=float, default=2.0)
     parser.add_argument("--final-hold", type=float, default=6.0)
     parser.add_argument("--ue-pid", type=int)
@@ -673,9 +737,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.ue_pid is not None and args.ue_pid <= 0:
         parser.error("--ue-pid must be positive")
     if not (args.inspect or args.inspect_frame_count) and (
-        args.status_file is None or args.summary is None
+        args.status_file is None
+        or args.summary is None
+        or args.camera_receipt is None
+        or args.camera_receipt_sha256 is None
     ):
-        parser.error("replay requires --status-file and --summary")
+        parser.error(
+            "replay requires --status-file, --summary, --camera-receipt, and "
+            "--camera-receipt-sha256"
+        )
     return args
 
 
@@ -700,6 +770,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             pre_roll_s=args.pre_roll,
             final_hold_s=args.final_hold,
             ue_pid=args.ue_pid,
+            camera_receipt_path=args.camera_receipt.expanduser().resolve(),
+            expected_camera_receipt_sha256=args.camera_receipt_sha256,
         )
     except (OSError, TraceValidationError, ValueError, RuntimeError) as exc:
         print(f"[matrix-trace-replay] ERROR: {exc}", file=os.sys.stderr)
