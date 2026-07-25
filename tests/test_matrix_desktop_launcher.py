@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -63,6 +64,7 @@ set -euo pipefail
         self.tmux_state = self.root / "tmux.state"
         self.runtime_dir = self.root / "runtime"
         self.runtime_dir.mkdir(mode=0o700)
+        self.host_lock = self.root / "matrix-sonic-host.lock"
         write_executable(
             self.fake_bin / "tmux",
             """#!/usr/bin/env bash
@@ -123,6 +125,7 @@ esac
                 "FAKE_TMUX_LOG": os.fspath(self.tmux_log),
                 "FAKE_TMUX_STATE": os.fspath(self.tmux_state),
                 "HOME": os.fspath(self.root / "home"),
+                "MATRIX_DESKTOP_HOST_LOCK_PATH": os.fspath(self.host_lock),
                 "XDG_RUNTIME_DIR": os.fspath(self.runtime_dir),
                 "PATH": os.fspath(self.fake_bin)
                 + os.pathsep
@@ -312,6 +315,24 @@ esac
         self.assertEqual(result.returncode, 1)
         self.assertIn("exited during startup", result.stderr)
         self.assertFalse(self.tmux_state.exists())
+
+    def test_external_host_runtime_is_reported_before_tmux_start(self) -> None:
+        with self.host_lock.open("w", encoding="utf-8") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_launcher("start", "--profile", "trna")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "Another Matrix SONIC instance owns this host", result.stderr
+        )
+        self.assertRegex(result.stderr, r"(?:source|lock)=")
+        self.assertFalse(self.run_log.exists())
+        self.assertFalse(
+            any(
+                call[0] == "new-session"
+                for call in parse_call_log(self.tmux_log)
+            )
+        )
 
 
 class MatrixDesktopInstallerTest(unittest.TestCase):
