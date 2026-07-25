@@ -6502,9 +6502,19 @@ class X11CalibrationOverlay:
                 build_info_model,
             )
         pointer_recentered = False
-        if not point_in_rectangle(
-            pointer,
-            (geometry.x, geometry.y, geometry.width, geometry.height),
+        game_rectangle = (
+            geometry.x,
+            geometry.y,
+            geometry.width,
+            geometry.height,
+        )
+        pointer_on_confinement_edge = bool(
+            pointer[0] in {geometry.x, geometry.x + geometry.width - 1}
+            or pointer[1] in {geometry.y, geometry.y + geometry.height - 1}
+        )
+        if (
+            not point_in_rectangle(pointer, game_rectangle)
+            or pointer_on_confinement_edge
         ):
             safe_x, safe_y, safe_width, safe_height = layout["crosshair_safe"]
             pointer = (

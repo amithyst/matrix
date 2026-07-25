@@ -1520,6 +1520,26 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(telemetry["stable_idle_sim_elapsed_s"], 0.0)
         self.assertTrue(probation.active)
 
+    def test_resume_probation_accepts_native_sonic_idle_yaw_balance(self) -> None:
+        probation = MODULE._GameWorldResumeProbation(
+            selected_checkpoint_id="cp-1",
+            clearance_auditor=self.safe_clearance_audit,
+            max_sim_sample_gap_seconds=2.0,
+        )
+        idle = self.resume_idle_command()
+        balancing = self.upright_resume_snapshot(
+            low_cmd_fresh=True,
+            sim_time=0.0,
+        )
+        balancing.qvel[5] = 0.06
+
+        probation.observe(balancing, idle, now_s=0.0)
+        balancing.sim_time = 1.5
+        probation.observe(balancing, idle, now_s=1.5)
+
+        self.assertTrue(probation.completed)
+        self.assertTrue(probation.telemetry()["root_motion_within_limits"])
+
     def test_resume_probation_ignores_creative_inventory_freejoint_velocity(
         self,
     ) -> None:
