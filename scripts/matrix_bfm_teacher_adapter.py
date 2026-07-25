@@ -706,6 +706,112 @@ class BfmTeacherCore:
                 result[name] = BfmTeacherCore._array_summary(value)
         return result
 
+    @staticmethod
+    def _max_abs_entry(
+        values: np.ndarray,
+        names: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        if array.size == 0:
+            return {
+                "max_abs": None,
+                "argmax": None,
+                "joint_name": None,
+                "signed_value": None,
+            }
+        index = int(np.argmax(np.abs(array)))
+        return {
+            "max_abs": float(abs(array[index])),
+            "argmax": index,
+            "joint_name": names[index] if index < len(names) else None,
+            "signed_value": float(array[index]),
+        }
+
+    @staticmethod
+    def _yaw_from_wxyz(quaternion: np.ndarray) -> float | None:
+        values = np.asarray(quaternion, dtype=np.float64).reshape(-1)
+        if values.shape != (4,) or not np.all(np.isfinite(values)):
+            return None
+        norm = float(np.linalg.norm(values))
+        if norm <= 1.0e-12:
+            return None
+        w, x, y, z = (values / norm).tolist()
+        return float(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+    def _joint_order_ledger(self) -> dict[str, Any]:
+        matrix_names = list(G1_29_JOINT_NAMES)
+        isaac_to_matrix = [int(value) for value in self.isaac_to_matrix.tolist()]
+        matrix_to_isaac = [
+            int(value) for value in self.teacher_module.MUJOCO_TO_ISAACLAB.tolist()
+        ]
+        isaac_names = [matrix_names[matrix_index] for matrix_index in isaac_to_matrix]
+        return {
+            "matrix_mujoco_actuator_order": [
+                {
+                    "matrix_index": matrix_index,
+                    "joint_name": joint_name,
+                    "isaac_index": matrix_to_isaac[matrix_index],
+                }
+                for matrix_index, joint_name in enumerate(matrix_names)
+            ],
+            "isaac_action_order": [
+                {
+                    "isaac_index": isaac_index,
+                    "joint_name": joint_name,
+                    "matrix_index": isaac_to_matrix[isaac_index],
+                }
+                for isaac_index, joint_name in enumerate(isaac_names)
+            ],
+        }
+
+    def _reference_continuity_summary(
+        self,
+        plan: Any,
+        lowstate: LowStateSnapshot,
+    ) -> dict[str, Any]:
+        raw_future_qpos = getattr(plan, "future_qpos", None)
+        if raw_future_qpos is None:
+            return {
+                "valid": False,
+                "foot_ik_observable": "unavailable",
+            }
+        future_qpos = np.asarray(raw_future_qpos, dtype=np.float64)
+        if future_qpos.shape != (10, 36) or not np.all(np.isfinite(future_qpos)):
+            return {
+                "valid": False,
+                "foot_ik_observable": "unavailable",
+            }
+        yaw_0 = self._yaw_from_wxyz(future_qpos[0, 3:7])
+        yaw_1 = self._yaw_from_wxyz(future_qpos[1, 3:7])
+        yaw_delta = (
+            None
+            if yaw_0 is None or yaw_1 is None
+            else float(math.atan2(math.sin(yaw_1 - yaw_0), math.cos(yaw_1 - yaw_0)))
+        )
+        reference_joint = future_qpos[0, 7:].astype(np.float32)
+        reference_joint_delta = reference_joint - lowstate.joint_pos_rad
+        root_delta_01 = future_qpos[1, :3] - future_qpos[0, :3]
+        return {
+            "valid": True,
+            "root_xyz_0": [float(value) for value in future_qpos[0, :3]],
+            "root_xyz_1": [float(value) for value in future_qpos[1, :3]],
+            "root_xyz_delta_01": [float(value) for value in root_delta_01],
+            "root_xy_delta_01_m": float(np.linalg.norm(root_delta_01[:2])),
+            "root_z_delta_01_m": float(root_delta_01[2]),
+            "root_yaw_0_rad": yaw_0,
+            "root_yaw_1_rad": yaw_1,
+            "root_yaw_delta_01_rad": yaw_delta,
+            "pelvis_quat_wxyz_0": [float(value) for value in future_qpos[0, 3:7]],
+            "pelvis_quat_wxyz_1": [float(value) for value in future_qpos[1, 3:7]],
+            "reference_joint_minus_current": self._max_abs_entry(
+                reference_joint_delta,
+                G1_29_JOINT_NAMES,
+            ),
+            "foot_ik_observable": (
+                "future_qpos_after_robo_pfnn_formal7168_pelvis_and_foot_ik"
+            ),
+        }
+
     def _write_trace_tick(
         self,
         *,
@@ -730,6 +836,16 @@ class BfmTeacherCore:
             or trace_written >= trace_ticks
         ):
             return
+        matrix_names = list(G1_29_JOINT_NAMES)
+        isaac_names = [
+            matrix_names[int(matrix_index)]
+            for matrix_index in self.isaac_to_matrix.tolist()
+        ]
+        previous_action_matrix = previous_action_before[self.isaac_to_matrix]
+        action_delta_isaac = action_isaac - previous_action_before
+        action_delta_matrix = action_matrix - previous_action_matrix
+        desired_target_delta = desired_target - lowstate.joint_pos_rad
+        published_target_delta = target - lowstate.joint_pos_rad
         record = {
             "schema": "matrix.bfm_teacher.policy_tick_trace.v1",
             "policy_id": POLICY_ID,
@@ -768,12 +884,36 @@ class BfmTeacherCore:
                 "buffer_swapped": bool(
                     getattr(reference, "buffer_swapped", False)
                 ),
+                "reference_ready": not bool(reference.pending_rebuild),
+                "continuity": self._reference_continuity_summary(
+                    reference.plan,
+                    lowstate,
+                ),
             },
             "height_map_z": self._array_summary(world.height_map_z),
             "action_isaac": self._array_summary(action_isaac),
             "action_matrix": self._array_summary(action_matrix),
             "desired_target": self._array_summary(desired_target),
             "published_target": self._array_summary(target),
+            "joint_ledger": self._joint_order_ledger(),
+            "joint_argmax": {
+                "published_target_minus_current": self._max_abs_entry(
+                    published_target_delta,
+                    matrix_names,
+                ),
+                "desired_target_minus_current": self._max_abs_entry(
+                    desired_target_delta,
+                    matrix_names,
+                ),
+                "raw_action_delta_isaac": self._max_abs_entry(
+                    action_delta_isaac,
+                    isaac_names,
+                ),
+                "action_delta_matrix": self._max_abs_entry(
+                    action_delta_matrix,
+                    matrix_names,
+                ),
+            },
             "continuity": {
                 "desired_target_delta_rms_rad": status[
                     "desired_target_delta_rms_rad"

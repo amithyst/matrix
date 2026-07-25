@@ -485,6 +485,28 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         )
         self.assertEqual(record["action_isaac"]["shape"], [MODULE.NUM_JOINTS])
         self.assertEqual(record["published_target"]["shape"], [MODULE.NUM_JOINTS])
+        self.assertEqual(
+            len(record["joint_ledger"]["matrix_mujoco_actuator_order"]),
+            MODULE.NUM_JOINTS,
+        )
+        self.assertEqual(
+            len(record["joint_ledger"]["isaac_action_order"]),
+            MODULE.NUM_JOINTS,
+        )
+        self.assertEqual(
+            record["joint_argmax"]["published_target_minus_current"]["joint_name"],
+            MODULE.G1_29_JOINT_NAMES[0],
+        )
+        self.assertEqual(
+            record["joint_argmax"]["raw_action_delta_isaac"]["joint_name"],
+            MODULE.G1_29_JOINT_NAMES[0],
+        )
+        self.assertTrue(record["reference"]["reference_ready"])
+        self.assertTrue(record["reference"]["continuity"]["valid"])
+        self.assertEqual(
+            record["reference"]["continuity"]["root_xy_delta_01_m"],
+            0.0,
+        )
         self.assertEqual(core.trace_written, 1)
 
     def test_motion_to_idle_discards_stale_walking_reference(self) -> None:
