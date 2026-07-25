@@ -764,7 +764,8 @@ MATRIX_PICO_PYTHON="${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}"
 
 physical_recovery_python_works() {
     local candidate="$1"
-    PYTHONNOUSERSITE=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+        PYTHONNOUSERSITE=1 \
         PYTHONPATH="$MATRIX_SONIC_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
         "$candidate" -c \
         'import numpy, onnxruntime; from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber; from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_; from unitree_sdk2py.utils.crc import CRC' \
@@ -964,6 +965,7 @@ done
 if [[ "$CONTROL_SOURCE" == "game" ]]; then
     for required in \
         "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+        "$PROJECT_ROOT/scripts/matrix_build_info.py" \
         "$PROJECT_ROOT/scripts/matrix_external_control.py" \
         "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
         "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
@@ -997,10 +999,10 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
             --jplephem-wheel "$CELESTIAL_JPLEPHEM_WHEEL"
         )
     fi
-    "$MATRIX_SONIC_PYTHON" \
+    PYTHONDONTWRITEBYTECODE=1 "$MATRIX_SONIC_PYTHON" \
         "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
         "${CELESTIAL_PREFLIGHT_ARGS[@]}"
-    "$MATRIX_SONIC_PYTHON" \
+    PYTHONDONTWRITEBYTECODE=1 "$MATRIX_SONIC_PYTHON" \
         "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" validate \
         --catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
         --profile "$CELESTIAL_VISUAL_PROFILE"
@@ -1179,6 +1181,19 @@ export MATRIX_SONIC_ROOT MATRIX_UNITREE_SDK2_ROOT
 export MATRIX_SONIC_PYTHON MATRIX_PICO_PYTHON
 export MATRIX_SONIC_CANONICAL_MODEL MATRIX_SONIC_CANONICAL_MESHES
 export MATRIX_SONIC_CONTROL_SOURCE="$CONTROL_SOURCE"
+if [[ "$CONTROL_SOURCE" == "game" ]]; then
+    if ! MATRIX_BUILD_INFO_JSON="$(
+        /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_build_info.py" \
+            --repo-root "$PROJECT_ROOT" \
+            --profile "${PROFILE:-local}" \
+            --scene "$SCENE_ID" \
+            --control-source "$CONTROL_SOURCE"
+    )"; then
+        echo "[ERROR] Could not build Matrix launch provenance" >&2
+        exit 2
+    fi
+    export MATRIX_BUILD_INFO_JSON
+fi
 export MATRIX_GAME_INPUT_SOURCE="$GAME_INPUT_SOURCE"
 export MATRIX_GAME_CAMERA_YAW_SOURCE="$GAME_CAMERA_YAW_SOURCE"
 export MATRIX_GAME_LOOK_BUTTON="$GAME_LOOK_BUTTON"

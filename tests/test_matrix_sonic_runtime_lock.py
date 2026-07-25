@@ -877,6 +877,13 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "git_checkout_root",
         ):
             self.assertIn(value, verifier)
+        for invocation in (
+            '[python_executable, "-B", "-c"',
+            '[python_executable, "-B", "-m", "pip", "check"]',
+            '[pico_python, "-B", "-c"',
+            '[pico_python, "-B", "-m", "pip", "check"]',
+        ):
+            self.assertIn(invocation, verifier)
 
     def test_wheelhouse_inventory_rejects_unlisted_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

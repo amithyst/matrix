@@ -568,6 +568,7 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
 
 class LauncherArgumentChainIntegrationTest(unittest.TestCase):
     GAME_CONTROL_DEPENDENCIES = (
+        "scripts/matrix_build_info.py",
         "scripts/matrix_game_control_input.py",
         "scripts/matrix_external_control.py",
         "scripts/matrix_calibration_overlay.py",
@@ -842,6 +843,7 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "run_matrix_sonic.sh",
             "run_sim.sh",
             "matrix_mouse_settings.py",
+            "matrix_build_info.py",
             "matrix_ui_settings.py",
             "matrix_video_settings.py",
             "matrix_external_control.py",

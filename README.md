@@ -96,6 +96,7 @@ To keep this README concise, detailed guides have been organized into the `docs/
 - [Matrix Urban V1](docs/URBAN_V1_CN.md) - Native Town10 city baseline and URDF-preserved G1 materials
 - [Matrix SOL-2080 Celestial Visuals](docs/MATRIX_CELESTIAL_VISUALS_CN.md) - Versioned CARLA weather profiles, OSS audit, and UE pixel gate
 - [Matrix + SONIC Multi-Host Runbook](docs/runbook.md) - Git sync, locked artifacts, bootstrap, and host profiles
+- [Matrix SONIC Desktop Launcher](docs/MATRIX_DESKTOP_LAUNCHER_CN.md) - One-click tmux launch and ESC Git provenance
 
 **Advanced Features**
 - [🌐 Multi-Robot Tutorial](docs/Multi_Robot_Tutorial.md) - Simulating multiple robots simultaneously

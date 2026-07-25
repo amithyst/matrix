@@ -37,6 +37,11 @@ import threading
 import time
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
+from matrix_build_info import (
+    BuildInfoError,
+    parse_build_info_json,
+    unavailable_build_info,
+)
 from matrix_mouse_settings import (
     PROFILE_LOCAL,
     PROFILE_REMOTE,
@@ -7363,6 +7368,17 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> int:
     args = _parse_args()
     _validate_args(args)
+    raw_build_info = os.environ.get("MATRIX_BUILD_INFO_JSON")
+    try:
+        build_info = parse_build_info_json(raw_build_info or "")
+    except BuildInfoError as exc:
+        build_info = unavailable_build_info(
+            profile="local",
+            scene_id=0,
+            control_source="game",
+            error=f"Launch provenance unavailable: {exc}",
+            launch_available=False,
+        )
     applied_mouse = AppliedMouseSettings(
         profile=args.applied_mouse_profile,
         effective_scale=args.applied_mouse_speed_scale,
@@ -7646,6 +7662,7 @@ def main() -> int:
             overlay.start(
                 {
                     **source_claim,
+                    "build_info": build_info,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "ui_settings": ui_settings.live_mapping(),
                     "video_settings": video_settings.live_mapping(),
@@ -8249,6 +8266,7 @@ def main() -> int:
                     overlay.publish(
                         {
                             **source_claim,
+                            "build_info": build_info,
                             "active": calibration.active,
                             "toggle_count": calibration.toggle_count,
                             "updated_monotonic_s": now,
@@ -8456,6 +8474,7 @@ def main() -> int:
         def build_final_status() -> dict[str, object]:
             return {
                 **source_claim,
+                "build_info": build_info,
                 "completed": return_code == 0,
                 "exit_reason": exit_reason,
                 "sampled_frames": sampled_frames,

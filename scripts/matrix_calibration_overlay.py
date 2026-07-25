@@ -39,6 +39,7 @@ from matrix_mouse_settings import (
     MIN_REMOTE_SPEED_SCALE,
     canonical_remote_speed_scale,
 )
+from matrix_build_info import BuildInfoError, validate_build_info
 from matrix_mc_commands import MAX_COMMAND_CHARS
 from matrix_ui_settings import (
     DEFAULT_FONT_SCALE,
@@ -467,7 +468,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_height = 32 if compact else 46
     tab_y = panel_y + (30 if compact else 76)
     tab_gap = 4 if compact else 8
-    tab_width = max(1, (panel_width - 2 * margin - 5 * tab_gap) // 6)
+    tab_width = max(1, (panel_width - 2 * margin - 6 * tab_gap) // 7)
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
@@ -638,6 +639,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             tab_width,
             tab_height,
         ),
+        "tab_system": (
+            panel_x + margin + 6 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
         "horizontal-shadow": (centre_x - 34, centre_y - 3, 69, 7),
         "vertical-shadow": (centre_x - 3, centre_y - 34, 7, 69),
         "horizontal": (centre_x - 32, centre_y - 1, 65, 3),
@@ -699,6 +706,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             command_input_y,
             console_width,
             command_input_height,
+        ),
+        "system_content": (
+            console_left,
+            console_top,
+            console_width,
+            console_height,
         ),
         "crosshair_safe": (
             centre_x - safe_half_size,
@@ -989,6 +1002,7 @@ _PANEL_TABS = (
     "tab_inventory",
     "tab_navigation",
     "tab_video",
+    "tab_system",
 )
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
@@ -1078,6 +1092,8 @@ def panel_action_at(
             + ("runtime_pause", "apply_return")
             + _VIDEO_STEP_ACTIONS
         )
+    elif page == "system":
+        targets = _PANEL_TABS + ("runtime_pause", "apply_return")
     for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
@@ -2162,6 +2178,102 @@ def read_overlay_state(path: Path) -> dict[str, object] | None:
     if not isinstance(value, dict) or value.get("version") != 1:
         return None
     return value
+
+
+@dataclass(frozen=True)
+class BuildInfoFileModel:
+    status: str
+    path: str
+    additions: int | None
+    deletions: int | None
+
+
+@dataclass(frozen=True)
+class BuildInfoPanelModel:
+    available: bool
+    launch_available: bool
+    profile: str
+    scene_id: int
+    scene_name: str
+    control_source: str
+    branch: str | None
+    commit: str | None
+    short_commit: str | None
+    subject: str | None
+    body: str | None
+    author: str | None
+    authored_at: str | None
+    changed_files: int
+    additions: int
+    deletions: int
+    files: tuple[BuildInfoFileModel, ...]
+    files_truncated: bool
+    dirty: bool
+    dirty_files: int
+    error: str | None
+
+
+def build_info_panel_model(state: dict[str, object]) -> BuildInfoPanelModel:
+    """Return a strict, render-only view of launcher-frozen Git provenance."""
+
+    try:
+        value = validate_build_info(state.get("build_info"))
+    except BuildInfoError as exc:
+        return BuildInfoPanelModel(
+            available=False,
+            launch_available=False,
+            profile="local",
+            scene_id=0,
+            scene_name="Unknown",
+            control_source="game",
+            branch=None,
+            commit=None,
+            short_commit=None,
+            subject=None,
+            body=None,
+            author=None,
+            authored_at=None,
+            changed_files=0,
+            additions=0,
+            deletions=0,
+            files=(),
+            files_truncated=False,
+            dirty=False,
+            dirty_files=0,
+            error=f"运行版本信息不可用: {exc}",
+        )
+    files = tuple(
+        BuildInfoFileModel(
+            status=item["status"],
+            path=item["path"],
+            additions=item["additions"],
+            deletions=item["deletions"],
+        )
+        for item in value["files"]
+    )
+    return BuildInfoPanelModel(
+        available=value["available"],
+        launch_available=value["launch_available"],
+        profile=value["profile"],
+        scene_id=value["scene_id"],
+        scene_name=value["scene_name"],
+        control_source=value["control_source"],
+        branch=value["branch"],
+        commit=value["commit"],
+        short_commit=value["short_commit"],
+        subject=value["subject"],
+        body=value["body"],
+        author=value["author"],
+        authored_at=value["authored_at"],
+        changed_files=value["changed_files"],
+        additions=value["additions"],
+        deletions=value["deletions"],
+        files=files,
+        files_truncated=value["files_truncated"],
+        dirty=value["dirty"],
+        dirty_files=value["dirty_files"],
+        error=value["error"],
+    )
 
 
 @dataclass(frozen=True)
@@ -3335,6 +3447,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_navigation_model: CelestialNavigationModel | None = None
         self._last_video_model: VideoSettingsPanelModel | None = None
+        self._last_build_info_model: BuildInfoPanelModel | None = None
         self._last_runtime_pause_model = runtime_pause_panel_model({})
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
@@ -4921,18 +5034,20 @@ class X11CalibrationOverlay:
         layout: dict[str, tuple[int, int, int, int]],
         page: str,
     ) -> None:
-        for name, label, target_page in (
-            ("tab_loadout", "策略装配", "loadout"),
-            ("tab_settings", "控制设置", "settings"),
-            ("tab_console", "命令台", "console"),
-            ("tab_inventory", "创造物品", "inventory"),
-            ("tab_navigation", "星体导航", "navigation"),
-            ("tab_video", "视频设置", "video"),
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        for name, label, compact_label, target_page in (
+            ("tab_loadout", "策略装配", "策略", "loadout"),
+            ("tab_settings", "控制设置", "控制", "settings"),
+            ("tab_console", "命令台", "命令", "console"),
+            ("tab_inventory", "创造物品", "物品", "inventory"),
+            ("tab_navigation", "星体导航", "导航", "navigation"),
+            ("tab_video", "视频设置", "视频", "video"),
+            ("tab_system", "运行信息", "运行", "system"),
         ):
             self._draw_button(
                 layout,
                 name,
-                label,
+                compact_label if compact else label,
                 fill=self._colours[
                     "selected" if page == target_page else "button"
                 ],
@@ -5649,6 +5764,82 @@ class X11CalibrationOverlay:
                 centred_in=destination_band,
             )
 
+    def _draw_system_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: BuildInfoPanelModel,
+    ) -> None:
+        content = self._fill_panel_band(
+            layout,
+            "system_content",
+            fill=self._colours["button"],
+            outline=self._colours["outline"],
+        )
+        x, y, width, height = content
+        font_size = getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
+        line_height = max(
+            15,
+            min(32, font_size + 7),
+        )
+        clip_width = max(1, (max(1, width - 24) * 10) // max(8, font_size))
+        available_lines = max(1, (height - 18) // line_height)
+        lines: list[tuple[str, str]] = []
+        if model.launch_available:
+            lines.append(
+                (
+                    "启动参数  "
+                    f"{model.profile} · {model.scene_name} "
+                    f"(scene {model.scene_id}) · {model.control_source}",
+                    "cyan",
+                )
+            )
+        if not model.available:
+            lines.append((model.error or "运行版本信息不可用", "error"))
+        else:
+            dirty_suffix = (
+                f" · 未提交 {model.dirty_files} 项" if model.dirty else " · 工作树干净"
+            )
+            lines.extend(
+                (
+                    (f"启动分支  {model.branch}{dirty_suffix}", "white"),
+                    (
+                        f"最后提交  {model.short_commit} · {model.subject}",
+                        "white",
+                    ),
+                    (
+                        f"提交作者  {model.author} · {model.authored_at}",
+                        "muted",
+                    ),
+                    (
+                        "修改摘要  "
+                        f"{model.changed_files} 个文件 · "
+                        f"+{model.additions} / -{model.deletions}",
+                        "cyan",
+                    ),
+                )
+            )
+            if model.body and model.body != model.subject:
+                lines.append((f"提交说明  {model.body}", "muted"))
+            for item in model.files:
+                additions = "?" if item.additions is None else str(item.additions)
+                deletions = "?" if item.deletions is None else str(item.deletions)
+                lines.append(
+                    (
+                        f"{item.status:<4} {item.path}  +{additions} -{deletions}",
+                        "white",
+                    )
+                )
+            if model.files_truncated:
+                remaining = max(0, model.changed_files - len(model.files))
+                lines.append((f"... 另有 {remaining} 个文件未显示", "muted"))
+        for index, (text, colour_name) in enumerate(lines[:available_lines]):
+            self._draw_text(
+                self._clip_console_line(text, clip_width),
+                x=x + 12,
+                y=y + 18 + index * line_height,
+                colour=self._colours[colour_name],
+            )
+
     @staticmethod
     def _apply_label_chinese(model: SettingsPanelModel) -> str:
         if model.restart_requested or model.status == "restarting":
@@ -5670,6 +5861,7 @@ class X11CalibrationOverlay:
         navigation_model: CelestialNavigationModel | None = None,
         video_model: VideoSettingsPanelModel | None = None,
         runtime_pause_model: RuntimePausePanelModel | None = None,
+        build_info_model: BuildInfoPanelModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -5721,6 +5913,11 @@ class X11CalibrationOverlay:
             self._draw_video_page(
                 layout,
                 video_model or video_settings_panel_model({}),
+            )
+        elif page == "system":
+            self._draw_system_page(
+                layout,
+                build_info_model or build_info_panel_model({}),
             )
         pause_model = runtime_pause_model or runtime_pause_panel_model({})
         visible_command_status = command_status or getattr(
@@ -6206,6 +6403,7 @@ class X11CalibrationOverlay:
         inventory_model = creative_inventory_model(state)
         navigation_model = celestial_navigation_model(state)
         video_model = video_settings_panel_model(state)
+        build_info_model = build_info_panel_model(state)
         command_status = command_console_status(state)
         runtime_pause_model = runtime_pause_panel_model(state)
         self._command_editor.reconcile(command_status)
@@ -6218,6 +6416,7 @@ class X11CalibrationOverlay:
             or inventory_model != getattr(self, "_last_inventory_model", None)
             or navigation_model != getattr(self, "_last_navigation_model", None)
             or video_model != getattr(self, "_last_video_model", None)
+            or build_info_model != getattr(self, "_last_build_info_model", None)
             or runtime_pause_model
             != getattr(self, "_last_runtime_pause_model", runtime_pause_panel_model({}))
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
@@ -6262,6 +6461,7 @@ class X11CalibrationOverlay:
                 navigation_model,
                 video_model,
                 runtime_pause_model,
+                build_info_model,
             )
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
@@ -6300,6 +6500,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model = inventory_model
         self._last_navigation_model = navigation_model
         self._last_video_model = video_model
+        self._last_build_info_model = build_info_model
         self._last_runtime_pause_model = runtime_pause_model
         self._last_rendered_font_size = getattr(
             self,
@@ -6331,6 +6532,8 @@ class X11CalibrationOverlay:
         self._last_strategy_model = None
         self._last_inventory_model = None
         self._last_navigation_model = None
+        self._last_video_model = None
+        self._last_build_info_model = None
         self._last_page = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision
