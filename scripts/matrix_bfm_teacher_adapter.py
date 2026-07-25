@@ -88,6 +88,7 @@ TURN_COMMAND_YAW_DAMPING_SECONDS = 0.1
 HOT_SWITCH_PREVIEW_STEPS = 4
 HOT_SWITCH_MAX_TARGET_DELTA_RAD = 0.12
 HOT_SWITCH_MAX_REFERENCE_ROOT_ERROR_M = 0.25
+HOT_SWITCH_LOW_CMD_MAX_AGE_S = 0.10
 
 BFM_SOURCE_COMMIT = "5e264ae2bee2315dc0522c48c64b4506977b2e25"
 REALSCAN_SOURCE_COMMIT = "850a71bef1e1472aaeb3ff4cb9004d9848830cfc"
@@ -128,6 +129,98 @@ CONTRACT_DIMS = {
     "compatibility_zero_dim": 99,
     "action_dim": NUM_JOINTS,
 }
+
+
+@dataclass(frozen=True)
+class LowCmdTargetSnapshot:
+    """Newest finite 29-DoF position target observed on ``rt/lowcmd``."""
+
+    joint_pos_rad: np.ndarray
+    received_monotonic: float
+
+    @classmethod
+    def validated(
+        cls,
+        *,
+        joint_pos_rad: Any,
+        received_monotonic: float,
+    ) -> "LowCmdTargetSnapshot":
+        values = np.asarray(joint_pos_rad, dtype=np.float32).reshape(-1)
+        received = float(received_monotonic)
+        if values.shape != (NUM_JOINTS,) or not np.all(np.isfinite(values)):
+            raise ValueError("LowCmd target must be finite 29D")
+        if not math.isfinite(received):
+            raise ValueError("LowCmd target timestamp must be finite")
+        return cls(values.copy(), received)
+
+
+class LatestLowCmdTarget:
+    """Thread-safe capture of the currently authoritative DDS position target."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._target: LowCmdTargetSnapshot | None = None
+
+    def set(self, target: LowCmdTargetSnapshot) -> None:
+        with self._lock:
+            self._target = target
+
+    def get(self) -> LowCmdTargetSnapshot | None:
+        with self._lock:
+            return self._target
+
+
+class BfmUnitreeDdsRuntime(UnitreeDdsRuntime):
+    """BFM DDS adapter that also observes the active controller's LowCmd.
+
+    A measured joint pose is not a torque-continuous handoff anchor for a PD
+    controller: commanding q_measured removes the position error that was
+    supporting the robot against gravity.  Capture the actual active LowCmd
+    target so BFM can begin from the same commanded pose without creating a
+    second writer before GO.
+    """
+
+    def __init__(
+        self,
+        *,
+        interface: str,
+        state_store: LatestLowState,
+        command_store: LatestLowCmdTarget,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(
+            interface=interface,
+            state_store=state_store,
+            monotonic=monotonic,
+        )
+        channel = importlib.import_module("unitree_sdk2py.core.channel")
+        messages = importlib.import_module("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+        self._command_store = command_store
+        self._command_monotonic = monotonic
+        self._command_subscriber = channel.ChannelSubscriber(
+            "rt/lowcmd",
+            messages.LowCmd_,
+        )
+        self._command_subscriber.Init(self._on_low_cmd, 10)
+
+    def _on_low_cmd(self, message: Any) -> None:
+        try:
+            motors = message.motor_cmd
+            if len(motors) < NUM_JOINTS:
+                return
+            # An authoritative locomotion command drives every G1 joint in
+            # position mode.  Ignore zero/default or partially built packets.
+            if any(int(motors[index].mode) != 1 for index in range(NUM_JOINTS)):
+                return
+            target = LowCmdTargetSnapshot.validated(
+                joint_pos_rad=[
+                    motors[index].q for index in range(NUM_JOINTS)
+                ],
+                received_monotonic=self._command_monotonic(),
+            )
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return
+        self._command_store.set(target)
 
 _ARMATURE_5020 = 0.003609725
 _ARMATURE_7520_14 = 0.010177520
@@ -547,6 +640,7 @@ class BfmTeacherCore:
         )
         self.activation_origin: np.ndarray | None = None
         self.activation_step = 0
+        self.last_published_target: np.ndarray | None = None
         self.trace_file = trace_file
         self.trace_ticks = max(0, int(trace_ticks))
         self.trace_written = 0
@@ -580,15 +674,20 @@ class BfmTeacherCore:
         self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
+        self.last_published_target = None
         self.direct_reference_start = None
 
-    def prepare_activation(self, lowstate: LowStateSnapshot) -> None:
-        """Start a policy-consistent, no-teleport handoff from current joints.
+    def prepare_activation(
+        self,
+        lowstate: LowStateSnapshot,
+        prior_target: np.ndarray | None = None,
+    ) -> None:
+        """Start a policy-consistent handoff from the active LowCmd target.
 
         The upstream closed-loop runner teleports the simulated robot to the
         first reference frame before its first Teacher inference.  Matrix must
-        preserve world state across a hot policy switch, so it instead clears
-        the actor history and ramps from the currently observed joint pose.
+        preserve world state across a hot policy switch, so it clears actor
+        history and ramps from the prior controller's observed LowCmd target.
         """
 
         self.teacher.reset()
@@ -597,26 +696,32 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
-        self.idle_anchor_target = lowstate.joint_pos_rad.astype(
-            np.float32,
-            copy=True,
+        anchor = (
+            lowstate.joint_pos_rad
+            if prior_target is None
+            else np.asarray(prior_target, dtype=np.float32)
         )
-        self.activation_origin = lowstate.joint_pos_rad.astype(
-            np.float32,
-            copy=True,
-        )
+        if anchor.shape != (NUM_JOINTS,) or not np.all(np.isfinite(anchor)):
+            raise ValueError("handoff anchor target must be finite 29D")
+        self.idle_anchor_target = anchor.astype(np.float32, copy=True)
+        self.activation_origin = anchor.astype(np.float32, copy=True)
         self.activation_step = 0
+        self.last_published_target = anchor.astype(np.float32, copy=True)
 
-    def prepare_handoff_activation(self, lowstate: LowStateSnapshot) -> None:
+    def prepare_handoff_activation(
+        self,
+        lowstate: LowStateSnapshot,
+        prior_target: np.ndarray,
+    ) -> None:
         """Re-root online PFNN and prepare a writer-free hot-switch preview."""
 
         self.stream.reset()
-        self.prepare_activation(lowstate)
+        self.prepare_activation(lowstate, prior_target)
         self.reference_transition = "handoff"
-        self.reference_hold_target = lowstate.joint_pos_rad.astype(
-            np.float32,
-            copy=True,
-        )
+        self.reference_hold_target = np.asarray(
+            prior_target,
+            dtype=np.float32,
+        ).copy()
 
     def prepare_direct_activation(self) -> None:
         """Reset actor history without perturbing the aligned reference cursor."""
@@ -630,6 +735,7 @@ class BfmTeacherCore:
         self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
+        self.last_published_target = None
 
     def enter_standby(self) -> None:
         """Discard actor state produced while another controller owns LowCmd."""
@@ -643,6 +749,18 @@ class BfmTeacherCore:
         self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
+        self.last_published_target = None
+
+    def _command_continuity_anchor(
+        self,
+        lowstate: LowStateSnapshot,
+    ) -> np.ndarray:
+        """Return the last applied target, with measured q only as cold fallback."""
+
+        last_target = getattr(self, "last_published_target", None)
+        if last_target is not None:
+            return last_target.astype(np.float32, copy=True)
+        return lowstate.joint_pos_rad.astype(np.float32, copy=True)
 
     def close(self) -> None:
         self.stream.close()
@@ -990,6 +1108,12 @@ class BfmTeacherCore:
                 "published_target_delta_max_rad": status[
                     "published_target_delta_max_rad"
                 ],
+                "published_target_step_delta_rms_rad": status[
+                    "published_target_step_delta_rms_rad"
+                ],
+                "published_target_step_delta_max_rad": status[
+                    "published_target_step_delta_max_rad"
+                ],
                 "reference_joint_error_rms_rad": status[
                     "reference_joint_error_rms_rad"
                 ],
@@ -1052,10 +1176,7 @@ class BfmTeacherCore:
             # old stand LowCmd for seconds and can apply a stale walk command
             # after the operator has already released the key.
             self.reference_transition = "starting"
-            self.reference_hold_target = lowstate.joint_pos_rad.astype(
-                np.float32,
-                copy=True,
-            )
+            self.reference_hold_target = self._command_continuity_anchor(lowstate)
             self.idle_anchor_target = None
             self.previous_action.fill(0.0)
             self.activation_origin = None
@@ -1065,12 +1186,9 @@ class BfmTeacherCore:
             # A background walk -> stand branch must not leave the old walking
             # target in control.  Hold the exact observed pose until the stand
             # buffer is ready, then restart Teacher history and blend from the
-            # current physical joints.
+            # last applied command target.
             self.reference_transition = "stopping"
-            self.reference_hold_target = lowstate.joint_pos_rad.astype(
-                np.float32,
-                copy=True,
-            )
+            self.reference_hold_target = self._command_continuity_anchor(lowstate)
             self.idle_anchor_target = None
             self.previous_action.fill(0.0)
             self.activation_origin = None
@@ -1179,10 +1297,7 @@ class BfmTeacherCore:
             # keep actor history clean; otherwise Matrix can apply a one-frame
             # target jump from a half-rebuilt reference.
             self.reference_transition = "rebuilding"
-            self.reference_hold_target = lowstate.joint_pos_rad.astype(
-                np.float32,
-                copy=True,
-            )
+            self.reference_hold_target = self._command_continuity_anchor(lowstate)
             self.previous_action.fill(0.0)
             self.activation_origin = None
             self.activation_step = 0
@@ -1197,10 +1312,7 @@ class BfmTeacherCore:
             self.teacher.reset()
             self.previous_action.fill(0.0)
             if active:
-                self.activation_origin = lowstate.joint_pos_rad.astype(
-                    np.float32,
-                    copy=True,
-                )
+                self.activation_origin = self._command_continuity_anchor(lowstate)
                 self.activation_step = 0
             else:
                 self.activation_origin = None
@@ -1234,6 +1346,14 @@ class BfmTeacherCore:
         desired_target = (
             self.default_joint_pos + self.action_scale * action_matrix
         ).astype(np.float32)
+        prior_published_target = (
+            getattr(self, "last_published_target", None).astype(
+                np.float32,
+                copy=True,
+            )
+            if getattr(self, "last_published_target", None) is not None
+            else None
+        )
         blend_fraction = 1.0
         target = desired_target
         idle_anchor_hold = bool(
@@ -1270,12 +1390,17 @@ class BfmTeacherCore:
                 + blend_fraction * (desired_target - self.activation_origin)
             ).astype(np.float32)
             self.activation_step += 1
-            target_delta = target - lowstate.joint_pos_rad
-            if float(np.max(np.abs(target_delta))) > HOT_SWITCH_MAX_TARGET_DELTA_RAD:
+            continuity_anchor = (
+                prior_published_target
+                if prior_published_target is not None
+                else self.activation_origin
+            )
+            target_step = target - continuity_anchor
+            if float(np.max(np.abs(target_step))) > HOT_SWITCH_MAX_TARGET_DELTA_RAD:
                 target = (
-                    lowstate.joint_pos_rad
+                    continuity_anchor
                     + np.clip(
-                        target_delta,
+                        target_step,
                         -HOT_SWITCH_MAX_TARGET_DELTA_RAD,
                         HOT_SWITCH_MAX_TARGET_DELTA_RAD,
                     )
@@ -1307,9 +1432,16 @@ class BfmTeacherCore:
                 ).astype(np.float32)
         else:
             self.previous_action.fill(0.0)
+        if active:
+            self.last_published_target = target.astype(np.float32, copy=True)
         self.last_world_sequence = world.sequence
         desired_delta = desired_target - lowstate.joint_pos_rad
         published_delta = target - lowstate.joint_pos_rad
+        published_step_delta = (
+            target - prior_published_target
+            if prior_published_target is not None
+            else np.zeros(NUM_JOINTS, dtype=np.float32)
+        )
         reference_joint = np.asarray(
             reference.plan.future_qpos[0, 7:],
             dtype=np.float32,
@@ -1408,6 +1540,12 @@ class BfmTeacherCore:
             ),
             "published_target_delta_max_rad": float(
                 np.max(np.abs(published_delta))
+            ),
+            "published_target_step_delta_rms_rad": float(
+                math.sqrt(np.mean(np.square(published_step_delta)))
+            ),
+            "published_target_step_delta_max_rad": float(
+                np.max(np.abs(published_step_delta))
             ),
             "reference_joint_error_rms_rad": float(
                 math.sqrt(np.mean(np.square(reference_delta)))
@@ -1681,11 +1819,22 @@ class _ResidentLowCmdPublisher:
             )
 
 
+def _handoff_is_writer_fenced(handoff: HandoffStateMachine) -> bool:
+    """Return true only for a standby that cannot currently publish."""
+
+    if handoff.state == HandoffStateMachine.WAITING:
+        return handoff.publisher is None
+    if handoff.state == HandoffStateMachine.PAUSED:
+        return handoff.publisher is not None
+    return False
+
+
 def run_worker(
     *,
     core: BfmTeacherCore,
     dds: UnitreeDdsRuntime,
     state_store: LatestLowState,
+    command_store: LatestLowCmdTarget,
     control_socket: Path,
     execution_provider: str,
     direct_start: bool = False,
@@ -1807,16 +1956,27 @@ def run_worker(
                             raise RuntimeError(
                                 "BFM Teacher prepare epoch did not advance"
                             )
+                        if preparing_authority_epoch == requested_epoch:
+                            # A duplicated local datagram must not kill the
+                            # resident policy.  The original preparation
+                            # remains writer-fenced and will emit its result.
+                            continue
+                        if prepared_authority_epoch == requested_epoch:
+                            continue
+                        if not _handoff_is_writer_fenced(handoff):
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE requires writer-fenced standby"
+                            )
                         if (
-                            handoff.state != HandoffStateMachine.WAITING
-                            or preparing_authority_epoch is not None
+                            preparing_authority_epoch is not None
                             or prepared_authority_epoch is not None
                         ):
                             raise RuntimeError(
-                                "BFM Teacher PREPARE requires writer-free standby"
+                                "BFM Teacher PREPARE authority epoch is busy"
                             )
                         now = monotonic()
                         state = state_store.get()
+                        prior_command = command_store.get()
                         if (
                             not warmed
                             or latest_world is None
@@ -1825,15 +1985,21 @@ def run_worker(
                             or state is None
                             or now - state.received_monotonic
                             > LOWSTATE_MAX_AGE_S
+                            or prior_command is None
+                            or now - prior_command.received_monotonic
+                            > HOT_SWITCH_LOW_CMD_MAX_AGE_S
                         ):
                             raise RuntimeError(
-                                "BFM Teacher PREPARE lacks fresh warmed inputs"
+                                "BFM Teacher PREPARE lacks fresh warmed inputs/LowCmd"
                             )
                         if not latest_world.safe_stop:
                             raise RuntimeError(
                                 "BFM Teacher PREPARE requires a safety-stop handoff"
                             )
-                        core.prepare_handoff_activation(state)
+                        core.prepare_handoff_activation(
+                            state,
+                            prior_command.joint_pos_rad,
+                        )
                         preparing_authority_epoch = requested_epoch
                         prepared_authority_epoch = None
                         prepare_ready_steps = 0
@@ -1876,12 +2042,12 @@ def run_worker(
                                 )
                             if (
                                 latest_policy_status.get(
-                                    "published_target_delta_max_rad"
+                                    "published_target_step_delta_max_rad"
                                 )
                                 is None
                                 or float(
                                     latest_policy_status[
-                                        "published_target_delta_max_rad"
+                                        "published_target_step_delta_max_rad"
                                     ]
                                 )
                                 > HOT_SWITCH_MAX_TARGET_DELTA_RAD
@@ -1976,7 +2142,11 @@ def run_worker(
                                 or prepared_authority_epoch is not None
                             ),
                             handoff_preview=(
-                                handoff.state == HandoffStateMachine.WAITING
+                                handoff.state
+                                in {
+                                    HandoffStateMachine.WAITING,
+                                    HandoffStateMachine.PAUSED,
+                                }
                                 and (
                                     preparing_authority_epoch is not None
                                     or prepared_authority_epoch is not None
@@ -1993,7 +2163,11 @@ def run_worker(
                             monotonic() - started
                         ) * 1000.0
                         if (
-                            handoff.state == HandoffStateMachine.WAITING
+                            handoff.state
+                            in {
+                                HandoffStateMachine.WAITING,
+                                HandoffStateMachine.PAUSED,
+                            }
                             and (
                                 preparing_authority_epoch is not None
                                 or prepared_authority_epoch is not None
@@ -2018,12 +2192,16 @@ def run_worker(
                                 )
                                 <= HOT_SWITCH_MAX_REFERENCE_ROOT_ERROR_M
                             )
-                            target_delta = float(
+                            target_step_delta = float(
                                 latest_policy_status.get(
-                                    "published_target_delta_max_rad", math.inf
+                                    "published_target_step_delta_max_rad",
+                                    math.inf,
                                 )
                             )
-                            if target_delta > HOT_SWITCH_MAX_TARGET_DELTA_RAD:
+                            if (
+                                target_step_delta
+                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                            ):
                                 rejected_epoch = (
                                     preparing_authority_epoch
                                     if preparing_authority_epoch is not None
@@ -2033,10 +2211,18 @@ def run_worker(
                                     "ACTIVATION_REJECTED",
                                     {
                                         "authority_epoch": rejected_epoch,
-                                        "writer_created": False,
+                                        "writer_created": (
+                                            handoff.publisher is not None
+                                        ),
+                                        "writer_reused": (
+                                            handoff.publisher is not None
+                                        ),
                                         "write_authorized": False,
                                         "reason": "published_target_delta_exceeded",
-                                        "target_delta_max_rad": target_delta,
+                                        "target_delta_max_rad": target_step_delta,
+                                        "target_step_delta_max_rad": (
+                                            target_step_delta
+                                        ),
                                         "target_delta_limit_rad": (
                                             HOT_SWITCH_MAX_TARGET_DELTA_RAD
                                         ),
@@ -2064,7 +2250,12 @@ def run_worker(
                                             "authority_epoch": (
                                                 prepared_authority_epoch
                                             ),
-                                            "writer_created": False,
+                                            "writer_created": (
+                                                handoff.publisher is not None
+                                            ),
+                                            "writer_reused": (
+                                                handoff.publisher is not None
+                                            ),
                                             "write_authorized": False,
                                             "reference_aligned": True,
                                             "reference_pending_rebuild": False,
@@ -2072,7 +2263,12 @@ def run_worker(
                                                 prepare_reference_buffer_swapped
                                             ),
                                             "preview_steps": prepare_ready_steps,
-                                            "target_delta_max_rad": target_delta,
+                                            "target_delta_max_rad": (
+                                                target_step_delta
+                                            ),
+                                            "target_step_delta_max_rad": (
+                                                target_step_delta
+                                            ),
                                             "desired_target_delta_max_rad": float(
                                                 latest_policy_status.get(
                                                     "desired_target_delta_max_rad",
@@ -2152,6 +2348,7 @@ def run_worker(
 
             if now >= next_status:
                 state = state_store.get()
+                observed_command = command_store.get()
                 status: dict[str, Any] = {
                     "writer_created": handoff.publisher is not None,
                     "write_authorized": (
@@ -2196,6 +2393,16 @@ def run_worker(
                     ),
                     "policy_trace_ticks_requested": int(core.trace_ticks),
                     "policy_trace_ticks_written": int(core.trace_written),
+                    "observed_lowcmd_target": observed_command is not None,
+                    "observed_lowcmd_target_age_ms": (
+                        max(
+                            0.0,
+                            monotonic() - observed_command.received_monotonic,
+                        )
+                        * 1000.0
+                        if observed_command is not None
+                        else None
+                    ),
                     **publisher.telemetry(now=monotonic()),
                     **latest_policy_status,
                 }
@@ -2312,7 +2519,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help=(
-            "smooth no-teleport takeover duration; the actor history records "
+            "smooth command-continuous takeover duration; actor history records "
             "the actually published blended targets"
         ),
     )
@@ -2365,15 +2572,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.control_socket is None:
         raise SystemExit("--control-socket is required outside --validate-only")
     state_store = LatestLowState()
-    dds = UnitreeDdsRuntime(
+    command_store = LatestLowCmdTarget()
+    dds = BfmUnitreeDdsRuntime(
         interface=args.interface,
         state_store=state_store,
+        command_store=command_store,
     )
     try:
         return run_worker(
             core=core,
             dds=dds,
             state_store=state_store,
+            command_store=command_store,
             control_socket=args.control_socket,
             execution_provider=args.execution_provider,
             direct_start=args.direct_start,

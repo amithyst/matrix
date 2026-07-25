@@ -8210,8 +8210,17 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 )
             if epoch != self.requested_authority_epoch:
                 raise RuntimeError("BFM Teacher prepared epoch mismatch")
-            if payload.get("writer_created") is not False:
-                raise RuntimeError("BFM Teacher preparation created a writer")
+            writer_created = payload.get("writer_created")
+            if type(writer_created) is not bool:
+                raise RuntimeError("BFM Teacher preparation has invalid writer state")
+            if writer_created and (
+                payload.get("writer_reused") is not True
+                or not self.first_write
+                or not self.paused
+            ):
+                raise RuntimeError(
+                    "BFM Teacher preparation did not reuse a fenced writer"
+                )
             if payload.get("write_authorized") is not False:
                 raise RuntimeError("BFM Teacher preparation gained authority")
             if payload.get("reference_aligned") is not True:
@@ -8240,8 +8249,17 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 )
             if epoch != self.requested_authority_epoch:
                 raise RuntimeError("BFM Teacher rejection epoch mismatch")
-            if payload.get("writer_created") is not False:
-                raise RuntimeError("BFM Teacher rejection retained a writer")
+            writer_created = payload.get("writer_created")
+            if type(writer_created) is not bool:
+                raise RuntimeError("BFM Teacher rejection has invalid writer state")
+            if writer_created and (
+                payload.get("writer_reused") is not True
+                or not self.first_write
+                or not self.paused
+            ):
+                raise RuntimeError(
+                    "BFM Teacher rejection retained an unfenced writer"
+                )
             if payload.get("write_authorized") is not False:
                 raise RuntimeError("BFM Teacher rejection retained authority")
             self.preparation_pending = False

@@ -7526,6 +7526,58 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(sent[-1]["command"], "GO")
         self.assertEqual(sent[-1]["authority_epoch"], 1)
 
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "FIRST_WRITE",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 1,
+                    "writer_created": True,
+                }
+            ).encode("utf-8")
+        )
+        control.pause()
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "PAUSED_RESIDENT_WRITER",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 1,
+                    "writer_created": True,
+                    "write_authorized": False,
+                }
+            ).encode("utf-8")
+        )
+
+        # A later SONIC -> BFM switch must reuse the fenced resident writer;
+        # requiring WAITING_NO_WRITER here killed the worker after recovery.
+        control.prepare_activation()
+        self.assertEqual(sent[-1]["command"], "PREPARE")
+        self.assertEqual(sent[-1]["authority_epoch"], 2)
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "ACTIVATION_PREPARED",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 2,
+                    "writer_created": True,
+                    "writer_reused": True,
+                    "write_authorized": False,
+                    "reference_aligned": True,
+                    "reference_pending_rebuild": False,
+                    "reference_buffer_swapped": True,
+                    "preview_steps": 4,
+                    "target_delta_max_rad": 0.0,
+                    "target_step_delta_max_rad": 0.0,
+                    "target_delta_limit_rad": 0.12,
+                }
+            ).encode("utf-8")
+        )
+        self.assertTrue(control.activation_prepared)
+
     def test_recovery_worker_tracks_first_write_authority_across_fallback(
         self,
     ) -> None:

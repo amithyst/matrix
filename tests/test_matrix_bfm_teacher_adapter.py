@@ -495,7 +495,8 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         lowstate = self.lowstate(joint_value=0.33)
         resets_before = core.stream.reset_count
 
-        core.prepare_handoff_activation(lowstate)
+        prior_target = np.full(MODULE.NUM_JOINTS, 0.42, dtype=np.float32)
+        core.prepare_handoff_activation(lowstate, prior_target)
 
         self.assertEqual(core.stream.reset_count, resets_before + 1)
         self.assertEqual(core.reference_transition, "handoff")
@@ -505,10 +506,98 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             active=True,
             handoff_preview=True,
         )
-        np.testing.assert_allclose(target, lowstate.joint_pos_rad)
+        np.testing.assert_allclose(target, prior_target)
         self.assertTrue(status["reference_transition_completed"])
         self.assertFalse(status["reference_pending_rebuild"])
-        self.assertEqual(status["published_target_delta_max_rad"], 0.0)
+        self.assertAlmostEqual(
+            status["published_target_delta_max_rad"],
+            0.09,
+            places=6,
+        )
+
+    def test_activation_limits_command_steps_without_chasing_falling_lowstate(
+        self,
+    ) -> None:
+        core = self.inference_core()
+        initial = self.lowstate(joint_value=0.4)
+        prior_command = np.full(MODULE.NUM_JOINTS, 0.55, dtype=np.float32)
+        core.prepare_activation(initial, prior_command)
+
+        preview, _status = core.step(
+            self.world(sequence=1),
+            initial,
+            active=True,
+            handoff_preview=True,
+        )
+        np.testing.assert_allclose(preview, prior_command)
+
+        previous = preview
+        settled = None
+        # The measured robot pose deliberately falls away from both the prior
+        # command and the Teacher target.  Command continuity must remain
+        # anchored to the previously published target, not chase q_measured.
+        for sequence in range(2, 20):
+            falling = self.lowstate(joint_value=0.4 - sequence * 0.03)
+            target, status = core.step(
+                self.world(sequence=sequence),
+                falling,
+                active=True,
+            )
+            self.assertLessEqual(
+                float(np.max(np.abs(target - previous))),
+                MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
+            )
+            self.assertLessEqual(
+                status["published_target_step_delta_max_rad"],
+                MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
+            )
+            previous = target
+            if not status["activation_settle_active"]:
+                settled = target
+                break
+
+        self.assertIsNotNone(settled)
+        np.testing.assert_allclose(settled, np.ones(MODULE.NUM_JOINTS))
+
+    def test_writer_fenced_preparation_accepts_waiting_and_paused_reuse(
+        self,
+    ) -> None:
+        events = []
+        handoff = MODULE.HandoffStateMachine(
+            lambda: object(),
+            lambda event, fields: events.append((event, fields)),
+        )
+
+        self.assertTrue(MODULE._handoff_is_writer_fenced(handoff))
+        handoff.command("GO")
+        self.assertFalse(MODULE._handoff_is_writer_fenced(handoff))
+        handoff.command("PAUSE")
+        self.assertTrue(MODULE._handoff_is_writer_fenced(handoff))
+        self.assertIsNotNone(handoff.publisher)
+
+    def test_lowcmd_observer_captures_finite_position_mode_target(self) -> None:
+        store = MODULE.LatestLowCmdTarget()
+        runtime = MODULE.BfmUnitreeDdsRuntime.__new__(
+            MODULE.BfmUnitreeDdsRuntime
+        )
+        runtime._command_store = store
+        runtime._command_monotonic = lambda: 12.5
+        message = SimpleNamespace(
+            motor_cmd=[
+                SimpleNamespace(mode=1, q=float(index) / 10.0)
+                for index in range(35)
+            ]
+        )
+
+        runtime._on_low_cmd(message)
+
+        captured = store.get()
+        self.assertIsNotNone(captured)
+        self.assertEqual(captured.received_monotonic, 12.5)
+        np.testing.assert_allclose(
+            captured.joint_pos_rad,
+            np.arange(MODULE.NUM_JOINTS, dtype=np.float32) / 10.0,
+        )
 
     def test_handoff_preview_holds_first_pose_but_authority_settles_to_stand(
         self,
@@ -692,7 +781,9 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
     def test_idle_to_motion_rebuilds_reference_from_current_pose(self) -> None:
         core = self.inference_core()
         lowstate = self.lowstate(joint_value=0.37)
-        core.step(self.world(sequence=1), lowstate, active=True)
+        idle_target, _ = core.step(
+            self.world(sequence=1), lowstate, active=True
+        )
         moving = self.world(sequence=2)
         moving.safe_stop = False
         moving.mode = "move"
@@ -709,7 +800,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(status["reference_start_reset_count"], 1)
         self.assertEqual(status["reference_target_speed_mps"], 0.8)
         self.assertEqual(status["reference_future_xy_delta_m"], 1.0)
-        np.testing.assert_allclose(target, lowstate.joint_pos_rad)
+        np.testing.assert_allclose(target, idle_target)
 
     def test_motion_start_waits_for_background_buffer_before_history_reset(
         self,
@@ -738,7 +829,9 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
 
         core = self.inference_core()
         lowstate = self.lowstate(joint_value=0.31)
-        core.step(self.world(sequence=1), lowstate, active=True)
+        idle_target, _ = core.step(
+            self.world(sequence=1), lowstate, active=True
+        )
         core.stream = DelayedStartStream()
         moving = self.world(sequence=2)
         moving.safe_stop = False
@@ -755,7 +848,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertTrue(pending["reference_pending_rebuild"])
         self.assertFalse(pending["reference_transition_completed"])
         self.assertTrue(pending["reference_transition_holding"])
-        np.testing.assert_allclose(held_target, lowstate.joint_pos_rad)
+        np.testing.assert_allclose(held_target, idle_target)
 
         moving.sequence = 3
         target, swapped = core.step(moving, lowstate, active=True)
@@ -764,7 +857,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertIsNone(swapped["reference_transition"])
         self.assertTrue(swapped["reference_buffer_swapped"])
         self.assertTrue(swapped["reference_transition_completed"])
-        np.testing.assert_allclose(target, lowstate.joint_pos_rad)
+        np.testing.assert_allclose(target, idle_target)
 
     def test_motion_stop_holds_observed_pose_until_stand_buffer_swaps(
         self,

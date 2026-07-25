@@ -441,9 +441,9 @@ def load_policy_candidate_manifest(path: Path) -> PolicyCandidateManifest:
         "action_dim": 29,
         "action_clip": 20,
         "activation_blend_seconds": 0.1,
-        "activation_contract": "current-lowstate-smoothstep-no-teleport",
+        "activation_contract": "observed-lowcmd-target-step-limited-v2",
         "standby_history_contract": (
-            "repeat-current-frame-zero-unapplied-actions"
+            "repeat-last-applied-target-zero-unapplied-actions"
         ),
         "turn_reference_contract": "yaw-only-pfnn-forward-seed-v1",
         "turn_reference_forward_mps": 0.00051,
