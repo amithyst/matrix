@@ -288,9 +288,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-max-acceleration", type=float, default=1.20)
     parser.add_argument("--game-max-deceleration", type=float, default=2.40)
     parser.add_argument("--game-max-turn-rate", type=float, default=2.50)
-    parser.add_argument("--game-keyboard-slow-speed", type=float, default=0.10)
+    parser.add_argument("--game-keyboard-slow-speed", type=float, default=0.20)
     parser.add_argument(
-        "--game-keyboard-slow-boost-speed", type=float, default=0.20
+        "--game-keyboard-slow-boost-speed", type=float, default=0.30
     )
     parser.add_argument("--game-keyboard-walk-speed", type=float, default=0.80)
     parser.add_argument(
@@ -4068,10 +4068,10 @@ def _game_control_status_fields(
             SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
         },
         "keyboard_slow_speed_mps": getattr(
-            args, "game_keyboard_slow_speed", 0.10
+            args, "game_keyboard_slow_speed", 0.20
         ),
         "keyboard_slow_boost_speed_mps": (
-            getattr(args, "game_keyboard_slow_boost_speed", 0.20)
+            getattr(args, "game_keyboard_slow_boost_speed", 0.30)
         ),
         "keyboard_walk_speed_mps": getattr(
             args, "game_keyboard_walk_speed", 0.80

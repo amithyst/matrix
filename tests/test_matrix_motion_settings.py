@@ -30,8 +30,8 @@ class MotionSettingsValueTest(unittest.TestCase):
     def test_defaults_cover_three_base_and_double_tap_tiers(self) -> None:
         settings = MODULE.MotionSettings()
         self.assertEqual(settings.revision, 0)
-        self.assertEqual(settings.slow_speed_mps, 0.10)
-        self.assertEqual(settings.slow_double_tap_speed_mps, 0.20)
+        self.assertEqual(settings.slow_speed_mps, 0.20)
+        self.assertEqual(settings.slow_double_tap_speed_mps, 0.30)
         self.assertEqual(settings.walk_speed_mps, 0.80)
         self.assertEqual(settings.walk_double_tap_speed_mps, 1.00)
         self.assertEqual(settings.run_speed_mps, 2.50)
@@ -164,7 +164,7 @@ class MotionSettingsValueTest(unittest.TestCase):
     def test_value_lookup_and_replacement_accept_only_whitelisted_paths(self) -> None:
         settings = MODULE.MotionSettings()
         slow = path("slow", "speed_mps")
-        self.assertEqual(settings.value_for_path(slow), 0.10)
+        self.assertEqual(settings.value_for_path(slow), 0.20)
         self.assertEqual(
             settings.value_for_path(MODULE.MAX_TURN_RATE_PATH),
             MODULE.DEFAULT_MAX_TURN_RATE_RAD_S,
@@ -172,7 +172,7 @@ class MotionSettingsValueTest(unittest.TestCase):
         replacement = settings.with_value(slow, 0.15, revision=3)
         self.assertEqual(replacement.slow_speed_mps, 0.15)
         self.assertEqual(replacement.revision, 3)
-        self.assertEqual(settings.slow_speed_mps, 0.10)
+        self.assertEqual(settings.slow_speed_mps, 0.20)
         turn_replacement = settings.with_value(
             MODULE.MAX_TURN_RATE_PATH,
             2.25,
@@ -328,8 +328,8 @@ class MotionSettingsStepTest(unittest.TestCase):
     def test_step_helper_uses_drift_free_tier_steps(self) -> None:
         settings = MODULE.MotionSettings()
         cases = (
-            (path("slow", "speed_mps"), 1, 0.15),
-            (path("slow", "double_tap_speed_mps"), -1, 0.15),
+            (path("slow", "speed_mps"), 1, 0.25),
+            (path("slow", "double_tap_speed_mps"), -1, 0.25),
             (path("walk", "speed_mps"), 1, 0.90),
             (path("walk", "double_tap_speed_mps"), -1, 0.90),
             # The base speed cannot step onto the current boost preset.
@@ -543,7 +543,7 @@ class MotionSettingsStoreTest(unittest.TestCase):
                 expected_revision=0,
             )
             self.assertTrue(result.changed)
-            self.assertEqual(result.value, 0.15)
+            self.assertEqual(result.value, 0.25)
             self.assertEqual(result.settings.revision, 1)
             self.assertEqual(store.mapping()["settings"]["revision"], 1)
 

@@ -21,10 +21,10 @@ For setup, camera calibration, safety tests, and Heyuan acceptance, follow the
 | **W / S** | Move toward / away from the camera's horizontal forward direction |
 | **A / D** | Move left / right in the camera's horizontal frame |
 | **W+A**, **W+D**, etc. | Diagonal movement at the same maximum speed as a cardinal direction |
-| Hold **Ctrl** or **Alt** + WASD | Native mode 1 `SLOW_WALK`, 0.10 m/s base target |
+| Hold **Ctrl** or **Alt** + WASD | Native mode 1 `SLOW_WALK`, 0.20 m/s base target |
 | WASD without a speed modifier | Native mode 2 `WALK`, 0.80 m/s target |
 | Hold **Shift** + WASD | Native mode 3 `RUN`, 2.50 m/s target |
-| Double-tap the same **W/A/S/D** key | Boost the active slow/walk/run tier to 0.20/1.00/2.75 m/s until release |
+| Double-tap the same **W/A/S/D** key | Boost the active slow/walk/run tier to 0.30/1.00/2.75 m/s until release |
 | **Left / Right Arrow** | Rotate the actual UE camera yaw through the main input provider |
 | **Up / Down Arrow** | Rotate the actual UE camera pitch through the main input provider |
 | Mouse drag | Native Matrix camera operation; the robot stops while the configured look button is held |
@@ -46,7 +46,7 @@ stop edge prevents noise from chattering the gait while still stopping a
 materially misaligned body.
 
 The keyboard tiers select SONIC's native locomotion modes, not three aliases of
-`SLOW_WALK`: Ctrl/Alt selects mode 1 at 0.10 m/s, unmodified WASD selects mode 2
+`SLOW_WALK`: Ctrl/Alt selects mode 1 at 0.20 m/s, unmodified WASD selects mode 2
 at 0.80 m/s, and Shift selects mode 3 at 2.50 m/s. A same-direction double tap
 raises those targets to 0.20, 1.00, and 2.75 m/s respectively. The base targets are the lower
 boundaries of SONIC's documented 0.10-0.80, 0.80-2.50, and 2.50-7.50 m/s gait
@@ -258,7 +258,7 @@ runtime camera bridge has passed the runbook's black-box acceptance checks.
 ### Safety behavior
 
 Game input is sampled at 50 Hz. Keyboard slow/walk/run targets are native modes
-1/2/3 with 0.10/0.80/2.50 m/s base and 0.20/1.00/2.75 m/s double-tap boost;
+1/2/3 with 0.20/0.80/2.50 m/s base and 0.30/1.00/2.75 m/s double-tap boost;
 gamepad speed remains continuous in native
 `SLOW_WALK` up to its separate configured cap (0.30 m/s by default, at most
 0.80 m/s). The input timeout threshold and maximum snapshot age are 0.15 s.

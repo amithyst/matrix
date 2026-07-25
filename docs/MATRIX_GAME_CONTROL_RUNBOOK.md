@@ -59,7 +59,7 @@ be claimed from this implementation.
 | SONIC control | 50 Hz; native physics remains 200 Hz |
 | Maximum keyboard target | 2.75 m/s by default (run boost; panel configurable) |
 | Analog maximum | 0.30 m/s default; configurable up to 0.80 m/s, kept inside `SLOW_WALK` |
-| Keyboard gait profiles | Ctrl/Alt slow 0.10/0.20; unmodified walk 0.80/1.00; Shift run 2.50/2.75 m/s; each pair is base/double-tap boost and slow wins a conflict |
+| Keyboard gait profiles | Ctrl/Alt slow 0.20/0.30; unmodified walk 0.80/1.00; Shift run 2.50/2.75 m/s; each pair is base/double-tap boost and slow wins a conflict |
 | Native gait intervals | mode 1: 0.10-0.80; mode 2: 0.80-2.50; mode 3: 2.50-7.50 m/s |
 | Acceleration / deceleration | 1.20 / 2.40 m/s² |
 | Maximum heading rate | 2.50 rad/s |

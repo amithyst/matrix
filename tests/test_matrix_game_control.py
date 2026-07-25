@@ -230,8 +230,8 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(config.max_acceleration_mps2, 1.20)
         self.assertEqual(config.max_deceleration_mps2, 2.40)
         self.assertEqual(config.max_turn_rate_rad_s, 2.50)
-        self.assertEqual(config.keyboard_slow_speed_mps, 0.10)
-        self.assertEqual(config.keyboard_slow_boost_speed_mps, 0.20)
+        self.assertEqual(config.keyboard_slow_speed_mps, 0.20)
+        self.assertEqual(config.keyboard_slow_boost_speed_mps, 0.30)
         self.assertEqual(config.keyboard_walk_speed_mps, 0.80)
         self.assertEqual(config.keyboard_walk_boost_speed_mps, 1.00)
         self.assertEqual(config.keyboard_run_speed_mps, 2.50)
@@ -331,15 +331,15 @@ class GameControlCoreTest(unittest.TestCase):
         slow = command_for(("ctrl",))
         walk = command_for(())
         run = command_for(("shift",))
-        self.assertEqual((slow.locomotion_mode, slow.speed_mps), (1, 0.10))
+        self.assertEqual((slow.locomotion_mode, slow.speed_mps), (1, 0.20))
         self.assertEqual((walk.locomotion_mode, walk.speed_mps), (2, 0.80))
         self.assertEqual((run.locomotion_mode, run.speed_mps), (3, 2.50))
         alt_slow = command_for(("alt",))
-        self.assertEqual((alt_slow.locomotion_mode, alt_slow.speed_mps), (1, 0.10))
+        self.assertEqual((alt_slow.locomotion_mode, alt_slow.speed_mps), (1, 0.20))
         self.assertEqual(
             (command_for(("ctrl",), boost=True).locomotion_mode,
              command_for(("ctrl",), boost=True).speed_mps),
-            (1, 0.20),
+            (1, 0.30),
         )
         self.assertEqual(
             (command_for((), boost=True).locomotion_mode,
@@ -353,7 +353,7 @@ class GameControlCoreTest(unittest.TestCase):
         )
         # The slower modifier wins an accidental overlap.
         conflict = command_for(("ctrl", "shift"))
-        self.assertEqual((conflict.locomotion_mode, conflict.speed_mps), (1, 0.10))
+        self.assertEqual((conflict.locomotion_mode, conflict.speed_mps), (1, 0.20))
 
     def test_modifiers_without_direction_are_native_idle(self) -> None:
         for modifiers in (
@@ -509,7 +509,7 @@ class GameControlCoreTest(unittest.TestCase):
             received_at_s=10.02,
         )
         self.assertAlmostEqual(
-            core.command(now_s=10.02, dt_s=0.1).speed_mps, 0.15
+            core.command(now_s=10.02, dt_s=0.1).speed_mps, 0.20
         )
 
     def test_keyboard_wins_over_left_stick_while_held(self) -> None:
@@ -726,7 +726,7 @@ class GameControlCoreTest(unittest.TestCase):
 
     def test_pure_w_crawl_resumes_on_progress_and_reaches_configured_tiers(self) -> None:
         cases = (
-            (("ctrl",), MODULE.SONIC_SLOW_WALK_MODE, 0.10),
+            (("ctrl",), MODULE.SONIC_SLOW_WALK_MODE, 0.20),
             ((), MODULE.SONIC_WALK_MODE, 0.80),
             (("shift",), MODULE.SONIC_RUN_MODE, 2.50),
         )

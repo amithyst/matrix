@@ -49,7 +49,7 @@ GEAR_SPEED_RANGES_MPS: Mapping[str, tuple[float, float]] = {
 }
 
 DEFAULT_GEAR_SPEEDS_MPS: Mapping[str, tuple[float, float]] = {
-    GEAR_SLOW: (0.10, 0.20),
+    GEAR_SLOW: (0.20, 0.30),
     GEAR_WALK: (0.80, 1.00),
     GEAR_RUN: (2.50, 2.75),
 }

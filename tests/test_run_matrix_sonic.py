@@ -3759,8 +3759,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             status["native_gait_modes"],
             {"IDLE": 0, "SLOW_WALK": 1, "WALK": 2, "RUN": 3},
         )
-        self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
-        self.assertEqual(status["keyboard_slow_boost_speed_mps"], 0.20)
+        self.assertEqual(status["keyboard_slow_speed_mps"], 0.20)
+        self.assertEqual(status["keyboard_slow_boost_speed_mps"], 0.30)
         self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
         self.assertEqual(status["keyboard_walk_boost_speed_mps"], 1.00)
         self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
