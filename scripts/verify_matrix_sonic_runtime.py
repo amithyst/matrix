@@ -1820,7 +1820,7 @@ def check_tensorrt_version(
         "fn=lib.getInferLibVersion; fn.restype=ctypes.c_int; print(fn())"
     )
     result = subprocess.run(
-        [python_executable, "-c", code, str(library)],
+        [python_executable, "-B", "-c", code, str(library)],
         env=env,
         text=True,
         capture_output=True,
@@ -1840,7 +1840,7 @@ def check_dlopen(
 ) -> tuple[bool, str]:
     code = "import ctypes,sys; ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)"
     result = subprocess.run(
-        [python_executable, "-c", code, str(path)],
+        [python_executable, "-B", "-c", code, str(path)],
         env=env,
         text=True,
         capture_output=True,
@@ -2022,7 +2022,7 @@ def main() -> int:
         identity_prefix = "MATRIX_VERIFY_PYTHON_JSON="
         identity_code = python_identity_probe_code(identity_prefix)
         identity_result = subprocess.run(
-            [python_executable, "-c", identity_code],
+            [python_executable, "-B", "-c", identity_code],
             env=identity_env,
             cwd=matrix_root,
             text=True,
@@ -2117,6 +2117,7 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
         result = subprocess.run(
             [
                 python_executable,
+                "-B",
                 "-c",
                 metadata_code,
                 json.dumps(sorted(pinned_requirements)),
@@ -2165,7 +2166,7 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
             record("native runtime pip check", False, pip_env_error)
         else:
             pip_check = subprocess.run(
-                [python_executable, "-m", "pip", "check"],
+                [python_executable, "-B", "-m", "pip", "check"],
                 env=pip_env,
                 text=True,
                 capture_output=True,
@@ -2496,7 +2497,7 @@ except BaseException:
 print("MATRIX_VERIFY_IMPORT_JSON=" + json.dumps(payload, sort_keys=True))
 """
             result = subprocess.run(
-                [python_executable, "-c", import_code, str(sonic_root)],
+                [python_executable, "-B", "-c", import_code, str(sonic_root)],
                 env=env,
                 text=True,
                 capture_output=True,
@@ -2619,7 +2620,7 @@ print("MATRIX_VERIFY_IMPORT_JSON=" + json.dumps(payload, sort_keys=True))
                 pico_identity_env.pop("PYTHONPATH", None)
                 pico_identity_env["PYTHONNOUSERSITE"] = "1"
                 pico_identity_result = subprocess.run(
-                    [pico_python, "-c", pico_identity_code],
+                    [pico_python, "-B", "-c", pico_identity_code],
                     env=pico_identity_env,
                     cwd=matrix_root,
                     text=True,
@@ -2704,6 +2705,7 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                 result = subprocess.run(
                     [
                         pico_python,
+                        "-B",
                         "-c",
                         pico_code,
                         pico_lock["distribution"],
@@ -2773,7 +2775,7 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                     or "import failed",
                 )
                 pico_pip_check = subprocess.run(
-                    [pico_python, "-m", "pip", "check"],
+                    [pico_python, "-B", "-m", "pip", "check"],
                     env=pico_env,
                     text=True,
                     capture_output=True,

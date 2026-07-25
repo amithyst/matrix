@@ -61,6 +61,8 @@ set -euo pipefail
         self.fake_bin.mkdir()
         self.tmux_log = self.root / "tmux.log"
         self.tmux_state = self.root / "tmux.state"
+        self.runtime_dir = self.root / "runtime"
+        self.runtime_dir.mkdir(mode=0o700)
         write_executable(
             self.fake_bin / "tmux",
             """#!/usr/bin/env bash
@@ -121,6 +123,7 @@ esac
                 "FAKE_TMUX_LOG": os.fspath(self.tmux_log),
                 "FAKE_TMUX_STATE": os.fspath(self.tmux_state),
                 "HOME": os.fspath(self.root / "home"),
+                "XDG_RUNTIME_DIR": os.fspath(self.runtime_dir),
                 "PATH": os.fspath(self.fake_bin)
                 + os.pathsep
                 + self.environment.get("PATH", "/usr/bin:/bin"),
@@ -190,6 +193,31 @@ esac
         )
         self.assertIn(f"tmux attach-session -t ={session_name}", first.stdout)
         self.assertIn("already running", second.stdout)
+
+    def test_concurrent_start_is_serialized_to_one_runtime(self) -> None:
+        processes = [
+            subprocess.Popen(
+                ["/bin/bash", os.fspath(self.launcher), "start"],
+                env=self.environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _ in range(2)
+        ]
+        results = [process.communicate(timeout=10.0) for process in processes]
+
+        for process, (stdout, stderr) in zip(processes, results, strict=True):
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertIn("Matrix SONIC", stdout)
+        self.assertEqual(len(parse_call_log(self.run_log)), 1)
+        self.assertEqual(
+            sum(
+                call[0] == "new-session"
+                for call in parse_call_log(self.tmux_log)
+            ),
+            1,
+        )
 
     def test_default_profile_status_attach_and_stop(self) -> None:
         started = self.run_launcher()

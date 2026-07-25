@@ -7,6 +7,8 @@ RUN_SCRIPT="$SCRIPT_DIR/run_matrix_sonic.sh"
 SESSION_NAME="matrix-sonic-desktop-${UID}"
 PROFILE="heyuan"
 ACTION="start"
+SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
+unset MATRIX_DESKTOP_LAUNCHER_LOCKED
 
 usage() {
     cat <<'EOF'
@@ -35,6 +37,40 @@ validate_profile() {
             die "unsupported profile: $1 (expected heyuan, trna, or zza)"
             ;;
     esac
+}
+
+session_lock_directory() {
+    local directory="${XDG_RUNTIME_DIR:-}"
+    local mode
+    local owner
+
+    if [[ -z "$directory" || "$directory" != /* || ! -d "$directory" \
+        || -L "$directory" ]]; then
+        directory="${HOME:?}/.cache/matrix-sonic"
+        mkdir -p -m 0700 -- "$directory"
+    fi
+    [[ -d "$directory" && ! -L "$directory" ]] \
+        || die "session lock path is not a real directory: $directory"
+    owner="$(stat -c '%u' -- "$directory")"
+    [[ "$owner" == "$UID" ]] \
+        || die "session lock directory must be owned by uid $UID: $directory"
+    mode="$(stat -c '%a' -- "$directory")"
+    (( (8#$mode & 0022) == 0 )) \
+        || die "session lock directory must not be group/world writable: $directory"
+    printf '%s\n' "$directory"
+}
+
+run_with_session_lock() {
+    local directory
+    local flock_bin
+
+    flock_bin="$(command -v flock)" || die "flock is required"
+    directory="$(session_lock_directory)"
+    umask 077
+    MATRIX_DESKTOP_LAUNCHER_LOCKED=1 "$flock_bin" --exclusive --close \
+        "$directory/matrix-sonic-desktop-${UID}.lock" \
+        /usr/bin/bash "$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")" \
+        "$ACTION" --profile "$PROFILE"
 }
 
 notify_user() {
@@ -225,6 +261,12 @@ done
 
 validate_profile "$PROFILE"
 command -v tmux >/dev/null 2>&1 || die "tmux is required"
+
+if [[ "$SESSION_LOCK_HELD" != "1" \
+    && ( "$ACTION" == "start" || "$ACTION" == "stop" ) ]]; then
+    run_with_session_lock
+    exit $?
+fi
 
 case "$ACTION" in
     start)
