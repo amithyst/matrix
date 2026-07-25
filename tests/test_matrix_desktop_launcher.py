@@ -381,7 +381,16 @@ class MatrixDesktopInstallerTest(unittest.TestCase):
         self.assertEqual(dangerous.returncode, 2)
         self.assertIn("dangerous desktop directory", dangerous.stderr)
         self.assertEqual(shared.returncode, 2)
-        self.assertIn("group- or world-writable", shared.stderr)
+        self.assertIn("world-writable", shared.stderr)
+
+    def test_accepts_owner_controlled_group_writable_desktop(self) -> None:
+        desktop = self.make_desktop_dir("GNOME Desktop")
+        desktop.chmod(0o775)
+
+        result = self.run_installer("--desktop-dir", os.fspath(desktop))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((desktop / "matrix-sonic.desktop").is_file())
 
     def test_rejects_symlink_target_without_touching_victim(self) -> None:
         desktop = self.make_desktop_dir()

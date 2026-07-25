@@ -96,8 +96,8 @@ canonical_private_directory() {
     [[ "$owner" == "$UID" ]] \
         || die "desktop directory must be owned by uid $UID: $physical_path"
     mode="$(stat -c '%a' -- "$physical_path")"
-    (( (8#$mode & 0022) == 0 )) \
-        || die "desktop directory must not be group- or world-writable: $physical_path"
+    (( (8#$mode & 0002) == 0 )) \
+        || die "desktop directory must not be world-writable: $physical_path"
     [[ -w "$physical_path" && -x "$physical_path" ]] \
         || die "desktop directory is not writable: $physical_path"
 
