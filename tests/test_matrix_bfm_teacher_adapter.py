@@ -645,6 +645,68 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertIsNone(swapped["reference_transition"])
         np.testing.assert_allclose(resumed_target, lowstate.joint_pos_rad)
 
+    def test_active_reference_rebuild_holds_observed_pose_until_buffer_swaps(
+        self,
+    ) -> None:
+        class DelayedRebuildStream:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def sample(self, _command, *_args):
+                self.calls += 1
+                swapped = self.calls >= 2
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=0.8,
+                )
+                plan.future_qpos[-1, 0] = 1.0
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=True,
+                    replan_reason="root_anchor",
+                    plan_index=self.calls,
+                    root_error_before_m=0.0,
+                    pending_rebuild=not swapped,
+                    buffer_swapped=swapped,
+                )
+
+        core = self.inference_core()
+        core.reference_motion_active = True
+        core.previous_action.fill(3.0)
+        core.stream = DelayedRebuildStream()
+        lowstate = self.lowstate(joint_value=0.37)
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.8
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+        resets_before = core.teacher.reset_count
+
+        held_target, pending = core.step(moving, lowstate, active=True)
+
+        self.assertEqual(core.teacher.reset_count, resets_before)
+        self.assertEqual(pending["reference_transition"], "rebuilding")
+        self.assertTrue(pending["reference_pending_rebuild"])
+        self.assertFalse(pending["reference_buffer_swapped"])
+        self.assertFalse(pending["reference_transition_completed"])
+        self.assertTrue(pending["reference_transition_holding"])
+        np.testing.assert_allclose(held_target, lowstate.joint_pos_rad)
+        np.testing.assert_allclose(
+            core.previous_action,
+            np.zeros(MODULE.NUM_JOINTS),
+        )
+
+        moving.sequence = 2
+        resumed_target, swapped = core.step(moving, lowstate, active=True)
+
+        self.assertEqual(core.teacher.reset_count, resets_before + 1)
+        self.assertIsNone(swapped["reference_transition"])
+        self.assertTrue(swapped["reference_buffer_swapped"])
+        self.assertTrue(swapped["reference_transition_completed"])
+        self.assertFalse(swapped["reference_transition_holding"])
+        np.testing.assert_allclose(resumed_target, lowstate.joint_pos_rad)
+
 
 if __name__ == "__main__":
     unittest.main()

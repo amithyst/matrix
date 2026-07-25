@@ -930,6 +930,25 @@ class BfmTeacherCore:
             getattr(reference, "buffer_swapped", False)
         )
         reference_pending_rebuild = bool(reference.pending_rebuild)
+        if (
+            active
+            and self.reference_transition is None
+            and reference_pending_rebuild
+            and not reference_buffer_swapped
+        ):
+            # Robo-PFNN can rebuild its future buffer while motion is already
+            # active, for example after a root-anchor correction.  Until the
+            # replacement buffer is swapped in, publish the observed pose and
+            # keep actor history clean; otherwise Matrix can apply a one-frame
+            # target jump from a half-rebuilt reference.
+            self.reference_transition = "rebuilding"
+            self.reference_hold_target = lowstate.joint_pos_rad.astype(
+                np.float32,
+                copy=True,
+            )
+            self.previous_action.fill(0.0)
+            self.activation_origin = None
+            self.activation_step = 0
         transition_completed = bool(
             self.reference_transition is not None
             and (
@@ -952,7 +971,7 @@ class BfmTeacherCore:
             self.reference_transition = None
             self.reference_hold_target = None
         holding_reference_transition = bool(
-            self.reference_transition in {"starting", "stopping"}
+            self.reference_transition in {"starting", "stopping", "rebuilding"}
             and self.reference_hold_target is not None
         )
         matrix_to_isaac = self.teacher_module.MUJOCO_TO_ISAACLAB
