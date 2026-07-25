@@ -767,10 +767,9 @@ if [[ "$GAME_FALL_RECOVERY" == "physical" ]]; then
             ;;
     esac
     if [[ "$PHYSICAL_RECOVERY_RESIDENT_POLICIES" == "1" ]]; then
-        if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" != "kungfu" \
-            || "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
+        if [[ "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
             || "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" != "cuda" ]]; then
-            echo "[ERROR] Resident recovery requires kungfu -> sonic with CUDA" >&2
+            echo "[ERROR] Resident recovery requires sonic handoff with CUDA" >&2
             exit 2
         fi
     fi
