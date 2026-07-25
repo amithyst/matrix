@@ -3684,6 +3684,17 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertIn("start_new_session=True", supervisor)
         self.assertIn("signal.SIGKILL", supervisor)
 
+    def test_run_sim_exposes_direct_bfm_to_the_ue_main_chain(self) -> None:
+        run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(encoding="utf-8")
+
+        self.assertIn('case "${MATRIX_BFM_DIRECT:-0}" in', run_sim)
+        self.assertIn("1|true|yes|on) BFM_DIRECT_ARGS+=(--bfm-direct)", run_sim)
+        self.assertIn('"${BFM_DIRECT_ARGS[@]}"', run_sim)
+        self.assertLess(
+            run_sim.index('"${INITIAL_LOCOMOTION_ARGS[@]}"'),
+            run_sim.index('"${BFM_DIRECT_ARGS[@]}"'),
+        )
+
     def test_ue_supervisor_classifies_unexpected_and_expected_exit(self) -> None:
         supervisor = REPO_ROOT / "scripts/supervise_matrix_ue.py"
         cases = (

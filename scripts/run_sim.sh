@@ -1983,6 +1983,15 @@ PY
             --bfm-trace-ticks "$BFM_TRACE_TICKS"
         )
     fi
+    BFM_DIRECT_ARGS=()
+    case "${MATRIX_BFM_DIRECT:-0}" in
+        1|true|yes|on) BFM_DIRECT_ARGS+=(--bfm-direct) ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_BFM_DIRECT must be a boolean" >&2
+            exit 1
+            ;;
+    esac
     SONIC_QUALIFICATION_ARGS=()
     if [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]]; then
         SONIC_QUALIFICATION_ARGS+=(
@@ -2159,6 +2168,7 @@ PY
         "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
         "${INITIAL_LOCOMOTION_ARGS[@]}" \
+        "${BFM_DIRECT_ARGS[@]}" \
         "${BFM_TRACE_ARGS[@]}" \
         "${PHYSICAL_RECOVERY_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \
