@@ -151,6 +151,7 @@ _RUNTIME_PAUSE_SUCCESS_CODES = {
     "paused": "OK_RUNTIME_PAUSED",
     "running": "OK_RUNTIME_RUNNING",
 }
+_STRATEGY_LOADOUT_REFRESH_INTERVAL_S = 1.0
 
 
 _X11_BAD_WINDOW = 3
@@ -5005,6 +5006,7 @@ class GameCommandClient:
         self._pending_warning: str | None = None
         self._pending_runtime_pause: tuple[str, int] | None = None
         self._auto_celestial_refresh_attempted = False
+        self._last_strategy_loadout_refresh_s: float | None = None
         self._outcome_unknown = False
         self.editing = False
         self._escape_release_required = False
@@ -5180,6 +5182,71 @@ class GameCommandClient:
 
     def strategy_loadout_mapping(self) -> dict[str, object]:
         return json.loads(json.dumps(self._strategy_loadout, allow_nan=False))
+
+    def refresh_loading_strategy_loadout(
+        self,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+        now_s: float | None = None,
+    ) -> bool:
+        """Refresh an asynchronous resident-policy startup snapshot.
+
+        The provider receives its first loadout before GPU workers finish
+        warming.  Reassigning the already-selected locomotion policy is an
+        idempotent, typed query that returns the current authoritative loadout
+        without changing writer ownership.
+        """
+
+        if (
+            self._strategy_loadout.get("status") != "loading"
+            or self.in_flight
+            or self.restart_required
+            or self._outcome_unknown
+            or not calibration_active
+            or not neutral_frame_ready
+            or restart_requested
+        ):
+            return False
+        now = time.monotonic() if now_s is None else now_s
+        last_refresh = self._last_strategy_loadout_refresh_s
+        if (
+            last_refresh is not None
+            and now - last_refresh < _STRATEGY_LOADOUT_REFRESH_INTERVAL_S
+        ):
+            return False
+        slots = self._strategy_loadout.get("slots")
+        if not isinstance(slots, list):
+            return False
+        locomotion = next(
+            (
+                slot
+                for slot in slots
+                if isinstance(slot, dict) and slot.get("slot") == "locomotion"
+            ),
+            None,
+        )
+        if not isinstance(locomotion, dict):
+            return False
+        selected = locomotion.get("selected_policy_id")
+        if not isinstance(selected, str):
+            return False
+        try:
+            command = PolicySlotAssignment(
+                slot="locomotion",
+                policy_id=selected,
+            )
+        except CommandParseError:
+            return False
+        submitted = self._send_typed_command(
+            command,
+            warning=None,
+            pending_message="Refreshing resident policy readiness",
+        )
+        if submitted:
+            self._last_strategy_loadout_refresh_s = now
+        return submitted
 
     @staticmethod
     def _validate_creative_inventory(value: object) -> dict[str, object]:
@@ -7949,6 +8016,15 @@ def main() -> int:
                 command_state_changed = True
                 if command_submitted:
                     apply_return.cancel_pending()
+            command_state_changed = bool(
+                game_command_client.refresh_loading_strategy_loadout(
+                    calibration_active=calibration.active,
+                    neutral_frame_ready=neutral_frame_ready,
+                    restart_requested=restart_requester.requested,
+                    now_s=now,
+                )
+                or command_state_changed
+            )
             if (
                 external_control is not None
                 and external_control.lease_active

@@ -852,6 +852,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             'deploy="$MATRIX_SONIC_ROOT/gear_sonic_deploy/target/release/g1_deploy_onnx_ref"',
             text,
         )
+        self.assertIn(
+            'bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh"',
+            text,
+        )
 
     def test_verifier_binds_python_source_and_wheelhouse_identity(self) -> None:
         verifier = SCRIPT_PATH.read_text(encoding="utf-8")

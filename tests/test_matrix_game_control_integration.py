@@ -2624,6 +2624,37 @@ print(json.dumps(payload, sort_keys=True))
             self.assertLess(ue_index, mounted_index)
             self.assertLess(mounted_index, remove_index)
 
+            environment["MATRIX_G1_SKIN"] = "unitree-stock"
+            environment["MATRIX_G1_MATERIAL_PALETTE"] = (
+                "0.018,0.024,0.035;0.055,0.075,0.11;"
+                "0.9,0.94,1;0.42,0.42,0.42"
+            )
+            environment["MATRIX_G1_MATERIAL_SCOPE_ALPHA"] = "0.99609375"
+            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
+                project / "launcher-missing-default-material.lock"
+            )
+            missing_default_material = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(missing_default_material.returncode, 1)
+            self.assertIn(
+                "requires the audited UE material bridge",
+                missing_default_material.stderr,
+            )
+            self.assertFalse(active.exists())
+
             material_fix = project / "libmatrix_ue_material_fix.so"
             self.write(material_fix, "invalid fixture library\n")
             with ue_log.open("a", encoding="utf-8") as stream:

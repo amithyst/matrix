@@ -1365,6 +1365,11 @@ case "${UE_MATERIAL_FIX_PRELOAD,,}" in
     ""|auto)
         if [[ -f "$UE_MATERIAL_FIX_DEFAULT" && ! -L "$UE_MATERIAL_FIX_DEFAULT" ]]; then
             UE_MATERIAL_FIX_PRELOAD="$UE_MATERIAL_FIX_DEFAULT"
+        elif [[ -n "$UE_G1_SKIN" ]]; then
+            echo "[ERROR] Matrix G1 skin '$UE_G1_SKIN' requires the audited UE material bridge:" >&2
+            echo "[ERROR] $UE_MATERIAL_FIX_DEFAULT" >&2
+            echo "[ERROR] Run scripts/bootstrap_matrix_sonic.sh or scripts/build_matrix_ue_material_fix.sh before launch." >&2
+            exit 1
         else
             UE_MATERIAL_FIX_PRELOAD=""
             echo "[INFO] Matrix UE material fix default not found; continuing without skin bridge"
