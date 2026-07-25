@@ -27,7 +27,7 @@ from inject_creative_inventory import (  # noqa: E402
 )
 
 
-PIPELINE_VERSION = 8
+PIPELINE_VERSION = 10
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
@@ -46,6 +46,26 @@ MOON_DYNAMIC_MAP_SHA256 = (
 MOON_DYNAMIC_MAP_SIDE_SAMPLES = 6000
 MOON_DYNAMIC_MAP_RESOLUTION_M = 0.1
 MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M = -0.9296965003013611
+MOON_CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
+MOON_CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
+MOON_SPAWN_PAD_GEOM_NAME = "matrix_moon_spawn_pad"
+MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES = 33
+MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M = 1.6
+MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M = 64.0
+MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
+# The pad covers a locked-map flat footprint.  Its top is intentionally 1 cm
+# above the coincident visual floor so startup clearance selects box contact.
+MOON_SPAWN_PAD_CENTER_M = (-94.7, -65.6, -6.101562023162842)
+MOON_SPAWN_PAD_HALF_SIZE_M = (6.0, 6.0, 0.01)
+MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE = (1993, 2113)
+MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE = (2284, 2404)
+MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M = (
+    -6.101562023162842,
+    -6.101562023162842,
+)
+MOON_COLLISION_FRICTION = "1 0.005 0.0001"
+MOON_COLLISION_SOLREF = "0.02 1"
+MOON_COLLISION_SOLIMP = "0.9 0.95 0.001 0.5 2"
 MOON_DEFAULT_ROOT_CLEARANCE_M = 0.793
 MOON_DEFAULT_SPAWN_Z_M = (
     MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M + MOON_DEFAULT_ROOT_CLEARANCE_M
@@ -255,6 +275,10 @@ def _vectors_equal(
     )
 
 
+def _mjcf_vector(values: tuple[float, ...]) -> str:
+    return " ".join(str(value).removesuffix(".0") for value in values)
+
+
 def _scene_transform_removals(
     native_scene: Path, scene_transform: str | None
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
@@ -370,7 +394,7 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
         return None
     return {
         "dynamic_ground": {
-            "schema": "matrix-moon-dynamic-ground/v1",
+            "schema": "matrix-moon-dynamic-ground/v3",
             "body_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
             "body_name_pattern": MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern,
             "body_mode": "mocap",
@@ -385,6 +409,46 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
             "height_mode": "absolute_world_z",
             "update_timing": "before_each_mj_step",
             "fallback_support_plane": False,
+            "collision": {
+                "mode": "rolling-heightfield-v1",
+                "asset_name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+                "geom_name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "grid_shape": [
+                    MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                    MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                ],
+                "half_extent_m": MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                "height_range_m": MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+                "base_depth_m": MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+                "source_tile_collision_enabled": False,
+                "friction": MOON_COLLISION_FRICTION,
+                "solref": MOON_COLLISION_SOLREF,
+                "solimp": MOON_COLLISION_SOLIMP,
+                "spawn_pad": {
+                    "mode": "finite-collision-only-box-v1",
+                    "geom_name": MOON_SPAWN_PAD_GEOM_NAME,
+                    "center_m": list(MOON_SPAWN_PAD_CENTER_M),
+                    "half_size_m": list(MOON_SPAWN_PAD_HALF_SIZE_M),
+                    "top_z_m": (
+                        MOON_SPAWN_PAD_CENTER_M[2]
+                        + MOON_SPAWN_PAD_HALF_SIZE_M[2]
+                    ),
+                    "top_offset_above_native_floor_m": MOON_SPAWN_PAD_HALF_SIZE_M[2],
+                    "locked_footprint": {
+                        "map_sha256": MOON_DYNAMIC_MAP_SHA256,
+                        "pixel_x_range": list(
+                            MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE
+                        ),
+                        "pixel_y_range": list(
+                            MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE
+                        ),
+                        "native_height_range_m": list(
+                            MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M
+                        ),
+                    },
+                    "rgba": [0.0, 0.0, 0.0, 0.0],
+                },
+            },
         }
     }
 
@@ -404,6 +468,17 @@ def _apply_scene_transform_additions(
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise SonicPhysicsModelError("MoonWorld derived scene has no worldbody")
+    if any(
+        item.get("name") == MOON_CONTINUOUS_SUPPORT_ASSET_NAME
+        for item in root.iter("hfield")
+    ) or any(
+        item.get("name")
+        in {MOON_CONTINUOUS_SUPPORT_GEOM_NAME, MOON_SPAWN_PAD_GEOM_NAME}
+        for item in root.iter("geom")
+    ):
+        raise SonicPhysicsModelError(
+            "MoonWorld source already contains Matrix dynamic-ground support"
+        )
     tile_bodies = [
         body
         for body in worldbody.iter("body")
@@ -432,10 +507,100 @@ def _apply_scene_transform_additions(
                 f"MoonWorld tile {body.get('name')} still owns a free joint"
             )
         body.set("mocap", "true")
+        body_name = body.get("name", "")
+        suffix = body_name.removeprefix("gb_")
+        tile_geoms = list(body.findall("geom"))
+        if len(tile_geoms) != 1:
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body_name} must own exactly one geom"
+            )
+        tile_geom = tile_geoms[0]
+        if (
+            tile_geom.get("name") != f"soil_{suffix}"
+            or tile_geom.get("type") != "box"
+            or not _vectors_equal(
+                _float_vector(tile_geom, "size", length=3),
+                (0.049, 0.049, 0.5),
+            )
+            or not _vectors_equal(
+                _float_vector(tile_geom, "pos", length=3),
+                (0.0, 0.0, -0.5),
+            )
+        ):
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body_name} collision source contract drifted"
+            )
+        # Preserve the locked native tile geometry for visual/provenance parity,
+        # but fence it out of collision. Its 0.049 m half-width on a 0.1 m
+        # lattice leaves gaps and exposes vertical faces between samples.
+        tile_geom.set("contype", "0")
+        tile_geom.set("conaffinity", "0")
+
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.Element("asset")
+        worldbody_index = list(root).index(worldbody)
+        root.insert(worldbody_index, asset)
+    ET.SubElement(
+        asset,
+        "hfield",
+        {
+            "name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+            "nrow": str(MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES),
+            "ncol": str(MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES),
+            "size": " ".join(
+                f"{value:g}"
+                for value in (
+                    MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                    MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                    MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+                    MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+                )
+            ),
+        },
+    )
+    worldbody.insert(
+        0,
+        ET.Element(
+            "geom",
+            {
+                "name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "type": "hfield",
+                "hfield": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+                "pos": f"0 0 {MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M:.12g}",
+                "contype": "1",
+                "conaffinity": "1",
+                "friction": MOON_COLLISION_FRICTION,
+                "solref": MOON_COLLISION_SOLREF,
+                "solimp": MOON_COLLISION_SOLIMP,
+                "rgba": "0 0 0 0",
+            },
+        ),
+    )
+    worldbody.insert(
+        1,
+        ET.Element(
+            "geom",
+            {
+                "name": MOON_SPAWN_PAD_GEOM_NAME,
+                "type": "box",
+                "pos": _mjcf_vector(MOON_SPAWN_PAD_CENTER_M),
+                "size": _mjcf_vector(MOON_SPAWN_PAD_HALF_SIZE_M),
+                "contype": "1",
+                "conaffinity": "1",
+                "friction": MOON_COLLISION_FRICTION,
+                "solref": MOON_COLLISION_SOLREF,
+                "solimp": MOON_COLLISION_SOLIMP,
+                "rgba": "0 0 0 0",
+            },
+        ),
+    )
     root.insert(
         0,
         ET.Comment(
-            " converted official MoonWorld rolling tiles to runtime-updated mocap bodies "
+            " converted official MoonWorld rolling tiles to non-colliding mocap visuals "
+            "and added one runtime-updated continuous collision hfield plus a "
+            "finite collision-only spawn pad "
         ),
     )
     ET.indent(tree, space="  ")

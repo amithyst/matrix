@@ -59,7 +59,7 @@ be claimed from this implementation.
 | SONIC control | 50 Hz; native physics remains 200 Hz |
 | Maximum keyboard target | 2.75 m/s by default (run boost; panel configurable) |
 | Analog maximum | 0.30 m/s default; configurable up to 0.80 m/s, kept inside `SLOW_WALK` |
-| Keyboard gait profiles | Ctrl/Alt slow 0.10/0.20; unmodified walk 0.80/1.00; Shift run 2.50/2.75 m/s; each pair is base/double-tap boost and slow wins a conflict |
+| Keyboard gait profiles | Ctrl/Alt slow 0.20/0.30; unmodified walk 0.80/1.00; Shift run 2.50/2.75 m/s; each pair is base/double-tap boost and slow wins a conflict |
 | Native gait intervals | mode 1: 0.10-0.80; mode 2: 0.80-2.50; mode 3: 2.50-7.50 m/s |
 | Acceleration / deceleration | 1.20 / 2.40 m/s² |
 | Maximum heading rate | 2.50 rad/s |
@@ -99,16 +99,18 @@ git -C /home/kaijie/matrix worktree add --detach \
   /home/kaijie/worktrees/matrix-game-control-exp \
   origin/main
 cd /home/kaijie/worktrees/matrix-game-control-exp
-MATRIX_SONIC_ROOT=/home/kaijie/worktrees/sonic-matrix-native-final \
-  bash scripts/bootstrap_matrix_sonic.sh \
-    --profile heyuan \
-    --release-cache /home/kaijie/matrix-eval/releases \
-    --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
-    --write-local-env
-/usr/bin/python3 scripts/update_matrix_local_env.py \
-  .matrix/local.env MATRIX_SONIC_ROOT \
-  /home/kaijie/worktrees/sonic-matrix-native-final
+bash scripts/bootstrap_matrix_sonic.sh \
+  --profile heyuan \
+  --release-cache /home/kaijie/matrix-eval/releases \
+  --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
+  --write-local-env
 ```
+
+The Heyuan profile consumes the attested
+`$MATRIX_RUNTIME_ROOT/GR00T-WholeBodyControl` archive mirror. The mirror must
+contain the locked `SONIC_COMMIT`, critical source hashes, runtime trees, and
+portable deploy binary; do not point a qualification run at an experimental
+SONIC worktree.
 
 ```bash
 MATRIX_EXPERIMENT_WORKTREE="${MATRIX_EXPERIMENT_WORKTREE:-/home/kaijie/worktrees/matrix-game-control-exp}"

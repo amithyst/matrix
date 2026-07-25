@@ -15,6 +15,8 @@ SKIP_ASSETS=0
 SKIP_PYTHON=0
 VERIFY_ONLY=0
 AUDIT_VENV="$PROJECT_ROOT/.venv-audit"
+INVOCATION_SONIC_ROOT_SET="${MATRIX_SONIC_ROOT+x}"
+INVOCATION_SONIC_ROOT_VALUE="${MATRIX_SONIC_ROOT-}"
 
 usage() {
     cat <<'EOF'
@@ -67,6 +69,11 @@ if ! load_matrix_local_env "$PROJECT_ROOT"; then
 fi
 if [[ -n "$RUNTIME_OVERRIDE" ]]; then
     export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"
+fi
+if [[ "$INVOCATION_SONIC_ROOT_SET" == "x" ]]; then
+    export MATRIX_SONIC_ROOT="$INVOCATION_SONIC_ROOT_VALUE"
+elif [[ -n "$RUNTIME_OVERRIDE" ]]; then
+    unset MATRIX_SONIC_ROOT
 fi
 # Load profile defaults after host-local overrides so paths derived from
 # MATRIX_RUNTIME_ROOT always follow the selected runtime bundle.
@@ -504,6 +511,8 @@ if [[ "$WRITE_LOCAL_ENV" == "1" ]]; then
     mkdir -p "$PROJECT_ROOT/.matrix"
     python3 "$SCRIPT_DIR/update_matrix_local_env.py" \
         "$PROJECT_ROOT/.matrix/local.env" MATRIX_RUNTIME_ROOT "$RUNTIME_ROOT"
+    python3 "$SCRIPT_DIR/update_matrix_local_env.py" \
+        "$PROJECT_ROOT/.matrix/local.env" MATRIX_SONIC_ROOT "$MATRIX_SONIC_ROOT"
     echo "[INFO] Updated ignored host override: $PROJECT_ROOT/.matrix/local.env"
 fi
 echo "[PASS] Matrix SONIC bootstrap complete: profile=$PROFILE runtime=$RUNTIME_ROOT"

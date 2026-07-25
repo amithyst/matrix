@@ -499,6 +499,15 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         heyuan = (REPO_ROOT / "config/hosts/heyuan.env").read_text(
             encoding="utf-8"
         )
+        self.assertIn(
+            'MATRIX_ENGINE_INPUT_BRIDGE="${MATRIX_ENGINE_INPUT_BRIDGE:-1}"',
+            heyuan,
+        )
+        self.assertIn(
+            "MATRIX_ENGINE_CAMERA_LOOK_BACKEND="
+            '"${MATRIX_ENGINE_CAMERA_LOOK_BACKEND:-xtest}"',
+            heyuan,
+        )
 
         self.assertIn('GAME_FALL_RECOVERY="physical"', launcher)
         self.assertIn('GAME_FALL_RECOVERY="off"', launcher)
@@ -556,7 +565,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         )
         self.assertIn("$MATRIX_PHYSICAL_RECOVERY_ARTIFACT_ROOT/venv/bin/python", heyuan)
         self.assertIn(
-            "/home/kaijie/worktrees/sonic-matrix-recovery-gate-20260719",
+            "$MATRIX_RUNTIME_ROOT/GR00T-WholeBodyControl",
             heyuan,
         )
         trna = (REPO_ROOT / "config/hosts/trna.env").read_text(encoding="utf-8")
@@ -818,6 +827,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("--write-local-env", text)
         self.assertIn(".matrix/local.env", text)
         self.assertIn("update_matrix_local_env.py", text)
+        self.assertIn('MATRIX_SONIC_ROOT "$MATRIX_SONIC_ROOT"', text)
+        self.assertIn('INVOCATION_SONIC_ROOT_SET="${MATRIX_SONIC_ROOT+x}"', text)
+        self.assertIn('elif [[ -n "$RUNTIME_OVERRIDE" ]]', text)
+        self.assertIn("unset MATRIX_SONIC_ROOT", text)
         self.assertIn("--no-index", text)
         self.assertIn("--only-binary=:all:", text)
         self.assertIn("--no-compile", text)
@@ -1925,10 +1938,20 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         override_assignment = bootstrap.index(
             'export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"'
         )
+        invocation_capture = bootstrap.index(
+            'INVOCATION_SONIC_ROOT_SET="${MATRIX_SONIC_ROOT+x}"'
+        )
+        bootstrap_local_env_source = bootstrap.index(
+            'load_matrix_local_env "$PROJECT_ROOT"'
+        )
+        sonic_runtime_rebind = bootstrap.index("unset MATRIX_SONIC_ROOT")
         profile_source = bootstrap.index(
             'source "$PROFILE_FILE"'
         )
+        self.assertLess(invocation_capture, bootstrap_local_env_source)
         self.assertLess(override_assignment, profile_source)
+        self.assertLess(bootstrap_local_env_source, sonic_runtime_rebind)
+        self.assertLess(sonic_runtime_rebind, profile_source)
 
     def test_active_launch_path_has_no_androidtwin_dependency(self) -> None:
         for relative in (

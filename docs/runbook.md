@@ -18,11 +18,12 @@ The local override parser accepts only `MATRIX_RUNTIME_ROOT`,
 `MATRIX_SONIC_ROOT`, `MATRIX_PICO_PYTHON`, and `MATRIX_PICO_WHEEL`, each as one
 literal shell-quoted value. Put display/GPU/tool defaults in the tracked host
 profiles rather than adding executable shell to the local file.
-Each host normally runs a clean Git checkout of the original SONIC repository
-at the pinned commit. An offline private bundle may contain an exact `git archive`
-deployment mirror of that commit plus its private runtime assets; it is not a
-second source repository and must pass the same source-file hashes. Neither Git
-repository stores the
+Each host normally consumes an exact `git archive` deployment mirror of the
+pinned SONIC commit from its private runtime bundle. The mirror includes a
+regular `SONIC_COMMIT` marker and the private runtime assets, is not a second
+source repository, and must pass the same critical source hashes. Developers
+may explicitly override `MATRIX_SONIC_ROOT` with a clean original-repository
+checkout for source work. Neither Git repository stores the
 7.76 GB Matrix release packages, the internal SONIC models, TensorRT libraries,
 generated engines, logs, or recordings. Those files are copied from a controlled
 artifact source and verified against the tracked lock.
@@ -39,9 +40,11 @@ or offline package installation into a false successful no-op.
 
 ## Checkout policy
 
-Use `~/matrix` as the active Matrix checkout on every host and keep one clean,
-pinned original SONIC checkout at the path in `config/hosts/<host>.env`. Keep historical
-`matrix-eval` directories read-only as evidence or package caches.
+Use `~/matrix` as the active Matrix checkout on every host. The host profile
+points qualification runs at the attested SONIC archive mirror in the runtime
+bundle; keep any original SONIC Git checkout at a separate path for source work.
+Keep historical `matrix-eval` directories read-only as evidence or package
+caches.
 
 ```bash
 git clone https://github.com/amithyst/matrix ~/matrix
@@ -51,7 +54,11 @@ git switch <shared-feature-branch>
 git pull --ff-only
 ```
 
-Verify the SONIC checkout separately before launch:
+The host profile normally points at the attested archive mirror in
+`$MATRIX_RUNTIME_ROOT/GR00T-WholeBodyControl`. Bootstrap verifies its regular
+`SONIC_COMMIT` marker, critical source hashes, runtime trees, and deploy
+dependency closure. If a development run explicitly overrides that path with
+a Git checkout, verify the checkout separately before launch:
 
 ```bash
 git -C "$MATRIX_SONIC_ROOT" fetch --all --prune

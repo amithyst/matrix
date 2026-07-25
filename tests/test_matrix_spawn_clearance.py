@@ -51,6 +51,7 @@ class FakeModel:
         self.geom_contype = (1,) * self.ngeom
         self.geom_conaffinity = (1,) * self.ngeom
         self.geom_type = (0,) * self.ngeom
+        self.geom_dataid = (-1,) * self.ngeom
         self.geom_size = ([1.0, 1.0, 0.01],) * self.ngeom
         self.geom_rbound = (0.0,) * self.ngeom
         self.body_jntadr = (0, 0, 1, 1, 1, 1)
@@ -76,6 +77,8 @@ class FakeModel:
             5: "pelvis_collision",
             6: "platform",
         }
+        self.nhfield = 0
+        self._hfields: dict[int, str] = {}
 
     def body(self, key: int | str) -> NamedItem:
         if isinstance(key, str):
@@ -91,6 +94,22 @@ class FakeModel:
         if key not in self._geoms:
             raise KeyError(key)
         return NamedItem(key, self._geoms[key])
+
+    def hfield(self, key: int) -> NamedItem:
+        if key not in self._hfields:
+            raise KeyError(key)
+        return NamedItem(key, self._hfields[key])
+
+    def enable_moon_continuous_support(self) -> None:
+        self._geoms[3] = MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+        self.nhfield = 1
+        self._hfields[0] = MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME
+        geom_types = list(self.geom_type)
+        geom_types[3] = FakeMujoco.mjtGeom.mjGEOM_HFIELD
+        self.geom_type = tuple(geom_types)
+        geom_data_ids = list(self.geom_dataid)
+        geom_data_ids[3] = 0
+        self.geom_dataid = tuple(geom_data_ids)
 
 
 class FakeData:
@@ -294,18 +313,35 @@ class SpawnClearanceAuditTest(unittest.TestCase):
                     "left_ankle_roll_link",
                 )
 
-    def test_allows_shallow_moon_mocap_tile_edge_contact(self) -> None:
+    def test_rejects_shallow_moon_mocap_tile_edge_contact(self) -> None:
         self.model.nmocap = 1
         self.model.body_mocapid = (-1, -1, -1, -1, -1, 0)
         self.model._bodies[5] = "gb_0_0"
 
         result = self.audit(Contact(0, 4, dist=-0.004, frame=HORIZONTAL))
 
-        self.assertTrue(result["safe"])
+        self.assertFalse(result["safe"])
+        self.assertEqual(result["reason"], "unsafe_foot_contact")
         self.assertEqual(
             result["contacts"][0]["classification"],
-            "allowed_foot_terrain_edge",
+            "unsafe_foot_terrain_edge",
         )
+
+    def test_moon_gate_rejects_any_body_contact(self) -> None:
+        self.model.enable_moon_continuous_support()
+        result = MODULE.audit_spawn_clearance(
+            self.model,
+            FakeData(Contact(2, 3, dist=0.0)),
+        )
+
+        self.assertFalse(result["safe"])
+        self.assertEqual(result["reason"], "scene_penetration")
+        self.assertEqual(
+            result["contacts"][0]["classification"],
+            "unsafe_body_contact",
+        )
+        self.assertTrue(result["moon_spawn_gate"]["enabled"])
+        self.assertFalse(result["moon_spawn_gate"]["body_contact_allowed"])
 
     def test_rejects_same_named_non_mocap_tile_edge_contact(self) -> None:
         self.model._bodies[5] = "gb_0_0"
@@ -330,7 +366,7 @@ class SpawnClearanceAuditTest(unittest.TestCase):
         self.assertFalse(result["safe"])
         self.assertEqual(
             result["worst"]["classification"],
-            "unsafe_foot_contact_normal",
+            "unsafe_foot_terrain_edge",
         )
 
     def test_rejects_downward_scene_to_robot_normal_as_ceiling_contact(self) -> None:
@@ -579,6 +615,162 @@ class GroundSupportProbeTest(unittest.TestCase):
             [True, False],
         )
 
+    def test_moon_gate_requires_both_feet_on_continuous_support(self) -> None:
+        self.model.enable_moon_continuous_support()
+        support = MODULE.probe_ground_support(
+            FakeMujoco(default_support=True),
+            self.model,
+            self.data,
+        )
+
+        self.assertTrue(support["supported"])
+        self.assertTrue(support["moon_spawn_gate"])
+        self.assertEqual(support["required_hits"], 2)
+        self.assertEqual(support["accepted_hits"], 2)
+        self.assertEqual(
+            support["supported_foot_names"],
+            ["left_ankle_roll_link", "right_ankle_roll_link"],
+        )
+        self.assertAlmostEqual(support["height_delta_m"], 0.0)
+        self.assertTrue(support["height_delta_safe"])
+
+    def test_moon_gate_rejects_false_platform_hits(self) -> None:
+        self.model.enable_moon_continuous_support()
+        engine = FakeMujoco(
+            default_support=False,
+            ray_hits={
+                (0.0, 6): (0.02, VERTICAL),
+                (1.0, 6): (0.02, VERTICAL),
+            },
+        )
+
+        support = MODULE.probe_ground_support(engine, self.model, self.data)
+
+        self.assertFalse(support["supported"])
+        self.assertEqual(support["accepted_hits"], 0)
+        self.assertEqual(
+            support["rejection_reason"],
+            "insufficient_distinct_foot_support",
+        )
+        self.assertFalse(any(geom_id == 6 for _, geom_id in engine.ray_calls))
+        self.assertTrue(
+            all(probe["scene_geom"] is None for probe in support["probes"])
+        )
+
+    def test_moon_gate_rejects_invalid_hfield_binding_and_collision(self) -> None:
+        cases = (
+            (
+                "world body",
+                {"geom_bodyid": 5},
+                "world body",
+            ),
+            (
+                "geom type",
+                {"geom_type": FakeMujoco.mjtGeom.mjGEOM_PLANE},
+                "MuJoCo hfield",
+            ),
+            (
+                "hfield binding",
+                {"geom_dataid": 1},
+                "bind the named hfield asset",
+            ),
+            (
+                "collision mask",
+                {"geom_contype": 2, "geom_conaffinity": 2},
+                "contype=1 and conaffinity=1",
+            ),
+        )
+        for label, replacements, message in cases:
+            with self.subTest(label=label):
+                model = FakeModel()
+                model.enable_moon_continuous_support()
+                if label == "hfield binding":
+                    model.nhfield = 2
+                    model._hfields[1] = "other_hfield"
+                for attribute, value in replacements.items():
+                    table = list(getattr(model, attribute))
+                    table[3] = value
+                    setattr(model, attribute, tuple(table))
+                with self.assertRaisesRegex(
+                    MODULE.SpawnClearanceError,
+                    message,
+                ):
+                    MODULE.probe_ground_support(FakeMujoco(), model, self.data)
+
+    def test_moon_gate_rejects_duplicate_support_geom_or_hfield(self) -> None:
+        duplicate_geom = FakeModel()
+        duplicate_geom.enable_moon_continuous_support()
+        duplicate_geom._geoms[6] = MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+        with self.assertRaisesRegex(
+            MODULE.SpawnClearanceError,
+            "support geom must be unique",
+        ):
+            MODULE.probe_ground_support(
+                FakeMujoco(),
+                duplicate_geom,
+                self.data,
+            )
+
+        duplicate_hfield = FakeModel()
+        duplicate_hfield.enable_moon_continuous_support()
+        duplicate_hfield.nhfield = 2
+        duplicate_hfield._hfields[1] = MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME
+        with self.assertRaisesRegex(
+            MODULE.SpawnClearanceError,
+            "hfield asset must be unique",
+        ):
+            MODULE.probe_ground_support(
+                FakeMujoco(),
+                duplicate_hfield,
+                self.data,
+            )
+
+    def test_moon_gate_rejects_one_foot_support(self) -> None:
+        self.model.enable_moon_continuous_support()
+        support = MODULE.probe_ground_support(
+            FakeMujoco(
+                default_support=False,
+                ray_hits={(0.0, 3): (0.04, VERTICAL)},
+            ),
+            self.model,
+            self.data,
+        )
+
+        self.assertFalse(support["supported"])
+        self.assertEqual(support["required_hits"], 2)
+        self.assertEqual(support["accepted_hits"], 1)
+        self.assertEqual(
+            support["rejection_reason"],
+            "insufficient_distinct_foot_support",
+        )
+
+    def test_moon_gate_rejects_excessive_foot_support_height_delta(self) -> None:
+        self.model.enable_moon_continuous_support()
+        support = MODULE.probe_ground_support(
+            FakeMujoco(
+                default_support=False,
+                ray_hits={
+                    (0.0, 3): (0.02, VERTICAL),
+                    (1.0, 3): (0.08, VERTICAL),
+                },
+            ),
+            self.model,
+            self.data,
+        )
+
+        self.assertFalse(support["supported"])
+        self.assertEqual(support["accepted_hits"], 2)
+        self.assertAlmostEqual(support["height_delta_m"], 0.06)
+        self.assertFalse(support["height_delta_safe"])
+        self.assertEqual(
+            support["maximum_height_delta_m"],
+            MODULE.MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M,
+        )
+        self.assertEqual(
+            support["rejection_reason"],
+            "foot_support_height_delta",
+        )
+
     def test_rejects_when_both_foot_rays_miss(self) -> None:
         support = MODULE.probe_ground_support(
             FakeMujoco(default_support=False),
@@ -669,6 +861,29 @@ class GroundSupportProbeTest(unittest.TestCase):
         self.assertEqual(result["rejected_contact_count"], 0)
         self.assertEqual(result["support"]["schema"], MODULE.GROUND_SUPPORT_SCHEMA)
         self.assertFalse(result["support"]["supported"])
+
+    def test_combined_moon_audit_enforces_dual_level_support(self) -> None:
+        self.model.enable_moon_continuous_support()
+        result = MODULE.audit_spawn_safety(
+            FakeMujoco(
+                default_support=False,
+                ray_hits={
+                    (0.0, 3): (0.02, VERTICAL),
+                    (1.0, 3): (0.08, VERTICAL),
+                },
+            ),
+            self.model,
+            self.data,
+        )
+
+        self.assertFalse(result["safe"])
+        self.assertEqual(result["reason"], "no_ground_support")
+        self.assertTrue(result["moon_spawn_gate"]["enabled"])
+        self.assertEqual(result["support"]["required_hits"], 2)
+        self.assertEqual(
+            result["support"]["rejection_reason"],
+            "foot_support_height_delta",
+        )
 
     def test_apply_root_pose_rejects_unsupported_candidate(self) -> None:
         result = MODULE.apply_root_pose_and_audit(

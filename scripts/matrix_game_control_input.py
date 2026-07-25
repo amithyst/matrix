@@ -93,6 +93,7 @@ from matrix_celestial_navigation import (
     CelestialNavigationError,
     DEFAULT_ASSET_MANIFEST_PATH,
     DEFAULT_CATALOG_PATH,
+    TeleportProbeSet,
     load_catalog,
     probes_from_response,
 )
@@ -116,7 +117,9 @@ from matrix_mc_commands import (
     GameCommandRequest,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
+    MAX_RUNTIME_PAUSE_EPOCH,
     PolicySlotAssignment,
+    RuntimePause,
     TeleportList,
     TeleportSelector,
     decode_command_response,
@@ -139,6 +142,10 @@ _JS_EVENT_BUTTON = 0x01
 _JS_EVENT_AXIS = 0x02
 _JS_EVENT_INIT = 0x80
 DEFAULT_CARLA_WRITE_READBACK_TOLERANCE_RAD = math.radians(0.5)
+_RUNTIME_PAUSE_SUCCESS_CODES = {
+    "paused": "OK_RUNTIME_PAUSED",
+    "running": "OK_RUNTIME_RUNNING",
+}
 
 
 _X11_BAD_WINDOW = 3
@@ -1018,14 +1025,15 @@ class MouseSettingsController:
     def _replace(self, replacement: MouseSettings) -> bool:
         if replacement == self.desired:
             return False
-        self.desired = replacement
-        self.change_count += 1
         try:
             atomic_save_settings(self.path, replacement)
-            self.persistence_error = None
-            self.load_status = "saved"
         except (OSError, ValueError) as exc:
             self.persistence_error = str(exc)
+            return False
+        self.desired = replacement
+        self.change_count += 1
+        self.persistence_error = None
+        self.load_status = "saved"
         return True
 
     def update(
@@ -1146,14 +1154,15 @@ class UiSettingsController:
     def _replace(self, replacement: UiSettings) -> bool:
         if replacement == self.desired:
             return False
-        self.desired = replacement
-        self.change_count += 1
         try:
             atomic_save_ui_settings(self.path, replacement)
-            self.persistence_error = None
-            self.load_status = "saved"
         except (OSError, ValueError) as exc:
             self.persistence_error = str(exc)
+            return False
+        self.desired = replacement
+        self.change_count += 1
+        self.persistence_error = None
+        self.load_status = "saved"
         return True
 
     def live_mapping(self) -> dict[str, object]:
@@ -1755,6 +1764,8 @@ class EngineCameraLookWorker:
         self._stop_requested = False
         self._pending_dx = 0
         self._pending_dy = 0
+        self._drag_requested = False
+        self._release_requested = False
         self._retry_not_before = 0.0
         self._status = "stopped"
         self._available = False
@@ -1764,6 +1775,8 @@ class EngineCameraLookWorker:
         self.coalesced_batches = 0
         self.emitted_batches = 0
         self.dropped_batches = 0
+        self.release_requests = 0
+        self.releases_emitted = 0
 
     def start(self) -> None:
         with self._condition:
@@ -1834,11 +1847,11 @@ class EngineCameraLookWorker:
             if (
                 not isinstance(supported_actions, list)
                 or not all(isinstance(item, str) for item in supported_actions)
-                or "look_delta" not in supported_actions
+                or not {"look_delta", "look_stop"}.issubset(supported_actions)
             ):
                 self._record_error(
                     RuntimeError(
-                        "engine input bridge does not advertise look_delta"
+                        "engine input bridge does not advertise held look protocol"
                     ),
                     retryable=False,
                 )
@@ -1853,14 +1866,40 @@ class EngineCameraLookWorker:
                     not self._stop_requested
                     and self._pending_dx == 0
                     and self._pending_dy == 0
+                    and not self._release_requested
                 ):
                     self._condition.wait()
-                if self._stop_requested:
+                stop_after_request = self._stop_requested
+                release = bool(
+                    self._release_requested
+                    or (stop_after_request and self._drag_requested)
+                )
+                if release:
+                    self._release_requested = False
+                    self._drag_requested = False
+                    self._pending_dx = 0
+                    self._pending_dy = 0
+                    dx = 0
+                    dy = 0
+                elif stop_after_request:
                     return
-                dx = self._pending_dx
-                dy = self._pending_dy
-                self._pending_dx = 0
-                self._pending_dy = 0
+                else:
+                    dx = self._pending_dx
+                    dy = self._pending_dy
+                    self._pending_dx = 0
+                    self._pending_dy = 0
+            if release:
+                try:
+                    self._request("look_stop", {})
+                except Exception as exc:
+                    self._record_error(exc)
+                else:
+                    with self._condition:
+                        self.releases_emitted += 1
+                    self._record_success()
+                if stop_after_request:
+                    return
+                continue
             try:
                 self._request(
                     "look_delta",
@@ -1895,6 +1934,8 @@ class EngineCameraLookWorker:
                 return False
             if self._pending_dx or self._pending_dy:
                 self.coalesced_batches += 1
+            self._drag_requested = True
+            self._release_requested = False
             self._pending_dx = int(
                 _clamp(
                     self._pending_dx + dx,
@@ -1915,11 +1956,21 @@ class EngineCameraLookWorker:
 
     def cancel_pending(self) -> bool:
         with self._condition:
-            changed = bool(self._pending_dx or self._pending_dy)
+            had_pending = bool(self._pending_dx or self._pending_dy)
+            changed = bool(
+                had_pending
+                or self._drag_requested
+            )
             self._pending_dx = 0
             self._pending_dy = 0
-            if changed:
+            if self._drag_requested:
+                self._drag_requested = False
+                self._release_requested = True
+                self.release_requests += 1
+            if had_pending:
                 self.dropped_batches += 1
+            if changed:
+                self._condition.notify()
             return changed
 
     @property
@@ -1930,7 +1981,7 @@ class EngineCameraLookWorker:
                 "available": self._available,
                 "capability_compatible": self._capability_compatible,
                 "status": self._status,
-                "transport": "uinput-relative-look-delta",
+                "transport": "engine-held-relative-look-delta",
                 "button": self._button,
                 "endpoint": os.fspath(self._endpoint),
                 "submitted_batches": self.submitted_batches,
@@ -1939,6 +1990,10 @@ class EngineCameraLookWorker:
                 "dropped_batches": self.dropped_batches,
                 "pending_dx": self._pending_dx,
                 "pending_dy": self._pending_dy,
+                "drag_requested": self._drag_requested,
+                "release_pending": self._release_requested,
+                "release_requests": self.release_requests,
+                "releases_emitted": self.releases_emitted,
                 "last_error": self._last_error,
             }
 
@@ -4615,16 +4670,21 @@ def build_snapshot(
     keys, move_stick, _look_yaw = select_physical_inputs(
         keyboard, gamepad, source=input_source
     )
+    native_free_camera_drag = bool(
+        keyboard.camera_dragging
+        and not keyboard_camera_arrow_active(keyboard)
+    )
     return InputSnapshot(
         sequence=sequence,
         timestamp_monotonic_s=timestamp_monotonic_s,
         # Missing actual camera yaw is a safety condition, not permission to
         # keep walking using the last direction.
-        # Native Matrix documents held mouse-drag as temporary free camera.
-        # Treat it like a focus interlock so camera-WASD cannot also walk G1.
+        # Native mouse drag is temporary free camera and remains an interlock.
+        # Arrow camera intentionally synthesizes that drag, so keep local
+        # locomotion available while a physical arrow is held.
         focused=(
             keyboard.focused
-            and not keyboard.camera_dragging
+            and not native_free_camera_drag
             and camera_available
             and input_available
         ),
@@ -4893,6 +4953,8 @@ class OverlayIntent:
     video_field: str | None = None
     video_value: object = None
     expected_revision: int | None = None
+    pause_target: str | None = None
+    expected_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -4918,9 +4980,11 @@ class GameCommandClient:
         self,
         file_descriptor: int | None,
         *,
+        runtime_pause_capable: bool = False,
         initial_strategy_loadout: object = None,
         initial_creative_inventory: object = None,
         initial_motion_settings: object = None,
+        game_world_id: str | None = None,
         celestial_catalog: CelestialCatalog | None = None,
         celestial_clock: PersistentSimulationClock | None = None,
         celestial_visual_catalog: CelestialVisualCatalog | None = None,
@@ -4934,6 +4998,8 @@ class GameCommandClient:
         self._pending: GameCommandRequest | None = None
         self._pending_external_input: PendingExternalInputPublish | None = None
         self._pending_warning: str | None = None
+        self._pending_runtime_pause: tuple[str, int] | None = None
+        self._auto_celestial_refresh_attempted = False
         self._outcome_unknown = False
         self.editing = False
         self._escape_release_required = False
@@ -4949,6 +5015,18 @@ class GameCommandClient:
         self.restart_required = False
         self.data: dict[str, object] | None = None
         self.last_request_id: str | None = None
+        if type(runtime_pause_capable) is not bool:
+            raise ValueError("runtime pause capability must be boolean")
+        if runtime_pause_capable and file_descriptor is None:
+            raise ValueError("runtime pause capability requires a command channel")
+        self._runtime_pause_capable = runtime_pause_capable
+        self._runtime_pause: dict[str, object] = {
+            "state": "running" if runtime_pause_capable else "unavailable",
+            "epoch": 0,
+            "can_pause": runtime_pause_capable,
+            "can_resume": False,
+            "last_error": None,
+        }
         self._strategy_loadout = self._validate_strategy_loadout(
             initial_strategy_loadout
         )
@@ -4982,7 +5060,20 @@ class GameCommandClient:
         self._celestial_visual_catalog = celestial_visual_catalog
         self._celestial_visual_profile = celestial_visual_profile
         self._celestial_lighting_bridge = celestial_lighting_bridge
-        self._teleport_probes = {}
+        if celestial_catalog is None:
+            if game_world_id is not None:
+                raise ValueError("game world id requires a celestial catalog")
+            self._teleport_probes = {}
+        else:
+            if game_world_id is None:
+                raise ValueError("celestial navigation requires an explicit game world id")
+            try:
+                self._teleport_probes = TeleportProbeSet(
+                    world_id=game_world_id,
+                    probes={},
+                )
+            except CelestialNavigationError as exc:
+                raise ValueError(f"game world id is invalid: {exc}") from exc
         if file_descriptor is None:
             return
         if (
@@ -5165,6 +5256,73 @@ class GameCommandClient:
             else None
         )
 
+    @staticmethod
+    def _validate_runtime_pause_ack(value: object) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != {
+            "phase",
+            "epoch",
+            "paused",
+        }:
+            raise ValueError("runtime pause ACK has an invalid schema")
+        phase = value.get("phase")
+        epoch = value.get("epoch")
+        paused = value.get("paused")
+        if (
+            type(phase) is not str
+            or phase not in {"running", "paused"}
+            or type(epoch) is not int
+            or not 0 <= epoch <= MAX_RUNTIME_PAUSE_EPOCH
+            or type(paused) is not bool
+            or paused != (phase == "paused")
+        ):
+            raise ValueError("runtime pause ACK values are invalid")
+        return {"phase": phase, "epoch": epoch, "paused": paused}
+
+    def runtime_pause_mapping(self) -> dict[str, object]:
+        mapping = dict(self._runtime_pause)
+        pending = self._pending_runtime_pause
+        if pending is not None:
+            mapping.update(
+                {
+                    "state": "pausing" if pending[0] == "paused" else "resuming",
+                    "can_pause": False,
+                    "can_resume": False,
+                }
+            )
+        return mapping
+
+    def _celestial_checkpoint_writes_allowed(self) -> bool:
+        return bool(
+            self._pending_runtime_pause is None
+            and self._runtime_pause.get("state") in {"running", "unavailable"}
+        )
+
+    def _commit_runtime_pause_ack(self, ack: dict[str, object]) -> str | None:
+        paused = ack["paused"]
+        assert type(paused) is bool
+        clock = self._celestial_clock
+        if clock is not None:
+            try:
+                clock.set_paused(paused)
+            except Exception as exc:
+                error = f"celestial pause synchronization failed: {exc}"[:256]
+                self._runtime_pause = {
+                    "state": "fault",
+                    "epoch": ack["epoch"],
+                    "can_pause": False,
+                    "can_resume": False,
+                    "last_error": error,
+                }
+                return error
+        self._runtime_pause = {
+            "state": ack["phase"],
+            "epoch": ack["epoch"],
+            "can_pause": not paused,
+            "can_resume": paused,
+            "last_error": None,
+        }
+        return None
+
     def celestial_navigation_mapping(self) -> dict[str, object]:
         catalog = self._celestial_catalog
         clock = self._celestial_clock
@@ -5211,12 +5369,17 @@ class GameCommandClient:
                     sample,
                 )
             mapping["lighting"] = profiled_lighting
-        clock.checkpoint()
+        if self._celestial_checkpoint_writes_allowed():
+            clock.checkpoint()
         return mapping
 
     def checkpoint_celestial_clock(self) -> bool:
         clock = self._celestial_clock
-        return clock.checkpoint() if clock is not None else False
+        return (
+            clock.checkpoint()
+            if clock is not None and self._celestial_checkpoint_writes_allowed()
+            else False
+        )
 
     @property
     def available(self) -> bool:
@@ -5250,8 +5413,10 @@ class GameCommandClient:
 
     def _protocol_failure(self, message: str) -> None:
         pending = self._pending
+        pending_runtime_pause = self._pending_runtime_pause
         self._pending = None
         self._pending_warning = None
+        self._pending_runtime_pause = None
         self._close_channel()
         if pending is not None:
             # A full SOCK_SEQPACKET record was accepted before this failure.
@@ -5265,14 +5430,33 @@ class GameCommandClient:
             self.status = "error"
             self.ok = None
             self.code = "E_COMMAND_OUTCOME_UNKNOWN"
-            self.message = (
-                f"Command outcome unknown ({detail}); do not retry blindly. "
-                "Restart Matrix and inspect the persisted world state"
-            )
             self.warning = None
             self.restart_required = False
             self.data = None
             self.last_request_id = pending.request_id
+            if pending_runtime_pause is not None:
+                clock = self._celestial_clock
+                if clock is not None:
+                    try:
+                        # The runtime may already have crossed the writer
+                        # fence. Freeze scenario time as well as checkpoint
+                        # writes until the required whole-runtime restart.
+                        clock.set_paused(True)
+                    except Exception as exc:
+                        detail = (
+                            f"{detail}; celestial fail-closed pause failed: {exc}"
+                        )[:256]
+                self._runtime_pause = {
+                    "state": "fault",
+                    "epoch": self._runtime_pause["epoch"],
+                    "can_pause": False,
+                    "can_resume": False,
+                    "last_error": detail,
+                }
+            self.message = (
+                f"Command outcome unknown ({detail}); do not retry blindly. "
+                "Restart Matrix and inspect the persisted world state"
+            )
             return
         self._local_error("E_COMMAND_PROTOCOL", message)
 
@@ -5400,6 +5584,100 @@ class GameCommandClient:
             pending_message="Command submitted; waiting for the runtime",
         )
 
+    def submit_runtime_pause(
+        self,
+        target: object,
+        expected_epoch: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Submit one authenticated pause transition without text-editor state."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if not self._runtime_pause_capable:
+            self._local_error(
+                "E_RUNTIME_PAUSE_UNAVAILABLE",
+                "Runtime pause is unavailable for this simulation",
+            )
+            return False
+        if type(target) is not str or target not in {"paused", "running"}:
+            self._local_error(
+                "E_RUNTIME_PAUSE_TARGET", "Runtime pause target is invalid"
+            )
+            return False
+        if (
+            type(expected_epoch) is not int
+            or not 0 <= expected_epoch <= MAX_RUNTIME_PAUSE_EPOCH
+        ):
+            self._local_error(
+                "E_RUNTIME_PAUSE_EPOCH", "Runtime pause epoch is invalid"
+            )
+            return False
+        if not calibration_active:
+            self._local_error(
+                "E_NOT_PAUSED", "Open the ESC panel before changing runtime pause"
+            )
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        current_epoch = self._runtime_pause.get("epoch")
+        current_state = self._runtime_pause.get("state")
+        allowed = bool(
+            (target == "paused" and self._runtime_pause.get("can_pause") is True)
+            or (target == "running" and self._runtime_pause.get("can_resume") is True)
+        )
+        if current_epoch != expected_epoch:
+            self._local_error(
+                "E_RUNTIME_PAUSE_EPOCH",
+                f"Runtime pause epoch changed from {expected_epoch} to {current_epoch}",
+            )
+            return False
+        if not allowed or current_state not in {"running", "paused"}:
+            self._local_error(
+                "E_RUNTIME_PAUSE_STATE",
+                f"Runtime pause cannot transition from {current_state!r} to {target!r}",
+            )
+            return False
+        command_text = f"/runtime pause {target} {expected_epoch}"
+        try:
+            parsed = parse_mc_command(command_text)
+        except CommandParseError as exc:
+            message = exc.message
+            if exc.column is not None:
+                message = f"{message} (column {exc.column})"
+            self._local_error(exc.code, message)
+            return False
+        if (
+            not isinstance(parsed.command, RuntimePause)
+            or parsed.command.target != target
+            or parsed.command.expected_epoch != expected_epoch
+        ):
+            self._local_error(
+                "E_COMMAND_PROTOCOL",
+                "Runtime pause text did not produce the expected typed command",
+            )
+            return False
+        submitted = self._send_typed_command(
+            parsed.command,
+            warning=parsed.warning,
+            pending_message=f"Runtime {target} transition submitted",
+        )
+        if submitted:
+            self._pending_runtime_pause = (target, expected_epoch)
+        return submitted
+
     def submit_external(
         self,
         command_text: object,
@@ -5474,6 +5752,14 @@ class GameCommandClient:
             self.data = data
             self.last_request_id = None
             return True
+        if isinstance(parsed.command, RuntimePause):
+            return self.submit_runtime_pause(
+                parsed.command.target,
+                parsed.command.expected_epoch,
+                calibration_active=calibration_active,
+                neutral_frame_ready=neutral_frame_ready,
+                restart_requested=restart_requested,
+            )
         if not calibration_active:
             self._local_error("E_NOT_PAUSED", "Open the ESC panel before commands")
             return False
@@ -5773,16 +6059,48 @@ class GameCommandClient:
                 "E_RESTART_PENDING", "A whole-runtime restart is already pending"
             )
             return False
+        return self._send_celestial_teleport_list(
+            pending_message="Refreshing celestial teleport points"
+        )
+
+    def auto_refresh_celestial_navigation_once(self) -> bool:
+        """Send one startup teleport probe query without panel gates."""
+
+        if (
+            self._auto_celestial_refresh_attempted
+            or self.in_flight
+            or self.restart_required
+            or self._outcome_unknown
+            or self._celestial_catalog is None
+            or not self.available
+        ):
+            return False
+        self._auto_celestial_refresh_attempted = True
+        return self._send_celestial_teleport_list(
+            pending_message="Refreshing celestial teleport points"
+        )
+
+    def _send_celestial_teleport_list(self, *, pending_message: str) -> bool:
+        catalog = self._celestial_catalog
+        if catalog is None:
+            self._local_error(
+                "E_NAVIGATION_UNAVAILABLE", "Celestial navigation is unavailable"
+            )
+            return False
         command = TeleportList(
             tuple(destination.teleport_tag for destination in catalog.destinations)
         )
         sent = self._send_typed_command(
             command,
             warning=None,
-            pending_message="Refreshing celestial teleport points",
+            pending_message=pending_message,
         )
         if sent:
-            self._teleport_probes = {}
+            assert isinstance(self._teleport_probes, TeleportProbeSet)
+            self._teleport_probes = TeleportProbeSet(
+                world_id=self._teleport_probes.world_id,
+                probes={},
+            )
         return sent
 
     def select_celestial_destination(
@@ -5883,6 +6201,69 @@ class GameCommandClient:
             self._protocol_failure("Game command response identity did not match")
             return True
         response_data = dict(response.data) if response.data is not None else None
+        pending_runtime_pause = self._pending_runtime_pause
+        pending_pause_command = (
+            pending.command if isinstance(pending.command, RuntimePause) else None
+        )
+        validated_runtime_pause: dict[str, object] | None = None
+        if pending_pause_command is None:
+            if pending_runtime_pause is not None:
+                self._protocol_failure(
+                    "Non-pause command retained runtime pause request state"
+                )
+                return True
+            if response_data is not None and "runtime_pause" in response_data:
+                self._protocol_failure(
+                    "Non-pause command response carried runtime pause data"
+                )
+                return True
+        else:
+            expected_pending = (
+                pending_pause_command.target,
+                pending_pause_command.expected_epoch,
+            )
+            if pending_runtime_pause != expected_pending:
+                self._protocol_failure(
+                    "Runtime pause request state did not match its pending AST"
+                )
+                return True
+            if response.ok:
+                expected_code = _RUNTIME_PAUSE_SUCCESS_CODES[
+                    pending_pause_command.target
+                ]
+                if response.code != expected_code:
+                    self._protocol_failure(
+                        "Runtime pause success code did not match its target"
+                    )
+                    return True
+                if response_data is None or set(response_data) != {"runtime_pause"}:
+                    self._protocol_failure(
+                        "Runtime pause success requires exactly one authoritative ACK"
+                    )
+                    return True
+                try:
+                    validated_runtime_pause = self._validate_runtime_pause_ack(
+                        response_data["runtime_pause"]
+                    )
+                except ValueError as exc:
+                    self._protocol_failure(
+                        f"Invalid runtime pause state in command response: {exc}"
+                    )
+                    return True
+                if (
+                    validated_runtime_pause["phase"]
+                    != pending_pause_command.target
+                    or validated_runtime_pause["epoch"]
+                    != pending_pause_command.expected_epoch + 1
+                ):
+                    self._protocol_failure(
+                        "Runtime pause ACK did not match target and next epoch"
+                    )
+                    return True
+            elif response_data is not None:
+                # Failed pause responses are not authoritative. Preserve any
+                # unrelated diagnostic data without exposing pause telemetry.
+                response_data.pop("runtime_pause", None)
         validated_loadout: dict[str, object] | None = None
         validated_inventory: dict[str, object] | None = None
         validated_motion_settings: dict[str, object] | None = None
@@ -5933,6 +6314,7 @@ class GameCommandClient:
                 )
                 return True
         self._pending = None
+        self._pending_runtime_pause = None
         warning = self._pending_warning
         self._pending_warning = None
         self._result_revision += 1
@@ -5949,11 +6331,21 @@ class GameCommandClient:
             self._creative_inventory = validated_inventory
         if validated_motion_settings is not None:
             self._motion_settings = validated_motion_settings
+        pause_sync_error = None
+        if response.ok and validated_runtime_pause is not None:
+            pause_sync_error = self._commit_runtime_pause_ack(
+                validated_runtime_pause
+            )
         if teleport_probes is not None:
             self._teleport_probes = teleport_probes
         self.last_request_id = response.request_id
         if response.ok and response.restart_required:
             self.status = "restarting"
+        elif pause_sync_error is not None:
+            self.status = "error"
+            self.ok = False
+            self.code = "E_CELESTIAL_PAUSE_SYNC"
+            self.message = pause_sync_error
         else:
             self.status = "success" if response.ok else "error"
         return True
@@ -5973,6 +6365,7 @@ class GameCommandClient:
             "warning": self.warning,
             "restart_required": self.restart_required,
             "outcome_unknown": self.outcome_unknown,
+            "runtime_pause": self.runtime_pause_mapping(),
             "data": self.data,
         }
 
@@ -6011,10 +6404,22 @@ class GameCommandClient:
         """Close providers after the final status mapping has been serialized."""
 
         first_error: BaseException | None = None
+        clock = self._celestial_clock
+
+        def close_clock() -> None:
+            assert clock is not None
+            if (
+                isinstance(clock, PersistentSimulationClock)
+                and not self._celestial_checkpoint_writes_allowed()
+            ):
+                clock.close(checkpoint=False)
+            else:
+                clock.close()
+
         operations = (
             (
-                self._celestial_clock.close
-                if self._celestial_clock is not None
+                close_clock
+                if clock is not None
                 else None
             ),
             (
@@ -6307,6 +6712,30 @@ class CalibrationOverlaySupervisor:
                 ):
                     raise RuntimeError("invalid calibration overlay command-submit intent")
                 intent = OverlayIntent(kind="command_submit", command=command)
+            elif kind == "runtime_pause":
+                pause_target = value.get("pause_target")
+                expected_epoch = value.get("expected_epoch")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "pause_target",
+                        "expected_epoch",
+                    }
+                    or type(pause_target) is not str
+                    or pause_target not in {"paused", "running"}
+                    or type(expected_epoch) is not int
+                    or not 0 <= expected_epoch <= MAX_RUNTIME_PAUSE_EPOCH
+                ):
+                    raise RuntimeError("invalid runtime-pause intent schema")
+                intent = OverlayIntent(
+                    kind="runtime_pause",
+                    pause_target=pause_target,
+                    expected_epoch=expected_epoch,
+                )
             elif kind == "strategy_select":
                 if set(value) != {
                     "version",
@@ -6611,6 +7040,12 @@ def _parse_args() -> argparse.Namespace:
         help="Inherited private SOCK_SEQPACKET channel for typed ESC commands",
     )
     parser.add_argument(
+        "--runtime-pause-capability",
+        choices=("unavailable", "available"),
+        default="unavailable",
+        help="Physics-runtime attestation that a fenced pause writer is available",
+    )
+    parser.add_argument(
         "--strategy-loadout-json",
         help="Initial resident strategy-slot state supplied by the physics runtime",
     )
@@ -6664,6 +7099,11 @@ def _parse_args() -> argparse.Namespace:
         help="Strict SOL universe/body/destination catalog",
     )
     parser.add_argument(
+        "--game-world-id",
+        required=True,
+        help="Exact current Matrix world identity supplied by the runtime",
+    )
+    parser.add_argument(
         "--celestial-clock-state-file",
         type=Path,
         help="Optional persistent TAI clock state shared across cold reloads",
@@ -6695,6 +7135,10 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    try:
+        TeleportProbeSet(world_id=args.game_world_id, probes={})
+    except CelestialNavigationError as exc:
+        raise SystemExit(f"--game-world-id is invalid: {exc}") from exc
     if not args.socket.is_absolute():
         raise SystemExit("--socket must be an absolute path")
     if not args.socket.parent.is_dir():
@@ -6815,6 +7259,13 @@ def _validate_args(args: argparse.Namespace) -> None:
             os.fstat(game_command_fd)
         except OSError as exc:
             raise SystemExit(f"--game-command-fd is not open: {exc}") from exc
+    if (
+        args.runtime_pause_capability == "available"
+        and game_command_fd is None
+    ):
+        raise SystemExit(
+            "--runtime-pause-capability available requires --game-command-fd"
+        )
     external_values = (
         args.external_control_socket,
         args.external_control_capability_file,
@@ -7094,9 +7545,13 @@ def main() -> int:
     try:
         game_command_client = GameCommandClient(
             getattr(args, "game_command_fd", None),
+            runtime_pause_capable=(
+                args.runtime_pause_capability == "available"
+            ),
             initial_strategy_loadout=initial_strategy_loadout,
             initial_creative_inventory=initial_creative_inventory,
             initial_motion_settings=initial_motion_settings,
+            game_world_id=args.game_world_id,
             celestial_catalog=celestial_catalog,
             celestial_clock=celestial_clock,
             celestial_visual_catalog=celestial_visual_catalog,
@@ -7315,6 +7770,10 @@ def main() -> int:
                 )
                 external_inflight_command = None
                 external_control_changed = True
+            command_state_changed = bool(
+                game_command_client.auto_refresh_celestial_navigation_once()
+                or command_state_changed
+            )
             shortcuts_armed = shortcut_arming.update(
                 escape_pressed=raw_keyboard.escape,
                 restart_pressed=raw_keyboard.apply_restart,
@@ -7361,6 +7820,22 @@ def main() -> int:
                         or command_state_changed
                     )
                     if intent.active:
+                        apply_return.cancel_pending()
+                    continue
+                if intent.kind == "runtime_pause":
+                    assert intent.pause_target is not None
+                    assert intent.expected_epoch is not None
+                    runtime_pause_submitted = (
+                        game_command_client.submit_runtime_pause(
+                            intent.pause_target,
+                            intent.expected_epoch,
+                            calibration_active=calibration.active,
+                            neutral_frame_ready=neutral_frame_ready,
+                            restart_requested=restart_requester.requested,
+                        )
+                    )
+                    command_state_changed = True
+                    if runtime_pause_submitted:
                         apply_return.cancel_pending()
                     continue
                 if intent.kind == "strategy_select":
@@ -7519,6 +7994,7 @@ def main() -> int:
                     in {
                         "command_edit",
                         "command_submit",
+                        "runtime_pause",
                         "strategy_select",
                         "creative_spawn",
                         "font_size",

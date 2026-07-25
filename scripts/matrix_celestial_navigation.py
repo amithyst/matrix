@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Mapping
 
@@ -166,14 +167,26 @@ class CelestialLaunchRoute:
     required_assets: tuple[str, ...]
 
     def missing_assets(self, project_root: Path) -> tuple[str, ...]:
-        """Return catalog-relative assets that are not installed locally."""
+        """Return catalog-relative assets that are not regular local files."""
 
         root = Path(project_root)
-        return tuple(
-            relative
-            for relative in self.required_assets
-            if not (root / relative).is_file()
-        )
+        try:
+            resolved_root = root.resolve(strict=True)
+        except OSError:
+            return self.required_assets
+        missing: list[str] = []
+        for relative in self.required_assets:
+            candidate = root / relative
+            try:
+                metadata = candidate.lstat()
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(resolved_root)
+            except (OSError, ValueError):
+                missing.append(relative)
+                continue
+            if candidate.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                missing.append(relative)
+        return tuple(missing)
 
     def synthetic_entity_id(self, *, destination_id: str, teleport_tag: str) -> str:
         digest = hashlib.sha256(
@@ -190,6 +203,22 @@ class CelestialLaunchRoute:
             "target_world_id": self.world_id,
             "entry_pose": self.entry_pose.to_mapping(),
             "required_assets": list(self.required_assets),
+        }
+
+    def runtime_mapping(
+        self, *, destination_id: str, teleport_tag: str
+    ) -> dict[str, object]:
+        return {
+            "schema": "matrix-celestial-launch-route/v1",
+            "destination_id": destination_id,
+            "teleport_tag": teleport_tag,
+            "target_scene_id": self.scene_id,
+            "target_world_id": self.world_id,
+            "entry_pose": self.entry_pose.to_mapping(),
+            "entity_id": self.synthetic_entity_id(
+                destination_id=destination_id,
+                teleport_tag=teleport_tag,
+            ),
         }
 
 
@@ -217,6 +246,25 @@ class TeleportProbe:
         if self.found != (self.entity_id is not None and self.pose is not None):
             raise CelestialNavigationError("teleport probe payload is inconsistent")
         object.__setattr__(self, "tag", tag)
+
+
+class TeleportProbeSet(dict[str, TeleportProbe]):
+    """Teleport probes bound to the exact world that produced them."""
+
+    def __init__(
+        self,
+        *,
+        world_id: str,
+        probes: Mapping[str, TeleportProbe],
+    ) -> None:
+        try:
+            self.world_id = validate_world_id(world_id)
+        except WorldStateError as exc:
+            raise CelestialNavigationError(str(exc)) from exc
+        for tag, probe in probes.items():
+            if not isinstance(probe, TeleportProbe) or probe.tag != tag:
+                raise CelestialNavigationError("teleport probe set is inconsistent")
+        super().__init__(probes)
 
 
 @dataclass(frozen=True)
@@ -252,6 +300,97 @@ class CelestialCatalog:
         raise CelestialNavigationError(
             f"unknown celestial destination {destination_id!r}"
         )
+
+    def body_id_for_world(self, world_id: str | None) -> str:
+        if world_id is None:
+            return self.default_body_id
+        try:
+            validated = validate_world_id(world_id)
+        except WorldStateError as exc:
+            raise CelestialNavigationError(str(exc)) from exc
+        body_ids = {
+            destination.body_id
+            for destination in self.destinations
+            if destination.launch_route is not None
+            and destination.launch_route.world_id == validated
+        }
+        if not body_ids:
+            return self.default_body_id
+        if len(body_ids) != 1:
+            raise CelestialNavigationError(
+                f"world {validated!r} maps to multiple celestial bodies"
+            )
+        return next(iter(body_ids))
+
+    def validate_runtime_launch_route(
+        self,
+        value: object,
+        *,
+        project_root: Path,
+    ) -> CelestialDestination:
+        expected_fields = {
+            "schema",
+            "destination_id",
+            "teleport_tag",
+            "target_scene_id",
+            "target_world_id",
+            "entry_pose",
+            "entity_id",
+        }
+        if not isinstance(value, dict) or set(value) != expected_fields:
+            raise CelestialNavigationError("runtime launch route has an invalid schema")
+        if value.get("schema") != "matrix-celestial-launch-route/v1":
+            raise CelestialNavigationError("runtime launch route schema is unsupported")
+        destination_id = _safe_id(
+            value.get("destination_id"), label="runtime launch route destination_id"
+        )
+        try:
+            teleport_tag = validate_tag(value.get("teleport_tag"))
+            target_world_id = validate_world_id(value.get("target_world_id"))
+            entry_pose = WorldPose.from_mapping(
+                value.get("entry_pose"), label="runtime launch route entry_pose"
+            )
+        except WorldStateError as exc:
+            raise CelestialNavigationError(str(exc)) from exc
+        target_scene_id = _bounded_integer(
+            value.get("target_scene_id"),
+            label="runtime launch route target_scene_id",
+            minimum=0,
+            maximum=99,
+        )
+        entity_id = value.get("entity_id")
+        if not isinstance(entity_id, str) or _ENTITY_ID_RE.fullmatch(entity_id) is None:
+            raise CelestialNavigationError("runtime launch route entity_id is invalid")
+        normalized = {
+            "schema": "matrix-celestial-launch-route/v1",
+            "destination_id": destination_id,
+            "teleport_tag": teleport_tag,
+            "target_scene_id": target_scene_id,
+            "target_world_id": target_world_id,
+            "entry_pose": entry_pose.to_mapping(),
+            "entity_id": entity_id,
+        }
+        destination = self.destination(destination_id)
+        route = destination.launch_route
+        if (
+            route is None
+            or not self.body(destination.body_id).runtime_ready
+            or normalized
+            != route.runtime_mapping(
+                destination_id=destination.destination_id,
+                teleport_tag=destination.teleport_tag,
+            )
+        ):
+            raise CelestialNavigationError(
+                "runtime launch route does not match the controlled catalog"
+            )
+        missing_assets = route.missing_assets(project_root)
+        if missing_assets:
+            raise CelestialNavigationError(
+                "runtime launch route assets are unavailable: "
+                + ", ".join(missing_assets)
+            )
+        return destination
 
     def list_command(self) -> str:
         tags = " ".join(destination.teleport_tag for destination in self.destinations)
@@ -309,6 +448,10 @@ class CelestialCatalog:
         navigation_available = bool(
             command_available and not restart_required and not outcome_unknown
         )
+        current_world_id = (
+            probes.world_id if isinstance(probes, TeleportProbeSet) else None
+        )
+        current_body_id = self.body_id_for_world(current_world_id)
         destinations: list[dict[str, object]] = []
         current_anchor: SurfaceAnchor | None = None
         current_local_position = (0.0, 0.0, 0.0)
@@ -362,7 +505,7 @@ class CelestialCatalog:
                 if probe is not None and probe.pose is not None
                 else None
             )
-            if body.body_id == self.default_body_id and current_anchor is None:
+            if body.body_id == current_body_id and current_anchor is None:
                 current_anchor = destination.surface_anchor
                 if probe is not None and probe.pose is not None:
                     current_local_position = (
@@ -402,7 +545,7 @@ class CelestialCatalog:
             )
         try:
             lighting = solar_lighting_state(
-                observer_body=definitions[self.default_body_id],
+                observer_body=definitions[current_body_id],
                 anchor=current_anchor,
                 local_position_m=current_local_position,
                 bodies=definitions,
@@ -450,7 +593,7 @@ class CelestialCatalog:
             "simulation_time": current_time.mapping(),
             "origin_rebasing": self.origin_rebasing,
             "simulation_local_bound_m": self.simulation_local_bound_m,
-            "current_body_id": self.default_body_id,
+            "current_body_id": current_body_id,
             "bodies": body_states,
             "lighting": lighting,
             "destinations": destinations,
@@ -971,6 +1114,18 @@ def load_catalog(
         raise CelestialNavigationError("celestial destination tags must be unique")
     if not any(destination.body_id == default_body_id for destination in destinations):
         raise CelestialNavigationError("default celestial body requires a destination")
+    route_world_bodies: dict[str, str] = {}
+    for destination in destinations:
+        route = destination.launch_route
+        if route is None:
+            continue
+        existing_body = route_world_bodies.setdefault(
+            route.world_id, destination.body_id
+        )
+        if existing_body != destination.body_id:
+            raise CelestialNavigationError(
+                f"launch route world {route.world_id!r} maps to multiple bodies"
+            )
     return CelestialCatalog(
         universe_id=_safe_id(universe.get("id"), label="universe.id"),
         display_name=_bounded_text(
@@ -996,14 +1151,14 @@ def load_catalog(
 
 def probes_from_response(
     value: object, *, catalog: CelestialCatalog
-) -> dict[str, TeleportProbe]:
+) -> TeleportProbeSet:
     if not isinstance(value, dict) or set(value) != {
         "world_id",
         "teleport_points",
     }:
         raise CelestialNavigationError("teleport-list response has an invalid schema")
     try:
-        validate_world_id(value.get("world_id"))
+        world_id = validate_world_id(value.get("world_id"))
     except WorldStateError as exc:
         raise CelestialNavigationError("teleport-list world id is invalid") from exc
     raw_points = value.get("teleport_points")
@@ -1062,7 +1217,7 @@ def probes_from_response(
                 f"teleport_points[{index}] has an invalid schema"
             )
         probes[tag] = probe
-    return probes
+    return TeleportProbeSet(world_id=world_id, probes=probes)
 
 
 def _parse_cli_args() -> argparse.Namespace:
@@ -1117,6 +1272,7 @@ __all__ = [
     "DEFAULT_CATALOG_PATH",
     "DEFAULT_ASSET_MANIFEST_PATH",
     "TeleportProbe",
+    "TeleportProbeSet",
     "load_catalog",
     "probes_from_response",
 ]

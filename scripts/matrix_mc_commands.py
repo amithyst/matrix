@@ -28,6 +28,7 @@ from matrix_motion_settings import MOTION_SETTING_PATHS
 COMMAND_PROTOCOL = "matrix-game-command/v1"
 MAX_COMMAND_CHARS = 512
 MAX_COMMAND_PACKET_BYTES = 4096
+MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 MAX_TELEPORT_QUERY_TAGS = 8
 _SESSION_RE = re.compile(r"[0-9a-f]{32}\Z")
 _REQUEST_ID_RE = re.compile(r"cmd-[0-9a-f]{32}\Z")
@@ -53,6 +54,11 @@ _POLICY_RE = re.compile(
 )
 _ITEM_RE = re.compile(
     r"/?item\s+spawn\s+(?P<item>[a-z0-9][a-z0-9_-]{0,47})\s*\Z",
+    re.IGNORECASE,
+)
+_RUNTIME_PAUSE_RE = re.compile(
+    r"/?runtime\s+pause\s+(?P<target>paused|running)\s+"
+    r"(?P<epoch>0|[1-9][0-9]{0,9})\s*\Z",
     re.IGNORECASE,
 )
 _DATA_MODIFY_RE = re.compile(
@@ -352,6 +358,31 @@ class CreativeSpawnItem:
 
 
 @dataclass(frozen=True)
+class RuntimePause:
+    """Request a fenced physics pause transition at one known epoch."""
+
+    target: str
+    expected_epoch: int
+
+    def __post_init__(self) -> None:
+        target = str(self.target).strip().lower()
+        if target not in {"paused", "running"}:
+            raise CommandParseError(
+                "E_RUNTIME_PAUSE_TARGET",
+                "runtime pause target must be paused or running",
+            )
+        if (
+            type(self.expected_epoch) is not int
+            or not 0 <= self.expected_epoch <= MAX_RUNTIME_PAUSE_EPOCH
+        ):
+            raise CommandParseError(
+                "E_RUNTIME_PAUSE_EPOCH",
+                "runtime pause epoch must be an integer in [0, 2147483647]",
+            )
+        object.__setattr__(self, "target", target)
+
+
+@dataclass(frozen=True)
 class DataModifyNumber:
     """Set one whitelisted numeric Matrix entity-data path."""
 
@@ -423,6 +454,7 @@ McCommand: TypeAlias = (
     | TeleportList
     | PolicySlotAssignment
     | CreativeSpawnItem
+    | RuntimePause
     | DataModifyNumber
     | DataModifyInput
 )
@@ -604,6 +636,14 @@ def _parse_data_modify(path: str, raw_value: str) -> DataModifyNumber | DataModi
 
 def parse_mc_command(text: object) -> ParsedCommand:
     command_text = _validate_text(text)
+    runtime_pause = _RUNTIME_PAUSE_RE.fullmatch(command_text)
+    if runtime_pause is not None:
+        return ParsedCommand(
+            RuntimePause(
+                target=runtime_pause.group("target"),
+                expected_epoch=int(runtime_pause.group("epoch")),
+            )
+        )
     item = _ITEM_RE.fullmatch(command_text)
     if item is not None:
         return ParsedCommand(CreativeSpawnItem(item.group("item")))
@@ -687,11 +727,17 @@ def parse_mc_command(text: object) -> ParsedCommand:
     raise CommandParseError(
         "E_COMMAND_UNKNOWN",
         "supported commands are /summon, /tp, /teleport list, /policy, "
-        "/item spawn, and /data modify",
+        "/item spawn, /runtime pause, and /data modify",
     )
 
 
 def command_to_mapping(command: McCommand) -> dict[str, object]:
+    if isinstance(command, RuntimePause):
+        return {
+            "name": "runtime_pause",
+            "target": command.target,
+            "expected_epoch": command.expected_epoch,
+        }
     if isinstance(command, CreativeSpawnItem):
         return {"name": "creative_spawn_item", "item_id": command.item_id}
     if isinstance(command, DataModifyInput):
@@ -750,6 +796,16 @@ def command_from_mapping(value: object) -> McCommand:
     if not isinstance(value, dict) or not isinstance(value.get("name"), str):
         raise CommandProtocolError("command AST has an invalid schema")
     name = value["name"]
+    if name == "runtime_pause":
+        if set(value) != {"name", "target", "expected_epoch"}:
+            raise CommandProtocolError("runtime pause has an invalid schema")
+        try:
+            return RuntimePause(
+                target=value.get("target"),
+                expected_epoch=value.get("expected_epoch"),
+            )
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
     if name == "creative_spawn_item":
         if set(value) != {"name", "item_id"}:
             raise CommandProtocolError("creative spawn item has an invalid schema")
@@ -1137,7 +1193,7 @@ def execute_command(
         )
     if isinstance(command, TeleportSelector):
         route = routes.get(command.tag)
-        if route is not None:
+        if route is not None and route.target_world_id != state.world_id:
             next_state = state.set_resume_pose(
                 current_pose,
                 source="teleport_command",
@@ -1196,7 +1252,7 @@ def execute_command(
         found_count = 0
         for tag in requested_tags:
             route = routes.get(tag)
-            if route is not None:
+            if route is not None and route.target_world_id != state.world_id:
                 results.append(
                     {
                         "tag": tag,
@@ -1265,6 +1321,7 @@ __all__ = [
     "MAX_TELEPORT_QUERY_TAGS",
     "ParsedCommand",
     "PolicySlotAssignment",
+    "RuntimePause",
     "SummonTeleportPoint",
     "TeleportCoordinates",
     "TeleportLocalCoordinates",

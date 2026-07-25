@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import importlib.util
 import inspect
@@ -28,6 +29,7 @@ GAME_CONTROL = sys.modules["matrix_game_control"]
 MC_COMMANDS = sys.modules["matrix_mc_commands"]
 WORLD_STATE = sys.modules["matrix_world_state"]
 MOTION_SETTINGS = sys.modules["matrix_motion_settings"]
+EARTH_WORLD_ID = "g1_29dof:scene_terrain_t10"
 
 
 class MatrixSonicRuntimeTest(unittest.TestCase):
@@ -581,6 +583,257 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "retained_previous_safe",
                 )
 
+    def test_final_world_checkpoint_is_blocked_while_writes_are_frozen(self) -> None:
+        baseline = {
+            "world_available": True,
+            "termination_reason": "signal",
+            "read_only_fall_stop": False,
+            "checkpoint_writes_armed": True,
+            "checkpoint_writes_frozen": False,
+        }
+        self.assertTrue(MODULE._final_world_checkpoint_allowed(**baseline))
+        self.assertFalse(
+            MODULE._final_world_checkpoint_allowed(
+                **{**baseline, "checkpoint_writes_frozen": True}
+            )
+        )
+        self.assertFalse(
+            MODULE._final_world_checkpoint_allowed(
+                **{**baseline, "termination_reason": "game_teleport"}
+            )
+        )
+
+    def test_pause_request_keeps_world_checkpoints_byte_exact_until_running(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            world_id = "town10:pause-checkpoint"
+            world_revision = "a" * 64
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id=world_id,
+                world_revision=world_revision,
+                checkpoint_seconds=0.1,
+            )
+            initial = self.snapshot()
+            initial.qpos[:7] = [1.0, 2.0, 0.8, 1.0, 0.0, 0.0, 0.0]
+            self.assertTrue(world.checkpoint(initial, now_s=1.0, force=True))
+
+            def durable_identity() -> tuple[str, int, WORLD_STATE.WorldPose | None]:
+                persisted = WORLD_STATE.WorldStateStore(
+                    state_path,
+                    world_id=world_id,
+                    world_revision=world_revision,
+                ).load()
+                return (
+                    MODULE._sha256_file(state_path),
+                    persisted.generation,
+                    persisted.last_exit,
+                )
+
+            baseline = durable_identity()
+            candidate = self.snapshot(step_index=1, sim_time=0.1)
+            candidate.qpos[:7] = [9.0, 8.0, 0.9, 1.0, 0.0, 0.0, 0.0]
+            pause = MODULE._RuntimePauseState()
+            self.assertFalse(
+                pause.request("paused", expected_epoch=0, now_s=10.0)
+            )
+            self.assertFalse(pause.physics_frozen)
+            self.assertTrue(pause.checkpoint_writes_frozen)
+
+            periodic_allowed = MODULE._world_checkpoint_writes_allowed(
+                checkpoint_writes_armed=True,
+                checkpoint_writes_frozen=pause.checkpoint_writes_frozen,
+            )
+            self.assertFalse(periodic_allowed)
+            if periodic_allowed:
+                world.checkpoint(candidate, now_s=10.1)
+            self.assertEqual(durable_identity(), baseline)
+
+            child_fault_allowed = MODULE._final_world_checkpoint_allowed(
+                world_available=True,
+                termination_reason="child_exit",
+                read_only_fall_stop=False,
+                checkpoint_writes_armed=True,
+                checkpoint_writes_frozen=pause.checkpoint_writes_frozen,
+            )
+            self.assertFalse(child_fault_allowed)
+            if child_fault_allowed:
+                world.checkpoint(candidate, now_s=10.2, force=True)
+            self.assertEqual(durable_identity(), baseline)
+
+            timed_out = MODULE._RuntimePauseState()
+            self.assertFalse(
+                timed_out.request("paused", expected_epoch=0, now_s=20.0)
+            )
+            with self.assertRaisesRegex(RuntimeError, "pause_requested.*5.001"):
+                timed_out.ensure_transition_fresh(now_s=25.001)
+            timeout_cleanup_allowed = MODULE._final_world_checkpoint_allowed(
+                world_available=True,
+                termination_reason="physical_recovery_failed",
+                read_only_fall_stop=False,
+                checkpoint_writes_armed=True,
+                checkpoint_writes_frozen=timed_out.checkpoint_writes_frozen,
+            )
+            self.assertFalse(timeout_cleanup_allowed)
+            if timeout_cleanup_allowed:
+                world.checkpoint(candidate, now_s=25.1, force=True)
+            self.assertEqual(durable_identity(), baseline)
+
+            pause.complete("paused", now_s=10.2)
+            self.assertFalse(
+                pause.request("running", expected_epoch=1, now_s=10.3)
+            )
+            self.assertEqual(pause.phase, pause.CONTINUE_REQUESTED)
+            self.assertTrue(pause.checkpoint_writes_frozen)
+            self.assertFalse(
+                MODULE._world_checkpoint_writes_allowed(
+                    checkpoint_writes_armed=True,
+                    checkpoint_writes_frozen=pause.checkpoint_writes_frozen,
+                )
+            )
+            self.assertEqual(durable_identity(), baseline)
+
+            pause.complete("running", now_s=10.4)
+            self.assertFalse(pause.checkpoint_writes_frozen)
+            self.assertTrue(
+                MODULE._world_checkpoint_writes_allowed(
+                    checkpoint_writes_armed=True,
+                    checkpoint_writes_frozen=pause.checkpoint_writes_frozen,
+                )
+            )
+            self.assertTrue(world.checkpoint(candidate, now_s=10.5, force=True))
+            resumed = durable_identity()
+            self.assertNotEqual(resumed[0], baseline[0])
+            self.assertGreater(resumed[1], baseline[1])
+            self.assertEqual(
+                resumed[2],
+                WORLD_STATE.WorldPose(9.0, 8.0, 0.9, 0.0),
+            )
+
+    def test_publish_frozen_lowstate_prepares_and_publishes_without_stepping(
+        self,
+    ) -> None:
+        observation = {
+            "time": 12.5,
+            "qpos": [1.0, 2.0, 3.0],
+        }
+        environment = SimpleNamespace(
+            mj_data=SimpleNamespace(time=12.5),
+            step_index=123,
+            world_generation=7,
+        )
+        environment.prepare_obs = mock.Mock(return_value=observation)
+        environment.step_once = mock.Mock(
+            side_effect=AssertionError("frozen LowState keepalive must not step")
+        )
+        bridge = SimpleNamespace(PublishLowState=mock.Mock())
+        simulator = SimpleNamespace(
+            sim_env=environment,
+            unitree_bridge=bridge,
+            step_index=456,
+            world_runtime=SimpleNamespace(generation=11),
+        )
+        before = (
+            environment.mj_data.time,
+            environment.step_index,
+            environment.world_generation,
+            simulator.step_index,
+            simulator.world_runtime.generation,
+        )
+
+        MODULE._publish_frozen_lowstate(simulator)
+
+        environment.prepare_obs.assert_called_once_with()
+        bridge.PublishLowState.assert_called_once_with(observation)
+        environment.step_once.assert_not_called()
+        self.assertEqual(
+            (
+                environment.mj_data.time,
+                environment.step_index,
+                environment.world_generation,
+                simulator.step_index,
+                simulator.world_runtime.generation,
+            ),
+            before,
+        )
+
+    def test_publish_frozen_lowstate_fails_closed_without_required_apis(
+        self,
+    ) -> None:
+        cases = (
+            SimpleNamespace(),
+            SimpleNamespace(
+                sim_env=SimpleNamespace(prepare_obs=None),
+                unitree_bridge=SimpleNamespace(PublishLowState=mock.Mock()),
+            ),
+            SimpleNamespace(
+                sim_env=SimpleNamespace(prepare_obs=mock.Mock()),
+                unitree_bridge=SimpleNamespace(PublishLowState=None),
+            ),
+        )
+        for simulator in cases:
+            with self.subTest(simulator=simulator):
+                publish_lowstate = getattr(
+                    getattr(simulator, "unitree_bridge", None),
+                    "PublishLowState",
+                    None,
+                )
+                with self.assertRaisesRegex(RuntimeError, "publish capability"):
+                    MODULE._publish_frozen_lowstate(simulator)
+                if isinstance(publish_lowstate, mock.Mock):
+                    publish_lowstate.assert_not_called()
+
+    def test_publish_frozen_lowstate_fails_closed_on_malformed_observation(
+        self,
+    ) -> None:
+        malformed_observations = (
+            None,
+            [],
+            {"time": None},
+            {"time": True},
+            {"time": float("nan")},
+        )
+        for observation in malformed_observations:
+            with self.subTest(observation=observation):
+                environment = SimpleNamespace(
+                    prepare_obs=mock.Mock(return_value=observation)
+                )
+                bridge = SimpleNamespace(PublishLowState=mock.Mock())
+                simulator = SimpleNamespace(
+                    sim_env=environment,
+                    unitree_bridge=bridge,
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "frozen LowState"):
+                    MODULE._publish_frozen_lowstate(simulator)
+
+                environment.prepare_obs.assert_called_once_with()
+                bridge.PublishLowState.assert_not_called()
+
+    def test_frozen_runtime_heartbeats_drain_then_force_neutral(self) -> None:
+        simulator = object()
+        stopped = self.resume_idle_command()
+        game_input = SimpleNamespace(
+            poll=mock.Mock(return_value=object()),
+            emergency_stop=mock.Mock(return_value=stopped),
+        )
+        with mock.patch.object(MODULE, "_publish_frozen_lowstate") as publish:
+            result = MODULE._maintain_frozen_runtime_heartbeats(
+                simulator,
+                game_input,
+                now_s=12.5,
+            )
+
+        self.assertIs(result, stopped)
+        game_input.poll.assert_called_once_with(now_s=12.5, dt_s=0.0)
+        game_input.emergency_stop.assert_called_once_with(
+            now_s=12.5,
+            reason="runtime_paused",
+        )
+        publish.assert_called_once_with(simulator)
+
     @staticmethod
     def resume_idle_command():
         return GAME_CONTROL.RobotMotionCommand(
@@ -1048,6 +1301,98 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertFalse(
                     MODULE._locomotion_switch_neutral(moving)
                 )
+
+    def test_runtime_pause_epoch_fences_stale_and_overlapping_requests(self) -> None:
+        pause = MODULE._RuntimePauseState()
+        self.assertEqual(pause.phase, "running")
+        self.assertFalse(
+            pause.request("paused", expected_epoch=0, now_s=10.0)
+        )
+        self.assertEqual(pause.phase, "pause_requested")
+        self.assertFalse(pause.physics_frozen)
+        self.assertTrue(pause.checkpoint_writes_frozen)
+        pause.ensure_transition_fresh(now_s=14.99)
+        with self.assertRaisesRegex(RuntimeError, "pause_requested.*5.001"):
+            pause.ensure_transition_fresh(now_s=15.001)
+        self.assertEqual(pause.last_error, "pause_requested_timeout")
+        with self.assertRaisesRegex(
+            MODULE.CommandExecutionError,
+            "already pause_requested",
+        ):
+            pause.request("paused", expected_epoch=0, now_s=10.1)
+
+        pause.complete("paused", now_s=10.2)
+        self.assertTrue(pause.physics_frozen)
+        self.assertTrue(pause.checkpoint_writes_frozen)
+        self.assertEqual(pause.epoch, 1)
+        self.assertTrue(
+            pause.request("paused", expected_epoch=1, now_s=10.3)
+        )
+        with self.assertRaisesRegex(
+            MODULE.CommandExecutionError,
+            "expected 0, active 1",
+        ):
+            pause.request("running", expected_epoch=0, now_s=10.4)
+
+        self.assertFalse(
+            pause.request("running", expected_epoch=1, now_s=10.5)
+        )
+        self.assertEqual(pause.phase, "continue_requested")
+        self.assertTrue(pause.physics_frozen)
+        self.assertTrue(pause.checkpoint_writes_frozen)
+        pause.complete("running", now_s=10.6)
+        self.assertEqual(pause.epoch, 2)
+        self.assertFalse(pause.physics_frozen)
+        self.assertFalse(pause.checkpoint_writes_frozen)
+
+    def test_runtime_pause_rejects_busy_recovery_before_transition(self) -> None:
+        pause = MODULE._RuntimePauseState()
+        with self.assertRaisesRegex(
+            MODULE.CommandExecutionError,
+            "physical_recovery",
+        ):
+            pause.request(
+                "paused",
+                expected_epoch=0,
+                now_s=20.0,
+                busy_reason="physical_recovery",
+            )
+        self.assertEqual(pause.phase, "running")
+        self.assertEqual(pause.epoch, 0)
+
+    def test_runtime_pause_epoch_exhaustion_fails_closed(self) -> None:
+        pause = MODULE._RuntimePauseState()
+        pause.epoch = MODULE.MAX_RUNTIME_PAUSE_EPOCH - 1
+        self.assertFalse(
+            pause.request(
+                "paused",
+                expected_epoch=MODULE.MAX_RUNTIME_PAUSE_EPOCH - 1,
+                now_s=30.0,
+            )
+        )
+        pause.complete("paused", now_s=30.1)
+        self.assertEqual(pause.epoch, MODULE.MAX_RUNTIME_PAUSE_EPOCH)
+
+        with self.assertRaises(MODULE.CommandExecutionError) as exhausted:
+            pause.request(
+                "running",
+                expected_epoch=MODULE.MAX_RUNTIME_PAUSE_EPOCH,
+                now_s=30.2,
+            )
+        self.assertEqual(
+            exhausted.exception.code,
+            "E_RUNTIME_PAUSE_EPOCH_EXHAUSTED",
+        )
+        self.assertEqual(pause.phase, "paused")
+        self.assertFalse(pause.transition_pending)
+
+        with self.assertRaises(MODULE.CommandExecutionError) as out_of_range:
+            pause.request(
+                "running",
+                expected_epoch=MODULE.MAX_RUNTIME_PAUSE_EPOCH + 1,
+                now_s=30.3,
+            )
+        self.assertEqual(out_of_range.exception.code, "E_RUNTIME_PAUSE_EPOCH")
 
     def test_resume_probation_requires_continuous_low_root_motion(self) -> None:
         ready = self.upright_resume_snapshot(low_cmd_fresh=True)
@@ -1829,8 +2174,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 "method": "downward_foot_geom_rays",
                 "required_hits": 1,
                 "accepted_hits": 0,
+                "required_distinct_feet": 1,
+                "supported_foot_names": [],
                 "maximum_drop_m": 0.12,
                 "minimum_normal_z": 0.8,
+                "height_delta_m": None,
+                "maximum_height_delta_m": None,
+                "height_delta_safe": True,
+                "rejection_reason": "insufficient_distinct_foot_support",
+                "moon_spawn_gate": False,
                 "ray_direction": [0.0, 0.0, -1.0],
                 "probes": [
                     {
@@ -1848,6 +2200,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                         "probe_geom": None,
                         "ray_origin_m": None,
                         "scene_geom": None,
+                        "support_height_m": None,
                     }
                     for body_id, name in (
                         (7, "left_ankle_roll_link"),
@@ -1879,6 +2232,35 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(
             MODULE._spawn_clearance_rollback_reason(produced_no_ground),
+            "no_ground_support",
+        )
+        moon_model = FakeModel()
+        moon_model.enable_moon_continuous_support()
+        moon_one_foot = MODULE.audit_spawn_safety(
+            FakeMujoco(
+                default_support=False,
+                ray_hits={(0.0, 3): (0.04, (0.0, 0.0, 1.0))},
+            ),
+            moon_model,
+            FakeData(),
+        )
+        self.assertEqual(
+            MODULE._spawn_clearance_rollback_reason(moon_one_foot),
+            "no_ground_support",
+        )
+        moon_height_delta = MODULE.audit_spawn_safety(
+            FakeMujoco(
+                default_support=False,
+                ray_hits={
+                    (0.0, 3): (0.02, (0.0, 0.0, 1.0)),
+                    (1.0, 3): (0.08, (0.0, 0.0, 1.0)),
+                },
+            ),
+            moon_model,
+            FakeData(),
+        )
+        self.assertEqual(
+            MODULE._spawn_clearance_rollback_reason(moon_height_delta),
             "no_ground_support",
         )
         for invalid_audit in (
@@ -1998,6 +2380,85 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     MODULE._game_world_rollback_ineligibility(
                         **{**coincident_fall, **changes}
                     )
+                )
+
+    def test_resume_rollback_accepts_real_clearance_classifications_only(self) -> None:
+        from tests.test_matrix_spawn_clearance import (
+            Contact,
+            FakeData,
+            FakeModel,
+            HORIZONTAL,
+        )
+
+        body_model = FakeModel()
+        body_model.enable_moon_continuous_support()
+        body_audit = MODULE.audit_spawn_clearance(
+            body_model,
+            FakeData(Contact(2, 3, dist=0.0)),
+        )
+
+        terrain_model = FakeModel()
+        terrain_model.nmocap = 1
+        terrain_model.body_mocapid = (-1, -1, -1, -1, -1, 0)
+        terrain_model._bodies[5] = "gb_0_0"
+        terrain_audit = MODULE.audit_spawn_clearance(
+            terrain_model,
+            FakeData(Contact(0, 4, dist=-0.004, frame=HORIZONTAL)),
+        )
+
+        baseline = {
+            "selected_checkpoint_id": "cp-1",
+            "selected_generation": 7,
+            "rollback_count": 0,
+            "elapsed_s": 5.0,
+            "low_cmd_received": False,
+            "active_lowcmd": False,
+            "active_frames": 0,
+            "active_elapsed_s": 0.0,
+            "termination_signal": None,
+            "child_failure": None,
+            "fall_detected": False,
+            "initial_reset_count": 0,
+            "final_reset_count": 0,
+        }
+        cases = (
+            (body_audit, "scene_penetration", "unsafe_body_contact"),
+            (
+                terrain_audit,
+                "unsafe_foot_contact",
+                "unsafe_foot_terrain_edge",
+            ),
+        )
+        for audit, reason, classification in cases:
+            with self.subTest(classification=classification):
+                self.assertEqual(audit["reason"], reason)
+                self.assertEqual(audit["worst"]["classification"], classification)
+                self.assertEqual(
+                    MODULE._spawn_clearance_rollback_reason(audit),
+                    reason,
+                )
+                self.assertIsNone(
+                    MODULE._game_world_rollback_ineligibility(
+                        **baseline,
+                        termination_reason="spawn_clearance_failed",
+                        numerical_error=f"spawn_clearance:{reason}",
+                        spawn_clearance_audit=audit,
+                    )
+                )
+
+                unknown = deepcopy(audit)
+                unknown["worst"]["classification"] = f"unknown_{classification}"
+                self.assertIsNone(
+                    MODULE._spawn_clearance_rollback_reason(unknown)
+                )
+                self.assertEqual(
+                    MODULE._game_world_rollback_ineligibility(
+                        **baseline,
+                        termination_reason="spawn_clearance_failed",
+                        numerical_error=f"spawn_clearance:{reason}",
+                        spawn_clearance_audit=unknown,
+                    ),
+                    "spawn_clearance_evidence_missing",
                 )
 
     def test_internal_restart_exit_is_75_even_with_acceptance_failure(self) -> None:
@@ -3111,6 +3572,27 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         ), self.assertRaisesRegex(SystemExit, "strictly distinct"):
             MODULE.main()
 
+    def test_game_cli_requires_world_identity_for_the_input_provider(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_matrix_sonic.py",
+                "--model",
+                os.fspath(SCRIPT_PATH),
+                "--sonic-root",
+                "/tmp",
+                "--control-source",
+                "game",
+                "--ue-pid",
+                "4242",
+            ],
+        ), self.assertRaisesRegex(
+            SystemExit,
+            "game input provider requires --game-world-id",
+        ):
+            MODULE.main()
+
     def test_parse_args_exposes_exact_world_resume_rollback_metadata(self) -> None:
         with mock.patch.object(
             sys,
@@ -3277,8 +3759,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             status["native_gait_modes"],
             {"IDLE": 0, "SLOW_WALK": 1, "WALK": 2, "RUN": 3},
         )
-        self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
-        self.assertEqual(status["keyboard_slow_boost_speed_mps"], 0.20)
+        self.assertEqual(status["keyboard_slow_speed_mps"], 0.20)
+        self.assertEqual(status["keyboard_slow_boost_speed_mps"], 0.30)
         self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
         self.assertEqual(status["keyboard_walk_boost_speed_mps"], 1.00)
         self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
@@ -3843,35 +4325,57 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             },
         )
 
-    def test_celestial_route_requires_every_local_asset(self) -> None:
+    def test_celestial_routes_require_every_regular_local_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project_root = Path(temporary)
 
-            self.assertNotIn(
-                "moon.tranquility",
-                MODULE._load_celestial_teleport_routes(
-                    project_root=project_root,
-                ),
+            self.assertEqual(
+                MODULE._load_celestial_teleport_routes(project_root=project_root),
+                {},
             )
 
             catalog = MODULE.load_celestial_catalog(
                 MODULE.DEFAULT_CELESTIAL_CATALOG_PATH
             )
+            earth = catalog.destination("earth-overworld-home")
             moon = catalog.destination("moon-tranquility-outpost")
+            assert earth.launch_route is not None
             assert moon.launch_route is not None
-            for relative in moon.launch_route.required_assets:
-                asset = project_root / relative
-                asset.parent.mkdir(parents=True, exist_ok=True)
-                asset.write_bytes(b"installed")
+            for destination in (earth, moon):
+                assert destination.launch_route is not None
+                for relative in destination.launch_route.required_assets:
+                    asset = project_root / relative
+                    asset.parent.mkdir(parents=True, exist_ok=True)
+                    asset.write_bytes(b"installed")
 
-            route = MODULE._load_celestial_teleport_routes(
+            routes = MODULE._load_celestial_teleport_routes(
                 project_root=project_root,
-            )["moon.tranquility"]
-            self.assertEqual(route.target_scene_id, 15)
+            )
+            self.assertEqual(set(routes), {"home", "moon.tranquility"})
+            self.assertEqual(routes["home"].target_scene_id, 2)
             self.assertEqual(
-                route.target_world_id,
+                routes["home"].target_world_id,
+                "g1_29dof:scene_terrain_t10",
+            )
+            self.assertEqual(routes["moon.tranquility"].target_scene_id, 15)
+            self.assertEqual(
+                routes["moon.tranquility"].target_world_id,
                 "g1_29dof:scene_terrain_moon_dynamic",
             )
+
+            earth_asset = project_root / earth.launch_route.required_assets[0]
+            earth_asset.unlink()
+            outside = project_root.parent / f"{project_root.name}-outside-asset"
+            outside.write_bytes(b"outside")
+            try:
+                earth_asset.symlink_to(outside)
+                routes = MODULE._load_celestial_teleport_routes(
+                    project_root=project_root,
+                )
+                self.assertNotIn("home", routes)
+                self.assertIn("moon.tranquility", routes)
+            finally:
+                outside.unlink(missing_ok=True)
 
     def test_render_projection_fails_closed_on_short_or_non_finite_state(
         self,
@@ -4671,6 +5175,115 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_game_command_runtime_waits_for_pause_and_continue_ack(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        pause = MODULE._RuntimePauseState()
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            runtime_pause=pause,
+        )
+        pose = WORLD_STATE.WorldPose(0.0, 0.0, 0.8, 0.0)
+        try:
+            pause_request = self.game_command_request(
+                "/runtime pause paused 0",
+                sequence=1,
+                request_character="5",
+            )
+            provider_socket.send(
+                MC_COMMANDS.encode_command_request(pause_request)
+            )
+            self.assertFalse(
+                runtime.poll(current_pose=pose, command_allowed=True)
+            )
+            self.assertEqual(pause.phase, "pause_requested")
+            self.assertIsNotNone(runtime.pending_runtime_pause_request)
+
+            pause.complete("paused", now_s=10.0)
+            self.assertFalse(
+                runtime.poll(current_pose=pose, command_allowed=True)
+            )
+            paused_response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertTrue(paused_response.ok)
+            self.assertEqual(paused_response.code, "OK_RUNTIME_PAUSED")
+            self.assertEqual(paused_response.data["runtime_pause"]["epoch"], 1)
+
+            continue_request = self.game_command_request(
+                "/runtime pause running 1",
+                sequence=2,
+                request_character="6",
+            )
+            provider_socket.send(
+                MC_COMMANDS.encode_command_request(continue_request)
+            )
+            self.assertFalse(
+                runtime.poll(current_pose=pose, command_allowed=True)
+            )
+            self.assertEqual(pause.phase, "continue_requested")
+            pause.complete("running", now_s=20.0)
+            self.assertFalse(
+                runtime.poll(current_pose=pose, command_allowed=True)
+            )
+            running_response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertTrue(running_response.ok)
+            self.assertEqual(running_response.code, "OK_RUNTIME_RUNNING")
+            self.assertEqual(running_response.data["runtime_pause"]["epoch"], 2)
+            self.assertEqual(runtime.runtime_pause_changes_executed, 2)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
+    def test_game_command_runtime_rejects_transition_at_max_pause_epoch(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        pause = MODULE._RuntimePauseState()
+        pause.epoch = MODULE.MAX_RUNTIME_PAUSE_EPOCH
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            runtime_pause=pause,
+        )
+        pose = WORLD_STATE.WorldPose(0.0, 0.0, 0.8, 0.0)
+        try:
+            request = self.game_command_request(
+                "/runtime pause paused "
+                f"{MODULE.MAX_RUNTIME_PAUSE_EPOCH}",
+                sequence=1,
+                request_character="a",
+            )
+            provider_socket.send(
+                MC_COMMANDS.encode_command_request(request)
+            )
+
+            self.assertFalse(
+                runtime.poll(current_pose=pose, command_allowed=True)
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertFalse(response.ok)
+            self.assertEqual(
+                response.code,
+                "E_RUNTIME_PAUSE_EPOCH_EXHAUSTED",
+            )
+            self.assertEqual(pause.phase, "running")
+            self.assertEqual(pause.epoch, MODULE.MAX_RUNTIME_PAUSE_EPOCH)
+            self.assertIsNone(runtime.pending_runtime_pause_request)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
     def test_game_command_runtime_persists_summon_and_teleport_response(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"
@@ -4844,7 +5457,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     self.assertFalse(
                         runtime.poll(
                             current_pose=current_pose,
-                            command_allowed=True,
+                            command_allowed=False,
                         )
                     )
                     save.assert_not_called()
@@ -6464,6 +7077,51 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 peer.close()
                 control.close()
 
+    def test_runtime_pause_coordinator_fences_and_reuses_sonic_writer(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.fsm = SimpleNamespace(
+            state=MODULE.ResidentRecoveryState.GAME_SONIC
+        )
+        coordinator._policy_selection_pending = None
+        coordinator.worker = SimpleNamespace(
+            fallback_due=False,
+            advance_transition_id=None,
+        )
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.bfm_control = mock.Mock()
+        writer = MODULE._SonicWriterControl(Path("/unused/sonic.sock"))
+        writer.connection = mock.Mock()
+        writer.episode_id = 1
+        writer.writer_created = True
+        writer.epoch_first_write = True
+        writer.authority_epoch = 4
+        writer.send = mock.Mock()
+        coordinator.sonic_writer = writer
+        coordinator.runtime_pause_policy_id = None
+        coordinator.runtime_pause_writer_epoch = None
+        coordinator.runtime_pause_resume_sent = False
+
+        self.assertIsNone(coordinator.runtime_pause_busy_reason())
+        coordinator.request_runtime_pause()
+        writer.send.assert_called_once_with("PAUSE")
+        self.assertEqual(coordinator.runtime_pause_writer_epoch, 4)
+        writer.paused = True
+        writer.epoch_first_write = False
+        self.assertTrue(coordinator.runtime_pause_acknowledged())
+
+        coordinator.request_runtime_continue()
+        writer.send.assert_called_with("RESUME")
+        writer.paused = False
+        writer.authority_epoch = 5
+        writer.epoch_first_write = True
+        self.assertTrue(coordinator.runtime_continue_acknowledged())
+        coordinator.finish_runtime_continue()
+        self.assertIsNone(coordinator.runtime_pause_policy_id)
+        self.assertIsNone(coordinator.runtime_pause_writer_epoch)
+        self.assertFalse(coordinator.runtime_pause_resume_sent)
+
     def test_resident_worker_ready_requires_gpu_policy_attestation(self) -> None:
         control = MODULE._RecoveryWorkerControl(
             Path("/unused/recovery.sock"),
@@ -6552,6 +7210,141 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(telemetry["resident_paused"])
         self.assertTrue(telemetry["resident_writer_created"])
         self.assertFalse(telemetry["paused_no_writer"])
+
+    def test_recovery_worker_tracks_first_write_authority_across_fallback(
+        self,
+    ) -> None:
+        control = MODULE._RecoveryWorkerControl(Path("/unused/recovery.sock"))
+        control.ready = True
+        control.episode_id = 7
+        control.go_sent = True
+        control.registered_policy_ids = ["kungfu", "host", "amp"]
+        control.initial_policy_id = "kungfu"
+        control.selected_policy_id = "kungfu"
+
+        def packet(event: str, **fields: object) -> bytes:
+            return json.dumps(
+                {
+                    "schema": "matrix.sonic_host_worker.control.v1",
+                    "event": event,
+                    "episode_id": 7,
+                    **fields,
+                }
+            ).encode("utf-8")
+
+        control._handle_packet(packet("FIRST_WRITE", writer_created=True))
+        self.assertEqual(control.active_policy_id, "kungfu")
+
+        control.fallback_due = True
+        control.last_fallback_due = {
+            "policy_index": -1,
+            "next_policy_index": 0,
+        }
+        control.advance_transition_id = "recovery-7-switch-1"
+        switch = {
+            "transition_id": "recovery-7-switch-1",
+            "from_policy_index": -1,
+            "to_policy_index": 0,
+            "from_policy_id": "kungfu",
+            "to_policy_id": "host",
+            "physical_continuation": True,
+        }
+        control._handle_packet(packet("POLICY_SWITCH", **switch))
+        self.assertEqual(control.active_policy_id, "kungfu")
+        control._handle_packet(
+            packet(
+                "POLICY_SWITCH_FIRST_WRITE",
+                **switch,
+                writer_reused=True,
+            )
+        )
+
+        self.assertEqual(control.selected_policy_id, "kungfu")
+        self.assertEqual(control.active_policy_id, "host")
+        self.assertEqual(control.telemetry()["active_policy_id"], "host")
+        control._handle_packet(
+            packet(
+                "STATUS",
+                controller="HOST_GETUP",
+                selected_policy_id="kungfu",
+                active_policy_id="host",
+            )
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "changed authority without a first-write event",
+        ):
+            control._handle_packet(
+                packet(
+                    "STATUS",
+                    controller="KUNGFU_GETUP",
+                    selected_policy_id="kungfu",
+                    active_policy_id="kungfu",
+                )
+            )
+
+    def test_resident_authority_telemetry_distinguishes_slot_from_writer(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.fsm = SimpleNamespace(
+            state=MODULE.ResidentRecoveryState.KUNGFU_RECOVERING
+        )
+        coordinator.worker = SimpleNamespace(active_policy_id="host")
+        coordinator.selected_locomotion_policy_id = "sonic"
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.KUNGFU_STARTING,
+            state=MODULE.ResidentRecoveryState.KUNGFU_RECOVERING,
+            authority_policy_id="kungfu",
+            recovery_policy_id="kungfu",
+        )
+
+        self.assertEqual(
+            coordinator._telemetry_authority_policy_id(output),
+            "host",
+        )
+        self.assertEqual(output.recovery_policy_id, "kungfu")
+
+        coordinator.worker.active_policy_id = None
+        self.assertEqual(
+            coordinator._telemetry_authority_policy_id(output),
+            "kungfu",
+        )
+        coordinator.fsm.state = MODULE.ResidentRecoveryState.GAME_SONIC
+        self.assertEqual(
+            coordinator._telemetry_authority_policy_id(output),
+            "sonic",
+        )
+
+    def test_recovery_policy_telemetry_supports_both_fsm_outputs(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_controller = "host"
+        replacement_output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.GAME_SONIC,
+            state=MODULE.RecoveryState.GAME_SONIC,
+        )
+        resident_output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            recovery_policy_id="kungfu",
+        )
+
+        self.assertEqual(
+            coordinator._telemetry_recovery_policy_id(replacement_output),
+            "host",
+        )
+        self.assertEqual(
+            coordinator._telemetry_recovery_policy_id(resident_output),
+            "kungfu",
+        )
+        self.assertEqual(
+            coordinator._telemetry_recovery_policy_id(None),
+            "host",
+        )
 
     def test_sonic_writer_safe_idle_hold_rejects_invalid_attestations(
         self,
@@ -7104,6 +7897,97 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             math.pi / 2.0,
         )
 
+    def test_resident_game_sonic_limits_only_zero_translation_turns(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.command_frame_rotation_rad = 0.0
+        coordinator.last_wire_facing_heading_rad = 0.0
+        coordinator.reframe_limited_frames = 0
+        coordinator.last_reframe_limited = False
+        coordinator.last_reframe_heading_error_rad = 0.0
+        requested_heading = 0.05
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=11,
+            movement=(0.0, 0.0, 0.0),
+            facing=(math.cos(requested_heading), math.sin(requested_heading), 0.0),
+            speed_mps=0.0,
+            locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+            mode="turn",
+            safe_stop=False,
+            reason="aligning_heading",
+            desired_facing=(0.0, 1.0, 0.0),
+        )
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            inhibit_game_input=False,
+        )
+
+        wire_command = coordinator.recovery_wire_command(
+            command,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+
+        expected_heading = (
+            coordinator.RESIDENT_TURN_ONLY_MAX_RATE_RAD_S * 0.02
+        )
+        self.assertIsNot(wire_command, command)
+        self.assertEqual(wire_command.mode, "turn")
+        self.assertEqual(wire_command.movement, (0.0, 0.0, 0.0))
+        self.assertEqual(wire_command.speed_mps, 0.0)
+        self.assertEqual(
+            wire_command.locomotion_mode,
+            GAME_CONTROL.SONIC_IDLE_MODE,
+        )
+        self.assertAlmostEqual(
+            math.atan2(wire_command.facing[1], wire_command.facing[0]),
+            expected_heading,
+        )
+        self.assertEqual(wire_command.desired_facing, command.desired_facing)
+        self.assertTrue(coordinator.last_reframe_limited)
+        self.assertAlmostEqual(
+            coordinator.last_reframe_heading_error_rad,
+            math.pi / 2.0,
+        )
+        self.assertEqual(coordinator.reframe_limited_frames, 1)
+
+        next_command = replace(command, sequence=12)
+        next_wire_command = coordinator.recovery_wire_command(
+            next_command,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+        self.assertAlmostEqual(
+            math.atan2(
+                next_wire_command.facing[1],
+                next_wire_command.facing[0],
+            ),
+            expected_heading * 2.0,
+        )
+        self.assertEqual(coordinator.reframe_limited_frames, 2)
+
+        within_envelope = replace(
+            command,
+            sequence=13,
+            facing=(math.cos(0.01), math.sin(0.01), 0.0),
+            desired_facing=(math.cos(0.01), math.sin(0.01), 0.0),
+        )
+        coordinator.last_wire_facing_heading_rad = 0.0
+        unchanged = coordinator.recovery_wire_command(
+            within_envelope,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+        self.assertIs(unchanged, within_envelope)
+        self.assertFalse(coordinator.last_reframe_limited)
+        self.assertEqual(coordinator.reframe_limited_frames, 2)
+
     def test_resident_game_sonic_rejects_impossible_rotated_command_frame(
         self,
     ) -> None:
@@ -7188,6 +8072,40 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         # Only a continuous grounded low-energy window authorizes the next
         # already-loaded policy.
         evaluate(12.71, root_z=0.25, root_up=0.2)
+        coordinator.worker.send.assert_called_once_with("ADVANCE_POLICY")
+        self.assertTrue(coordinator.policy_advance_requested)
+        self.assertEqual(coordinator.policy_advances, 1)
+
+    def test_resident_kungfu_fallback_uses_the_same_authorization_gate(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.worker = mock.Mock()
+        coordinator.worker.fallback_due = True
+        coordinator.worker.connection = object()
+        coordinator.worker.go_sent = True
+        coordinator.worker.stop_sent = False
+        coordinator.worker.amp_hold_sent = False
+        coordinator.worker.joint_hold_sent = False
+        coordinator.policy_fallback_last_near_upright_s = None
+        coordinator.policy_fallback_quiet_since_s = None
+        coordinator.policy_advance_requested = False
+        coordinator.policy_advances = 0
+        arguments = {
+            "root_z_m": 0.2,
+            "root_up_z": 0.1,
+            "root_linear_speed_m_s": 0.0,
+            "root_angular_speed_rad_s": 0.0,
+            "joint_velocity_rms_rad_s": 0.0,
+            "grounded_contact": True,
+            "recovery_state": MODULE.ResidentRecoveryState.POLICY_RECOVERING,
+            "policy_alive": True,
+            "worker_controller": "KUNGFU_GETUP",
+        }
+
+        coordinator._maybe_authorize_policy_advance(now_s=30.0, **arguments)
+        coordinator._maybe_authorize_policy_advance(now_s=30.51, **arguments)
+
         coordinator.worker.send.assert_called_once_with("ADVANCE_POLICY")
         self.assertTrue(coordinator.policy_advance_requested)
         self.assertEqual(coordinator.policy_advances, 1)
@@ -7562,6 +8480,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             socket.SOCK_SEQPACKET,
         )
         command_fd = command_child.fileno()
+        applied_video_settings_json = (
+            '{"revision":3,"resolution":"1600x900",'
+            '"resolution_width":1600,"resolution_height":900,'
+            '"window_mode":"fullscreen","fps_limit":90,"quality":"epic",'
+            '"camera_smoothing":"high"}'
+        )
         try:
             provider_pid = group.start_game_input(
                 "/runtime/python",
@@ -7575,6 +8499,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 mouse_settings_file=Path(
                     "/home/user/.config/matrix/mouse-control.json"
                 ),
+                video_settings_file=Path(
+                    "/home/user/.config/matrix/video-settings.json"
+                ),
+                applied_video_settings_json=applied_video_settings_json,
                 applied_mouse_profile="remote",
                 applied_mouse_speed_scale=0.5,
                 restart_request_file=Path("/run/user/1000/matrix/restart.json"),
@@ -7601,6 +8529,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 expected_ue_pid=4242,
                 status_file=Path("/matrix/outputs/game-input.json"),
                 command_fd=command_fd,
+                runtime_pause_capable=True,
+                game_world_id=EARTH_WORLD_ID,
                 motion_settings_json='{"settings":"runtime-owned"}',
                 celestial_clock_state_file=Path(
                     "/matrix/state/celestial-clock.json"
@@ -7648,6 +8578,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             str(command_fd),
         )
         self.assertEqual(
+            command[command.index("--runtime-pause-capability") + 1],
+            "available",
+        )
+        self.assertEqual(
+            command[command.index("--game-world-id") + 1],
+            EARTH_WORLD_ID,
+        )
+        self.assertEqual(
             command[command.index("--motion-settings-json") + 1],
             '{"settings":"runtime-owned"}',
         )
@@ -7683,6 +8621,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--mouse-settings-file") + 1],
             "/home/user/.config/matrix/mouse-control.json",
+        )
+        self.assertEqual(
+            command[command.index("--video-settings-file") + 1],
+            "/home/user/.config/matrix/video-settings.json",
+        )
+        self.assertEqual(
+            command[command.index("--applied-video-settings-json") + 1],
+            applied_video_settings_json,
         )
         self.assertEqual(
             command[command.index("--applied-mouse-profile") + 1], "remote"
@@ -7762,7 +8708,40 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 focus_title="matrix",
                 expected_ue_pid=4242,
                 status_file=None,
+                game_world_id=EARTH_WORLD_ID,
                 celestial_de440s_kernel=Path("/matrix/assets/de440s.bsp"),
+            )
+
+        popen.assert_not_called()
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_native_process_group_rejects_invalid_game_world_id(self, popen) -> None:
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+
+        with self.assertRaisesRegex(ValueError, "game world id is invalid"):
+            group.start_game_input(
+                "/runtime/python",
+                Path("/matrix/scripts/matrix_game_control_input.py"),
+                input_socket=Path("/run/user/1000/matrix-game.sock"),
+                input_source="auto",
+                camera_yaw_source="x11-mirror",
+                look_button="left",
+                initial_camera_yaw_deg=0.0,
+                mouse_sensitivity_deg=0.12,
+                camera_yaw_sign=1,
+                camera_yaw_offset_deg=0.0,
+                carla_host="127.0.0.1",
+                carla_port=2000,
+                gamepad_look_yaw_rate_deg_s=120.0,
+                gamepad_look_pitch_rate_deg_s=90.0,
+                gamepad_look_deadzone=0.1,
+                gamepad_move_deadzone=0.1,
+                gamepad_look_min_pitch_deg=-70.0,
+                gamepad_look_max_pitch_deg=50.0,
+                focus_title="matrix",
+                expected_ue_pid=4242,
+                status_file=None,
+                game_world_id="invalid world id",
             )
 
         popen.assert_not_called()
@@ -7796,6 +8775,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             focus_title="matrix",
             expected_ue_pid=4242,
             status_file=None,
+            game_world_id=EARTH_WORLD_ID,
         )
 
         guarded = popen.call_args.args[0]
@@ -7807,6 +8787,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--ue-camera-state-file") + 1],
             "/run/user/1000/camera-state.bin",
+        )
+        self.assertEqual(
+            command[command.index("--runtime-pause-capability") + 1],
+            "unavailable",
+        )
+        self.assertEqual(
+            command[command.index("--game-world-id") + 1],
+            EARTH_WORLD_ID,
         )
 
     def test_process_group_prepends_sonic_to_existing_pythonpath(self) -> None:

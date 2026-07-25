@@ -34,6 +34,14 @@ class CelestialCatalogTest(unittest.TestCase):
             [destination.teleport_tag for destination in self.catalog.destinations],
             ["home", "moon.tranquility", "mars.utopia"],
         )
+        earth = self.catalog.destination("earth-overworld-home")
+        self.assertIsNotNone(earth.launch_route)
+        assert earth.launch_route is not None
+        self.assertEqual(earth.launch_route.scene_id, 2)
+        self.assertEqual(
+            earth.launch_route.world_id,
+            "g1_29dof:scene_terrain_t10",
+        )
         moon = self.catalog.destination("moon-tranquility-outpost")
         self.assertIsNotNone(moon.launch_route)
         assert moon.launch_route is not None
@@ -86,6 +94,20 @@ class CelestialCatalogTest(unittest.TestCase):
             ):
                 MODULE.load_catalog(path)
 
+    def test_catalog_rejects_world_routes_that_map_to_multiple_bodies(self) -> None:
+        value = json.loads(MODULE.DEFAULT_CATALOG_PATH.read_text(encoding="utf-8"))
+        value["destinations"][1]["launch_route"]["target_world_id"] = (
+            "g1_29dof:scene_terrain_t10"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ambiguous-route.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(
+                MODULE.CelestialNavigationError,
+                "maps to multiple bodies",
+            ):
+                MODULE.load_catalog(path)
+
     def test_catalog_and_probe_reject_overflowing_json_integers(self) -> None:
         value = json.loads(MODULE.DEFAULT_CATALOG_PATH.read_text(encoding="utf-8"))
         value["bodies"][0]["ellipsoid_radii_m"][0] = 10**1000
@@ -123,7 +145,7 @@ class CelestialCatalogTest(unittest.TestCase):
     def test_probe_response_drives_ready_and_honest_planned_statuses(self) -> None:
         probes = MODULE.probes_from_response(
             {
-                "world_id": "town10:test",
+                "world_id": "g1_29dof:scene_terrain_t10",
                 "teleport_points": [
                     {
                         "tag": "home",
@@ -136,7 +158,7 @@ class CelestialCatalogTest(unittest.TestCase):
                         "tag": "moon.tranquility",
                         "found": True,
                         "entity_id": "tp-" + "b" * 32,
-                        "position": [0.0, 0.0, -0.1366965003013611],
+                        "position": [-94.7, -65.6, -5.251562023162842],
                         "yaw_rad": 0.0,
                     },
                     {"tag": "mars.utopia", "found": False},
@@ -153,6 +175,7 @@ class CelestialCatalogTest(unittest.TestCase):
         )
 
         self.assertEqual(mapping["status"], "ready")
+        self.assertEqual(mapping["current_body_id"], "earth")
         earth, moon, mars = mapping["destinations"]
         self.assertEqual(earth["status"], "ready")
         self.assertTrue(earth["enabled"])
@@ -161,15 +184,19 @@ class CelestialCatalogTest(unittest.TestCase):
         self.assertEqual(mapping["version"], 2)
         self.assertEqual(mapping["simulation_time"]["scenario_utc"], "2080-01-01T00:00:00Z")
         self.assertEqual(mapping["lighting"]["render_authority"], "state-only")
+        self.assertEqual(mapping["lighting"]["body_id"], "earth")
         self.assertEqual(moon["status"], "ready")
         self.assertEqual(mars["status"], "world_unavailable")
         self.assertTrue(moon["enabled"])
         self.assertFalse(mars["enabled"])
-        self.assertEqual(moon["local_position_m"], [0.0, 0.0, -0.1366965003013611])
+        self.assertEqual(
+            moon["local_position_m"],
+            [-94.7, -65.6, -5.251562023162842],
+        )
 
         missing_route = MODULE.probes_from_response(
             {
-                "world_id": "town10:test",
+                "world_id": "g1_29dof:scene_terrain_t10",
                 "teleport_points": [
                     {
                         "tag": "home",
@@ -223,6 +250,78 @@ class CelestialCatalogTest(unittest.TestCase):
                 for destination in restarting["destinations"]
             )
         )
+
+    def test_probe_world_drives_current_body_and_lighting(self) -> None:
+        probes = MODULE.probes_from_response(
+            {
+                "world_id": "g1_29dof:scene_terrain_moon_dynamic",
+                "teleport_points": [
+                    {
+                        "tag": "home",
+                        "found": True,
+                        "entity_id": "tp-" + "a" * 32,
+                        "position": [0.0, 0.0, 0.793],
+                        "yaw_rad": 0.0,
+                    },
+                    {"tag": "moon.tranquility", "found": False},
+                    {"tag": "mars.utopia", "found": False},
+                ],
+            },
+            catalog=self.catalog,
+        )
+
+        mapping = self.catalog.navigation_mapping(
+            probes,
+            command_available=True,
+            in_flight=False,
+            restart_required=False,
+            outcome_unknown=False,
+        )
+
+        self.assertEqual(probes.world_id, "g1_29dof:scene_terrain_moon_dynamic")
+        self.assertEqual(mapping["current_body_id"], "moon")
+        self.assertEqual(mapping["lighting"]["body_id"], "moon")
+        self.assertEqual(mapping["destinations"][0]["status"], "ready")
+        self.assertEqual(mapping["destinations"][1]["status"], "undiscovered")
+
+    def test_runtime_route_must_exactly_match_catalog_and_local_assets(self) -> None:
+        destination = self.catalog.destination("earth-overworld-home")
+        assert destination.launch_route is not None
+        runtime_route = destination.launch_route.runtime_mapping(
+            destination_id=destination.destination_id,
+            teleport_tag=destination.teleport_tag,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            with self.assertRaisesRegex(
+                MODULE.CelestialNavigationError,
+                "assets are unavailable",
+            ):
+                self.catalog.validate_runtime_launch_route(
+                    runtime_route,
+                    project_root=project_root,
+                )
+            for relative in destination.launch_route.required_assets:
+                asset = project_root / relative
+                asset.parent.mkdir(parents=True, exist_ok=True)
+                asset.write_bytes(b"installed")
+
+            matched = self.catalog.validate_runtime_launch_route(
+                runtime_route,
+                project_root=project_root,
+            )
+            self.assertEqual(matched.destination_id, "earth-overworld-home")
+
+            forged = dict(runtime_route)
+            forged["entity_id"] = "tp-" + "f" * 32
+            with self.assertRaisesRegex(
+                MODULE.CelestialNavigationError,
+                "does not match",
+            ):
+                self.catalog.validate_runtime_launch_route(
+                    forged,
+                    project_root=project_root,
+                )
 
     def test_probe_response_rejects_reordered_catalog_tags(self) -> None:
         with self.assertRaisesRegex(

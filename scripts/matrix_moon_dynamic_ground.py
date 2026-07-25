@@ -33,7 +33,17 @@ TILE_SIDE_COUNT = 16
 TILE_COUNT = TILE_SIDE_COUNT * TILE_SIDE_COUNT
 TILE_INDEX_ORIGIN = -(TILE_SIDE_COUNT // 2)
 TILE_BODY_PATTERN = re.compile(r"gb_([0-9]+)_([0-9]+)")
-TELEMETRY_SCHEMA = "matrix-moon-dynamic-ground/v1"
+CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
+CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
+CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES = (TILE_SIDE_COUNT * 2) + 1
+CONTINUOUS_SUPPORT_SAMPLE_COUNT = (
+    CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES * CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES
+)
+CONTINUOUS_SUPPORT_HALF_EXTENT_M = 1.6
+CONTINUOUS_SUPPORT_HEIGHT_RANGE_M = 64.0
+CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
+_MUJOCO_HFIELD_GEOM_TYPE = 1
+TELEMETRY_SCHEMA = "matrix-moon-dynamic-ground/v2"
 LOCKED_MOONWORLD_SHA256 = (
     "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
 )
@@ -191,13 +201,158 @@ def resolve_tile_mocap_ids(model: Any) -> np.ndarray:
     return mocap_ids
 
 
+def _named_model_id(model: Any, kind: str, name: str) -> int:
+    try:
+        item = getattr(model, kind)(name)
+        item_id = int(item.id)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exc:
+        raise MoonDynamicGroundError(
+            f"MuJoCo model is missing {kind} {name!r}"
+        ) from exc
+    if item_id < 0:
+        raise MoonDynamicGroundError(f"MuJoCo {kind} {name!r} has an invalid id")
+    return item_id
+
+
+def _unique_named_model_id(
+    model: Any,
+    kind: str,
+    name: str,
+    *,
+    count: int,
+) -> int:
+    matches: list[int] = []
+    try:
+        accessor = getattr(model, kind)
+        for item_id in range(count):
+            item_name = accessor(item_id).name
+            if isinstance(item_name, bytes):
+                item_name = item_name.decode("utf-8")
+            if item_name == name:
+                matches.append(item_id)
+    except (AttributeError, IndexError, KeyError, TypeError, UnicodeDecodeError) as exc:
+        raise MoonDynamicGroundError(
+            f"MuJoCo {kind} name table is unavailable or truncated"
+        ) from exc
+    if not matches:
+        raise MoonDynamicGroundError(f"MuJoCo model is missing {kind} {name!r}")
+    if len(matches) != 1:
+        raise MoonDynamicGroundError(
+            f"MuJoCo {kind} {name!r} must be unique"
+        )
+    return matches[0]
+
+
+def resolve_continuous_support(model: Any) -> dict[str, int]:
+    """Resolve and validate the single rolling collision hfield contract."""
+
+    try:
+        ngeom = int(model.ngeom)
+        nhfield = int(model.nhfield)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise MoonDynamicGroundError(
+            "MuJoCo continuous-support model counts are unavailable"
+        ) from exc
+    if ngeom < 0 or nhfield < 0:
+        raise MoonDynamicGroundError(
+            "MuJoCo continuous-support model counts are invalid"
+        )
+    geom_id = _unique_named_model_id(
+        model,
+        "geom",
+        CONTINUOUS_SUPPORT_GEOM_NAME,
+        count=ngeom,
+    )
+    hfield_id = _unique_named_model_id(
+        model,
+        "hfield",
+        CONTINUOUS_SUPPORT_ASSET_NAME,
+        count=nhfield,
+    )
+    try:
+        geom_data_id = int(model.geom_dataid[geom_id])
+        geom_body_id = int(model.geom_bodyid[geom_id])
+        geom_type = int(model.geom_type[geom_id])
+        geom_contype = int(model.geom_contype[geom_id])
+        geom_conaffinity = int(model.geom_conaffinity[geom_id])
+        nrow = int(model.hfield_nrow[hfield_id])
+        ncol = int(model.hfield_ncol[hfield_id])
+        data_adr = int(model.hfield_adr[hfield_id])
+        hfield_size = tuple(float(value) for value in model.hfield_size[hfield_id])
+        hfield_data_size = int(np.size(model.hfield_data))
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        raise MoonDynamicGroundError(
+            "MuJoCo continuous-support metadata is unavailable or truncated"
+        ) from exc
+    if not 0 <= geom_id < ngeom or not 0 <= hfield_id < nhfield:
+        raise MoonDynamicGroundError("continuous-support id is outside the model table")
+    if geom_body_id != 0:
+        raise MoonDynamicGroundError(
+            "continuous support must be attached to the world body"
+        )
+    if geom_type != _MUJOCO_HFIELD_GEOM_TYPE:
+        raise MoonDynamicGroundError(
+            "continuous support geom must be a MuJoCo hfield"
+        )
+    if geom_data_id != hfield_id:
+        raise MoonDynamicGroundError(
+            "continuous support geom must bind the named hfield asset"
+        )
+    if geom_contype != 1 or geom_conaffinity != 1:
+        raise MoonDynamicGroundError(
+            "continuous support geom must use contype=1 and conaffinity=1"
+        )
+    if (
+        nrow != CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES
+        or ncol != CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES
+        or data_adr < 0
+        or data_adr + CONTINUOUS_SUPPORT_SAMPLE_COUNT > hfield_data_size
+    ):
+        raise MoonDynamicGroundError(
+            "continuous-support hfield shape/address contract drifted"
+        )
+    expected_size = (
+        CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+        CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+        CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+        CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+    )
+    if len(hfield_size) != 4 or any(
+        not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12)
+        for actual, expected in zip(hfield_size, expected_size, strict=True)
+    ):
+        raise MoonDynamicGroundError(
+            "continuous-support hfield size contract drifted"
+        )
+
+    for i, j in _EXPECTED_TILE_KEYS:
+        geom_name = f"soil_{i}_{j}"
+        tile_geom_id = _named_model_id(model, "geom", geom_name)
+        try:
+            contype = int(model.geom_contype[tile_geom_id])
+            conaffinity = int(model.geom_conaffinity[tile_geom_id])
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise MoonDynamicGroundError(
+                f"MuJoCo tile geom collision metadata is unavailable: {geom_name}"
+            ) from exc
+        if contype != 0 or conaffinity != 0:
+            raise MoonDynamicGroundError(
+                f"MoonWorld source tile geom remains collidable: {geom_name}"
+            )
+    return {
+        "geom_id": geom_id,
+        "hfield_id": hfield_id,
+        "data_adr": data_adr,
+    }
+
+
 def _round_array_away_from_zero(values: np.ndarray) -> np.ndarray:
     shifts = np.where(values >= 0.0, 0.5, -0.5)
     return np.trunc(values + shifts).astype(np.int64)
 
 
 class MoonDynamicGround:
-    """Read-only mmap plus a batch updater for the 256 rolling terrain tiles."""
+    """Read-only mmap plus rolling visual tiles and one collision hfield."""
 
     def __init__(
         self,
@@ -235,6 +390,9 @@ class MoonDynamicGround:
         self._cached_pixel_x_range: tuple[int, int] | None = None
         self._cached_pixel_y_range: tuple[int, int] | None = None
         self._cached_height_range_m: tuple[float, float] | None = None
+        self._cached_support_pixel_x_range: tuple[int, int] | None = None
+        self._cached_support_pixel_y_range: tuple[int, int] | None = None
+        self._cached_support_height_range_m: tuple[float, float] | None = None
 
         tile_i = np.repeat(
             np.arange(TILE_SIDE_COUNT, dtype=np.float64),
@@ -257,10 +415,37 @@ class MoonDynamicGround:
             (TILE_COUNT, 4), dtype=np.float64
         )
         self._identity_quaternions[:, 0] = 1.0
+        self._support_axis_offsets = np.linspace(
+            -CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+            CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+            CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+            dtype=np.float64,
+        )
+        self._support_values = np.empty(
+            CONTINUOUS_SUPPORT_SAMPLE_COUNT,
+            dtype=np.float32,
+        )
+        self._support_position = np.empty(3, dtype=np.float64)
 
         try:
             self._open_and_validate_map()
+            assert self.minimum_height_m is not None
+            assert self.maximum_height_m is not None
+            if (
+                self.maximum_height_m - self.minimum_height_m
+                > CONTINUOUS_SUPPORT_HEIGHT_RANGE_M
+            ):
+                raise MoonDynamicGroundError(
+                    "MoonWorld map height range exceeds continuous-support capacity: "
+                    f"minimum={self.minimum_height_m} maximum={self.maximum_height_m} "
+                    f"capacity={CONTINUOUS_SUPPORT_HEIGHT_RANGE_M}"
+                )
             self.mocap_ids = resolve_tile_mocap_ids(model)
+            support = resolve_continuous_support(model)
+            self._model = model
+            self.support_geom_id = support["geom_id"]
+            self.support_hfield_id = support["hfield_id"]
+            self.support_data_adr = support["data_adr"]
             self._cache_sentinel_mocap_ids = tuple(
                 int(self.mocap_ids[tile_index])
                 for tile_index in _CACHE_SENTINEL_TILE_INDICES
@@ -374,19 +559,53 @@ class MoonDynamicGround:
         return self._heights
 
     def sample_height(self, x_m: object, y_m: object) -> float:
-        """Sample one absolute world-Z value using the native nearest pixel."""
+        """Sample the continuous support using MuJoCo's hfield triangulation."""
 
         heights = self._require_open_heights()
-        pixel_x, pixel_y = world_to_pixel(x_m, y_m)
-        height = float(heights[pixel_y, pixel_x])
+        x = _finite_float(x_m, label="world x")
+        y = _finite_float(y_m, label="world y")
+        fractional_x = min(
+            max((x + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M, 0.0),
+            MAP_SIDE_SAMPLES - 1.0,
+        )
+        fractional_y = min(
+            max((y + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M, 0.0),
+            MAP_SIDE_SAMPLES - 1.0,
+        )
+        x0 = int(math.floor(fractional_x))
+        y0 = int(math.floor(fractional_y))
+        x1 = min(x0 + 1, MAP_SIDE_SAMPLES - 1)
+        y1 = min(y0 + 1, MAP_SIDE_SAMPLES - 1)
+        weight_x = fractional_x - x0
+        weight_y = fractional_y - y0
+        height_00 = float(heights[y0, x0])
+        height_10 = float(heights[y0, x1])
+        height_01 = float(heights[y1, x0])
+        height_11 = float(heights[y1, x1])
+        # MuJoCo splits every hfield cell along the (0, 0) -> (1, 1)
+        # diagonal. Match that piecewise-linear surface exactly so fall and
+        # clearance metrics agree with collision rays.
+        if weight_x >= weight_y:
+            height = (
+                (1.0 - weight_x) * height_00
+                + (weight_x - weight_y) * height_10
+                + weight_y * height_11
+            )
+        else:
+            height = (
+                (1.0 - weight_y) * height_00
+                + (weight_y - weight_x) * height_01
+                + weight_x * height_11
+            )
         if not math.isfinite(height):
             raise MoonDynamicGroundError(
-                f"MoonWorld sampled a non-finite height at ({pixel_x}, {pixel_y})"
+                "MoonWorld sampled a non-finite continuous support height at "
+                f"({fractional_x}, {fractional_y})"
             )
         return height
 
     def _cache_sentinels_match(self, data: Any) -> bool:
-        """Check two corner poses so a same-object ``mj_resetData`` is visible."""
+        """Check cached poses and support so external resets are visible."""
 
         try:
             mocap_pos = data.mocap_pos
@@ -408,6 +627,19 @@ class MoonDynamicGround:
                         != float(self._identity_quaternions[tile_index, axis])
                     ):
                         return False
+            support_position = self._model.geom_pos[self.support_geom_id]
+            for axis in range(3):
+                if float(support_position[axis]) != float(
+                    self._support_position[axis]
+                ):
+                    return False
+            support_data = self._model.hfield_data[
+                self.support_data_adr : (
+                    self.support_data_adr + CONTINUOUS_SUPPORT_SAMPLE_COUNT
+                )
+            ]
+            if not bool(np.array_equal(support_data, self._support_values)):
+                return False
         except (
             AttributeError,
             IndexError,
@@ -459,6 +691,9 @@ class MoonDynamicGround:
                 self._cached_pixel_x_range is None
                 or self._cached_pixel_y_range is None
                 or self._cached_height_range_m is None
+                or self._cached_support_pixel_x_range is None
+                or self._cached_support_pixel_y_range is None
+                or self._cached_support_height_range_m is None
             ):
                 raise MoonDynamicGroundError(
                     "MoonWorld dynamic-ground cache metadata is incomplete"
@@ -473,9 +708,19 @@ class MoonDynamicGround:
                     "pixel_x_range": list(self._cached_pixel_x_range),
                     "pixel_y_range": list(self._cached_pixel_y_range),
                     "height_range_m": list(self._cached_height_range_m),
+                    "support_pixel_x_range": list(
+                        self._cached_support_pixel_x_range
+                    ),
+                    "support_pixel_y_range": list(
+                        self._cached_support_pixel_y_range
+                    ),
+                    "support_height_range_m": list(
+                        self._cached_support_height_range_m
+                    ),
                     "cache_hit": True,
                     "cache_invalidated": False,
                     "tiles_updated": False,
+                    "continuous_support_updated": False,
                 }
                 return dict(self._last_update)
             cache_invalidated = True
@@ -496,9 +741,39 @@ class MoonDynamicGround:
                 "MoonWorld rolling tile update sampled a non-finite height"
             )
 
+        support_center_x = quantized_x + MAP_HALF_CELL_M
+        support_center_y = quantized_y + MAP_HALF_CELL_M
+        support_x = support_center_x + self._support_axis_offsets
+        support_y = support_center_y + self._support_axis_offsets
+        support_pixel_x = _round_array_away_from_zero(
+            (support_x + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M
+        )
+        support_pixel_y = _round_array_away_from_zero(
+            (support_y + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M
+        )
+        np.clip(support_pixel_x, 0, MAP_SIDE_SAMPLES - 1, out=support_pixel_x)
+        np.clip(support_pixel_y, 0, MAP_SIDE_SAMPLES - 1, out=support_pixel_y)
+        support_z = heights[np.ix_(support_pixel_y, support_pixel_x)]
+        if not bool(np.all(np.isfinite(support_z))):
+            raise MoonDynamicGroundError(
+                "MoonWorld continuous support sampled a non-finite height"
+            )
+        assert self.minimum_height_m is not None
+        normalized_support = (
+            np.asarray(support_z, dtype=np.float64) - self.minimum_height_m
+        ) / CONTINUOUS_SUPPORT_HEIGHT_RANGE_M
+        if bool(np.any(normalized_support < 0.0)) or bool(
+            np.any(normalized_support > 1.0)
+        ):
+            raise MoonDynamicGroundError(
+                "MoonWorld continuous support exceeds its normalized height range"
+            )
+
         try:
             mocap_pos = data.mocap_pos
             mocap_quat = data.mocap_quat
+            hfield_data = self._model.hfield_data
+            geom_pos = self._model.geom_pos
         except AttributeError as exc:
             raise MoonDynamicGroundError(
                 "MuJoCo data is missing mocap_pos/mocap_quat"
@@ -520,13 +795,33 @@ class MoonDynamicGround:
             raise MoonDynamicGroundError(
                 "MuJoCo mocap arrays are shorter than the resolved tile ids"
             )
+        if np.size(hfield_data) < (
+            self.support_data_adr + CONTINUOUS_SUPPORT_SAMPLE_COUNT
+        ):
+            raise MoonDynamicGroundError(
+                "MuJoCo hfield data is shorter than the continuous support"
+            )
+        if tuple(np.shape(geom_pos)) != (int(self._model.ngeom), 3):
+            raise MoonDynamicGroundError("MuJoCo geom_pos has an invalid shape")
 
         self._positions[:, 0] = tile_x
         self._positions[:, 1] = tile_y
         self._positions[:, 2] = tile_z
+        self._support_values[:] = normalized_support.reshape(-1)
+        self._support_position[:] = (
+            support_center_x,
+            support_center_y,
+            self.minimum_height_m,
+        )
         try:
             mocap_pos[self.mocap_ids, :] = self._positions
             mocap_quat[self.mocap_ids, :] = self._identity_quaternions
+            hfield_data[
+                self.support_data_adr : (
+                    self.support_data_adr + CONTINUOUS_SUPPORT_SAMPLE_COUNT
+                )
+            ] = self._support_values
+            geom_pos[self.support_geom_id, :] = self._support_position
         except (IndexError, TypeError, ValueError) as exc:
             raise MoonDynamicGroundError(
                 f"cannot write MoonWorld mocap poses: {exc}"
@@ -535,11 +830,26 @@ class MoonDynamicGround:
         pixel_x_range = (int(np.min(pixel_x)), int(np.max(pixel_x)))
         pixel_y_range = (int(np.min(pixel_y)), int(np.max(pixel_y)))
         height_range_m = (float(np.min(tile_z)), float(np.max(tile_z)))
+        support_pixel_x_range = (
+            int(np.min(support_pixel_x)),
+            int(np.max(support_pixel_x)),
+        )
+        support_pixel_y_range = (
+            int(np.min(support_pixel_y)),
+            int(np.max(support_pixel_y)),
+        )
+        support_height_range_m = (
+            float(np.min(support_z)),
+            float(np.max(support_z)),
+        )
         self._cached_data = data
         self._cached_quantized_base_xy = quantized_base_xy
         self._cached_pixel_x_range = pixel_x_range
         self._cached_pixel_y_range = pixel_y_range
         self._cached_height_range_m = height_range_m
+        self._cached_support_pixel_x_range = support_pixel_x_range
+        self._cached_support_pixel_y_range = support_pixel_y_range
+        self._cached_support_height_range_m = support_height_range_m
         self._update_count += 1
         self._tile_update_count += 1
         if cache_invalidated:
@@ -551,9 +861,13 @@ class MoonDynamicGround:
             "pixel_x_range": list(pixel_x_range),
             "pixel_y_range": list(pixel_y_range),
             "height_range_m": list(height_range_m),
+            "support_pixel_x_range": list(support_pixel_x_range),
+            "support_pixel_y_range": list(support_pixel_y_range),
+            "support_height_range_m": list(support_height_range_m),
             "cache_hit": False,
             "cache_invalidated": cache_invalidated,
             "tiles_updated": True,
+            "continuous_support_updated": True,
         }
         return dict(self._last_update)
 
@@ -587,6 +901,21 @@ class MoonDynamicGround:
                     else 0
                 ),
             },
+            "continuous_support": {
+                "mode": "rolling-heightfield-v1",
+                "geom_name": CONTINUOUS_SUPPORT_GEOM_NAME,
+                "asset_name": CONTINUOUS_SUPPORT_ASSET_NAME,
+                "geom_id": getattr(self, "support_geom_id", None),
+                "hfield_id": getattr(self, "support_hfield_id", None),
+                "grid_shape": [
+                    CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                    CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                ],
+                "half_extent_m": CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                "height_range_m": CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+                "base_depth_m": CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+                "source_tile_collision_enabled": False,
+            },
             # ``update_count`` retains its v1 meaning: successful calls.
             # ``tile_update_count`` counts the cache misses that wrote 256 poses.
             "update_count": self._update_count,
@@ -613,6 +942,9 @@ class MoonDynamicGround:
         self._cached_pixel_x_range = None
         self._cached_pixel_y_range = None
         self._cached_height_range_m = None
+        self._cached_support_pixel_x_range = None
+        self._cached_support_pixel_y_range = None
+        self._cached_support_height_range_m = None
         heights = self._heights
         self._heights = None
         if heights is not None:
@@ -633,6 +965,13 @@ class MoonDynamicGround:
 
 
 __all__ = (
+    "CONTINUOUS_SUPPORT_ASSET_NAME",
+    "CONTINUOUS_SUPPORT_BASE_DEPTH_M",
+    "CONTINUOUS_SUPPORT_GEOM_NAME",
+    "CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES",
+    "CONTINUOUS_SUPPORT_HALF_EXTENT_M",
+    "CONTINUOUS_SUPPORT_HEIGHT_RANGE_M",
+    "CONTINUOUS_SUPPORT_SAMPLE_COUNT",
     "MAP_DTYPE",
     "MAP_HALF_CELL_M",
     "MAP_HALF_EXTENT_M",
@@ -648,6 +987,7 @@ __all__ = (
     "TILE_COUNT",
     "TILE_SIDE_COUNT",
     "native_quantize",
+    "resolve_continuous_support",
     "resolve_tile_mocap_ids",
     "round_away_from_zero",
     "world_to_pixel",

@@ -353,12 +353,12 @@ SONIC_GAIT_SPEED_RANGES_MPS = {
     SONIC_RUN_MODE: (2.50, 7.50),
 }
 KEYBOARD_GAIT_TARGETS_MPS = {
-    SONIC_SLOW_WALK_MODE: 0.10,
+    SONIC_SLOW_WALK_MODE: 0.20,
     SONIC_WALK_MODE: 0.80,
     SONIC_RUN_MODE: 2.50,
 }
 KEYBOARD_GAIT_BOOST_TARGETS_MPS = {
-    SONIC_SLOW_WALK_MODE: 0.20,
+    SONIC_SLOW_WALK_MODE: 0.30,
     SONIC_WALK_MODE: 1.00,
     SONIC_RUN_MODE: 2.75,
 }
@@ -367,14 +367,9 @@ DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
 # per-command cap even if a caller supplies a larger dt or tuning rate.
 MAX_MEASURED_FACING_LEAD_RAD = 0.05
-# Ordinary WALK/RUN keyboard input should feel like a third-person game: a
-# moderate camera/body mismatch produces a curved path instead of forcing the
-# operator to hold a key through a long turn-in-place.  Reversals and sharp
-# side steps still turn before translating, and precise SLOW_WALK keeps the
-# tighter configurable safety gate below.
-KEYBOARD_CURVE_START_HEADING_ERROR_RAD = math.radians(60.0)
-KEYBOARD_CURVE_STOP_HEADING_ERROR_RAD = math.radians(75.0)
-KEYBOARD_FULL_SPEED_HEADING_ERROR_RAD = math.radians(15.0)
+PURE_FORWARD_CRAWL_MAX_ERROR_RAD = math.pi / 2.0
+PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD = 0.005
+PURE_FORWARD_CRAWL_STALL_GRACE_S = 0.40
 
 
 def native_locomotion_mode_for_speed(
@@ -590,8 +585,23 @@ class GameControlCore:
         self._v_was_down = False
         self._turn_sign = 1.0
         self._requires_neutral_rearm = True
+        self._neutral_rearm_pending = False
+        self._neutral_rearm_frame_required = False
+        self._rearm_completed_sequence: int | None = None
         self._invalid_reason: str | None = None
         self._stopped_heading_latched = False
+        self._observed_movement_chord: tuple[bool, bool, bool, bool] = (
+            False,
+            False,
+            False,
+            False,
+        )
+        self._movement_chord_epoch = 0
+        self._consumed_movement_chord_epoch = 0
+        self._locked_movement_chord: tuple[bool, bool, bool, bool] | None = None
+        self._locked_movement_heading_rad: float | None = None
+        self._pure_forward_crawl_error_rad: float | None = None
+        self._pure_forward_crawl_stall_s = 0.0
 
     @property
     def free_camera(self) -> bool:
@@ -630,6 +640,7 @@ class GameControlCore:
         self._speed_mps = 0.0
         self._gait_active = False
         self._stopped_heading_latched = True
+        self._reset_pure_forward_crawl_tracker()
 
     def invalidate_input(self, reason: str = "input_invalidated") -> None:
         """Stop immediately and require neutral input before re-arming."""
@@ -640,8 +651,75 @@ class GameControlCore:
         self._last_received_at_s = None
         self._speed_mps = 0.0
         self._gait_active = False
-        self._requires_neutral_rearm = True
+        self._require_neutral_rearm()
         self._invalid_reason = reason
+        self._clear_movement_chord_lock()
+
+    def _require_neutral_rearm(self) -> None:
+        self._requires_neutral_rearm = True
+        self._neutral_rearm_pending = False
+        self._neutral_rearm_frame_required = True
+        self._rearm_completed_sequence = None
+        self._reset_pure_forward_crawl_tracker()
+
+    def _snapshot_is_neutral(self) -> bool:
+        if self._snapshot is None:
+            return False
+        return bool(
+            not any(
+                (
+                    self._snapshot.keys.w,
+                    self._snapshot.keys.a,
+                    self._snapshot.keys.s,
+                    self._snapshot.keys.d,
+                )
+            )
+            and math.hypot(
+                self._snapshot.move_stick.right,
+                self._snapshot.move_stick.forward,
+            )
+            <= self.config.stick_deadzone
+        )
+
+    def _complete_neutral_rearm_frame(self) -> None:
+        if not self._neutral_rearm_pending or self._last_sequence is None:
+            raise RuntimeError("neutral re-arm frame was not pending")
+        self._requires_neutral_rearm = False
+        self._neutral_rearm_pending = False
+        self._neutral_rearm_frame_required = False
+        # Packets already consumed in this control frame cannot drive a later
+        # frame. A strictly newer snapshot is required after this boundary.
+        self._rearm_completed_sequence = self._last_sequence
+
+    def _clear_movement_chord_lock(self) -> None:
+        self._locked_movement_chord = None
+        self._locked_movement_heading_rad = None
+        self._reset_pure_forward_crawl_tracker()
+
+    def _reset_pure_forward_crawl_tracker(self) -> None:
+        self._pure_forward_crawl_error_rad = None
+        self._pure_forward_crawl_stall_s = 0.0
+
+    def _pure_forward_crawl_progress_allows(
+        self, measured_error_abs_rad: float, *, dt_s: float
+    ) -> bool:
+        if measured_error_abs_rad >= PURE_FORWARD_CRAWL_MAX_ERROR_RAD:
+            self._reset_pure_forward_crawl_tracker()
+            return False
+        previous_error = self._pure_forward_crawl_error_rad
+        progressed = (
+            previous_error is not None
+            and measured_error_abs_rad
+            <= previous_error - PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD
+        )
+        if previous_error is None or progressed:
+            self._pure_forward_crawl_stall_s = 0.0
+            self._pure_forward_crawl_error_rad = measured_error_abs_rad
+        else:
+            self._pure_forward_crawl_stall_s += dt_s
+        return progressed or self._pure_forward_crawl_stall_s < (
+            PURE_FORWARD_CRAWL_STALL_GRACE_S - 1e-12
+        )
 
     def _latch_stopped_heading(self) -> None:
         """Hold one physical heading for the complete stopped interval.
@@ -696,23 +774,53 @@ class GameControlCore:
         # edge, and holding V across refocus cannot toggle the mode by accident.
         if snapshot.focused and snapshot.keys.v and not self._v_was_down:
             self._free_camera = not self._free_camera
-            self._requires_neutral_rearm = True
+            self._require_neutral_rearm()
         self._v_was_down = snapshot.keys.v
         if not snapshot.focused:
-            self._requires_neutral_rearm = True
-        digital_neutral = not any(
-            (snapshot.keys.w, snapshot.keys.a, snapshot.keys.s, snapshot.keys.d)
+            self._require_neutral_rearm()
+        movement_chord = (
+            snapshot.keys.w,
+            snapshot.keys.a,
+            snapshot.keys.s,
+            snapshot.keys.d,
         )
+        if movement_chord != self._observed_movement_chord:
+            # Runtime drains can contain W -> W+D -> W before command() runs.
+            # Preserve that boundary even though the final chord matches the
+            # existing lock, while ordinary held-key snapshots leave the epoch
+            # unchanged as final-POV yaw follows the body.
+            self._observed_movement_chord = movement_chord
+            self._movement_chord_epoch += 1
+        digital_neutral = not any(movement_chord)
         analog_neutral = math.hypot(
             snapshot.move_stick.right, snapshot.move_stick.forward
         ) <= self.config.stick_deadzone
+        digital_right = int(snapshot.keys.d) - int(snapshot.keys.a)
+        digital_forward = int(snapshot.keys.w) - int(snapshot.keys.s)
+        if digital_right == 0 and digital_forward == 0:
+            # A release or an opposing-key chord ends the current digital
+            # movement interval even if no command is sampled for this packet.
+            self._clear_movement_chord_lock()
         if (
             snapshot.focused
             and not self._free_camera
             and digital_neutral
             and analog_neutral
+            and self._requires_neutral_rearm
         ):
-            self._requires_neutral_rearm = False
+            if self._neutral_rearm_frame_required:
+                self._neutral_rearm_pending = True
+            else:
+                # Startup has no prior unsafe command generation to fence. Keep
+                # its long-standing synchronous neutral initialization while
+                # every post-invalidation re-arm uses a full control frame.
+                self._requires_neutral_rearm = False
+        elif (
+            not self._requires_neutral_rearm
+            and self._rearm_completed_sequence is not None
+            and snapshot.sequence > self._rearm_completed_sequence
+        ):
+            self._rearm_completed_sequence = None
         self._snapshot = snapshot
         self._last_received_at_s = received_at
         self._last_sequence = snapshot.sequence
@@ -750,21 +858,23 @@ class GameControlCore:
         if self._snapshot is None or self._last_received_at_s is None:
             return (self._invalid_reason or "no_input", True)
         if now_s < self._last_received_at_s:
-            self._requires_neutral_rearm = True
+            self._require_neutral_rearm()
             return ("clock_regression", True)
         if (
             now_s - self._last_received_at_s >= self.config.input_timeout_s
             or now_s - self._snapshot.timestamp_monotonic_s
             >= self.config.input_timeout_s
         ):
-            self._requires_neutral_rearm = True
+            self._require_neutral_rearm()
             return ("input_timeout", True)
         if not self._snapshot.focused:
-            self._requires_neutral_rearm = True
+            self._require_neutral_rearm()
             return ("focus_lost", True)
         if self._free_camera:
             return ("free_camera", False)
-        if self._requires_neutral_rearm:
+        if self._requires_neutral_rearm and not self._neutral_rearm_pending:
+            return ("awaiting_neutral", True)
+        if self._rearm_completed_sequence is not None:
             return ("awaiting_neutral", True)
         return None
 
@@ -855,16 +965,26 @@ class GameControlCore:
             return self._safe_stop(reason=reason, deadman=deadman)
 
         assert self._snapshot is not None
+        completing_neutral_rearm = (
+            self._requires_neutral_rearm and self._neutral_rearm_pending
+        )
+        if completing_neutral_rearm and not self._snapshot_is_neutral():
+            command = self._safe_stop(reason="awaiting_neutral", deadman=True)
+            self._complete_neutral_rearm_frame()
+            return command
         local_right, local_forward = self._local_movement()
         input_magnitude = min(1.0, math.hypot(local_right, local_forward))
         keys = self._snapshot.keys
         digital_movement = any((keys.w, keys.a, keys.s, keys.d))
+        movement_chord_boundary = (
+            self._movement_chord_epoch != self._consumed_movement_chord_epoch
+        )
+        self._consumed_movement_chord_epoch = self._movement_chord_epoch
         alignment = 0.0
         requested_speed = 0.0
         requested_locomotion_mode = SONIC_IDLE_MODE
         desired_heading = self._command_heading_rad
-        gait_start_heading_error_rad = self.config.gait_start_heading_error_rad
-        gait_stop_heading_error_rad = self.config.gait_stop_heading_error_rad
+        pure_forward_alignment_crawl = False
 
         if input_magnitude > 1e-12:
             self._stopped_heading_latched = False
@@ -873,7 +993,22 @@ class GameControlCore:
                 forward=local_forward,
                 camera_yaw_rad=self._snapshot.camera_yaw_rad,
             )
-            desired_heading = math.atan2(world_y, world_x)
+            projected_heading = math.atan2(world_y, world_x)
+            if digital_movement:
+                movement_chord = (keys.w, keys.a, keys.s, keys.d)
+                if (
+                    movement_chord_boundary
+                    or movement_chord != self._locked_movement_chord
+                ):
+                    self._reset_pure_forward_crawl_tracker()
+                    self._locked_movement_chord = movement_chord
+                    self._locked_movement_heading_rad = projected_heading
+                assert self._locked_movement_heading_rad is not None
+                desired_heading = self._locked_movement_heading_rad
+            else:
+                # Analog movement remains continuously camera-relative.
+                self._clear_movement_chord_lock()
+                desired_heading = projected_heading
             # Keep the planner-facing setpoint close to the physical body.
             # During a post-recovery handoff SONIC can remain in a writer-
             # confirmed hold for longer than it takes an open-loop setpoint to
@@ -941,26 +1076,42 @@ class GameControlCore:
             requested_speed, requested_locomotion_mode = (
                 self._requested_locomotion(input_magnitude)
             )
-            curved_keyboard_motion = digital_movement and (
-                requested_locomotion_mode in {SONIC_WALK_MODE, SONIC_RUN_MODE}
-            )
-            if curved_keyboard_motion:
-                gait_start_heading_error_rad = (
-                    KEYBOARD_CURVE_START_HEADING_ERROR_RAD
-                )
-                gait_stop_heading_error_rad = KEYBOARD_CURVE_STOP_HEADING_ERROR_RAD
             target_speed = requested_speed * alignment
+            pure_forward_alignment_crawl_eligible = (
+                digital_movement
+                and keys.w
+                and not any((keys.a, keys.s, keys.d))
+                and self._measured_heading_rad is not None
+                and alignment < math.cos(self.config.gait_start_heading_error_rad)
+            )
+            if pure_forward_alignment_crawl_eligible:
+                assert self._measured_heading_rad is not None
+                measured_error_abs = abs(
+                    wrap_angle_rad(desired_heading - self._measured_heading_rad)
+                )
+                pure_forward_alignment_crawl = (
+                    self._pure_forward_crawl_progress_allows(
+                        measured_error_abs,
+                        dt_s=dt,
+                    )
+                )
+                if pure_forward_alignment_crawl:
+                    target_speed = min(self.config.gait_start_speed_mps, requested_speed)
+                    requested_locomotion_mode = SONIC_SLOW_WALK_MODE
+                else:
+                    target_speed = 0.0
+            else:
+                self._reset_pure_forward_crawl_tracker()
             if (
                 digital_movement
                 and alignment
-                >= math.cos(KEYBOARD_FULL_SPEED_HEADING_ERROR_RAD)
+                >= math.cos(self.config.gait_start_heading_error_rad)
             ):
                 # Keyboard targets sit exactly on native gait boundaries.
                 # Cosine attenuation at a harmless residual heading error
                 # would otherwise make WALK/RUN mathematically unreachable.
-                # Preserve the exact tier target once the body is inside the
-                # tight full-speed gate.  Moderate WALK/RUN turns retain cosine
-                # attenuation and therefore curve naturally toward the camera.
+                # The translation gate already supplies turn-before-move, so
+                # preserve the exact tier target once the body is inside it.
                 target_speed = requested_speed
         else:
             target_speed = 0.0
@@ -990,6 +1141,8 @@ class GameControlCore:
             self._speed_mps = _move_toward(
                 self._speed_mps, target_speed, rate * dt
             )
+            if pure_forward_alignment_crawl:
+                self._speed_mps = min(self._speed_mps, target_speed)
             if math.isclose(
                 self._speed_mps, target_speed, rel_tol=0.0, abs_tol=1e-12
             ):
@@ -1015,11 +1168,12 @@ class GameControlCore:
         if (
             input_magnitude > 1e-12
             and self._gait_active
+            and not pure_forward_alignment_crawl
             and (
                 target_speed + self.config.speed_epsilon_mps
                 < self.config.gait_stop_speed_mps
                 or alignment
-                < math.cos(gait_stop_heading_error_rad)
+                < math.cos(self.config.gait_stop_heading_error_rad)
             )
         ):
             # Keep turning in native IDLE until physical alignment can support
@@ -1031,11 +1185,11 @@ class GameControlCore:
             and requested_speed + self.config.speed_epsilon_mps
             >= self.config.gait_start_speed_mps
             and alignment + self.config.speed_epsilon_mps
-            >= math.cos(gait_start_heading_error_rad)
+            >= math.cos(self.config.gait_start_heading_error_rad)
             and self._speed_mps + self.config.speed_epsilon_mps
             >= (
                 self.config.min_gait_speed_mps
-                * math.cos(gait_start_heading_error_rad)
+                * math.cos(self.config.gait_start_heading_error_rad)
             )
         ):
             self._gait_active = True
@@ -1043,6 +1197,15 @@ class GameControlCore:
             # Snap the hidden ramp back to that exact floor on entry so the
             # first non-zero frame is 0.10 m/s, then subsequent frames obey the
             # configured acceleration from that boundary.
+            self._speed_mps = self.config.gait_start_speed_mps
+        elif (
+            input_magnitude > 1e-12
+            and pure_forward_alignment_crawl
+            and not self._gait_active
+            and self._speed_mps + self.config.speed_epsilon_mps
+            >= self.config.gait_start_speed_mps
+        ):
+            self._gait_active = True
             self._speed_mps = self.config.gait_start_speed_mps
         if self._speed_mps == 0.0:
             self._gait_active = False
@@ -1077,7 +1240,7 @@ class GameControlCore:
         # the look stick.  Keep turn-before-translation on that native
         # contract: SLOW_WALK has a non-zero 0.10 m/s floor and must never be
         # paired with zero speed/movement.
-        return RobotMotionCommand(
+        command = RobotMotionCommand(
             sequence=self._last_sequence,
             movement=direction if moving else (0.0, 0.0, 0.0),
             facing=direction,
@@ -1088,6 +1251,9 @@ class GameControlCore:
             reason="aligning_heading" if turning_to_heading else None,
             desired_facing=desired_direction,
         )
+        if completing_neutral_rearm:
+            self._complete_neutral_rearm_frame()
+        return command
 
 
 @dataclass(frozen=True)

@@ -186,7 +186,7 @@ def celestial_navigation_state() -> dict[str, object]:
                     runtime_status="active",
                     status="ready",
                     enabled=True,
-                    position=[0.0, 0.0, -0.1366965003013611],
+                    position=[-94.7, -65.6, -5.251562023162842],
                     gravity=1.62,
                     atmosphere="vacuum",
                 ),
@@ -347,6 +347,47 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertGreaterEqual(layout["command_result"][3], 14)
         self.assertFalse(self.intersects(layout["title"], layout["profile_local"]))
         self.assertFalse(self.intersects(layout["title"], layout["profile_remote"]))
+
+    def test_runtime_pause_footer_is_bounded_distinct_and_on_every_page(self) -> None:
+        for geometry in (
+            MODULE.WindowGeometry(1, 0, 0, 480, 360),
+            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
+        ):
+            with self.subTest(geometry=geometry):
+                layout = MODULE.overlay_layout(geometry)
+                panel = layout["panel"]
+                pause = layout["runtime_pause"]
+                apply = layout["apply_return"]
+                self.assertFalse(self.intersects(pause, apply))
+                for rectangle in (pause, apply):
+                    self.assertTrue(
+                        MODULE.point_in_rectangle(rectangle[:2], panel)
+                    )
+                    self.assertTrue(
+                        MODULE.point_in_rectangle(
+                            (
+                                rectangle[0] + rectangle[2] - 1,
+                                rectangle[1] + rectangle[3] - 1,
+                            ),
+                            panel,
+                        )
+                    )
+                centre = (
+                    pause[0] + pause[2] // 2,
+                    pause[1] + pause[3] // 2,
+                )
+                for page in (
+                    "loadout",
+                    "settings",
+                    "console",
+                    "inventory",
+                    "navigation",
+                    "video",
+                ):
+                    self.assertEqual(
+                        MODULE.panel_action_at(layout, *centre, page=page),
+                        "runtime_pause",
+                    )
 
     def test_motion_speed_grid_is_bounded_page_scoped_and_avoids_crosshair(self) -> None:
         for geometry in (
@@ -665,6 +706,158 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(unavailable.apply_label, "APPLY UNAVAILABLE")
         self.assertIn("unavailable", unavailable.error)
         self.assertFalse(unavailable.action_enabled("apply_return"))
+
+    def test_runtime_pause_model_is_strict_and_disables_busy_or_fault(self) -> None:
+        def model(
+            phase: str,
+            epoch: int,
+            can_pause: bool,
+            can_resume: bool,
+            last_error=None,
+        ):
+            return MODULE.runtime_pause_panel_model(
+                {
+                    "command_console": {
+                        "runtime_pause": {
+                            "state": phase,
+                            "epoch": epoch,
+                            "can_pause": can_pause,
+                            "can_resume": can_resume,
+                            "last_error": last_error,
+                        }
+                    }
+                }
+            )
+
+        running = model("running", 4, True, False)
+        self.assertTrue(running.enabled)
+        self.assertEqual(running.pause_target, "paused")
+        self.assertIn("Pause", running.label)
+        paused = model("paused", 5, False, True)
+        self.assertTrue(paused.enabled)
+        self.assertEqual(paused.pause_target, "running")
+        self.assertIn("Continue", paused.label)
+        for phase in ("pausing", "resuming", "busy"):
+            with self.subTest(phase=phase):
+                busy = model(phase, 5, False, False)
+                self.assertFalse(busy.enabled)
+                self.assertIsNone(busy.pause_target)
+        fault = model("fault", 5, False, False, "MuJoCo pause failed")
+        self.assertFalse(fault.enabled)
+        self.assertEqual(fault.last_error, "MuJoCo pause failed")
+        malformed = MODULE.runtime_pause_panel_model(
+            {
+                "command_console": {
+                    "runtime_pause": {
+                        "state": "running",
+                        "epoch": True,
+                        "can_pause": True,
+                        "can_resume": False,
+                        "last_error": None,
+                        "shell": "pause",
+                    }
+                }
+            }
+        )
+        self.assertFalse(malformed.available)
+        self.assertFalse(malformed.enabled)
+
+    def test_runtime_pause_button_draws_visible_state_semantics(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        panel_model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+
+        def runtime_pause_state(state: str, *, epoch: int = 7):
+            return MODULE.runtime_pause_panel_model(
+                {
+                    "command_console": {
+                        "runtime_pause": {
+                            "state": state,
+                            "epoch": epoch,
+                            "can_pause": state == "running",
+                            "can_resume": state == "paused",
+                            "last_error": "pause bridge fault"
+                            if state == "fault"
+                            else None,
+                        }
+                    }
+                }
+            )
+
+        def command_status(*, busy: bool = False):
+            return MODULE.command_console_status(
+                {
+                    "command_console": {
+                        "available": True,
+                        "editing": False,
+                        "in_flight": busy,
+                        "status": "pending" if busy else "idle",
+                    }
+                }
+            )
+
+        def draw_runtime_button(state: str, *, busy: bool = False):
+            overlay = object.__new__(MODULE.X11CalibrationOverlay)
+            overlay._x11 = mock.Mock()
+            overlay._display = 1
+            overlay._windows = {"panel": 2}
+            overlay._panel_gc = 3
+            overlay._xft = None
+            overlay._xft_draw = None
+            overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
+            overlay._active_page = "settings"
+            overlay._colours = {
+                name: index
+                for index, name in enumerate(
+                    (
+                        "white",
+                        "muted",
+                        "selected",
+                        "button",
+                        "disabled",
+                        "pending",
+                        "error",
+                        "apply",
+                        "outline",
+                        "cyan",
+                    ),
+                    10,
+                )
+            }
+            overlay._command_editor = MODULE.CommandLineEditor()
+            status = command_status(busy=busy)
+            overlay._last_command_status = status
+            overlay._draw_text = mock.Mock()
+            overlay._draw_button = mock.Mock()
+
+            overlay._draw_panel(
+                layout,
+                panel_model,
+                status,
+                runtime_pause_model=runtime_pause_state(state),
+            )
+
+            return next(
+                call
+                for call in overlay._draw_button.call_args_list
+                if call.args[1] == "runtime_pause"
+            ), overlay._colours
+
+        cases = (
+            ("running", False, "暂停 / Pause", False, "button"),
+            ("paused", False, "继续 / Continue", False, "selected"),
+            ("running", True, "处理中 / Busy", True, "pending"),
+            ("pausing", False, "暂停中 / Pausing", True, "pending"),
+            ("fault", False, "暂停故障 / Fault", True, "error"),
+            ("unavailable", False, "暂停不可用", True, "disabled"),
+        )
+        for state, busy, label, disabled, fill_name in cases:
+            with self.subTest(state=state, busy=busy):
+                button, colours = draw_runtime_button(state, busy=busy)
+                self.assertEqual(button.args[2], label)
+                self.assertIs(button.kwargs["disabled"], disabled)
+                self.assertEqual(button.kwargs["fill"], colours[fill_name])
 
     def test_creative_inventory_visual_blocker_disables_every_item(self) -> None:
         model = MODULE.creative_inventory_model(
@@ -1251,6 +1444,76 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn("可传送", buttons["navigation_destination_0"].args[2])
         self.assertIn("可传送", buttons["navigation_destination_1"].args[2])
 
+    def test_navigation_undiscovered_draws_disabled_not_pending(self) -> None:
+        state = celestial_navigation_state()
+        state["celestial_navigation"]["bodies"][3] = {
+            **state["celestial_navigation"]["bodies"][3],
+            "runtime_status": "active",
+        }
+        destinations = state["celestial_navigation"]["destinations"]
+        destinations[1] = {
+            **destinations[1],
+            "status": "unknown",
+            "enabled": False,
+            "local_position_m": None,
+            "universe_position_m": None,
+        }
+        destinations[2] = {
+            **destinations[2],
+            "runtime_status": "active",
+            "status": "undiscovered",
+            "local_position_m": None,
+            "universe_position_m": None,
+        }
+        model = MODULE.celestial_navigation_model(state)
+        self.assertEqual(model.destinations[1].status, "unknown")
+        self.assertEqual(model.destinations[2].status, "undiscovered")
+        self.assertFalse(model.destination_enabled("moon-tranquility-outpost"))
+        self.assertFalse(model.destination_enabled("mars-utopia-outpost"))
+
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "navigation_summary")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+
+        overlay._draw_navigation_page(layout, model)
+
+        buttons = {
+            call.args[1]: call for call in overlay._draw_button.call_args_list
+        }
+        self.assertEqual(
+            buttons["navigation_destination_1"].kwargs["fill"],
+            overlay._colours["pending"],
+        )
+        self.assertTrue(buttons["navigation_destination_1"].kwargs["disabled"])
+        self.assertEqual(
+            buttons["navigation_destination_2"].kwargs["fill"],
+            overlay._colours["disabled"],
+        )
+        self.assertTrue(buttons["navigation_destination_2"].kwargs["disabled"])
+        self.assertIn("待同步", buttons["navigation_destination_1"].args[2])
+        self.assertIn("未发现", buttons["navigation_destination_2"].args[2])
+
     def test_disabled_locomotion_candidate_emits_no_selection_intent(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
         model = MODULE.StrategyLoadoutModel(
@@ -1707,7 +1970,9 @@ class HotFontSizeTest(unittest.TestCase):
         overlay._last_layout = MODULE.overlay_layout(
             MODULE.WindowGeometry(1, 0, 0, 1280, 800)
         )
-        overlay._set_font_size = mock.Mock(return_value=True)
+        overlay._set_font_size = mock.Mock(
+            side_effect=AssertionError("font changed before provider ACK")
+        )
         track = MODULE.font_slider_track(
             overlay._last_layout["font_size_slider"]
         )
@@ -1717,12 +1982,131 @@ class HotFontSizeTest(unittest.TestCase):
 
         overlay._active_page = "settings"
         self.assertTrue(overlay._set_font_size_from_root_x(track[0] + track[2]))
-        overlay._set_font_size.assert_called_once_with(
-            MODULE._MAX_OVERLAY_FONT_SIZE
+        overlay._set_font_size.assert_not_called()
+        self.assertEqual(overlay._font_size, MODULE._DEFAULT_OVERLAY_FONT_SIZE)
+        self.assertEqual(
+            overlay._pending_font_slider_size,
+            MODULE._MAX_OVERLAY_FONT_SIZE,
         )
 
 
+class RuntimePausePointerTest(unittest.TestCase):
+    @staticmethod
+    def overlay(state: str, *, page: str = "settings"):
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        pause_state = {
+            "command_console": {
+                "runtime_pause": {
+                    "state": state,
+                    "epoch": 3,
+                    "can_pause": state == "running",
+                    "can_resume": state == "paused",
+                    "last_error": "runtime fault" if state == "fault" else None,
+                }
+            }
+        }
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._last_layout = layout
+        overlay._active_page = page
+        overlay._last_panel_model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+        overlay._last_runtime_pause_model = MODULE.runtime_pause_panel_model(
+            pause_state
+        )
+        overlay._last_command_status = MODULE.command_console_status(
+            {
+                "command_console": {
+                    "available": True,
+                    "editing": False,
+                    "in_flight": False,
+                    "status": "idle",
+                }
+            }
+        )
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._pressed_action = None
+        overlay._pressed_window = None
+        overlay._visible = True
+        overlay._font_slider_dragging = False
+        x, y, width, height = layout["runtime_pause"]
+        events = []
+        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
+            event = MODULE.XEvent()
+            event.type = event_type
+            event.xbutton.button = 1
+            event.xbutton.window = 2
+            event.xbutton.x_root = x + width // 2
+            event.xbutton.y_root = y + height // 2
+            events.append(event)
+        overlay._x11.XPending.side_effect = lambda _display: len(events)
+
+        def next_event(_display, destination):
+            event = events.pop(0)
+            MODULE.ctypes.memmove(
+                destination,
+                MODULE.ctypes.byref(event),
+                MODULE.ctypes.sizeof(event),
+            )
+
+        overlay._x11.XNextEvent.side_effect = next_event
+        return overlay
+
+    def test_running_and_paused_clicks_emit_exact_transition_intents(self) -> None:
+        for state, target in (("running", "paused"), ("paused", "running")):
+            with self.subTest(state=state):
+                overlay = self.overlay(state, page="inventory")
+                publisher = mock.Mock()
+                self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
+                publisher.publish_runtime_pause.assert_called_once_with(
+                    target, expected_epoch=3
+                )
+                publisher.publish.assert_not_called()
+
+    def test_busy_and_fault_clicks_emit_nothing(self) -> None:
+        for state in ("pausing", "resuming", "busy", "fault", "unavailable"):
+            with self.subTest(state=state):
+                overlay = self.overlay(state)
+                publisher = mock.Mock()
+                self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
+                publisher.publish_runtime_pause.assert_not_called()
+
+
 class PointerActionPublisherTest(unittest.TestCase):
+    def test_runtime_pause_intent_is_typed_and_epoch_guarded(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(), session="known-session"
+        )
+        try:
+            publisher.publish_runtime_pause("paused", expected_epoch=9)
+            self.assertEqual(
+                json.loads(receiver.recv(1024).decode("ascii")),
+                {
+                    "version": 1,
+                    "session": "known-session",
+                    "sequence": 1,
+                    "kind": "runtime_pause",
+                    "pause_target": "paused",
+                    "expected_epoch": 9,
+                },
+            )
+            for target, epoch in (
+                ("toggle", 9),
+                ([], 9),
+                ("running", True),
+                ("paused", -1),
+            ):
+                with self.subTest(target=target, epoch=epoch), self.assertRaisesRegex(
+                    ValueError, "invalid"
+                ):
+                    publisher.publish_runtime_pause(target, expected_epoch=epoch)
+        finally:
+            publisher.close()
+            receiver.close()
+
     def test_video_settings_model_and_intent_are_revision_guarded(self) -> None:
         model = MODULE.video_settings_panel_model(
             {
@@ -1972,7 +2356,12 @@ class MotionPanelActionTest(unittest.TestCase):
         )
 
     @staticmethod
-    def overlay(action: str, *, in_flight: bool = False):
+    def overlay(
+        action: str,
+        *,
+        in_flight: bool = False,
+        motion_settings: MODULE.MotionSettings | None = None,
+    ):
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 480, 360))
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
         overlay._x11 = mock.Mock()
@@ -1983,7 +2372,11 @@ class MotionPanelActionTest(unittest.TestCase):
             {"restart": {"available": True, "requested": False}}
         )
         overlay._last_motion_model = MODULE.motion_settings_panel_model(
-            {"motion_settings": MODULE.MotionSettings().to_mapping()}
+            {
+                "motion_settings": (
+                    motion_settings or MODULE.MotionSettings()
+                ).to_mapping()
+            }
         )
         overlay._last_command_status = MotionPanelActionTest.command_status(
             in_flight=in_flight
@@ -2034,7 +2427,16 @@ class MotionPanelActionTest(unittest.TestCase):
             ("motion_walk_speed_mps_up", True),
         ):
             with self.subTest(action=action, in_flight=in_flight):
-                overlay = self.overlay(action, in_flight=in_flight)
+                motion_settings = (
+                    MODULE.MotionSettings(slow_speed_mps=0.10)
+                    if action == "motion_slow_speed_mps_down"
+                    else None
+                )
+                overlay = self.overlay(
+                    action,
+                    in_flight=in_flight,
+                    motion_settings=motion_settings,
+                )
                 publisher = mock.Mock()
                 self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
                 publisher.publish_command_submit.assert_not_called()
@@ -2334,6 +2736,13 @@ class OverlayRenderCacheTest(unittest.TestCase):
                 "editing": False,
                 "in_flight": False,
                 "status": "idle",
+                "runtime_pause": {
+                    "state": "running",
+                    "epoch": 0,
+                    "can_pause": True,
+                    "can_resume": False,
+                    "last_error": None,
+                },
             },
         }
 
@@ -2408,6 +2817,41 @@ class OverlayRenderCacheTest(unittest.TestCase):
 
         overlay._font_size = MODULE._MAX_OVERLAY_FONT_SIZE
         overlay.show(geometry, (300, 300), state, now_s=10.02)
+        self.assertEqual(overlay._draw_panel.call_count, 2)
+
+    def test_authoritative_ui_telemetry_drives_the_live_font_commit(self) -> None:
+        overlay = self.make_overlay()
+        overlay._set_font_size = mock.Mock(return_value=True)
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        state = self.state()
+        state["ui_settings"] = {
+            "font_scale": 1.0,
+            "font_size": 9,
+            "load_status": "saved",
+            "persistence_error": None,
+            "change_count": 1,
+        }
+
+        overlay.show(geometry, (300, 300), state, now_s=10.0)
+
+        overlay._set_font_size.assert_called_once_with(9)
+
+    def test_runtime_pause_state_or_epoch_invalidates_static_render_key(self) -> None:
+        overlay = self.make_overlay()
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        state = self.state()
+        overlay.show(geometry, (300, 300), state, now_s=10.0)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+
+        changed = json.loads(json.dumps(state))
+        changed["command_console"]["runtime_pause"] = {
+            "state": "paused",
+            "epoch": 1,
+            "can_pause": False,
+            "can_resume": True,
+            "last_error": None,
+        }
+        overlay.show(geometry, (300, 300), changed, now_s=10.02)
         self.assertEqual(overlay._draw_panel.call_count, 2)
 
     def test_motion_telemetry_change_invalidates_the_static_panel_render_key(

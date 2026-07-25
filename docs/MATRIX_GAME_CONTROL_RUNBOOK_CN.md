@@ -113,7 +113,7 @@ Matrix 0.1.2 cooked 运行包目前**没有完成**以下能力：
 | SONIC 控制 | 50 Hz；原生物理保持 200 Hz |
 | 键盘最高目标 | 默认 2.75 m/s（RUN boost，可在面板调节） |
 | 模拟量最高速度 | 默认 0.30 m/s；最高可配置 0.80 m/s，保持在 `SLOW_WALK` |
-| 键盘步态档 | Ctrl/Alt slow 0.10/0.20；无修饰 walk 0.80/1.00；Shift run 2.50/2.75 m/s；前者为 base、后者为双击 boost，slow 优先 |
+| 键盘步态档 | Ctrl/Alt slow 0.20/0.30；无修饰 walk 0.80/1.00；Shift run 2.50/2.75 m/s；前者为 base、后者为双击 boost，slow 优先 |
 | 原生步态区间 | mode 1：0.10-0.80；mode 2：0.80-2.50；mode 3：2.50-7.50 m/s |
 | 加速度 / 减速度 | 1.20 / 2.40 m/s² |
 | 最大朝向变化率 | 2.50 rad/s |
@@ -204,16 +204,17 @@ git -C /home/kaijie/matrix worktree add --detach \
   /home/kaijie/worktrees/matrix-game-control-exp \
   origin/main
 cd /home/kaijie/worktrees/matrix-game-control-exp
-MATRIX_SONIC_ROOT=/home/kaijie/worktrees/sonic-matrix-native-final \
-  bash scripts/bootstrap_matrix_sonic.sh \
-    --profile heyuan \
-    --release-cache /home/kaijie/matrix-eval/releases \
-    --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
-    --write-local-env
-/usr/bin/python3 scripts/update_matrix_local_env.py \
-  .matrix/local.env MATRIX_SONIC_ROOT \
-  /home/kaijie/worktrees/sonic-matrix-native-final
+bash scripts/bootstrap_matrix_sonic.sh \
+  --profile heyuan \
+  --release-cache /home/kaijie/matrix-eval/releases \
+  --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
+  --write-local-env
 ```
+
+Heyuan profile 默认使用
+`$MATRIX_RUNTIME_ROOT/GR00T-WholeBodyControl` 中经过证明的归档镜像。该镜像必须同时
+包含锁定的 `SONIC_COMMIT`、关键源码哈希、运行时目录和可移植 deploy 二进制；正式验收
+不得改指向实验 SONIC worktree。
 
 ```bash
 MATRIX_EXPERIMENT_WORKTREE="${MATRIX_EXPERIMENT_WORKTREE:-/home/kaijie/worktrees/matrix-game-control-exp}"

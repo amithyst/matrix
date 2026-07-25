@@ -2,6 +2,11 @@
 set -euo pipefail
 ORIGINAL_ENVIRONMENT=()
 while IFS= read -r -d '' entry; do
+    case "$entry" in
+        MATRIX_SONIC_RESTART_ROUTE_JSON=*|MATRIX_GAME_ROUTE_ENTRY_JSON=*)
+            continue
+            ;;
+    esac
     ORIGINAL_ENVIRONMENT+=("$entry")
 done < "/proc/$$/environ"
 if ((BASH_VERSINFO[0] < 5 \
@@ -320,6 +325,7 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 MATRIX_SONIC_HOST_LOCK="${MATRIX_SONIC_HOST_LOCK:-/tmp/matrix-sonic-${UID}.lock}"
 MATRIX_SONIC_INTERNAL_RESTART=0
+unset MATRIX_GAME_ROUTE_ENTRY_JSON
 if [[ "${MATRIX_SONIC_RESTART_LOCK_FD:-}" == "9" ]]; then
     inherited_target="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
     expected_target="$(realpath -m "$MATRIX_SONIC_HOST_LOCK")"
@@ -353,14 +359,34 @@ if [[ "$MATRIX_SONIC_INTERNAL_RESTART" == "1" ]]; then
         fi
         export MATRIX_GAME_WORLD_ID="$MATRIX_SONIC_RESTART_WORLD_ID"
     fi
+    if [[ -n "${MATRIX_SONIC_RESTART_ROUTE_JSON:-}" ]]; then
+        if [[ -z "${MATRIX_SONIC_RESTART_SCENE_ID:-}" \
+            || -z "${MATRIX_SONIC_RESTART_WORLD_ID:-}" ]]; then
+            echo "[ERROR] Matrix restart route is missing its target identity" >&2
+            exit 2
+        fi
+        if ! MATRIX_GAME_ROUTE_ENTRY_JSON="$(
+            /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_route_entry.py" \
+                --expected-world-id "$MATRIX_SONIC_RESTART_WORLD_ID" \
+                --expected-scene-id "$MATRIX_SONIC_RESTART_SCENE_ID" \
+                --json "$MATRIX_SONIC_RESTART_ROUTE_JSON" 2>&1
+        )"; then
+            echo "[ERROR] Matrix restart route entry is invalid: " \
+                "$MATRIX_GAME_ROUTE_ENTRY_JSON" >&2
+            exit 2
+        fi
+        export MATRIX_GAME_ROUTE_ENTRY_JSON
+    fi
 else
     if [[ -n "${MATRIX_SONIC_RESTART_SCENE_ID:-}" \
-        || -n "${MATRIX_SONIC_RESTART_WORLD_ID:-}" ]]; then
+        || -n "${MATRIX_SONIC_RESTART_WORLD_ID:-}" \
+        || -n "${MATRIX_SONIC_RESTART_ROUTE_JSON:-}" ]]; then
         echo "[ERROR] Matrix restart route requires the inherited host lock" >&2
         exit 2
     fi
 fi
 unset MATRIX_SONIC_RESTART_SCENE_ID MATRIX_SONIC_RESTART_WORLD_ID
+unset MATRIX_SONIC_RESTART_ROUTE_JSON
 
 # The host lock serializes every mutation of Saved/Paks.  Clear a verified
 # leftover from an interrupted generation before any runtime audit, then verify
@@ -403,6 +429,7 @@ IFS=$'\t' read -r MATRIX_MOUSE_APPLIED_PROFILE \
 if [[ "$MATRIX_MOUSE_APPLIED_PROFILE" != "local" \
     && "$MATRIX_MOUSE_APPLIED_PROFILE" != "remote" ]] \
     || [[ "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "loaded" \
+        && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "loaded_legacy" \
         && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "missing" \
         && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "invalid" ]]; then
     echo "[ERROR] Invalid mouse-settings helper output" >&2
@@ -946,6 +973,7 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
         "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
         "$PROJECT_ROOT/scripts/matrix_item_asset_pack.py" \
         "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
+        "$PROJECT_ROOT/scripts/matrix_route_entry.py" \
         "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
         "$PROJECT_ROOT/scripts/matrix_world_state.py" \
         "$PROJECT_ROOT/config/universe/sol-2080.json" \
@@ -1395,6 +1423,7 @@ stop_engine_input_bridge() {
 
 start_engine_input_bridge() {
     local enabled="${MATRIX_ENGINE_INPUT_BRIDGE:-0}"
+    local look_backend="${MATRIX_ENGINE_CAMERA_LOOK_BACKEND:-uinput}"
     local profile="${MATRIX_PROFILE:-local}"
     local target_gid
     local poll
@@ -1405,6 +1434,19 @@ start_engine_input_bridge() {
     if [[ "$enabled" != "1" ]]; then
         echo "[ERROR] MATRIX_ENGINE_INPUT_BRIDGE must be 0 or 1" >&2
         return 1
+    fi
+    if [[ "$look_backend" != "uinput" && "$look_backend" != "xtest" ]]; then
+        echo "[ERROR] Matrix engine camera look backend must be uinput or xtest" >&2
+        return 1
+    fi
+    if [[ "$look_backend" == "xtest" ]]; then
+        if [[ -z "${DISPLAY:-}" \
+            || -z "${XAUTHORITY:-}" \
+            || "$XAUTHORITY" != /* \
+            || ! -r "$XAUTHORITY" ]]; then
+            echo "[ERROR] XTEST camera look requires DISPLAY and readable absolute XAUTHORITY" >&2
+            return 1
+        fi
     fi
     if [[ ! "$profile" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
         echo "[ERROR] Matrix engine-input profile is invalid: $profile" >&2
@@ -1455,13 +1497,18 @@ PY
         return 1
     fi
     target_gid="$(id -g)"
-    /usr/bin/sudo -n /usr/bin/python3 -I \
+    /usr/bin/sudo -n /usr/bin/env \
+        "DISPLAY=${DISPLAY:-}" \
+        "XAUTHORITY=${XAUTHORITY:-}" \
+        /usr/bin/python3 -I \
         "$PROJECT_ROOT/scripts/matrix_engine_input_bridge.py" \
         --socket "$ENGINE_INPUT_SOCKET" \
         --capability-file "$ENGINE_INPUT_CAPABILITY_FILE" \
         --ready-file "$ENGINE_INPUT_READY_FILE" \
         --target-uid "$UID" \
         --target-gid "$target_gid" \
+        --look-backend "$look_backend" \
+        --display "${DISPLAY:-}" \
         >"$ENGINE_INPUT_LOG_FILE" 2>&1 &
     ENGINE_INPUT_BRIDGE_PID=$!
     for ((poll = 0; poll < 120; poll++)); do
@@ -1517,7 +1564,8 @@ PY
             fi
             export MATRIX_ENGINE_INPUT_SOCKET="$ENGINE_INPUT_SOCKET"
             export MATRIX_ENGINE_INPUT_CAPABILITY_FILE="$ENGINE_INPUT_CAPABILITY_FILE"
-            echo "[INFO] Matrix engine-input bridge ready: $ENGINE_INPUT_SOCKET"
+            echo "[INFO] Matrix engine-input bridge ready: " \
+                "$ENGINE_INPUT_SOCKET look_backend=$look_backend"
             return 0
         fi
         if ! kill -0 "$ENGINE_INPUT_BRIDGE_PID" 2>/dev/null; then
@@ -1610,6 +1658,7 @@ RESTART_REQUEST_VALID=0
 RESTART_EXPECTED_EXIT_CODE=143
 NEXT_SCENE_ID="$SCENE_ID"
 NEXT_WORLD_ID=""
+NEXT_ROUTE_JSON=""
 GAME_RESUME_ROLLBACK_COUNT="${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
 # Keep this equal to matrix_world_state.MAX_RESUME_CHECKPOINTS: each failed
 # generation may quarantine exactly one member of the bounded resume ring.
@@ -2024,12 +2073,63 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
         echo "[ERROR] Matrix resume rollback limit reached; " \
             "leaving the runtime stopped" >&2
     elif VERIFIED_ROLLBACK_OUTPUT="$(
-        /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+        /usr/bin/python3 -I - \
+            "$MATRIX_SONIC_STATUS_FILE" \
+            "$MATRIX_SONIC_PYTHON" \
+            "$PROJECT_ROOT/scripts" <<'PY'
 import json
 import math
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
+
+
+_CLEARANCE_REASONS = {
+    "no_ground_support",
+    "scene_penetration",
+    "unsafe_foot_contact",
+}
+
+
+def runtime_clearance_reason(audit):
+    """Return a reason only from the isolated authoritative validator."""
+
+    validator = r'''
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+from matrix_spawn_clearance import spawn_clearance_rollback_reason
+audit = json.loads(sys.stdin.read())
+reason = spawn_clearance_rollback_reason(audit)
+print(json.dumps({"reason": reason}, separators=(",", ":"), sort_keys=True))
+'''
+    try:
+        completed = subprocess.run(
+            [sys.argv[2], "-I", "-c", validator, sys.argv[3]],
+            input=json.dumps(audit, allow_nan=False, separators=(",", ":")),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10.0,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return None
+    if completed.returncode != 0 or completed.stderr:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"reason"}:
+        return None
+    reason = payload["reason"]
+    if reason not in _CLEARANCE_REASONS:
+        return None
+    return reason
+
 
 path = Path(sys.argv[1])
 if not path.is_file() or path.is_symlink():
@@ -2068,138 +2168,9 @@ if termination_reason == "numerical_instability":
     rollback_reason = "startup_numerical_instability"
 else:
     clearance = status.get("spawn_clearance")
-    if not isinstance(clearance, dict):
+    clearance_reason = runtime_clearance_reason(clearance)
+    if clearance_reason is None:
         raise SystemExit(1)
-    clearance_reason = clearance.get("reason")
-    if (
-        clearance.get("schema") != "matrix-spawn-clearance-audit/v1"
-        or clearance.get("safe") is not False
-        or clearance.get("error") is not None
-        or clearance_reason
-        not in {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
-    ):
-        raise SystemExit(1)
-    rejected_count = clearance.get("rejected_contact_count")
-    if clearance_reason == "no_ground_support":
-        support = clearance.get("support")
-        required_hits = (
-            support.get("required_hits") if isinstance(support, dict) else None
-        )
-        accepted_hits = (
-            support.get("accepted_hits") if isinstance(support, dict) else None
-        )
-        ray_direction = (
-            support.get("ray_direction") if isinstance(support, dict) else None
-        )
-        if (
-            isinstance(rejected_count, bool)
-            or rejected_count != 0
-            or not isinstance(support, dict)
-            or support.get("schema") != "matrix-ground-support-probe/v1"
-            or support.get("supported") is not False
-            or isinstance(required_hits, bool)
-            or not isinstance(required_hits, int)
-            or required_hits != 1
-            or isinstance(accepted_hits, bool)
-            or not isinstance(accepted_hits, int)
-            or accepted_hits != 0
-            or support.get("method") != "downward_foot_geom_rays"
-            or support.get("maximum_drop_m") != 0.12
-            or support.get("minimum_normal_z") != 0.8
-            or not isinstance(ray_direction, list)
-            or len(ray_direction) != 3
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                for value in ray_direction
-            )
-            or [float(value) for value in ray_direction]
-            != [0.0, 0.0, -1.0]
-        ):
-            raise SystemExit(1)
-        probes = support.get("probes")
-        if not isinstance(probes, list) or len(probes) != 2:
-            raise SystemExit(1)
-        expected_names = {
-            "left_ankle_roll_link",
-            "right_ankle_roll_link",
-        }
-        observed_names = set()
-        for probe in probes:
-            if not isinstance(probe, dict):
-                raise SystemExit(1)
-            foot_body = probe.get("foot_body")
-            origins = probe.get("origins")
-            if (
-                not isinstance(foot_body, dict)
-                or isinstance(foot_body.get("id"), bool)
-                or not isinstance(foot_body.get("id"), int)
-                or foot_body.get("id") <= 0
-                or foot_body.get("name") not in expected_names
-                or not isinstance(origins, list)
-                or not 1 <= len(origins) <= 32
-                or probe.get("accepted") is not False
-                or probe.get("distance_m") is not None
-                or probe.get("normal") is not None
-                or probe.get("probe_geom") is not None
-                or probe.get("ray_origin_m") is not None
-                or probe.get("scene_geom") is not None
-            ):
-                raise SystemExit(1)
-            observed_geom_ids = set()
-            for origin in origins:
-                if not isinstance(origin, dict):
-                    raise SystemExit(1)
-                geom_id = origin.get("geom_id")
-                geom_name = origin.get("geom_name")
-                position = origin.get("position_m")
-                if (
-                    isinstance(geom_id, bool)
-                    or not isinstance(geom_id, int)
-                    or geom_id < 0
-                    or geom_id in observed_geom_ids
-                    or (
-                        geom_name is not None
-                        and (
-                            not isinstance(geom_name, str)
-                            or not geom_name
-                            or len(geom_name) > 256
-                        )
-                    )
-                    or not isinstance(position, list)
-                    or len(position) != 3
-                    or any(
-                        isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not math.isfinite(float(value))
-                        for value in position
-                    )
-                ):
-                    raise SystemExit(1)
-                observed_geom_ids.add(geom_id)
-            observed_names.add(foot_body["name"])
-        if observed_names != expected_names:
-            raise SystemExit(1)
-    else:
-        worst = clearance.get("worst")
-        if (
-            isinstance(rejected_count, bool)
-            or not isinstance(rejected_count, int)
-            or rejected_count <= 0
-            or not isinstance(worst, dict)
-            or worst.get("allowed") is not False
-        ):
-            raise SystemExit(1)
-        classification = worst.get("classification")
-        if clearance_reason == "scene_penetration":
-            if classification != "scene_penetration":
-                raise SystemExit(1)
-        elif classification not in {
-            "unsafe_foot_contact_normal",
-            "unsafe_foot_penetration",
-        }:
-            raise SystemExit(1)
     rollback_reason = f"spawn_clearance:{clearance_reason}"
     if numerical_error != rollback_reason:
         raise SystemExit(1)
@@ -2479,14 +2450,19 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
     && "$exit_code" == "75" \
     && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
     if VERIFIED_INTERNAL_RESTART_REASON="$(
-        /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+        /usr/bin/python3 -I - \
+            "$MATRIX_SONIC_STATUS_FILE" \
+            "$PROJECT_ROOT/config/universe/sol-2080.json" \
+            "$PROJECT_ROOT" \
+            "${MATRIX_GAME_WORLD_STATE_FILE:-}" <<'PY'
 import json
-import math
 from pathlib import Path
-import re
 import sys
 
 path = Path(sys.argv[1])
+catalog_path = Path(sys.argv[2])
+project_root = Path(sys.argv[3])
+explicit_world_state_file = sys.argv[4]
 if not path.is_file() or path.is_symlink():
     raise SystemExit(1)
 try:
@@ -2526,40 +2502,58 @@ if reason != "game_teleport" or not isinstance(launch_route, dict):
     raise SystemExit(1)
 if target_scene_id != launch_route.get("target_scene_id"):
     raise SystemExit(1)
-if (
-    launch_route.get("schema") != "matrix-celestial-launch-route/v1"
-    or launch_route.get("destination_id") != "moon-tranquility-outpost"
-    or launch_route.get("teleport_tag") != "moon.tranquility"
-    or launch_route.get("target_scene_id") != 15
-    or launch_route.get("target_world_id") != "g1_29dof:scene_terrain_moon_dynamic"
+source_world_id = world.get("world_id")
+target_world_id = launch_route.get("target_world_id")
+if explicit_world_state_file or source_world_id == target_world_id:
+    raise SystemExit(1)
+scripts_path = project_root / "scripts"
+if not scripts_path.is_dir() or not catalog_path.is_file() or catalog_path.is_symlink():
+    raise SystemExit(1)
+sys.path.insert(0, str(scripts_path))
+try:
+    from matrix_celestial_navigation import (
+        CelestialNavigationError,
+        load_catalog,
+    )
+    from matrix_world_state import WorldStateError, validate_world_id
+except (ImportError, OSError):
+    raise SystemExit(1)
+catalog = None
+try:
+    source_world_id = validate_world_id(source_world_id)
+    catalog = load_catalog(catalog_path)
+    catalog.validate_runtime_launch_route(
+        launch_route,
+        project_root=project_root,
+    )
+except (
+    CelestialNavigationError,
+    OSError,
+    UnicodeError,
+    ValueError,
+    WorldStateError,
 ):
     raise SystemExit(1)
-entity_id = launch_route.get("entity_id")
-entry_pose = launch_route.get("entry_pose")
-if not isinstance(entity_id, str) or re.fullmatch(r"tp-[0-9a-f]{32}", entity_id) is None:
-    raise SystemExit(1)
-if not isinstance(entry_pose, dict) or set(entry_pose) != {"position", "yaw_rad"}:
-    raise SystemExit(1)
-position = entry_pose.get("position")
-if (
-    not isinstance(position, list)
-    or len(position) != 3
-    or any(isinstance(component, bool) or not isinstance(component, (int, float)) for component in position)
-    or any(not math.isfinite(float(component)) for component in position)
-    or isinstance(entry_pose.get("yaw_rad"), bool)
-    or not isinstance(entry_pose.get("yaw_rad"), (int, float))
-    or not math.isfinite(float(entry_pose.get("yaw_rad")))
-):
-    raise SystemExit(1)
-print(f"{reason}\t{target_scene_id}\t{launch_route['target_world_id']}")
+finally:
+    if catalog is not None:
+        catalog.ephemeris.close()
+route_json = json.dumps(
+    launch_route,
+    allow_nan=False,
+    separators=(",", ":"),
+    sort_keys=True,
+)
+print(f"{reason}\t{target_scene_id}\t{launch_route['target_world_id']}\t{route_json}")
 PY
     )"; then
         VERIFIED_INTERNAL_RESTART_TARGET_SCENE=""
         VERIFIED_INTERNAL_RESTART_TARGET_WORLD=""
+        VERIFIED_INTERNAL_RESTART_ROUTE_JSON=""
         IFS=$'\t' read -r \
             VERIFIED_INTERNAL_RESTART_REASON \
             VERIFIED_INTERNAL_RESTART_TARGET_SCENE \
             VERIFIED_INTERNAL_RESTART_TARGET_WORLD \
+            VERIFIED_INTERNAL_RESTART_ROUTE_JSON \
             <<<"$VERIFIED_INTERNAL_RESTART_REASON"
         INTERNAL_RESTART_NOW="$(date +%s)"
         if [[ "$INTERNAL_RESTART_WINDOW" == "0" ]] \
@@ -2574,6 +2568,7 @@ PY
             if [[ -n "$VERIFIED_INTERNAL_RESTART_TARGET_SCENE" ]]; then
                 NEXT_SCENE_ID="$VERIFIED_INTERNAL_RESTART_TARGET_SCENE"
                 NEXT_WORLD_ID="$VERIFIED_INTERNAL_RESTART_TARGET_WORLD"
+                NEXT_ROUTE_JSON="$VERIFIED_INTERNAL_RESTART_ROUTE_JSON"
             fi
             echo "[INFO] Validated Matrix world reload " \
                 "reason=$VERIFIED_INTERNAL_RESTART_REASON " \
@@ -2788,6 +2783,11 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
             if [[ -n "$NEXT_WORLD_ID" ]]; then
                 RESTART_ROUTE_ENV+=(
                     "MATRIX_SONIC_RESTART_WORLD_ID=$NEXT_WORLD_ID"
+                )
+            fi
+            if [[ -n "${NEXT_ROUTE_JSON:-}" ]]; then
+                RESTART_ROUTE_ENV+=(
+                    "MATRIX_SONIC_RESTART_ROUTE_JSON=$NEXT_ROUTE_JSON"
                 )
             fi
             exec /usr/bin/env -i \

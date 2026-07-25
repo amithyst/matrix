@@ -991,6 +991,7 @@ class PersistentSimulationClock:
         self._base_elapsed_ns = 0
         self._base_monotonic_ns = self._read_monotonic()
         self._last_checkpoint_monotonic_ns = self._base_monotonic_ns
+        self._paused = False
         self._writer_condition = threading.Condition()
         self._pending_payload: dict[str, object] | None = None
         self._writer_writing = False
@@ -1058,9 +1059,11 @@ class PersistentSimulationClock:
         )
         if now < self._base_monotonic_ns:
             raise CelestialEphemerisError("monotonic clock moved backwards")
-        scaled = (
-            (now - self._base_monotonic_ns) * self.rate_numerator
-        ) // self.rate_denominator
+        scaled = 0
+        if not self._paused:
+            scaled = (
+                (now - self._base_monotonic_ns) * self.rate_numerator
+            ) // self.rate_denominator
         result = self._base_elapsed_ns + scaled
         return _integer(
             result,
@@ -1097,6 +1100,32 @@ class PersistentSimulationClock:
             rate_denominator=self.rate_denominator,
             utc_assumption="frozen-tai-minus-utc-at-scenario-epoch",
         )
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def set_paused(self, paused: bool) -> bool:
+        """Freeze or resume scenario time without accumulating wall-clock debt."""
+
+        if type(paused) is not bool:
+            raise CelestialEphemerisError("clock pause state must be boolean")
+        if paused == self._paused:
+            return False
+        if paused:
+            with self._writer_condition:
+                while (
+                    self._pending_payload is not None or self._writer_writing
+                ) and self._writer_error is None:
+                    self._writer_condition.wait()
+                self._raise_writer_error()
+        now = self._read_monotonic()
+        if paused:
+            self._base_elapsed_ns = self.elapsed_tai_ns(now)
+        self._base_monotonic_ns = now
+        self._last_checkpoint_monotonic_ns = now
+        self._paused = paused
+        return True
 
     def _write_payload(self, payload: dict[str, object]) -> None:
         assert self._state_path is not None
@@ -1162,6 +1191,8 @@ class PersistentSimulationClock:
             self._raise_writer_error()
             if self._closed:
                 raise CelestialEphemerisError("celestial clock is closed")
+        if self._paused:
+            return False
         now = self._read_monotonic()
         if (
             not force
@@ -1192,15 +1223,18 @@ class PersistentSimulationClock:
                 self._raise_writer_error()
         return True
 
-    def close(self) -> None:
+    def close(self, *, checkpoint: bool = True) -> None:
         if self._state_path is None or self._closed:
             return
         checkpoint_error: Exception | None = None
-        try:
-            self.checkpoint(force=True)
-        except Exception as exc:
-            checkpoint_error = exc
+        if checkpoint and not self._paused:
+            try:
+                self.checkpoint(force=True)
+            except Exception as exc:
+                checkpoint_error = exc
         with self._writer_condition:
+            if not checkpoint:
+                self._pending_payload = None
             self._writer_stopping = True
             self._closed = True
             self._writer_condition.notify_all()

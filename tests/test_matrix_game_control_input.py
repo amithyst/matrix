@@ -33,6 +33,10 @@ MODULE = importlib.util.module_from_spec(SPEC)
 os.sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+EARTH_WORLD_ID = "g1_29dof:scene_terrain_t10"
+MOON_WORLD_ID = "g1_29dof:scene_terrain_moon_dynamic"
+WORLD_CLI_ARGS = ("--game-world-id", EARTH_WORLD_ID)
+
 
 class CalibrationOverlaySupervisorTest(unittest.TestCase):
     def test_isolated_overlay_explicitly_disables_bytecode_writes(self) -> None:
@@ -348,6 +352,65 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 receiver.close()
                 supervisor._action_socket = None
 
+    def test_private_socket_accepts_only_strict_runtime_pause_intents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+
+            def drain(packet: dict[str, object]):
+                supervisor = MODULE.CalibrationOverlaySupervisor(
+                    state_file=root / "state.json",
+                    display_name=None,
+                    expected_ue_pid=41,
+                    script=script,
+                )
+                packet = {
+                    **packet,
+                    "session": supervisor._action_session,
+                }
+                receiver, sender = socket.socketpair(
+                    socket.AF_UNIX, socket.SOCK_SEQPACKET
+                )
+                receiver.setblocking(False)
+                supervisor._action_socket = receiver
+                try:
+                    sender.send(json.dumps(packet).encode("ascii"))
+                    return supervisor.drain_intents()
+                finally:
+                    sender.close()
+                    receiver.close()
+                    supervisor._action_socket = None
+
+            valid = {
+                "version": 1,
+                "sequence": 1,
+                "kind": "runtime_pause",
+                "pause_target": "paused",
+                "expected_epoch": 7,
+            }
+            self.assertEqual(
+                drain(valid),
+                (
+                    MODULE.OverlayIntent(
+                        kind="runtime_pause",
+                        pause_target="paused",
+                        expected_epoch=7,
+                    ),
+                ),
+            )
+            invalid_packets = (
+                {**valid, "pause_target": "toggle"},
+                {**valid, "pause_target": []},
+                {**valid, "expected_epoch": True},
+                {**valid, "shell": "pause"},
+            )
+            for packet in invalid_packets:
+                with self.subTest(packet=packet), self.assertRaisesRegex(
+                    RuntimeError, "runtime-pause"
+                ):
+                    drain(packet)
+
     def test_private_intent_socket_accepts_only_strict_navigation_intents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -633,7 +696,22 @@ class GameCommandClientTest(unittest.TestCase):
 
     def make_client(self):
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(provider.detach())
+        client = MODULE.GameCommandClient(
+            provider.detach(), runtime_pause_capable=True
+        )
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+        return client, runtime
+
+    def make_celestial_client(self):
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            game_world_id=EARTH_WORLD_ID,
+            celestial_catalog=MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH),
+            celestial_visual_catalog=VISUALS.load_visual_catalog(),
+        )
         runtime.setblocking(False)
         self.addCleanup(client.close)
         self.addCleanup(runtime.close)
@@ -645,6 +723,50 @@ class GameCommandClientTest(unittest.TestCase):
             True, panel_active=True, restart_requested=False
         )
 
+    @staticmethod
+    def teleport_list_response(
+        request,
+        *,
+        ok: bool = True,
+        code: str = "OK_TELEPORT_LIST",
+        message: str = "Found 2/3 requested teleport points",
+    ):
+        data = (
+            {
+                "world_id": EARTH_WORLD_ID,
+                "teleport_points": [
+                    {
+                        "tag": "home",
+                        "found": True,
+                        "entity_id": "tp-" + "b" * 32,
+                        "position": [160.0, 117.0, 1.2],
+                        "yaw_rad": 0.0,
+                    },
+                    {
+                        "tag": "moon.tranquility",
+                        "found": True,
+                        "entity_id": "tp-" + "c" * 32,
+                        "position": [-94.7, -65.6, -5.251562023162842],
+                        "yaw_rad": 0.0,
+                    },
+                    {"tag": "mars.utopia", "found": False},
+                ],
+            }
+            if ok
+            else None
+        )
+        return MC_COMMANDS.encode_command_response(
+            MC_COMMANDS.GameCommandResponse(
+                session=request.session,
+                sequence=request.sequence,
+                request_id=request.request_id,
+                ok=ok,
+                code=code,
+                message=message,
+                data=data,
+            )
+        )
+
     def test_unavailable_channel_cannot_enter_editor_or_capture_escape(self) -> None:
         client = MODULE.GameCommandClient(None)
         self.addCleanup(client.close)
@@ -652,10 +774,137 @@ class GameCommandClientTest(unittest.TestCase):
             client.set_editing(True, panel_active=True, restart_requested=False)
         )
         self.assertFalse(client.editing)
+        self.assertEqual(
+            client.mapping()["runtime_pause"]["state"], "unavailable"
+        )
         self.assertTrue(
             client.panel_escape_pressed(True, editor_owned_this_frame=True)
         )
         self.assertFalse(client.panel_escape_pressed(False))
+
+    def test_escape_gate_never_submits_or_changes_runtime_pause(self) -> None:
+        client, runtime = self.make_client()
+        before = client.runtime_pause_mapping()
+
+        self.assertTrue(client.panel_escape_pressed(True))
+        self.assertFalse(client.panel_escape_pressed(False))
+
+        self.assertEqual(client.runtime_pause_mapping(), before)
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+    def test_command_channel_without_runtime_capability_cannot_offer_pause(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(provider.detach())
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertEqual(
+            client.runtime_pause_mapping(),
+            {
+                "state": "unavailable",
+                "epoch": 0,
+                "can_pause": False,
+                "can_resume": False,
+                "last_error": None,
+            },
+        )
+        self.assertFalse(
+            client.submit_runtime_pause(
+                "paused",
+                0,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertEqual(client.code, "E_RUNTIME_PAUSE_UNAVAILABLE")
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+    def test_unavailable_pause_state_allows_celestial_periodic_checkpoint(self) -> None:
+        clock = mock.Mock()
+        clock.checkpoint.return_value = True
+        client = MODULE.GameCommandClient(
+            None,
+            game_world_id=EARTH_WORLD_ID,
+            celestial_catalog=mock.Mock(),
+            celestial_clock=clock,
+        )
+
+        self.assertEqual(client.runtime_pause_mapping()["state"], "unavailable")
+        self.assertTrue(client.checkpoint_celestial_clock())
+        clock.checkpoint.assert_called_once_with()
+
+    def test_unavailable_pause_state_finalizes_real_persistent_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "celestial-clock.json"
+            now_ns = [1_000_000_000]
+            catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
+            clock = MODULE.PersistentSimulationClock(
+                universe_id=catalog.universe_id,
+                reference_epoch_utc=catalog.reference_epoch_utc,
+                tai_minus_utc_at_epoch_s=catalog.tai_minus_utc_at_epoch_s,
+                rate_numerator=catalog.clock_rate_numerator,
+                rate_denominator=catalog.clock_rate_denominator,
+                state_path=path,
+                monotonic_ns=lambda: now_ns[0],
+            )
+            self.addCleanup(clock.close, checkpoint=False)
+            client = MODULE.GameCommandClient(
+                None,
+                game_world_id=EARTH_WORLD_ID,
+                celestial_catalog=catalog,
+                celestial_clock=clock,
+            )
+            now_ns[0] = 3_500_000_000
+
+            self.assertFalse(path.exists())
+            client.finalize_celestial_resources()
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["elapsed_tai_ns"], 2_500_000_000)
+            self.assertEqual(persisted["universe_id"], catalog.universe_id)
+
+    def test_teleport_response_cannot_smuggle_runtime_pause_ack(self) -> None:
+        client, runtime = self.make_client()
+        before = client.runtime_pause_mapping()
+        self.enable_editor(client)
+        self.assertTrue(
+            client.submit(
+                "/tp @s ~1 2 ~-3",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT",
+                    message="forged pause data",
+                    data={
+                        "runtime_pause": {
+                            "phase": "paused",
+                            "epoch": 1,
+                            "paused": True,
+                        }
+                    },
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.runtime_pause_mapping(), before)
+        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
+        self.assertTrue(client.outcome_unknown)
+        self.assertIsNone(client.data)
 
     def test_command_channel_rejects_a_unix_stream_socket(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -712,9 +961,404 @@ class GameCommandClientTest(unittest.TestCase):
                 "warning": None,
                 "restart_required": True,
                 "outcome_unknown": False,
+                "runtime_pause": {
+                    "state": "running",
+                    "epoch": 0,
+                    "can_pause": True,
+                    "can_resume": False,
+                    "last_error": None,
+                },
                 "data": {"position": [1.0, 2.0, 3.0]},
             },
         )
+
+    def test_runtime_pause_text_ack_and_celestial_clock_are_epoch_guarded(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        clock = mock.Mock()
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            runtime_pause_capable=True,
+            game_world_id=EARTH_WORLD_ID,
+            celestial_catalog=mock.Mock(),
+            celestial_clock=clock,
+        )
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        with mock.patch.object(
+            MODULE, "parse_mc_command", wraps=MODULE.parse_mc_command
+        ) as parse:
+            self.assertTrue(
+                client.submit_runtime_pause(
+                    "paused",
+                    0,
+                    calibration_active=True,
+                    neutral_frame_ready=True,
+                    restart_requested=False,
+                )
+            )
+        parse.assert_called_once_with("/runtime pause paused 0")
+        self.assertEqual(client.mapping()["runtime_pause"]["state"], "pausing")
+        clock.checkpoint.return_value = True
+        self.assertFalse(client.checkpoint_celestial_clock())
+        clock.checkpoint.assert_not_called()
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(request.command, MC_COMMANDS.RuntimePause("paused", 0))
+        pause_ack = {"phase": "paused", "epoch": 1, "paused": True}
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_PAUSED",
+                    message="paused",
+                    data={"runtime_pause": pause_ack},
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        mapping = client.mapping()
+        self.assertEqual(
+            mapping["runtime_pause"],
+            {
+                "state": "paused",
+                "epoch": 1,
+                "can_pause": False,
+                "can_resume": True,
+                "last_error": None,
+            },
+        )
+        self.assertEqual(mapping["data"]["runtime_pause"], pause_ack)
+        clock.set_paused.assert_called_once_with(True)
+        self.assertFalse(client.checkpoint_celestial_clock())
+        clock.checkpoint.assert_not_called()
+
+        with mock.patch.object(
+            MODULE, "parse_mc_command", wraps=MODULE.parse_mc_command
+        ) as parse:
+            self.assertTrue(
+                client.submit_runtime_pause(
+                    "running",
+                    1,
+                    calibration_active=True,
+                    neutral_frame_ready=True,
+                    restart_requested=False,
+                )
+            )
+        parse.assert_called_once_with("/runtime pause running 1")
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(request.command, MC_COMMANDS.RuntimePause("running", 1))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_RUNNING",
+                    message="running",
+                    data={
+                        "runtime_pause": {
+                            "phase": "running",
+                            "epoch": 2,
+                            "paused": False,
+                        }
+                    },
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertEqual(client.mapping()["runtime_pause"]["state"], "running")
+        self.assertEqual(
+            clock.set_paused.call_args_list,
+            [mock.call(True), mock.call(False)],
+        )
+        clock.checkpoint.return_value = True
+        self.assertTrue(client.checkpoint_celestial_clock())
+
+    def test_failed_pause_request_restores_celestial_checkpoint_writes(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        clock = mock.Mock()
+        clock.checkpoint.return_value = True
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            runtime_pause_capable=True,
+            game_world_id=EARTH_WORLD_ID,
+            celestial_catalog=mock.Mock(),
+            celestial_clock=clock,
+        )
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertTrue(
+            client.submit_runtime_pause(
+                "paused",
+                0,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertFalse(client.checkpoint_celestial_clock())
+        clock.checkpoint.assert_not_called()
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=False,
+                    code="E_RUNTIME_PAUSE_BUSY",
+                    message="busy",
+                    data=None,
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.runtime_pause_mapping()["state"], "running")
+        self.assertTrue(client.checkpoint_celestial_clock())
+        clock.checkpoint.assert_called_once_with()
+
+    def test_pending_pause_closes_celestial_clock_without_checkpoint(self) -> None:
+        class FakePersistentClock:
+            def __init__(self) -> None:
+                self.close_calls: list[bool] = []
+
+            def close(self, *, checkpoint: bool = True) -> None:
+                self.close_calls.append(checkpoint)
+
+        clock = FakePersistentClock()
+        with mock.patch.object(
+            MODULE,
+            "PersistentSimulationClock",
+            FakePersistentClock,
+        ):
+            client = MODULE.GameCommandClient(
+                None,
+                game_world_id=EARTH_WORLD_ID,
+                celestial_catalog=mock.Mock(),
+                celestial_clock=clock,
+            )
+            client._pending_runtime_pause = ("paused", 0)
+            client.finalize_celestial_resources()
+
+        self.assertEqual(clock.close_calls, [False])
+
+    def test_failed_runtime_pause_ack_does_not_change_local_pause_state(self) -> None:
+        client, runtime = self.make_client()
+        before = client.runtime_pause_mapping()
+        self.assertTrue(
+            client.submit_runtime_pause(
+                "paused",
+                0,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=False,
+                    code="E_RUNTIME_PAUSE_BUSY",
+                    message="busy",
+                    data={
+                        "runtime_pause": {
+                            "phase": "paused",
+                            "epoch": 1,
+                            "paused": True,
+                        }
+                    },
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertEqual(client.runtime_pause_mapping(), before)
+        self.assertEqual(client.code, "E_RUNTIME_PAUSE_BUSY")
+        self.assertNotIn("runtime_pause", client.mapping()["data"])
+
+    def test_runtime_pause_success_code_must_match_pending_ast_target(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        clock = mock.Mock()
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            runtime_pause_capable=True,
+            game_world_id=EARTH_WORLD_ID,
+            celestial_catalog=mock.Mock(),
+            celestial_clock=clock,
+        )
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+        self.assertTrue(
+            client.submit_runtime_pause(
+                "paused",
+                0,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_RUNNING",
+                    message="wrong target code",
+                    data={
+                        "runtime_pause": {
+                            "phase": "paused",
+                            "epoch": 1,
+                            "paused": True,
+                        }
+                    },
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
+        self.assertEqual(client.runtime_pause_mapping()["state"], "fault")
+        self.assertEqual(client.runtime_pause_mapping()["epoch"], 0)
+        clock.set_paused.assert_called_once_with(True)
+        self.assertFalse(client.checkpoint_celestial_clock())
+        clock.checkpoint.assert_not_called()
+
+    def test_celestial_pause_sync_fault_never_checkpoints(self) -> None:
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        clock = mock.Mock()
+        clock.set_paused.side_effect = OSError("clock unavailable")
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            runtime_pause_capable=True,
+            game_world_id=EARTH_WORLD_ID,
+            celestial_catalog=mock.Mock(),
+            celestial_clock=clock,
+        )
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertTrue(
+            client.submit_runtime_pause(
+                "paused",
+                0,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_PAUSED",
+                    message="paused",
+                    data={
+                        "runtime_pause": {
+                            "phase": "paused",
+                            "epoch": 1,
+                            "paused": True,
+                        }
+                    },
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.code, "E_CELESTIAL_PAUSE_SYNC")
+        self.assertEqual(client.runtime_pause_mapping()["state"], "fault")
+        self.assertFalse(client.checkpoint_celestial_clock())
+        clock.checkpoint.assert_not_called()
+
+    def test_runtime_pause_ack_mapping_is_exact_finite_and_coherent(self) -> None:
+        self.assertEqual(MODULE.MAX_RUNTIME_PAUSE_EPOCH, 2_147_483_647)
+        self.assertEqual(
+            MODULE.GameCommandClient._validate_runtime_pause_ack(
+                {"phase": "paused", "epoch": 4, "paused": True}
+            ),
+            {"phase": "paused", "epoch": 4, "paused": True},
+        )
+        invalid = (
+            {"phase": "paused", "epoch": 4, "paused": False},
+            {"phase": "running", "epoch": True, "paused": False},
+            {"phase": [], "epoch": 4, "paused": False},
+            {"phase": "running", "epoch": 4, "paused": False, "extra": 1},
+            {
+                "phase": "running",
+                "epoch": MODULE.MAX_RUNTIME_PAUSE_EPOCH + 1,
+                "paused": False,
+            },
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                MODULE.GameCommandClient._validate_runtime_pause_ack(value)
+
+    def test_runtime_pause_submission_fails_closed_on_all_provider_gates(self) -> None:
+        cases = (
+            (
+                {
+                    "calibration_active": False,
+                    "neutral_frame_ready": True,
+                    "restart_requested": False,
+                },
+                "E_NOT_PAUSED",
+            ),
+            (
+                {
+                    "calibration_active": True,
+                    "neutral_frame_ready": False,
+                    "restart_requested": False,
+                },
+                "E_NEUTRAL_REQUIRED",
+            ),
+            (
+                {
+                    "calibration_active": True,
+                    "neutral_frame_ready": True,
+                    "restart_requested": True,
+                },
+                "E_RESTART_PENDING",
+            ),
+        )
+        for arguments, code in cases:
+            with self.subTest(code=code):
+                client, runtime = self.make_client()
+                self.assertFalse(client.submit_runtime_pause("paused", 0, **arguments))
+                self.assertEqual(client.code, code)
+                with self.assertRaises(BlockingIOError):
+                    runtime.recv(4096)
+
+        client, runtime = self.make_client()
+        self.assertFalse(
+            client.submit_runtime_pause(
+                "paused",
+                1,
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        self.assertEqual(client.code, "E_RUNTIME_PAUSE_EPOCH")
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
 
     def test_strategy_slot_select_skips_text_editor_and_tracks_runtime_ack(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -845,17 +1489,211 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertEqual(inventory["spawn_count"], 0)
         self.assertEqual(inventory["items"][0]["remaining"], 8)
 
+    def test_initial_world_binds_navigation_without_fake_destination_probes(self) -> None:
+        catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
+        visuals = VISUALS.load_visual_catalog()
+        cases = (
+            (EARTH_WORLD_ID, "earth", "earth-wet-cloudy-v1"),
+            (MOON_WORLD_ID, "moon", "moon-vacuum-v1"),
+        )
+        for world_id, body_id, profile_id in cases:
+            with self.subTest(world_id=world_id):
+                provider, runtime = socket.socketpair(
+                    socket.AF_UNIX,
+                    socket.SOCK_SEQPACKET,
+                )
+                client = MODULE.GameCommandClient(
+                    provider.detach(),
+                    game_world_id=world_id,
+                    celestial_catalog=catalog,
+                    celestial_visual_catalog=visuals,
+                )
+                try:
+                    navigation = client.celestial_navigation_mapping()
+                    self.assertEqual(navigation["current_body_id"], body_id)
+                    self.assertEqual(navigation["lighting"]["body_id"], body_id)
+                    self.assertEqual(
+                        navigation["lighting"]["visual_profile"]["id"],
+                        profile_id,
+                    )
+                    self.assertTrue(
+                        all(
+                            destination["enabled"] is False
+                            for destination in navigation["destinations"]
+                        )
+                    )
+                    self.assertEqual(
+                        [
+                            destination["status"]
+                            for destination in navigation["destinations"][:2]
+                        ],
+                        ["unknown", "unknown"],
+                    )
+                finally:
+                    client.close()
+                    runtime.close()
+
+    def test_invalid_initial_game_world_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "game world id is invalid"):
+            MODULE.GameCommandClient(
+                None,
+                game_world_id="invalid world id",
+                celestial_catalog=MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH),
+            )
+
+    def test_auto_celestial_refresh_runs_once_without_panel_gates(self) -> None:
+        client, runtime = self.make_celestial_client()
+
+        self.assertTrue(client.auto_refresh_celestial_navigation_once())
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            request.command,
+            MC_COMMANDS.TeleportList(
+                ("home", "moon.tranquility", "mars.utopia")
+            ),
+        )
+        self.assertTrue(client.in_flight)
+        self.assertEqual(client.status, "pending")
+        self.assertEqual(client.message, "Refreshing celestial teleport points")
+
+        for _ in range(3):
+            self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        runtime.send(self.teleport_list_response(request))
+        self.assertTrue(client.poll())
+        self.assertEqual(client.code, "OK_TELEPORT_LIST")
+        earth, moon, mars = client.celestial_navigation_mapping()["destinations"]
+        self.assertEqual(earth["status"], "ready")
+        self.assertEqual(moon["status"], "ready")
+        self.assertEqual(mars["status"], "world_unavailable")
+
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        self.assertTrue(
+            client.refresh_celestial_navigation(
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        manual_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(request.sequence + 1, manual_request.sequence)
+        self.assertEqual(manual_request.command, request.command)
+        runtime.send(self.teleport_list_response(manual_request))
+        self.assertTrue(client.poll())
+
+    def test_auto_celestial_refresh_failure_is_not_retried(self) -> None:
+        client, runtime = self.make_celestial_client()
+
+        self.assertTrue(client.auto_refresh_celestial_navigation_once())
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            self.teleport_list_response(
+                request,
+                ok=False,
+                code="E_TELEPORT_LIST",
+                message="provider not ready",
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.status, "error")
+        self.assertEqual(client.code, "E_TELEPORT_LIST")
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        self.assertTrue(
+            client.refresh_celestial_navigation(
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        manual_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertIsInstance(manual_request.command, MC_COMMANDS.TeleportList)
+        runtime.send(self.teleport_list_response(manual_request))
+        self.assertTrue(client.poll())
+
+    def test_auto_celestial_refresh_waits_for_busy_channel_and_skips_restart(self) -> None:
+        client, runtime = self.make_celestial_client()
+        self.enable_editor(client)
+        arguments = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+        }
+
+        self.assertTrue(client.submit("/tp @s 1 2 3", **arguments))
+        teleport_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=teleport_request.session,
+                    sequence=teleport_request.sequence,
+                    request_id=teleport_request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT",
+                    message="teleported",
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+
+        self.assertTrue(client.auto_refresh_celestial_navigation_once())
+        auto_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(self.teleport_list_response(auto_request))
+        self.assertTrue(client.poll())
+
+        self.assertTrue(client.submit("/tp @s 4 5 6", **arguments))
+        restart_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=restart_request.session,
+                    sequence=restart_request.sequence,
+                    request_id=restart_request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_RESTART",
+                    message="restart",
+                    restart_required=True,
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertTrue(client.restart_required)
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
     def test_celestial_refresh_discovers_home_and_routes_active_moon(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
         client = MODULE.GameCommandClient(
             provider.detach(),
+            game_world_id=EARTH_WORLD_ID,
             celestial_catalog=catalog,
             celestial_visual_catalog=VISUALS.load_visual_catalog(),
         )
         runtime.settimeout(1.0)
         self.addCleanup(client.close)
         self.addCleanup(runtime.close)
+
+        initial_navigation = client.celestial_navigation_mapping()
+        self.assertEqual(initial_navigation["current_body_id"], "earth")
+        self.assertTrue(
+            all(
+                destination["enabled"] is False
+                for destination in initial_navigation["destinations"]
+            )
+        )
 
         self.assertTrue(
             client.refresh_celestial_navigation(
@@ -882,6 +1720,10 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertTrue(client.in_flight)
         self.assertEqual(client.status, "pending")
         self.assertIsNone(client.code)
+        self.assertEqual(
+            client.celestial_navigation_mapping()["current_body_id"],
+            "earth",
+        )
         runtime.send(
             MC_COMMANDS.encode_command_response(
                 MC_COMMANDS.GameCommandResponse(
@@ -892,7 +1734,7 @@ class GameCommandClientTest(unittest.TestCase):
                     code="OK_TELEPORT_LIST",
                     message="Found 1/3 requested teleport points",
                     data={
-                        "world_id": "town10:test",
+                        "world_id": EARTH_WORLD_ID,
                         "teleport_points": [
                             {
                                 "tag": "home",
@@ -905,7 +1747,7 @@ class GameCommandClientTest(unittest.TestCase):
                                 "tag": "moon.tranquility",
                                 "found": True,
                                 "entity_id": "tp-" + "c" * 32,
-                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "position": [-94.7, -65.6, -5.251562023162842],
                                 "yaw_rad": 0.0,
                             },
                             {"tag": "mars.utopia", "found": False},
@@ -957,7 +1799,7 @@ class GameCommandClientTest(unittest.TestCase):
                             "target_scene_id": 15,
                             "target_world_id": "g1_29dof:scene_terrain_moon_dynamic",
                             "entry_pose": {
-                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "position": [-94.7, -65.6, -5.251562023162842],
                                 "yaw_rad": 0.0,
                             },
                             "entity_id": "tp-" + "d" * 32,
@@ -1003,6 +1845,7 @@ class GameCommandClientTest(unittest.TestCase):
         bridge = LightingBridge()
         client = MODULE.GameCommandClient(
             None,
+            game_world_id=EARTH_WORLD_ID,
             celestial_catalog=catalog,
             celestial_visual_catalog=VISUALS.load_visual_catalog(),
             celestial_lighting_bridge=bridge,
@@ -1037,6 +1880,7 @@ class GameCommandClientTest(unittest.TestCase):
         ephemeris = Resource()
         client = MODULE.GameCommandClient(
             None,
+            game_world_id=EARTH_WORLD_ID,
             celestial_catalog=Catalog(ephemeris),
             celestial_clock=clock,
             celestial_visual_catalog=mock.Mock(),
@@ -1267,6 +2111,126 @@ class GameCommandClientTest(unittest.TestCase):
         request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
         self.assertIsInstance(request.command, MC_COMMANDS.TeleportCoordinates)
         self.assertFalse(client.editing)
+
+    def test_external_runtime_pause_round_trips_strict_ack_without_unknown(self) -> None:
+        client, runtime = self.make_client()
+        unused_input_modifier = mock.Mock(side_effect=AssertionError("input only"))
+        arguments = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+            "input_modifier": unused_input_modifier,
+        }
+
+        self.assertTrue(
+            client.submit_external("/runtime pause paused 0", **arguments)
+        )
+        self.assertEqual(
+            client.runtime_pause_mapping(),
+            {
+                "state": "pausing",
+                "epoch": 0,
+                "can_pause": False,
+                "can_resume": False,
+                "last_error": None,
+            },
+        )
+        self.assertTrue(client.in_flight)
+        self.assertFalse(client.outcome_unknown)
+        pause_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            pause_request.command,
+            MC_COMMANDS.RuntimePause("paused", 0),
+        )
+        pause_ack = {"phase": "paused", "epoch": 1, "paused": True}
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=pause_request.session,
+                    sequence=pause_request.sequence,
+                    request_id=pause_request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_PAUSED",
+                    message="paused",
+                    data={"runtime_pause": pause_ack},
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertFalse(client.outcome_unknown)
+        self.assertIs(client.ok, True)
+        self.assertEqual(client.code, "OK_RUNTIME_PAUSED")
+        self.assertEqual(client.data, {"runtime_pause": pause_ack})
+        self.assertEqual(
+            client.runtime_pause_mapping(),
+            {
+                "state": "paused",
+                "epoch": 1,
+                "can_pause": False,
+                "can_resume": True,
+                "last_error": None,
+            },
+        )
+
+        self.assertTrue(
+            client.submit_external("/runtime pause running 1", **arguments)
+        )
+        self.assertEqual(client.runtime_pause_mapping()["state"], "resuming")
+        resume_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            resume_request.command,
+            MC_COMMANDS.RuntimePause("running", 1),
+        )
+        resume_ack = {"phase": "running", "epoch": 2, "paused": False}
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=resume_request.session,
+                    sequence=resume_request.sequence,
+                    request_id=resume_request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_RUNNING",
+                    message="running",
+                    data={"runtime_pause": resume_ack},
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertFalse(client.outcome_unknown)
+        self.assertIs(client.ok, True)
+        self.assertEqual(client.code, "OK_RUNTIME_RUNNING")
+        self.assertEqual(client.data, {"runtime_pause": resume_ack})
+        self.assertEqual(
+            client.runtime_pause_mapping(),
+            {
+                "state": "running",
+                "epoch": 2,
+                "can_pause": True,
+                "can_resume": False,
+                "last_error": None,
+            },
+        )
+        unused_input_modifier.assert_not_called()
+
+    def test_external_runtime_pause_requires_panel_gate(self) -> None:
+        client, runtime = self.make_client()
+        self.assertFalse(
+            client.submit_external(
+                "/runtime pause paused 0",
+                calibration_active=False,
+                neutral_frame_ready=True,
+                restart_requested=False,
+                input_modifier=mock.Mock(),
+            )
+        )
+        self.assertEqual(client.code, "E_NOT_PAUSED")
+        self.assertFalse(client.in_flight)
+        self.assertFalse(client.outcome_unknown)
+        self.assertEqual(client.runtime_pause_mapping()["state"], "running")
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
 
     def test_submit_requires_panel_neutral_editor_and_no_restart(self) -> None:
         client, runtime = self.make_client()
@@ -3433,6 +4397,24 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(snapshot.focused)
         self.assertTrue(snapshot.keys.w)
 
+    def test_arrow_camera_drag_keeps_keyboard_locomotion_available(self) -> None:
+        snapshot = MODULE.build_snapshot(
+            sequence=3,
+            timestamp_monotonic_s=1.0,
+            keyboard=MODULE.KeyboardMouseSample(
+                w=True,
+                arrow_right=True,
+                focused=True,
+                camera_dragging=True,
+            ),
+            gamepad=MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.5,
+            camera_available=True,
+        )
+        self.assertTrue(snapshot.focused)
+        self.assertTrue(snapshot.keys.w)
+
 
 class UeFinalPovYawReaderTest(unittest.TestCase):
     class State:
@@ -3917,6 +4899,95 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             # The current generation remains exactly the launch snapshot.
             self.assertEqual(applied.effective_scale, 1.0)
 
+    def test_failed_saves_never_publish_uncommitted_desired_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            applied = MODULE.AppliedMouseSettings(
+                profile="local", effective_scale=1.0
+            )
+            mouse = MODULE.MouseSettingsController(
+                path=root / "mouse.json",
+                desired=MODULE.MouseSettings(),
+                load_status="loaded",
+                load_error=None,
+            )
+            before_mouse = mouse.live_mapping(applied)
+            with mock.patch.object(
+                MODULE,
+                "atomic_save_settings",
+                side_effect=OSError("read-only mouse settings"),
+            ):
+                self.assertFalse(
+                    mouse.apply_panel_action("profile_remote", active=True)
+                )
+            after_mouse = mouse.live_mapping(applied)
+            self.assertEqual(mouse.desired, MODULE.MouseSettings())
+            self.assertEqual(after_mouse["next_launch"], before_mouse["next_launch"])
+            self.assertEqual(after_mouse["change_count"], 0)
+            self.assertEqual(after_mouse["load_status"], "loaded")
+            self.assertIn("read-only", after_mouse["persistence_error"])
+
+            ui = MODULE.UiSettingsController(
+                path=root / "ui.json",
+                desired=MODULE.UiSettings(),
+                load_status="loaded",
+                load_error=None,
+            )
+            before_ui = ui.live_mapping()
+            with mock.patch.object(
+                MODULE,
+                "atomic_save_ui_settings",
+                side_effect=OSError("read-only UI settings"),
+            ):
+                self.assertFalse(ui.apply_font_size(20, active=True))
+            after_ui = ui.live_mapping()
+            self.assertEqual(ui.desired, MODULE.UiSettings())
+            self.assertEqual(after_ui["font_size"], before_ui["font_size"])
+            self.assertEqual(after_ui["change_count"], 0)
+            self.assertEqual(after_ui["load_status"], "loaded")
+            self.assertIn("read-only", after_ui["persistence_error"])
+
+    def test_finite_settings_telemetry_has_persistence_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mouse = MODULE.MouseSettingsController(
+                path=root / "mouse.json",
+                desired=MODULE.MouseSettings(),
+                load_status="missing",
+                load_error=None,
+            ).live_mapping(
+                MODULE.AppliedMouseSettings(profile="local", effective_scale=1.0)
+            )
+            ui = MODULE.UiSettingsController(
+                path=root / "ui.json",
+                desired=MODULE.UiSettings(),
+                load_status="missing",
+                load_error=None,
+            ).live_mapping()
+            video = MODULE.VideoSettingsController(
+                store=MODULE.VideoSettingsStore(root / "video.json"),
+                applied=MODULE.VideoSettings(),
+            ).live_mapping()
+            motion = MOTION_SETTINGS.MotionSettingsStore(
+                root / "motion.json"
+            ).mapping()
+
+            for name, telemetry in (
+                ("mouse", mouse),
+                ("ui", ui),
+                ("video", video),
+                ("motion", motion),
+            ):
+                with self.subTest(name=name):
+                    self.assertTrue(Path(telemetry["settings_file"]).is_absolute())
+                    self.assertIsInstance(telemetry["load_status"], str)
+                    self.assertNotIn("runtime_pause", telemetry)
+            self.assertIsInstance(mouse["change_count"], int)
+            self.assertIsInstance(ui["change_count"], int)
+            self.assertIsInstance(video["revision"], int)
+            self.assertIsInstance(video["change_count"], int)
+            self.assertIsInstance(motion["settings"]["revision"], int)
+
     def test_panel_selects_profiles_and_speed_without_key_emulation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config/mouse.json"
@@ -4023,6 +5094,32 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             self.assertEqual(restored.status, "loaded")
             self.assertEqual(restored.settings.font_scale, 1.0)
             self.assertEqual(restored.settings.font_size, 20)
+
+    def test_ui_font_size_nine_ack_survives_controller_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config/matrix/hosts/trna/ui-settings.json"
+            controller = MODULE.UiSettingsController(
+                path=path,
+                desired=MODULE.UiSettings(),
+                load_status="missing",
+                load_error=None,
+            )
+
+            self.assertTrue(controller.apply_font_size(9, active=True))
+            acknowledged = controller.live_mapping()
+            self.assertEqual(acknowledged["font_size"], 9)
+            self.assertEqual(acknowledged["load_status"], "saved")
+            self.assertEqual(acknowledged["change_count"], 1)
+
+            loaded = MODULE.load_ui_settings(path)
+            restarted = MODULE.UiSettingsController(
+                path=path,
+                desired=loaded.settings,
+                load_status=loaded.status,
+                load_error=loaded.error,
+            )
+            self.assertEqual(restarted.live_mapping()["font_size"], 9)
+            self.assertEqual(restarted.live_mapping()["change_count"], 0)
 
     @staticmethod
     def requester(*, available: bool = True, succeeds: bool = True):
@@ -4559,7 +5656,11 @@ class KeyboardCameraLookTest(unittest.TestCase):
                 return {
                     "ok": True,
                     "data": {
-                        "supported_actions": ["status", "look_delta"],
+                        "supported_actions": [
+                            "status",
+                            "look_delta",
+                            "look_stop",
+                        ],
                     },
                 }
 
@@ -4588,10 +5689,14 @@ class KeyboardCameraLookTest(unittest.TestCase):
             ),
             calls,
         )
-        with worker._condition:
-            worker._pending_dx = 4
-            worker._pending_dy = 2
         self.assertTrue(worker.cancel_pending())
+        deadline = time.monotonic() + 1.0
+        while (
+            worker.telemetry["releases_emitted"] < 1
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertIn(("look_stop", {}), calls)
         self.assertEqual(worker.telemetry["pending_dx"], 0)
         self.assertEqual(worker.telemetry["pending_dy"], 0)
 
@@ -4653,7 +5758,7 @@ class KeyboardCameraLookTest(unittest.TestCase):
         self.assertFalse(telemetry["available"])
         self.assertFalse(telemetry["capability_compatible"])
         self.assertEqual(telemetry["status"], "unsupported")
-        self.assertIn("does not advertise look_delta", telemetry["last_error"])
+        self.assertIn("held look protocol", telemetry["last_error"])
         worker._retry_not_before = 0.0
         self.assertFalse(worker.submit(10, 0))
 
@@ -6811,7 +7916,7 @@ class CameraYawSourceCliTest(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
             os.sys,
             "argv",
-            ["matrix_game_control_input.py", "--dry-run"],
+            ["matrix_game_control_input.py", *WORLD_CLI_ARGS, "--dry-run"],
         ):
             args = MODULE._parse_args()
         MODULE._validate_args(args)
@@ -6828,11 +7933,33 @@ class CameraYawSourceCliTest(unittest.TestCase):
         ), mock.patch.object(
             os.sys,
             "argv",
-            ["matrix_game_control_input.py", "--dry-run"],
+            ["matrix_game_control_input.py", *WORLD_CLI_ARGS, "--dry-run"],
         ):
             incomplete = MODULE._parse_args()
         with self.assertRaisesRegex(SystemExit, "supplied together"):
             MODULE._validate_args(incomplete)
+
+    def test_provider_requires_and_strictly_validates_game_world_id(self) -> None:
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            ["matrix_game_control_input.py", "--dry-run"],
+        ), self.assertRaises(SystemExit):
+            MODULE._parse_args()
+
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                "--game-world-id",
+                "invalid world id",
+                "--dry-run",
+            ],
+        ):
+            invalid = MODULE._parse_args()
+        with self.assertRaisesRegex(SystemExit, "--game-world-id is invalid"):
+            MODULE._validate_args(invalid)
 
     def test_provider_parser_accepts_an_open_game_command_fd(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -6842,23 +7969,44 @@ class CameraYawSourceCliTest(unittest.TestCase):
                 "argv",
                 [
                     "matrix_game_control_input.py",
+                    *WORLD_CLI_ARGS,
                     "--game-command-fd",
                     str(provider.fileno()),
+                    "--runtime-pause-capability",
+                    "available",
                     "--dry-run",
                 ],
             ):
                 args = MODULE._parse_args()
             MODULE._validate_args(args)
             self.assertEqual(args.game_command_fd, provider.fileno())
+            self.assertEqual(args.runtime_pause_capability, "available")
         finally:
             provider.close()
             runtime.close()
+
+    def test_provider_rejects_pause_capability_without_command_channel(self) -> None:
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                *WORLD_CLI_ARGS,
+                "--runtime-pause-capability",
+                "available",
+                "--dry-run",
+            ],
+        ):
+            args = MODULE._parse_args()
+        with self.assertRaisesRegex(SystemExit, "requires --game-command-fd"):
+            MODULE._validate_args(args)
 
     def test_provider_external_control_endpoint_is_all_or_none_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             base = [
                 "matrix_game_control_input.py",
+                *WORLD_CLI_ARGS,
                 "--external-control-socket",
                 os.fspath(root / "control.sock"),
                 "--external-control-capability-file",
@@ -6877,6 +8025,7 @@ class CameraYawSourceCliTest(unittest.TestCase):
                 "argv",
                 [
                     "matrix_game_control_input.py",
+                    *WORLD_CLI_ARGS,
                     "--external-control-socket",
                     os.fspath(root / "control.sock"),
                     "--dry-run",
@@ -6912,6 +8061,7 @@ class CameraYawSourceCliTest(unittest.TestCase):
             "argv",
             [
                 "matrix_game_control_input.py",
+                *WORLD_CLI_ARGS,
                 "--game-command-fd",
                 str(descriptor),
                 "--dry-run",
@@ -6926,7 +8076,12 @@ class CameraYawSourceCliTest(unittest.TestCase):
             with self.subTest(source=source), mock.patch.object(
                 os.sys,
                 "argv",
-                ["matrix_game_control_input.py", "--camera-yaw-source", source],
+                [
+                    "matrix_game_control_input.py",
+                    *WORLD_CLI_ARGS,
+                    "--camera-yaw-source",
+                    source,
+                ],
             ):
                 args = MODULE._parse_args()
                 self.assertEqual(args.camera_yaw_source, source)
@@ -6937,6 +8092,7 @@ class CameraYawSourceCliTest(unittest.TestCase):
             "argv",
             [
                 "matrix_game_control_input.py",
+                *WORLD_CLI_ARGS,
                 "--camera-yaw-source",
                 "ue-final-pov",
                 "--ue-camera-state-file",
@@ -6960,6 +8116,7 @@ class CameraYawSourceCliTest(unittest.TestCase):
             "argv",
             [
                 "matrix_game_control_input.py",
+                *WORLD_CLI_ARGS,
                 "--camera-yaw-source",
                 "ue-final-pov",
                 "--dry-run",
