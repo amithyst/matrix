@@ -6362,6 +6362,7 @@ class NativeProcessGroup:
             raise RuntimeError("BFM Teacher locomotion worker is already alive")
         command = [
             python,
+            "-B",
             "-u",
             str(worker),
             "--model",

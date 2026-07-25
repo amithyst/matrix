@@ -6005,6 +6005,43 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "/models/amp.json",
         )
 
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_bfm_teacher_disables_bytecode_writes_in_locked_sources(
+        self, popen
+    ) -> None:
+        popen.return_value = mock.Mock(pid=4400)
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+
+        group.start_bfm_teacher(
+            "/policy/python",
+            Path("/matrix/scripts/matrix_bfm_teacher_adapter.py"),
+            interface="lo",
+            control_socket=Path("/run/user/1000/bfm.sock"),
+            model=Path("/models/teacher.onnx"),
+            config=Path("/models/config.yaml"),
+            bfm_source_root=Path("/sources/bfm"),
+            realscan_source_root=Path("/sources/realscan"),
+            robo_pfnn_root=Path("/sources/robo-pfnn"),
+            weights=Path("/sources/bfm/weights"),
+            g1_xml=Path("/sources/robo-pfnn/g1.xml"),
+            formal_ik=Path("/sources/bfm/pfnn_ik.py"),
+            execution_provider="cpu",
+            activation_blend_seconds=0.1,
+            direct_start=True,
+        )
+
+        guarded = popen.call_args.args[0]
+        command = guarded[guarded.index("--") + 1 :]
+        self.assertEqual(
+            command[:4],
+            [
+                "/policy/python",
+                "-B",
+                "-u",
+                "/matrix/scripts/matrix_bfm_teacher_adapter.py",
+            ],
+        )
+
     @unittest.skipUnless(
         hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
         "Linux Unix seqpacket credentials are required",
