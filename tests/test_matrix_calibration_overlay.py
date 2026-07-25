@@ -2925,6 +2925,7 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
         overlay._x11 = mock.Mock()
         overlay._display = 1
+        overlay._root = 2
         overlay._windows = {
             name: index
             for index, name in enumerate(MODULE.X11CalibrationOverlay._WINDOW_ORDER, 10)
@@ -2941,12 +2942,39 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay._last_raise_s = None
         overlay._pressed_action = None
         overlay._pressed_window = None
+        overlay._pointer_recenter_count = 0
         overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
         overlay._last_rendered_font_size = None
         overlay._font_slider_dragging = False
         overlay._keyboard_grabbed = False
         overlay._draw_panel = mock.Mock()
         return overlay
+
+    def test_pointer_outside_modal_game_window_recenters_to_safe_area(self) -> None:
+        overlay = self.make_overlay()
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        layout = MODULE.overlay_layout(geometry)
+        safe_x, safe_y, safe_width, safe_height = layout["crosshair_safe"]
+        expected = (safe_x + safe_width // 2, safe_y + safe_height // 2)
+
+        overlay.show(geometry, (30, 10), self.state(), now_s=10.0)
+
+        overlay._x11.XWarpPointer.assert_called_once_with(
+            1,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            expected[0],
+            expected[1],
+        )
+        self.assertEqual(overlay._last_pointer, expected)
+        self.assertEqual(overlay._pointer_recenter_count, 1)
+
+        overlay.show(geometry, expected, self.state(), now_s=10.02)
+        overlay._x11.XWarpPointer.assert_called_once()
 
     def test_steady_30hz_frames_only_move_cursor_and_do_not_redraw(self) -> None:
         overlay = self.make_overlay()
@@ -3133,6 +3161,7 @@ class X11WindowProbeTest(unittest.TestCase):
                 "polled_left_transition_count": 0,
                 "polled_left_fallback_events": 0,
                 "recovered_pause_release_count": 0,
+                "pointer_recenter_count": 0,
             },
         )
 
@@ -3190,6 +3219,7 @@ class X11WindowProbeTest(unittest.TestCase):
                 "polled_left_transition_count": 0,
                 "polled_left_fallback_events": 0,
                 "recovered_pause_release_count": 0,
+                "pointer_recenter_count": 0,
             },
         )
 

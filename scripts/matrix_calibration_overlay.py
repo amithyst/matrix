@@ -3463,6 +3463,7 @@ class X11CalibrationOverlay:
         self._polled_left_transition_count = 0
         self._polled_left_fallback_events = 0
         self._recovered_pause_release_count = 0
+        self._pointer_recenter_count = 0
         self._target_window: int | None = None
         self._command_editor = CommandLineEditor()
         self._keyboard_grabbed = False
@@ -3511,6 +3512,20 @@ class X11CalibrationOverlay:
                     ctypes.POINTER(ctypes.c_int),
                     ctypes.POINTER(ctypes.c_int),
                     ctypes.POINTER(ctypes.c_uint),
+                ],
+                ctypes.c_int,
+            ),
+            "XWarpPointer": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.c_int,
                 ],
                 ctypes.c_int,
             ),
@@ -3973,6 +3988,9 @@ class X11CalibrationOverlay:
             ),
             "recovered_pause_release_count": getattr(
                 self, "_recovered_pause_release_count", 0
+            ),
+            "pointer_recenter_count": getattr(
+                self, "_pointer_recenter_count", 0
             ),
         }
 
@@ -6483,6 +6501,31 @@ class X11CalibrationOverlay:
                 runtime_pause_model,
                 build_info_model,
             )
+        pointer_recentered = False
+        if not point_in_rectangle(
+            pointer,
+            (geometry.x, geometry.y, geometry.width, geometry.height),
+        ):
+            safe_x, safe_y, safe_width, safe_height = layout["crosshair_safe"]
+            pointer = (
+                safe_x + safe_width // 2,
+                safe_y + safe_height // 2,
+            )
+            self._x11.XWarpPointer(
+                self._display,
+                0,
+                self._root,
+                0,
+                0,
+                0,
+                0,
+                pointer[0],
+                pointer[1],
+            )
+            self._pointer_recenter_count = (
+                getattr(self, "_pointer_recenter_count", 0) + 1
+            )
+            pointer_recentered = True
         pointer_x, pointer_y = pointer
         pointer_changed = pointer != self._last_pointer
         if not self._cursor_visible or pointer_changed:
@@ -6510,6 +6553,7 @@ class X11CalibrationOverlay:
             or model_changed
             or pointer_changed
             or raise_due
+            or pointer_recentered
         ):
             self._x11.XFlush(self._display)
         self._last_layout = layout
