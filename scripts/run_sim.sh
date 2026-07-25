@@ -1510,6 +1510,7 @@ if $MATRIX_SONIC_ENABLED; then
     if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         for required in \
             "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
+            "$PROJECT_ROOT/scripts/matrix_build_info.py" \
             "$PROJECT_ROOT/scripts/matrix_external_control.py" \
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
             "$PROJECT_ROOT/scripts/matrix_ui_settings.py" \

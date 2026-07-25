@@ -207,6 +207,50 @@ def celestial_navigation_state() -> dict[str, object]:
     }
 
 
+def build_info_state() -> dict[str, object]:
+    return {
+        "build_info": {
+            "schema": "matrix-build-info/v1",
+            "available": True,
+            "launch_available": True,
+            "profile": "heyuan",
+            "scene_id": 2,
+            "scene_name": "Town10World",
+            "control_source": "game",
+            "branch": "feature/desktop-launcher",
+            "commit": "a" * 40,
+            "short_commit": "a" * 7,
+            "subject": "show launch provenance in ESC",
+            "body": "Display the latest commit and changed files.",
+            "author": "Matrix Test",
+            "authored_at": "2026-07-25T12:00:00Z",
+            "changed_files": 2,
+            "additions": 24,
+            "deletions": 3,
+            "files": [
+                {
+                    "status": "M",
+                    "path": "scripts/matrix_calibration_overlay.py",
+                    "additions": 20,
+                    "deletions": 3,
+                },
+                {
+                    "status": "A",
+                    "path": "scripts/matrix_build_info.py",
+                    "additions": 4,
+                    "deletions": 0,
+                },
+            ],
+            "files_truncated": False,
+            "dirty": False,
+            "dirty_files": 0,
+            "dirty_paths": [],
+            "dirty_paths_truncated": False,
+            "error": None,
+        }
+    }
+
+
 class OverlayLayoutTest(unittest.TestCase):
     @staticmethod
     def intersects(left, right) -> bool:
@@ -1874,6 +1918,108 @@ class OverlayStateTest(unittest.TestCase):
         self.assertTrue(maximum.action_enabled("font_down"))
         self.assertFalse(maximum.action_enabled("font_up"))
         self.assertEqual(model(99, scale=1.3).font_size, 17)
+
+
+class BuildInfoPanelTest(unittest.TestCase):
+    def test_strict_model_exposes_launch_and_last_commit(self) -> None:
+        model = MODULE.build_info_panel_model(build_info_state())
+        self.assertTrue(model.available)
+        self.assertEqual(model.profile, "heyuan")
+        self.assertEqual(model.scene_name, "Town10World")
+        self.assertEqual(model.branch, "feature/desktop-launcher")
+        self.assertEqual(model.short_commit, "a" * 7)
+        self.assertEqual(model.changed_files, 2)
+        self.assertEqual(model.files[0].status, "M")
+
+    def test_invalid_model_fails_to_render_only_unavailable(self) -> None:
+        state = build_info_state()
+        state["build_info"]["control_source"] = "game;touch /tmp/no"
+        model = MODULE.build_info_panel_model(state)
+        self.assertFalse(model.available)
+        self.assertIn("不可用", model.error)
+
+    def test_missing_payload_does_not_claim_fake_launch_parameters(self) -> None:
+        model = MODULE.build_info_panel_model({})
+        self.assertFalse(model.available)
+        self.assertFalse(model.launch_available)
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._font_size = 13
+        overlay._colours = {
+            "button": 1,
+            "outline": 2,
+            "cyan": 3,
+            "white": 4,
+            "muted": 5,
+            "error": 6,
+            "selected": 7,
+        }
+        overlay._fill_panel_band = mock.Mock(return_value=(20, 90, 1000, 440))
+        overlay._draw_text = mock.Mock()
+        overlay._draw_system_page(
+            MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800)),
+            model,
+        )
+        labels = [call.args[0] for call in overlay._draw_text.call_args_list]
+        self.assertFalse(any("启动参数" in label for label in labels))
+        self.assertTrue(any("不可用" in label for label in labels))
+
+    def test_system_tab_is_bounded_clickable_and_draws_provenance(self) -> None:
+        layout = MODULE.overlay_layout(
+            MODULE.WindowGeometry(1, 0, 0, 1280, 800)
+        )
+        panel = layout["panel"]
+        previous_right = panel[0]
+        for name in MODULE._PANEL_TABS:
+            rectangle = layout[name]
+            self.assertGreaterEqual(rectangle[0], previous_right)
+            self.assertLessEqual(rectangle[0] + rectangle[2], panel[0] + panel[2])
+            previous_right = rectangle[0] + rectangle[2]
+        x, y, width, height = layout["tab_system"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="system",
+            ),
+            "tab_system",
+        )
+
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._font_size = 13
+        overlay._colours = {
+            "button": 1,
+            "outline": 2,
+            "cyan": 3,
+            "white": 4,
+            "muted": 5,
+            "error": 6,
+            "selected": 7,
+        }
+        overlay._fill_panel_band = mock.Mock(return_value=(20, 90, 1000, 440))
+        overlay._draw_text = mock.Mock()
+        overlay._draw_system_page(
+            layout,
+            MODULE.build_info_panel_model(build_info_state()),
+        )
+        labels = [call.args[0] for call in overlay._draw_text.call_args_list]
+        self.assertTrue(any("heyuan" in label and "scene 2" in label for label in labels))
+        self.assertTrue(any("feature/desktop-launcher" in label for label in labels))
+        self.assertTrue(any("aaaaaaa" in label for label in labels))
+        self.assertTrue(any("+24 / -3" in label for label in labels))
+
+        compact = MODULE.overlay_layout(
+            MODULE.WindowGeometry(1, 0, 0, 480, 360)
+        )
+        overlay._draw_button = mock.Mock()
+        overlay._draw_tabs(compact, "system")
+        compact_labels = [
+            call.args[2] for call in overlay._draw_button.call_args_list
+        ]
+        self.assertEqual(
+            compact_labels,
+            ["策略", "控制", "命令", "物品", "导航", "视频", "运行"],
+        )
 
 
 class HotFontSizeTest(unittest.TestCase):
