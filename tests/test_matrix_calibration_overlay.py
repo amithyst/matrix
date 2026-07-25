@@ -2976,6 +2976,29 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay.show(geometry, expected, self.state(), now_s=10.02)
         overlay._x11.XWarpPointer.assert_called_once()
 
+    def test_pointer_clamped_to_modal_edge_recenters_to_safe_area(self) -> None:
+        overlay = self.make_overlay()
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        layout = MODULE.overlay_layout(geometry)
+        safe_x, safe_y, safe_width, safe_height = layout["crosshair_safe"]
+        expected = (safe_x + safe_width // 2, safe_y + safe_height // 2)
+
+        overlay.show(geometry, (100, 80), self.state(), now_s=10.0)
+
+        overlay._x11.XWarpPointer.assert_called_once_with(
+            1,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            expected[0],
+            expected[1],
+        )
+        self.assertEqual(overlay._last_pointer, expected)
+        self.assertEqual(overlay._pointer_recenter_count, 1)
+
     def test_steady_30hz_frames_only_move_cursor_and_do_not_redraw(self) -> None:
         overlay = self.make_overlay()
         geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)

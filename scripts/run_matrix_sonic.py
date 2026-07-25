@@ -137,11 +137,13 @@ _GAME_WORLD_RESUME_STABLE_IDLE_SECONDS = 1.5
 _GAME_WORLD_RESUME_CLEARANCE_AUDIT_SECONDS = 0.1
 # A resumed policy must be physically settled, not merely publishing IDLE.
 # These limits cap residual motion during the 1.5-second qualification window
-# to roughly 3 cm of planar travel and 4.3 degrees of yaw in the worst case.
+# to roughly 3 cm of planar travel and 6.5 degrees of yaw in the worst case.
+# Native SONIC idle balance reaches about 0.063 rad/s yaw on TRNA; treating that
+# normal correction as instability can keep a valid resume point locked forever.
 _GAME_WORLD_RESUME_MAX_ROOT_PLANAR_SPEED_M_S = 0.02
 _GAME_WORLD_RESUME_MAX_ROOT_VERTICAL_SPEED_M_S = 0.02
 _GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S = 0.05
-_GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S = 0.05
+_GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S = 0.075
 _GAME_WORLD_RESUME_MAX_JOINT_SPEED_RAD_S = 0.10
 _GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S = 0.03
 # The runtime observes every 200 Hz native step.  A gap larger than ten
