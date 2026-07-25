@@ -465,12 +465,17 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             joint_vel_rad_s=np.zeros(MODULE.NUM_JOINTS, dtype=np.float32),
         )
 
-    def test_activation_starts_at_current_joint_pose_without_teleport(self) -> None:
+    def test_handoff_preview_starts_at_current_joint_pose_without_teleport(self) -> None:
         core = self.inference_core()
         lowstate = self.lowstate()
 
         core.prepare_activation(lowstate)
-        target, status = core.step(self.world(), lowstate, active=True)
+        target, status = core.step(
+            self.world(),
+            lowstate,
+            active=True,
+            handoff_preview=True,
+        )
 
         np.testing.assert_allclose(target, lowstate.joint_pos_rad)
         np.testing.assert_allclose(
@@ -478,6 +483,8 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             np.zeros(MODULE.NUM_JOINTS),
         )
         self.assertTrue(status["idle_anchor_hold"])
+        self.assertTrue(status["handoff_preview"])
+        self.assertTrue(status["activation_settle_active"])
         self.assertEqual(status["activation_blend_fraction"], 0.0)
         self.assertEqual(status["published_target_delta_rms_rad"], 0.0)
 
@@ -492,26 +499,36 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
 
         self.assertEqual(core.stream.reset_count, resets_before + 1)
         self.assertEqual(core.reference_transition, "handoff")
-        target, status = core.step(self.world(sequence=1), lowstate, active=True)
+        target, status = core.step(
+            self.world(sequence=1),
+            lowstate,
+            active=True,
+            handoff_preview=True,
+        )
         np.testing.assert_allclose(target, lowstate.joint_pos_rad)
         self.assertTrue(status["reference_transition_completed"])
         self.assertFalse(status["reference_pending_rebuild"])
         self.assertEqual(status["published_target_delta_max_rad"], 0.0)
 
-    def test_active_idle_holds_first_current_pose_without_teacher_drift(self) -> None:
+    def test_handoff_preview_holds_first_pose_but_authority_settles_to_stand(
+        self,
+    ) -> None:
         core = self.inference_core()
         first_lowstate = self.lowstate(joint_value=0.41)
         second_lowstate = self.lowstate(joint_value=0.36)
+        core.prepare_activation(first_lowstate)
 
         first_target, first_status = core.step(
             self.world(sequence=1),
             first_lowstate,
             active=True,
+            handoff_preview=True,
         )
         second_target, second_status = core.step(
             self.world(sequence=2),
             second_lowstate,
             active=True,
+            handoff_preview=True,
         )
 
         np.testing.assert_allclose(first_target, first_lowstate.joint_pos_rad)
@@ -529,6 +546,44 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             0.05,
             places=6,
         )
+
+        # Writer authority starts with the prepared target, then converges to
+        # the Teacher stand target under the same per-tick delta safety bound.
+        observed = self.lowstate(joint_value=0.36)
+        settled_status = None
+        settled_target = None
+        for sequence in range(3, 20):
+            settled_target, settled_status = core.step(
+                self.world(sequence=sequence),
+                observed,
+                active=True,
+            )
+            self.assertLessEqual(
+                settled_status["published_target_delta_max_rad"],
+                MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
+            )
+            observed = self.lowstate(joint_value=float(settled_target[0]))
+            if not settled_status["activation_settle_active"]:
+                break
+
+        self.assertIsNotNone(settled_status)
+        self.assertFalse(settled_status["idle_anchor_hold"])
+        self.assertFalse(settled_status["handoff_preview"])
+        self.assertFalse(settled_status["activation_settle_active"])
+        np.testing.assert_allclose(
+            settled_target,
+            np.ones(MODULE.NUM_JOINTS),
+        )
+
+    def test_handoff_preview_requires_active_policy_state(self) -> None:
+        core = self.inference_core()
+        with self.assertRaisesRegex(ValueError, "requires active policy state"):
+            core.step(
+                self.world(),
+                self.lowstate(),
+                active=False,
+                handoff_preview=True,
+            )
 
     def test_standby_preview_does_not_accumulate_unapplied_action(self) -> None:
         core = self.inference_core()

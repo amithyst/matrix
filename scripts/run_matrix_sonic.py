@@ -9922,6 +9922,9 @@ class _PhysicalRecoveryCoordinator:
                     pending["target_delta_max_rad"] = preparation.get(
                         "target_delta_max_rad"
                     )
+                    pending["desired_target_delta_max_rad"] = preparation.get(
+                        "desired_target_delta_max_rad"
+                    )
                     self.sonic_writer.send("PAUSE")
                     pending["phase"] = "pause_sonic"
                     return

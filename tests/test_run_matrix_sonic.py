@@ -6467,9 +6467,16 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "reference_buffer_swapped": True,
             "preview_steps": 4,
             "target_delta_max_rad": 0.01,
+            "desired_target_delta_max_rad": 0.33,
         }
         coordinator._reconcile_policy_slot_assignment()
         coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+        self.assertEqual(
+            coordinator._policy_selection_pending[
+                "desired_target_delta_max_rad"
+            ],
+            0.33,
+        )
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
             "pause_sonic",

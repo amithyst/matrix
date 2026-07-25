@@ -1007,7 +1007,10 @@ class BfmTeacherCore:
         lowstate: LowStateSnapshot,
         *,
         active: bool = True,
+        handoff_preview: bool = False,
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        if handoff_preview and not active:
+            raise ValueError("BFM handoff preview requires active policy state")
         if self.last_reset_count is None:
             self.last_reset_count = world.reset_count
         elif world.reset_count != self.last_reset_count:
@@ -1235,9 +1238,11 @@ class BfmTeacherCore:
         target = desired_target
         idle_anchor_hold = bool(
             active
+            and handoff_preview
             and not command_motion_active
             and not holding_reference_transition
         )
+        activation_target_limited = False
         if idle_anchor_hold:
             if self.idle_anchor_target is None:
                 self.idle_anchor_target = lowstate.joint_pos_rad.astype(
@@ -1246,7 +1251,10 @@ class BfmTeacherCore:
                 )
             target = self.idle_anchor_target.copy()
             blend_fraction = 0.0
-            self.activation_origin = None
+            # PREPARE is writer-free.  Keep the exact observed pose as the
+            # admission target, but preserve activation_origin so the first
+            # authoritative policy ticks can settle onto BFM's own stand
+            # target instead of holding a SONIC pose forever.
             self.activation_step = 0
         elif active and holding_reference_transition:
             target = self.reference_hold_target.copy()
@@ -1262,8 +1270,21 @@ class BfmTeacherCore:
                 + blend_fraction * (desired_target - self.activation_origin)
             ).astype(np.float32)
             self.activation_step += 1
-            if progress >= 1.0:
+            target_delta = target - lowstate.joint_pos_rad
+            if float(np.max(np.abs(target_delta))) > HOT_SWITCH_MAX_TARGET_DELTA_RAD:
+                target = (
+                    lowstate.joint_pos_rad
+                    + np.clip(
+                        target_delta,
+                        -HOT_SWITCH_MAX_TARGET_DELTA_RAD,
+                        HOT_SWITCH_MAX_TARGET_DELTA_RAD,
+                    )
+                ).astype(np.float32)
+                activation_target_limited = True
+            if progress >= 1.0 and not activation_target_limited:
                 self.activation_origin = None
+        if active and not handoff_preview:
+            self.idle_anchor_target = None
         if active:
             if idle_anchor_hold or holding_reference_transition:
                 # The old reference mode is deliberately discarded while the
@@ -1367,9 +1388,13 @@ class BfmTeacherCore:
             "world_input_locomotion_mode": int(world.locomotion_mode),
             "reference_target_speed_mps": float(reference.plan.target_speed),
             "reference_future_xy_delta_m": reference_future_xy_delta_m,
-            "shadow_preview": not active,
+            "shadow_preview": not active or handoff_preview,
+            "handoff_preview": bool(handoff_preview),
             "activation_blend_fraction": float(blend_fraction),
             "activation_blend_steps": int(self.activation_blend_steps),
+            "activation_settle_active": self.activation_origin is not None,
+            "activation_target_limited": activation_target_limited,
+            "activation_target_delta_limit_rad": HOT_SWITCH_MAX_TARGET_DELTA_RAD,
             "raw_action_l2": float(np.linalg.norm(action_isaac)),
             "raw_action_max_abs": float(np.max(np.abs(action_isaac))),
             "desired_target_delta_rms_rad": float(
@@ -1950,6 +1975,13 @@ def run_worker(
                                 or preparing_authority_epoch is not None
                                 or prepared_authority_epoch is not None
                             ),
+                            handoff_preview=(
+                                handoff.state == HandoffStateMachine.WAITING
+                                and (
+                                    preparing_authority_epoch is not None
+                                    or prepared_authority_epoch is not None
+                                )
+                            ),
                         )
                     except RuntimeError as exc:
                         if "duplicate world sequence" not in str(exc):
@@ -2041,6 +2073,12 @@ def run_worker(
                                             ),
                                             "preview_steps": prepare_ready_steps,
                                             "target_delta_max_rad": target_delta,
+                                            "desired_target_delta_max_rad": float(
+                                                latest_policy_status.get(
+                                                    "desired_target_delta_max_rad",
+                                                    math.inf,
+                                                )
+                                            ),
                                             "target_delta_limit_rad": (
                                                 HOT_SWITCH_MAX_TARGET_DELTA_RAD
                                             ),
