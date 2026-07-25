@@ -2316,6 +2316,79 @@ printf '%s\n%s\n%s\n' \
             self.assertEqual(xset_log.read_text(encoding="utf-8"), "")
             self.assertEqual(xset_state.read_text(encoding="utf-8"), "2/1 4\n")
 
+    def test_launcher_accepts_preserved_legacy_mouse_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            self.write(project / "config/hosts/test.env", "\n")
+            legacy = project / "home/.config/matrix/mouse-control.json"
+            self.write(
+                legacy,
+                json.dumps(
+                    {"version": 1, "profile": "remote", "speed_scale": 0.02}
+                ),
+            )
+            host_settings = (
+                project
+                / "home/.config/matrix/hosts/test/mouse-control.json"
+            )
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--profile",
+                    "test",
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("status=loaded_legacy", result.stdout)
+            capture = json.loads(fixture["capture"].read_text(encoding="utf-8"))
+            with mock.patch.object(
+                sys, "argv", ["run_matrix_sonic.py", *capture["argv"]]
+            ):
+                parsed = RUNTIME._parse_args()
+            self.assertEqual(parsed.game_applied_mouse_profile, "remote")
+            self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.02)
+            self.assertEqual(parsed.game_mouse_settings_file, host_settings)
+            self.assertFalse(host_settings.exists())
+            self.assertEqual(
+                json.loads(legacy.read_text(encoding="utf-8")),
+                {"version": 1, "profile": "remote", "speed_scale": 0.02},
+            )
+
     def test_corrupt_mouse_settings_fall_back_to_explicit_local_one_x(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"

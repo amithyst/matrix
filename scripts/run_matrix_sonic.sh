@@ -429,6 +429,7 @@ IFS=$'\t' read -r MATRIX_MOUSE_APPLIED_PROFILE \
 if [[ "$MATRIX_MOUSE_APPLIED_PROFILE" != "local" \
     && "$MATRIX_MOUSE_APPLIED_PROFILE" != "remote" ]] \
     || [[ "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "loaded" \
+        && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "loaded_legacy" \
         && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "missing" \
         && "$MATRIX_MOUSE_SETTINGS_LOAD_STATUS" != "invalid" ]]; then
     echo "[ERROR] Invalid mouse-settings helper output" >&2
