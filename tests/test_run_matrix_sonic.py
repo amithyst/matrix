@@ -316,8 +316,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             profiles.apply(MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID)
         )
         actual = profiles.telemetry()["active_armatures"]
-        self.assertEqual(actual["left_hip_pitch_joint"], 0.025101925)
+        self.assertEqual(actual["left_hip_pitch_joint"], 0.010177520)
+        self.assertEqual(actual["left_hip_roll_joint"], 0.025101925)
         self.assertEqual(actual["left_hip_yaw_joint"], 0.010177520)
+        self.assertEqual(actual["left_knee_joint"], 0.025101925)
         self.assertEqual(actual["left_ankle_pitch_joint"], 0.00721945)
         self.assertEqual(actual["left_wrist_pitch_joint"], 0.00425)
         self.assertEqual(actual["left_shoulder_pitch_joint"], 0.003609725)

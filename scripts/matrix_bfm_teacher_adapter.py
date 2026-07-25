@@ -320,11 +320,15 @@ def _joint_control_vectors() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     kd: list[float] = []
     effort: list[float] = []
     for name in G1_29_JOINT_NAMES:
-        if any(token in name for token in ("hip_pitch", "hip_roll", "knee")):
+        if any(token in name for token in ("hip_roll", "knee")):
             kp.append(stiffness_7520_22)
             kd.append(damping_7520_22)
             effort.append(139.0)
-        elif "hip_yaw" in name or name == "waist_yaw_joint":
+        elif (
+            "hip_pitch" in name
+            or "hip_yaw" in name
+            or name == "waist_yaw_joint"
+        ):
             kp.append(stiffness_7520_14)
             kd.append(damping_7520_14)
             effort.append(88.0)

@@ -267,6 +267,21 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             200.0,
         )
 
+    def test_bfm_g1_pd_contract_keeps_hip_pitch_on_7520_14(self) -> None:
+        kp, kd, scale = MODULE._joint_control_vectors()
+        names = list(MODULE.G1_29_JOINT_NAMES)
+        hip_pitch = names.index("left_hip_pitch_joint")
+        hip_roll = names.index("left_hip_roll_joint")
+        knee = names.index("left_knee_joint")
+        hip_yaw = names.index("left_hip_yaw_joint")
+
+        self.assertAlmostEqual(kp[hip_pitch], kp[hip_yaw])
+        self.assertAlmostEqual(kd[hip_pitch], kd[hip_yaw])
+        self.assertAlmostEqual(scale[hip_pitch], scale[hip_yaw])
+        self.assertNotAlmostEqual(kp[hip_pitch], kp[hip_roll])
+        self.assertAlmostEqual(kp[hip_roll], kp[knee])
+        self.assertAlmostEqual(scale[hip_roll], scale[knee])
+
     def test_resident_lowcmd_publisher_rejects_state_beyond_stale_grace(
         self,
     ) -> None:
