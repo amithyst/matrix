@@ -362,6 +362,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--initial-locomotion-policy",
+        choices=("sonic", BFM_TEACHER50K_POLICY_ID),
+        default=os.environ.get("MATRIX_INITIAL_LOCOMOTION_POLICY", "sonic"),
+        help=(
+            "Initial locomotion policy selected after resident writer gates are "
+            "ready; uses the same writer-fenced handoff as /policy"
+        ),
+    )
+    parser.add_argument(
         "--bfm-teacher-worker",
         type=Path,
         default=_SCRIPT_DIR / "matrix_bfm_teacher_adapter.py",
@@ -8373,6 +8382,10 @@ class _PhysicalRecoveryCoordinator:
             ),
         )
         self.selected_locomotion_policy_id = "sonic"
+        self.initial_locomotion_policy_id = str(args.initial_locomotion_policy)
+        self._initial_locomotion_policy_requested = (
+            self.initial_locomotion_policy_id == "sonic"
+        )
         self.bfm_control = _BfmTeacherControl(
             Path(args.bfm_teacher_control_socket)
         )
@@ -8965,6 +8978,32 @@ class _PhysicalRecoveryCoordinator:
             transition_id, None
         )
 
+    def _request_initial_locomotion_policy_if_ready(self) -> None:
+        if getattr(self, "_initial_locomotion_policy_requested", True):
+            return
+        target = getattr(self, "initial_locomotion_policy_id", "sonic")
+        if target == getattr(self, "selected_locomotion_policy_id", "sonic"):
+            self._initial_locomotion_policy_requested = True
+            return
+        if self._policy_selection_pending is not None:
+            return
+        if target != BFM_TEACHER50K_POLICY_ID:
+            raise RuntimeError(f"unsupported initial locomotion policy: {target}")
+        if not getattr(self, "bfm_switch_admission_ready", False):
+            return
+        loadout = self.request_policy_slot_assignment(
+            PolicySlotAssignment("locomotion", target),
+            transition_id=f"initial-locomotion-{target}",
+        )
+        self._initial_locomotion_policy_requested = True
+        if loadout is not None:
+            self._policy_selection_results[f"initial-locomotion-{target}"] = (
+                True,
+                "OK_POLICY_SLOT_ASSIGNED",
+                f"Assigned {target} to locomotion",
+                loadout,
+            )
+
     def _capture_restart_anchor(self, qpos: Any) -> None:
         self.restarted_root_yaw_rad = _root_yaw_rad(qpos)
         anchor_delta = wrap_angle_rad(
@@ -9213,6 +9252,7 @@ class _PhysicalRecoveryCoordinator:
         if getattr(self, "bfm_process_started", False):
             self.bfm_control.poll()
         self._reconcile_policy_slot_assignment()
+        self._request_initial_locomotion_policy_if_ready()
         if self.fsm.state not in {
             RecoveryState.GAME_SONIC,
             ResidentRecoveryState.GAME_SONIC,

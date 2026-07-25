@@ -1955,6 +1955,19 @@ PY
     if [[ "${MATRIX_SONIC_MIN_DISPLACEMENT_M:-0}" != "0" ]]; then
         SONIC_ACCEPTANCE_ARGS+=(--min-displacement-m "${MATRIX_SONIC_MIN_DISPLACEMENT_M}")
     fi
+    INITIAL_LOCOMOTION_ARGS=()
+    if [[ -n "${MATRIX_INITIAL_LOCOMOTION_POLICY:-}" ]]; then
+        case "$MATRIX_INITIAL_LOCOMOTION_POLICY" in
+            sonic|bfm-sonic-teacher50k) ;;
+            *)
+                echo "[ERROR] MATRIX_INITIAL_LOCOMOTION_POLICY must be sonic or bfm-sonic-teacher50k" >&2
+                exit 1
+                ;;
+        esac
+        INITIAL_LOCOMOTION_ARGS+=(
+            --initial-locomotion-policy "$MATRIX_INITIAL_LOCOMOTION_POLICY"
+        )
+    fi
     BFM_TRACE_ARGS=()
     if [[ -n "${MATRIX_BFM_POLICY_TRACE_FILE:-}" ]]; then
         if [[ "$MATRIX_BFM_POLICY_TRACE_FILE" != /* ]]; then
@@ -2146,6 +2159,7 @@ PY
         --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
         "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
+        "${INITIAL_LOCOMOTION_ARGS[@]}" \
         "${BFM_TRACE_ARGS[@]}" \
         "${PHYSICAL_RECOVERY_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \

@@ -5449,6 +5449,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_initial_bfm_locomotion_policy_waits_for_admission(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_locomotion_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator._initial_locomotion_policy_requested = False
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator._policy_selection_pending = None
+        coordinator.bfm_switch_admission_ready = False
+        coordinator.request_policy_slot_assignment = mock.Mock(return_value=None)
+
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_not_called()
+        self.assertFalse(coordinator._initial_locomotion_policy_requested)
+
+        coordinator.bfm_switch_admission_ready = True
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_called_once()
+        command = coordinator.request_policy_slot_assignment.call_args.args[0]
+        self.assertEqual(command.slot, "locomotion")
+        self.assertEqual(command.policy_id, MODULE.BFM_TEACHER50K_POLICY_ID)
+        self.assertEqual(
+            coordinator.request_policy_slot_assignment.call_args.kwargs[
+                "transition_id"
+            ],
+            "initial-locomotion-bfm-sonic-teacher50k",
+        )
+        self.assertTrue(coordinator._initial_locomotion_policy_requested)
+
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_called_once()
+
     def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
         self,
     ) -> None:
