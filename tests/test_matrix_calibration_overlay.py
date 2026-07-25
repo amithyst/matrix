@@ -2356,7 +2356,12 @@ class MotionPanelActionTest(unittest.TestCase):
         )
 
     @staticmethod
-    def overlay(action: str, *, in_flight: bool = False):
+    def overlay(
+        action: str,
+        *,
+        in_flight: bool = False,
+        motion_settings: MODULE.MotionSettings | None = None,
+    ):
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 480, 360))
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
         overlay._x11 = mock.Mock()
@@ -2367,7 +2372,11 @@ class MotionPanelActionTest(unittest.TestCase):
             {"restart": {"available": True, "requested": False}}
         )
         overlay._last_motion_model = MODULE.motion_settings_panel_model(
-            {"motion_settings": MODULE.MotionSettings().to_mapping()}
+            {
+                "motion_settings": (
+                    motion_settings or MODULE.MotionSettings()
+                ).to_mapping()
+            }
         )
         overlay._last_command_status = MotionPanelActionTest.command_status(
             in_flight=in_flight
@@ -2418,7 +2427,16 @@ class MotionPanelActionTest(unittest.TestCase):
             ("motion_walk_speed_mps_up", True),
         ):
             with self.subTest(action=action, in_flight=in_flight):
-                overlay = self.overlay(action, in_flight=in_flight)
+                motion_settings = (
+                    MODULE.MotionSettings(slow_speed_mps=0.10)
+                    if action == "motion_slow_speed_mps_down"
+                    else None
+                )
+                overlay = self.overlay(
+                    action,
+                    in_flight=in_flight,
+                    motion_settings=motion_settings,
+                )
                 publisher = mock.Mock()
                 self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
                 publisher.publish_command_submit.assert_not_called()

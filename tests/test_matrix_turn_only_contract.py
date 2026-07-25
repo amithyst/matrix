@@ -162,9 +162,27 @@ class TurnOnlyCoreContractTest(unittest.TestCase):
             "d": -math.pi / 2.0,
         }
         modifier_cases = (
-            ("plain", False, False, CORE.SONIC_WALK_MODE, 0.8),
-            ("ctrl", True, False, CORE.SONIC_SLOW_WALK_MODE, 0.1),
-            ("shift", False, True, CORE.SONIC_RUN_MODE, 2.5),
+            (
+                "plain",
+                False,
+                False,
+                CORE.SONIC_WALK_MODE,
+                CORE.KEYBOARD_GAIT_TARGETS_MPS[CORE.SONIC_WALK_MODE],
+            ),
+            (
+                "ctrl",
+                True,
+                False,
+                CORE.SONIC_SLOW_WALK_MODE,
+                CORE.KEYBOARD_GAIT_TARGETS_MPS[CORE.SONIC_SLOW_WALK_MODE],
+            ),
+            (
+                "shift",
+                False,
+                True,
+                CORE.SONIC_RUN_MODE,
+                CORE.KEYBOARD_GAIT_TARGETS_MPS[CORE.SONIC_RUN_MODE],
+            ),
         )
         for error_deg in (0, 20, 53, 78, 90, 180):
             target_heading = math.radians(error_deg)
