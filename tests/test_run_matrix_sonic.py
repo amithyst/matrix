@@ -7318,6 +7318,34 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "sonic",
         )
 
+    def test_recovery_policy_telemetry_supports_both_fsm_outputs(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_controller = "host"
+        replacement_output = MODULE.RecoveryOutput(
+            previous_state=MODULE.RecoveryState.GAME_SONIC,
+            state=MODULE.RecoveryState.GAME_SONIC,
+        )
+        resident_output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            recovery_policy_id="kungfu",
+        )
+
+        self.assertEqual(
+            coordinator._telemetry_recovery_policy_id(replacement_output),
+            "host",
+        )
+        self.assertEqual(
+            coordinator._telemetry_recovery_policy_id(resident_output),
+            "kungfu",
+        )
+        self.assertEqual(
+            coordinator._telemetry_recovery_policy_id(None),
+            "host",
+        )
+
     def test_sonic_writer_safe_idle_hold_rejects_invalid_attestations(
         self,
     ) -> None:

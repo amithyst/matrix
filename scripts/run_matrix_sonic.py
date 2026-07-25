@@ -10668,6 +10668,15 @@ class _PhysicalRecoveryCoordinator:
                 return authority_policy_id
         return self.selected_locomotion_policy_id
 
+    def _telemetry_recovery_policy_id(
+        self,
+        output: RecoveryOutput | ResidentRecoveryOutput | None,
+    ) -> str:
+        policy_id = getattr(output, "recovery_policy_id", None)
+        if isinstance(policy_id, str) and policy_id:
+            return policy_id
+        return self.initial_controller
+
     def telemetry(
         self, *, now_s: float, processes: NativeProcessGroup
     ) -> dict[str, object]:
@@ -10686,11 +10695,7 @@ class _PhysicalRecoveryCoordinator:
                 self.selected_locomotion_policy_id
             ),
             "authority_policy_id": self._telemetry_authority_policy_id(output),
-            "recovery_policy_id": (
-                output.recovery_policy_id
-                if output is not None
-                else self.initial_controller
-            ),
+            "recovery_policy_id": self._telemetry_recovery_policy_id(output),
             "recovery_active_policy_id": getattr(
                 self.worker, "active_policy_id", None
             ),
