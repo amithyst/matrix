@@ -5465,6 +5465,17 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertFalse(coordinator._initial_locomotion_policy_requested)
 
         coordinator.bfm_switch_admission_ready = True
+        coordinator.request_policy_slot_assignment.side_effect = MODULE.CommandExecutionError(
+            "E_POLICY_WORKER_NOT_READY",
+            "BFM Teacher resident shadow is not ready and writer-fenced",
+        )
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_called_once()
+        self.assertFalse(coordinator._initial_locomotion_policy_requested)
+
+        coordinator.request_policy_slot_assignment.reset_mock()
+        coordinator.request_policy_slot_assignment.side_effect = None
+        coordinator.request_policy_slot_assignment.return_value = None
         coordinator._request_initial_locomotion_policy_if_ready()
         coordinator.request_policy_slot_assignment.assert_called_once()
         command = coordinator.request_policy_slot_assignment.call_args.args[0]

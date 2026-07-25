@@ -8991,10 +8991,15 @@ class _PhysicalRecoveryCoordinator:
             raise RuntimeError(f"unsupported initial locomotion policy: {target}")
         if not getattr(self, "bfm_switch_admission_ready", False):
             return
-        loadout = self.request_policy_slot_assignment(
-            PolicySlotAssignment("locomotion", target),
-            transition_id=f"initial-locomotion-{target}",
-        )
+        try:
+            loadout = self.request_policy_slot_assignment(
+                PolicySlotAssignment("locomotion", target),
+                transition_id=f"initial-locomotion-{target}",
+            )
+        except CommandExecutionError as exc:
+            if exc.code in {"E_POLICY_WORKER_NOT_READY", "E_POLICY_SWITCH_UNSAFE"}:
+                return
+            raise
         self._initial_locomotion_policy_requested = True
         if loadout is not None:
             self._policy_selection_results[f"initial-locomotion-{target}"] = (
