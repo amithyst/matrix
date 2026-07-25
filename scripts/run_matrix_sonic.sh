@@ -767,7 +767,7 @@ physical_recovery_python_works() {
     PYTHONDONTWRITEBYTECODE=1 \
         PYTHONNOUSERSITE=1 \
         PYTHONPATH="$MATRIX_SONIC_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-        "$candidate" -B -c \
+        "$candidate" -c \
         'import numpy, onnxruntime; from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber; from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_; from unitree_sdk2py.utils.crc import CRC' \
         >/dev/null 2>&1
 }
@@ -999,10 +999,10 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
             --jplephem-wheel "$CELESTIAL_JPLEPHEM_WHEEL"
         )
     fi
-    PYTHONDONTWRITEBYTECODE=1 "$MATRIX_SONIC_PYTHON" -B \
+    PYTHONDONTWRITEBYTECODE=1 "$MATRIX_SONIC_PYTHON" \
         "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
         "${CELESTIAL_PREFLIGHT_ARGS[@]}"
-    PYTHONDONTWRITEBYTECODE=1 "$MATRIX_SONIC_PYTHON" -B \
+    PYTHONDONTWRITEBYTECODE=1 "$MATRIX_SONIC_PYTHON" \
         "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" validate \
         --catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
         --profile "$CELESTIAL_VISUAL_PROFILE"
