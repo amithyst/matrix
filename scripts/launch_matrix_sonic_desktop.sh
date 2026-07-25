@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 RUN_SCRIPT="$SCRIPT_DIR/run_matrix_sonic.sh"
 SESSION_NAME="matrix-sonic-desktop-${UID}"
+HOST_LOCK_PATH="${MATRIX_DESKTOP_HOST_LOCK_PATH:-/tmp/matrix-sonic-${UID}.lock}"
 PROFILE="heyuan"
 ACTION="start"
 SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
@@ -116,7 +117,52 @@ report_running() {
     notify_user "Already running in $SESSION_NAME. Attach: tmux attach-session -t =$SESSION_NAME"
 }
 
+host_runtime_is_locked() {
+    local fd
+    local flock_bin
+    local parent
+
+    [[ "$HOST_LOCK_PATH" == /* ]] \
+        || die "host runtime lock path must be absolute: $HOST_LOCK_PATH"
+    parent="$(dirname -- "$HOST_LOCK_PATH")"
+    [[ -d "$parent" && ! -L "$parent" ]] \
+        || die "host runtime lock directory is invalid: $parent"
+    flock_bin="$(command -v flock)" || die "flock is required"
+    umask 077
+    exec {fd}>"$HOST_LOCK_PATH" \
+        || die "cannot open host runtime lock: $HOST_LOCK_PATH"
+    if "$flock_bin" --exclusive --nonblock "$fd"; then
+        "$flock_bin" --unlock "$fd" >/dev/null 2>&1 || true
+        exec {fd}>&-
+        return 1
+    fi
+    exec {fd}>&-
+    return 0
+}
+
+describe_host_runtime_owner() {
+    local owner_cwd
+    local owner_name
+    local owner_pid
+
+    if command -v lsof >/dev/null 2>&1; then
+        while IFS= read -r owner_pid; do
+            [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || continue
+            owner_cwd="$(readlink -f -- "/proc/$owner_pid/cwd" 2>/dev/null || true)"
+            if [[ "$owner_cwd" == /* ]]; then
+                owner_name="$(basename -- "$owner_cwd")"
+                printf 'pid=%s, source=%s\n' "$owner_pid" "$owner_name"
+                return 0
+            fi
+        done < <(lsof -t -- "$HOST_LOCK_PATH" 2>/dev/null | sort -n -u)
+    fi
+    printf 'lock=%s\n' "$HOST_LOCK_PATH"
+}
+
 start_session() {
+    local owner
+    local message
+
     if [[ ! -f "$RUN_SCRIPT" || ! -r "$RUN_SCRIPT" ]]; then
         die "runtime launcher is missing: $RUN_SCRIPT"
     fi
@@ -130,6 +176,14 @@ start_session() {
             || die "failed to remove stale tmux session: $SESSION_NAME"
         printf 'Removed stale Matrix SONIC tmux session %s before startup.\n' \
             "$SESSION_NAME"
+    fi
+
+    if host_runtime_is_locked; then
+        owner="$(describe_host_runtime_owner)"
+        message="Another Matrix SONIC instance owns this host ($owner). Wait for it to finish or stop it before starting profile $PROFILE."
+        notify_user "$message"
+        printf '[ERROR] %s\n' "$message" >&2
+        return 1
     fi
 
     if tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT" -- \
