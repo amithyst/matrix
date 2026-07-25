@@ -97,6 +97,27 @@ ROBO_PFNN_G1_XML_SHA256 = (
 ROBO_PFNN_IK_SHA256 = (
     "c8776f1e7651a4f179ea75e17b9746c41fa77a15be2cacf5809fe648340a7ab2"
 )
+CONTRACT_SOURCE_HASHES = {
+    "bfm_source_commit": BFM_SOURCE_COMMIT,
+    "realscan_source_commit": REALSCAN_SOURCE_COMMIT,
+    "robo_pfnn_source_commit": ROBO_PFNN_SOURCE_COMMIT,
+    "teacher_onnx_sha256": TEACHER_ONNX_SHA256,
+    "teacher_config_sha256": TEACHER_CONFIG_SHA256,
+    "robo_pfnn_weights_tree_sha256": ROBO_PFNN_WEIGHTS_TREE_SHA256,
+    "robo_pfnn_g1_xml_sha256": ROBO_PFNN_G1_XML_SHA256,
+    "formal7168_ik_sha256": ROBO_PFNN_IK_SHA256,
+}
+CONTRACT_DIMS = {
+    "model_input_dim": 1790,
+    "tokenizer_dim": 761,
+    "command_dim": 580,
+    "height_map_dim": 121,
+    "orientation_dim": 60,
+    "actor_observation_dim": 1029,
+    "history_length": 10,
+    "compatibility_zero_dim": 99,
+    "action_dim": NUM_JOINTS,
+}
 
 _ARMATURE_5020 = 0.003609725
 _ARMATURE_7520_14 = 0.010177520
@@ -416,6 +437,8 @@ class BfmTeacherCore:
         formal_ik: Path,
         execution_provider: str,
         activation_blend_seconds: float = 0.1,
+        trace_file: Path | None = None,
+        trace_ticks: int = 0,
     ) -> None:
         if (
             not math.isfinite(activation_blend_seconds)
@@ -492,6 +515,12 @@ class BfmTeacherCore:
         )
         self.activation_origin: np.ndarray | None = None
         self.activation_step = 0
+        self.trace_file = trace_file
+        self.trace_ticks = max(0, int(trace_ticks))
+        self.trace_written = 0
+        if self.trace_file is not None and self.trace_ticks > 0:
+            self.trace_file.parent.mkdir(parents=True, exist_ok=True)
+            self.trace_file.write_text("", encoding="utf-8")
         self.kp, self.kd, self.action_scale = _joint_control_vectors()
         self.default_joint_pos = np.asarray(
             self.teacher_module.SMP_DEFAULT_QPOS,
@@ -645,6 +674,129 @@ class BfmTeacherCore:
             gait=gait,
             stop_latched=bool(sample.safe_stop),
         )
+
+    @staticmethod
+    def _array_summary(values: Any) -> dict[str, Any]:
+        array = np.asarray(values)
+        finite = bool(np.all(np.isfinite(array)))
+        summary: dict[str, Any] = {
+            "shape": [int(value) for value in array.shape],
+            "finite": finite,
+        }
+        if array.size:
+            summary.update(
+                {
+                    "min": float(np.min(array)),
+                    "max": float(np.max(array)),
+                    "mean": float(np.mean(array)),
+                }
+            )
+        return summary
+
+    @staticmethod
+    def _reference_plan_summary(plan: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name in ("future_qpos", "future_qvel", "target_speed"):
+            value = getattr(plan, name, None)
+            if value is None:
+                result[name] = None
+            elif name == "target_speed":
+                result[name] = float(value)
+            else:
+                result[name] = BfmTeacherCore._array_summary(value)
+        return result
+
+    def _write_trace_tick(
+        self,
+        *,
+        world: WorldSample,
+        lowstate: LowStateSnapshot,
+        active: bool,
+        reference: Any,
+        observation: Any,
+        action_isaac: np.ndarray,
+        action_matrix: np.ndarray,
+        desired_target: np.ndarray,
+        target: np.ndarray,
+        previous_action_before: np.ndarray,
+        status: Mapping[str, Any],
+    ) -> None:
+        trace_file = getattr(self, "trace_file", None)
+        trace_ticks = int(getattr(self, "trace_ticks", 0))
+        trace_written = int(getattr(self, "trace_written", 0))
+        if (
+            trace_file is None
+            or trace_ticks <= 0
+            or trace_written >= trace_ticks
+        ):
+            return
+        record = {
+            "schema": "matrix.bfm_teacher.policy_tick_trace.v1",
+            "policy_id": POLICY_ID,
+            "tick_index": trace_written,
+            "active_writer": bool(active),
+            "world_sequence": int(world.sequence),
+            "world_sim_time_s": (
+                float(world.sim_time_s)
+                if getattr(world, "sim_time_s", None) is not None
+                else None
+            ),
+            "world_reset_count": int(world.reset_count),
+            "contract_dims": CONTRACT_DIMS,
+            "source_hashes": CONTRACT_SOURCE_HASHES,
+            "lowstate": {
+                "base_quat_wxyz": self._array_summary(lowstate.quaternion_wxyz),
+                "base_ang_vel": self._array_summary(lowstate.body_gyro_rad_s),
+                "joint_pos": self._array_summary(lowstate.joint_pos_rad),
+                "joint_vel": self._array_summary(lowstate.joint_vel_rad_s),
+            },
+            "observation": {
+                "base_quat_wxyz": self._array_summary(
+                    observation.base_quat_wxyz
+                ),
+                "base_ang_vel": self._array_summary(observation.base_ang_vel),
+                "joint_pos": self._array_summary(observation.joint_pos),
+                "joint_vel": self._array_summary(observation.joint_vel),
+                "previous_action": self._array_summary(previous_action_before),
+            },
+            "reference": {
+                "plan": self._reference_plan_summary(reference.plan),
+                "replanned": bool(reference.replanned),
+                "reason": reference.replan_reason,
+                "plan_index": int(reference.plan_index),
+                "pending_rebuild": bool(reference.pending_rebuild),
+                "buffer_swapped": bool(
+                    getattr(reference, "buffer_swapped", False)
+                ),
+            },
+            "height_map_z": self._array_summary(world.height_map_z),
+            "action_isaac": self._array_summary(action_isaac),
+            "action_matrix": self._array_summary(action_matrix),
+            "desired_target": self._array_summary(desired_target),
+            "published_target": self._array_summary(target),
+            "continuity": {
+                "desired_target_delta_rms_rad": status[
+                    "desired_target_delta_rms_rad"
+                ],
+                "desired_target_delta_max_rad": status[
+                    "desired_target_delta_max_rad"
+                ],
+                "published_target_delta_rms_rad": status[
+                    "published_target_delta_rms_rad"
+                ],
+                "published_target_delta_max_rad": status[
+                    "published_target_delta_max_rad"
+                ],
+                "reference_joint_error_rms_rad": status[
+                    "reference_joint_error_rms_rad"
+                ],
+            },
+            "status": dict(status),
+        }
+        with trace_file.open("a", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+        self.trace_written = trace_written + 1
 
     def step(
         self,
@@ -811,6 +963,7 @@ class BfmTeacherCore:
             joint_vel=lowstate.joint_vel_rad_s[matrix_to_isaac],
             previous_action=self.previous_action,
         )
+        previous_action_before = self.previous_action.copy()
         action_isaac = self.teacher.step(
             reference.plan,
             observation,
@@ -896,7 +1049,7 @@ class BfmTeacherCore:
                 abs_tol=1.0e-12,
             )
         )
-        return target, {
+        status = {
             "reference_replanned": bool(reference.replanned),
             "reference_reason": reference.replan_reason,
             "reference_plan_index": int(reference.plan_index),
@@ -965,6 +1118,20 @@ class BfmTeacherCore:
                 math.sqrt(np.mean(np.square(reference_delta)))
             ),
         }
+        self._write_trace_tick(
+            world=world,
+            lowstate=lowstate,
+            active=active,
+            reference=reference,
+            observation=observation,
+            action_isaac=action_isaac,
+            action_matrix=action_matrix,
+            desired_target=desired_target,
+            target=target,
+            previous_action_before=previous_action_before,
+            status=status,
+        )
+        return target, status
 
 
 def _connect_control(path: Path, timeout_s: float = 10.0) -> socket.socket:
@@ -1508,6 +1675,11 @@ def run_worker(
                         if latest_world is not None
                         else None
                     ),
+                    "policy_trace_file": (
+                        str(core.trace_file) if core.trace_file is not None else None
+                    ),
+                    "policy_trace_ticks_requested": int(core.trace_ticks),
+                    "policy_trace_ticks_written": int(core.trace_written),
                     **publisher.telemetry(now=monotonic()),
                     **latest_policy_status,
                 }
@@ -1615,6 +1787,8 @@ def build_parser() -> argparse.ArgumentParser:
             "the actually published blended targets"
         ),
     )
+    parser.add_argument("--trace-file", type=Path)
+    parser.add_argument("--trace-ticks", type=int, default=0)
     parser.add_argument(
         "--validate-only",
         action="store_true",
@@ -1635,6 +1809,8 @@ def main(argv: list[str] | None = None) -> int:
         formal_ik=args.formal_ik,
         execution_provider=args.execution_provider,
         activation_blend_seconds=args.activation_blend_seconds,
+        trace_file=args.trace_file,
+        trace_ticks=args.trace_ticks,
     )
     if args.validate_only:
         core.close()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 from pathlib import Path
 import sys
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -446,6 +448,44 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         )
         self.assertTrue(status["shadow_preview"])
         self.assertEqual(core.teacher.reset_count, 1)
+
+    def test_policy_trace_writes_contract_and_shape_summary(self) -> None:
+        core = self.inference_core()
+        with tempfile.TemporaryDirectory() as temporary:
+            trace_file = Path(temporary) / "bfm-policy-trace.jsonl"
+            core.trace_file = trace_file
+            core.trace_ticks = 1
+            core.trace_written = 0
+
+            core.step(self.world(), self.lowstate(), active=False)
+            core.step(self.world(sequence=2), self.lowstate(), active=False)
+
+            records = [
+                json.loads(line)
+                for line in trace_file.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(
+            record["schema"],
+            "matrix.bfm_teacher.policy_tick_trace.v1",
+        )
+        self.assertEqual(record["contract_dims"]["model_input_dim"], 1790)
+        self.assertEqual(record["contract_dims"]["action_dim"], MODULE.NUM_JOINTS)
+        self.assertEqual(
+            record["source_hashes"]["teacher_onnx_sha256"],
+            MODULE.TEACHER_ONNX_SHA256,
+        )
+        self.assertEqual(record["height_map_z"]["shape"], [11, 11])
+        self.assertTrue(record["height_map_z"]["finite"])
+        self.assertEqual(
+            record["observation"]["previous_action"]["shape"],
+            [MODULE.NUM_JOINTS],
+        )
+        self.assertEqual(record["action_isaac"]["shape"], [MODULE.NUM_JOINTS])
+        self.assertEqual(record["published_target"]["shape"], [MODULE.NUM_JOINTS])
+        self.assertEqual(core.trace_written, 1)
 
     def test_motion_to_idle_discards_stale_walking_reference(self) -> None:
         core = self.inference_core()

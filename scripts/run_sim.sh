@@ -1955,6 +1955,22 @@ PY
     if [[ "${MATRIX_SONIC_MIN_DISPLACEMENT_M:-0}" != "0" ]]; then
         SONIC_ACCEPTANCE_ARGS+=(--min-displacement-m "${MATRIX_SONIC_MIN_DISPLACEMENT_M}")
     fi
+    BFM_TRACE_ARGS=()
+    if [[ -n "${MATRIX_BFM_POLICY_TRACE_FILE:-}" ]]; then
+        if [[ "$MATRIX_BFM_POLICY_TRACE_FILE" != /* ]]; then
+            echo "[ERROR] MATRIX_BFM_POLICY_TRACE_FILE must be absolute" >&2
+            exit 1
+        fi
+        BFM_TRACE_TICKS="${MATRIX_BFM_POLICY_TRACE_TICKS:-200}"
+        if [[ ! "$BFM_TRACE_TICKS" =~ ^[0-9]+$ ]]; then
+            echo "[ERROR] MATRIX_BFM_POLICY_TRACE_TICKS must be non-negative" >&2
+            exit 1
+        fi
+        BFM_TRACE_ARGS+=(
+            --bfm-trace-file "$MATRIX_BFM_POLICY_TRACE_FILE"
+            --bfm-trace-ticks "$BFM_TRACE_TICKS"
+        )
+    fi
     SONIC_QUALIFICATION_ARGS=()
     if [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]]; then
         SONIC_QUALIFICATION_ARGS+=(
@@ -2130,6 +2146,7 @@ PY
         --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
         "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
+        "${BFM_TRACE_ARGS[@]}" \
         "${PHYSICAL_RECOVERY_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \
         "${SONIC_STARTUP_ARGS[@]}" \

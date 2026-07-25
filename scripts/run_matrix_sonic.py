@@ -772,6 +772,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--vy", type=float, default=0.0)
     parser.add_argument("--yaw-rate", type=float, default=0.0)
     parser.add_argument("--status-file", type=Path)
+    parser.add_argument("--bfm-trace-file", type=Path)
+    parser.add_argument("--bfm-trace-ticks", type=int, default=0)
     parser.add_argument("--qualified-runtime", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--qualification-profile", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--runtime-lock-sha256", default=None, help=argparse.SUPPRESS)
@@ -6269,6 +6271,8 @@ class NativeProcessGroup:
         formal_ik: Path,
         execution_provider: str,
         activation_blend_seconds: float,
+        trace_file: Path | None = None,
+        trace_ticks: int = 0,
     ) -> int:
         if self.bfm_teacher_alive():
             raise RuntimeError("BFM Teacher locomotion worker is already alive")
@@ -6301,6 +6305,15 @@ class NativeProcessGroup:
             "--activation-blend-seconds",
             str(activation_blend_seconds),
         ]
+        if trace_file is not None and trace_ticks > 0:
+            command.extend(
+                (
+                    "--trace-file",
+                    str(trace_file),
+                    "--trace-ticks",
+                    str(trace_ticks),
+                )
+            )
         pid = self._start(
             "bfm-locomotion-policy",
             command,
@@ -8383,6 +8396,8 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_activation_blend_seconds = float(
             args.bfm_teacher_activation_blend_seconds
         )
+        self.bfm_trace_file = optional_path("bfm_trace_file")
+        self.bfm_trace_ticks = max(0, int(args.bfm_trace_ticks))
         if (
             not math.isfinite(self.bfm_activation_blend_seconds)
             or self.bfm_activation_blend_seconds <= 0.0
@@ -10039,6 +10054,8 @@ class _PhysicalRecoveryCoordinator:
             formal_ik=self.bfm_formal_ik,
             execution_provider=self.execution_provider,
             activation_blend_seconds=self.bfm_activation_blend_seconds,
+            trace_file=self.bfm_trace_file,
+            trace_ticks=self.bfm_trace_ticks,
         )
         self.bfm_control.bind_expected_peer_pid(worker_pid)
         self.bfm_process_started = True
@@ -10112,6 +10129,10 @@ class _PhysicalRecoveryCoordinator:
             "sonic_pid": self.sonic_writer.expected_peer_pid,
             "recovery_policy_pid": self.worker.expected_peer_pid,
             "bfm_teacher_pid": self.bfm_control.expected_peer_pid,
+            "bfm_policy_trace_file": (
+                str(self.bfm_trace_file) if self.bfm_trace_file is not None else None
+            ),
+            "bfm_policy_trace_ticks_requested": self.bfm_trace_ticks,
             "locomotion_switch_admission_ready": bool(
                 self.bfm_switch_admission_ready
             ),
@@ -10683,6 +10704,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         or args.low_cmd_fresh_timeout_seconds <= 0.0
     ):
         raise SystemExit("--low-cmd-fresh-timeout-seconds must be positive and finite")
+    if getattr(args, "bfm_trace_ticks", 0) < 0:
+        raise SystemExit("--bfm-trace-ticks must be non-negative")
+    if (
+        getattr(args, "bfm_trace_file", None) is not None
+        and not args.bfm_trace_file.is_absolute()
+    ):
+        raise SystemExit("--bfm-trace-file must be absolute")
     if args.dds_interface != "lo":
         raise SystemExit("native Matrix SONIC requires --dds-interface lo")
     try:
@@ -10802,6 +10830,39 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     height = center_height
                 result[row, column] = float(height)
         return result
+
+    def live_mujoco_gravity_status() -> dict[str, object]:
+        environment = getattr(simulator, "sim_env", None)
+        model = getattr(environment, "mj_model", None)
+        gravity = getattr(getattr(model, "opt", None), "gravity", None)
+        if gravity is None:
+            return {
+                "mujoco_gravity": None,
+                "mujoco_gravity_contract": "fixed_1g",
+                "mujoco_gravity_is_fixed_1g": False,
+            }
+        try:
+            vector = np.asarray(gravity, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            return {
+                "mujoco_gravity": None,
+                "mujoco_gravity_contract": "fixed_1g",
+                "mujoco_gravity_is_fixed_1g": False,
+            }
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            return {
+                "mujoco_gravity": None,
+                "mujoco_gravity_contract": "fixed_1g",
+                "mujoco_gravity_is_fixed_1g": False,
+            }
+        values = [round(float(value), 8) for value in vector]
+        return {
+            "mujoco_gravity": values,
+            "mujoco_gravity_contract": "fixed_1g",
+            "mujoco_gravity_is_fixed_1g": bool(
+                np.allclose(vector, np.asarray((0.0, 0.0, -9.81)), atol=1e-9)
+            ),
+        }
 
     def live_clearance_audit() -> dict[str, object]:
         environment = getattr(simulator, "sim_env", None)
@@ -11974,6 +12035,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "elapsed_wall_s": round(now - started_wall, 3),
                     "model": str(model_path),
                     **model_attestation,
+                    **live_mujoco_gravity_status(),
                     "nu": len(snapshot.ctrl),
                     "low_cmd_age_s": (
                         round(float(low_cmd_age_s), 6)
@@ -12451,6 +12513,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "verification_receipt_sha256": args.verification_receipt_sha256,
             "model": str(model_path),
             **model_attestation,
+            **live_mujoco_gravity_status(),
             "nq": len(snapshot.qpos),
             "nu": len(snapshot.ctrl),
             "numerical_error": numerical_error,
