@@ -2027,6 +2027,11 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertLess(primary_lock, primary_status_cleanup)
         self.assertLess(primary_status_cleanup, primary_verifier)
         self.assertLess(primary_bytecode_guard, primary_qualification_gate)
+        self.assertIn('"$candidate" -B -c', primary)
+        self.assertGreaterEqual(
+            primary.count('PYTHONDONTWRITEBYTECODE=1 "$MATRIX_SONIC_PYTHON" -B'),
+            2,
+        )
         for launcher in (primary, overworld):
             self.assertIn("--require-git-sonic", launcher)
             self.assertIn("VERIFY_RUNTIME_ARGS+=(--fast)", launcher)
