@@ -8,7 +8,7 @@ SESSION_NAME="matrix-sonic-desktop-${UID}"
 PROFILE="heyuan"
 ACTION="start"
 SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
-STOP_GRACE_ATTEMPTS=240
+STOP_GRACE_SECONDS=60
 unset MATRIX_DESKTOP_LAUNCHER_LOCKED
 
 usage() {
@@ -186,6 +186,9 @@ status_session() {
 }
 
 stop_session() {
+    local deadline
+    local pane_pid=""
+    local pane_uid=""
     if ! session_exists; then
         printf 'Matrix SONIC is already stopped (tmux session %s does not exist).\n' \
             "$SESSION_NAME"
@@ -202,11 +205,31 @@ stop_session() {
     fi
 
     tmux send-keys -t "=$SESSION_NAME:0.0" C-c
-    local attempt=0
+    sleep 0.25
+    if session_is_live; then
+        pane_pid="$(
+            while read -r pane_dead candidate_pid; do
+                if [[ "$pane_dead" == "0" ]]; then
+                    printf '%s\n' "$candidate_pid"
+                    break
+                fi
+            done < <(
+                tmux list-panes -t "=$SESSION_NAME" \
+                    -F '#{pane_dead} #{pane_pid}' 2>/dev/null
+            )
+        )"
+        if [[ "$pane_pid" =~ ^[1-9][0-9]*$ ]]; then
+            pane_uid="$(ps -o uid= -p "$pane_pid" 2>/dev/null | tr -d ' ')"
+            if [[ "$pane_uid" == "$UID" ]]; then
+                kill -INT "$pane_pid" 2>/dev/null || true
+            fi
+        fi
+    fi
     # run_matrix_sonic.sh allows its run_sim child 25 seconds for normal TERM
     # cleanup before restoring tracked config, so the desktop wrapper must wait
     # longer than that inner contract before declaring the whole stack stuck.
-    while ((attempt < STOP_GRACE_ATTEMPTS)); do
+    deadline=$((SECONDS + STOP_GRACE_SECONDS))
+    while ((SECONDS < deadline)); do
         if ! session_exists; then
             printf 'Stopped Matrix SONIC tmux session %s cleanly.\n' \
                 "$SESSION_NAME"
@@ -222,7 +245,6 @@ stop_session() {
             return 0
         fi
         sleep 0.25
-        attempt=$((attempt + 1))
     done
 
     tmux kill-session -t "=$SESSION_NAME" >/dev/null 2>&1 || true
