@@ -158,7 +158,7 @@ class CelestialCatalogTest(unittest.TestCase):
                         "tag": "moon.tranquility",
                         "found": True,
                         "entity_id": "tp-" + "b" * 32,
-                        "position": [0.0, 0.0, -0.1366965003013611],
+                        "position": [-94.7, -65.6, -5.251562023162842],
                         "yaw_rad": 0.0,
                     },
                     {"tag": "mars.utopia", "found": False},
@@ -189,7 +189,10 @@ class CelestialCatalogTest(unittest.TestCase):
         self.assertEqual(mars["status"], "world_unavailable")
         self.assertTrue(moon["enabled"])
         self.assertFalse(mars["enabled"])
-        self.assertEqual(moon["local_position_m"], [0.0, 0.0, -0.1366965003013611])
+        self.assertEqual(
+            moon["local_position_m"],
+            [-94.7, -65.6, -5.251562023162842],
+        )
 
         missing_route = MODULE.probes_from_response(
             {

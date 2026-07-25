@@ -712,6 +712,128 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 WORLD_STATE.WorldPose(9.0, 8.0, 0.9, 0.0),
             )
 
+    def test_publish_frozen_lowstate_prepares_and_publishes_without_stepping(
+        self,
+    ) -> None:
+        observation = {
+            "time": 12.5,
+            "qpos": [1.0, 2.0, 3.0],
+        }
+        environment = SimpleNamespace(
+            mj_data=SimpleNamespace(time=12.5),
+            step_index=123,
+            world_generation=7,
+        )
+        environment.prepare_obs = mock.Mock(return_value=observation)
+        environment.step_once = mock.Mock(
+            side_effect=AssertionError("frozen LowState keepalive must not step")
+        )
+        bridge = SimpleNamespace(PublishLowState=mock.Mock())
+        simulator = SimpleNamespace(
+            sim_env=environment,
+            unitree_bridge=bridge,
+            step_index=456,
+            world_runtime=SimpleNamespace(generation=11),
+        )
+        before = (
+            environment.mj_data.time,
+            environment.step_index,
+            environment.world_generation,
+            simulator.step_index,
+            simulator.world_runtime.generation,
+        )
+
+        MODULE._publish_frozen_lowstate(simulator)
+
+        environment.prepare_obs.assert_called_once_with()
+        bridge.PublishLowState.assert_called_once_with(observation)
+        environment.step_once.assert_not_called()
+        self.assertEqual(
+            (
+                environment.mj_data.time,
+                environment.step_index,
+                environment.world_generation,
+                simulator.step_index,
+                simulator.world_runtime.generation,
+            ),
+            before,
+        )
+
+    def test_publish_frozen_lowstate_fails_closed_without_required_apis(
+        self,
+    ) -> None:
+        cases = (
+            SimpleNamespace(),
+            SimpleNamespace(
+                sim_env=SimpleNamespace(prepare_obs=None),
+                unitree_bridge=SimpleNamespace(PublishLowState=mock.Mock()),
+            ),
+            SimpleNamespace(
+                sim_env=SimpleNamespace(prepare_obs=mock.Mock()),
+                unitree_bridge=SimpleNamespace(PublishLowState=None),
+            ),
+        )
+        for simulator in cases:
+            with self.subTest(simulator=simulator):
+                publish_lowstate = getattr(
+                    getattr(simulator, "unitree_bridge", None),
+                    "PublishLowState",
+                    None,
+                )
+                with self.assertRaisesRegex(RuntimeError, "publish capability"):
+                    MODULE._publish_frozen_lowstate(simulator)
+                if isinstance(publish_lowstate, mock.Mock):
+                    publish_lowstate.assert_not_called()
+
+    def test_publish_frozen_lowstate_fails_closed_on_malformed_observation(
+        self,
+    ) -> None:
+        malformed_observations = (
+            None,
+            [],
+            {"time": None},
+            {"time": True},
+            {"time": float("nan")},
+        )
+        for observation in malformed_observations:
+            with self.subTest(observation=observation):
+                environment = SimpleNamespace(
+                    prepare_obs=mock.Mock(return_value=observation)
+                )
+                bridge = SimpleNamespace(PublishLowState=mock.Mock())
+                simulator = SimpleNamespace(
+                    sim_env=environment,
+                    unitree_bridge=bridge,
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "frozen LowState"):
+                    MODULE._publish_frozen_lowstate(simulator)
+
+                environment.prepare_obs.assert_called_once_with()
+                bridge.PublishLowState.assert_not_called()
+
+    def test_frozen_runtime_heartbeats_drain_then_force_neutral(self) -> None:
+        simulator = object()
+        stopped = self.resume_idle_command()
+        game_input = SimpleNamespace(
+            poll=mock.Mock(return_value=object()),
+            emergency_stop=mock.Mock(return_value=stopped),
+        )
+        with mock.patch.object(MODULE, "_publish_frozen_lowstate") as publish:
+            result = MODULE._maintain_frozen_runtime_heartbeats(
+                simulator,
+                game_input,
+                now_s=12.5,
+            )
+
+        self.assertIs(result, stopped)
+        game_input.poll.assert_called_once_with(now_s=12.5, dt_s=0.0)
+        game_input.emergency_stop.assert_called_once_with(
+            now_s=12.5,
+            reason="runtime_paused",
+        )
+        publish.assert_called_once_with(simulator)
+
     @staticmethod
     def resume_idle_command():
         return GAME_CONTROL.RobotMotionCommand(
@@ -5335,7 +5457,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     self.assertFalse(
                         runtime.poll(
                             current_pose=current_pose,
-                            command_allowed=True,
+                            command_allowed=False,
                         )
                     )
                     save.assert_not_called()
@@ -7747,6 +7869,97 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             math.pi / 2.0,
         )
 
+    def test_resident_game_sonic_limits_only_zero_translation_turns(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.command_frame_rotation_rad = 0.0
+        coordinator.last_wire_facing_heading_rad = 0.0
+        coordinator.reframe_limited_frames = 0
+        coordinator.last_reframe_limited = False
+        coordinator.last_reframe_heading_error_rad = 0.0
+        requested_heading = 0.05
+        command = GAME_CONTROL.RobotMotionCommand(
+            sequence=11,
+            movement=(0.0, 0.0, 0.0),
+            facing=(math.cos(requested_heading), math.sin(requested_heading), 0.0),
+            speed_mps=0.0,
+            locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+            mode="turn",
+            safe_stop=False,
+            reason="aligning_heading",
+            desired_facing=(0.0, 1.0, 0.0),
+        )
+        output = MODULE.ResidentRecoveryOutput(
+            previous_state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            state=MODULE.ResidentRecoveryState.GAME_SONIC,
+            inhibit_game_input=False,
+        )
+
+        wire_command = coordinator.recovery_wire_command(
+            command,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+
+        expected_heading = (
+            coordinator.RESIDENT_TURN_ONLY_MAX_RATE_RAD_S * 0.02
+        )
+        self.assertIsNot(wire_command, command)
+        self.assertEqual(wire_command.mode, "turn")
+        self.assertEqual(wire_command.movement, (0.0, 0.0, 0.0))
+        self.assertEqual(wire_command.speed_mps, 0.0)
+        self.assertEqual(
+            wire_command.locomotion_mode,
+            GAME_CONTROL.SONIC_IDLE_MODE,
+        )
+        self.assertAlmostEqual(
+            math.atan2(wire_command.facing[1], wire_command.facing[0]),
+            expected_heading,
+        )
+        self.assertEqual(wire_command.desired_facing, command.desired_facing)
+        self.assertTrue(coordinator.last_reframe_limited)
+        self.assertAlmostEqual(
+            coordinator.last_reframe_heading_error_rad,
+            math.pi / 2.0,
+        )
+        self.assertEqual(coordinator.reframe_limited_frames, 1)
+
+        next_command = replace(command, sequence=12)
+        next_wire_command = coordinator.recovery_wire_command(
+            next_command,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+        self.assertAlmostEqual(
+            math.atan2(
+                next_wire_command.facing[1],
+                next_wire_command.facing[0],
+            ),
+            expected_heading * 2.0,
+        )
+        self.assertEqual(coordinator.reframe_limited_frames, 2)
+
+        within_envelope = replace(
+            command,
+            sequence=13,
+            facing=(math.cos(0.01), math.sin(0.01), 0.0),
+            desired_facing=(math.cos(0.01), math.sin(0.01), 0.0),
+        )
+        coordinator.last_wire_facing_heading_rad = 0.0
+        unchanged = coordinator.recovery_wire_command(
+            within_envelope,
+            output,
+            measured_heading_rad=0.0,
+            dt_s=0.02,
+        )
+        self.assertIs(unchanged, within_envelope)
+        self.assertFalse(coordinator.last_reframe_limited)
+        self.assertEqual(coordinator.reframe_limited_frames, 2)
+
     def test_resident_game_sonic_rejects_impossible_rotated_command_frame(
         self,
     ) -> None:
@@ -8239,6 +8452,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             socket.SOCK_SEQPACKET,
         )
         command_fd = command_child.fileno()
+        applied_video_settings_json = (
+            '{"revision":3,"resolution":"1600x900",'
+            '"resolution_width":1600,"resolution_height":900,'
+            '"window_mode":"fullscreen","fps_limit":90,"quality":"epic",'
+            '"camera_smoothing":"high"}'
+        )
         try:
             provider_pid = group.start_game_input(
                 "/runtime/python",
@@ -8252,6 +8471,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 mouse_settings_file=Path(
                     "/home/user/.config/matrix/mouse-control.json"
                 ),
+                video_settings_file=Path(
+                    "/home/user/.config/matrix/video-settings.json"
+                ),
+                applied_video_settings_json=applied_video_settings_json,
                 applied_mouse_profile="remote",
                 applied_mouse_speed_scale=0.5,
                 restart_request_file=Path("/run/user/1000/matrix/restart.json"),
@@ -8370,6 +8593,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--mouse-settings-file") + 1],
             "/home/user/.config/matrix/mouse-control.json",
+        )
+        self.assertEqual(
+            command[command.index("--video-settings-file") + 1],
+            "/home/user/.config/matrix/video-settings.json",
+        )
+        self.assertEqual(
+            command[command.index("--applied-video-settings-json") + 1],
+            applied_video_settings_json,
         )
         self.assertEqual(
             command[command.index("--applied-mouse-profile") + 1], "remote"

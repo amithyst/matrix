@@ -367,6 +367,9 @@ DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
 # per-command cap even if a caller supplies a larger dt or tuning rate.
 MAX_MEASURED_FACING_LEAD_RAD = 0.05
+PURE_FORWARD_CRAWL_MAX_ERROR_RAD = math.pi / 2.0
+PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD = 0.005
+PURE_FORWARD_CRAWL_STALL_GRACE_S = 0.40
 
 
 def native_locomotion_mode_for_speed(
@@ -597,6 +600,8 @@ class GameControlCore:
         self._consumed_movement_chord_epoch = 0
         self._locked_movement_chord: tuple[bool, bool, bool, bool] | None = None
         self._locked_movement_heading_rad: float | None = None
+        self._pure_forward_crawl_error_rad: float | None = None
+        self._pure_forward_crawl_stall_s = 0.0
 
     @property
     def free_camera(self) -> bool:
@@ -635,6 +640,7 @@ class GameControlCore:
         self._speed_mps = 0.0
         self._gait_active = False
         self._stopped_heading_latched = True
+        self._reset_pure_forward_crawl_tracker()
 
     def invalidate_input(self, reason: str = "input_invalidated") -> None:
         """Stop immediately and require neutral input before re-arming."""
@@ -654,6 +660,7 @@ class GameControlCore:
         self._neutral_rearm_pending = False
         self._neutral_rearm_frame_required = True
         self._rearm_completed_sequence = None
+        self._reset_pure_forward_crawl_tracker()
 
     def _snapshot_is_neutral(self) -> bool:
         if self._snapshot is None:
@@ -687,6 +694,32 @@ class GameControlCore:
     def _clear_movement_chord_lock(self) -> None:
         self._locked_movement_chord = None
         self._locked_movement_heading_rad = None
+        self._reset_pure_forward_crawl_tracker()
+
+    def _reset_pure_forward_crawl_tracker(self) -> None:
+        self._pure_forward_crawl_error_rad = None
+        self._pure_forward_crawl_stall_s = 0.0
+
+    def _pure_forward_crawl_progress_allows(
+        self, measured_error_abs_rad: float, *, dt_s: float
+    ) -> bool:
+        if measured_error_abs_rad >= PURE_FORWARD_CRAWL_MAX_ERROR_RAD:
+            self._reset_pure_forward_crawl_tracker()
+            return False
+        previous_error = self._pure_forward_crawl_error_rad
+        progressed = (
+            previous_error is not None
+            and measured_error_abs_rad
+            <= previous_error - PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD
+        )
+        if previous_error is None or progressed:
+            self._pure_forward_crawl_stall_s = 0.0
+            self._pure_forward_crawl_error_rad = measured_error_abs_rad
+        else:
+            self._pure_forward_crawl_stall_s += dt_s
+        return progressed or self._pure_forward_crawl_stall_s < (
+            PURE_FORWARD_CRAWL_STALL_GRACE_S - 1e-12
+        )
 
     def _latch_stopped_heading(self) -> None:
         """Hold one physical heading for the complete stopped interval.
@@ -951,6 +984,7 @@ class GameControlCore:
         requested_speed = 0.0
         requested_locomotion_mode = SONIC_IDLE_MODE
         desired_heading = self._command_heading_rad
+        pure_forward_alignment_crawl = False
 
         if input_magnitude > 1e-12:
             self._stopped_heading_latched = False
@@ -966,6 +1000,7 @@ class GameControlCore:
                     movement_chord_boundary
                     or movement_chord != self._locked_movement_chord
                 ):
+                    self._reset_pure_forward_crawl_tracker()
                     self._locked_movement_chord = movement_chord
                     self._locked_movement_heading_rad = projected_heading
                 assert self._locked_movement_heading_rad is not None
@@ -1042,6 +1077,31 @@ class GameControlCore:
                 self._requested_locomotion(input_magnitude)
             )
             target_speed = requested_speed * alignment
+            pure_forward_alignment_crawl_eligible = (
+                digital_movement
+                and keys.w
+                and not any((keys.a, keys.s, keys.d))
+                and self._measured_heading_rad is not None
+                and alignment < math.cos(self.config.gait_start_heading_error_rad)
+            )
+            if pure_forward_alignment_crawl_eligible:
+                assert self._measured_heading_rad is not None
+                measured_error_abs = abs(
+                    wrap_angle_rad(desired_heading - self._measured_heading_rad)
+                )
+                pure_forward_alignment_crawl = (
+                    self._pure_forward_crawl_progress_allows(
+                        measured_error_abs,
+                        dt_s=dt,
+                    )
+                )
+                if pure_forward_alignment_crawl:
+                    target_speed = min(self.config.gait_start_speed_mps, requested_speed)
+                    requested_locomotion_mode = SONIC_SLOW_WALK_MODE
+                else:
+                    target_speed = 0.0
+            else:
+                self._reset_pure_forward_crawl_tracker()
             if (
                 digital_movement
                 and alignment
@@ -1081,6 +1141,8 @@ class GameControlCore:
             self._speed_mps = _move_toward(
                 self._speed_mps, target_speed, rate * dt
             )
+            if pure_forward_alignment_crawl:
+                self._speed_mps = min(self._speed_mps, target_speed)
             if math.isclose(
                 self._speed_mps, target_speed, rel_tol=0.0, abs_tol=1e-12
             ):
@@ -1106,6 +1168,7 @@ class GameControlCore:
         if (
             input_magnitude > 1e-12
             and self._gait_active
+            and not pure_forward_alignment_crawl
             and (
                 target_speed + self.config.speed_epsilon_mps
                 < self.config.gait_stop_speed_mps
@@ -1134,6 +1197,15 @@ class GameControlCore:
             # Snap the hidden ramp back to that exact floor on entry so the
             # first non-zero frame is 0.10 m/s, then subsequent frames obey the
             # configured acceleration from that boundary.
+            self._speed_mps = self.config.gait_start_speed_mps
+        elif (
+            input_magnitude > 1e-12
+            and pure_forward_alignment_crawl
+            and not self._gait_active
+            and self._speed_mps + self.config.speed_epsilon_mps
+            >= self.config.gait_start_speed_mps
+        ):
+            self._gait_active = True
             self._speed_mps = self.config.gait_start_speed_mps
         if self._speed_mps == 0.0:
             self._gait_active = False

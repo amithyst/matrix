@@ -100,10 +100,10 @@ from prepare_sonic_physics_model import (
 )
 from matrix_spawn_clearance import (
     AUDIT_SCHEMA as SPAWN_CLEARANCE_AUDIT_SCHEMA,
-    GROUND_SUPPORT_SCHEMA,
     apply_root_pose_and_audit,
     audit_spawn_clearance,
     audit_spawn_safety,
+    spawn_clearance_rollback_reason,
 )
 from matrix_world_state import (
     MAX_RESUME_CHECKPOINTS,
@@ -153,9 +153,7 @@ _GAME_WORLD_ROLLBACK_NUMERICAL_ERROR_PREFIXES = (
     "snapshot_non_finite:",
     "snapshot_sim_time_not_increasing:",
 )
-_GAME_WORLD_ROLLBACK_CLEARANCE_REASONS = frozenset(
-    {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
-)
+_spawn_clearance_rollback_reason = spawn_clearance_rollback_reason
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
@@ -1821,6 +1819,30 @@ def _root_up_z(qpos) -> float:
     """Diagnostic world-Z component of the floating base's local up axis."""
     _, x, y, _ = [float(value) for value in qpos[3:7]]
     return 1.0 - 2.0 * (x * x + y * y)
+
+
+def _publish_frozen_lowstate(simulator: Any) -> None:
+    """Keep DDS state alive while runtime pause leaves MuJoCo untouched."""
+
+    environment = getattr(simulator, "sim_env", None)
+    bridge = getattr(simulator, "unitree_bridge", None)
+    prepare_observation = getattr(environment, "prepare_obs", None)
+    publish_lowstate = getattr(bridge, "PublishLowState", None)
+    if not callable(prepare_observation) or not callable(publish_lowstate):
+        raise RuntimeError(
+            "runtime pause requires a frozen LowState publish capability"
+        )
+    observation = prepare_observation()
+    if not isinstance(observation, dict):
+        raise RuntimeError("runtime pause produced an invalid frozen LowState")
+    sim_time = observation.get("time")
+    if (
+        isinstance(sim_time, bool)
+        or not isinstance(sim_time, (int, float))
+        or not math.isfinite(float(sim_time))
+    ):
+        raise RuntimeError("runtime pause frozen LowState has invalid simulation time")
+    publish_lowstate(observation)
 
 
 def _physical_foot_contact(simulator: Any) -> bool:
@@ -3831,305 +3853,6 @@ def _game_world_rollback_ineligibility(
     return None
 
 
-def _spawn_clearance_rollback_reason(
-    audit: dict[str, object] | None,
-) -> str | None:
-    """Return the typed rollback reason for a trusted collision audit.
-
-    Parser/model failures deliberately stay outside the rollback allowlist:
-    only classified scene collision or exact no-ground evidence may quarantine
-    a checkpoint.
-    """
-
-    if not isinstance(audit, dict):
-        return None
-    reason = audit.get("reason")
-    if (
-        audit.get("schema") != SPAWN_CLEARANCE_AUDIT_SCHEMA
-        or audit.get("safe") is not False
-        or audit.get("error") is not None
-        or reason not in _GAME_WORLD_ROLLBACK_CLEARANCE_REASONS
-    ):
-        return None
-    if reason == "no_ground_support":
-        support = audit.get("support")
-        rejected_count = audit.get("rejected_contact_count")
-        required_hits = (
-            support.get("required_hits") if isinstance(support, dict) else None
-        )
-        accepted_hits = (
-            support.get("accepted_hits") if isinstance(support, dict) else None
-        )
-        moon_spawn_gate = (
-            support.get("moon_spawn_gate")
-            if isinstance(support, dict)
-            else None
-        )
-        ray_direction = (
-            support.get("ray_direction") if isinstance(support, dict) else None
-        )
-        if (
-            not isinstance(support, dict)
-            or support.get("schema") != GROUND_SUPPORT_SCHEMA
-            or support.get("supported") is not False
-            or isinstance(required_hits, bool)
-            or not isinstance(required_hits, int)
-            or required_hits not in {1, 2}
-            or isinstance(accepted_hits, bool)
-            or not isinstance(accepted_hits, int)
-            or not 0 <= accepted_hits <= required_hits
-            or (required_hits == 1 and accepted_hits != 0)
-            or type(moon_spawn_gate) is not bool
-            or moon_spawn_gate != (required_hits == 2)
-            or support.get("required_distinct_feet") != required_hits
-            or support.get("method") != "downward_foot_geom_rays"
-            or support.get("maximum_drop_m") != 0.12
-            or support.get("minimum_normal_z") != 0.8
-            or not isinstance(ray_direction, list)
-            or len(ray_direction) != 3
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                for value in ray_direction
-            )
-            or [float(value) for value in ray_direction]
-            != [0.0, 0.0, -1.0]
-            or isinstance(rejected_count, bool)
-            or rejected_count != 0
-        ):
-            return None
-        probes = support.get("probes")
-        if not isinstance(probes, list) or len(probes) != 2:
-            return None
-        supported_foot_names = support.get("supported_foot_names")
-        height_delta_m = support.get("height_delta_m")
-        maximum_height_delta_m = support.get("maximum_height_delta_m")
-        height_delta_safe = support.get("height_delta_safe")
-        rejection_reason = support.get("rejection_reason")
-        if (
-            not isinstance(supported_foot_names, list)
-            or any(not isinstance(name, str) for name in supported_foot_names)
-            or len(supported_foot_names) != accepted_hits
-            or type(height_delta_safe) is not bool
-            or height_delta_safe is not (required_hits == 1)
-            or (
-                required_hits == 1
-                and (
-                    height_delta_m is not None
-                    or maximum_height_delta_m is not None
-                    or rejection_reason != "insufficient_distinct_foot_support"
-                )
-            )
-            or (
-                required_hits == 2
-                and (
-                    maximum_height_delta_m != 0.04
-                    or rejection_reason
-                    not in {
-                        "insufficient_distinct_foot_support",
-                        "foot_support_height_delta",
-                    }
-                )
-            )
-        ):
-            return None
-        expected_names = {
-            "left_ankle_roll_link",
-            "right_ankle_roll_link",
-        }
-        observed_names: set[str] = set()
-        accepted_names: list[str] = []
-        accepted_support_heights: list[float] = []
-        for probe in probes:
-            if not isinstance(probe, dict):
-                return None
-            foot_body = probe.get("foot_body")
-            origins = probe.get("origins")
-            if (
-                not isinstance(foot_body, dict)
-                or isinstance(foot_body.get("id"), bool)
-                or not isinstance(foot_body.get("id"), int)
-                or int(foot_body["id"]) <= 0
-                or foot_body.get("name") not in expected_names
-                or not isinstance(origins, list)
-                or not 1 <= len(origins) <= 32
-                or type(probe.get("accepted")) is not bool
-            ):
-                return None
-            observed_geom_ids: set[int] = set()
-            for origin in origins:
-                if not isinstance(origin, dict):
-                    return None
-                geom_id = origin.get("geom_id")
-                geom_name = origin.get("geom_name")
-                position = origin.get("position_m")
-                if (
-                    isinstance(geom_id, bool)
-                    or not isinstance(geom_id, int)
-                    or geom_id < 0
-                    or geom_id in observed_geom_ids
-                    or (
-                        geom_name is not None
-                        and (
-                            not isinstance(geom_name, str)
-                            or not geom_name
-                            or len(geom_name) > 256
-                        )
-                    )
-                    or not isinstance(position, list)
-                    or len(position) != 3
-                    or any(
-                        isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not math.isfinite(float(value))
-                        for value in position
-                    )
-                ):
-                    return None
-                observed_geom_ids.add(geom_id)
-            foot_name = str(foot_body["name"])
-            observed_names.add(foot_name)
-            if probe["accepted"] is False:
-                if any(
-                    probe.get(field) is not None
-                    for field in (
-                        "distance_m",
-                        "normal",
-                        "probe_geom",
-                        "ray_origin_m",
-                        "scene_geom",
-                        "support_height_m",
-                    )
-                ):
-                    return None
-                continue
-            distance = probe.get("distance_m")
-            normal = probe.get("normal")
-            probe_geom = probe.get("probe_geom")
-            ray_origin = probe.get("ray_origin_m")
-            scene_geom = probe.get("scene_geom")
-            support_height = probe.get("support_height_m")
-            if (
-                isinstance(distance, bool)
-                or not isinstance(distance, (int, float))
-                or not 0.0 <= float(distance) <= 0.12
-                or not isinstance(normal, list)
-                or len(normal) != 3
-                or any(
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    for value in normal
-                )
-                or float(normal[2]) < 0.8
-                or not isinstance(probe_geom, dict)
-                or isinstance(probe_geom.get("id"), bool)
-                or not isinstance(probe_geom.get("id"), int)
-                or probe_geom.get("id") not in observed_geom_ids
-                or not isinstance(probe_geom.get("name"), str)
-                or not probe_geom.get("name")
-                or not isinstance(ray_origin, list)
-                or len(ray_origin) != 3
-                or any(
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    for value in ray_origin
-                )
-                or not isinstance(scene_geom, dict)
-                or isinstance(scene_geom.get("id"), bool)
-                or not isinstance(scene_geom.get("id"), int)
-                or scene_geom.get("id") < 0
-                or not isinstance(scene_geom.get("name"), str)
-                or not scene_geom.get("name")
-                or isinstance(support_height, bool)
-                or not isinstance(support_height, (int, float))
-                or not math.isfinite(float(support_height))
-                or not math.isclose(
-                    float(support_height),
-                    float(ray_origin[2]) - float(distance),
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
-                or (
-                    moon_spawn_gate
-                    and scene_geom.get("name")
-                    != "matrix_moon_continuous_support"
-                )
-            ):
-                return None
-            accepted_names.append(foot_name)
-            accepted_support_heights.append(float(support_height))
-        observed_height_delta = (
-            max(accepted_support_heights) - min(accepted_support_heights)
-            if len(accepted_support_heights) >= 2
-            else None
-        )
-        if (
-            observed_names != expected_names
-            or accepted_hits != len(accepted_names)
-            or supported_foot_names != accepted_names
-            or (
-                height_delta_m is None
-                and observed_height_delta is not None
-            )
-            or (
-                height_delta_m is not None
-                and (
-                    isinstance(height_delta_m, bool)
-                    or not isinstance(height_delta_m, (int, float))
-                    or observed_height_delta is None
-                    or not math.isclose(
-                        float(height_delta_m),
-                        observed_height_delta,
-                        rel_tol=0.0,
-                        abs_tol=1e-9,
-                    )
-                )
-            )
-            or (
-                required_hits == 2
-                and accepted_hits < 2
-                and rejection_reason != "insufficient_distinct_foot_support"
-            )
-            or (
-                required_hits == 2
-                and accepted_hits == 2
-                and (
-                    rejection_reason != "foot_support_height_delta"
-                    or observed_height_delta is None
-                    or observed_height_delta <= 0.04
-                )
-            )
-        ):
-            return None
-        return str(reason)
-    rejected_count = audit.get("rejected_contact_count")
-    worst = audit.get("worst")
-    if (
-        isinstance(rejected_count, bool)
-        or not isinstance(rejected_count, int)
-        or rejected_count <= 0
-        or not isinstance(worst, dict)
-        or worst.get("allowed") is not False
-    ):
-        return None
-    classification = worst.get("classification")
-    expected_classifications = (
-        {"scene_penetration", "unsafe_body_contact"}
-        if reason == "scene_penetration"
-        else {
-            "unsafe_foot_contact_normal",
-            "unsafe_foot_penetration",
-            "unsafe_foot_terrain_edge",
-        }
-    )
-    if classification not in expected_classifications:
-        return None
-    return str(reason)
-
-
 def _runtime_exit_code(
     *,
     internal_restart_requested: bool,
@@ -5336,6 +5059,23 @@ class GameInputRuntime:
         self.server.close()
 
 
+def _maintain_frozen_runtime_heartbeats(
+    simulator: Any,
+    game_input: GameInputRuntime,
+    *,
+    now_s: float,
+) -> RobotMotionCommand:
+    """Drain provider input and publish frozen sensors without moving physics."""
+
+    game_input.poll(now_s=now_s, dt_s=0.0)
+    stopped = game_input.emergency_stop(
+        now_s=now_s,
+        reason="runtime_paused",
+    )
+    _publish_frozen_lowstate(simulator)
+    return stopped
+
+
 def _game_command_poll_allowed(
     command: RobotMotionCommand,
     *,
@@ -5902,7 +5642,7 @@ class GameCommandRuntime:
                     )
                 )
                 continue
-            if not command_allowed:
+            if not command_allowed and not isinstance(request.command, TeleportList):
                 self.rejected_commands += 1
                 self._send(
                     self._response(
@@ -8788,6 +8528,12 @@ class _PhysicalRecoveryCoordinator:
     # from bypassing the core's own yaw slew limiter.
     WIRE_MAX_TURN_RATE_RAD_S = 1.0
     WIRE_MAX_HEADING_STEP_RAD = 0.02
+    # SONIC's official PICO planner uses a 1.5 rad/s yaw accumulator, while
+    # its WALK-backed turn-around smoke advances at roughly pi/2 rad/s.  Keep
+    # the user's requested turn rate intact, but bound zero-translation turns
+    # to that qualified envelope at the final resident SONIC wire boundary.
+    RESIDENT_TURN_ONLY_MAX_RATE_RAD_S = 1.5
+    RESIDENT_TURN_ONLY_MAX_HEADING_STEP_RAD = 0.03
     # GameControlCore deliberately keeps its planner-facing target close to
     # measured yaw.  That short lead is below SONIC's effective turning
     # threshold after a deploy-frame re-anchor, so the recovery adapter may use
@@ -10511,6 +10257,99 @@ class _PhysicalRecoveryCoordinator:
             desired_facing=facing,
         )
 
+    def resident_game_sonic_wire_command(
+        self,
+        command: RobotMotionCommand,
+        *,
+        measured_heading_rad: float,
+        dt_s: float,
+    ) -> RobotMotionCommand:
+        """Apply the resident SONIC turn-only stability envelope.
+
+        Moving commands retain the user's configured turn response.  Only a
+        WALK-backed command with zero translation is kept within SONIC's
+        qualified in-place yaw envelope; the persisted setting remains the
+        requested rate and is never rewritten by this boundary.
+        """
+
+        if not math.isclose(
+            self.command_frame_rotation_rad,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError("resident SONIC command frame unexpectedly rotated")
+        facing_norm = math.hypot(command.facing[0], command.facing[1])
+        if facing_norm <= 1e-12:
+            raise ValueError("resident SONIC command has zero horizontal facing")
+        requested_heading = math.atan2(command.facing[1], command.facing[0])
+        if command.mode != "turn":
+            self.last_wire_facing_heading_rad = requested_heading
+            self.last_reframe_limited = False
+            self.last_reframe_heading_error_rad = 0.0
+            return command
+
+        step_seconds = float(dt_s)
+        measured_heading = float(measured_heading_rad)
+        if (
+            not math.isfinite(step_seconds)
+            or step_seconds < 0.0
+            or not math.isfinite(measured_heading)
+        ):
+            raise ValueError(
+                "resident SONIC turn timing and measured heading must be finite"
+            )
+        measured_heading = wrap_angle_rad(measured_heading)
+        requested_error = wrap_angle_rad(requested_heading - measured_heading)
+        desired_facing = command.desired_facing or command.facing
+        desired_norm = math.hypot(desired_facing[0], desired_facing[1])
+        if not math.isfinite(desired_norm) or desired_norm <= 1e-12:
+            raise ValueError(
+                "resident SONIC turn has zero or non-finite desired facing"
+            )
+        desired_heading = math.atan2(desired_facing[1], desired_facing[0])
+        desired_error = wrap_angle_rad(desired_heading - measured_heading)
+        bounded_desired_error = max(
+            -self.WIRE_TURN_LEAD_WINDOW_RAD,
+            min(self.WIRE_TURN_LEAD_WINDOW_RAD, desired_error),
+        )
+        wire_target_heading = wrap_angle_rad(
+            measured_heading + bounded_desired_error
+        )
+        previous_wire_heading = self.last_wire_facing_heading_rad
+        if previous_wire_heading is None:
+            previous_wire_heading = measured_heading
+        maximum_step = min(
+            self.RESIDENT_TURN_ONLY_MAX_HEADING_STEP_RAD,
+            self.RESIDENT_TURN_ONLY_MAX_RATE_RAD_S * step_seconds,
+            abs(requested_error),
+        )
+        wire_slew = wrap_angle_rad(
+            wire_target_heading - previous_wire_heading
+        )
+        bounded_slew = max(-maximum_step, min(maximum_step, wire_slew))
+        bounded_heading = wrap_angle_rad(previous_wire_heading + bounded_slew)
+        limited = not math.isclose(
+            wrap_angle_rad(bounded_heading - requested_heading),
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        self.last_wire_facing_heading_rad = bounded_heading
+        self.last_reframe_limited = limited
+        self.last_reframe_heading_error_rad = desired_error
+        if limited:
+            self.reframe_limited_frames += 1
+            return replace(
+                command,
+                facing=(
+                    math.cos(bounded_heading),
+                    math.sin(bounded_heading),
+                    0.0,
+                ),
+            )
+        return command
+
     def recovery_wire_command(
         self,
         command: RobotMotionCommand,
@@ -10528,30 +10367,14 @@ class _PhysicalRecoveryCoordinator:
             if output.state is ResidentRecoveryState.GAME_SONIC:
                 # Resident recovery returns authority to the same SONIC
                 # process and therefore never creates a new deploy yaw frame.
-                # Applying the replacement-deploy 1 rad/s wire limiter here
-                # double-limits the core's already feedback-bounded 2.5 rad/s
-                # turn, forcing ordinary camera-relative running into long
-                # turn-only (zero-translation) intervals.
-                if not math.isclose(
-                    self.command_frame_rotation_rad,
-                    0.0,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                ):
-                    raise RuntimeError(
-                        "resident SONIC command frame unexpectedly rotated"
-                    )
-                facing_norm = math.hypot(command.facing[0], command.facing[1])
-                if facing_norm <= 1e-12:
-                    raise ValueError(
-                        "resident SONIC command has zero horizontal facing"
-                    )
-                self.last_wire_facing_heading_rad = math.atan2(
-                    command.facing[1], command.facing[0]
+                # Ordinary moving commands bypass the replacement-deploy
+                # limiter; only zero-translation turns use the qualified
+                # resident stability envelope.
+                return self.resident_game_sonic_wire_command(
+                    command,
+                    measured_heading_rad=measured_heading_rad,
+                    dt_s=dt_s,
                 )
-                self.last_reframe_limited = False
-                self.last_reframe_heading_error_rad = 0.0
-                return command
             # The resident deploy keeps consuming planner frames while KungFu
             # owns LowCmd. Track the live body yaw so RESUME cannot inherit a
             # stale camera-facing turn request during the fragile handoff.
@@ -12289,6 +12112,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     current_pose=_snapshot_world_pose(snapshot),
                                     command_allowed=True,
                                 )
+                    if runtime_pause.physics_frozen:
+                        runtime_pause_neutral_command = (
+                            _maintain_frozen_runtime_heartbeats(
+                                simulator,
+                                game_input,
+                                now_s=frame_wall,
+                            )
+                        )
                 except (EOFError, OSError, RuntimeError, ValueError) as exc:
                     stop_for_physical_recovery_exception(exc, action=True)
                     break

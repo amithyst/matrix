@@ -2,6 +2,11 @@
 set -euo pipefail
 ORIGINAL_ENVIRONMENT=()
 while IFS= read -r -d '' entry; do
+    case "$entry" in
+        MATRIX_SONIC_RESTART_ROUTE_JSON=*|MATRIX_GAME_ROUTE_ENTRY_JSON=*)
+            continue
+            ;;
+    esac
     ORIGINAL_ENVIRONMENT+=("$entry")
 done < "/proc/$$/environ"
 if ((BASH_VERSINFO[0] < 5 \
@@ -320,6 +325,7 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 MATRIX_SONIC_HOST_LOCK="${MATRIX_SONIC_HOST_LOCK:-/tmp/matrix-sonic-${UID}.lock}"
 MATRIX_SONIC_INTERNAL_RESTART=0
+unset MATRIX_GAME_ROUTE_ENTRY_JSON
 if [[ "${MATRIX_SONIC_RESTART_LOCK_FD:-}" == "9" ]]; then
     inherited_target="$(readlink -f "/proc/$$/fd/9" 2>/dev/null || true)"
     expected_target="$(realpath -m "$MATRIX_SONIC_HOST_LOCK")"
@@ -353,14 +359,34 @@ if [[ "$MATRIX_SONIC_INTERNAL_RESTART" == "1" ]]; then
         fi
         export MATRIX_GAME_WORLD_ID="$MATRIX_SONIC_RESTART_WORLD_ID"
     fi
+    if [[ -n "${MATRIX_SONIC_RESTART_ROUTE_JSON:-}" ]]; then
+        if [[ -z "${MATRIX_SONIC_RESTART_SCENE_ID:-}" \
+            || -z "${MATRIX_SONIC_RESTART_WORLD_ID:-}" ]]; then
+            echo "[ERROR] Matrix restart route is missing its target identity" >&2
+            exit 2
+        fi
+        if ! MATRIX_GAME_ROUTE_ENTRY_JSON="$(
+            /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_route_entry.py" \
+                --expected-world-id "$MATRIX_SONIC_RESTART_WORLD_ID" \
+                --expected-scene-id "$MATRIX_SONIC_RESTART_SCENE_ID" \
+                --json "$MATRIX_SONIC_RESTART_ROUTE_JSON" 2>&1
+        )"; then
+            echo "[ERROR] Matrix restart route entry is invalid: " \
+                "$MATRIX_GAME_ROUTE_ENTRY_JSON" >&2
+            exit 2
+        fi
+        export MATRIX_GAME_ROUTE_ENTRY_JSON
+    fi
 else
     if [[ -n "${MATRIX_SONIC_RESTART_SCENE_ID:-}" \
-        || -n "${MATRIX_SONIC_RESTART_WORLD_ID:-}" ]]; then
+        || -n "${MATRIX_SONIC_RESTART_WORLD_ID:-}" \
+        || -n "${MATRIX_SONIC_RESTART_ROUTE_JSON:-}" ]]; then
         echo "[ERROR] Matrix restart route requires the inherited host lock" >&2
         exit 2
     fi
 fi
 unset MATRIX_SONIC_RESTART_SCENE_ID MATRIX_SONIC_RESTART_WORLD_ID
+unset MATRIX_SONIC_RESTART_ROUTE_JSON
 
 # The host lock serializes every mutation of Saved/Paks.  Clear a verified
 # leftover from an interrupted generation before any runtime audit, then verify
@@ -946,6 +972,7 @@ if [[ "$CONTROL_SOURCE" == "game" ]]; then
         "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
         "$PROJECT_ROOT/scripts/matrix_item_asset_pack.py" \
         "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
+        "$PROJECT_ROOT/scripts/matrix_route_entry.py" \
         "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
         "$PROJECT_ROOT/scripts/matrix_world_state.py" \
         "$PROJECT_ROOT/config/universe/sol-2080.json" \
@@ -1610,6 +1637,7 @@ RESTART_REQUEST_VALID=0
 RESTART_EXPECTED_EXIT_CODE=143
 NEXT_SCENE_ID="$SCENE_ID"
 NEXT_WORLD_ID=""
+NEXT_ROUTE_JSON=""
 GAME_RESUME_ROLLBACK_COUNT="${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
 # Keep this equal to matrix_world_state.MAX_RESUME_CHECKPOINTS: each failed
 # generation may quarantine exactly one member of the bounded resume ring.
@@ -2051,9 +2079,9 @@ def runtime_clearance_reason(audit):
 import json
 import sys
 sys.path.insert(0, sys.argv[1])
-from run_matrix_sonic import _spawn_clearance_rollback_reason
+from matrix_spawn_clearance import spawn_clearance_rollback_reason
 audit = json.loads(sys.stdin.read())
-reason = _spawn_clearance_rollback_reason(audit)
+reason = spawn_clearance_rollback_reason(audit)
 print(json.dumps({"reason": reason}, separators=(",", ":"), sort_keys=True))
 '''
     try:
@@ -2488,15 +2516,23 @@ except (
 finally:
     if catalog is not None:
         catalog.ephemeris.close()
-print(f"{reason}\t{target_scene_id}\t{launch_route['target_world_id']}")
+route_json = json.dumps(
+    launch_route,
+    allow_nan=False,
+    separators=(",", ":"),
+    sort_keys=True,
+)
+print(f"{reason}\t{target_scene_id}\t{launch_route['target_world_id']}\t{route_json}")
 PY
     )"; then
         VERIFIED_INTERNAL_RESTART_TARGET_SCENE=""
         VERIFIED_INTERNAL_RESTART_TARGET_WORLD=""
+        VERIFIED_INTERNAL_RESTART_ROUTE_JSON=""
         IFS=$'\t' read -r \
             VERIFIED_INTERNAL_RESTART_REASON \
             VERIFIED_INTERNAL_RESTART_TARGET_SCENE \
             VERIFIED_INTERNAL_RESTART_TARGET_WORLD \
+            VERIFIED_INTERNAL_RESTART_ROUTE_JSON \
             <<<"$VERIFIED_INTERNAL_RESTART_REASON"
         INTERNAL_RESTART_NOW="$(date +%s)"
         if [[ "$INTERNAL_RESTART_WINDOW" == "0" ]] \
@@ -2511,6 +2547,7 @@ PY
             if [[ -n "$VERIFIED_INTERNAL_RESTART_TARGET_SCENE" ]]; then
                 NEXT_SCENE_ID="$VERIFIED_INTERNAL_RESTART_TARGET_SCENE"
                 NEXT_WORLD_ID="$VERIFIED_INTERNAL_RESTART_TARGET_WORLD"
+                NEXT_ROUTE_JSON="$VERIFIED_INTERNAL_RESTART_ROUTE_JSON"
             fi
             echo "[INFO] Validated Matrix world reload " \
                 "reason=$VERIFIED_INTERNAL_RESTART_REASON " \
@@ -2725,6 +2762,11 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
             if [[ -n "$NEXT_WORLD_ID" ]]; then
                 RESTART_ROUTE_ENV+=(
                     "MATRIX_SONIC_RESTART_WORLD_ID=$NEXT_WORLD_ID"
+                )
+            fi
+            if [[ -n "${NEXT_ROUTE_JSON:-}" ]]; then
+                RESTART_ROUTE_ENV+=(
+                    "MATRIX_SONIC_RESTART_ROUTE_JSON=$NEXT_ROUTE_JSON"
                 )
             fi
             exec /usr/bin/env -i \

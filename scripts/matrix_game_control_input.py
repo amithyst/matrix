@@ -4948,6 +4948,7 @@ class GameCommandClient:
         self._pending_external_input: PendingExternalInputPublish | None = None
         self._pending_warning: str | None = None
         self._pending_runtime_pause: tuple[str, int] | None = None
+        self._auto_celestial_refresh_attempted = False
         self._outcome_unknown = False
         self.editing = False
         self._escape_release_required = False
@@ -5700,6 +5701,14 @@ class GameCommandClient:
             self.data = data
             self.last_request_id = None
             return True
+        if isinstance(parsed.command, RuntimePause):
+            return self.submit_runtime_pause(
+                parsed.command.target,
+                parsed.command.expected_epoch,
+                calibration_active=calibration_active,
+                neutral_frame_ready=neutral_frame_ready,
+                restart_requested=restart_requested,
+            )
         if not calibration_active:
             self._local_error("E_NOT_PAUSED", "Open the ESC panel before commands")
             return False
@@ -5999,13 +6008,41 @@ class GameCommandClient:
                 "E_RESTART_PENDING", "A whole-runtime restart is already pending"
             )
             return False
+        return self._send_celestial_teleport_list(
+            pending_message="Refreshing celestial teleport points"
+        )
+
+    def auto_refresh_celestial_navigation_once(self) -> bool:
+        """Send one startup teleport probe query without panel gates."""
+
+        if (
+            self._auto_celestial_refresh_attempted
+            or self.in_flight
+            or self.restart_required
+            or self._outcome_unknown
+            or self._celestial_catalog is None
+            or not self.available
+        ):
+            return False
+        self._auto_celestial_refresh_attempted = True
+        return self._send_celestial_teleport_list(
+            pending_message="Refreshing celestial teleport points"
+        )
+
+    def _send_celestial_teleport_list(self, *, pending_message: str) -> bool:
+        catalog = self._celestial_catalog
+        if catalog is None:
+            self._local_error(
+                "E_NAVIGATION_UNAVAILABLE", "Celestial navigation is unavailable"
+            )
+            return False
         command = TeleportList(
             tuple(destination.teleport_tag for destination in catalog.destinations)
         )
         sent = self._send_typed_command(
             command,
             warning=None,
-            pending_message="Refreshing celestial teleport points",
+            pending_message=pending_message,
         )
         if sent:
             assert isinstance(self._teleport_probes, TeleportProbeSet)
@@ -7682,6 +7719,10 @@ def main() -> int:
                 )
                 external_inflight_command = None
                 external_control_changed = True
+            command_state_changed = bool(
+                game_command_client.auto_refresh_celestial_navigation_once()
+                or command_state_changed
+            )
             shortcuts_armed = shortcut_arming.update(
                 escape_pressed=raw_keyboard.escape,
                 restart_pressed=raw_keyboard.apply_restart,

@@ -5629,7 +5629,7 @@ class X11CalibrationOverlay:
             label = self._clip_console_line(label, max(1, rectangle[2] - 8))
             if enabled:
                 fill_name = "apply"
-            elif refreshing or destination.status in {"unknown", "undiscovered"}:
+            elif refreshing or destination.status == "unknown":
                 fill_name = "pending"
             else:
                 fill_name = "disabled"

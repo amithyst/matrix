@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import venv
 
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
@@ -167,7 +168,7 @@ _spawn_clearance_rollback_reason = _runtime["_spawn_clearance_rollback_reason"]
             self._install_runtime_validator_shim(project)
             if not validator_available:
                 self.launcher_fixture.write(
-                    project / "scripts/run_matrix_sonic.py",
+                    project / "scripts/matrix_spawn_clearance.py",
                     "raise RuntimeError('validator unavailable')\n",
                 )
             runtime_python = self._runtime_python_wrapper(
@@ -308,6 +309,69 @@ exit 0
                     "Refusing unverified Matrix resume rollback proposal",
                     result.stderr,
                 )
+
+    def test_spawn_clearance_rollback_reason_imports_without_numpy(self) -> None:
+        audits = [*self._moon_no_ground_audits(), *self._moon_contact_audits()]
+        body_audit, _foot_audit = self._moon_contact_audits()
+        unknown = deepcopy(body_audit)
+        unknown["worst"]["classification"] = "unknown_unsafe_body_contact"
+        payload = {"audits": audits, "unknown": unknown}
+        validator = r'''
+import importlib.util
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from matrix_spawn_clearance import spawn_clearance_rollback_reason
+
+payload = json.loads(sys.stdin.read())
+result = {
+    "numpy_available": importlib.util.find_spec("numpy") is not None,
+    "reasons": [
+        spawn_clearance_rollback_reason(audit)
+        for audit in payload["audits"]
+    ],
+    "unknown": spawn_clearance_rollback_reason(payload["unknown"]),
+}
+print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            env_dir = Path(temporary) / "no-pip-venv"
+            venv.EnvBuilder(with_pip=False).create(env_dir)
+            python = env_dir / "bin/python"
+            result = subprocess.run(
+                [
+                    os.fspath(python),
+                    "-I",
+                    "-c",
+                    validator,
+                    os.fspath(REPO_ROOT / "scripts"),
+                ],
+                input=json.dumps(payload, allow_nan=False, separators=(",", ":")),
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+                env={"PYTHONDONTWRITEBYTECODE": "1"},
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        decoded = json.loads(result.stdout)
+        self.assertFalse(decoded["numpy_available"])
+        self.assertEqual(
+            decoded["reasons"],
+            [
+                "no_ground_support",
+                "no_ground_support",
+                "scene_penetration",
+                "unsafe_foot_contact",
+            ],
+        )
+        self.assertIsNone(decoded["unknown"])
 
     def test_real_moon_audits_quarantine_then_restart(self) -> None:
         audits = (*self._moon_no_ground_audits(), *self._moon_contact_audits())

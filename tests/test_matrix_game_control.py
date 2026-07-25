@@ -633,33 +633,237 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(moving.mode, "move")
         self.assertGreater(moving.speed_mps, 0.0)
 
-    def test_walk_turns_in_place_during_moderate_camera_body_mismatch(self) -> None:
-        core = armed_core(immediate_config())
-        camera_body_error = math.radians(53.0)
-        core.synchronize_heading(camera_body_error)
-        core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
+    def test_pure_w_crawl_requires_sub_right_angle_convergence(self) -> None:
+        for modifiers in (("ctrl",), (), ("shift",)):
+            with self.subTest(modifiers=modifiers):
+                core = armed_core(immediate_config(input_timeout_s=10.0))
+                core.synchronize_heading(0.0)
+                core.accept_snapshot(
+                    snapshot(
+                        yaw=math.radians(53.0),
+                        pressed=("w",),
+                        speed_modifiers=modifiers,
+                    ),
+                    received_at_s=10.0,
+                )
 
-        entering = core.command(now_s=10.0, dt_s=0.1)
-        still_turning = core.command(now_s=10.0, dt_s=0.1)
+                samples = [(core.command(now_s=10.0, dt_s=0.1), 0.0)]
+                # Each individual step is below the 0.005 rad progress
+                # quantum. Cumulative convergence must still refresh the
+                # bounded crawl instead of being mistaken for a stuck body.
+                for index in range(1, 9):
+                    measured_heading = math.radians(index * 0.1)
+                    core.synchronize_heading(measured_heading)
+                    samples.append(
+                        (
+                            core.command(
+                                now_s=10.0 + index * 0.1,
+                                dt_s=0.1,
+                            ),
+                            measured_heading,
+                        )
+                    )
 
-        for command in (entering, still_turning):
-            self.assertEqual(command.mode, "turn")
-            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
-            self.assertEqual(command.speed_mps, 0.0)
-            self.assertEqual(command.movement, (0.0, 0.0, 0.0))
+                for command, measured_heading in samples:
+                    self.assertEqual(command.mode, "move")
+                    self.assertEqual(
+                        command.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
+                    )
+                    self.assertAlmostEqual(command.speed_mps, 0.10)
+                    self.assertEqual(command.movement, command.facing)
+                    self.assertLessEqual(
+                        abs(
+                            MODULE.wrap_angle_rad(
+                                math.atan2(command.facing[1], command.facing[0])
+                                - measured_heading
+                            )
+                        ),
+                        MODULE.MAX_MEASURED_FACING_LEAD_RAD + 1e-12,
+                    )
+                    self.assertAlmostEqual(
+                        math.atan2(
+                            command.desired_facing[1],
+                            command.desired_facing[0],
+                        ),
+                        math.radians(53.0),
+                    )
 
+    def test_stuck_pure_w_crawl_stops_within_bounded_grace(self) -> None:
+        core = armed_core(immediate_config(input_timeout_s=10.0))
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(yaw=math.radians(53.0), pressed=("w",)),
+            received_at_s=10.0,
+        )
+
+        distance_m = 0.0
+        modes = []
+        for index in range(7):
+            command = core.command(now_s=10.0 + index * 0.1, dt_s=0.1)
+            modes.append(command.mode)
+            distance_m += command.speed_mps * 0.1
+
+        self.assertEqual(modes[:4], ["move", "move", "move", "move"])
+        self.assertEqual(modes[4:], ["turn", "turn", "turn"])
+        self.assertLessEqual(distance_m, 0.04 + 1e-12)
+
+    def test_pure_w_right_angle_and_reversal_never_translate(self) -> None:
+        for error_deg in (90.0, 150.0, 180.0):
+            with self.subTest(error_deg=error_deg):
+                core = armed_core(immediate_config(input_timeout_s=10.0))
+                core.synchronize_heading(0.0)
+                core.accept_snapshot(
+                    snapshot(yaw=math.radians(error_deg), pressed=("w",)),
+                    received_at_s=10.0,
+                )
+
+                for index in range(3):
+                    command = core.command(now_s=10.0 + index * 0.1, dt_s=0.1)
+                    self.assertEqual(command.mode, "turn")
+                    self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+                    self.assertEqual(command.speed_mps, 0.0)
+                    self.assertEqual(command.movement, (0.0, 0.0, 0.0))
+
+    def test_pure_w_crawl_resumes_on_progress_and_reaches_configured_tiers(self) -> None:
+        cases = (
+            (("ctrl",), MODULE.SONIC_SLOW_WALK_MODE, 0.10),
+            ((), MODULE.SONIC_WALK_MODE, 0.80),
+            (("shift",), MODULE.SONIC_RUN_MODE, 2.50),
+        )
+        for modifiers, expected_mode, expected_speed in cases:
+            with self.subTest(modifiers=modifiers):
+                core = armed_core(immediate_config(input_timeout_s=10.0))
+                core.synchronize_heading(0.0)
+                core.accept_snapshot(
+                    snapshot(
+                        yaw=math.radians(53.0),
+                        pressed=("w",),
+                        speed_modifiers=modifiers,
+                    ),
+                    received_at_s=10.0,
+                )
+                for index in range(5):
+                    last = core.command(now_s=10.0 + index * 0.1, dt_s=0.1)
+                self.assertEqual(last.mode, "turn")
+                self.assertEqual(last.speed_mps, 0.0)
+
+                core.synchronize_heading(math.radians(1.0))
+                resumed = core.command(now_s=10.5, dt_s=0.1)
+                self.assertEqual(resumed.mode, "move")
+                self.assertEqual(
+                    resumed.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
+                )
+                self.assertEqual(resumed.speed_mps, 0.10)
+
+                core.synchronize_heading(math.radians(48.0))
+                aligned = core.command(now_s=10.6, dt_s=0.1)
+                self.assertEqual(aligned.mode, "move")
+                self.assertEqual(aligned.locomotion_mode, expected_mode)
+                self.assertAlmostEqual(aligned.speed_mps, expected_speed)
+
+    def test_pure_w_drift_back_consumes_grace_deterministically(self) -> None:
+        core = armed_core(immediate_config(input_timeout_s=10.0))
         core.synchronize_heading(math.radians(10.0))
         core.accept_snapshot(
-            snapshot(sequence=2, timestamp=10.01, pressed=("w",)),
+            snapshot(yaw=math.radians(53.0), pressed=("w",)),
+            received_at_s=10.0,
+        )
+
+        self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "move")
+        core.synchronize_heading(math.radians(11.0))
+        self.assertEqual(core.command(now_s=10.1, dt_s=0.1).mode, "move")
+        for index, measured_deg in enumerate((10.5, 10.0, 9.5, 9.0), start=2):
+            core.synchronize_heading(math.radians(measured_deg))
+            command = core.command(now_s=10.0 + index * 0.1, dt_s=0.1)
+        self.assertEqual(command.mode, "turn")
+        self.assertEqual(command.speed_mps, 0.0)
+
+    def test_analog_mismatch_does_not_use_pure_w_crawl(self) -> None:
+        core = armed_core(immediate_config())
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(yaw=math.radians(53.0), stick=(0.0, 1.0)),
+            received_at_s=10.0,
+        )
+
+        command = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(command.mode, "turn")
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(command.speed_mps, 0.0)
+
+    def test_pure_w_alignment_crawl_clamps_existing_speed(self) -> None:
+        core = armed_core(immediate_config())
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        running = core.command(now_s=10.0, dt_s=0.1)
+        self.assertEqual(running.mode, "move")
+        self.assertEqual(running.speed_mps, 2.5)
+
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.01,
+                yaw=math.pi / 2.0,
+                pressed=("w", "a"),
+                speed_modifiers=("shift",),
+            ),
             received_at_s=10.01,
         )
-        gait_entry = core.command(now_s=10.01, dt_s=0.1)
-        aligned = core.command(now_s=10.01, dt_s=0.1)
-        self.assertEqual(gait_entry.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
-        self.assertEqual(gait_entry.speed_mps, 0.1)
-        self.assertEqual(aligned.mode, "move")
-        self.assertEqual(aligned.locomotion_mode, MODULE.SONIC_WALK_MODE)
-        self.assertEqual(aligned.speed_mps, 0.8)
+        core.command(now_s=10.01, dt_s=0.1)
+        core.accept_snapshot(
+            snapshot(
+                sequence=3,
+                timestamp=10.02,
+                yaw=math.radians(53.0),
+                pressed=("w",),
+                speed_modifiers=("shift",),
+            ),
+            received_at_s=10.02,
+        )
+
+        crawl = core.command(now_s=10.02, dt_s=0.1)
+
+        self.assertEqual(crawl.mode, "move")
+        self.assertEqual(crawl.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertEqual(crawl.speed_mps, 0.10)
+
+    def test_non_forward_mismatch_still_turns_before_translation(self) -> None:
+        cases = (
+            (("a",), 0.0, math.pi / 2.0),
+            (("d",), 0.0, -math.pi / 2.0),
+            (("s",), 0.0, math.pi),
+            (("w", "a"), 0.0, math.pi / 4.0),
+        )
+        for pressed, yaw, expected_heading in cases:
+            with self.subTest(pressed=pressed):
+                core = armed_core(immediate_config())
+                core.synchronize_heading(0.0)
+                core.accept_snapshot(
+                    snapshot(yaw=yaw, pressed=pressed),
+                    received_at_s=10.0,
+                )
+
+                command = core.command(now_s=10.0, dt_s=0.1)
+
+                self.assertEqual(command.mode, "turn")
+                self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+                self.assertEqual(command.speed_mps, 0.0)
+                self.assertEqual(command.movement, (0.0, 0.0, 0.0))
+                self.assertAlmostEqual(
+                    MODULE.wrap_angle_rad(
+                        math.atan2(
+                            command.desired_facing[1],
+                            command.desired_facing[0],
+                        )
+                        - expected_heading
+                    ),
+                    0.0,
+                )
 
     def test_digital_chord_locks_world_heading_until_change_or_release(self) -> None:
         core = armed_core(immediate_config())
@@ -902,10 +1106,19 @@ class GameControlCoreTest(unittest.TestCase):
         )
         self.assertAlmostEqual(rearmed_heading, math.pi / 2.0)
 
-    def test_walk_still_turns_in_place_for_large_camera_body_mismatch(self) -> None:
-        core = armed_core(immediate_config())
-        core.synchronize_heading(math.radians(70.0))
-        core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
+    def test_walk_without_measured_heading_still_uses_existing_turn_gate(self) -> None:
+        core = armed_core(
+            MODULE.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=1000.0,
+                max_deceleration_mps2=1000.0,
+                max_turn_rate_rad_s=1.0,
+                max_step_s=0.1,
+            )
+        )
+        core.accept_snapshot(
+            snapshot(yaw=math.pi / 2.0, pressed=("w",)), received_at_s=10.0
+        )
 
         turning = core.command(now_s=10.0, dt_s=0.1)
 
@@ -1155,10 +1368,11 @@ class GameControlCoreTest(unittest.TestCase):
             )
         )
         core.accept_snapshot(
-            snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
+            snapshot(pressed=("s",), speed_modifiers=("ctrl",)),
             received_at_s=10.0,
         )
-        core.synchronize_heading(0.0)
+        desired_heading = math.pi
+        core.synchronize_heading(desired_heading)
         self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "move")
 
         # Once active, noise near the 30-degree stop edge stops exactly once;
@@ -1167,12 +1381,12 @@ class GameControlCoreTest(unittest.TestCase):
         active_modes = []
         for sequence, delta in enumerate((-0.002, 0.002, -0.002, 0.002), start=2):
             now = 10.0 + sequence * 0.01
-            core.synchronize_heading(stop_error + delta)
+            core.synchronize_heading(desired_heading + stop_error + delta)
             core.accept_snapshot(
                 snapshot(
                     sequence=sequence,
                     timestamp=now,
-                    pressed=("w",),
+                    pressed=("s",),
                     speed_modifiers=("ctrl",),
                 ),
                 received_at_s=now,
@@ -1185,12 +1399,12 @@ class GameControlCoreTest(unittest.TestCase):
         # active because the wider 30-degree stop edge has not been crossed.
         sequence = 6
         now = 10.06
-        core.synchronize_heading(math.radians(16.0))
+        core.synchronize_heading(desired_heading + math.radians(16.0))
         core.accept_snapshot(
             snapshot(
                 sequence=sequence,
                 timestamp=now,
-                pressed=("w",),
+                pressed=("s",),
                 speed_modifiers=("ctrl",),
             ),
             received_at_s=now,
@@ -1200,12 +1414,12 @@ class GameControlCoreTest(unittest.TestCase):
         restart_modes = []
         for sequence, error_deg in enumerate((15.1, 14.9, 15.1), start=7):
             now = 10.0 + sequence * 0.01
-            core.synchronize_heading(math.radians(error_deg))
+            core.synchronize_heading(desired_heading + math.radians(error_deg))
             core.accept_snapshot(
                 snapshot(
                     sequence=sequence,
                     timestamp=now,
-                    pressed=("w",),
+                    pressed=("s",),
                     speed_modifiers=("ctrl",),
                 ),
                 received_at_s=now,
@@ -1225,19 +1439,19 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(slow.mode, "move")
         self.assertAlmostEqual(slow.speed_mps, 0.10)
 
-        turning = armed_core(config)
-        turning.synchronize_heading(math.radians(20.0))
-        turning.accept_snapshot(
+        crawling = armed_core(config)
+        crawling.synchronize_heading(math.radians(20.0))
+        crawling.accept_snapshot(
             snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
             received_at_s=10.0,
         )
-        turn_only = turning.command(now_s=10.0, dt_s=0.1)
-        self.assertEqual(turn_only.mode, "turn")
+        forward_crawl = crawling.command(now_s=10.0, dt_s=0.1)
+        self.assertEqual(forward_crawl.mode, "move")
         self.assertEqual(
-            turn_only.locomotion_mode, MODULE.SONIC_IDLE_MODE
+            forward_crawl.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
         )
-        self.assertEqual(turn_only.speed_mps, 0.0)
-        self.assertEqual(turn_only.movement, (0.0, 0.0, 0.0))
+        self.assertEqual(forward_crawl.speed_mps, 0.10)
+        self.assertEqual(forward_crawl.movement, forward_crawl.facing)
 
     def test_small_effective_stick_input_can_enter_native_gait(self) -> None:
         core = armed_core(

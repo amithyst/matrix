@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import math
 from pathlib import Path
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -454,6 +456,7 @@ material="demo_ground_material" /></worldbody>
                 [geom.get("name") for geom in geoms],
                 [
                     MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                    MODULE.MOON_SPAWN_PAD_GEOM_NAME,
                     "soil_0_0",
                     "soil_0_1",
                 ],
@@ -466,7 +469,34 @@ material="demo_ground_material" /></worldbody>
             )
             self.assertEqual(support_geom.get("contype"), "1")
             self.assertEqual(support_geom.get("conaffinity"), "1")
-            for tile_geom in geoms[1:]:
+            self.assertEqual(
+                support_geom.get("friction"), MODULE.MOON_COLLISION_FRICTION
+            )
+            self.assertEqual(
+                support_geom.get("solref"), MODULE.MOON_COLLISION_SOLREF
+            )
+            self.assertEqual(
+                support_geom.get("solimp"), MODULE.MOON_COLLISION_SOLIMP
+            )
+            spawn_pad = geoms[1]
+            self.assertEqual(spawn_pad.get("type"), "box")
+            self.assertEqual(
+                [float(value) for value in spawn_pad.get("pos").split()],
+                list(MODULE.MOON_SPAWN_PAD_CENTER_M),
+            )
+            self.assertEqual(
+                [float(value) for value in spawn_pad.get("size").split()],
+                list(MODULE.MOON_SPAWN_PAD_HALF_SIZE_M),
+            )
+            self.assertEqual(spawn_pad.get("contype"), "1")
+            self.assertEqual(spawn_pad.get("conaffinity"), "1")
+            self.assertEqual(
+                spawn_pad.get("friction"), MODULE.MOON_COLLISION_FRICTION
+            )
+            self.assertEqual(spawn_pad.get("solref"), MODULE.MOON_COLLISION_SOLREF)
+            self.assertEqual(spawn_pad.get("solimp"), MODULE.MOON_COLLISION_SOLIMP)
+            self.assertEqual(spawn_pad.get("rgba"), "0 0 0 0")
+            for tile_geom in geoms[2:]:
                 self.assertEqual(tile_geom.get("contype"), "0")
                 self.assertEqual(tile_geom.get("conaffinity"), "0")
             hfields = list(scene_root.iter("hfield"))
@@ -496,7 +526,7 @@ material="demo_ground_material" /></worldbody>
                 manifest["scene_transform_contract"],
                 {
                     "dynamic_ground": {
-                        "schema": "matrix-moon-dynamic-ground/v2",
+                        "schema": "matrix-moon-dynamic-ground/v3",
                         "body_count": 2,
                         "body_name_pattern": (
                             MODULE.MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern
@@ -523,6 +553,37 @@ material="demo_ground_material" /></worldbody>
                             "height_range_m": 64.0,
                             "base_depth_m": 1.0,
                             "source_tile_collision_enabled": False,
+                            "friction": MODULE.MOON_COLLISION_FRICTION,
+                            "solref": MODULE.MOON_COLLISION_SOLREF,
+                            "solimp": MODULE.MOON_COLLISION_SOLIMP,
+                            "spawn_pad": {
+                                "mode": "finite-collision-only-box-v1",
+                                "geom_name": MODULE.MOON_SPAWN_PAD_GEOM_NAME,
+                                "center_m": list(MODULE.MOON_SPAWN_PAD_CENTER_M),
+                                "half_size_m": list(
+                                    MODULE.MOON_SPAWN_PAD_HALF_SIZE_M
+                                ),
+                                "top_z_m": (
+                                    MODULE.MOON_SPAWN_PAD_CENTER_M[2]
+                                    + MODULE.MOON_SPAWN_PAD_HALF_SIZE_M[2]
+                                ),
+                                "top_offset_above_native_floor_m": (
+                                    MODULE.MOON_SPAWN_PAD_HALF_SIZE_M[2]
+                                ),
+                                "locked_footprint": {
+                                    "map_sha256": MODULE.MOON_DYNAMIC_MAP_SHA256,
+                                    "pixel_x_range": list(
+                                        MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE
+                                    ),
+                                    "pixel_y_range": list(
+                                        MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE
+                                    ),
+                                    "native_height_range_m": list(
+                                        MODULE.MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M
+                                    ),
+                                },
+                                "rgba": [0.0, 0.0, 0.0, 0.0],
+                            },
                         },
                     }
                 },
@@ -532,6 +593,78 @@ material="demo_ground_material" /></worldbody>
                 manifest["staticized_freejoint_bodies"],
                 ["gb_0_0", "gb_0_1"],
             )
+
+            scene.write_text(
+                f"""<mujoco><include file="xgb.xml" /><worldbody>
+<geom name="{MODULE.MOON_SPAWN_PAD_GEOM_NAME}" type="box" size="1 1 1" />
+<body name="gb_0_0" pos="-0.75 -0.75 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_0" />
+  <geom name="soil_0_0" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>
+<body name="gb_0_1" pos="-0.75 -0.65 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_1" />
+  <geom name="soil_0_1" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
+                    MODULE._file_sha256(scene),
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT",
+                    2,
+                ),
+                self.assertRaisesRegex(
+                    MODULE.SonicPhysicsModelError,
+                    "already contains Matrix dynamic-ground support",
+                ),
+            ):
+                MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    root / "collision-output",
+                    body_joint_names=("joint_a",),
+                    scene_transform=MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+                )
+
+    def test_moon_spawn_pad_locked_footprint_matches_asset_when_present(self) -> None:
+        map_path = REPO_ROOT / "dynamicmaps/moonworld.bin"
+        if not map_path.is_file():
+            self.skipTest("locked MoonWorld height map asset is not installed")
+
+        self.assertEqual(map_path.stat().st_size, MODULE.MOON_DYNAMIC_MAP_SIZE_BYTES)
+        digest = hashlib.sha256()
+        with map_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        self.assertEqual(digest.hexdigest(), MODULE.MOON_DYNAMIC_MAP_SHA256)
+
+        x0, x1 = MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE
+        y0, y1 = MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE
+        expected_min, expected_max = MODULE.MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M
+        observed_min = math.inf
+        observed_max = -math.inf
+        with map_path.open("rb") as stream:
+            for y in range(y0, y1 + 1):
+                for x in range(x0, x1 + 1):
+                    stream.seek(
+                        (
+                            y * MODULE.MOON_DYNAMIC_MAP_SIDE_SAMPLES
+                            + x
+                        )
+                        * 4
+                    )
+                    (height,) = struct.unpack("<f", stream.read(4))
+                    observed_min = min(observed_min, height)
+                    observed_max = max(observed_max, height)
+        self.assertEqual(observed_min, expected_min)
+        self.assertEqual(observed_max, expected_max)
 
 
 if __name__ == "__main__":

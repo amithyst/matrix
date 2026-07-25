@@ -186,7 +186,7 @@ def celestial_navigation_state() -> dict[str, object]:
                     runtime_status="active",
                     status="ready",
                     enabled=True,
-                    position=[0.0, 0.0, -0.1366965003013611],
+                    position=[-94.7, -65.6, -5.251562023162842],
                     gravity=1.62,
                     atmosphere="vacuum",
                 ),
@@ -761,6 +761,103 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertFalse(malformed.available)
         self.assertFalse(malformed.enabled)
+
+    def test_runtime_pause_button_draws_visible_state_semantics(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        panel_model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+
+        def runtime_pause_state(state: str, *, epoch: int = 7):
+            return MODULE.runtime_pause_panel_model(
+                {
+                    "command_console": {
+                        "runtime_pause": {
+                            "state": state,
+                            "epoch": epoch,
+                            "can_pause": state == "running",
+                            "can_resume": state == "paused",
+                            "last_error": "pause bridge fault"
+                            if state == "fault"
+                            else None,
+                        }
+                    }
+                }
+            )
+
+        def command_status(*, busy: bool = False):
+            return MODULE.command_console_status(
+                {
+                    "command_console": {
+                        "available": True,
+                        "editing": False,
+                        "in_flight": busy,
+                        "status": "pending" if busy else "idle",
+                    }
+                }
+            )
+
+        def draw_runtime_button(state: str, *, busy: bool = False):
+            overlay = object.__new__(MODULE.X11CalibrationOverlay)
+            overlay._x11 = mock.Mock()
+            overlay._display = 1
+            overlay._windows = {"panel": 2}
+            overlay._panel_gc = 3
+            overlay._xft = None
+            overlay._xft_draw = None
+            overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
+            overlay._active_page = "settings"
+            overlay._colours = {
+                name: index
+                for index, name in enumerate(
+                    (
+                        "white",
+                        "muted",
+                        "selected",
+                        "button",
+                        "disabled",
+                        "pending",
+                        "error",
+                        "apply",
+                        "outline",
+                        "cyan",
+                    ),
+                    10,
+                )
+            }
+            overlay._command_editor = MODULE.CommandLineEditor()
+            status = command_status(busy=busy)
+            overlay._last_command_status = status
+            overlay._draw_text = mock.Mock()
+            overlay._draw_button = mock.Mock()
+
+            overlay._draw_panel(
+                layout,
+                panel_model,
+                status,
+                runtime_pause_model=runtime_pause_state(state),
+            )
+
+            return next(
+                call
+                for call in overlay._draw_button.call_args_list
+                if call.args[1] == "runtime_pause"
+            ), overlay._colours
+
+        cases = (
+            ("running", False, "暂停 / Pause", False, "button"),
+            ("paused", False, "继续 / Continue", False, "selected"),
+            ("running", True, "处理中 / Busy", True, "pending"),
+            ("pausing", False, "暂停中 / Pausing", True, "pending"),
+            ("fault", False, "暂停故障 / Fault", True, "error"),
+            ("unavailable", False, "暂停不可用", True, "disabled"),
+        )
+        for state, busy, label, disabled, fill_name in cases:
+            with self.subTest(state=state, busy=busy):
+                button, colours = draw_runtime_button(state, busy=busy)
+                self.assertEqual(button.args[2], label)
+                self.assertIs(button.kwargs["disabled"], disabled)
+                self.assertEqual(button.kwargs["fill"], colours[fill_name])
 
     def test_creative_inventory_visual_blocker_disables_every_item(self) -> None:
         model = MODULE.creative_inventory_model(
@@ -1346,6 +1443,76 @@ class OverlayStateTest(unittest.TestCase):
         self.assertTrue(buttons["navigation_destination_2"].kwargs["disabled"])
         self.assertIn("可传送", buttons["navigation_destination_0"].args[2])
         self.assertIn("可传送", buttons["navigation_destination_1"].args[2])
+
+    def test_navigation_undiscovered_draws_disabled_not_pending(self) -> None:
+        state = celestial_navigation_state()
+        state["celestial_navigation"]["bodies"][3] = {
+            **state["celestial_navigation"]["bodies"][3],
+            "runtime_status": "active",
+        }
+        destinations = state["celestial_navigation"]["destinations"]
+        destinations[1] = {
+            **destinations[1],
+            "status": "unknown",
+            "enabled": False,
+            "local_position_m": None,
+            "universe_position_m": None,
+        }
+        destinations[2] = {
+            **destinations[2],
+            "runtime_status": "active",
+            "status": "undiscovered",
+            "local_position_m": None,
+            "universe_position_m": None,
+        }
+        model = MODULE.celestial_navigation_model(state)
+        self.assertEqual(model.destinations[1].status, "unknown")
+        self.assertEqual(model.destinations[2].status, "undiscovered")
+        self.assertFalse(model.destination_enabled("moon-tranquility-outpost"))
+        self.assertFalse(model.destination_enabled("mars-utopia-outpost"))
+
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "navigation_summary")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+
+        overlay._draw_navigation_page(layout, model)
+
+        buttons = {
+            call.args[1]: call for call in overlay._draw_button.call_args_list
+        }
+        self.assertEqual(
+            buttons["navigation_destination_1"].kwargs["fill"],
+            overlay._colours["pending"],
+        )
+        self.assertTrue(buttons["navigation_destination_1"].kwargs["disabled"])
+        self.assertEqual(
+            buttons["navigation_destination_2"].kwargs["fill"],
+            overlay._colours["disabled"],
+        )
+        self.assertTrue(buttons["navigation_destination_2"].kwargs["disabled"])
+        self.assertIn("待同步", buttons["navigation_destination_1"].args[2])
+        self.assertIn("未发现", buttons["navigation_destination_2"].args[2])
 
     def test_disabled_locomotion_candidate_emits_no_selection_intent(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))

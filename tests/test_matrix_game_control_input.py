@@ -704,10 +704,67 @@ class GameCommandClientTest(unittest.TestCase):
         self.addCleanup(runtime.close)
         return client, runtime
 
+    def make_celestial_client(self):
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            game_world_id=EARTH_WORLD_ID,
+            celestial_catalog=MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH),
+            celestial_visual_catalog=VISUALS.load_visual_catalog(),
+        )
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+        return client, runtime
+
     @staticmethod
     def enable_editor(client) -> None:
         assert client.set_editing(
             True, panel_active=True, restart_requested=False
+        )
+
+    @staticmethod
+    def teleport_list_response(
+        request,
+        *,
+        ok: bool = True,
+        code: str = "OK_TELEPORT_LIST",
+        message: str = "Found 2/3 requested teleport points",
+    ):
+        data = (
+            {
+                "world_id": EARTH_WORLD_ID,
+                "teleport_points": [
+                    {
+                        "tag": "home",
+                        "found": True,
+                        "entity_id": "tp-" + "b" * 32,
+                        "position": [160.0, 117.0, 1.2],
+                        "yaw_rad": 0.0,
+                    },
+                    {
+                        "tag": "moon.tranquility",
+                        "found": True,
+                        "entity_id": "tp-" + "c" * 32,
+                        "position": [-94.7, -65.6, -5.251562023162842],
+                        "yaw_rad": 0.0,
+                    },
+                    {"tag": "mars.utopia", "found": False},
+                ],
+            }
+            if ok
+            else None
+        )
+        return MC_COMMANDS.encode_command_response(
+            MC_COMMANDS.GameCommandResponse(
+                session=request.session,
+                sequence=request.sequence,
+                request_id=request.request_id,
+                ok=ok,
+                code=code,
+                message=message,
+                data=data,
+            )
         )
 
     def test_unavailable_channel_cannot_enter_editor_or_capture_escape(self) -> None:
@@ -1484,6 +1541,138 @@ class GameCommandClientTest(unittest.TestCase):
                 celestial_catalog=MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH),
             )
 
+    def test_auto_celestial_refresh_runs_once_without_panel_gates(self) -> None:
+        client, runtime = self.make_celestial_client()
+
+        self.assertTrue(client.auto_refresh_celestial_navigation_once())
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            request.command,
+            MC_COMMANDS.TeleportList(
+                ("home", "moon.tranquility", "mars.utopia")
+            ),
+        )
+        self.assertTrue(client.in_flight)
+        self.assertEqual(client.status, "pending")
+        self.assertEqual(client.message, "Refreshing celestial teleport points")
+
+        for _ in range(3):
+            self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        runtime.send(self.teleport_list_response(request))
+        self.assertTrue(client.poll())
+        self.assertEqual(client.code, "OK_TELEPORT_LIST")
+        earth, moon, mars = client.celestial_navigation_mapping()["destinations"]
+        self.assertEqual(earth["status"], "ready")
+        self.assertEqual(moon["status"], "ready")
+        self.assertEqual(mars["status"], "world_unavailable")
+
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        self.assertTrue(
+            client.refresh_celestial_navigation(
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        manual_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(request.sequence + 1, manual_request.sequence)
+        self.assertEqual(manual_request.command, request.command)
+        runtime.send(self.teleport_list_response(manual_request))
+        self.assertTrue(client.poll())
+
+    def test_auto_celestial_refresh_failure_is_not_retried(self) -> None:
+        client, runtime = self.make_celestial_client()
+
+        self.assertTrue(client.auto_refresh_celestial_navigation_once())
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            self.teleport_list_response(
+                request,
+                ok=False,
+                code="E_TELEPORT_LIST",
+                message="provider not ready",
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.status, "error")
+        self.assertEqual(client.code, "E_TELEPORT_LIST")
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
+        self.assertTrue(
+            client.refresh_celestial_navigation(
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        manual_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertIsInstance(manual_request.command, MC_COMMANDS.TeleportList)
+        runtime.send(self.teleport_list_response(manual_request))
+        self.assertTrue(client.poll())
+
+    def test_auto_celestial_refresh_waits_for_busy_channel_and_skips_restart(self) -> None:
+        client, runtime = self.make_celestial_client()
+        self.enable_editor(client)
+        arguments = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+        }
+
+        self.assertTrue(client.submit("/tp @s 1 2 3", **arguments))
+        teleport_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=teleport_request.session,
+                    sequence=teleport_request.sequence,
+                    request_id=teleport_request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT",
+                    message="teleported",
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+
+        self.assertTrue(client.auto_refresh_celestial_navigation_once())
+        auto_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(self.teleport_list_response(auto_request))
+        self.assertTrue(client.poll())
+
+        self.assertTrue(client.submit("/tp @s 4 5 6", **arguments))
+        restart_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=restart_request.session,
+                    sequence=restart_request.sequence,
+                    request_id=restart_request.request_id,
+                    ok=True,
+                    code="OK_TELEPORT_RESTART",
+                    message="restart",
+                    restart_required=True,
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertTrue(client.restart_required)
+        self.assertFalse(client.auto_refresh_celestial_navigation_once())
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
+
     def test_celestial_refresh_discovers_home_and_routes_active_moon(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
@@ -1558,7 +1747,7 @@ class GameCommandClientTest(unittest.TestCase):
                                 "tag": "moon.tranquility",
                                 "found": True,
                                 "entity_id": "tp-" + "c" * 32,
-                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "position": [-94.7, -65.6, -5.251562023162842],
                                 "yaw_rad": 0.0,
                             },
                             {"tag": "mars.utopia", "found": False},
@@ -1610,7 +1799,7 @@ class GameCommandClientTest(unittest.TestCase):
                             "target_scene_id": 15,
                             "target_world_id": "g1_29dof:scene_terrain_moon_dynamic",
                             "entry_pose": {
-                                "position": [0.0, 0.0, -0.1366965003013611],
+                                "position": [-94.7, -65.6, -5.251562023162842],
                                 "yaw_rad": 0.0,
                             },
                             "entity_id": "tp-" + "d" * 32,
@@ -1922,6 +2111,126 @@ class GameCommandClientTest(unittest.TestCase):
         request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
         self.assertIsInstance(request.command, MC_COMMANDS.TeleportCoordinates)
         self.assertFalse(client.editing)
+
+    def test_external_runtime_pause_round_trips_strict_ack_without_unknown(self) -> None:
+        client, runtime = self.make_client()
+        unused_input_modifier = mock.Mock(side_effect=AssertionError("input only"))
+        arguments = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+            "input_modifier": unused_input_modifier,
+        }
+
+        self.assertTrue(
+            client.submit_external("/runtime pause paused 0", **arguments)
+        )
+        self.assertEqual(
+            client.runtime_pause_mapping(),
+            {
+                "state": "pausing",
+                "epoch": 0,
+                "can_pause": False,
+                "can_resume": False,
+                "last_error": None,
+            },
+        )
+        self.assertTrue(client.in_flight)
+        self.assertFalse(client.outcome_unknown)
+        pause_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            pause_request.command,
+            MC_COMMANDS.RuntimePause("paused", 0),
+        )
+        pause_ack = {"phase": "paused", "epoch": 1, "paused": True}
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=pause_request.session,
+                    sequence=pause_request.sequence,
+                    request_id=pause_request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_PAUSED",
+                    message="paused",
+                    data={"runtime_pause": pause_ack},
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertFalse(client.outcome_unknown)
+        self.assertIs(client.ok, True)
+        self.assertEqual(client.code, "OK_RUNTIME_PAUSED")
+        self.assertEqual(client.data, {"runtime_pause": pause_ack})
+        self.assertEqual(
+            client.runtime_pause_mapping(),
+            {
+                "state": "paused",
+                "epoch": 1,
+                "can_pause": False,
+                "can_resume": True,
+                "last_error": None,
+            },
+        )
+
+        self.assertTrue(
+            client.submit_external("/runtime pause running 1", **arguments)
+        )
+        self.assertEqual(client.runtime_pause_mapping()["state"], "resuming")
+        resume_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            resume_request.command,
+            MC_COMMANDS.RuntimePause("running", 1),
+        )
+        resume_ack = {"phase": "running", "epoch": 2, "paused": False}
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=resume_request.session,
+                    sequence=resume_request.sequence,
+                    request_id=resume_request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_RUNNING",
+                    message="running",
+                    data={"runtime_pause": resume_ack},
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertFalse(client.outcome_unknown)
+        self.assertIs(client.ok, True)
+        self.assertEqual(client.code, "OK_RUNTIME_RUNNING")
+        self.assertEqual(client.data, {"runtime_pause": resume_ack})
+        self.assertEqual(
+            client.runtime_pause_mapping(),
+            {
+                "state": "running",
+                "epoch": 2,
+                "can_pause": True,
+                "can_resume": False,
+                "last_error": None,
+            },
+        )
+        unused_input_modifier.assert_not_called()
+
+    def test_external_runtime_pause_requires_panel_gate(self) -> None:
+        client, runtime = self.make_client()
+        self.assertFalse(
+            client.submit_external(
+                "/runtime pause paused 0",
+                calibration_active=False,
+                neutral_frame_ready=True,
+                restart_requested=False,
+                input_modifier=mock.Mock(),
+            )
+        )
+        self.assertEqual(client.code, "E_NOT_PAUSED")
+        self.assertFalse(client.in_flight)
+        self.assertFalse(client.outcome_unknown)
+        self.assertEqual(client.runtime_pause_mapping()["state"], "running")
+        with self.assertRaises(BlockingIOError):
+            runtime.recv(4096)
 
     def test_submit_requires_panel_neutral_editor_and_no_restart(self) -> None:
         client, runtime = self.make_client()

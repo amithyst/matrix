@@ -4,6 +4,10 @@ set -euo pipefail
 MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT="${MATRIX_G1_MATERIAL_PALETTE:-}"
 MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT="${MATRIX_G1_MATERIAL_SCOPE_ALPHA:-}"
 unset MATRIX_G1_MATERIAL_PALETTE MATRIX_G1_MATERIAL_SCOPE_ALPHA
+# A catalog-backed cross-world route is private launcher state. Retain it only
+# long enough to validate the target spawn, and do not expose it to children.
+MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE="${MATRIX_GAME_ROUTE_ENTRY_JSON:-}"
+unset MATRIX_GAME_ROUTE_ENTRY_JSON
 
 #######################################
 # 基础
@@ -128,7 +132,12 @@ setup_runtime_environment
 if [[ "${SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER:-0}" != "1" ]] && [[ "$ROBOT_ARG" == "custom" || "$ROBOT_ARG" == "7" ]] && [[ -n "$CUSTOM_URDF" ]]; then
     if [[ -f "$CUSTOM_WRAPPER" ]]; then
         echo "[INFO] Delegating custom URDF setup to $CUSTOM_WRAPPER"
-        exec "$CUSTOM_WRAPPER" "$ROBOT_ARG" "$SCENE_ID" "$OFFSCREEN" "$PIXELSTREAM" "$MUJOCORUNNING" "$CUSTOM_URDF" "$CUSTOM_NAME"
+        # The wrapper re-enters this script after preparing the custom robot.
+        # Carry the one-shot route only across that trusted handoff; the second
+        # run_sim invocation consumes and unsets it before spawning children.
+        MATRIX_GAME_ROUTE_ENTRY_JSON="$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" \
+            exec "$CUSTOM_WRAPPER" "$ROBOT_ARG" "$SCENE_ID" "$OFFSCREEN" \
+                "$PIXELSTREAM" "$MUJOCORUNNING" "$CUSTOM_URDF" "$CUSTOM_NAME"
     else
         echo "[ERROR] Custom URDF wrapper not found at: $CUSTOM_WRAPPER" >&2
         exit 1
@@ -1065,6 +1074,13 @@ case "${MATRIX_SONIC,,}" in
         ;;
 esac
 
+if [[ -n "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" ]] \
+    && { ! $MATRIX_SONIC_ENABLED \
+        || [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; }; then
+    echo "[ERROR] Matrix route entry requires native SONIC game control" >&2
+    exit 1
+fi
+
 # The stock cooked package already contains a camera-bearing SpringArm on each
 # robot Blueprint.  In interactive SONIC game mode, select the real rendered
 # robot as the UE view target and make that native arm direct/collision-aware.
@@ -1486,6 +1502,11 @@ if $MATRIX_SONIC_ENABLED; then
             exit 1
             ;;
     esac
+    if [[ -n "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" \
+        && "$GAME_WORLD_PERSISTENCE_ENABLED" != "1" ]]; then
+        echo "[ERROR] Matrix route entry requires persistent game world state" >&2
+        exit 1
+    fi
     if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         for required in \
             "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
@@ -1500,6 +1521,7 @@ if $MATRIX_SONIC_ENABLED; then
             "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
             "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
             "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
+            "$PROJECT_ROOT/scripts/matrix_route_entry.py" \
             "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
             "$PROJECT_ROOT/scripts/matrix_world_state.py" \
             "$PROJECT_ROOT/config/universe/sol-2080.json" \
@@ -1594,9 +1616,10 @@ if $MATRIX_SONIC_ENABLED; then
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
         && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
         SONIC_SPAWN_ARGS=(
-            --spawn-x "0"
-            --spawn-y "0"
-            --spawn-z "-0.1366965003013611"
+            --spawn-x "-94.7"
+            --spawn-y "-65.6"
+            --spawn-z "-5.251562023162842"
+            --spawn-yaw "0"
         )
         echo "[INFO] MoonWorld map-default spawn aligned to locked terrain height"
     fi
@@ -1634,6 +1657,8 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] MATRIX_CELESTIAL_CLOCK_STATE_FILE must be absolute" >&2
             exit 1
         fi
+        GAME_WORLD_RESUME_CHECKPOINT_ID=""
+        GAME_WORLD_RESUME_GENERATION=""
         if ! GAME_WORLD_START_OUTPUT="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 resolve-start \
@@ -1658,6 +1683,8 @@ if $MATRIX_SONIC_ENABLED; then
                 --spawn-z "${GAME_WORLD_START_LINES[3]}"
                 --spawn-yaw "${GAME_WORLD_START_LINES[4]}"
             )
+            GAME_WORLD_RESUME_CHECKPOINT_ID="${GAME_WORLD_START_LINES[7]}"
+            GAME_WORLD_RESUME_GENERATION="${GAME_WORLD_START_LINES[8]}"
             echo "[INFO] Matrix resume pose: ${GAME_WORLD_START_LINES[5]} " \
                 "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]} " \
                 "checkpoint=${GAME_WORLD_START_LINES[7]} " \
@@ -1673,6 +1700,60 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] Invalid Matrix world-state helper response" >&2
             exit 1
         fi
+        if [[ -n "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" ]]; then
+            if ! MATRIX_ROUTE_ENTRY_OUTPUT="$(
+                /usr/bin/python3 -I -S - \
+                    "$PROJECT_ROOT/scripts" \
+                    "$GAME_WORLD_ID" \
+                    "$SCENE_ID" \
+                    "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from matrix_route_entry import parse_route_entry_output_text
+
+entry = parse_route_entry_output_text(
+    sys.argv[4],
+    expected_world_id=sys.argv[2],
+    expected_scene_id=int(sys.argv[3]),
+)
+for value in (
+    entry.destination_id,
+    entry.teleport_tag,
+    entry.entity_id,
+    entry.entry_pose.x,
+    entry.entry_pose.y,
+    entry.entry_pose.z,
+    entry.entry_pose.yaw_rad,
+):
+    print(value)
+PY
+            )"; then
+                echo "[ERROR] Invalid one-shot Matrix route entry" >&2
+                exit 1
+            fi
+            mapfile -t MATRIX_ROUTE_ENTRY_LINES <<<"$MATRIX_ROUTE_ENTRY_OUTPUT"
+            if [[ "${#MATRIX_ROUTE_ENTRY_LINES[@]}" != "7" ]]; then
+                echo "[ERROR] Invalid Matrix route-entry helper response" >&2
+                exit 1
+            fi
+            SONIC_SPAWN_ARGS=(
+                --spawn-x "${MATRIX_ROUTE_ENTRY_LINES[3]}"
+                --spawn-y "${MATRIX_ROUTE_ENTRY_LINES[4]}"
+                --spawn-z "${MATRIX_ROUTE_ENTRY_LINES[5]}"
+                --spawn-yaw "${MATRIX_ROUTE_ENTRY_LINES[6]}"
+            )
+            # The target state was loaded and revision-checked above, but its
+            # previous resume identity must not override this route entry. A
+            # successful startup writes a new clearance-audited checkpoint.
+            GAME_WORLD_RESUME_CHECKPOINT_ID=""
+            GAME_WORLD_RESUME_GENERATION=""
+            echo "[INFO] Matrix route entry: " \
+                "destination=${MATRIX_ROUTE_ENTRY_LINES[0]} " \
+                "tag=${MATRIX_ROUTE_ENTRY_LINES[1]} " \
+                "entity=${MATRIX_ROUTE_ENTRY_LINES[2]} " \
+                "world=$GAME_WORLD_ID scene=$SCENE_ID"
+        fi
         SONIC_WORLD_ARGS=(
             --game-world-id "$GAME_WORLD_ID"
             --game-world-revision "$GAME_WORLD_REVISION"
@@ -1681,10 +1762,10 @@ if $MATRIX_SONIC_ENABLED; then
             --game-world-checkpoint-seconds "${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
             --game-resume-rollback-count "${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
         )
-        if [[ "${GAME_WORLD_START_LINES[7]:-none}" != "none" ]]; then
+        if [[ -n "$GAME_WORLD_RESUME_CHECKPOINT_ID" ]]; then
             SONIC_WORLD_ARGS+=(
-                --game-world-resume-checkpoint-id "${GAME_WORLD_START_LINES[7]}"
-                --game-world-resume-generation "${GAME_WORLD_START_LINES[8]}"
+                --game-world-resume-checkpoint-id "$GAME_WORLD_RESUME_CHECKPOINT_ID"
+                --game-world-resume-generation "$GAME_WORLD_RESUME_GENERATION"
             )
         fi
         case "${MATRIX_GAME_AUTO_RESPAWN:-0}" in

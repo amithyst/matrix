@@ -34,6 +34,9 @@ MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M = 0.04
 MOON_CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
 MOON_CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
 _MUJOCO_HFIELD_GEOM_TYPE = 1
+_ROLLBACK_CLEARANCE_REASONS = frozenset(
+    {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
+)
 
 _PELVIS_BODY_NAME = "pelvis"
 _FOOT_BODY_NAMES = (
@@ -84,6 +87,293 @@ _GROUND_SUPPORT_TOPOLOGY_CACHE: weakref.WeakKeyDictionary[
 
 class SpawnClearanceError(ValueError):
     """Raised internally when an audit input cannot be trusted."""
+
+
+def spawn_clearance_rollback_reason(audit: dict[str, object] | None) -> str | None:
+    """Return the typed rollback reason for trusted serialized audit evidence."""
+
+    if not isinstance(audit, dict):
+        return None
+    reason = audit.get("reason")
+    if (
+        audit.get("schema") != AUDIT_SCHEMA
+        or audit.get("safe") is not False
+        or audit.get("error") is not None
+        or reason not in _ROLLBACK_CLEARANCE_REASONS
+    ):
+        return None
+    if reason == "no_ground_support":
+        support = audit.get("support")
+        rejected_count = audit.get("rejected_contact_count")
+        required_hits = (
+            support.get("required_hits") if isinstance(support, dict) else None
+        )
+        accepted_hits = (
+            support.get("accepted_hits") if isinstance(support, dict) else None
+        )
+        moon_spawn_gate = (
+            support.get("moon_spawn_gate") if isinstance(support, dict) else None
+        )
+        ray_direction = (
+            support.get("ray_direction") if isinstance(support, dict) else None
+        )
+        if (
+            not isinstance(support, dict)
+            or support.get("schema") != GROUND_SUPPORT_SCHEMA
+            or support.get("supported") is not False
+            or isinstance(required_hits, bool)
+            or not isinstance(required_hits, int)
+            or required_hits not in {1, 2}
+            or isinstance(accepted_hits, bool)
+            or not isinstance(accepted_hits, int)
+            or not 0 <= accepted_hits <= required_hits
+            or (required_hits == 1 and accepted_hits != 0)
+            or type(moon_spawn_gate) is not bool
+            or moon_spawn_gate != (required_hits == 2)
+            or support.get("required_distinct_feet") != required_hits
+            or support.get("method") != "downward_foot_geom_rays"
+            or support.get("maximum_drop_m") != MAXIMUM_GROUND_SUPPORT_DROP_M
+            or support.get("minimum_normal_z") != MINIMUM_GROUND_SUPPORT_NORMAL_Z
+            or not isinstance(ray_direction, list)
+            or len(ray_direction) != 3
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in ray_direction
+            )
+            or [float(value) for value in ray_direction] != [0.0, 0.0, -1.0]
+            or isinstance(rejected_count, bool)
+            or rejected_count != 0
+        ):
+            return None
+        probes = support.get("probes")
+        if not isinstance(probes, list) or len(probes) != 2:
+            return None
+        supported_foot_names = support.get("supported_foot_names")
+        height_delta_m = support.get("height_delta_m")
+        maximum_height_delta_m = support.get("maximum_height_delta_m")
+        height_delta_safe = support.get("height_delta_safe")
+        rejection_reason = support.get("rejection_reason")
+        if (
+            not isinstance(supported_foot_names, list)
+            or any(not isinstance(name, str) for name in supported_foot_names)
+            or len(supported_foot_names) != accepted_hits
+            or type(height_delta_safe) is not bool
+            or height_delta_safe is not (required_hits == 1)
+            or (
+                required_hits == 1
+                and (
+                    height_delta_m is not None
+                    or maximum_height_delta_m is not None
+                    or rejection_reason != "insufficient_distinct_foot_support"
+                )
+            )
+            or (
+                required_hits == 2
+                and (
+                    maximum_height_delta_m
+                    != MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M
+                    or rejection_reason
+                    not in {
+                        "insufficient_distinct_foot_support",
+                        "foot_support_height_delta",
+                    }
+                )
+            )
+        ):
+            return None
+        expected_names = {
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+        }
+        observed_names: set[str] = set()
+        accepted_names: list[str] = []
+        accepted_support_heights: list[float] = []
+        for probe in probes:
+            if not isinstance(probe, dict):
+                return None
+            foot_body = probe.get("foot_body")
+            origins = probe.get("origins")
+            if (
+                not isinstance(foot_body, dict)
+                or isinstance(foot_body.get("id"), bool)
+                or not isinstance(foot_body.get("id"), int)
+                or int(foot_body["id"]) <= 0
+                or foot_body.get("name") not in expected_names
+                or not isinstance(origins, list)
+                or not 1 <= len(origins) <= 32
+                or type(probe.get("accepted")) is not bool
+            ):
+                return None
+            observed_geom_ids: set[int] = set()
+            for origin in origins:
+                if not isinstance(origin, dict):
+                    return None
+                geom_id = origin.get("geom_id")
+                geom_name = origin.get("geom_name")
+                position = origin.get("position_m")
+                if (
+                    isinstance(geom_id, bool)
+                    or not isinstance(geom_id, int)
+                    or geom_id < 0
+                    or geom_id in observed_geom_ids
+                    or (
+                        geom_name is not None
+                        and (
+                            not isinstance(geom_name, str)
+                            or not geom_name
+                            or len(geom_name) > 256
+                        )
+                    )
+                    or not isinstance(position, list)
+                    or len(position) != 3
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        for value in position
+                    )
+                ):
+                    return None
+                observed_geom_ids.add(geom_id)
+            foot_name = str(foot_body["name"])
+            observed_names.add(foot_name)
+            if probe["accepted"] is False:
+                if any(
+                    probe.get(field) is not None
+                    for field in (
+                        "distance_m",
+                        "normal",
+                        "probe_geom",
+                        "ray_origin_m",
+                        "scene_geom",
+                        "support_height_m",
+                    )
+                ):
+                    return None
+                continue
+            distance = probe.get("distance_m")
+            normal = probe.get("normal")
+            probe_geom = probe.get("probe_geom")
+            ray_origin = probe.get("ray_origin_m")
+            scene_geom = probe.get("scene_geom")
+            support_height = probe.get("support_height_m")
+            if (
+                isinstance(distance, bool)
+                or not isinstance(distance, (int, float))
+                or not 0.0 <= float(distance) <= MAXIMUM_GROUND_SUPPORT_DROP_M
+                or not isinstance(normal, list)
+                or len(normal) != 3
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in normal
+                )
+                or float(normal[2]) < MINIMUM_GROUND_SUPPORT_NORMAL_Z
+                or not isinstance(probe_geom, dict)
+                or isinstance(probe_geom.get("id"), bool)
+                or not isinstance(probe_geom.get("id"), int)
+                or probe_geom.get("id") not in observed_geom_ids
+                or not isinstance(probe_geom.get("name"), str)
+                or not probe_geom.get("name")
+                or not isinstance(ray_origin, list)
+                or len(ray_origin) != 3
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    for value in ray_origin
+                )
+                or not isinstance(scene_geom, dict)
+                or isinstance(scene_geom.get("id"), bool)
+                or not isinstance(scene_geom.get("id"), int)
+                or scene_geom.get("id") < 0
+                or not isinstance(scene_geom.get("name"), str)
+                or not scene_geom.get("name")
+                or isinstance(support_height, bool)
+                or not isinstance(support_height, (int, float))
+                or not math.isfinite(float(support_height))
+                or not math.isclose(
+                    float(support_height),
+                    float(ray_origin[2]) - float(distance),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                or (
+                    moon_spawn_gate
+                    and scene_geom.get("name") != MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+                )
+            ):
+                return None
+            accepted_names.append(foot_name)
+            accepted_support_heights.append(float(support_height))
+        observed_height_delta = (
+            max(accepted_support_heights) - min(accepted_support_heights)
+            if len(accepted_support_heights) >= 2
+            else None
+        )
+        if (
+            observed_names != expected_names
+            or accepted_hits != len(accepted_names)
+            or supported_foot_names != accepted_names
+            or (height_delta_m is None and observed_height_delta is not None)
+            or (
+                height_delta_m is not None
+                and (
+                    isinstance(height_delta_m, bool)
+                    or not isinstance(height_delta_m, (int, float))
+                    or observed_height_delta is None
+                    or not math.isclose(
+                        float(height_delta_m),
+                        observed_height_delta,
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                )
+            )
+            or (
+                required_hits == 2
+                and accepted_hits < 2
+                and rejection_reason != "insufficient_distinct_foot_support"
+            )
+            or (
+                required_hits == 2
+                and accepted_hits == 2
+                and (
+                    rejection_reason != "foot_support_height_delta"
+                    or observed_height_delta is None
+                    or observed_height_delta
+                    <= MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M
+                )
+            )
+        ):
+            return None
+        return str(reason)
+    rejected_count = audit.get("rejected_contact_count")
+    worst = audit.get("worst")
+    if (
+        isinstance(rejected_count, bool)
+        or not isinstance(rejected_count, int)
+        or rejected_count <= 0
+        or not isinstance(worst, dict)
+        or worst.get("allowed") is not False
+    ):
+        return None
+    classification = worst.get("classification")
+    expected_classifications = (
+        {"scene_penetration", "unsafe_body_contact"}
+        if reason == "scene_penetration"
+        else {
+            "unsafe_foot_contact_normal",
+            "unsafe_foot_penetration",
+            "unsafe_foot_terrain_edge",
+        }
+    )
+    if classification not in expected_classifications:
+        return None
+    return str(reason)
 
 
 def _index(value: object, *, label: str) -> int:

@@ -616,7 +616,7 @@ class McCommandExecutionTest(unittest.TestCase):
             tag="moon.tranquility",
             target_scene_id=15,
             target_world_id="g1_29dof:scene_terrain_moon_dynamic",
-            entry_pose=WorldPose(0.0, 0.0, -0.1366965003013611, 0.0),
+            entry_pose=WorldPose(-94.7, -65.6, -5.251562023162842, 0.0),
             entity_id="tp-" + "d" * 32,
             destination_id="moon-tranquility-outpost",
         )
@@ -636,7 +636,7 @@ class McCommandExecutionTest(unittest.TestCase):
                     "tag": "moon.tranquility",
                     "found": True,
                     "entity_id": route.entity_id,
-                    "position": [0.0, 0.0, -0.1366965003013611],
+                    "position": [-94.7, -65.6, -5.251562023162842],
                     "yaw_rad": 0.0,
                 }
             ],
@@ -752,7 +752,7 @@ class McCommandExecutionTest(unittest.TestCase):
             tag="moon.tranquility",
             target_scene_id=15,
             target_world_id=moon_world,
-            entry_pose=WorldPose(0.0, 0.0, -0.1366965003013611, 0.0),
+            entry_pose=WorldPose(-94.7, -65.6, -5.251562023162842, 0.0),
             entity_id="tp-" + "2" * 32,
             destination_id="moon-tranquility-outpost",
         )
