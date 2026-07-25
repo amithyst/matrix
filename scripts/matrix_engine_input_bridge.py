@@ -387,6 +387,9 @@ class XTestPointer:
         if not self._display:
             raise RuntimeError(f"cannot open X11 display {display_name}")
         self._pressed_button: str | None = None
+        self.anchor_window: int | None = None
+        self.anchor_size: tuple[int, int] | None = None
+        self.anchor_count = 0
         event_base = ctypes.c_int()
         error_base = ctypes.c_int()
         major = ctypes.c_int()
@@ -405,6 +408,42 @@ class XTestPointer:
     def _configure_signatures(self) -> None:
         signatures = {
             "XOpenDisplay": ([ctypes.c_char_p], ctypes.c_void_p),
+            "XGetInputFocus": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_int),
+                ],
+                ctypes.c_int,
+            ),
+            "XGetGeometry": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.POINTER(ctypes.c_ulong),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_uint),
+                    ctypes.POINTER(ctypes.c_uint),
+                    ctypes.POINTER(ctypes.c_uint),
+                    ctypes.POINTER(ctypes.c_uint),
+                ],
+                ctypes.c_int,
+            ),
+            "XWarpPointer": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                ],
+                ctypes.c_int,
+            ),
             "XSync": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_int),
             "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
         }
@@ -464,6 +503,56 @@ class XTestPointer:
             raise OSError(errno.EIO, "XTEST button press failed")
         self._sync()
         self._pressed_button = button
+
+    def center_focused_window(self) -> tuple[int, int, int]:
+        """Move the core pointer away from frame borders before dragging."""
+
+        focus = ctypes.c_ulong()
+        revert = ctypes.c_int()
+        if not self._x11.XGetInputFocus(
+            self._display,
+            ctypes.byref(focus),
+            ctypes.byref(revert),
+        ) or focus.value <= 1:
+            raise OSError(errno.ENODEV, "XTEST focused window is unavailable")
+        root = ctypes.c_ulong()
+        x = ctypes.c_int()
+        y = ctypes.c_int()
+        width = ctypes.c_uint()
+        height = ctypes.c_uint()
+        border = ctypes.c_uint()
+        depth = ctypes.c_uint()
+        if not self._x11.XGetGeometry(
+            self._display,
+            focus.value,
+            ctypes.byref(root),
+            ctypes.byref(x),
+            ctypes.byref(y),
+            ctypes.byref(width),
+            ctypes.byref(height),
+            ctypes.byref(border),
+            ctypes.byref(depth),
+        ):
+            raise OSError(errno.ENODEV, "XTEST focused window geometry is unavailable")
+        if width.value < 32 or height.value < 32:
+            raise OSError(errno.ERANGE, "XTEST focused window is too small")
+        if not self._x11.XWarpPointer(
+            self._display,
+            0,
+            focus.value,
+            0,
+            0,
+            0,
+            0,
+            width.value // 2,
+            height.value // 2,
+        ):
+            raise OSError(errno.EIO, "XTEST pointer centering failed")
+        self._sync()
+        self.anchor_window = int(focus.value)
+        self.anchor_size = (int(width.value), int(height.value))
+        self.anchor_count += 1
+        return (self.anchor_window, *self.anchor_size)
 
     def move(self, dx: int, dy: int) -> None:
         if self._pressed_button is None:
@@ -654,6 +743,7 @@ class EngineInputController:
         if self._xtest_pointer is not None:
             if self._look_button != button or not self._xtest_pointer.active:
                 self._release_xtest_look(wait_for_render=False)
+                self._xtest_pointer.center_focused_window()
                 self._xtest_pointer.press(button)
                 self._look_button = button
                 self._sleep(LOOK_DRAG_PRESS_LEAD_SECONDS)
@@ -1138,6 +1228,22 @@ def main() -> int:
                             "look_backend": controller.look_backend,
                             "look_drag_active": controller.look_drag_active,
                             "look_drag_expirations": controller.look_drag_expirations,
+                            "look_anchor_window": (
+                                controller._xtest_pointer.anchor_window
+                                if controller._xtest_pointer is not None
+                                else None
+                            ),
+                            "look_anchor_size": (
+                                list(controller._xtest_pointer.anchor_size)
+                                if controller._xtest_pointer is not None
+                                and controller._xtest_pointer.anchor_size is not None
+                                else None
+                            ),
+                            "look_anchor_count": (
+                                controller._xtest_pointer.anchor_count
+                                if controller._xtest_pointer is not None
+                                else 0
+                            ),
                             "supported_actions": list(SUPPORTED_ACTIONS),
                         }
                         result = _response(

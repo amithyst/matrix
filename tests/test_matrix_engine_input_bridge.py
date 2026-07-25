@@ -241,6 +241,29 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
         x11 = mock.Mock()
         x11.XOpenDisplay.return_value = 123
 
+        def get_focus(_display, focus, _revert):
+            focus._obj.value = 456
+            return 1
+
+        def get_geometry(
+            _display,
+            _window,
+            _root,
+            _x,
+            _y,
+            width,
+            height,
+            _border,
+            _depth,
+        ):
+            width._obj.value = 1920
+            height._obj.value = 1080
+            return 1
+
+        x11.XGetInputFocus.side_effect = get_focus
+        x11.XGetGeometry.side_effect = get_geometry
+        x11.XWarpPointer.return_value = 1
+
         def query_extension(_display, _event, _error, major, minor):
             major._obj.value = 2
             minor._obj.value = 2
@@ -256,6 +279,7 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
             xtest_library=xtest,
         )
 
+        self.assertEqual(pointer.center_focused_window(), (456, 1920, 1080))
         pointer.press("left")
         pointer.move(20, -7)
         pointer.release()
@@ -272,6 +296,17 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
             0,
         )
         self.assertFalse(pointer.active)
+        x11.XWarpPointer.assert_called_once_with(
+            123,
+            0,
+            456,
+            0,
+            0,
+            0,
+            0,
+            960,
+            540,
+        )
         pointer.close()
         x11.XCloseDisplay.assert_called_once_with(123)
 
@@ -290,6 +325,7 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
         pointer.press = mock.Mock(
             side_effect=lambda button: setattr(pointer, "_pressed_button", button)
         )
+        pointer.center_focused_window = mock.Mock(return_value=(456, 1920, 1080))
         pointer.move = mock.Mock()
         pointer.release = mock.Mock(
             side_effect=lambda: setattr(pointer, "_pressed_button", None)
@@ -301,6 +337,7 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
         controller.look_delta(dx=20, dy=0, button="left")
         controller.look_delta(dx=10, dy=-5, button="left")
         self.assertTrue(controller.look_drag_active)
+        pointer.center_focused_window.assert_called_once_with()
         pointer.press.assert_called_once_with("left")
         self.assertEqual(
             pointer.move.call_args_list,
