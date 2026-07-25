@@ -1764,6 +1764,8 @@ class EngineCameraLookWorker:
         self._stop_requested = False
         self._pending_dx = 0
         self._pending_dy = 0
+        self._drag_requested = False
+        self._release_requested = False
         self._retry_not_before = 0.0
         self._status = "stopped"
         self._available = False
@@ -1773,6 +1775,8 @@ class EngineCameraLookWorker:
         self.coalesced_batches = 0
         self.emitted_batches = 0
         self.dropped_batches = 0
+        self.release_requests = 0
+        self.releases_emitted = 0
 
     def start(self) -> None:
         with self._condition:
@@ -1843,11 +1847,11 @@ class EngineCameraLookWorker:
             if (
                 not isinstance(supported_actions, list)
                 or not all(isinstance(item, str) for item in supported_actions)
-                or "look_delta" not in supported_actions
+                or not {"look_delta", "look_stop"}.issubset(supported_actions)
             ):
                 self._record_error(
                     RuntimeError(
-                        "engine input bridge does not advertise look_delta"
+                        "engine input bridge does not advertise held look protocol"
                     ),
                     retryable=False,
                 )
@@ -1862,14 +1866,40 @@ class EngineCameraLookWorker:
                     not self._stop_requested
                     and self._pending_dx == 0
                     and self._pending_dy == 0
+                    and not self._release_requested
                 ):
                     self._condition.wait()
-                if self._stop_requested:
+                stop_after_request = self._stop_requested
+                release = bool(
+                    self._release_requested
+                    or (stop_after_request and self._drag_requested)
+                )
+                if release:
+                    self._release_requested = False
+                    self._drag_requested = False
+                    self._pending_dx = 0
+                    self._pending_dy = 0
+                    dx = 0
+                    dy = 0
+                elif stop_after_request:
                     return
-                dx = self._pending_dx
-                dy = self._pending_dy
-                self._pending_dx = 0
-                self._pending_dy = 0
+                else:
+                    dx = self._pending_dx
+                    dy = self._pending_dy
+                    self._pending_dx = 0
+                    self._pending_dy = 0
+            if release:
+                try:
+                    self._request("look_stop", {})
+                except Exception as exc:
+                    self._record_error(exc)
+                else:
+                    with self._condition:
+                        self.releases_emitted += 1
+                    self._record_success()
+                if stop_after_request:
+                    return
+                continue
             try:
                 self._request(
                     "look_delta",
@@ -1904,6 +1934,8 @@ class EngineCameraLookWorker:
                 return False
             if self._pending_dx or self._pending_dy:
                 self.coalesced_batches += 1
+            self._drag_requested = True
+            self._release_requested = False
             self._pending_dx = int(
                 _clamp(
                     self._pending_dx + dx,
@@ -1924,11 +1956,21 @@ class EngineCameraLookWorker:
 
     def cancel_pending(self) -> bool:
         with self._condition:
-            changed = bool(self._pending_dx or self._pending_dy)
+            had_pending = bool(self._pending_dx or self._pending_dy)
+            changed = bool(
+                had_pending
+                or self._drag_requested
+            )
             self._pending_dx = 0
             self._pending_dy = 0
-            if changed:
+            if self._drag_requested:
+                self._drag_requested = False
+                self._release_requested = True
+                self.release_requests += 1
+            if had_pending:
                 self.dropped_batches += 1
+            if changed:
+                self._condition.notify()
             return changed
 
     @property
@@ -1939,7 +1981,7 @@ class EngineCameraLookWorker:
                 "available": self._available,
                 "capability_compatible": self._capability_compatible,
                 "status": self._status,
-                "transport": "uinput-relative-look-delta",
+                "transport": "engine-held-relative-look-delta",
                 "button": self._button,
                 "endpoint": os.fspath(self._endpoint),
                 "submitted_batches": self.submitted_batches,
@@ -1948,6 +1990,10 @@ class EngineCameraLookWorker:
                 "dropped_batches": self.dropped_batches,
                 "pending_dx": self._pending_dx,
                 "pending_dy": self._pending_dy,
+                "drag_requested": self._drag_requested,
+                "release_pending": self._release_requested,
+                "release_requests": self.release_requests,
+                "releases_emitted": self.releases_emitted,
                 "last_error": self._last_error,
             }
 

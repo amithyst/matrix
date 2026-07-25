@@ -5638,7 +5638,11 @@ class KeyboardCameraLookTest(unittest.TestCase):
                 return {
                     "ok": True,
                     "data": {
-                        "supported_actions": ["status", "look_delta"],
+                        "supported_actions": [
+                            "status",
+                            "look_delta",
+                            "look_stop",
+                        ],
                     },
                 }
 
@@ -5667,10 +5671,14 @@ class KeyboardCameraLookTest(unittest.TestCase):
             ),
             calls,
         )
-        with worker._condition:
-            worker._pending_dx = 4
-            worker._pending_dy = 2
         self.assertTrue(worker.cancel_pending())
+        deadline = time.monotonic() + 1.0
+        while (
+            worker.telemetry["releases_emitted"] < 1
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertIn(("look_stop", {}), calls)
         self.assertEqual(worker.telemetry["pending_dx"], 0)
         self.assertEqual(worker.telemetry["pending_dy"], 0)
 
@@ -5732,7 +5740,7 @@ class KeyboardCameraLookTest(unittest.TestCase):
         self.assertFalse(telemetry["available"])
         self.assertFalse(telemetry["capability_compatible"])
         self.assertEqual(telemetry["status"], "unsupported")
-        self.assertIn("does not advertise look_delta", telemetry["last_error"])
+        self.assertIn("held look protocol", telemetry["last_error"])
         worker._retry_not_before = 0.0
         self.assertFalse(worker.submit(10, 0))
 

@@ -20,7 +20,14 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
     def test_status_capability_includes_immediate_camera_look(self) -> None:
         self.assertEqual(
             MODULE.SUPPORTED_ACTIONS,
-            ("status", "key", "mouse", "look_delta", "gamepad"),
+            (
+                "status",
+                "key",
+                "mouse",
+                "look_delta",
+                "look_stop",
+                "gamepad",
+            ),
         )
 
     def test_linux_abi_struct_sizes_are_frozen(self) -> None:
@@ -229,6 +236,105 @@ class MatrixEngineInputBridgeTest(unittest.TestCase):
         self.assertEqual(controller._gamepad_pressed, set())
         self.assertTrue(all(value == 0 for value in controller._axis_values.values()))
         self.assertEqual(controller.actions, 4)
+
+    def test_xtest_pointer_emits_ordered_held_drag(self) -> None:
+        x11 = mock.Mock()
+        x11.XOpenDisplay.return_value = 123
+
+        def query_extension(_display, _event, _error, major, minor):
+            major._obj.value = 2
+            minor._obj.value = 2
+            return 1
+
+        xtest = mock.Mock()
+        xtest.XTestQueryExtension.side_effect = query_extension
+        xtest.XTestFakeButtonEvent.return_value = 1
+        xtest.XTestFakeRelativeMotionEvent.return_value = 1
+        pointer = MODULE.XTestPointer(
+            ":99",
+            x11_library=x11,
+            xtest_library=xtest,
+        )
+
+        pointer.press("left")
+        pointer.move(20, -7)
+        pointer.release()
+
+        self.assertEqual(pointer.extension_version, (2, 2))
+        self.assertEqual(
+            xtest.XTestFakeButtonEvent.call_args_list,
+            [mock.call(123, 1, 1, 0), mock.call(123, 1, 0, 0)],
+        )
+        xtest.XTestFakeRelativeMotionEvent.assert_called_once_with(
+            123,
+            20,
+            -7,
+            0,
+        )
+        self.assertFalse(pointer.active)
+        pointer.close()
+        x11.XCloseDisplay.assert_called_once_with(123)
+
+    def test_xtest_controller_holds_drag_until_stop_or_deadman(self) -> None:
+        devices: list[mock.Mock] = []
+
+        def device(*_args, **_kwargs):
+            value = mock.Mock()
+            devices.append(value)
+            return value
+
+        with mock.patch.object(MODULE, "UInputDevice", side_effect=device):
+            controller = MODULE.EngineInputController(Path("/dev/uinput"))
+        pointer = object.__new__(MODULE.XTestPointer)
+        pointer._pressed_button = None
+        pointer.press = mock.Mock(
+            side_effect=lambda button: setattr(pointer, "_pressed_button", button)
+        )
+        pointer.move = mock.Mock()
+        pointer.release = mock.Mock(
+            side_effect=lambda: setattr(pointer, "_pressed_button", None)
+        )
+        pointer.close = mock.Mock()
+        controller.enable_xtest_look(pointer)
+        controller._sleep = mock.Mock()
+
+        controller.look_delta(dx=20, dy=0, button="left")
+        controller.look_delta(dx=10, dy=-5, button="left")
+        self.assertTrue(controller.look_drag_active)
+        pointer.press.assert_called_once_with("left")
+        self.assertEqual(
+            pointer.move.call_args_list,
+            [mock.call(20, 0), mock.call(10, -5)],
+        )
+        self.assertEqual(
+            controller._sleep.call_args_list,
+            [mock.call(MODULE.LOOK_DRAG_PRESS_LEAD_SECONDS)],
+        )
+
+        last_activity = controller._look_last_activity_s
+        assert last_activity is not None
+        self.assertFalse(
+            controller.expire_look_drag(
+                last_activity + MODULE.LOOK_DRAG_DEADMAN_SECONDS / 2.0
+            )
+        )
+        self.assertTrue(
+            controller.expire_look_drag(
+                last_activity + MODULE.LOOK_DRAG_DEADMAN_SECONDS
+            )
+        )
+        self.assertFalse(controller.look_drag_active)
+        self.assertEqual(controller.look_drag_expirations, 1)
+
+        controller.look_delta(dx=-4, dy=0, button="left")
+        controller.look_stop()
+        self.assertFalse(controller.look_drag_active)
+        self.assertEqual(
+            controller._sleep.call_args_list[-1],
+            mock.call(MODULE.LOOK_DRAG_RELEASE_LAG_SECONDS),
+        )
+        controller.close()
+        pointer.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

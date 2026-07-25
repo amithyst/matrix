@@ -503,6 +503,11 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             'MATRIX_ENGINE_INPUT_BRIDGE="${MATRIX_ENGINE_INPUT_BRIDGE:-1}"',
             heyuan,
         )
+        self.assertIn(
+            "MATRIX_ENGINE_CAMERA_LOOK_BACKEND="
+            '"${MATRIX_ENGINE_CAMERA_LOOK_BACKEND:-xtest}"',
+            heyuan,
+        )
 
         self.assertIn('GAME_FALL_RECOVERY="physical"', launcher)
         self.assertIn('GAME_FALL_RECOVERY="off"', launcher)

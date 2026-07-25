@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Capability-gated Linux uinput bridge for Matrix engine automation.
+"""Capability-gated Linux input bridge for Matrix engine automation.
 
 The launcher starts this helper before UE so SDL enumerates the synthetic
 pointer/keyboard and gamepad during engine startup.  Opening ``/dev/uinput`` is
 the only privileged operation.  The process immediately drops to the Matrix
 user before binding its private Unix socket, reading requests, or emitting any
-input events.
+input events.  X11/XTEST is used for held camera drags because packaged Matrix
+UE ignores uinput pointer motion on the supported remote-desktop hosts.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+import ctypes.util
 import errno
 import fcntl
 import hmac
@@ -33,8 +35,18 @@ MAX_PACKET_BYTES = 4096
 MAX_SECONDS = 10.0
 MAX_MOUSE_DELTA = 4096
 MOUSE_PRESS_LEAD_SECONDS = 0.02
+LOOK_DRAG_PRESS_LEAD_SECONDS = 0.04
+LOOK_DRAG_RELEASE_LAG_SECONDS = 0.04
+LOOK_DRAG_DEADMAN_SECONDS = 0.25
 _CAPABILITY_RE = re.compile(r"[0-9a-f]{64}\Z")
-SUPPORTED_ACTIONS = ("status", "key", "mouse", "look_delta", "gamepad")
+SUPPORTED_ACTIONS = (
+    "status",
+    "key",
+    "mouse",
+    "look_delta",
+    "look_stop",
+    "gamepad",
+)
 
 _UINPUT_TYPE = ord("U")
 _IOC_WRITE = 1
@@ -139,6 +151,12 @@ GAMEPAD_BUTTON_CODES = {
     "right_bumper": BTN_TR,
     "select": BTN_SELECT,
     "start": BTN_START,
+}
+
+X11_BUTTON_NUMBERS = {
+    "left": 1,
+    "middle": 2,
+    "right": 3,
 }
 
 
@@ -340,6 +358,154 @@ class UInputDevice:
             self._created = False
 
 
+class XTestPointer:
+    """Emit a real X11 core-pointer drag from an unprivileged helper."""
+
+    def __init__(
+        self,
+        display_name: str,
+        *,
+        x11_library: Any | None = None,
+        xtest_library: Any | None = None,
+    ) -> None:
+        if not isinstance(display_name, str) or not display_name:
+            raise ValueError("XTEST display name is required")
+        if x11_library is None:
+            library_name = ctypes.util.find_library("X11")
+            if not library_name:
+                raise RuntimeError("libX11 was not found")
+            x11_library = ctypes.CDLL(library_name)
+        if xtest_library is None:
+            library_name = ctypes.util.find_library("Xtst")
+            if not library_name:
+                raise RuntimeError("libXtst was not found")
+            xtest_library = ctypes.CDLL(library_name)
+        self._x11 = x11_library
+        self._xtest = xtest_library
+        self._configure_signatures()
+        self._display = self._x11.XOpenDisplay(display_name.encode("utf-8"))
+        if not self._display:
+            raise RuntimeError(f"cannot open X11 display {display_name}")
+        self._pressed_button: str | None = None
+        event_base = ctypes.c_int()
+        error_base = ctypes.c_int()
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
+        if not self._xtest.XTestQueryExtension(
+            self._display,
+            ctypes.byref(event_base),
+            ctypes.byref(error_base),
+            ctypes.byref(major),
+            ctypes.byref(minor),
+        ):
+            self.close()
+            raise RuntimeError("XTEST extension is unavailable")
+        self.extension_version = (major.value, minor.value)
+
+    def _configure_signatures(self) -> None:
+        signatures = {
+            "XOpenDisplay": ([ctypes.c_char_p], ctypes.c_void_p),
+            "XSync": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_int),
+            "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
+        }
+        for name, (argtypes, restype) in signatures.items():
+            function = getattr(self._x11, name)
+            try:
+                function.argtypes = argtypes
+                function.restype = restype
+            except (AttributeError, TypeError):
+                pass
+        xtest_signatures = {
+            "XTestQueryExtension": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.POINTER(ctypes.c_int),
+                ],
+                ctypes.c_int,
+            ),
+            "XTestFakeButtonEvent": (
+                [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
+            "XTestFakeRelativeMotionEvent": (
+                [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
+        }
+        for name, (argtypes, restype) in xtest_signatures.items():
+            function = getattr(self._xtest, name)
+            try:
+                function.argtypes = argtypes
+                function.restype = restype
+            except (AttributeError, TypeError):
+                pass
+
+    def _sync(self) -> None:
+        if self._display is None:
+            raise OSError(errno.EBADF, "XTEST display is closed")
+        self._x11.XSync(self._display, 0)
+
+    def press(self, button: str) -> None:
+        if button not in X11_BUTTON_NUMBERS:
+            raise ValueError("XTEST look button is invalid")
+        if self._pressed_button == button:
+            return
+        if self._pressed_button is not None:
+            self.release()
+        if not self._xtest.XTestFakeButtonEvent(
+            self._display,
+            X11_BUTTON_NUMBERS[button],
+            1,
+            0,
+        ):
+            raise OSError(errno.EIO, "XTEST button press failed")
+        self._sync()
+        self._pressed_button = button
+
+    def move(self, dx: int, dy: int) -> None:
+        if self._pressed_button is None:
+            raise RuntimeError("XTEST look drag is not active")
+        if not self._xtest.XTestFakeRelativeMotionEvent(
+            self._display,
+            dx,
+            dy,
+            0,
+        ):
+            raise OSError(errno.EIO, "XTEST relative motion failed")
+        self._sync()
+
+    def release(self) -> None:
+        button = self._pressed_button
+        if button is None:
+            return
+        if not self._xtest.XTestFakeButtonEvent(
+            self._display,
+            X11_BUTTON_NUMBERS[button],
+            0,
+            0,
+        ):
+            raise OSError(errno.EIO, "XTEST button release failed")
+        self._sync()
+        self._pressed_button = None
+
+    @property
+    def active(self) -> bool:
+        return self._pressed_button is not None
+
+    def close(self) -> None:
+        display = getattr(self, "_display", None)
+        if display is None:
+            return
+        try:
+            self.release()
+        finally:
+            self._display = None
+            self._x11.XCloseDisplay(display)
+
+
 class EngineInputController:
     def __init__(self, uinput_path: Path) -> None:
         pointer_keys = tuple(
@@ -376,6 +542,32 @@ class EngineInputController:
         self.actions = 0
         self.errors = 0
         self._stop_requested = False
+        self._xtest_pointer: XTestPointer | None = None
+        self._look_button: str | None = None
+        self._look_last_activity_s: float | None = None
+        self.look_drag_expirations = 0
+
+    def enable_xtest_look(self, pointer: XTestPointer) -> None:
+        if not isinstance(pointer, XTestPointer):
+            raise TypeError("XTEST pointer is required")
+        if self._xtest_pointer is not None:
+            raise RuntimeError("XTEST look backend is already configured")
+        self._xtest_pointer = pointer
+
+    @property
+    def look_backend(self) -> str:
+        return (
+            "xtest-held-drag"
+            if self._xtest_pointer is not None
+            else "uinput-pulse"
+        )
+
+    @property
+    def look_drag_active(self) -> bool:
+        return bool(
+            self._xtest_pointer is not None
+            and self._xtest_pointer.active
+        )
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -407,6 +599,7 @@ class EngineInputController:
             self._gamepad_pressed.remove(code)
 
     def neutral(self) -> None:
+        self._release_xtest_look(wait_for_render=False)
         for code in tuple(self._pointer_pressed):
             self._pointer_device.emit(EV_KEY, code, 0)
         self._pointer_pressed.clear()
@@ -456,7 +649,18 @@ class EngineInputController:
         dy: int,
         button: str,
     ) -> None:
-        """Emit one ordered look-button drag without sleeping the caller."""
+        """Extend one held camera drag or emit the legacy uinput pulse."""
+
+        if self._xtest_pointer is not None:
+            if self._look_button != button or not self._xtest_pointer.active:
+                self._release_xtest_look(wait_for_render=False)
+                self._xtest_pointer.press(button)
+                self._look_button = button
+                self._sleep(LOOK_DRAG_PRESS_LEAD_SECONDS)
+            self._xtest_pointer.move(dx, dy)
+            self._look_last_activity_s = time.monotonic()
+            self.actions += 1
+            return
 
         code = MOUSE_BUTTON_CODES[button]
         try:
@@ -471,6 +675,39 @@ class EngineInputController:
             self._pointer_key(code, False)
             self._pointer_device.sync()
         self.actions += 1
+
+    def _release_xtest_look(self, *, wait_for_render: bool) -> bool:
+        pointer = self._xtest_pointer
+        if pointer is None or not pointer.active:
+            self._look_button = None
+            self._look_last_activity_s = None
+            return False
+        if wait_for_render:
+            self._sleep(LOOK_DRAG_RELEASE_LAG_SECONDS)
+        try:
+            pointer.release()
+        finally:
+            self._look_button = None
+            self._look_last_activity_s = None
+        return True
+
+    def look_stop(self) -> None:
+        self._release_xtest_look(wait_for_render=True)
+        self.actions += 1
+
+    def expire_look_drag(self, now_s: float) -> bool:
+        if not math.isfinite(now_s):
+            raise ValueError("look drag clock must be finite")
+        last = self._look_last_activity_s
+        if (
+            last is None
+            or now_s - last < LOOK_DRAG_DEADMAN_SECONDS
+        ):
+            return False
+        changed = self._release_xtest_look(wait_for_render=False)
+        if changed:
+            self.look_drag_expirations += 1
+        return changed
 
     def key(
         self,
@@ -536,9 +773,15 @@ class EngineInputController:
             self.neutral()
         finally:
             try:
-                self._gamepad_device.close()
+                pointer = self._xtest_pointer
+                self._xtest_pointer = None
+                if pointer is not None:
+                    pointer.close()
             finally:
-                self._pointer_device.close()
+                try:
+                    self._gamepad_device.close()
+                finally:
+                    self._pointer_device.close()
 
 
 def _validate_mouse(payload: dict[str, object]) -> dict[str, object]:
@@ -768,6 +1011,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-uid", type=int, required=True)
     parser.add_argument("--target-gid", type=int, required=True)
     parser.add_argument("--uinput", type=Path, default=Path("/dev/uinput"))
+    parser.add_argument(
+        "--look-backend",
+        choices=("uinput", "xtest"),
+        default="uinput",
+    )
+    parser.add_argument("--display")
     parser.add_argument("--enumeration-delay-seconds", type=float, default=2.0)
     args = parser.parse_args()
     for path in (
@@ -780,6 +1029,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("all paths must be absolute")
     if args.target_uid < 0 or args.target_gid < 0:
         parser.error("target uid/gid must be nonnegative")
+    if args.look_backend == "xtest" and not args.display:
+        parser.error("--display is required for the XTEST look backend")
     if (
         not math.isfinite(args.enumeration_delay_seconds)
         or not 0.5 <= args.enumeration_delay_seconds <= 10.0
@@ -811,6 +1062,8 @@ def main() -> int:
     signal.signal(signal.SIGHUP, stop)
     try:
         _drop_privileges(args.target_uid, args.target_gid)
+        if args.look_backend == "xtest":
+            controller.enable_xtest_look(XTestPointer(args.display))
         capability = _private_capability(
             args.capability_file,
             args.target_uid,
@@ -825,7 +1078,7 @@ def main() -> int:
         if args.socket.exists() or args.socket.is_symlink():
             raise FileExistsError(args.socket)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        listener.settimeout(0.2)
+        listener.settimeout(min(0.1, LOOK_DRAG_DEADMAN_SECONDS / 2.0))
         listener.bind(os.fspath(args.socket))
         os.chmod(args.socket, 0o600, follow_symlinks=False)
         listener.listen(4)
@@ -837,6 +1090,7 @@ def main() -> int:
             flush=True,
         )
         while running:
+            controller.expire_look_drag(time.monotonic())
             try:
                 connection, _ = listener.accept()
             except socket.timeout:
@@ -881,6 +1135,9 @@ def main() -> int:
                             "rejected_peers": rejected_peers,
                             "pointer_device": "Matrix Engine Pointer Keyboard",
                             "gamepad_device": "Matrix Engine Gamepad",
+                            "look_backend": controller.look_backend,
+                            "look_drag_active": controller.look_drag_active,
+                            "look_drag_expirations": controller.look_drag_expirations,
                             "supported_actions": list(SUPPORTED_ACTIONS),
                         }
                         result = _response(
@@ -907,6 +1164,15 @@ def main() -> int:
                             ok=True,
                             code="OK_LOOK_DELTA",
                             message="engine camera look delta completed",
+                        )
+                    elif action == "look_stop":
+                        _exact(payload, set())
+                        controller.look_stop()
+                        result = _response(
+                            sequence=sequence,
+                            ok=True,
+                            code="OK_LOOK_STOP",
+                            message="engine camera look drag stopped",
                         )
                     elif action == "key":
                         values = _validate_key(payload)

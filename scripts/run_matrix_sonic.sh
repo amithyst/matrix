@@ -1423,6 +1423,7 @@ stop_engine_input_bridge() {
 
 start_engine_input_bridge() {
     local enabled="${MATRIX_ENGINE_INPUT_BRIDGE:-0}"
+    local look_backend="${MATRIX_ENGINE_CAMERA_LOOK_BACKEND:-uinput}"
     local profile="${MATRIX_PROFILE:-local}"
     local target_gid
     local poll
@@ -1433,6 +1434,19 @@ start_engine_input_bridge() {
     if [[ "$enabled" != "1" ]]; then
         echo "[ERROR] MATRIX_ENGINE_INPUT_BRIDGE must be 0 or 1" >&2
         return 1
+    fi
+    if [[ "$look_backend" != "uinput" && "$look_backend" != "xtest" ]]; then
+        echo "[ERROR] Matrix engine camera look backend must be uinput or xtest" >&2
+        return 1
+    fi
+    if [[ "$look_backend" == "xtest" ]]; then
+        if [[ -z "${DISPLAY:-}" \
+            || -z "${XAUTHORITY:-}" \
+            || "$XAUTHORITY" != /* \
+            || ! -r "$XAUTHORITY" ]]; then
+            echo "[ERROR] XTEST camera look requires DISPLAY and readable absolute XAUTHORITY" >&2
+            return 1
+        fi
     fi
     if [[ ! "$profile" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
         echo "[ERROR] Matrix engine-input profile is invalid: $profile" >&2
@@ -1483,13 +1497,18 @@ PY
         return 1
     fi
     target_gid="$(id -g)"
-    /usr/bin/sudo -n /usr/bin/python3 -I \
+    /usr/bin/sudo -n /usr/bin/env \
+        "DISPLAY=${DISPLAY:-}" \
+        "XAUTHORITY=${XAUTHORITY:-}" \
+        /usr/bin/python3 -I \
         "$PROJECT_ROOT/scripts/matrix_engine_input_bridge.py" \
         --socket "$ENGINE_INPUT_SOCKET" \
         --capability-file "$ENGINE_INPUT_CAPABILITY_FILE" \
         --ready-file "$ENGINE_INPUT_READY_FILE" \
         --target-uid "$UID" \
         --target-gid "$target_gid" \
+        --look-backend "$look_backend" \
+        --display "${DISPLAY:-}" \
         >"$ENGINE_INPUT_LOG_FILE" 2>&1 &
     ENGINE_INPUT_BRIDGE_PID=$!
     for ((poll = 0; poll < 120; poll++)); do
@@ -1545,7 +1564,8 @@ PY
             fi
             export MATRIX_ENGINE_INPUT_SOCKET="$ENGINE_INPUT_SOCKET"
             export MATRIX_ENGINE_INPUT_CAPABILITY_FILE="$ENGINE_INPUT_CAPABILITY_FILE"
-            echo "[INFO] Matrix engine-input bridge ready: $ENGINE_INPUT_SOCKET"
+            echo "[INFO] Matrix engine-input bridge ready: " \
+                "$ENGINE_INPUT_SOCKET look_backend=$look_backend"
             return 0
         fi
         if ! kill -0 "$ENGINE_INPUT_BRIDGE_PID" 2>/dev/null; then
