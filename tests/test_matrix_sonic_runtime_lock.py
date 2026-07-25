@@ -499,6 +499,10 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         heyuan = (REPO_ROOT / "config/hosts/heyuan.env").read_text(
             encoding="utf-8"
         )
+        self.assertIn(
+            'MATRIX_ENGINE_INPUT_BRIDGE="${MATRIX_ENGINE_INPUT_BRIDGE:-1}"',
+            heyuan,
+        )
 
         self.assertIn('GAME_FALL_RECOVERY="physical"', launcher)
         self.assertIn('GAME_FALL_RECOVERY="off"', launcher)
