@@ -8,6 +8,7 @@ SESSION_NAME="matrix-sonic-desktop-${UID}"
 PROFILE="heyuan"
 ACTION="start"
 SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
+STOP_GRACE_ATTEMPTS=240
 unset MATRIX_DESKTOP_LAUNCHER_LOCKED
 
 usage() {
@@ -202,7 +203,10 @@ stop_session() {
 
     tmux send-keys -t "=$SESSION_NAME:0.0" C-c
     local attempt=0
-    while ((attempt < 80)); do
+    # run_matrix_sonic.sh allows its run_sim child 25 seconds for normal TERM
+    # cleanup before restoring tracked config, so the desktop wrapper must wait
+    # longer than that inner contract before declaring the whole stack stuck.
+    while ((attempt < STOP_GRACE_ATTEMPTS)); do
         if ! session_exists; then
             printf 'Stopped Matrix SONIC tmux session %s cleanly.\n' \
                 "$SESSION_NAME"
