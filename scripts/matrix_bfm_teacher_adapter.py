@@ -79,6 +79,16 @@ FORMAL_COMMAND_YAW_LIMIT_RAD_S = 1.5
 TURN_COMMAND_YAW_LIMIT_RAD_S = 0.6
 TURN_COMMAND_YAW_DAMPING_SECONDS = 0.1
 
+# A hot locomotion handoff is prepared while the existing controller still
+# owns LowCmd.  The BFM worker resets its online PFNN stream onto the current
+# physical root/terrain, runs four writer-free policy ticks, and admits the
+# next authority epoch only if the target that would be published remains a
+# small continuation of the measured joint pose.  These are writer-safety
+# invariants, not policy/action-scale tuning parameters.
+HOT_SWITCH_PREVIEW_STEPS = 4
+HOT_SWITCH_MAX_TARGET_DELTA_RAD = 0.12
+HOT_SWITCH_MAX_REFERENCE_ROOT_ERROR_M = 0.25
+
 BFM_SOURCE_COMMIT = "5e264ae2bee2315dc0522c48c64b4506977b2e25"
 REALSCAN_SOURCE_COMMIT = "850a71bef1e1472aaeb3ff4cb9004d9848830cfc"
 ROBO_PFNN_SOURCE_COMMIT = "eb1b8b8001a221d2147f8daa073ca447acc8649e"
@@ -596,6 +606,17 @@ class BfmTeacherCore:
             copy=True,
         )
         self.activation_step = 0
+
+    def prepare_handoff_activation(self, lowstate: LowStateSnapshot) -> None:
+        """Re-root online PFNN and prepare a writer-free hot-switch preview."""
+
+        self.stream.reset()
+        self.prepare_activation(lowstate)
+        self.reference_transition = "handoff"
+        self.reference_hold_target = lowstate.joint_pos_rad.astype(
+            np.float32,
+            copy=True,
+        )
 
     def prepare_direct_activation(self) -> None:
         """Reset actor history without perturbing the aligned reference cursor."""
@@ -1655,6 +1676,10 @@ def run_worker(
     latest_policy_status: dict[str, Any] = {}
     warmed = False
     stopped_event_sent = False
+    preparing_authority_epoch: int | None = None
+    prepared_authority_epoch: int | None = None
+    prepare_ready_steps = 0
+    prepare_reference_buffer_swapped = False
 
     def send_event(event: str, fields: Mapping[str, Any] | None = None) -> None:
         payload: dict[str, Any] = {
@@ -1747,6 +1772,49 @@ def run_worker(
                             received_monotonic=monotonic(),
                         )
                         continue
+                    if command == "PREPARE":
+                        requested_epoch = int(payload.get("authority_epoch"))
+                        if direct_start:
+                            raise RuntimeError(
+                                "direct BFM does not use hot-switch preparation"
+                            )
+                        if requested_epoch != authority_epoch + 1:
+                            raise RuntimeError(
+                                "BFM Teacher prepare epoch did not advance"
+                            )
+                        if (
+                            handoff.state != HandoffStateMachine.WAITING
+                            or preparing_authority_epoch is not None
+                            or prepared_authority_epoch is not None
+                        ):
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE requires writer-free standby"
+                            )
+                        now = monotonic()
+                        state = state_store.get()
+                        if (
+                            not warmed
+                            or latest_world is None
+                            or now - latest_world.received_monotonic
+                            > WORLD_SAMPLE_MAX_AGE_S
+                            or state is None
+                            or now - state.received_monotonic
+                            > LOWSTATE_MAX_AGE_S
+                        ):
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE lacks fresh warmed inputs"
+                            )
+                        if not latest_world.safe_stop:
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE requires a safety-stop handoff"
+                            )
+                        core.prepare_handoff_activation(state)
+                        preparing_authority_epoch = requested_epoch
+                        prepared_authority_epoch = None
+                        prepare_ready_steps = 0
+                        prepare_reference_buffer_swapped = False
+                        next_policy = monotonic()
+                        continue
                     if command == "GO":
                         requested_epoch = int(payload.get("authority_epoch"))
                         if requested_epoch != authority_epoch + 1:
@@ -1777,19 +1845,41 @@ def run_worker(
                         if direct_start:
                             core.prepare_direct_activation()
                         else:
-                            core.prepare_activation(state)
-                        started = monotonic()
-                        target, latest_policy_status = core.step(
-                            latest_world,
-                            state,
-                            active=True,
-                        )
-                        with target_lock:
-                            latest_target = target
-                        latest_policy_status["inference_ms"] = (
-                            monotonic() - started
-                        ) * 1000.0
+                            if prepared_authority_epoch != requested_epoch:
+                                raise RuntimeError(
+                                    "BFM Teacher GO arrived before safe preparation"
+                                )
+                            if (
+                                latest_policy_status.get(
+                                    "published_target_delta_max_rad"
+                                )
+                                is None
+                                or float(
+                                    latest_policy_status[
+                                        "published_target_delta_max_rad"
+                                    ]
+                                )
+                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                            ):
+                                raise RuntimeError(
+                                    "BFM Teacher prepared target exceeded safety gate"
+                                )
+                        if direct_start:
+                            started = monotonic()
+                            target, latest_policy_status = core.step(
+                                latest_world,
+                                state,
+                                active=True,
+                            )
+                            with target_lock:
+                                latest_target = target
+                            latest_policy_status["inference_ms"] = (
+                                monotonic() - started
+                            ) * 1000.0
                         authority_epoch = requested_epoch
+                        preparing_authority_epoch = None
+                        prepared_authority_epoch = None
+                        prepare_ready_steps = 0
                         with writer_lock:
                             handoff.command("GO")
                         publisher.wake()
@@ -1800,6 +1890,9 @@ def run_worker(
                             handoff.command("PAUSE")
                         publisher.wake()
                         core.enter_standby()
+                        preparing_authority_epoch = None
+                        prepared_authority_epoch = None
+                        prepare_ready_steps = 0
                         continue
                     if command == "STOP":
                         with writer_lock:
@@ -1854,6 +1947,8 @@ def run_worker(
                             state,
                             active=(
                                 handoff.state == HandoffStateMachine.ACTIVE
+                                or preparing_authority_epoch is not None
+                                or prepared_authority_epoch is not None
                             ),
                         )
                     except RuntimeError as exc:
@@ -1865,6 +1960,92 @@ def run_worker(
                         latest_policy_status["inference_ms"] = (
                             monotonic() - started
                         ) * 1000.0
+                        if (
+                            handoff.state == HandoffStateMachine.WAITING
+                            and (
+                                preparing_authority_epoch is not None
+                                or prepared_authority_epoch is not None
+                            )
+                        ):
+                            prepare_reference_buffer_swapped |= bool(
+                                latest_policy_status.get(
+                                    "reference_buffer_swapped", False
+                                )
+                            )
+                            reference_ready = bool(
+                                not latest_policy_status.get(
+                                    "reference_pending_rebuild", True
+                                )
+                                and not latest_policy_status.get(
+                                    "reference_transition_holding", True
+                                )
+                                and float(
+                                    latest_policy_status.get(
+                                        "reference_root_error_m", math.inf
+                                    )
+                                )
+                                <= HOT_SWITCH_MAX_REFERENCE_ROOT_ERROR_M
+                            )
+                            target_delta = float(
+                                latest_policy_status.get(
+                                    "published_target_delta_max_rad", math.inf
+                                )
+                            )
+                            if target_delta > HOT_SWITCH_MAX_TARGET_DELTA_RAD:
+                                rejected_epoch = (
+                                    preparing_authority_epoch
+                                    if preparing_authority_epoch is not None
+                                    else prepared_authority_epoch
+                                )
+                                send_event(
+                                    "ACTIVATION_REJECTED",
+                                    {
+                                        "authority_epoch": rejected_epoch,
+                                        "writer_created": False,
+                                        "write_authorized": False,
+                                        "reason": "published_target_delta_exceeded",
+                                        "target_delta_max_rad": target_delta,
+                                        "target_delta_limit_rad": (
+                                            HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                                        ),
+                                        "reference_aligned": reference_ready,
+                                    },
+                                )
+                                preparing_authority_epoch = None
+                                prepared_authority_epoch = None
+                                prepare_ready_steps = 0
+                                core.enter_standby()
+                            elif preparing_authority_epoch is not None:
+                                prepare_ready_steps = (
+                                    prepare_ready_steps + 1
+                                    if reference_ready
+                                    else 0
+                                )
+                                if prepare_ready_steps >= HOT_SWITCH_PREVIEW_STEPS:
+                                    prepared_authority_epoch = (
+                                        preparing_authority_epoch
+                                    )
+                                    preparing_authority_epoch = None
+                                    send_event(
+                                        "ACTIVATION_PREPARED",
+                                        {
+                                            "authority_epoch": (
+                                                prepared_authority_epoch
+                                            ),
+                                            "writer_created": False,
+                                            "write_authorized": False,
+                                            "reference_aligned": True,
+                                            "reference_pending_rebuild": False,
+                                            "reference_buffer_swapped": (
+                                                prepare_reference_buffer_swapped
+                                            ),
+                                            "preview_steps": prepare_ready_steps,
+                                            "target_delta_max_rad": target_delta,
+                                            "target_delta_limit_rad": (
+                                                HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                                            ),
+                                        },
+                                    )
                         if not warmed:
                             direct_reference = core.direct_reference_start
                             if direct_start and direct_reference is None:
@@ -1945,6 +2126,20 @@ def run_worker(
                     ),
                     "models_loaded_once": True,
                     "models_warmed": warmed,
+                    "activation_preparing": (
+                        preparing_authority_epoch is not None
+                    ),
+                    "activation_prepared": (
+                        prepared_authority_epoch is not None
+                    ),
+                    "prepared_authority_epoch": prepared_authority_epoch,
+                    "activation_preview_ready_steps": prepare_ready_steps,
+                    "activation_preview_steps_required": (
+                        HOT_SWITCH_PREVIEW_STEPS
+                    ),
+                    "activation_target_delta_limit_rad": (
+                        HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                    ),
                     "transient_input_stale": transient_stale_active,
                     "transient_input_stale_events": transient_stale_events,
                     "transient_input_stale_grace_ms": (

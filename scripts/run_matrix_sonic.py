@@ -8094,6 +8094,10 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self.warmed = False
+        self.preparation_pending = False
+        self.activation_prepared = False
+        self.activation_rejected_reason: str | None = None
+        self.activation_preparation_status: dict[str, object] | None = None
         self.activation_pending = False
         self.pause_pending = False
         self.authority_epoch = 0
@@ -8194,7 +8198,56 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.epoch_first_write = True
             self.first_write = True
             self.paused = False
+            self.activation_prepared = False
+            self.activation_preparation_status = None
             self.activation_pending = False
+        elif event == "ACTIVATION_PREPARED":
+            if not self.preparation_pending:
+                raise RuntimeError(
+                    "BFM Teacher prepared without supervisor request"
+                )
+            if epoch != self.requested_authority_epoch:
+                raise RuntimeError("BFM Teacher prepared epoch mismatch")
+            if payload.get("writer_created") is not False:
+                raise RuntimeError("BFM Teacher preparation created a writer")
+            if payload.get("write_authorized") is not False:
+                raise RuntimeError("BFM Teacher preparation gained authority")
+            if payload.get("reference_aligned") is not True:
+                raise RuntimeError("BFM Teacher preparation is not root-aligned")
+            preview_steps = payload.get("preview_steps")
+            if type(preview_steps) is not int or preview_steps < 4:
+                raise RuntimeError("BFM Teacher preparation preview was too short")
+            target_delta = payload.get("target_delta_max_rad")
+            target_limit = payload.get("target_delta_limit_rad")
+            if (
+                not isinstance(target_delta, (int, float))
+                or not isinstance(target_limit, (int, float))
+                or not math.isfinite(float(target_delta))
+                or not math.isfinite(float(target_limit))
+                or float(target_delta) > float(target_limit)
+            ):
+                raise RuntimeError("BFM Teacher preparation target gate failed")
+            self.preparation_pending = False
+            self.activation_prepared = True
+            self.activation_rejected_reason = None
+            self.activation_preparation_status = dict(payload)
+        elif event == "ACTIVATION_REJECTED":
+            if not (self.preparation_pending or self.activation_prepared):
+                raise RuntimeError(
+                    "BFM Teacher rejected an inactive preparation"
+                )
+            if epoch != self.requested_authority_epoch:
+                raise RuntimeError("BFM Teacher rejection epoch mismatch")
+            if payload.get("writer_created") is not False:
+                raise RuntimeError("BFM Teacher rejection retained a writer")
+            if payload.get("write_authorized") is not False:
+                raise RuntimeError("BFM Teacher rejection retained authority")
+            self.preparation_pending = False
+            self.activation_prepared = False
+            self.activation_rejected_reason = str(
+                payload.get("reason", "activation_preparation_rejected")
+            )
+            self.activation_preparation_status = dict(payload)
         elif event == "PAUSED_RESIDENT_WRITER":
             if not self.pause_pending:
                 raise RuntimeError("BFM Teacher paused without supervisor request")
@@ -8205,6 +8258,9 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             if payload.get("write_authorized") is not False:
                 raise RuntimeError("BFM Teacher pause retained write authority")
             self.paused = True
+            self.preparation_pending = False
+            self.activation_prepared = False
+            self.activation_preparation_status = None
             self.pause_pending = False
             self.epoch_first_write = False
         elif event == "STATUS":
@@ -8222,19 +8278,54 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         elif event == "STOPPED":
             self.stopped = True
             self.paused = False
+            self.preparation_pending = False
+            self.activation_prepared = False
             self.activation_pending = False
             self.pause_pending = False
         else:
             raise RuntimeError(f"unsupported BFM Teacher event: {event}")
+
+    def prepare_activation(self) -> None:
+        if self.connection is None or not self.ready or not self.warmed:
+            raise RuntimeError("BFM Teacher is not connected and warmed")
+        if (
+            not self.paused
+            or self.pause_pending
+            or self.preparation_pending
+            or self.activation_prepared
+            or self.activation_pending
+        ):
+            raise RuntimeError("BFM Teacher is not ready for preparation")
+        if self.stopped:
+            raise RuntimeError("BFM Teacher was stopped")
+        requested_epoch = self.authority_epoch + 1
+        self._send_payload(
+            {
+                "schema": self.SCHEMA,
+                "command": "PREPARE",
+                "authority_epoch": requested_epoch,
+            }
+        )
+        self.requested_authority_epoch = requested_epoch
+        self.preparation_pending = True
+        self.activation_rejected_reason = None
+        self.activation_preparation_status = None
 
     def activate(self) -> None:
         if self.connection is None or not self.ready or not self.warmed:
             raise RuntimeError("BFM Teacher is not connected and warmed")
         if not self.paused or self.pause_pending or self.activation_pending:
             raise RuntimeError("BFM Teacher is not in writer-fenced standby")
+        if not self.direct_start and not self.activation_prepared:
+            raise RuntimeError("BFM Teacher was not safely prepared")
         if self.stopped:
             raise RuntimeError("BFM Teacher was stopped")
         requested_epoch = self.authority_epoch + 1
+        if (
+            not self.direct_start
+            and requested_epoch != self.requested_authority_epoch
+        ):
+            raise RuntimeError("BFM Teacher prepared epoch is stale")
         payload = {
             "schema": self.SCHEMA,
             "command": "GO",
@@ -8243,6 +8334,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self._send_payload(payload)
         self.requested_authority_epoch = requested_epoch
         self.activation_pending = True
+        self.activation_prepared = False
         self.paused = False
         self.epoch_first_write = False
 
@@ -8351,6 +8443,14 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             {
                 "schema": self.SCHEMA,
                 "warmed": self.warmed,
+                "preparation_pending": self.preparation_pending,
+                "activation_prepared": self.activation_prepared,
+                "activation_rejected_reason": self.activation_rejected_reason,
+                "activation_preparation_status": (
+                    dict(self.activation_preparation_status)
+                    if self.activation_preparation_status is not None
+                    else None
+                ),
                 "activation_pending": self.activation_pending,
                 "pause_pending": self.pause_pending,
                 "authority_epoch": self.authority_epoch,
@@ -9200,6 +9300,7 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_timeout_s = 10.0
         self.bfm_switch_admission_ready = False
         self.bfm_switch_admission_reason = "awaiting_runtime_observation"
+        self.last_locomotion_handoff: dict[str, object] | None = None
         self.physics_profiles = None
         self.runtime_pause_policy_id: str | None = None
         self.runtime_pause_writer_epoch: int | None = None
@@ -9598,18 +9699,36 @@ class _PhysicalRecoveryCoordinator:
                         "E_POLICY_WORKER_NOT_READY",
                         "BFM Teacher resident shadow is not ready and writer-fenced",
                     )
+                if self.bfm_control.reference_source != "robo_pfnn_formal7168":
+                    raise CommandExecutionError(
+                        "E_POLICY_SWITCH_UNSAFE",
+                        "BFM hot switch requires the online Robo-PFNN reference",
+                    )
                 if not self.sonic_writer.current_first_write:
                     raise CommandExecutionError(
                         "E_POLICY_SWITCH_UNSAFE",
                         "Native SONIC does not own a confirmed writer epoch",
                     )
-                self.sonic_writer.send("PAUSE")
+                shadow_status = self.bfm_control.last_status
+                baseline_sequence = (
+                    int(shadow_status.get("world_sample_sequence", -1))
+                    if isinstance(shadow_status, dict)
+                    and isinstance(
+                        shadow_status.get("world_sample_sequence"), int
+                    )
+                    else -1
+                )
                 self._policy_selection_pending = {
                     "slot": "locomotion",
                     "policy_id": BFM_TEACHER50K_POLICY_ID,
                     "transition_id": transition_id,
-                    "phase": "pause_sonic",
+                    "phase": "await_bfm_shadow",
                     "requested_monotonic_s": time.monotonic(),
+                    "shadow_baseline_sequence": baseline_sequence,
+                    "prior_writer_policy_id": "sonic",
+                    "prior_writer_epoch": self.sonic_writer.authority_epoch,
+                    "prior_writer_fenced": False,
+                    "reference_aligned": False,
                 }
                 return None
             raise CommandExecutionError(
@@ -9671,15 +9790,146 @@ class _PhysicalRecoveryCoordinator:
             return
         transition_id = str(pending["transition_id"])
         if pending.get("slot") == "locomotion":
-            requested_at = float(pending["requested_monotonic_s"])
-            if time.monotonic() - requested_at > self.bfm_switch_timeout_s:
-                raise RuntimeError(
-                    "locomotion policy writer handoff exceeded its safety timeout"
+            def finish_rejection(reason: str) -> None:
+                pending["rejection_reason"] = reason
+                self.last_locomotion_handoff = dict(pending)
+                self._policy_selection_pending = None
+                self._policy_selection_results[transition_id] = (
+                    False,
+                    "E_POLICY_SWITCH_REJECTED",
+                    reason,
+                    self.strategy_loadout_mapping(),
                 )
+
+            def begin_sonic_rollback(reason: str) -> None:
+                pending["rejection_reason"] = reason
+                if self.sonic_writer.paused:
+                    self._apply_locomotion_physics_profile(
+                        _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+                    )
+                    self.sonic_writer.send("RESUME")
+                    pending["phase"] = "rollback_sonic"
+                    pending["rollback_requested_monotonic_s"] = time.monotonic()
+                elif self.sonic_writer.pause_pending:
+                    # PAUSE cannot be cancelled once sent.  Keep ownership of
+                    # the transaction until its fence acknowledgement arrives,
+                    # then immediately restore SONIC with a new writer epoch.
+                    pending["phase"] = "rollback_wait_sonic_pause"
+                    pending["rollback_requested_monotonic_s"] = time.monotonic()
+                else:
+                    finish_rejection(reason)
+
+            requested_at = float(pending["requested_monotonic_s"])
             phase = str(pending.get("phase"))
             target = str(pending["policy_id"])
+            if phase == "rollback_wait_sonic_pause":
+                if self.sonic_writer.paused:
+                    self._apply_locomotion_physics_profile(
+                        _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+                    )
+                    self.sonic_writer.send("RESUME")
+                    pending["phase"] = "rollback_sonic"
+                    pending["rollback_requested_monotonic_s"] = time.monotonic()
+                    return
+                rollback_at = float(
+                    pending.get("rollback_requested_monotonic_s", requested_at)
+                )
+                if time.monotonic() - rollback_at > self.bfm_switch_timeout_s:
+                    raise RuntimeError(
+                        "SONIC pause fence for rollback exceeded its safety timeout"
+                    )
+                return
+            if phase == "rollback_sonic":
+                if self.sonic_writer.current_first_write:
+                    finish_rejection(
+                        str(
+                            pending.get(
+                                "rejection_reason",
+                                "BFM hot switch rolled back safely",
+                            )
+                        )
+                    )
+                    return
+                rollback_at = float(
+                    pending.get("rollback_requested_monotonic_s", requested_at)
+                )
+                if time.monotonic() - rollback_at > self.bfm_switch_timeout_s:
+                    raise RuntimeError(
+                        "SONIC rollback exceeded its safety timeout"
+                    )
+                return
+            if time.monotonic() - requested_at > self.bfm_switch_timeout_s:
+                begin_sonic_rollback(
+                    "BFM hot switch preparation exceeded its safety timeout"
+                )
+                return
             if target == BFM_TEACHER50K_POLICY_ID:
+                if self.bfm_control.activation_rejected_reason is not None:
+                    begin_sonic_rollback(
+                        "BFM activation preparation rejected: "
+                        f"{self.bfm_control.activation_rejected_reason}"
+                    )
+                    return
+                if phase == "await_bfm_shadow":
+                    status = self.bfm_control.last_status
+                    baseline_sequence = int(
+                        pending.get("shadow_baseline_sequence", -1)
+                    )
+                    sequence = (
+                        status.get("world_sample_sequence")
+                        if isinstance(status, dict)
+                        else None
+                    )
+                    reference_root_error = (
+                        status.get("reference_root_error_m")
+                        if isinstance(status, dict)
+                        else None
+                    )
+                    shadow_ready = bool(
+                        type(sequence) is int
+                        and sequence > baseline_sequence
+                        and status.get("shadow_preview") is True
+                        and status.get("world_input_safe_stop") is True
+                        and status.get("reference_pending_rebuild") is False
+                        and status.get("reference_transition_holding") is False
+                        and isinstance(reference_root_error, (int, float))
+                        and math.isfinite(float(reference_root_error))
+                        and float(reference_root_error) <= 0.25
+                    )
+                    if not shadow_ready:
+                        return
+                    self.bfm_control.prepare_activation()
+                    pending["phase"] = "prepare_bfm"
+                    pending["reference_aligned"] = True
+                    pending["reference_status_sequence"] = sequence
+                    return
+                if (
+                    phase == "prepare_bfm"
+                    and self.bfm_control.activation_prepared
+                ):
+                    preparation = (
+                        self.bfm_control.activation_preparation_status or {}
+                    )
+                    pending["reference_aligned"] = bool(
+                        preparation.get("reference_aligned") is True
+                    )
+                    pending["reference_buffer_swapped"] = bool(
+                        preparation.get("reference_buffer_swapped", False)
+                    )
+                    pending["preview_steps"] = preparation.get("preview_steps")
+                    pending["target_delta_max_rad"] = preparation.get(
+                        "target_delta_max_rad"
+                    )
+                    self.sonic_writer.send("PAUSE")
+                    pending["phase"] = "pause_sonic"
+                    return
                 if phase == "pause_sonic" and self.sonic_writer.paused:
+                    if not self.bfm_control.activation_prepared:
+                        begin_sonic_rollback(
+                            "BFM preparation was lost before writer handoff"
+                        )
+                        return
+                    pending["prior_writer_fenced"] = True
                     self._apply_locomotion_physics_profile(
                         _LocomotionPhysicsProfiles.BFM_PROFILE_ID
                     )
@@ -9689,8 +9939,12 @@ class _PhysicalRecoveryCoordinator:
                 if (
                     phase == "activate_bfm"
                     and self.bfm_control.current_first_write
+                    and self.sonic_writer.paused
                 ):
                     self.selected_locomotion_policy_id = target
+                    pending["authority_epoch"] = self.bfm_control.authority_epoch
+                    pending["completed_monotonic_s"] = time.monotonic()
+                    self.last_locomotion_handoff = dict(pending)
                     self._policy_selection_pending = None
                     self._policy_selection_results[transition_id] = (
                         True,
@@ -9837,7 +10091,11 @@ class _PhysicalRecoveryCoordinator:
         if isinstance(writer, _SonicWriterControl):
             if writer.pause_pending or writer.resume_pending:
                 return "locomotion_writer_transition"
-        elif writer.pause_pending or writer.activation_pending:
+        elif (
+            writer.pause_pending
+            or writer.preparation_pending
+            or writer.activation_pending
+        ):
             return "locomotion_writer_transition"
         return None
 
@@ -9888,6 +10146,15 @@ class _PhysicalRecoveryCoordinator:
         if isinstance(writer, _SonicWriterControl):
             writer.send("RESUME")
         else:
+            if writer.activation_rejected_reason is not None:
+                raise RuntimeError(
+                    "BFM runtime-continue preparation rejected: "
+                    f"{writer.activation_rejected_reason}"
+                )
+            if not writer.activation_prepared:
+                if not writer.preparation_pending:
+                    writer.prepare_activation()
+                return
             writer.activate()
         self.runtime_pause_resume_sent = True
 
@@ -10938,10 +11205,19 @@ class _PhysicalRecoveryCoordinator:
                         self.bfm_control.paused
                         and not self.bfm_control.activation_pending
                     ):
-                        self._apply_locomotion_physics_profile(
-                            _LocomotionPhysicsProfiles.BFM_PROFILE_ID
-                        )
-                        self.bfm_control.activate()
+                        if self.bfm_control.activation_rejected_reason is not None:
+                            raise RuntimeError(
+                                "BFM recovery-return preparation rejected: "
+                                f"{self.bfm_control.activation_rejected_reason}"
+                            )
+                        if not self.bfm_control.activation_prepared:
+                            if not self.bfm_control.preparation_pending:
+                                self.bfm_control.prepare_activation()
+                        else:
+                            self._apply_locomotion_physics_profile(
+                                _LocomotionPhysicsProfiles.BFM_PROFILE_ID
+                            )
+                            self.bfm_control.activate()
                 elif self.sonic_writer.paused and not self.sonic_writer.resume_pending:
                     self._apply_locomotion_physics_profile(
                         _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
@@ -11171,6 +11447,16 @@ class _PhysicalRecoveryCoordinator:
             ),
             "locomotion_switch_admission_reason": (
                 self.bfm_switch_admission_reason
+            ),
+            "locomotion_policy_handoff": (
+                dict(self._policy_selection_pending)
+                if self._policy_selection_pending is not None
+                and self._policy_selection_pending.get("slot") == "locomotion"
+                else (
+                    dict(self.last_locomotion_handoff)
+                    if self.last_locomotion_handoff is not None
+                    else None
+                )
             ),
             "resident_process_identity_stable": (
                 self.resident_policies

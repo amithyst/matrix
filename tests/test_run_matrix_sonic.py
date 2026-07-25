@@ -6373,9 +6373,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.worker.send.assert_not_called()
         popen.assert_not_called()
 
-        # A provenance-verified, warmed resident adapter begins by fencing the
-        # currently active SONIC writer.  BFM is authorized only after the
-        # asynchronous WRITER_PAUSED acknowledgement.
+        # A provenance-verified resident adapter first refreshes its neutral
+        # shadow, then prepares four writer-free BFM preview ticks.  SONIC is
+        # fenced only after that target/reference admission passes.
         coordinator.locomotion_policy_candidates = (
             MODULE.PolicyCandidateState(
                 policy_id="bfm-sonic-teacher50k",
@@ -6399,10 +6399,23 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             warmed=True,
             paused=True,
             current_first_write=False,
+            reference_source="robo_pfnn_formal7168",
+            last_status={
+                "world_sample_sequence": 10,
+                "shadow_preview": True,
+                "world_input_safe_stop": True,
+                "reference_pending_rebuild": False,
+                "reference_transition_holding": False,
+                "reference_root_error_m": 0.0,
+            },
+            activation_rejected_reason=None,
+            activation_prepared=False,
+            activation_preparation_status=None,
         )
         coordinator.sonic_writer = mock.Mock(
             current_first_write=True,
             paused=False,
+            authority_epoch=3,
         )
         coordinator.physics_profiles = mock.Mock()
         coordinator.bfm_switch_timeout_s = 10.0
@@ -6414,6 +6427,28 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             transition_id="transition-bfm-ready",
         )
         self.assertIsNone(result)
+        coordinator.sonic_writer.send.assert_not_called()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "await_bfm_shadow",
+        )
+
+        coordinator.bfm_control.last_status["world_sample_sequence"] = 11
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator.bfm_control.prepare_activation.assert_called_once_with()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "prepare_bfm",
+        )
+
+        coordinator.bfm_control.activation_prepared = True
+        coordinator.bfm_control.activation_preparation_status = {
+            "reference_aligned": True,
+            "reference_buffer_swapped": True,
+            "preview_steps": 4,
+            "target_delta_max_rad": 0.01,
+        }
+        coordinator._reconcile_policy_slot_assignment()
         coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
@@ -6441,7 +6476,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "activate_bfm",
         )
 
+        # If preparation is revoked after PAUSE was sent but before the
+        # acknowledgement arrives, the transaction must wait for that fence
+        # and then resume SONIC; it must not orphan a paused writer.
         events.clear()
+        coordinator.bfm_control.activation_rejected_reason = "preview_drift"
+        coordinator.sonic_writer.paused = False
+        coordinator.sonic_writer.pause_pending = True
+        coordinator.sonic_writer.send.reset_mock()
+        coordinator._policy_selection_pending = {
+            "slot": "locomotion",
+            "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+            "transition_id": "transition-bfm-rollback-race",
+            "phase": "pause_sonic",
+            "requested_monotonic_s": time.monotonic(),
+        }
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "rollback_wait_sonic_pause",
+        )
+        coordinator.sonic_writer.paused = True
+        coordinator.sonic_writer.pause_pending = False
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "rollback_sonic",
+        )
+        coordinator.sonic_writer.send.assert_called_once_with("RESUME")
+        self.assertIn("physics:sonic-recovery", events)
+
+        events.clear()
+        coordinator.bfm_control.activation_rejected_reason = None
         coordinator.selected_locomotion_policy_id = (
             MODULE.BFM_TEACHER50K_POLICY_ID
         )
@@ -7385,6 +7451,53 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(telemetry["resident_paused"])
         self.assertTrue(telemetry["resident_writer_created"])
         self.assertFalse(telemetry["paused_no_writer"])
+
+    def test_bfm_control_requires_writer_free_preparation_before_go(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        sent: list[dict[str, object]] = []
+
+        def send(packet: bytes) -> int:
+            sent.append(json.loads(packet.decode("utf-8")))
+            return len(packet)
+
+        control.connection = SimpleNamespace(send=send)
+        control.ready = True
+        control.warmed = True
+        control.models_warmed = True
+        control.paused = True
+        control.reference_source = "robo_pfnn_formal7168"
+
+        control.prepare_activation()
+
+        self.assertTrue(control.preparation_pending)
+        self.assertEqual(sent[-1]["command"], "PREPARE")
+        self.assertEqual(sent[-1]["authority_epoch"], 1)
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "ACTIVATION_PREPARED",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 1,
+                    "writer_created": False,
+                    "write_authorized": False,
+                    "reference_aligned": True,
+                    "reference_pending_rebuild": False,
+                    "reference_buffer_swapped": True,
+                    "preview_steps": 4,
+                    "target_delta_max_rad": 0.01,
+                    "target_delta_limit_rad": 0.12,
+                }
+            ).encode("utf-8")
+        )
+        self.assertTrue(control.activation_prepared)
+        self.assertFalse(control.preparation_pending)
+
+        control.activate()
+
+        self.assertTrue(control.activation_pending)
+        self.assertEqual(sent[-1]["command"], "GO")
+        self.assertEqual(sent[-1]["authority_epoch"], 1)
 
     def test_recovery_worker_tracks_first_write_authority_across_fallback(
         self,
@@ -8344,6 +8457,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             paused=True,
             pause_pending=False,
             stop_sent=False,
+            preparation_pending=False,
+            activation_prepared=False,
+            activation_rejected_reason=None,
             activation_pending=False,
         )
         processes = mock.Mock()
@@ -8376,9 +8492,28 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(coordinator.current_recovery_worker_episode_id, 17)
 
         events.clear()
+        coordinator.bfm_control.prepare_activation.side_effect = (
+            lambda: events.append("prepare_bfm")
+        )
         coordinator.bfm_control.activate.side_effect = (
             lambda: events.append("activate_bfm")
         )
+        coordinator.execute(
+            MODULE.ResidentRecoveryOutput(
+                previous_state=MODULE.ResidentRecoveryState.POLICY_QUIET,
+                state=MODULE.ResidentRecoveryState.SONIC_RESUME_REQUESTED,
+                resume_sonic_writer=True,
+            ),
+            processes=processes,
+            planner=planner,
+        )
+        self.assertEqual(
+            events,
+            ["prepare_bfm"],
+        )
+
+        events.clear()
+        coordinator.bfm_control.activation_prepared = True
         coordinator.execute(
             MODULE.ResidentRecoveryOutput(
                 previous_state=MODULE.ResidentRecoveryState.POLICY_QUIET,

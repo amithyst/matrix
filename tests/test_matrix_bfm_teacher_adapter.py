@@ -481,6 +481,23 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(status["activation_blend_fraction"], 0.0)
         self.assertEqual(status["published_target_delta_rms_rad"], 0.0)
 
+    def test_hot_handoff_resets_reference_to_current_root_before_preview(
+        self,
+    ) -> None:
+        core = self.inference_core()
+        lowstate = self.lowstate(joint_value=0.33)
+        resets_before = core.stream.reset_count
+
+        core.prepare_handoff_activation(lowstate)
+
+        self.assertEqual(core.stream.reset_count, resets_before + 1)
+        self.assertEqual(core.reference_transition, "handoff")
+        target, status = core.step(self.world(sequence=1), lowstate, active=True)
+        np.testing.assert_allclose(target, lowstate.joint_pos_rad)
+        self.assertTrue(status["reference_transition_completed"])
+        self.assertFalse(status["reference_pending_rebuild"])
+        self.assertEqual(status["published_target_delta_max_rad"], 0.0)
+
     def test_active_idle_holds_first_current_pose_without_teacher_drift(self) -> None:
         core = self.inference_core()
         first_lowstate = self.lowstate(joint_value=0.41)
