@@ -3695,6 +3695,23 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             run_sim.index('"${BFM_DIRECT_ARGS[@]}"'),
         )
 
+    def test_launcher_fall_diagnostic_is_unbounded_planner_only(self) -> None:
+        launcher = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("--allow-fall-diagnostic", launcher)
+        self.assertIn('if [[ "$ALLOW_FALL_DIAGNOSTIC" == "1" ]]', launcher)
+        self.assertIn(
+            "--allow-fall-diagnostic requires --max-seconds 0",
+            launcher,
+        )
+        self.assertIn(
+            "--allow-fall-diagnostic requires planner control and recovery off",
+            launcher,
+        )
+        self.assertIn("export MATRIX_SONIC_FAIL_ON_FALL=0", launcher)
+
     def test_ue_supervisor_classifies_unexpected_and_expected_exit(self) -> None:
         supervisor = REPO_ROOT / "scripts/supervise_matrix_ue.py"
         cases = (
