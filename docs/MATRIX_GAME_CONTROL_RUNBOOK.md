@@ -99,16 +99,18 @@ git -C /home/kaijie/matrix worktree add --detach \
   /home/kaijie/worktrees/matrix-game-control-exp \
   origin/main
 cd /home/kaijie/worktrees/matrix-game-control-exp
-MATRIX_SONIC_ROOT=/home/kaijie/worktrees/sonic-matrix-native-final \
-  bash scripts/bootstrap_matrix_sonic.sh \
-    --profile heyuan \
-    --release-cache /home/kaijie/matrix-eval/releases \
-    --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
-    --write-local-env
-/usr/bin/python3 scripts/update_matrix_local_env.py \
-  .matrix/local.env MATRIX_SONIC_ROOT \
-  /home/kaijie/worktrees/sonic-matrix-native-final
+bash scripts/bootstrap_matrix_sonic.sh \
+  --profile heyuan \
+  --release-cache /home/kaijie/matrix-eval/releases \
+  --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
+  --write-local-env
 ```
+
+The Heyuan profile consumes the attested
+`$MATRIX_RUNTIME_ROOT/GR00T-WholeBodyControl` archive mirror. The mirror must
+contain the locked `SONIC_COMMIT`, critical source hashes, runtime trees, and
+portable deploy binary; do not point a qualification run at an experimental
+SONIC worktree.
 
 ```bash
 MATRIX_EXPERIMENT_WORKTREE="${MATRIX_EXPERIMENT_WORKTREE:-/home/kaijie/worktrees/matrix-game-control-exp}"
