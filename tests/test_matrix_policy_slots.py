@@ -36,7 +36,7 @@ class MatrixPolicySlotsTest(unittest.TestCase):
                 "checkpoint": "613274ee5956db59b8f2509c408619ee600e7b847c4609ad1643e6c7ffd410c1",
                 "config": "e7bed95642a3627cc6f6cff416da784fe2d0841b697d0f34e7039fd73af10e3f",
                 "teacher_onnx": "edbec19062d6c34621dd97df864c596d29937432d8a019dd949d03785d9cdc45",
-                "runtime_adapter": "3375ffc19f68cc5a2be5541712af656620dcbff27ff6c7209573ac1b395a4dae",
+                "runtime_adapter": "2ba374db186b0dbbb8297d98ec86dcb421914b33ac9fb26f8c412ecda4e8257f",
                 "g1_xml": "8c586e4747da85804180fe44d8692e0fd8231356728b6327e256dca498087a78",
                 "formal_ik": "c8776f1e7651a4f179ea75e17b9746c41fa77a15be2cacf5809fe648340a7ab2",
             },
