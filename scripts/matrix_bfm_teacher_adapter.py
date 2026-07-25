@@ -441,6 +441,8 @@ class BfmTeacherCore:
         formal_ik: Path,
         execution_provider: str,
         activation_blend_seconds: float = 0.1,
+        reference_clip: Path | None = None,
+        direct_start: bool = False,
         trace_file: Path | None = None,
         trace_ticks: int = 0,
     ) -> None:
@@ -479,6 +481,9 @@ class BfmTeacherCore:
         self.reference_module = importlib.import_module(
             "bfm_sonic_realscan_play.robo_pfnn_reference"
         )
+        self.recorded_reference_module = importlib.import_module(
+            "bfm_sonic_realscan_play.recorded_reference"
+        )
         ik_module = _load_module_from_path(
             "_matrix_bfm_formal_pfnn_ik",
             formal_ik,
@@ -495,16 +500,28 @@ class BfmTeacherCore:
             providers=providers,
         )
         self.forward = NumpyPfnnForward(weights_dir)
-        self.stream = self.reference_module.RoboPfnnReferenceStream(
-            repo=robo_pfnn_root,
-            weights=weights_dir,
-            g1_xml=g1_xml,
-            device="cpu",
-        )
-        # The upstream stream accepts a preloaded forward instance.  Supplying
-        # the NumPy implementation avoids a Torch dependency in Matrix's DDS
-        # runtime while preserving the same four-bank network calculation.
-        self.stream._forward = self.forward
+        if reference_clip is None:
+            self.stream = self.reference_module.RoboPfnnReferenceStream(
+                repo=robo_pfnn_root,
+                weights=weights_dir,
+                g1_xml=g1_xml,
+                device="cpu",
+            )
+            # The upstream stream accepts a preloaded forward instance.
+            # Supplying the NumPy implementation avoids a Torch dependency in
+            # Matrix's DDS runtime while preserving the same four-bank network
+            # calculation.
+            self.stream._forward = self.forward
+            self.reference_source = "robo_pfnn_formal7168"
+        else:
+            self.stream = self.recorded_reference_module.RecordedMotionReferenceStream(
+                reference_clip,
+            )
+            self.reference_source = (
+                f"formal7168_clip:{self.stream.motion_key}"
+            )
+        self.direct_start = bool(direct_start)
+        self.direct_reference_start: dict[str, list[float]] | None = None
         self.previous_action = np.zeros(NUM_JOINTS, dtype=np.float32)
         self.last_reset_count: int | None = None
         self.last_world_sequence: int | None = None
@@ -553,6 +570,7 @@ class BfmTeacherCore:
         self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
+        self.direct_reference_start = None
 
     def prepare_activation(self, lowstate: LowStateSnapshot) -> None:
         """Start a policy-consistent, no-teleport handoff from current joints.
@@ -577,6 +595,19 @@ class BfmTeacherCore:
             np.float32,
             copy=True,
         )
+        self.activation_step = 0
+
+    def prepare_direct_activation(self) -> None:
+        """Reset actor history without perturbing the aligned reference cursor."""
+
+        self.teacher.reset()
+        self.previous_action.fill(0.0)
+        self.last_world_sequence = None
+        self.reference_motion_active = True
+        self.reference_transition = None
+        self.reference_hold_target = None
+        self.idle_anchor_target = None
+        self.activation_origin = None
         self.activation_step = 0
 
     def enter_standby(self) -> None:
@@ -1079,6 +1110,35 @@ class BfmTeacherCore:
             world.root_yaw,
             height_field,
         )
+        if (
+            getattr(self, "direct_start", False)
+            and getattr(self, "direct_reference_start", None) is None
+        ):
+            qpos_50hz = np.asarray(reference.plan.qpos_50hz, dtype=np.float32)
+            joint_vel_50hz = np.asarray(
+                reference.plan.joint_vel_50hz,
+                dtype=np.float32,
+            )
+            if qpos_50hz.ndim != 2 or qpos_50hz.shape[1] != 36:
+                raise RuntimeError(
+                    "direct BFM reference qpos must have shape (frames, 36)"
+                )
+            if qpos_50hz.shape[0] < 2 or joint_vel_50hz.shape[1:] != (29,):
+                raise RuntimeError("direct BFM reference has no 50 Hz velocity frame")
+            root_velocity = self.reference_module.qpos_root_velocity(
+                qpos_50hz[0],
+                qpos_50hz[1],
+                POLICY_HZ,
+            )
+            qvel = np.concatenate(
+                (root_velocity, joint_vel_50hz[0]),
+            ).astype(np.float32)
+            if qvel.shape != (35,) or not np.all(np.isfinite(qvel)):
+                raise RuntimeError("direct BFM reference qvel must be finite 35D")
+            self.direct_reference_start = {
+                "qpos": [float(value) for value in qpos_50hz[0]],
+                "qvel": [float(value) for value in qvel],
+            }
         reference_buffer_swapped = bool(
             getattr(reference, "buffer_swapped", False)
         )
@@ -1582,6 +1642,7 @@ def run_worker(
     state_store: LatestLowState,
     control_socket: Path,
     execution_provider: str,
+    direct_start: bool = False,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     connection = _connect_control(control_socket)
@@ -1623,6 +1684,8 @@ def run_worker(
             "writer_scope": "rt/lowcmd",
             "models_loaded_once": True,
             "models_warmed": False,
+            "direct_start": bool(direct_start),
+            "reference_source": core.reference_source,
         }
     )
 
@@ -1707,11 +1770,14 @@ def run_worker(
                             raise RuntimeError(
                                 "BFM Teacher GO lacks fresh world/LowState input"
                             )
-                        if not latest_world.safe_stop:
+                        if not direct_start and not latest_world.safe_stop:
                             raise RuntimeError(
                                 "BFM Teacher GO requires a safety-stop handoff"
-                        )
-                        core.prepare_activation(state)
+                            )
+                        if direct_start:
+                            core.prepare_direct_activation()
+                        else:
+                            core.prepare_activation(state)
                         started = monotonic()
                         target, latest_policy_status = core.step(
                             latest_world,
@@ -1770,6 +1836,17 @@ def run_worker(
                     transient_stale_active = False
                     assert latest_world is not None
                     assert state is not None
+                    if (
+                        direct_start
+                        and warmed
+                        and handoff.state == HandoffStateMachine.WAITING
+                    ):
+                        next_policy = _advance_deadline(
+                            next_policy,
+                            policy_period,
+                            now,
+                        )
+                        continue
                     started = monotonic()
                     try:
                         target, latest_policy_status = core.step(
@@ -1789,6 +1866,11 @@ def run_worker(
                             monotonic() - started
                         ) * 1000.0
                         if not warmed:
+                            direct_reference = core.direct_reference_start
+                            if direct_start and direct_reference is None:
+                                raise RuntimeError(
+                                    "direct BFM warmup produced no reference start"
+                                )
                             warmed = True
                             send_event(
                                 "WARMED_NO_WRITER",
@@ -1796,6 +1878,18 @@ def run_worker(
                                     "writer_created": False,
                                     "models_loaded_once": True,
                                     "models_warmed": True,
+                                    "direct_start": bool(direct_start),
+                                    "reference_source": core.reference_source,
+                                    "direct_initial_qpos": (
+                                        direct_reference["qpos"]
+                                        if direct_reference is not None
+                                        else None
+                                    ),
+                                    "direct_initial_qvel": (
+                                        direct_reference["qvel"]
+                                        if direct_reference is not None
+                                        else None
+                                    ),
                                 },
                             )
                 elif handoff.state == HandoffStateMachine.ACTIVE:
@@ -1948,6 +2042,16 @@ def validate_artifacts(args: argparse.Namespace) -> None:
             f"files={file_count} expected_sha={ROBO_PFNN_WEIGHTS_TREE_SHA256} "
             f"actual_sha={tree_sha256}"
         )
+    if args.reference_clip is not None:
+        if not args.reference_clip.is_absolute():
+            raise ValueError("direct BFM reference clip must be absolute")
+        if not args.reference_clip_sha256:
+            raise ValueError("direct BFM reference clip SHA256 is required")
+        require_file_sha256(
+            args.reference_clip,
+            args.reference_clip_sha256,
+            "formal7168 reference clip",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1960,6 +2064,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights", required=True, type=Path)
     parser.add_argument("--g1-xml", required=True, type=Path)
     parser.add_argument("--formal-ik", required=True, type=Path)
+    parser.add_argument("--reference-clip", type=Path)
+    parser.add_argument("--reference-clip-sha256")
+    parser.add_argument("--direct-start", action="store_true")
     parser.add_argument("--interface", default="lo")
     parser.add_argument("--control-socket", type=Path)
     parser.add_argument(
@@ -1988,6 +2095,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.reference_clip is not None and not args.direct_start:
+        raise SystemExit("--reference-clip requires --direct-start")
+    if args.reference_clip_sha256 is not None and args.reference_clip is None:
+        raise SystemExit("--reference-clip-sha256 requires --reference-clip")
     validate_artifacts(args)
     core = BfmTeacherCore(
         model_path=args.model,
@@ -1998,6 +2109,8 @@ def main(argv: list[str] | None = None) -> int:
         formal_ik=args.formal_ik,
         execution_provider=args.execution_provider,
         activation_blend_seconds=args.activation_blend_seconds,
+        reference_clip=args.reference_clip,
+        direct_start=args.direct_start,
         trace_file=args.trace_file,
         trace_ticks=args.trace_ticks,
     )
@@ -2030,6 +2143,7 @@ def main(argv: list[str] | None = None) -> int:
             state_store=state_store,
             control_socket=args.control_socket,
             execution_provider=args.execution_provider,
+            direct_start=args.direct_start,
         )
     finally:
         core.close()

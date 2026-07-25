@@ -358,8 +358,11 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
                     self.future_xy_delta_m = 0.0
                 plan = SimpleNamespace(
                     future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    qpos_50hz=np.zeros((47, 36), dtype=np.float32),
+                    joint_vel_50hz=np.zeros((47, 29), dtype=np.float32),
                     target_speed=self.target_speed,
                 )
+                plan.qpos_50hz[:, 3] = 1.0
                 plan.future_qpos[-1, 0] = self.future_xy_delta_m
                 return SimpleNamespace(
                     plan=plan,
@@ -379,7 +382,8 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             RobotObservation=lambda **fields: SimpleNamespace(**fields),
         )
         core.reference_module = SimpleNamespace(
-            LocalTerrainHeightField=lambda *_args: object()
+            LocalTerrainHeightField=lambda *_args: object(),
+            qpos_root_velocity=lambda *_args: np.zeros(6, dtype=np.float32),
         )
         core.teacher = FakeTeacher()
         core.stream = FakeStream()
@@ -398,7 +402,36 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         core.default_joint_pos = np.zeros(MODULE.NUM_JOINTS, dtype=np.float32)
         core.action_scale = np.ones(MODULE.NUM_JOINTS, dtype=np.float32)
         core.isaac_to_matrix = np.arange(MODULE.NUM_JOINTS)
+        core.direct_start = False
+        core.direct_reference_start = None
         return core
+
+    def test_direct_start_exports_reference_state_and_skips_hot_switch_blend(
+        self,
+    ) -> None:
+        core = self.inference_core()
+        core.direct_start = True
+        moving = self.world(sequence=1)
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+        moving.speed_mps = 0.3
+        moving.locomotion_mode = 1
+        moving.mode = "move"
+        moving.safe_stop = False
+
+        core.step(moving, self.lowstate(), active=False)
+
+        self.assertEqual(len(core.direct_reference_start["qpos"]), 36)
+        self.assertEqual(len(core.direct_reference_start["qvel"]), 35)
+        core.prepare_direct_activation()
+        self.assertTrue(core.reference_motion_active)
+        self.assertIsNone(core.activation_origin)
+
+        moving.sequence = 2
+        target, status = core.step(moving, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
+        self.assertEqual(status["activation_blend_fraction"], 1.0)
+        self.assertFalse(status["reference_transition_holding"])
 
     @staticmethod
     def world(sequence: int = 1):

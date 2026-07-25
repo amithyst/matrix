@@ -352,6 +352,37 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(profiles.switch_count, 2)
         profiles.verify_active()
 
+    def test_direct_bfm_alignment_applies_profile_before_exact_state_write(
+        self,
+    ) -> None:
+        mujoco, model, data, _joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        qpos = tuple(0.01 * index for index in range(36))
+        qvel = tuple(-0.02 * index for index in range(35))
+        runtime = MODULE._DirectBfmRuntime.__new__(MODULE._DirectBfmRuntime)
+        runtime.control = SimpleNamespace(
+            direct_initial_qpos=qpos,
+            direct_initial_qvel=qvel,
+        )
+        runtime.physics_profiles = profiles
+        runtime.reference_aligned = False
+        runtime.reference_alignment_step_index = None
+        runtime.reference_alignment_wall_s = None
+
+        runtime.align_reference(snapshot=self.snapshot(step_index=17))
+
+        self.assertTrue(runtime.reference_aligned)
+        self.assertEqual(runtime.reference_alignment_step_index, 17)
+        self.assertEqual(tuple(data.qpos[:36]), qpos)
+        self.assertEqual(tuple(data.qvel[:35]), qvel)
+        self.assertEqual(
+            profiles.active_profile_id,
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID,
+        )
+        profiles.verify_active()
+
     def test_flat_v3_physics_profile_comes_from_locked_policy_config(self) -> None:
         mujoco, model, data, _joint_by_name = (
             self.fake_physics_profile_runtime()
@@ -2876,6 +2907,40 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 SystemExit, expected
             ):
                 MODULE._validate_game_fall_recovery(SimpleNamespace(**values))
+
+    def test_direct_bfm_validation_locks_writer_scope_and_reference_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            clip = Path(temporary) / "formal7168.pkl"
+            clip.write_bytes(b"locked-reference")
+            values = {
+                "bfm_direct": True,
+                "bfm_reference_clip": clip.resolve(),
+                "bfm_reference_clip_sha256": MODULE._sha256_file(clip),
+                "bfm_direct_startup_timeout_seconds": 45.0,
+                "control_source": "planner",
+                "game_fall_recovery": "off",
+                "physical_recovery_resident_policies": False,
+                "initial_locomotion_policy": MODULE.BFM_TEACHER50K_POLICY_ID,
+                "walk_after": 0.0,
+                "vx": 0.3,
+                "vy": 0.0,
+            }
+            MODULE._validate_direct_bfm(SimpleNamespace(**values))
+
+            for expected, changes in (
+                ("control-source planner", {"control_source": "game"}),
+                ("forbids fall recovery", {"game_fall_recovery": "physical"}),
+                ("initial-locomotion-policy", {"initial_locomotion_policy": "sonic"}),
+                ("walk-after 0", {"walk_after": -1.0}),
+                ("SHA256 mismatch", {"bfm_reference_clip_sha256": "0" * 64}),
+            ):
+                invalid = values.copy()
+                invalid.update(changes)
+                with self.subTest(changes=changes), self.assertRaisesRegex(
+                    SystemExit,
+                    expected,
+                ):
+                    MODULE._validate_direct_bfm(SimpleNamespace(**invalid))
 
     def test_physical_recovery_validation_requires_local_worker_and_models(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -5,7 +5,7 @@
     "manifests": [
       {
         "path": "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
-        "sha256": "62980028f96655cd3e216345fce0c30c6a1a5ff4b815d9cd9506221efc5600ac"
+        "sha256": "e8d5258085c42c5e159586d3a24ccd7ff303a636b927cb810434cfcbe9f8a335"
       }
     ]
   },
