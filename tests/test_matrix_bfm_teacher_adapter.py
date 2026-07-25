@@ -376,6 +376,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         core.reference_stop_resets = 0
         core.reference_transition = None
         core.reference_hold_target = None
+        core.idle_anchor_target = None
         core.activation_blend_steps = 4
         core.activation_origin = None
         core.activation_step = 0
@@ -432,31 +433,37 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(status["activation_blend_fraction"], 0.0)
         self.assertEqual(status["published_target_delta_rms_rad"], 0.0)
 
-    def test_active_idle_holds_current_pose_without_teacher_drift(self) -> None:
+    def test_active_idle_holds_first_current_pose_without_teacher_drift(self) -> None:
         core = self.inference_core()
-        lowstate = self.lowstate(joint_value=0.41)
+        first_lowstate = self.lowstate(joint_value=0.41)
+        second_lowstate = self.lowstate(joint_value=0.36)
 
         first_target, first_status = core.step(
             self.world(sequence=1),
-            lowstate,
+            first_lowstate,
             active=True,
         )
         second_target, second_status = core.step(
             self.world(sequence=2),
-            lowstate,
+            second_lowstate,
             active=True,
         )
 
-        np.testing.assert_allclose(first_target, lowstate.joint_pos_rad)
-        np.testing.assert_allclose(second_target, lowstate.joint_pos_rad)
+        np.testing.assert_allclose(first_target, first_lowstate.joint_pos_rad)
+        np.testing.assert_allclose(second_target, first_lowstate.joint_pos_rad)
         np.testing.assert_allclose(
             core.previous_action,
             np.zeros(MODULE.NUM_JOINTS),
         )
         self.assertTrue(first_status["idle_anchor_hold"])
         self.assertTrue(second_status["idle_anchor_hold"])
+        self.assertTrue(second_status["idle_anchor_initialized"])
         self.assertEqual(first_status["published_target_delta_max_rad"], 0.0)
-        self.assertEqual(second_status["published_target_delta_max_rad"], 0.0)
+        self.assertAlmostEqual(
+            second_status["published_target_delta_max_rad"],
+            0.05,
+            places=6,
+        )
 
     def test_standby_preview_does_not_accumulate_unapplied_action(self) -> None:
         core = self.inference_core()

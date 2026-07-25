@@ -509,6 +509,7 @@ class BfmTeacherCore:
         self.reference_stop_resets = 0
         self.reference_transition: str | None = None
         self.reference_hold_target: np.ndarray | None = None
+        self.idle_anchor_target: np.ndarray | None = None
         self.activation_blend_steps = max(
             2,
             int(round(float(activation_blend_seconds) * POLICY_HZ)),
@@ -545,6 +546,7 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
+        self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
 
@@ -563,6 +565,10 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
+        self.idle_anchor_target = lowstate.joint_pos_rad.astype(
+            np.float32,
+            copy=True,
+        )
         self.activation_origin = lowstate.joint_pos_rad.astype(
             np.float32,
             copy=True,
@@ -578,6 +584,7 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
+        self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
 
@@ -990,6 +997,7 @@ class BfmTeacherCore:
                 np.float32,
                 copy=True,
             )
+            self.idle_anchor_target = None
             self.previous_action.fill(0.0)
             self.activation_origin = None
             self.activation_step = 0
@@ -1004,6 +1012,7 @@ class BfmTeacherCore:
                 np.float32,
                 copy=True,
             )
+            self.idle_anchor_target = None
             self.previous_action.fill(0.0)
             self.activation_origin = None
             self.activation_step = 0
@@ -1145,7 +1154,12 @@ class BfmTeacherCore:
             and not holding_reference_transition
         )
         if idle_anchor_hold:
-            target = lowstate.joint_pos_rad.astype(np.float32, copy=True)
+            if self.idle_anchor_target is None:
+                self.idle_anchor_target = lowstate.joint_pos_rad.astype(
+                    np.float32,
+                    copy=True,
+                )
+            target = self.idle_anchor_target.copy()
             blend_fraction = 0.0
             self.activation_origin = None
             self.activation_step = 0
@@ -1227,6 +1241,7 @@ class BfmTeacherCore:
             "reference_buffer_swapped": reference_buffer_swapped,
             "reference_transition": self.reference_transition,
             "idle_anchor_hold": idle_anchor_hold,
+            "idle_anchor_initialized": self.idle_anchor_target is not None,
             "reference_transition_completed": transition_completed,
             "reference_transition_holding": holding_reference_transition,
             "reference_start_reset": start_reference_reset,
