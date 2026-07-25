@@ -4670,16 +4670,21 @@ def build_snapshot(
     keys, move_stick, _look_yaw = select_physical_inputs(
         keyboard, gamepad, source=input_source
     )
+    native_free_camera_drag = bool(
+        keyboard.camera_dragging
+        and not keyboard_camera_arrow_active(keyboard)
+    )
     return InputSnapshot(
         sequence=sequence,
         timestamp_monotonic_s=timestamp_monotonic_s,
         # Missing actual camera yaw is a safety condition, not permission to
         # keep walking using the last direction.
-        # Native Matrix documents held mouse-drag as temporary free camera.
-        # Treat it like a focus interlock so camera-WASD cannot also walk G1.
+        # Native mouse drag is temporary free camera and remains an interlock.
+        # Arrow camera intentionally synthesizes that drag, so keep local
+        # locomotion available while a physical arrow is held.
         focused=(
             keyboard.focused
-            and not keyboard.camera_dragging
+            and not native_free_camera_drag
             and camera_available
             and input_available
         ),

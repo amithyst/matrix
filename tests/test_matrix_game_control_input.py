@@ -4397,6 +4397,24 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(snapshot.focused)
         self.assertTrue(snapshot.keys.w)
 
+    def test_arrow_camera_drag_keeps_keyboard_locomotion_available(self) -> None:
+        snapshot = MODULE.build_snapshot(
+            sequence=3,
+            timestamp_monotonic_s=1.0,
+            keyboard=MODULE.KeyboardMouseSample(
+                w=True,
+                arrow_right=True,
+                focused=True,
+                camera_dragging=True,
+            ),
+            gamepad=MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.5,
+            camera_available=True,
+        )
+        self.assertTrue(snapshot.focused)
+        self.assertTrue(snapshot.keys.w)
+
 
 class UeFinalPovYawReaderTest(unittest.TestCase):
     class State:
