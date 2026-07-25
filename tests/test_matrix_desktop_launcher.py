@@ -81,6 +81,9 @@ case "$command_name" in
     has-session)
         [[ -f "${FAKE_TMUX_STATE:?}" ]]
         ;;
+    list-panes)
+        cat "${FAKE_TMUX_STATE:?}"
+        ;;
     new-session)
         while (($# > 0)); do
             if [[ "$1" == "--" ]]; then
@@ -91,7 +94,7 @@ case "$command_name" in
         done
         (($# > 0)) || exit 64
         "$@"
-        : > "$FAKE_TMUX_STATE"
+        printf '%s\n' "${FAKE_TMUX_NEW_PANE_DEAD:-0}" > "$FAKE_TMUX_STATE"
         ;;
     kill-session)
         rm -f -- "$FAKE_TMUX_STATE"
@@ -234,6 +237,53 @@ esac
         self.assertIn("unsupported argument", unknown.stderr)
         self.assertFalse(marker.exists())
         self.assertEqual(parse_call_log(self.tmux_log), [])
+
+    def test_stale_session_is_reported_replaced_and_directly_cleaned(self) -> None:
+        self.tmux_state.write_text("1\n", encoding="utf-8")
+
+        stale_status = self.run_launcher("status")
+        restarted = self.run_launcher("start")
+
+        self.assertEqual(stale_status.returncode, 1, stale_status.stderr)
+        self.assertIn("is stale", stale_status.stdout)
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertIn("Removed stale", restarted.stdout)
+        self.assertEqual(self.tmux_state.read_text(encoding="utf-8"), "0\n")
+        calls = parse_call_log(self.tmux_log)
+        self.assertLess(
+            next(i for i, call in enumerate(calls) if call[0] == "kill-session"),
+            next(i for i, call in enumerate(calls) if call[0] == "new-session"),
+        )
+
+        self.tmux_state.write_text("1\n", encoding="utf-8")
+        self.tmux_log.unlink()
+        stopped = self.run_launcher("stop")
+
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertIn("Removed stopped", stopped.stdout)
+        self.assertFalse(self.tmux_state.exists())
+        self.assertEqual(
+            [call[0] for call in parse_call_log(self.tmux_log)],
+            [
+                "has-session",
+                "has-session",
+                "list-panes",
+                "has-session",
+                "has-session",
+                "list-panes",
+                "kill-session",
+                "has-session",
+            ],
+        )
+
+    def test_startup_failure_does_not_leave_a_dead_tmux_session(self) -> None:
+        self.environment["FAKE_TMUX_NEW_PANE_DEAD"] = "1"
+
+        result = self.run_launcher("start")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exited during startup", result.stderr)
+        self.assertFalse(self.tmux_state.exists())
 
 
 class MatrixDesktopInstallerTest(unittest.TestCase):

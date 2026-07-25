@@ -13,8 +13,8 @@ usage() {
 Usage: bash scripts/launch_matrix_sonic_desktop.sh [ACTION] [--profile PROFILE]
 
 Actions:
-  start    Start Matrix SONIC unless its tmux session already exists (default)
-  status   Report whether the Matrix SONIC tmux session exists
+  start    Start Matrix SONIC unless its tmux session is still live (default)
+  status   Report whether the Matrix SONIC tmux session is live or stale
   stop     Stop the Matrix SONIC tmux session
   attach   Attach this terminal to the Matrix SONIC tmux session
 
@@ -54,6 +54,25 @@ session_exists() {
     tmux has-session -t "=$SESSION_NAME" >/dev/null 2>&1
 }
 
+session_is_live() {
+    local pane_dead
+
+    session_exists || return 1
+    while IFS= read -r pane_dead; do
+        if [[ "$pane_dead" == "0" ]]; then
+            return 0
+        fi
+    done < <(tmux list-panes -t "=$SESSION_NAME" -F '#{pane_dead}' 2>/dev/null)
+    return 1
+}
+
+remove_stale_session() {
+    if session_exists && ! session_is_live; then
+        tmux kill-session -t "=$SESSION_NAME" >/dev/null 2>&1 || true
+    fi
+    ! session_exists
+}
+
 report_running() {
     printf 'Matrix SONIC is already running in tmux session %s.\n' "$SESSION_NAME"
     print_attach_hint
@@ -65,9 +84,15 @@ start_session() {
         die "runtime launcher is missing: $RUN_SCRIPT"
     fi
 
-    if session_exists; then
+    if session_is_live; then
         report_running
         return 0
+    fi
+    if session_exists; then
+        remove_stale_session \
+            || die "failed to remove stale tmux session: $SESSION_NAME"
+        printf 'Removed stale Matrix SONIC tmux session %s before startup.\n' \
+            "$SESSION_NAME"
     fi
 
     if tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT" -- \
@@ -77,7 +102,8 @@ start_session() {
         --scene 2 \
         --control-source game; then
         sleep 0.20
-        if ! session_exists; then
+        if ! session_is_live; then
+            remove_stale_session || true
             notify_user "Matrix SONIC exited during startup. Run the launcher from a terminal for details."
             printf '[ERROR] Matrix SONIC exited during startup\n' >&2
             return 1
@@ -90,10 +116,11 @@ start_session() {
     fi
 
     # A simultaneous desktop click can win the create race after our first check.
-    if session_exists; then
+    if session_is_live; then
         report_running
         return 0
     fi
+    remove_stale_session || true
 
     notify_user "Failed to start Matrix SONIC. Run the launcher from a terminal for details."
     printf '[ERROR] failed to create tmux session %s\n' "$SESSION_NAME" >&2
@@ -101,11 +128,18 @@ start_session() {
 }
 
 status_session() {
-    if session_exists; then
+    if session_is_live; then
         printf 'Matrix SONIC is running in tmux session %s.\n' "$SESSION_NAME"
         print_attach_hint
         notify_user "Running in $SESSION_NAME. Attach: tmux attach-session -t =$SESSION_NAME"
         return 0
+    fi
+
+    if session_exists; then
+        printf 'Matrix SONIC is stopped; tmux session %s is stale (all panes exited).\n' \
+            "$SESSION_NAME"
+        notify_user "Stopped: tmux session $SESSION_NAME is stale. Start again to clean it."
+        return 1
     fi
 
     printf 'Matrix SONIC is stopped (tmux session %s does not exist).\n' \
@@ -122,11 +156,27 @@ stop_session() {
         return 0
     fi
 
+    if ! session_is_live; then
+        remove_stale_session \
+            || die "failed to remove stale tmux session: $SESSION_NAME"
+        printf 'Removed stopped Matrix SONIC tmux session %s.\n' "$SESSION_NAME"
+        notify_user "Removed stopped session $SESSION_NAME."
+        return 0
+    fi
+
     tmux send-keys -t "=$SESSION_NAME:0.0" C-c
     local attempt=0
     while ((attempt < 80)); do
         if ! session_exists; then
             printf 'Stopped Matrix SONIC tmux session %s cleanly.\n' \
+                "$SESSION_NAME"
+            notify_user "Stopped $SESSION_NAME cleanly."
+            return 0
+        fi
+        if ! session_is_live; then
+            remove_stale_session \
+                || die "failed to remove stopped tmux session: $SESSION_NAME"
+            printf 'Stopped Matrix SONIC and removed tmux session %s cleanly.\n' \
                 "$SESSION_NAME"
             notify_user "Stopped $SESSION_NAME cleanly."
             return 0
@@ -143,8 +193,8 @@ stop_session() {
 }
 
 attach_session() {
-    if ! session_exists; then
-        printf '[ERROR] Matrix SONIC is stopped; tmux session %s does not exist.\n' \
+    if ! session_is_live; then
+        printf '[ERROR] Matrix SONIC is stopped; tmux session %s is missing or stale.\n' \
             "$SESSION_NAME" >&2
         return 1
     fi
