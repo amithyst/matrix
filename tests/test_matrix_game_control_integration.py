@@ -1914,6 +1914,7 @@ printf '%s\n%s\n%s\n' \
             xset_log = project / "xset.log"
             xset_state = project / "xset.state"
             material_fix = project / "outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
+            prepare_capture = project / "prepare-physics.json"
             self.write(
                 mouse_settings,
                 json.dumps(
@@ -1968,6 +1969,7 @@ printf '%s\n%s\n%s\n' \
                 "PATH": os.fspath(fixture["fake_bin"])
                 + os.pathsep
                 + os.environ.get("PATH", "/usr/bin:/bin"),
+                "PREPARE_CAPTURE_PATH": os.fspath(prepare_capture),
                 "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
                 "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
                 "XSET_LOG": os.fspath(xset_log),
@@ -2221,7 +2223,7 @@ printf '%s\n%s\n%s\n' \
                 world_revision=parsed.game_world_revision,
             )
             selected_state = world_store.state.set_resume_pose(
-                WORLD_STATE.WorldPose(4.0, 5.0, 0.81, 0.25),
+                WORLD_STATE.WorldPose(4.0, 5.0, 0.81, -1.25e-05),
                 now_unix_ns=1,
             )
             world_store.save(selected_state)
@@ -2262,6 +2264,14 @@ printf '%s\n%s\n%s\n' \
                 selected.generation,
             )
             self.assertEqual(resumed_args.game_resume_rollback_count, 0)
+            prepared = json.loads(prepare_capture.read_text(encoding="utf-8"))
+            spawn_yaw = next(
+                argument
+                for argument in prepared["argv"]
+                if argument.startswith("--spawn-yaw=")
+            )
+            self.assertEqual(float(spawn_yaw.split("=", 1)[1]), -1.25e-05)
+            self.assertNotIn("--spawn-yaw", prepared["argv"])
 
             # X11 setup is an experience improvement, never a launch gate.
             # A headless launch and an unreachable X server both continue with
@@ -3761,14 +3771,8 @@ esac
                 ("--spawn-z", "-5.251562023162842"),
                 ("--spawn-yaw", "0.0"),
             ):
-                self.assertEqual(
-                    prepared_args[prepared_args.index(option) + 1],
-                    expected,
-                )
-            self.assertNotEqual(
-                prepared_args[prepared_args.index("--spawn-z") + 1],
-                str(old_resume.pose.z),
-            )
+                self.assertIn(f"{option}={expected}", prepared_args)
+            self.assertNotIn(f"--spawn-z={old_resume.pose.z}", prepared_args)
             self.assertIsNone(prepared["route_entry_env"])
 
             runtime = json.loads(fixture["capture"].read_text(encoding="utf-8"))
@@ -3903,10 +3907,7 @@ SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=1 \
                 ("--spawn-z", "-5.251562023162842"),
                 ("--spawn-yaw", "0.0"),
             ):
-                self.assertEqual(
-                    prepared_args[prepared_args.index(option) + 1],
-                    expected,
-                )
+                self.assertIn(f"{option}={expected}", prepared_args)
             self.assertIsNone(prepared["route_entry_env"])
             runtime = json.loads(fixture["capture"].read_text(encoding="utf-8"))
             self.assertIsNone(runtime["route_entry_env"])

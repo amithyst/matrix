@@ -1617,10 +1617,10 @@ if $MATRIX_SONIC_ENABLED; then
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
         && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
         SONIC_SPAWN_ARGS=(
-            --spawn-x "-94.7"
-            --spawn-y "-65.6"
-            --spawn-z "-5.251562023162842"
-            --spawn-yaw "0"
+            "--spawn-x=-94.7"
+            "--spawn-y=-65.6"
+            "--spawn-z=-5.251562023162842"
+            "--spawn-yaw=0"
         )
         echo "[INFO] MoonWorld map-default spawn aligned to locked terrain height"
     fi
@@ -1679,10 +1679,10 @@ if $MATRIX_SONIC_ENABLED; then
                 exit 1
             fi
             SONIC_SPAWN_ARGS=(
-                --spawn-x "${GAME_WORLD_START_LINES[1]}"
-                --spawn-y "${GAME_WORLD_START_LINES[2]}"
-                --spawn-z "${GAME_WORLD_START_LINES[3]}"
-                --spawn-yaw "${GAME_WORLD_START_LINES[4]}"
+                "--spawn-x=${GAME_WORLD_START_LINES[1]}"
+                "--spawn-y=${GAME_WORLD_START_LINES[2]}"
+                "--spawn-z=${GAME_WORLD_START_LINES[3]}"
+                "--spawn-yaw=${GAME_WORLD_START_LINES[4]}"
             )
             GAME_WORLD_RESUME_CHECKPOINT_ID="${GAME_WORLD_START_LINES[7]}"
             GAME_WORLD_RESUME_GENERATION="${GAME_WORLD_START_LINES[8]}"
@@ -1739,10 +1739,10 @@ PY
                 exit 1
             fi
             SONIC_SPAWN_ARGS=(
-                --spawn-x "${MATRIX_ROUTE_ENTRY_LINES[3]}"
-                --spawn-y "${MATRIX_ROUTE_ENTRY_LINES[4]}"
-                --spawn-z "${MATRIX_ROUTE_ENTRY_LINES[5]}"
-                --spawn-yaw "${MATRIX_ROUTE_ENTRY_LINES[6]}"
+                "--spawn-x=${MATRIX_ROUTE_ENTRY_LINES[3]}"
+                "--spawn-y=${MATRIX_ROUTE_ENTRY_LINES[4]}"
+                "--spawn-z=${MATRIX_ROUTE_ENTRY_LINES[5]}"
+                "--spawn-yaw=${MATRIX_ROUTE_ENTRY_LINES[6]}"
             )
             # The target state was loaded and revision-checked above, but its
             # previous resume identity must not override this route entry. A
