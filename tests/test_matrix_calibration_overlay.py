@@ -2138,7 +2138,13 @@ class HotFontSizeTest(unittest.TestCase):
 
 class RuntimePausePointerTest(unittest.TestCase):
     @staticmethod
-    def overlay(state: str, *, page: str = "settings"):
+    def overlay(
+        state: str,
+        *,
+        page: str = "settings",
+        release_point: tuple[int, int] | None = None,
+        release_window: int = 2,
+    ):
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
         pause_state = {
             "command_console": {
@@ -2175,6 +2181,7 @@ class RuntimePausePointerTest(unittest.TestCase):
         overlay._command_editor = MODULE.CommandLineEditor()
         overlay._pressed_action = None
         overlay._pressed_window = None
+        overlay._recovered_pause_release_count = 0
         overlay._visible = True
         overlay._font_slider_dragging = False
         x, y, width, height = layout["runtime_pause"]
@@ -2183,9 +2190,16 @@ class RuntimePausePointerTest(unittest.TestCase):
             event = MODULE.XEvent()
             event.type = event_type
             event.xbutton.button = 1
-            event.xbutton.window = 2
-            event.xbutton.x_root = x + width // 2
-            event.xbutton.y_root = y + height // 2
+            event.xbutton.window = (
+                release_window if event_type == MODULE._BUTTON_RELEASE else 2
+            )
+            point = (
+                release_point
+                if event_type == MODULE._BUTTON_RELEASE
+                and release_point is not None
+                else (x + width // 2, y + height // 2)
+            )
+            event.xbutton.x_root, event.xbutton.y_root = point
             events.append(event)
         overlay._x11.XPending.side_effect = lambda _display: len(events)
 
@@ -2218,6 +2232,21 @@ class RuntimePausePointerTest(unittest.TestCase):
                 publisher = mock.Mock()
                 self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
                 publisher.publish_runtime_pause.assert_not_called()
+
+    def test_pause_release_survives_remote_pointer_warp(self) -> None:
+        overlay = self.overlay(
+            "running",
+            release_point=(30, 10),
+            release_window=3,
+        )
+        publisher = mock.Mock()
+
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
+
+        publisher.publish_runtime_pause.assert_called_once_with(
+            "paused", expected_epoch=3
+        )
+        self.assertEqual(overlay._recovered_pause_release_count, 1)
 
 
 class PointerActionPublisherTest(unittest.TestCase):
@@ -3103,6 +3132,7 @@ class X11WindowProbeTest(unittest.TestCase):
                 },
                 "polled_left_transition_count": 0,
                 "polled_left_fallback_events": 0,
+                "recovered_pause_release_count": 0,
             },
         )
 
@@ -3159,6 +3189,7 @@ class X11WindowProbeTest(unittest.TestCase):
                 "last_bad_window": None,
                 "polled_left_transition_count": 0,
                 "polled_left_fallback_events": 0,
+                "recovered_pause_release_count": 0,
             },
         )
 

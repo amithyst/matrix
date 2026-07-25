@@ -3462,6 +3462,7 @@ class X11CalibrationOverlay:
         self._polled_left_was_down = False
         self._polled_left_transition_count = 0
         self._polled_left_fallback_events = 0
+        self._recovered_pause_release_count = 0
         self._target_window: int | None = None
         self._command_editor = CommandLineEditor()
         self._keyboard_grabbed = False
@@ -3969,6 +3970,9 @@ class X11CalibrationOverlay:
             ),
             "polled_left_fallback_events": getattr(
                 self, "_polled_left_fallback_events", 0
+            ),
+            "recovered_pause_release_count": getattr(
+                self, "_recovered_pause_release_count", 0
             ),
         }
 
@@ -6178,13 +6182,29 @@ class X11CalibrationOverlay:
                         publisher.publish(action)
                         emitted += 1
                     continue
+                release_matches_press = bool(
+                    action == pressed and pressed_window == int(button.window)
+                )
+                recovered_pause_release = bool(
+                    pressed == "runtime_pause"
+                    and not release_matches_press
+                    and self._visible
+                )
                 if (
                     pressed is None
-                    or action != pressed
-                    or pressed_window != int(button.window)
+                    or (not release_matches_press and not recovered_pause_release)
                     or not self._visible
                 ):
                     continue
+                if recovered_pause_release:
+                    # SDL/remote-desktop pointer lock can warp the core pointer
+                    # after a valid Pause press but before its release.  Pause
+                    # is reversible, so preserve that one press transaction;
+                    # every other control retains drag-out cancellation.
+                    action = pressed
+                    self._recovered_pause_release_count = (
+                        getattr(self, "_recovered_pause_release_count", 0) + 1
+                    )
                 if action in _PANEL_TABS:
                     next_page = action.removeprefix("tab_")
                     if next_page != getattr(self, "_active_page", "loadout"):
