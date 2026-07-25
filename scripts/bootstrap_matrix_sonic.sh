@@ -485,6 +485,10 @@ PY
     fi
 fi
 
+if [[ "$VERIFY_ONLY" != "1" ]]; then
+    bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh"
+fi
+
 if [[ -z "${RUNTIME_PYTHON:-}" ]]; then
     select_runtime_python
 fi

@@ -1406,6 +1406,91 @@ class GameCommandClientTest(unittest.TestCase):
             "host",
         )
 
+    def test_loading_strategy_loadout_refreshes_until_runtime_ready(self) -> None:
+        provider, runtime = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            initial_strategy_loadout=self.strategy_loadout(status="loading"),
+        )
+        runtime.setblocking(False)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+        gates = {
+            "calibration_active": True,
+            "neutral_frame_ready": True,
+            "restart_requested": False,
+        }
+
+        self.assertTrue(
+            client.refresh_loading_strategy_loadout(now_s=10.0, **gates)
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            request.command,
+            MC_COMMANDS.PolicySlotAssignment("locomotion", "sonic"),
+        )
+        self.assertFalse(
+            client.refresh_loading_strategy_loadout(now_s=11.0, **gates)
+        )
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_POLICY_SLOT_ASSIGNED",
+                    message="unchanged",
+                    data={"strategy_loadout": self.strategy_loadout(status="loading")},
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertFalse(
+            client.refresh_loading_strategy_loadout(now_s=10.5, **gates)
+        )
+        self.assertTrue(
+            client.refresh_loading_strategy_loadout(now_s=11.0, **gates)
+        )
+        retry = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        ready = self.strategy_loadout(status="ready")
+        ready["slots"][0]["locked"] = False
+        ready["slots"][0]["candidates"].append(
+            {
+                "policy_id": "bfm-sonic-teacher50k",
+                "resident": True,
+                "available": True,
+            }
+        )
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=retry.session,
+                    sequence=retry.sequence,
+                    request_id=retry.request_id,
+                    ok=True,
+                    code="OK_POLICY_SLOT_ASSIGNED",
+                    message="ready",
+                    data={"strategy_loadout": ready},
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertFalse(
+            client.refresh_loading_strategy_loadout(now_s=12.0, **gates)
+        )
+        self.assertFalse(
+            client.refresh_loading_strategy_loadout(
+                now_s=13.0,
+                calibration_active=False,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+
     def test_creative_spawn_skips_editor_and_tracks_remaining_inventory(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         client = MODULE.GameCommandClient(
