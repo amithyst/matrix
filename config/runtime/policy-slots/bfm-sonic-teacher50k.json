@@ -39,13 +39,13 @@
     {
       "name": "teacher_onnx",
       "path_env": "MATRIX_BFM_SONIC_TEACHER_ONNX",
-      "sha256": "edbec19062d6c34621dd97df864c596d29937432d8a019dd949d03785d9cdc45",
+      "sha256": "243a839d325f7b214ff40367d0c2fb32d5a36c7ef0e869b85b70a428212f37b1",
       "executable": false
     },
     {
       "name": "runtime_adapter",
       "path_env": "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
-      "sha256": "3375ffc19f68cc5a2be5541712af656620dcbff27ff6c7209573ac1b395a4dae",
+      "sha256": "f3979eda4f38a57fb25c58dc71d6d692c73a0b7e14703af038afdf0d6b2db6b1",
       "executable": true
     },
     {

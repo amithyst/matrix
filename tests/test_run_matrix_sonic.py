@@ -318,8 +318,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             profiles.apply(MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID)
         )
         actual = profiles.telemetry()["active_armatures"]
-        self.assertEqual(actual["left_hip_pitch_joint"], 0.025101925)
+        self.assertEqual(actual["left_hip_pitch_joint"], 0.010177520)
+        self.assertEqual(actual["left_hip_roll_joint"], 0.025101925)
         self.assertEqual(actual["left_hip_yaw_joint"], 0.010177520)
+        self.assertEqual(actual["left_knee_joint"], 0.025101925)
         self.assertEqual(actual["left_ankle_pitch_joint"], 0.00721945)
         self.assertEqual(actual["left_wrist_pitch_joint"], 0.00425)
         self.assertEqual(actual["left_shoulder_pitch_joint"], 0.003609725)
@@ -350,6 +352,37 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             )
         )
         self.assertEqual(profiles.switch_count, 2)
+        profiles.verify_active()
+
+    def test_direct_bfm_alignment_applies_profile_before_exact_state_write(
+        self,
+    ) -> None:
+        mujoco, model, data, _joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        qpos = tuple(0.01 * index for index in range(36))
+        qvel = tuple(-0.02 * index for index in range(35))
+        runtime = MODULE._DirectBfmRuntime.__new__(MODULE._DirectBfmRuntime)
+        runtime.control = SimpleNamespace(
+            direct_initial_qpos=qpos,
+            direct_initial_qvel=qvel,
+        )
+        runtime.physics_profiles = profiles
+        runtime.reference_aligned = False
+        runtime.reference_alignment_step_index = None
+        runtime.reference_alignment_wall_s = None
+
+        runtime.align_reference(snapshot=self.snapshot(step_index=17))
+
+        self.assertTrue(runtime.reference_aligned)
+        self.assertEqual(runtime.reference_alignment_step_index, 17)
+        self.assertEqual(tuple(data.qpos[:36]), qpos)
+        self.assertEqual(tuple(data.qvel[:35]), qvel)
+        self.assertEqual(
+            profiles.active_profile_id,
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID,
+        )
         profiles.verify_active()
 
     def test_flat_v3_physics_profile_comes_from_locked_policy_config(self) -> None:
@@ -3336,6 +3369,40 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             ):
                 MODULE._validate_game_fall_recovery(SimpleNamespace(**values))
 
+    def test_direct_bfm_validation_locks_writer_scope_and_reference_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            clip = Path(temporary) / "formal7168.pkl"
+            clip.write_bytes(b"locked-reference")
+            values = {
+                "bfm_direct": True,
+                "bfm_reference_clip": clip.resolve(),
+                "bfm_reference_clip_sha256": MODULE._sha256_file(clip),
+                "bfm_direct_startup_timeout_seconds": 45.0,
+                "control_source": "planner",
+                "game_fall_recovery": "off",
+                "physical_recovery_resident_policies": False,
+                "initial_locomotion_policy": MODULE.BFM_TEACHER50K_POLICY_ID,
+                "walk_after": 0.0,
+                "vx": 0.3,
+                "vy": 0.0,
+            }
+            MODULE._validate_direct_bfm(SimpleNamespace(**values))
+
+            for expected, changes in (
+                ("control-source planner", {"control_source": "game"}),
+                ("forbids fall recovery", {"game_fall_recovery": "physical"}),
+                ("initial-locomotion-policy", {"initial_locomotion_policy": "sonic"}),
+                ("walk-after 0", {"walk_after": -1.0}),
+                ("SHA256 mismatch", {"bfm_reference_clip_sha256": "0" * 64}),
+            ):
+                invalid = values.copy()
+                invalid.update(changes)
+                with self.subTest(changes=changes), self.assertRaisesRegex(
+                    SystemExit,
+                    expected,
+                ):
+                    MODULE._validate_direct_bfm(SimpleNamespace(**invalid))
+
     def test_physical_recovery_validation_requires_local_worker_and_models(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4099,6 +4166,34 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertIn("os.WNOWAIT", supervisor)
         self.assertIn("start_new_session=True", supervisor)
         self.assertIn("signal.SIGKILL", supervisor)
+
+    def test_run_sim_exposes_direct_bfm_to_the_ue_main_chain(self) -> None:
+        run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(encoding="utf-8")
+
+        self.assertIn('case "${MATRIX_BFM_DIRECT:-0}" in', run_sim)
+        self.assertIn("1|true|yes|on) BFM_DIRECT_ARGS+=(--bfm-direct)", run_sim)
+        self.assertIn('"${BFM_DIRECT_ARGS[@]}"', run_sim)
+        self.assertLess(
+            run_sim.index('"${INITIAL_LOCOMOTION_ARGS[@]}"'),
+            run_sim.index('"${BFM_DIRECT_ARGS[@]}"'),
+        )
+
+    def test_launcher_fall_diagnostic_is_unbounded_planner_only(self) -> None:
+        launcher = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("--allow-fall-diagnostic", launcher)
+        self.assertIn('if [[ "$ALLOW_FALL_DIAGNOSTIC" == "1" ]]', launcher)
+        self.assertIn(
+            "--allow-fall-diagnostic requires --max-seconds 0",
+            launcher,
+        )
+        self.assertIn(
+            "--allow-fall-diagnostic requires planner control and recovery off",
+            launcher,
+        )
+        self.assertIn("export MATRIX_SONIC_FAIL_ON_FALL=0", launcher)
 
     def test_ue_supervisor_classifies_unexpected_and_expected_exit(self) -> None:
         supervisor = REPO_ROOT / "scripts/supervise_matrix_ue.py"
@@ -6175,6 +6270,49 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_initial_bfm_locomotion_policy_waits_for_admission(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.initial_locomotion_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator._initial_locomotion_policy_requested = False
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator._policy_selection_pending = None
+        coordinator.bfm_switch_admission_ready = False
+        coordinator.request_policy_slot_assignment = mock.Mock(return_value=None)
+
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_not_called()
+        self.assertFalse(coordinator._initial_locomotion_policy_requested)
+
+        coordinator.bfm_switch_admission_ready = True
+        coordinator.request_policy_slot_assignment.side_effect = MODULE.CommandExecutionError(
+            "E_POLICY_WORKER_NOT_READY",
+            "BFM Teacher resident shadow is not ready and writer-fenced",
+        )
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_called_once()
+        self.assertFalse(coordinator._initial_locomotion_policy_requested)
+
+        coordinator.request_policy_slot_assignment.reset_mock()
+        coordinator.request_policy_slot_assignment.side_effect = None
+        coordinator.request_policy_slot_assignment.return_value = None
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_called_once()
+        command = coordinator.request_policy_slot_assignment.call_args.args[0]
+        self.assertEqual(command.slot, "locomotion")
+        self.assertEqual(command.policy_id, MODULE.BFM_TEACHER50K_POLICY_ID)
+        self.assertEqual(
+            coordinator.request_policy_slot_assignment.call_args.kwargs[
+                "transition_id"
+            ],
+            "initial-locomotion-bfm-sonic-teacher50k",
+        )
+        self.assertTrue(coordinator._initial_locomotion_policy_requested)
+
+        coordinator._request_initial_locomotion_policy_if_ready()
+        coordinator.request_policy_slot_assignment.assert_called_once()
+
     def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
         self,
     ) -> None:
@@ -6619,6 +6757,43 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(
             command[command.index("--amp-hold-config") + 1],
             "/models/amp.json",
+        )
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_bfm_teacher_disables_bytecode_writes_in_locked_sources(
+        self, popen
+    ) -> None:
+        popen.return_value = mock.Mock(pid=4400)
+        group = MODULE.NativeProcessGroup(Path("/sonic"), {})
+
+        group.start_bfm_teacher(
+            "/policy/python",
+            Path("/matrix/scripts/matrix_bfm_teacher_adapter.py"),
+            interface="lo",
+            control_socket=Path("/run/user/1000/bfm.sock"),
+            model=Path("/models/teacher.onnx"),
+            config=Path("/models/config.yaml"),
+            bfm_source_root=Path("/sources/bfm"),
+            realscan_source_root=Path("/sources/realscan"),
+            robo_pfnn_root=Path("/sources/robo-pfnn"),
+            weights=Path("/sources/bfm/weights"),
+            g1_xml=Path("/sources/robo-pfnn/g1.xml"),
+            formal_ik=Path("/sources/bfm/pfnn_ik.py"),
+            execution_provider="cpu",
+            activation_blend_seconds=0.1,
+            direct_start=True,
+        )
+
+        guarded = popen.call_args.args[0]
+        command = guarded[guarded.index("--") + 1 :]
+        self.assertEqual(
+            command[:4],
+            [
+                "/policy/python",
+                "-B",
+                "-u",
+                "/matrix/scripts/matrix_bfm_teacher_adapter.py",
+            ],
         )
 
     @unittest.skipUnless(

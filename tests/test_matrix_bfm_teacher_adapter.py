@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 from pathlib import Path
 import sys
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -265,6 +267,21 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             200.0,
         )
 
+    def test_bfm_g1_pd_contract_keeps_hip_pitch_on_7520_14(self) -> None:
+        kp, kd, scale = MODULE._joint_control_vectors()
+        names = list(MODULE.G1_29_JOINT_NAMES)
+        hip_pitch = names.index("left_hip_pitch_joint")
+        hip_roll = names.index("left_hip_roll_joint")
+        knee = names.index("left_knee_joint")
+        hip_yaw = names.index("left_hip_yaw_joint")
+
+        self.assertAlmostEqual(kp[hip_pitch], kp[hip_yaw])
+        self.assertAlmostEqual(kd[hip_pitch], kd[hip_yaw])
+        self.assertAlmostEqual(scale[hip_pitch], scale[hip_yaw])
+        self.assertNotAlmostEqual(kp[hip_pitch], kp[hip_roll])
+        self.assertAlmostEqual(kp[hip_roll], kp[knee])
+        self.assertAlmostEqual(scale[hip_roll], scale[knee])
+
     def test_resident_lowcmd_publisher_rejects_state_beyond_stale_grace(
         self,
     ) -> None:
@@ -341,8 +358,11 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
                     self.future_xy_delta_m = 0.0
                 plan = SimpleNamespace(
                     future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    qpos_50hz=np.zeros((47, 36), dtype=np.float32),
+                    joint_vel_50hz=np.zeros((47, 29), dtype=np.float32),
                     target_speed=self.target_speed,
                 )
+                plan.qpos_50hz[:, 3] = 1.0
                 plan.future_qpos[-1, 0] = self.future_xy_delta_m
                 return SimpleNamespace(
                     plan=plan,
@@ -362,7 +382,8 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             RobotObservation=lambda **fields: SimpleNamespace(**fields),
         )
         core.reference_module = SimpleNamespace(
-            LocalTerrainHeightField=lambda *_args: object()
+            LocalTerrainHeightField=lambda *_args: object(),
+            qpos_root_velocity=lambda *_args: np.zeros(6, dtype=np.float32),
         )
         core.teacher = FakeTeacher()
         core.stream = FakeStream()
@@ -374,13 +395,43 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         core.reference_stop_resets = 0
         core.reference_transition = None
         core.reference_hold_target = None
+        core.idle_anchor_target = None
         core.activation_blend_steps = 4
         core.activation_origin = None
         core.activation_step = 0
         core.default_joint_pos = np.zeros(MODULE.NUM_JOINTS, dtype=np.float32)
         core.action_scale = np.ones(MODULE.NUM_JOINTS, dtype=np.float32)
         core.isaac_to_matrix = np.arange(MODULE.NUM_JOINTS)
+        core.direct_start = False
+        core.direct_reference_start = None
         return core
+
+    def test_direct_start_exports_reference_state_and_skips_hot_switch_blend(
+        self,
+    ) -> None:
+        core = self.inference_core()
+        core.direct_start = True
+        moving = self.world(sequence=1)
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+        moving.speed_mps = 0.3
+        moving.locomotion_mode = 1
+        moving.mode = "move"
+        moving.safe_stop = False
+
+        core.step(moving, self.lowstate(), active=False)
+
+        self.assertEqual(len(core.direct_reference_start["qpos"]), 36)
+        self.assertEqual(len(core.direct_reference_start["qvel"]), 35)
+        core.prepare_direct_activation()
+        self.assertTrue(core.reference_motion_active)
+        self.assertIsNone(core.activation_origin)
+
+        moving.sequence = 2
+        target, status = core.step(moving, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
+        self.assertEqual(status["activation_blend_fraction"], 1.0)
+        self.assertFalse(status["reference_transition_holding"])
 
     @staticmethod
     def world(sequence: int = 1):
@@ -424,10 +475,43 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         np.testing.assert_allclose(target, lowstate.joint_pos_rad)
         np.testing.assert_allclose(
             core.previous_action,
-            lowstate.joint_pos_rad,
+            np.zeros(MODULE.NUM_JOINTS),
         )
+        self.assertTrue(status["idle_anchor_hold"])
         self.assertEqual(status["activation_blend_fraction"], 0.0)
         self.assertEqual(status["published_target_delta_rms_rad"], 0.0)
+
+    def test_active_idle_holds_first_current_pose_without_teacher_drift(self) -> None:
+        core = self.inference_core()
+        first_lowstate = self.lowstate(joint_value=0.41)
+        second_lowstate = self.lowstate(joint_value=0.36)
+
+        first_target, first_status = core.step(
+            self.world(sequence=1),
+            first_lowstate,
+            active=True,
+        )
+        second_target, second_status = core.step(
+            self.world(sequence=2),
+            second_lowstate,
+            active=True,
+        )
+
+        np.testing.assert_allclose(first_target, first_lowstate.joint_pos_rad)
+        np.testing.assert_allclose(second_target, first_lowstate.joint_pos_rad)
+        np.testing.assert_allclose(
+            core.previous_action,
+            np.zeros(MODULE.NUM_JOINTS),
+        )
+        self.assertTrue(first_status["idle_anchor_hold"])
+        self.assertTrue(second_status["idle_anchor_hold"])
+        self.assertTrue(second_status["idle_anchor_initialized"])
+        self.assertEqual(first_status["published_target_delta_max_rad"], 0.0)
+        self.assertAlmostEqual(
+            second_status["published_target_delta_max_rad"],
+            0.05,
+            places=6,
+        )
 
     def test_standby_preview_does_not_accumulate_unapplied_action(self) -> None:
         core = self.inference_core()
@@ -446,6 +530,66 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         )
         self.assertTrue(status["shadow_preview"])
         self.assertEqual(core.teacher.reset_count, 1)
+
+    def test_policy_trace_writes_contract_and_shape_summary(self) -> None:
+        core = self.inference_core()
+        with tempfile.TemporaryDirectory() as temporary:
+            trace_file = Path(temporary) / "bfm-policy-trace.jsonl"
+            core.trace_file = trace_file
+            core.trace_ticks = 1
+            core.trace_written = 0
+
+            core.step(self.world(), self.lowstate(), active=False)
+            core.step(self.world(sequence=2), self.lowstate(), active=False)
+
+            records = [
+                json.loads(line)
+                for line in trace_file.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(
+            record["schema"],
+            "matrix.bfm_teacher.policy_tick_trace.v1",
+        )
+        self.assertEqual(record["contract_dims"]["model_input_dim"], 1790)
+        self.assertEqual(record["contract_dims"]["action_dim"], MODULE.NUM_JOINTS)
+        self.assertEqual(
+            record["source_hashes"]["teacher_onnx_sha256"],
+            MODULE.TEACHER_ONNX_SHA256,
+        )
+        self.assertEqual(record["height_map_z"]["shape"], [11, 11])
+        self.assertTrue(record["height_map_z"]["finite"])
+        self.assertEqual(
+            record["observation"]["previous_action"]["shape"],
+            [MODULE.NUM_JOINTS],
+        )
+        self.assertEqual(record["action_isaac"]["shape"], [MODULE.NUM_JOINTS])
+        self.assertEqual(record["published_target"]["shape"], [MODULE.NUM_JOINTS])
+        self.assertEqual(
+            len(record["joint_ledger"]["matrix_mujoco_actuator_order"]),
+            MODULE.NUM_JOINTS,
+        )
+        self.assertEqual(
+            len(record["joint_ledger"]["isaac_action_order"]),
+            MODULE.NUM_JOINTS,
+        )
+        self.assertEqual(
+            record["joint_argmax"]["published_target_minus_current"]["joint_name"],
+            MODULE.G1_29_JOINT_NAMES[0],
+        )
+        self.assertEqual(
+            record["joint_argmax"]["raw_action_delta_isaac"]["joint_name"],
+            MODULE.G1_29_JOINT_NAMES[0],
+        )
+        self.assertTrue(record["reference"]["reference_ready"])
+        self.assertTrue(record["reference"]["continuity"]["valid"])
+        self.assertEqual(
+            record["reference"]["continuity"]["root_xy_delta_01_m"],
+            0.0,
+        )
+        self.assertEqual(core.trace_written, 1)
 
     def test_motion_to_idle_discards_stale_walking_reference(self) -> None:
         core = self.inference_core()
@@ -603,6 +747,68 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertFalse(swapped["reference_transition_holding"])
         self.assertTrue(swapped["reference_transition_completed"])
         self.assertIsNone(swapped["reference_transition"])
+        np.testing.assert_allclose(resumed_target, lowstate.joint_pos_rad)
+
+    def test_active_reference_rebuild_holds_observed_pose_until_buffer_swaps(
+        self,
+    ) -> None:
+        class DelayedRebuildStream:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def sample(self, _command, *_args):
+                self.calls += 1
+                swapped = self.calls >= 2
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=0.8,
+                )
+                plan.future_qpos[-1, 0] = 1.0
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=True,
+                    replan_reason="root_anchor",
+                    plan_index=self.calls,
+                    root_error_before_m=0.0,
+                    pending_rebuild=not swapped,
+                    buffer_swapped=swapped,
+                )
+
+        core = self.inference_core()
+        core.reference_motion_active = True
+        core.previous_action.fill(3.0)
+        core.stream = DelayedRebuildStream()
+        lowstate = self.lowstate(joint_value=0.37)
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.8
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+        resets_before = core.teacher.reset_count
+
+        held_target, pending = core.step(moving, lowstate, active=True)
+
+        self.assertEqual(core.teacher.reset_count, resets_before)
+        self.assertEqual(pending["reference_transition"], "rebuilding")
+        self.assertTrue(pending["reference_pending_rebuild"])
+        self.assertFalse(pending["reference_buffer_swapped"])
+        self.assertFalse(pending["reference_transition_completed"])
+        self.assertTrue(pending["reference_transition_holding"])
+        np.testing.assert_allclose(held_target, lowstate.joint_pos_rad)
+        np.testing.assert_allclose(
+            core.previous_action,
+            np.zeros(MODULE.NUM_JOINTS),
+        )
+
+        moving.sequence = 2
+        resumed_target, swapped = core.step(moving, lowstate, active=True)
+
+        self.assertEqual(core.teacher.reset_count, resets_before + 1)
+        self.assertIsNone(swapped["reference_transition"])
+        self.assertTrue(swapped["reference_buffer_swapped"])
+        self.assertTrue(swapped["reference_transition_completed"])
+        self.assertFalse(swapped["reference_transition_holding"])
         np.testing.assert_allclose(resumed_target, lowstate.joint_pos_rad)
 
 

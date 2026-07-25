@@ -141,6 +141,7 @@ OFFSCREEN=0
 STARTUP_BAND=1
 STARTUP_BAND_HOLD="4"
 STARTUP_BAND_FADE="3"
+ALLOW_FALL_DIAGNOSTIC=0
 
 usage() {
     printf '%s\n' \
@@ -199,6 +200,7 @@ usage() {
         "  --vy MPS                    Lateral command after walk delay" \
         "  --yaw-rate RAD_S           Yaw command after walk delay" \
         "  --max-seconds SECONDS      Stop a bounded smoke automatically; 0 is unlimited" \
+        "  --allow-fall-diagnostic    Keep an unbounded planner run alive after a fall for video diagnosis" \
         "  --min-active-seconds SEC   Fail if fresh lowcmd is active for less than SEC" \
         "  --min-displacement-m M     Fail if final XY displacement is below M" \
         "  --low-cmd-fresh-timeout-seconds SEC  Maximum accepted DDS lowcmd age (default: 0.1)" \
@@ -265,6 +267,7 @@ while [[ $# -gt 0 ]]; do
         --vy) VY="$2"; shift 2 ;;
         --yaw-rate) YAW_RATE="$2"; shift 2 ;;
         --max-seconds) MAX_SECONDS="$2"; shift 2 ;;
+        --allow-fall-diagnostic) ALLOW_FALL_DIAGNOSTIC=1; shift ;;
         --min-active-seconds) MIN_ACTIVE_SECONDS="$2"; shift 2 ;;
         --min-displacement-m) MIN_DISPLACEMENT_M="$2"; shift 2 ;;
         --low-cmd-fresh-timeout-seconds) LOW_CMD_FRESH_TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -826,10 +829,9 @@ if [[ "$GAME_FALL_RECOVERY" == "physical" ]]; then
             ;;
     esac
     if [[ "$PHYSICAL_RECOVERY_RESIDENT_POLICIES" == "1" ]]; then
-        if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" != "kungfu" \
-            || "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
+        if [[ "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
             || "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" != "cuda" ]]; then
-            echo "[ERROR] Resident recovery requires kungfu -> sonic with CUDA" >&2
+            echo "[ERROR] Resident recovery requires sonic handoff with CUDA" >&2
             exit 2
         fi
     fi
@@ -1266,7 +1268,17 @@ export MATRIX_SONIC_QUALIFICATION_PROFILE
 export MATRIX_SONIC_RUNTIME_LOCK_SHA256
 export MATRIX_SONIC_MATRIX_COMMIT
 export MATRIX_SONIC_VERIFICATION_RECEIPT
-if [[ "$GAME_AUTO_RESPAWN" == "1" \
+if [[ "$ALLOW_FALL_DIAGNOSTIC" == "1" ]]; then
+    if [[ "$QUALIFICATION_REQUESTED" == "1" ]]; then
+        echo "[ERROR] --allow-fall-diagnostic requires --max-seconds 0" >&2
+        exit 2
+    fi
+    if [[ "$CONTROL_SOURCE" != "planner" || "$GAME_FALL_RECOVERY" != "off" ]]; then
+        echo "[ERROR] --allow-fall-diagnostic requires planner control and recovery off" >&2
+        exit 2
+    fi
+    export MATRIX_SONIC_FAIL_ON_FALL=0
+elif [[ "$GAME_AUTO_RESPAWN" == "1" \
     || "$GAME_FALL_RECOVERY" == "sonic" \
     || "$GAME_FALL_RECOVERY" == "physical" ]]; then
     export MATRIX_SONIC_FAIL_ON_FALL=0

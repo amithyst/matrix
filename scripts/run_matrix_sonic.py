@@ -373,6 +373,38 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--initial-locomotion-policy",
+        choices=("sonic", BFM_TEACHER50K_POLICY_ID),
+        default=os.environ.get("MATRIX_INITIAL_LOCOMOTION_POLICY", "sonic"),
+        help=(
+            "Initial locomotion policy selected after resident writer gates are "
+            "ready; uses the same writer-fenced handoff as /policy"
+        ),
+    )
+    parser.add_argument(
+        "--bfm-direct",
+        action="store_true",
+        help=(
+            "Cold-start the provenance-locked BFM Teacher as the sole LowCmd "
+            "writer; no SONIC deploy or recovery worker is created"
+        ),
+    )
+    parser.add_argument(
+        "--bfm-reference-clip",
+        type=Path,
+        help=(
+            "Optional absolute formal7168 robot pickle for the fixed-reference "
+            "direct-BFM gate; omit for online Robo-PFNN"
+        ),
+    )
+    parser.add_argument("--bfm-reference-clip-sha256")
+    parser.add_argument(
+        "--bfm-direct-startup-timeout-seconds",
+        type=float,
+        default=45.0,
+        help="Writer-free BFM load, reference alignment, and first-write deadline",
+    )
+    parser.add_argument(
         "--bfm-teacher-worker",
         type=Path,
         default=_SCRIPT_DIR / "matrix_bfm_teacher_adapter.py",
@@ -783,6 +815,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--vy", type=float, default=0.0)
     parser.add_argument("--yaw-rate", type=float, default=0.0)
     parser.add_argument("--status-file", type=Path)
+    parser.add_argument("--bfm-trace-file", type=Path)
+    parser.add_argument("--bfm-trace-ticks", type=int, default=0)
     parser.add_argument("--qualified-runtime", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--qualification-profile", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--runtime-lock-sha256", default=None, help=argparse.SUPPRESS)
@@ -1579,6 +1613,55 @@ def _validate_qualified_acceptance(args: argparse.Namespace) -> None:
         raise SystemExit(
             "qualified acceptance gates cannot weaken the runtime lock:\n  "
             + "\n  ".join(weaker)
+        )
+
+
+def _validate_direct_bfm(args: argparse.Namespace) -> None:
+    enabled = bool(getattr(args, "bfm_direct", False))
+    reference_clip = getattr(args, "bfm_reference_clip", None)
+    reference_sha256 = getattr(args, "bfm_reference_clip_sha256", None)
+    if not enabled:
+        if reference_clip is not None or reference_sha256 is not None:
+            raise SystemExit("--bfm-reference-clip requires --bfm-direct")
+        return
+    if args.control_source != "planner":
+        raise SystemExit("--bfm-direct requires --control-source planner")
+    if getattr(args, "game_fall_recovery", "off") != "off":
+        raise SystemExit("--bfm-direct forbids fall recovery")
+    if bool(getattr(args, "physical_recovery_resident_policies", False)):
+        raise SystemExit("--bfm-direct forbids resident recovery policies")
+    if str(args.initial_locomotion_policy) != BFM_TEACHER50K_POLICY_ID:
+        raise SystemExit(
+            "--bfm-direct requires --initial-locomotion-policy "
+            f"{BFM_TEACHER50K_POLICY_ID}"
+        )
+    if not math.isclose(float(args.walk_after), 0.0, abs_tol=1e-12):
+        raise SystemExit("--bfm-direct requires --walk-after 0")
+    speed = math.hypot(float(args.vx), float(args.vy))
+    if not math.isfinite(speed) or speed <= 1.0e-8:
+        raise SystemExit("--bfm-direct requires a finite nonzero planar velocity")
+    timeout = float(args.bfm_direct_startup_timeout_seconds)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise SystemExit(
+            "--bfm-direct-startup-timeout-seconds must be positive and finite"
+        )
+    if reference_clip is None:
+        if reference_sha256 is not None:
+            raise SystemExit(
+                "--bfm-reference-clip-sha256 requires --bfm-reference-clip"
+            )
+        return
+    if not reference_clip.is_absolute():
+        raise SystemExit("--bfm-reference-clip must be absolute")
+    if not reference_clip.is_file():
+        raise SystemExit(f"BFM reference clip is missing: {reference_clip}")
+    if re.fullmatch(r"[0-9a-f]{64}", reference_sha256 or "") is None:
+        raise SystemExit("--bfm-reference-clip-sha256 must be a lowercase SHA256")
+    actual = _sha256_file(reference_clip)
+    if actual != reference_sha256:
+        raise SystemExit(
+            "BFM reference clip SHA256 mismatch: "
+            f"expected={reference_sha256} actual={actual}"
         )
 
 
@@ -6612,11 +6695,17 @@ class NativeProcessGroup:
         formal_ik: Path,
         execution_provider: str,
         activation_blend_seconds: float,
+        direct_start: bool = False,
+        reference_clip: Path | None = None,
+        reference_clip_sha256: str | None = None,
+        trace_file: Path | None = None,
+        trace_ticks: int = 0,
     ) -> int:
         if self.bfm_teacher_alive():
             raise RuntimeError("BFM Teacher locomotion worker is already alive")
         command = [
             python,
+            "-B",
             "-u",
             str(worker),
             "--model",
@@ -6644,6 +6733,30 @@ class NativeProcessGroup:
             "--activation-blend-seconds",
             str(activation_blend_seconds),
         ]
+        if direct_start:
+            command.append("--direct-start")
+        if reference_clip is not None:
+            if not direct_start or not reference_clip_sha256:
+                raise RuntimeError(
+                    "fixed BFM reference requires direct start and SHA256"
+                )
+            command.extend(
+                (
+                    "--reference-clip",
+                    str(reference_clip),
+                    "--reference-clip-sha256",
+                    reference_clip_sha256,
+                )
+            )
+        if trace_file is not None and trace_ticks > 0:
+            command.extend(
+                (
+                    "--trace-file",
+                    str(trace_file),
+                    "--trace-ticks",
+                    str(trace_ticks),
+                )
+            )
         pid = self._start(
             "bfm-locomotion-policy",
             command,
@@ -7988,6 +8101,10 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self.epoch_first_write = False
         self.dropped_state_packets = 0
         self.last_state_sequence: int | None = None
+        self.direct_start = False
+        self.reference_source: str | None = None
+        self.direct_initial_qpos: tuple[float, ...] | None = None
+        self.direct_initial_qvel: tuple[float, ...] | None = None
 
     @property
     def current_first_write(self) -> bool:
@@ -8033,6 +8150,11 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.paused = True
             self.execution_provider = str(payload.get("execution_provider"))
             self.models_loaded_once = True
+            self.direct_start = bool(payload.get("direct_start", False))
+            reference_source = payload.get("reference_source")
+            self.reference_source = (
+                str(reference_source) if reference_source is not None else None
+            )
         elif event == "WARMED_NO_WRITER":
             if not self.ready or payload.get("writer_created") is not False:
                 raise RuntimeError("BFM Teacher warmup violated writer-free startup")
@@ -8040,6 +8162,27 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 raise RuntimeError("BFM Teacher did not attest warmup")
             self.warmed = True
             self.models_warmed = True
+            if bool(payload.get("direct_start", False)) != self.direct_start:
+                raise RuntimeError("BFM Teacher direct-start attestation changed")
+            reference_source = payload.get("reference_source")
+            if reference_source != self.reference_source:
+                raise RuntimeError("BFM Teacher reference source changed during warmup")
+            if self.direct_start:
+                try:
+                    qpos = tuple(float(value) for value in payload["direct_initial_qpos"])
+                    qvel = tuple(float(value) for value in payload["direct_initial_qvel"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "BFM Teacher direct warmup has invalid initial state"
+                    ) from exc
+                if len(qpos) != 36 or len(qvel) != 35 or any(
+                    not math.isfinite(value) for value in (*qpos, *qvel)
+                ):
+                    raise RuntimeError(
+                        "BFM Teacher direct initial state must be finite 36D/35D"
+                    )
+                self.direct_initial_qpos = qpos
+                self.direct_initial_qvel = qvel
         elif event == "FIRST_WRITE":
             if not self.activation_pending:
                 raise RuntimeError("BFM Teacher wrote without supervisor activation")
@@ -8216,6 +8359,12 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 "current_first_write": self.current_first_write,
                 "dropped_state_packets": self.dropped_state_packets,
                 "last_state_sequence": self.last_state_sequence,
+                "direct_start": self.direct_start,
+                "reference_source": self.reference_source,
+                "direct_initial_state_received": bool(
+                    self.direct_initial_qpos is not None
+                    and self.direct_initial_qvel is not None
+                ),
             }
         )
         return result
@@ -8327,9 +8476,9 @@ class _LocomotionPhysicsProfiles:
 
     @staticmethod
     def _bfm_armature(name: str) -> float:
-        if any(token in name for token in ("hip_pitch", "hip_roll", "knee")):
+        if any(token in name for token in ("hip_roll", "knee")):
             return 0.025101925
-        if "hip_yaw" in name or name == "waist_yaw_joint":
+        if "hip_pitch" in name or "hip_yaw" in name or name == "waist_yaw_joint":
             return 0.010177520
         if "ankle_" in name or name in {
             "waist_roll_joint",
@@ -8500,6 +8649,270 @@ class _LocomotionPhysicsProfiles:
             "last_transition": self.last_transition,
             "last_error": self.last_error,
         }
+
+
+class _DirectBfmRuntime:
+    """Cold-start BFM as Matrix's sole locomotion writer."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        manifest_path = Path(args.locomotion_policy_manifest)
+        self.candidate = evaluate_policy_candidate(
+            manifest_path,
+            _SCRIPT_DIR.parent / "config/runtime/matrix-sonic.lock.json",
+            project_root=_SCRIPT_DIR.parent,
+        )
+        self.control = _BfmTeacherControl(Path(args.bfm_teacher_control_socket))
+        self.python = str(args.bfm_teacher_python)
+        self.worker_script = Path(args.bfm_teacher_worker).resolve()
+
+        def required_path(name: str) -> Path:
+            value = getattr(args, name, None)
+            if not isinstance(value, Path):
+                raise ValueError(f"direct BFM requires --{name.replace('_', '-')}")
+            return value.resolve()
+
+        self.model = required_path("bfm_teacher_model")
+        self.config = required_path("bfm_teacher_config")
+        self.bfm_source_root = required_path("bfm_source_root")
+        self.realscan_source_root = required_path("bfm_realscan_source_root")
+        self.robo_pfnn_root = required_path("bfm_robo_pfnn_root")
+        self.weights = required_path("bfm_pfnn_weights")
+        self.g1_xml = required_path("bfm_g1_xml")
+        self.formal_ik = required_path("bfm_formal_ik")
+        reference_clip = getattr(args, "bfm_reference_clip", None)
+        self.reference_clip = (
+            reference_clip.resolve() if isinstance(reference_clip, Path) else None
+        )
+        self.reference_clip_sha256 = getattr(
+            args,
+            "bfm_reference_clip_sha256",
+            None,
+        )
+        self.execution_provider = str(args.physical_recovery_execution_provider)
+        self.activation_blend_seconds = float(
+            args.bfm_teacher_activation_blend_seconds
+        )
+        self.trace_file = (
+            args.bfm_trace_file.resolve()
+            if isinstance(args.bfm_trace_file, Path)
+            else None
+        )
+        self.trace_ticks = max(0, int(args.bfm_trace_ticks))
+        self.startup_timeout_s = float(args.bfm_direct_startup_timeout_seconds)
+        self.physics_profiles: _LocomotionPhysicsProfiles | None = None
+        self.process_started = False
+        self.reference_aligned = False
+        self.reference_alignment_step_index: int | None = None
+        self.reference_alignment_wall_s: float | None = None
+        self.activation_requested = False
+        self.first_write_wall_s: float | None = None
+
+    def validate(self) -> None:
+        if (
+            self.candidate.policy_id != BFM_TEACHER50K_POLICY_ID
+            or not self.candidate.provenance_verified
+        ):
+            raise RuntimeError(
+                "direct BFM candidate provenance is not verified: "
+                + "; ".join(self.candidate.unavailable_reasons)
+            )
+        python = Path(self.python)
+        if not python.is_file():
+            raise RuntimeError(f"BFM Teacher Python is missing: {python}")
+        for label, path in {
+            "worker": self.worker_script,
+            "model": self.model,
+            "config": self.config,
+            "G1 XML": self.g1_xml,
+            "formal IK": self.formal_ik,
+        }.items():
+            if not path.is_file():
+                raise RuntimeError(f"BFM Teacher {label} is missing: {path}")
+        for label, path in {
+            "BFM source": self.bfm_source_root,
+            "RealScan source": self.realscan_source_root,
+            "Robo-PFNN source": self.robo_pfnn_root,
+            "PFNN weights": self.weights,
+        }.items():
+            if not path.is_dir():
+                raise RuntimeError(f"BFM Teacher {label} is missing: {path}")
+        configured_adapter = os.environ.get(
+            "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
+            "",
+        ).strip()
+        if (
+            not configured_adapter
+            or Path(configured_adapter).resolve() != self.worker_script
+        ):
+            raise RuntimeError(
+                "BFM Teacher worker does not match the locked runtime adapter"
+            )
+        if self.reference_clip is not None:
+            if not self.reference_clip.is_file():
+                raise RuntimeError(
+                    f"BFM fixed reference clip is missing: {self.reference_clip}"
+                )
+            if _sha256_file(self.reference_clip) != self.reference_clip_sha256:
+                raise RuntimeError("BFM fixed reference clip SHA256 mismatch")
+
+    def open(
+        self,
+        *,
+        processes: NativeProcessGroup,
+        mujoco_module: Any,
+        model: Any,
+        data: Any,
+    ) -> None:
+        self.validate()
+        self.physics_profiles = _LocomotionPhysicsProfiles(
+            mujoco_module,
+            model,
+            data,
+        )
+        self.control.open()
+        worker_pid = processes.start_bfm_teacher(
+            self.python,
+            self.worker_script,
+            interface=self.args.dds_interface,
+            control_socket=self.control.path,
+            model=self.model,
+            config=self.config,
+            bfm_source_root=self.bfm_source_root,
+            realscan_source_root=self.realscan_source_root,
+            robo_pfnn_root=self.robo_pfnn_root,
+            weights=self.weights,
+            g1_xml=self.g1_xml,
+            formal_ik=self.formal_ik,
+            execution_provider=self.execution_provider,
+            activation_blend_seconds=self.activation_blend_seconds,
+            direct_start=True,
+            reference_clip=self.reference_clip,
+            reference_clip_sha256=self.reference_clip_sha256,
+            trace_file=self.trace_file,
+            trace_ticks=self.trace_ticks,
+        )
+        self.control.bind_expected_peer_pid(worker_pid)
+        self.process_started = True
+
+    def poll(self) -> None:
+        self.control.poll()
+        if self.control.error is not None:
+            raise RuntimeError(f"BFM Teacher worker: {self.control.error}")
+
+    def command(self, snapshot: Any, *, walking: bool = True) -> RobotMotionCommand:
+        root_yaw = _root_yaw_rad(snapshot.qpos)
+        speed = math.hypot(float(self.args.vx), float(self.args.vy))
+        if not walking or speed <= 1.0e-8:
+            return RobotMotionCommand(
+                sequence=int(snapshot.step_index),
+                movement=(0.0, 0.0, 0.0),
+                facing=(math.cos(root_yaw), math.sin(root_yaw), 0.0),
+                speed_mps=0.0,
+                locomotion_mode=SONIC_IDLE_MODE,
+                mode="safe_stop",
+                safe_stop=True,
+                reason="direct_bfm_wait",
+            )
+        local_x = float(self.args.vx) / speed
+        local_y = float(self.args.vy) / speed
+        cosine = math.cos(root_yaw)
+        sine = math.sin(root_yaw)
+        movement = (
+            cosine * local_x - sine * local_y,
+            sine * local_x + cosine * local_y,
+            0.0,
+        )
+        facing = (cosine, sine, 0.0)
+        return RobotMotionCommand(
+            sequence=int(snapshot.step_index),
+            movement=movement,
+            facing=facing,
+            desired_facing=facing,
+            speed_mps=speed,
+            locomotion_mode=SONIC_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+
+    def publish_state(self, snapshot: Any, *, height_map_z: Any) -> bool:
+        return self.control.send_state(
+            snapshot,
+            self.command(snapshot, walking=True),
+            root_yaw=_root_yaw_rad(snapshot.qpos),
+            height_map_z=height_map_z,
+        )
+
+    def align_reference(self, *, snapshot: Any) -> None:
+        if self.reference_aligned:
+            return
+        qpos = self.control.direct_initial_qpos
+        qvel = self.control.direct_initial_qvel
+        profiles = self.physics_profiles
+        if qpos is None or qvel is None or profiles is None:
+            raise RuntimeError("direct BFM reference is not ready for alignment")
+        profiles.apply(_LocomotionPhysicsProfiles.BFM_PROFILE_ID)
+        data = profiles.data
+        if len(data.qpos) < len(qpos) or len(data.qvel) < len(qvel):
+            raise RuntimeError("live MuJoCo state is smaller than direct BFM reference")
+        for index, value in enumerate(qpos):
+            data.qpos[index] = value
+        for index, value in enumerate(qvel):
+            data.qvel[index] = value
+        profiles.mujoco.mj_forward(profiles.model, data)
+        profiles.verify_active()
+        actual_qpos = tuple(float(value) for value in data.qpos[:36])
+        actual_qvel = tuple(float(value) for value in data.qvel[:35])
+        if actual_qpos != qpos or actual_qvel != qvel:
+            raise RuntimeError("direct BFM reference alignment did not read back")
+        self.reference_aligned = True
+        self.reference_alignment_step_index = int(snapshot.step_index)
+        self.reference_alignment_wall_s = time.perf_counter()
+
+    def activate(self) -> None:
+        if not self.reference_aligned:
+            raise RuntimeError("direct BFM cannot activate before reference alignment")
+        if self.physics_profiles is None:
+            raise RuntimeError("direct BFM physics profile is unavailable")
+        self.physics_profiles.verify_active()
+        self.control.activate()
+        self.activation_requested = True
+
+    def observe_first_write(self) -> bool:
+        if self.control.current_first_write and self.first_write_wall_s is None:
+            self.first_write_wall_s = time.perf_counter()
+        return self.control.current_first_write
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "sole_lowcmd_writer": BFM_TEACHER50K_POLICY_ID,
+            "sonic_deploy_started": False,
+            "recovery_worker_started": False,
+            "reference_clip": (
+                str(self.reference_clip) if self.reference_clip is not None else None
+            ),
+            "reference_clip_sha256": self.reference_clip_sha256,
+            "reference_aligned": self.reference_aligned,
+            "reference_alignment_step_index": self.reference_alignment_step_index,
+            "activation_requested": self.activation_requested,
+            "first_write": self.control.current_first_write,
+            "writer_gate": self.control.telemetry(),
+            "physics_profile": (
+                self.physics_profiles.telemetry()
+                if self.physics_profiles is not None
+                else None
+            ),
+        }
+
+    def close(self) -> None:
+        if self.control.connection is not None and not self.control.stopped:
+            try:
+                self.control.stop()
+            except (OSError, RuntimeError):
+                pass
+        self.control.close()
 
 
 class _PhysicalRecoveryCoordinator:
@@ -8747,6 +9160,10 @@ class _PhysicalRecoveryCoordinator:
             ),
         )
         self.selected_locomotion_policy_id = "sonic"
+        self.initial_locomotion_policy_id = str(args.initial_locomotion_policy)
+        self._initial_locomotion_policy_requested = (
+            self.initial_locomotion_policy_id == "sonic"
+        )
         self.bfm_control = _BfmTeacherControl(
             Path(args.bfm_teacher_control_socket)
         )
@@ -8770,6 +9187,8 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_activation_blend_seconds = float(
             args.bfm_teacher_activation_blend_seconds
         )
+        self.bfm_trace_file = optional_path("bfm_trace_file")
+        self.bfm_trace_ticks = max(0, int(args.bfm_trace_ticks))
         if (
             not math.isfinite(self.bfm_activation_blend_seconds)
             or self.bfm_activation_blend_seconds <= 0.0
@@ -9340,6 +9759,37 @@ class _PhysicalRecoveryCoordinator:
             transition_id, None
         )
 
+    def _request_initial_locomotion_policy_if_ready(self) -> None:
+        if getattr(self, "_initial_locomotion_policy_requested", True):
+            return
+        target = getattr(self, "initial_locomotion_policy_id", "sonic")
+        if target == getattr(self, "selected_locomotion_policy_id", "sonic"):
+            self._initial_locomotion_policy_requested = True
+            return
+        if self._policy_selection_pending is not None:
+            return
+        if target != BFM_TEACHER50K_POLICY_ID:
+            raise RuntimeError(f"unsupported initial locomotion policy: {target}")
+        if not getattr(self, "bfm_switch_admission_ready", False):
+            return
+        try:
+            loadout = self.request_policy_slot_assignment(
+                PolicySlotAssignment("locomotion", target),
+                transition_id=f"initial-locomotion-{target}",
+            )
+        except CommandExecutionError as exc:
+            if exc.code in {"E_POLICY_WORKER_NOT_READY", "E_POLICY_SWITCH_UNSAFE"}:
+                return
+            raise
+        self._initial_locomotion_policy_requested = True
+        if loadout is not None:
+            self._policy_selection_results[f"initial-locomotion-{target}"] = (
+                True,
+                "OK_POLICY_SLOT_ASSIGNED",
+                f"Assigned {target} to locomotion",
+                loadout,
+            )
+
     def _capture_restart_anchor(self, qpos: Any) -> None:
         self.restarted_root_yaw_rad = _root_yaw_rad(qpos)
         anchor_delta = wrap_angle_rad(
@@ -9691,6 +10141,7 @@ class _PhysicalRecoveryCoordinator:
         if getattr(self, "bfm_process_started", False):
             self.bfm_control.poll()
         self._reconcile_policy_slot_assignment()
+        self._request_initial_locomotion_policy_if_ready()
         if self.fsm.state not in {
             RecoveryState.GAME_SONIC,
             ResidentRecoveryState.GAME_SONIC,
@@ -10621,6 +11072,8 @@ class _PhysicalRecoveryCoordinator:
             formal_ik=self.bfm_formal_ik,
             execution_provider=self.execution_provider,
             activation_blend_seconds=self.bfm_activation_blend_seconds,
+            trace_file=self.bfm_trace_file,
+            trace_ticks=self.bfm_trace_ticks,
         )
         self.bfm_control.bind_expected_peer_pid(worker_pid)
         self.bfm_process_started = True
@@ -10709,6 +11162,10 @@ class _PhysicalRecoveryCoordinator:
             "sonic_pid": self.sonic_writer.expected_peer_pid,
             "recovery_policy_pid": self.worker.expected_peer_pid,
             "bfm_teacher_pid": self.bfm_control.expected_peer_pid,
+            "bfm_policy_trace_file": (
+                str(self.bfm_trace_file) if self.bfm_trace_file is not None else None
+            ),
+            "bfm_policy_trace_ticks_requested": self.bfm_trace_ticks,
             "locomotion_switch_admission_ready": bool(
                 self.bfm_switch_admission_ready
             ),
@@ -11274,6 +11731,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         )
     ):
         raise SystemExit("qualification metadata requires --qualified-runtime")
+    _validate_direct_bfm(args)
     _validate_game_fall_recovery(args)
     qualification_receipt = _validate_qualification_receipt(args)
     _validate_qualified_acceptance(args)
@@ -11286,6 +11744,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         or args.low_cmd_fresh_timeout_seconds <= 0.0
     ):
         raise SystemExit("--low-cmd-fresh-timeout-seconds must be positive and finite")
+    if getattr(args, "bfm_trace_ticks", 0) < 0:
+        raise SystemExit("--bfm-trace-ticks must be non-negative")
+    if (
+        getattr(args, "bfm_trace_file", None) is not None
+        and not args.bfm_trace_file.is_absolute()
+    ):
+        raise SystemExit("--bfm-trace-file must be absolute")
     if args.dds_interface != "lo":
         raise SystemExit("native Matrix SONIC requires --dds-interface lo")
     try:
@@ -11423,6 +11888,39 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 result[row, column] = float(height)
         return result
 
+    def live_mujoco_gravity_status() -> dict[str, object]:
+        environment = getattr(simulator, "sim_env", None)
+        model = getattr(environment, "mj_model", None)
+        gravity = getattr(getattr(model, "opt", None), "gravity", None)
+        if gravity is None:
+            return {
+                "mujoco_gravity": None,
+                "mujoco_gravity_contract": "fixed_1g",
+                "mujoco_gravity_is_fixed_1g": False,
+            }
+        try:
+            vector = np.asarray(gravity, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError):
+            return {
+                "mujoco_gravity": None,
+                "mujoco_gravity_contract": "fixed_1g",
+                "mujoco_gravity_is_fixed_1g": False,
+            }
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            return {
+                "mujoco_gravity": None,
+                "mujoco_gravity_contract": "fixed_1g",
+                "mujoco_gravity_is_fixed_1g": False,
+            }
+        values = [round(float(value), 8) for value in vector]
+        return {
+            "mujoco_gravity": values,
+            "mujoco_gravity_contract": "fixed_1g",
+            "mujoco_gravity_is_fixed_1g": bool(
+                np.allclose(vector, np.asarray((0.0, 0.0, -9.81)), atol=1e-9)
+            ),
+        }
+
     def live_clearance_audit() -> dict[str, object]:
         environment = getattr(simulator, "sim_env", None)
         return audit_spawn_clearance(
@@ -11456,6 +11954,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     runtime_pause: _RuntimePauseState | None = None
     runtime_pause_started_wall: float | None = None
     runtime_pause_neutral_command: RobotMotionCommand | None = None
+    direct_bfm: _DirectBfmRuntime | None = None
     game_command = None
     processes = None
     resume_probation_selected = resume_probation.enabled
@@ -11555,6 +12054,158 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             raise SystemExit(
                 f"invalid native SONIC initial snapshot: {initial_snapshot_error}"
             )
+        if bool(getattr(args, "bfm_direct", False)):
+            environment = getattr(simulator, "sim_env", None)
+            model = getattr(environment, "mj_model", None)
+            data = getattr(environment, "mj_data", None)
+            if mujoco_module is None or model is None or data is None:
+                raise SystemExit("direct BFM requires live MuJoCo model/data")
+            processes = NativeProcessGroup(sonic_root, os.environ.copy())
+            direct_bfm = _DirectBfmRuntime(args)
+            try:
+                direct_bfm.open(
+                    processes=processes,
+                    mujoco_module=mujoco_module,
+                    model=model,
+                    data=data,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise SystemExit(f"cannot start direct BFM: {exc}") from exc
+            startup_started = time.perf_counter()
+            startup_deadline = startup_started + direct_bfm.startup_timeout_s
+            startup_period_s = 1.0 / float(args.physics_hz)
+            startup_next_step = startup_started + startup_period_s
+            startup_substeps = max(
+                1,
+                int(round(float(args.physics_hz) / float(args.control_hz))),
+            )
+            startup_steps = 0
+            startup_initial_reset_count = int(snapshot.reset_count)
+            startup_state_sent = False
+            startup_last_state_pulse_s: float | None = None
+            aligned_step_index: int | None = None
+            print(
+                "matrix-sonic-runtime direct_bfm_phase=writer_free_start "
+                "sonic_deploy=false recovery_worker=false",
+                flush=True,
+            )
+            while True:
+                if time.perf_counter() >= startup_deadline:
+                    raise SystemExit(
+                        "direct BFM startup timed out before confirmed first write"
+                    )
+                failure = processes.failed_child()
+                if failure is not None:
+                    raise SystemExit(
+                        "direct BFM worker exited during startup: "
+                        f"{failure[0]}={failure[1]}"
+                    )
+                try:
+                    direct_bfm.poll()
+                except (EOFError, OSError, RuntimeError, ValueError) as exc:
+                    raise SystemExit(f"direct BFM writer gate failed: {exc}") from exc
+                if not direct_bfm.control.ready:
+                    time.sleep(min(startup_period_s, 0.01))
+                    continue
+                if not direct_bfm.control.warmed:
+                    now = time.perf_counter()
+                    if (
+                        not startup_state_sent
+                        or startup_last_state_pulse_s is None
+                        or now - startup_last_state_pulse_s >= 0.05
+                    ):
+                        snapshot = simulator.step_once(rate_limit=False)
+                        startup_steps += 1
+                        startup_error = _snapshot_validation_error(
+                            snapshot,
+                            expected_dims=expected_snapshot_dims,
+                        )
+                        if startup_error is not None:
+                            raise SystemExit(
+                                "direct BFM startup snapshot invalid: "
+                                f"{startup_error}"
+                            )
+                        if bool(snapshot.fall_detected):
+                            raise SystemExit(
+                                "direct BFM fell before reference warmup"
+                            )
+                        if int(snapshot.reset_count) != startup_initial_reset_count:
+                            raise SystemExit(
+                                "direct BFM reset before reference warmup"
+                            )
+                        startup_last_state_pulse_s = now
+                    else:
+                        time.sleep(min(startup_period_s, 0.01))
+                    try:
+                        direct_bfm.publish_state(
+                            snapshot,
+                            height_map_z=bfm_height_map(snapshot),
+                        )
+                        startup_state_sent = True
+                    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                        raise SystemExit(
+                            f"direct BFM startup STATE failed: {exc}"
+                        ) from exc
+                    continue
+                if direct_bfm.control.warmed and not direct_bfm.reference_aligned:
+                    direct_bfm.align_reference(snapshot=snapshot)
+                    snapshot = simulator.get_state_snapshot()
+                    aligned_step_index = int(snapshot.step_index)
+                    print(
+                        "matrix-sonic-runtime direct_bfm_phase=reference_aligned "
+                        f"source={direct_bfm.control.reference_source} "
+                        "physics_profile=bfm-sonic-teacher50k",
+                        flush=True,
+                    )
+                if (
+                    direct_bfm.reference_aligned
+                    and aligned_step_index is not None
+                    and int(snapshot.step_index) > aligned_step_index
+                    and not direct_bfm.activation_requested
+                ):
+                    direct_bfm.publish_state(
+                        snapshot,
+                        height_map_z=bfm_height_map(snapshot),
+                    )
+                    direct_bfm.activate()
+                    print(
+                        "matrix-sonic-runtime direct_bfm_phase=writer_authorized",
+                        flush=True,
+                    )
+                if direct_bfm.observe_first_write() and bool(snapshot.low_cmd_fresh):
+                    print(
+                        "matrix-sonic-runtime direct_bfm_phase=first_write_confirmed "
+                        f"startup_wall_s={time.perf_counter() - startup_started:.3f}",
+                        flush=True,
+                    )
+                    break
+                snapshot = simulator.step_once(rate_limit=False)
+                startup_steps += 1
+                startup_error = _snapshot_validation_error(
+                    snapshot,
+                    expected_dims=expected_snapshot_dims,
+                )
+                if startup_error is not None:
+                    raise SystemExit(
+                        f"direct BFM startup snapshot invalid: {startup_error}"
+                    )
+                if bool(snapshot.fall_detected):
+                    raise SystemExit("direct BFM fell before first-write admission")
+                if int(snapshot.reset_count) != startup_initial_reset_count:
+                    raise SystemExit("direct BFM reset before first-write admission")
+                if startup_steps % startup_substeps == 0:
+                    try:
+                        direct_bfm.poll()
+                    except (EOFError, OSError, RuntimeError, ValueError) as exc:
+                        raise SystemExit(
+                            f"direct BFM writer gate failed: {exc}"
+                        ) from exc
+                startup_next_step = _pace_absolute_deadline(
+                    startup_next_step,
+                    startup_period_s,
+                )
+            snapshot = simulator.get_state_snapshot()
+            initial_ground_height_m = local_ground_height(snapshot)
         if args.control_source == "game":
             spawn_clearance_audit = pose_clearance_audit(
                 _snapshot_world_pose(snapshot)
@@ -11644,7 +12295,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             if args.no_render_sync
             else MatrixRenderPublisher(args.render_host, args.render_port)
         )
-        processes = NativeProcessGroup(sonic_root, os.environ.copy())
+        if processes is None:
+            processes = NativeProcessGroup(sonic_root, os.environ.copy())
 
         def register_child_failure(failure: tuple[str, int] | None) -> bool:
             nonlocal child_failure, running, termination_reason
@@ -11703,7 +12355,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         # failure during the historical seven-second startup window is already
         # present here and must prevent deploy/PICO from starting.
         poll_failed_child()
-        if running and args.control_source in {"planner", "game"}:
+        if (
+            running
+            and direct_bfm is None
+            and args.control_source in {"planner", "game"}
+        ):
             planner = NativePlannerClient(
                 args.planner_bind,
                 zmq_module=zmq,
@@ -11902,7 +12558,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             processes.start_pico(
                 args.pico_python or sys.executable, port=planner_port
             )
-        if running:
+        if running and direct_bfm is None:
             initial_writer_control_socket = (
                 physical_recovery.prepare_initial_sonic_gate()
                 if physical_recovery is not None
@@ -12155,7 +12811,38 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 and args.walk_after >= 0.0
                 and active_elapsed >= args.walk_after
             )
-            if planner is not None and not runtime_pause_transition_frame:
+            if direct_bfm is not None:
+                try:
+                    direct_bfm.poll()
+                    if not direct_bfm.observe_first_write():
+                        raise RuntimeError(
+                            "direct BFM lost its confirmed writer epoch"
+                        )
+                    assert direct_bfm.physics_profiles is not None
+                    direct_bfm.physics_profiles.verify_active()
+                    direct_bfm.publish_state(
+                        snapshot,
+                        height_map_z=bfm_height_map(snapshot),
+                    )
+                except (
+                    EOFError,
+                    MoonDynamicGroundError,
+                    OSError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    unstable = True
+                    running = False
+                    termination_reason = "direct_bfm_failed"
+                    numerical_error = f"direct_bfm:{exc}"
+                    print(
+                        f"matrix-sonic-runtime ERROR direct BFM: {exc}",
+                        flush=True,
+                    )
+                    break
+                walking = True
+            elif planner is not None and not runtime_pause_transition_frame:
                 if game_input is not None:
                     assert initial_root_yaw_rad is not None
                     assert game_readiness is not None
@@ -12780,6 +13467,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "elapsed_wall_s": round(now - started_wall, 3),
                     "model": str(model_path),
                     **model_attestation,
+                    **live_mujoco_gravity_status(),
                     "nu": len(snapshot.ctrl),
                     "low_cmd_age_s": (
                         round(float(low_cmd_age_s), 6)
@@ -12873,6 +13561,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     status["moon_dynamic_ground"] = (
                         moon_dynamic_ground.telemetry()
                     )
+                if direct_bfm is not None:
+                    status["direct_bfm"] = direct_bfm.telemetry()
                 if resume_probation.enabled:
                     status["resume_probation"] = resume_probation.telemetry(
                         now_s=now
@@ -13268,6 +13958,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "verification_receipt_sha256": args.verification_receipt_sha256,
             "model": str(model_path),
             **model_attestation,
+            **live_mujoco_gravity_status(),
             "nq": len(snapshot.qpos),
             "nu": len(snapshot.ctrl),
             "numerical_error": numerical_error,
@@ -13378,6 +14069,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             final_status["moon_dynamic_ground"] = (
                 moon_dynamic_ground.telemetry()
             )
+        if direct_bfm is not None:
+            final_status["direct_bfm"] = direct_bfm.telemetry()
         if resume_probation.enabled:
             final_status["resume_probation"] = resume_probation.telemetry(
                 now_s=finished_wall
@@ -13445,6 +14138,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             cleanup_errors.append(error)
         for name, resource in (
             ("physical recovery", physical_recovery),
+            ("direct BFM", direct_bfm),
             ("native processes", processes),
             ("renderer", renderer),
             ("MoonWorld dynamic ground", moon_dynamic_ground),

@@ -83,7 +83,7 @@ BFM_SOURCE_COMMIT = "5e264ae2bee2315dc0522c48c64b4506977b2e25"
 REALSCAN_SOURCE_COMMIT = "850a71bef1e1472aaeb3ff4cb9004d9848830cfc"
 ROBO_PFNN_SOURCE_COMMIT = "eb1b8b8001a221d2147f8daa073ca447acc8649e"
 TEACHER_ONNX_SHA256 = (
-    "edbec19062d6c34621dd97df864c596d29937432d8a019dd949d03785d9cdc45"
+    "243a839d325f7b214ff40367d0c2fb32d5a36c7ef0e869b85b70a428212f37b1"
 )
 TEACHER_CONFIG_SHA256 = (
     "e7bed95642a3627cc6f6cff416da784fe2d0841b697d0f34e7039fd73af10e3f"
@@ -97,6 +97,27 @@ ROBO_PFNN_G1_XML_SHA256 = (
 ROBO_PFNN_IK_SHA256 = (
     "c8776f1e7651a4f179ea75e17b9746c41fa77a15be2cacf5809fe648340a7ab2"
 )
+CONTRACT_SOURCE_HASHES = {
+    "bfm_source_commit": BFM_SOURCE_COMMIT,
+    "realscan_source_commit": REALSCAN_SOURCE_COMMIT,
+    "robo_pfnn_source_commit": ROBO_PFNN_SOURCE_COMMIT,
+    "teacher_onnx_sha256": TEACHER_ONNX_SHA256,
+    "teacher_config_sha256": TEACHER_CONFIG_SHA256,
+    "robo_pfnn_weights_tree_sha256": ROBO_PFNN_WEIGHTS_TREE_SHA256,
+    "robo_pfnn_g1_xml_sha256": ROBO_PFNN_G1_XML_SHA256,
+    "formal7168_ik_sha256": ROBO_PFNN_IK_SHA256,
+}
+CONTRACT_DIMS = {
+    "model_input_dim": 1790,
+    "tokenizer_dim": 761,
+    "command_dim": 580,
+    "height_map_dim": 121,
+    "orientation_dim": 60,
+    "actor_observation_dim": 1029,
+    "history_length": 10,
+    "compatibility_zero_dim": 99,
+    "action_dim": NUM_JOINTS,
+}
 
 _ARMATURE_5020 = 0.003609725
 _ARMATURE_7520_14 = 0.010177520
@@ -299,11 +320,15 @@ def _joint_control_vectors() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     kd: list[float] = []
     effort: list[float] = []
     for name in G1_29_JOINT_NAMES:
-        if any(token in name for token in ("hip_pitch", "hip_roll", "knee")):
+        if any(token in name for token in ("hip_roll", "knee")):
             kp.append(stiffness_7520_22)
             kd.append(damping_7520_22)
             effort.append(139.0)
-        elif "hip_yaw" in name or name == "waist_yaw_joint":
+        elif (
+            "hip_pitch" in name
+            or "hip_yaw" in name
+            or name == "waist_yaw_joint"
+        ):
             kp.append(stiffness_7520_14)
             kd.append(damping_7520_14)
             effort.append(88.0)
@@ -416,6 +441,10 @@ class BfmTeacherCore:
         formal_ik: Path,
         execution_provider: str,
         activation_blend_seconds: float = 0.1,
+        reference_clip: Path | None = None,
+        direct_start: bool = False,
+        trace_file: Path | None = None,
+        trace_ticks: int = 0,
     ) -> None:
         if (
             not math.isfinite(activation_blend_seconds)
@@ -452,6 +481,9 @@ class BfmTeacherCore:
         self.reference_module = importlib.import_module(
             "bfm_sonic_realscan_play.robo_pfnn_reference"
         )
+        self.recorded_reference_module = importlib.import_module(
+            "bfm_sonic_realscan_play.recorded_reference"
+        )
         ik_module = _load_module_from_path(
             "_matrix_bfm_formal_pfnn_ik",
             formal_ik,
@@ -468,16 +500,28 @@ class BfmTeacherCore:
             providers=providers,
         )
         self.forward = NumpyPfnnForward(weights_dir)
-        self.stream = self.reference_module.RoboPfnnReferenceStream(
-            repo=robo_pfnn_root,
-            weights=weights_dir,
-            g1_xml=g1_xml,
-            device="cpu",
-        )
-        # The upstream stream accepts a preloaded forward instance.  Supplying
-        # the NumPy implementation avoids a Torch dependency in Matrix's DDS
-        # runtime while preserving the same four-bank network calculation.
-        self.stream._forward = self.forward
+        if reference_clip is None:
+            self.stream = self.reference_module.RoboPfnnReferenceStream(
+                repo=robo_pfnn_root,
+                weights=weights_dir,
+                g1_xml=g1_xml,
+                device="cpu",
+            )
+            # The upstream stream accepts a preloaded forward instance.
+            # Supplying the NumPy implementation avoids a Torch dependency in
+            # Matrix's DDS runtime while preserving the same four-bank network
+            # calculation.
+            self.stream._forward = self.forward
+            self.reference_source = "robo_pfnn_formal7168"
+        else:
+            self.stream = self.recorded_reference_module.RecordedMotionReferenceStream(
+                reference_clip,
+            )
+            self.reference_source = (
+                f"formal7168_clip:{self.stream.motion_key}"
+            )
+        self.direct_start = bool(direct_start)
+        self.direct_reference_start: dict[str, list[float]] | None = None
         self.previous_action = np.zeros(NUM_JOINTS, dtype=np.float32)
         self.last_reset_count: int | None = None
         self.last_world_sequence: int | None = None
@@ -486,12 +530,19 @@ class BfmTeacherCore:
         self.reference_stop_resets = 0
         self.reference_transition: str | None = None
         self.reference_hold_target: np.ndarray | None = None
+        self.idle_anchor_target: np.ndarray | None = None
         self.activation_blend_steps = max(
             2,
             int(round(float(activation_blend_seconds) * POLICY_HZ)),
         )
         self.activation_origin: np.ndarray | None = None
         self.activation_step = 0
+        self.trace_file = trace_file
+        self.trace_ticks = max(0, int(trace_ticks))
+        self.trace_written = 0
+        if self.trace_file is not None and self.trace_ticks > 0:
+            self.trace_file.parent.mkdir(parents=True, exist_ok=True)
+            self.trace_file.write_text("", encoding="utf-8")
         self.kp, self.kd, self.action_scale = _joint_control_vectors()
         self.default_joint_pos = np.asarray(
             self.teacher_module.SMP_DEFAULT_QPOS,
@@ -516,8 +567,10 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
+        self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
+        self.direct_reference_start = None
 
     def prepare_activation(self, lowstate: LowStateSnapshot) -> None:
         """Start a policy-consistent, no-teleport handoff from current joints.
@@ -534,10 +587,27 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
+        self.idle_anchor_target = lowstate.joint_pos_rad.astype(
+            np.float32,
+            copy=True,
+        )
         self.activation_origin = lowstate.joint_pos_rad.astype(
             np.float32,
             copy=True,
         )
+        self.activation_step = 0
+
+    def prepare_direct_activation(self) -> None:
+        """Reset actor history without perturbing the aligned reference cursor."""
+
+        self.teacher.reset()
+        self.previous_action.fill(0.0)
+        self.last_world_sequence = None
+        self.reference_motion_active = True
+        self.reference_transition = None
+        self.reference_hold_target = None
+        self.idle_anchor_target = None
+        self.activation_origin = None
         self.activation_step = 0
 
     def enter_standby(self) -> None:
@@ -549,6 +619,7 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
+        self.idle_anchor_target = None
         self.activation_origin = None
         self.activation_step = 0
 
@@ -646,6 +717,269 @@ class BfmTeacherCore:
             stop_latched=bool(sample.safe_stop),
         )
 
+    @staticmethod
+    def _array_summary(values: Any) -> dict[str, Any]:
+        array = np.asarray(values)
+        finite = bool(np.all(np.isfinite(array)))
+        summary: dict[str, Any] = {
+            "shape": [int(value) for value in array.shape],
+            "finite": finite,
+        }
+        if array.size:
+            summary.update(
+                {
+                    "min": float(np.min(array)),
+                    "max": float(np.max(array)),
+                    "mean": float(np.mean(array)),
+                }
+            )
+        return summary
+
+    @staticmethod
+    def _reference_plan_summary(plan: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name in ("future_qpos", "future_qvel", "target_speed"):
+            value = getattr(plan, name, None)
+            if value is None:
+                result[name] = None
+            elif name == "target_speed":
+                result[name] = float(value)
+            else:
+                result[name] = BfmTeacherCore._array_summary(value)
+        return result
+
+    @staticmethod
+    def _max_abs_entry(
+        values: np.ndarray,
+        names: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        array = np.asarray(values, dtype=np.float64).reshape(-1)
+        if array.size == 0:
+            return {
+                "max_abs": None,
+                "argmax": None,
+                "joint_name": None,
+                "signed_value": None,
+            }
+        index = int(np.argmax(np.abs(array)))
+        return {
+            "max_abs": float(abs(array[index])),
+            "argmax": index,
+            "joint_name": names[index] if index < len(names) else None,
+            "signed_value": float(array[index]),
+        }
+
+    @staticmethod
+    def _yaw_from_wxyz(quaternion: np.ndarray) -> float | None:
+        values = np.asarray(quaternion, dtype=np.float64).reshape(-1)
+        if values.shape != (4,) or not np.all(np.isfinite(values)):
+            return None
+        norm = float(np.linalg.norm(values))
+        if norm <= 1.0e-12:
+            return None
+        w, x, y, z = (values / norm).tolist()
+        return float(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+    def _joint_order_ledger(self) -> dict[str, Any]:
+        matrix_names = list(G1_29_JOINT_NAMES)
+        isaac_to_matrix = [int(value) for value in self.isaac_to_matrix.tolist()]
+        matrix_to_isaac = [
+            int(value) for value in self.teacher_module.MUJOCO_TO_ISAACLAB.tolist()
+        ]
+        isaac_names = [matrix_names[matrix_index] for matrix_index in isaac_to_matrix]
+        return {
+            "matrix_mujoco_actuator_order": [
+                {
+                    "matrix_index": matrix_index,
+                    "joint_name": joint_name,
+                    "isaac_index": matrix_to_isaac[matrix_index],
+                }
+                for matrix_index, joint_name in enumerate(matrix_names)
+            ],
+            "isaac_action_order": [
+                {
+                    "isaac_index": isaac_index,
+                    "joint_name": joint_name,
+                    "matrix_index": isaac_to_matrix[isaac_index],
+                }
+                for isaac_index, joint_name in enumerate(isaac_names)
+            ],
+        }
+
+    def _reference_continuity_summary(
+        self,
+        plan: Any,
+        lowstate: LowStateSnapshot,
+    ) -> dict[str, Any]:
+        raw_future_qpos = getattr(plan, "future_qpos", None)
+        if raw_future_qpos is None:
+            return {
+                "valid": False,
+                "foot_ik_observable": "unavailable",
+            }
+        future_qpos = np.asarray(raw_future_qpos, dtype=np.float64)
+        if future_qpos.shape != (10, 36) or not np.all(np.isfinite(future_qpos)):
+            return {
+                "valid": False,
+                "foot_ik_observable": "unavailable",
+            }
+        yaw_0 = self._yaw_from_wxyz(future_qpos[0, 3:7])
+        yaw_1 = self._yaw_from_wxyz(future_qpos[1, 3:7])
+        yaw_delta = (
+            None
+            if yaw_0 is None or yaw_1 is None
+            else float(math.atan2(math.sin(yaw_1 - yaw_0), math.cos(yaw_1 - yaw_0)))
+        )
+        reference_joint = future_qpos[0, 7:].astype(np.float32)
+        reference_joint_delta = reference_joint - lowstate.joint_pos_rad
+        root_delta_01 = future_qpos[1, :3] - future_qpos[0, :3]
+        return {
+            "valid": True,
+            "root_xyz_0": [float(value) for value in future_qpos[0, :3]],
+            "root_xyz_1": [float(value) for value in future_qpos[1, :3]],
+            "root_xyz_delta_01": [float(value) for value in root_delta_01],
+            "root_xy_delta_01_m": float(np.linalg.norm(root_delta_01[:2])),
+            "root_z_delta_01_m": float(root_delta_01[2]),
+            "root_yaw_0_rad": yaw_0,
+            "root_yaw_1_rad": yaw_1,
+            "root_yaw_delta_01_rad": yaw_delta,
+            "pelvis_quat_wxyz_0": [float(value) for value in future_qpos[0, 3:7]],
+            "pelvis_quat_wxyz_1": [float(value) for value in future_qpos[1, 3:7]],
+            "reference_joint_minus_current": self._max_abs_entry(
+                reference_joint_delta,
+                G1_29_JOINT_NAMES,
+            ),
+            "foot_ik_observable": (
+                "future_qpos_after_robo_pfnn_formal7168_pelvis_and_foot_ik"
+            ),
+        }
+
+    def _write_trace_tick(
+        self,
+        *,
+        world: WorldSample,
+        lowstate: LowStateSnapshot,
+        active: bool,
+        reference: Any,
+        observation: Any,
+        action_isaac: np.ndarray,
+        action_matrix: np.ndarray,
+        desired_target: np.ndarray,
+        target: np.ndarray,
+        previous_action_before: np.ndarray,
+        status: Mapping[str, Any],
+    ) -> None:
+        trace_file = getattr(self, "trace_file", None)
+        trace_ticks = int(getattr(self, "trace_ticks", 0))
+        trace_written = int(getattr(self, "trace_written", 0))
+        if (
+            trace_file is None
+            or trace_ticks <= 0
+            or trace_written >= trace_ticks
+        ):
+            return
+        matrix_names = list(G1_29_JOINT_NAMES)
+        isaac_names = [
+            matrix_names[int(matrix_index)]
+            for matrix_index in self.isaac_to_matrix.tolist()
+        ]
+        previous_action_matrix = previous_action_before[self.isaac_to_matrix]
+        action_delta_isaac = action_isaac - previous_action_before
+        action_delta_matrix = action_matrix - previous_action_matrix
+        desired_target_delta = desired_target - lowstate.joint_pos_rad
+        published_target_delta = target - lowstate.joint_pos_rad
+        record = {
+            "schema": "matrix.bfm_teacher.policy_tick_trace.v1",
+            "policy_id": POLICY_ID,
+            "tick_index": trace_written,
+            "active_writer": bool(active),
+            "world_sequence": int(world.sequence),
+            "world_sim_time_s": (
+                float(world.sim_time_s)
+                if getattr(world, "sim_time_s", None) is not None
+                else None
+            ),
+            "world_reset_count": int(world.reset_count),
+            "contract_dims": CONTRACT_DIMS,
+            "source_hashes": CONTRACT_SOURCE_HASHES,
+            "lowstate": {
+                "base_quat_wxyz": self._array_summary(lowstate.quaternion_wxyz),
+                "base_ang_vel": self._array_summary(lowstate.body_gyro_rad_s),
+                "joint_pos": self._array_summary(lowstate.joint_pos_rad),
+                "joint_vel": self._array_summary(lowstate.joint_vel_rad_s),
+            },
+            "observation": {
+                "base_quat_wxyz": self._array_summary(
+                    observation.base_quat_wxyz
+                ),
+                "base_ang_vel": self._array_summary(observation.base_ang_vel),
+                "joint_pos": self._array_summary(observation.joint_pos),
+                "joint_vel": self._array_summary(observation.joint_vel),
+                "previous_action": self._array_summary(previous_action_before),
+            },
+            "reference": {
+                "plan": self._reference_plan_summary(reference.plan),
+                "replanned": bool(reference.replanned),
+                "reason": reference.replan_reason,
+                "plan_index": int(reference.plan_index),
+                "pending_rebuild": bool(reference.pending_rebuild),
+                "buffer_swapped": bool(
+                    getattr(reference, "buffer_swapped", False)
+                ),
+                "reference_ready": not bool(reference.pending_rebuild),
+                "continuity": self._reference_continuity_summary(
+                    reference.plan,
+                    lowstate,
+                ),
+            },
+            "height_map_z": self._array_summary(world.height_map_z),
+            "action_isaac": self._array_summary(action_isaac),
+            "action_matrix": self._array_summary(action_matrix),
+            "desired_target": self._array_summary(desired_target),
+            "published_target": self._array_summary(target),
+            "joint_ledger": self._joint_order_ledger(),
+            "joint_argmax": {
+                "published_target_minus_current": self._max_abs_entry(
+                    published_target_delta,
+                    matrix_names,
+                ),
+                "desired_target_minus_current": self._max_abs_entry(
+                    desired_target_delta,
+                    matrix_names,
+                ),
+                "raw_action_delta_isaac": self._max_abs_entry(
+                    action_delta_isaac,
+                    isaac_names,
+                ),
+                "action_delta_matrix": self._max_abs_entry(
+                    action_delta_matrix,
+                    matrix_names,
+                ),
+            },
+            "continuity": {
+                "desired_target_delta_rms_rad": status[
+                    "desired_target_delta_rms_rad"
+                ],
+                "desired_target_delta_max_rad": status[
+                    "desired_target_delta_max_rad"
+                ],
+                "published_target_delta_rms_rad": status[
+                    "published_target_delta_rms_rad"
+                ],
+                "published_target_delta_max_rad": status[
+                    "published_target_delta_max_rad"
+                ],
+                "reference_joint_error_rms_rad": status[
+                    "reference_joint_error_rms_rad"
+                ],
+            },
+            "status": dict(status),
+        }
+        with trace_file.open("a", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+        self.trace_written = trace_written + 1
+
     def step(
         self,
         world: WorldSample,
@@ -698,6 +1032,7 @@ class BfmTeacherCore:
                 np.float32,
                 copy=True,
             )
+            self.idle_anchor_target = None
             self.previous_action.fill(0.0)
             self.activation_origin = None
             self.activation_step = 0
@@ -712,6 +1047,7 @@ class BfmTeacherCore:
                 np.float32,
                 copy=True,
             )
+            self.idle_anchor_target = None
             self.previous_action.fill(0.0)
             self.activation_origin = None
             self.activation_step = 0
@@ -774,10 +1110,58 @@ class BfmTeacherCore:
             world.root_yaw,
             height_field,
         )
+        if (
+            getattr(self, "direct_start", False)
+            and getattr(self, "direct_reference_start", None) is None
+        ):
+            qpos_50hz = np.asarray(reference.plan.qpos_50hz, dtype=np.float32)
+            joint_vel_50hz = np.asarray(
+                reference.plan.joint_vel_50hz,
+                dtype=np.float32,
+            )
+            if qpos_50hz.ndim != 2 or qpos_50hz.shape[1] != 36:
+                raise RuntimeError(
+                    "direct BFM reference qpos must have shape (frames, 36)"
+                )
+            if qpos_50hz.shape[0] < 2 or joint_vel_50hz.shape[1:] != (29,):
+                raise RuntimeError("direct BFM reference has no 50 Hz velocity frame")
+            root_velocity = self.reference_module.qpos_root_velocity(
+                qpos_50hz[0],
+                qpos_50hz[1],
+                POLICY_HZ,
+            )
+            qvel = np.concatenate(
+                (root_velocity, joint_vel_50hz[0]),
+            ).astype(np.float32)
+            if qvel.shape != (35,) or not np.all(np.isfinite(qvel)):
+                raise RuntimeError("direct BFM reference qvel must be finite 35D")
+            self.direct_reference_start = {
+                "qpos": [float(value) for value in qpos_50hz[0]],
+                "qvel": [float(value) for value in qvel],
+            }
         reference_buffer_swapped = bool(
             getattr(reference, "buffer_swapped", False)
         )
         reference_pending_rebuild = bool(reference.pending_rebuild)
+        if (
+            active
+            and self.reference_transition is None
+            and reference_pending_rebuild
+            and not reference_buffer_swapped
+        ):
+            # Robo-PFNN can rebuild its future buffer while motion is already
+            # active, for example after a root-anchor correction.  Until the
+            # replacement buffer is swapped in, publish the observed pose and
+            # keep actor history clean; otherwise Matrix can apply a one-frame
+            # target jump from a half-rebuilt reference.
+            self.reference_transition = "rebuilding"
+            self.reference_hold_target = lowstate.joint_pos_rad.astype(
+                np.float32,
+                copy=True,
+            )
+            self.previous_action.fill(0.0)
+            self.activation_origin = None
+            self.activation_step = 0
         transition_completed = bool(
             self.reference_transition is not None
             and (
@@ -800,7 +1184,7 @@ class BfmTeacherCore:
             self.reference_transition = None
             self.reference_hold_target = None
         holding_reference_transition = bool(
-            self.reference_transition in {"starting", "stopping"}
+            self.reference_transition in {"starting", "stopping", "rebuilding"}
             and self.reference_hold_target is not None
         )
         matrix_to_isaac = self.teacher_module.MUJOCO_TO_ISAACLAB
@@ -811,6 +1195,7 @@ class BfmTeacherCore:
             joint_vel=lowstate.joint_vel_rad_s[matrix_to_isaac],
             previous_action=self.previous_action,
         )
+        previous_action_before = self.previous_action.copy()
         action_isaac = self.teacher.step(
             reference.plan,
             observation,
@@ -827,7 +1212,22 @@ class BfmTeacherCore:
         ).astype(np.float32)
         blend_fraction = 1.0
         target = desired_target
-        if active and holding_reference_transition:
+        idle_anchor_hold = bool(
+            active
+            and not command_motion_active
+            and not holding_reference_transition
+        )
+        if idle_anchor_hold:
+            if self.idle_anchor_target is None:
+                self.idle_anchor_target = lowstate.joint_pos_rad.astype(
+                    np.float32,
+                    copy=True,
+                )
+            target = self.idle_anchor_target.copy()
+            blend_fraction = 0.0
+            self.activation_origin = None
+            self.activation_step = 0
+        elif active and holding_reference_transition:
             target = self.reference_hold_target.copy()
             blend_fraction = 0.0
         elif active and self.activation_origin is not None:
@@ -844,7 +1244,7 @@ class BfmTeacherCore:
             if progress >= 1.0:
                 self.activation_origin = None
         if active:
-            if holding_reference_transition:
+            if idle_anchor_hold or holding_reference_transition:
                 # The old reference mode is deliberately discarded while the
                 # requested branch builds.  Do not feed the held posture back
                 # as a fictitious Teacher action.
@@ -896,7 +1296,7 @@ class BfmTeacherCore:
                 abs_tol=1.0e-12,
             )
         )
-        return target, {
+        status = {
             "reference_replanned": bool(reference.replanned),
             "reference_reason": reference.replan_reason,
             "reference_plan_index": int(reference.plan_index),
@@ -904,6 +1304,8 @@ class BfmTeacherCore:
             "reference_pending_rebuild": reference_pending_rebuild,
             "reference_buffer_swapped": reference_buffer_swapped,
             "reference_transition": self.reference_transition,
+            "idle_anchor_hold": idle_anchor_hold,
+            "idle_anchor_initialized": self.idle_anchor_target is not None,
             "reference_transition_completed": transition_completed,
             "reference_transition_holding": holding_reference_transition,
             "reference_start_reset": start_reference_reset,
@@ -965,6 +1367,20 @@ class BfmTeacherCore:
                 math.sqrt(np.mean(np.square(reference_delta)))
             ),
         }
+        self._write_trace_tick(
+            world=world,
+            lowstate=lowstate,
+            active=active,
+            reference=reference,
+            observation=observation,
+            action_isaac=action_isaac,
+            action_matrix=action_matrix,
+            desired_target=desired_target,
+            target=target,
+            previous_action_before=previous_action_before,
+            status=status,
+        )
+        return target, status
 
 
 def _connect_control(path: Path, timeout_s: float = 10.0) -> socket.socket:
@@ -1226,6 +1642,7 @@ def run_worker(
     state_store: LatestLowState,
     control_socket: Path,
     execution_provider: str,
+    direct_start: bool = False,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     connection = _connect_control(control_socket)
@@ -1267,6 +1684,8 @@ def run_worker(
             "writer_scope": "rt/lowcmd",
             "models_loaded_once": True,
             "models_warmed": False,
+            "direct_start": bool(direct_start),
+            "reference_source": core.reference_source,
         }
     )
 
@@ -1351,11 +1770,14 @@ def run_worker(
                             raise RuntimeError(
                                 "BFM Teacher GO lacks fresh world/LowState input"
                             )
-                        if not latest_world.safe_stop:
+                        if not direct_start and not latest_world.safe_stop:
                             raise RuntimeError(
                                 "BFM Teacher GO requires a safety-stop handoff"
-                        )
-                        core.prepare_activation(state)
+                            )
+                        if direct_start:
+                            core.prepare_direct_activation()
+                        else:
+                            core.prepare_activation(state)
                         started = monotonic()
                         target, latest_policy_status = core.step(
                             latest_world,
@@ -1414,6 +1836,17 @@ def run_worker(
                     transient_stale_active = False
                     assert latest_world is not None
                     assert state is not None
+                    if (
+                        direct_start
+                        and warmed
+                        and handoff.state == HandoffStateMachine.WAITING
+                    ):
+                        next_policy = _advance_deadline(
+                            next_policy,
+                            policy_period,
+                            now,
+                        )
+                        continue
                     started = monotonic()
                     try:
                         target, latest_policy_status = core.step(
@@ -1433,6 +1866,11 @@ def run_worker(
                             monotonic() - started
                         ) * 1000.0
                         if not warmed:
+                            direct_reference = core.direct_reference_start
+                            if direct_start and direct_reference is None:
+                                raise RuntimeError(
+                                    "direct BFM warmup produced no reference start"
+                                )
                             warmed = True
                             send_event(
                                 "WARMED_NO_WRITER",
@@ -1440,6 +1878,18 @@ def run_worker(
                                     "writer_created": False,
                                     "models_loaded_once": True,
                                     "models_warmed": True,
+                                    "direct_start": bool(direct_start),
+                                    "reference_source": core.reference_source,
+                                    "direct_initial_qpos": (
+                                        direct_reference["qpos"]
+                                        if direct_reference is not None
+                                        else None
+                                    ),
+                                    "direct_initial_qvel": (
+                                        direct_reference["qvel"]
+                                        if direct_reference is not None
+                                        else None
+                                    ),
                                 },
                             )
                 elif handoff.state == HandoffStateMachine.ACTIVE:
@@ -1508,6 +1958,11 @@ def run_worker(
                         if latest_world is not None
                         else None
                     ),
+                    "policy_trace_file": (
+                        str(core.trace_file) if core.trace_file is not None else None
+                    ),
+                    "policy_trace_ticks_requested": int(core.trace_ticks),
+                    "policy_trace_ticks_written": int(core.trace_written),
                     **publisher.telemetry(now=monotonic()),
                     **latest_policy_status,
                 }
@@ -1587,6 +2042,16 @@ def validate_artifacts(args: argparse.Namespace) -> None:
             f"files={file_count} expected_sha={ROBO_PFNN_WEIGHTS_TREE_SHA256} "
             f"actual_sha={tree_sha256}"
         )
+    if args.reference_clip is not None:
+        if not args.reference_clip.is_absolute():
+            raise ValueError("direct BFM reference clip must be absolute")
+        if not args.reference_clip_sha256:
+            raise ValueError("direct BFM reference clip SHA256 is required")
+        require_file_sha256(
+            args.reference_clip,
+            args.reference_clip_sha256,
+            "formal7168 reference clip",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1599,6 +2064,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights", required=True, type=Path)
     parser.add_argument("--g1-xml", required=True, type=Path)
     parser.add_argument("--formal-ik", required=True, type=Path)
+    parser.add_argument("--reference-clip", type=Path)
+    parser.add_argument("--reference-clip-sha256")
+    parser.add_argument("--direct-start", action="store_true")
     parser.add_argument("--interface", default="lo")
     parser.add_argument("--control-socket", type=Path)
     parser.add_argument(
@@ -1615,6 +2083,8 @@ def build_parser() -> argparse.ArgumentParser:
             "the actually published blended targets"
         ),
     )
+    parser.add_argument("--trace-file", type=Path)
+    parser.add_argument("--trace-ticks", type=int, default=0)
     parser.add_argument(
         "--validate-only",
         action="store_true",
@@ -1625,6 +2095,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.reference_clip is not None and not args.direct_start:
+        raise SystemExit("--reference-clip requires --direct-start")
+    if args.reference_clip_sha256 is not None and args.reference_clip is None:
+        raise SystemExit("--reference-clip-sha256 requires --reference-clip")
     validate_artifacts(args)
     core = BfmTeacherCore(
         model_path=args.model,
@@ -1635,6 +2109,10 @@ def main(argv: list[str] | None = None) -> int:
         formal_ik=args.formal_ik,
         execution_provider=args.execution_provider,
         activation_blend_seconds=args.activation_blend_seconds,
+        reference_clip=args.reference_clip,
+        direct_start=args.direct_start,
+        trace_file=args.trace_file,
+        trace_ticks=args.trace_ticks,
     )
     if args.validate_only:
         core.close()
@@ -1665,6 +2143,7 @@ def main(argv: list[str] | None = None) -> int:
             state_store=state_store,
             control_socket=args.control_socket,
             execution_provider=args.execution_provider,
+            direct_start=args.direct_start,
         )
     finally:
         core.close()

@@ -1890,10 +1890,9 @@ PY
                     ;;
             esac
             if [[ "$PHYSICAL_RECOVERY_RESIDENT_POLICIES" == "1" ]]; then
-                if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" != "kungfu" \
-                    || "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
+                if [[ "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
                     || "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" != "cuda" ]]; then
-                    echo "[ERROR] Resident recovery requires kungfu -> sonic with CUDA" >&2
+                    echo "[ERROR] Resident recovery requires sonic handoff with CUDA" >&2
                     exit 1
                 fi
             fi
@@ -2088,6 +2087,44 @@ PY
     if [[ "${MATRIX_SONIC_MIN_DISPLACEMENT_M:-0}" != "0" ]]; then
         SONIC_ACCEPTANCE_ARGS+=(--min-displacement-m "${MATRIX_SONIC_MIN_DISPLACEMENT_M}")
     fi
+    INITIAL_LOCOMOTION_ARGS=()
+    if [[ -n "${MATRIX_INITIAL_LOCOMOTION_POLICY:-}" ]]; then
+        case "$MATRIX_INITIAL_LOCOMOTION_POLICY" in
+            sonic|bfm-sonic-teacher50k) ;;
+            *)
+                echo "[ERROR] MATRIX_INITIAL_LOCOMOTION_POLICY must be sonic or bfm-sonic-teacher50k" >&2
+                exit 1
+                ;;
+        esac
+        INITIAL_LOCOMOTION_ARGS+=(
+            --initial-locomotion-policy "$MATRIX_INITIAL_LOCOMOTION_POLICY"
+        )
+    fi
+    BFM_TRACE_ARGS=()
+    if [[ -n "${MATRIX_BFM_POLICY_TRACE_FILE:-}" ]]; then
+        if [[ "$MATRIX_BFM_POLICY_TRACE_FILE" != /* ]]; then
+            echo "[ERROR] MATRIX_BFM_POLICY_TRACE_FILE must be absolute" >&2
+            exit 1
+        fi
+        BFM_TRACE_TICKS="${MATRIX_BFM_POLICY_TRACE_TICKS:-200}"
+        if [[ ! "$BFM_TRACE_TICKS" =~ ^[0-9]+$ ]]; then
+            echo "[ERROR] MATRIX_BFM_POLICY_TRACE_TICKS must be non-negative" >&2
+            exit 1
+        fi
+        BFM_TRACE_ARGS+=(
+            --bfm-trace-file "$MATRIX_BFM_POLICY_TRACE_FILE"
+            --bfm-trace-ticks "$BFM_TRACE_TICKS"
+        )
+    fi
+    BFM_DIRECT_ARGS=()
+    case "${MATRIX_BFM_DIRECT:-0}" in
+        1|true|yes|on) BFM_DIRECT_ARGS+=(--bfm-direct) ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_BFM_DIRECT must be a boolean" >&2
+            exit 1
+            ;;
+    esac
     SONIC_QUALIFICATION_ARGS=()
     if [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]]; then
         SONIC_QUALIFICATION_ARGS+=(
@@ -2263,6 +2300,9 @@ PY
         --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
         "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
+        "${INITIAL_LOCOMOTION_ARGS[@]}" \
+        "${BFM_DIRECT_ARGS[@]}" \
+        "${BFM_TRACE_ARGS[@]}" \
         "${PHYSICAL_RECOVERY_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \
         "${SONIC_STARTUP_ARGS[@]}" \
