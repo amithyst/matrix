@@ -1139,7 +1139,17 @@ class BfmTeacherCore:
         ).astype(np.float32)
         blend_fraction = 1.0
         target = desired_target
-        if active and holding_reference_transition:
+        idle_anchor_hold = bool(
+            active
+            and not command_motion_active
+            and not holding_reference_transition
+        )
+        if idle_anchor_hold:
+            target = lowstate.joint_pos_rad.astype(np.float32, copy=True)
+            blend_fraction = 0.0
+            self.activation_origin = None
+            self.activation_step = 0
+        elif active and holding_reference_transition:
             target = self.reference_hold_target.copy()
             blend_fraction = 0.0
         elif active and self.activation_origin is not None:
@@ -1156,7 +1166,7 @@ class BfmTeacherCore:
             if progress >= 1.0:
                 self.activation_origin = None
         if active:
-            if holding_reference_transition:
+            if idle_anchor_hold or holding_reference_transition:
                 # The old reference mode is deliberately discarded while the
                 # requested branch builds.  Do not feed the held posture back
                 # as a fictitious Teacher action.
@@ -1216,6 +1226,7 @@ class BfmTeacherCore:
             "reference_pending_rebuild": reference_pending_rebuild,
             "reference_buffer_swapped": reference_buffer_swapped,
             "reference_transition": self.reference_transition,
+            "idle_anchor_hold": idle_anchor_hold,
             "reference_transition_completed": transition_completed,
             "reference_transition_holding": holding_reference_transition,
             "reference_start_reset": start_reference_reset,
