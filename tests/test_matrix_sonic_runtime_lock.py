@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import py_compile
 import shutil
 import shlex
 import subprocess
@@ -1064,6 +1065,96 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             results = {name: ok for name, ok, _ in checks}
             self.assertFalse(
                 results["native runtime Python site-packages inventory"]
+            )
+
+    def test_record_owned_pep3147_caches_are_derived_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            wheelhouse = root / "wheelhouse"
+            site_packages = root / "site-packages"
+            runtime_python = root / "venv/bin/python"
+            wheelhouse.mkdir()
+            site_packages.mkdir()
+
+            cmeel_wheel, _, cmeel_installed = write_test_wheel(
+                wheelhouse,
+                "cmeel-0.60.1-py3-none-any.whl",
+                {"cmeel_pth.py": b"VALUE = 'cmeel'\n"},
+            )
+            setuptools_wheel, _, setuptools_installed = write_test_wheel(
+                wheelhouse,
+                "setuptools-81.0.0-py3-none-any.whl",
+                {"_distutils_hack/__init__.py": b"VALUE = 'setuptools'\n"},
+            )
+            (wheelhouse / "SHA256SUMS").write_text(
+                "\n".join(
+                    f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}"
+                    for wheel in (cmeel_wheel, setuptools_wheel)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            for installed in (cmeel_installed, setuptools_installed):
+                for relative, content in installed.items():
+                    path = site_packages / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+
+            for source in (
+                site_packages / "cmeel_pth.py",
+                site_packages / "_distutils_hack/__init__.py",
+            ):
+                cache = Path(importlib.util.cache_from_source(os.fspath(source)))
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                py_compile.compile(
+                    os.fspath(source),
+                    cfile=os.fspath(cache),
+                    doraise=True,
+                    invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+                )
+
+            checks = MODULE.verify_python_wheel_records(
+                wheelhouse,
+                site_packages,
+                {
+                    "cmeel": ("cmeel", "0.60.1"),
+                    "setuptools": ("setuptools", "81.0.0"),
+                },
+                runtime_python,
+            )
+            self.assertTrue(all(ok for _, ok, _ in checks), checks)
+            inventory_detail = {
+                name: detail for name, _, detail in checks
+            }["native runtime Python site-packages inventory"]
+            self.assertIn("derived-pyc=2", inventory_detail)
+
+            no_source = site_packages / "orphan.py"
+            no_source.write_text("VALUE = 'orphan'\n", encoding="utf-8")
+            orphan_cache = Path(importlib.util.cache_from_source(os.fspath(no_source)))
+            orphan_cache.parent.mkdir(parents=True, exist_ok=True)
+            py_compile.compile(
+                os.fspath(no_source),
+                cfile=os.fspath(orphan_cache),
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+            )
+            no_source.unlink()
+            checks = MODULE.verify_python_wheel_records(
+                wheelhouse,
+                site_packages,
+                {
+                    "cmeel": ("cmeel", "0.60.1"),
+                    "setuptools": ("setuptools", "81.0.0"),
+                },
+                runtime_python,
+            )
+            results = {name: (ok, detail) for name, ok, detail in checks}
+            ok, detail = results["native runtime Python site-packages inventory"]
+            self.assertFalse(ok)
+            self.assertIn(
+                "unowned-loadable:__pycache__/orphan."
+                f"{sys.implementation.cache_tag}.pyc",
+                detail,
             )
 
     def test_target_wheel_records_map_scripts_data_and_owned_cache(self) -> None:
