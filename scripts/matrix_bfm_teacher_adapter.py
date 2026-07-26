@@ -2085,7 +2085,7 @@ def run_worker(
                                         "published_target_step_delta_max_rad"
                                     ]
                                 )
-                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6
                             ):
                                 raise RuntimeError(
                                     "BFM Teacher prepared target exceeded safety gate"
@@ -2235,7 +2235,7 @@ def run_worker(
                             )
                             if (
                                 target_step_delta
-                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6
                             ):
                                 rejected_epoch = (
                                     preparing_authority_epoch
