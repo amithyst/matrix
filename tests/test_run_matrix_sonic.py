@@ -2386,9 +2386,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             moon_model,
             FakeData(),
         )
-        self.assertEqual(
-            MODULE._spawn_clearance_rollback_reason(moon_one_foot),
-            "no_ground_support",
+        self.assertIsNone(
+            MODULE._spawn_clearance_rollback_reason(moon_one_foot)
         )
         moon_height_delta = MODULE.audit_spawn_safety(
             FakeMujoco(
@@ -2401,9 +2400,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             moon_model,
             FakeData(),
         )
-        self.assertEqual(
-            MODULE._spawn_clearance_rollback_reason(moon_height_delta),
-            "no_ground_support",
+        self.assertIsNone(
+            MODULE._spawn_clearance_rollback_reason(moon_height_delta)
         )
         for invalid_audit in (
             {
@@ -6544,6 +6542,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.bfm_control = mock.Mock(
             direct_initial_qpos=tuple(0.01 * index for index in range(36)),
             direct_initial_qvel=tuple(-0.01 * index for index in range(35)),
+            direct_initial_status_sequence=12,
             last_state_sequence=41,
             last_status={
                 "world_sample_sequence": 11,
@@ -6859,7 +6858,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         coordinator.bfm_control.last_status["world_sample_sequence"] = 11
         coordinator._reconcile_policy_slot_assignment()
-        coordinator.bfm_control.prepare_activation.assert_called_once_with()
+        coordinator.bfm_control.prepare_activation.assert_called_once_with(
+            allow_idle_neutral=False
+        )
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
             "prepare_bfm",
