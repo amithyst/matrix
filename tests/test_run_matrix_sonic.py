@@ -3948,6 +3948,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["maximum_acceleration_mps2"], 1.20)
         self.assertEqual(status["maximum_deceleration_mps2"], 2.40)
         self.assertEqual(status["maximum_turn_rate_rad_s"], 2.50)
+        self.assertEqual(
+            status["movement_control"],
+            {
+                "mode": "camera_face",
+                "translation_frame": "camera",
+                "facing_policy": "face_movement",
+            },
+        )
         self.assertEqual(status["stick_deadzone"], 0.15)
         self.assertEqual(status["input_timeout_s"], 0.15)
         self.assertEqual(status["camera_yaw_sign"], -1)
@@ -5925,6 +5933,87 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertFalse(rejected.ok)
                 self.assertEqual(rejected.code, "E_DATA_CONSTRAINT")
                 self.assertEqual(core.config.keyboard_walk_speed_mps, 0.8)
+                self.assertEqual(store.settings.revision, 1)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
+    def test_game_command_runtime_hot_switches_mode_only_from_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "motion-control.json"
+            store = MOTION_SETTINGS.MotionSettingsStore(settings_path)
+            core = GAME_CONTROL.GameControlCore(GAME_CONTROL.ControlConfig())
+            core.accept_snapshot(
+                self.game_input_snapshot(0, 9.99), received_at_s=9.99
+            )
+            core.command(now_s=9.99, dt_s=0.0)
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                None,
+                motion_settings=store,
+                control_core=core,
+            )
+            pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+
+            def request(mode: str, revision: int, sequence: int, character: str):
+                return MC_COMMANDS.GameCommandRequest(
+                    session="a" * 32,
+                    sequence=sequence,
+                    request_id="cmd-" + character * 32,
+                    command=MC_COMMANDS.MovementModeSet(mode, revision),
+                )
+
+            try:
+                provider_socket.send(
+                    MC_COMMANDS.encode_command_request(
+                        request("camera_strafe", 0, 1, "c")
+                    )
+                )
+                self.assertFalse(
+                    runtime.poll(current_pose=pose, command_allowed=False)
+                )
+                changed = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(changed.ok)
+                self.assertEqual(changed.code, "OK_MOVEMENT_MODE_SET")
+                self.assertEqual(core.movement_mode, "camera_strafe")
+                self.assertEqual(store.settings.movement_mode, "camera_strafe")
+                self.assertEqual(store.settings.revision, 1)
+                self.assertEqual(
+                    core.command(now_s=10.0, dt_s=0.02).reason,
+                    "movement_mode_changed",
+                )
+
+                core.accept_snapshot(
+                    self.game_input_snapshot(1, 10.01), received_at_s=10.01
+                )
+                core.command(now_s=10.01, dt_s=0.02)
+                core.accept_snapshot(
+                    self.game_input_snapshot(2, 10.02, w=True),
+                    received_at_s=10.02,
+                )
+                core.command(now_s=10.02, dt_s=0.1)
+
+                provider_socket.send(
+                    MC_COMMANDS.encode_command_request(
+                        request("body_relative", 1, 2, "d")
+                    )
+                )
+                self.assertFalse(
+                    runtime.poll(current_pose=pose, command_allowed=False)
+                )
+                blocked = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertFalse(blocked.ok)
+                self.assertEqual(blocked.code, "E_MOVEMENT_MODE_BUSY")
+                self.assertEqual(core.movement_mode, "camera_strafe")
                 self.assertEqual(store.settings.revision, 1)
             finally:
                 provider_socket.close()

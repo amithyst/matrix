@@ -19,6 +19,12 @@ import tempfile
 import threading
 from typing import Callable, Mapping
 
+from matrix_movement_modes import (
+    DEFAULT_MOVEMENT_MODE,
+    movement_mode_metadata,
+    validate_movement_mode,
+)
+
 
 SETTINGS_VERSION = 1
 MAX_REVISION = (2**63) - 1
@@ -32,6 +38,7 @@ KEYBOARD_LOOK_RATE_PATH = f"control.camera.{KEYBOARD_LOOK_RATE_FIELD}"
 DEFAULT_KEYBOARD_LOOK_RATE_DEG_S = 120.0
 KEYBOARD_LOOK_RATE_RANGE_DEG_S = (30.0, 360.0)
 KEYBOARD_LOOK_RATE_STEP_DEG_S = 30.0
+MOVEMENT_MODE_PATH = "control.motion.movement_mode"
 
 GEAR_SLOW = "slow"
 GEAR_WALK = "walk"
@@ -193,6 +200,7 @@ class MotionSettings:
     """One validated, revisioned snapshot of motion and keyboard camera rates."""
 
     revision: int = 0
+    movement_mode: str = DEFAULT_MOVEMENT_MODE
     max_turn_rate_rad_s: float = DEFAULT_MAX_TURN_RATE_RAD_S
     keyboard_look_rate_deg_s: float = DEFAULT_KEYBOARD_LOOK_RATE_DEG_S
     slow_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][0]
@@ -204,6 +212,11 @@ class MotionSettings:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "revision", _revision(self.revision))
+        try:
+            movement_mode = validate_movement_mode(self.movement_mode)
+        except ValueError as exc:
+            raise MotionSettingsError("E_MOVEMENT_MODE", str(exc)) from exc
+        object.__setattr__(self, "movement_mode", movement_mode)
         turn_rate = _finite_speed(
             self.max_turn_rate_rad_s,
             name=MAX_TURN_RATE_FIELD,
@@ -278,11 +291,25 @@ class MotionSettings:
         next_revision = self.revision if revision is None else _revision(revision)
         return replace(self, revision=next_revision, **{field_name: speed})
 
+    def with_movement_mode(
+        self,
+        movement_mode: object,
+        *,
+        revision: int | None = None,
+    ) -> "MotionSettings":
+        try:
+            mode = validate_movement_mode(movement_mode)
+        except ValueError as exc:
+            raise MotionSettingsError("E_MOVEMENT_MODE", str(exc)) from exc
+        next_revision = self.revision if revision is None else _revision(revision)
+        return replace(self, revision=next_revision, movement_mode=mode)
+
     def to_mapping(self) -> dict[str, object]:
         return {
             "version": SETTINGS_VERSION,
             "revision": self.revision,
             MAX_TURN_RATE_FIELD: self.max_turn_rate_rad_s,
+            "movement": movement_mode_metadata(self.movement_mode),
             "camera": {
                 KEYBOARD_LOOK_RATE_FIELD: self.keyboard_look_rate_deg_s,
             },
@@ -300,7 +327,7 @@ class MotionSettings:
     @classmethod
     def from_mapping(cls, value: object) -> "MotionSettings":
         required = {"version", "revision", "gears"}
-        allowed = required | {MAX_TURN_RATE_FIELD, "camera"}
+        allowed = required | {MAX_TURN_RATE_FIELD, "camera", "movement"}
         if not isinstance(value, dict) or not required <= set(value) <= allowed:
             raise MotionSettingsError(
                 "E_DATA_SCHEMA", "motion settings must contain version/revision/gears"
@@ -321,7 +348,29 @@ class MotionSettings:
                 DEFAULT_MAX_TURN_RATE_RAD_S,
             ),
             KEYBOARD_LOOK_RATE_FIELD: DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
+            "movement_mode": DEFAULT_MOVEMENT_MODE,
         }
+        movement = value.get("movement")
+        if "movement" in value:
+            if not isinstance(movement, dict) or set(movement) not in (
+                {"mode"},
+                {"mode", "translation_frame", "facing_policy"},
+            ):
+                raise MotionSettingsError(
+                    "E_DATA_SCHEMA",
+                    "motion settings movement has an invalid schema",
+                )
+            fields["movement_mode"] = movement.get("mode")
+            if set(movement) != {"mode"}:
+                try:
+                    expected_metadata = movement_mode_metadata(movement.get("mode"))
+                except ValueError as exc:
+                    raise MotionSettingsError("E_MOVEMENT_MODE", str(exc)) from exc
+                if movement != expected_metadata:
+                    raise MotionSettingsError(
+                        "E_DATA_SCHEMA",
+                        "motion settings movement metadata does not match its mode",
+                    )
         camera = value.get("camera")
         if "camera" in value:
             if not isinstance(camera, dict) or set(camera) != {
@@ -543,8 +592,8 @@ def step_motion_speed(
 class MotionSettingsModification:
     settings: MotionSettings
     path: str
-    previous_value: float
-    value: float
+    previous_value: float | str
+    value: float | str
     changed: bool
 
 
@@ -613,7 +662,8 @@ class MotionSettingsStore:
                 if expected != current.revision:
                     raise MotionSettingsError(
                         "E_DATA_REVISION_CONFLICT",
-                        f"expected revision {expected}, current revision is {current.revision}",
+                        "expected revision "
+                        f"{expected}, current revision is {current.revision}",
                     )
             previous = current.value_for_path(canonical_path)
             # with_value performs type/range/cross-field validation before any
@@ -666,6 +716,55 @@ class MotionSettingsStore:
                 expected_revision=expected_revision,
             )
 
+    def modify_movement_mode(
+        self,
+        movement_mode: object,
+        *,
+        expected_revision: int | None = None,
+    ) -> MotionSettingsModification:
+        with self._lock:
+            current = self._settings
+            if expected_revision is not None:
+                expected = _revision(expected_revision)
+                if expected != current.revision:
+                    raise MotionSettingsError(
+                        "E_DATA_REVISION_CONFLICT",
+                        f"expected revision {expected}, current revision is {current.revision}",
+                    )
+            validated = current.with_movement_mode(movement_mode)
+            if validated.movement_mode == current.movement_mode:
+                return MotionSettingsModification(
+                    current,
+                    MOVEMENT_MODE_PATH,
+                    current.movement_mode,
+                    current.movement_mode,
+                    False,
+                )
+            if current.revision >= MAX_REVISION:
+                raise MotionSettingsError(
+                    "E_DATA_REVISION", "motion settings revision is exhausted"
+                )
+            candidate = current.with_movement_mode(
+                validated.movement_mode,
+                revision=current.revision + 1,
+            )
+            try:
+                self._saver(self.path, candidate)
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise MotionSettingsPersistenceError(
+                    f"could not persist motion settings: {exc}"
+                ) from exc
+            self._settings = candidate
+            self.load_status = "saved"
+            self.load_error = None
+            return MotionSettingsModification(
+                candidate,
+                MOVEMENT_MODE_PATH,
+                current.movement_mode,
+                candidate.movement_mode,
+                True,
+            )
+
     def mapping(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -694,6 +793,7 @@ __all__ = [
     "MAX_TURN_RATE_RANGE_RAD_S",
     "MAX_TURN_RATE_STEP_RAD_S",
     "MOTION_SETTING_PATHS",
+    "MOVEMENT_MODE_PATH",
     "MotionSettings",
     "MotionSettingsError",
     "MotionSettingsLoad",

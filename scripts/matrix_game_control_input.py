@@ -64,6 +64,7 @@ from matrix_motion_settings import (
     MotionSettings,
     MotionSettingsError,
 )
+from matrix_movement_modes import next_movement_mode
 from matrixctl import MatrixEngineInputClient
 from matrix_video_settings import (
     VideoSettings,
@@ -123,6 +124,7 @@ from matrix_mc_commands import (
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
     MAX_RUNTIME_PAUSE_EPOCH,
+    MovementModeSet,
     PolicySlotAssignment,
     RuntimePause,
     TeleportList,
@@ -238,6 +240,7 @@ class KeyboardMouseSample:
     mouse_speed_up: bool = False
     apply_restart: bool = False
     apply_return: bool = False
+    movement_mode_cycle: bool = False
     mouse_dx: float = 0.0
     mouse_dy: float = 0.0
     camera_dragging: bool = False
@@ -313,6 +316,7 @@ def physical_external_override_reason(
             "mouse_speed_up",
             "apply_restart",
             "apply_return",
+            "movement_mode_cycle",
         )
     ):
         return "physical_keyboard"
@@ -1354,6 +1358,23 @@ class ApplyRestartKey:
         ):
             return False
         return requester.request()
+
+
+class MovementModeCycleKey:
+    """Emit F6 edges only after observing a release in this generation."""
+
+    def __init__(self) -> None:
+        self._armed = False
+        self._was_down = False
+
+    def update(self, pressed: bool) -> bool:
+        if type(pressed) is not bool:
+            raise TypeError("movement mode cycle key level must be boolean")
+        if not pressed:
+            self._armed = True
+        edge = self._armed and pressed and not self._was_down
+        self._was_down = pressed
+        return edge
 
 
 class ApplyReturnController:
@@ -3827,6 +3848,7 @@ class X11KeyboardMouse:
         "mouse_speed_down": 0x002D,
         "mouse_speed_up": 0x003D,
         "apply_restart": 0xFFC6,
+        "movement_mode_cycle": 0xFFC3,
         "apply_return": 0xFF0D,
     }
 
@@ -4459,6 +4481,7 @@ class X11KeyboardMouse:
             mouse_speed_up=pressed.get("mouse_speed_up", False),
             apply_restart=pressed.get("apply_restart", False),
             apply_return=pressed.get("apply_return", False),
+            movement_mode_cycle=pressed.get("movement_mode_cycle", False),
             mouse_dx=mouse_dx,
             mouse_dy=mouse_dy,
             camera_dragging=focused
@@ -4961,6 +4984,7 @@ class OverlayIntent:
     expected_revision: int | None = None
     pause_target: str | None = None
     expected_epoch: int | None = None
+    movement_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -5756,6 +5780,61 @@ class GameCommandClient:
             self._pending_runtime_pause = (target, expected_epoch)
         return submitted
 
+    def set_movement_mode(
+        self,
+        movement_mode: object,
+        expected_revision: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+        hot_switch: bool = False,
+        motion_input_neutral: bool = False,
+    ) -> bool:
+        """Submit an ESC selection or a neutral F6 gameplay hot switch."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if type(hot_switch) is not bool or type(motion_input_neutral) is not bool:
+            raise TypeError("movement mode switch gate flags must be boolean")
+        if hot_switch:
+            if calibration_active or not motion_input_neutral:
+                self._local_error(
+                    "E_NEUTRAL_REQUIRED",
+                    "Release WASD, Q/E, and the movement stick before pressing F6",
+                )
+                return False
+        else:
+            if not calibration_active:
+                self._local_error(
+                    "E_NOT_PAUSED", "Open the ESC panel before switching movement mode"
+                )
+                return False
+            if not neutral_frame_ready:
+                self._local_error(
+                    "E_NEUTRAL_REQUIRED",
+                    "Wait for the ESC panel to deliver a neutral frame",
+                )
+                return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        try:
+            command = MovementModeSet(
+                movement_mode=movement_mode,
+                expected_revision=expected_revision,
+            )
+        except CommandParseError as exc:
+            self._local_error(exc.code, exc.message)
+            return False
+        return self._send_typed_command(
+            command,
+            warning=None,
+            pending_message=f"Switching movement mode to {command.movement_mode}",
+        )
+
     def submit_external(
         self,
         command_text: object,
@@ -6375,6 +6454,38 @@ class GameCommandClient:
                     f"Invalid motion settings in command response: {exc}"
                 )
                 return True
+        if isinstance(pending.command, MovementModeSet) and response.ok:
+            if response.code not in {
+                "OK_MOVEMENT_MODE_SET",
+                "OK_MOVEMENT_MODE_UNCHANGED",
+            }:
+                self._protocol_failure(
+                    "Movement mode success code did not match its typed command"
+                )
+                return True
+            if (
+                response_data is None
+                or set(response_data) != {"motion_settings"}
+                or validated_motion_settings is None
+            ):
+                self._protocol_failure(
+                    "Movement mode success requires one authoritative settings ACK"
+                )
+                return True
+            acknowledged = MotionSettings.from_mapping(
+                validated_motion_settings["settings"]
+            )
+            expected_revision = pending.command.expected_revision + (
+                1 if response.code == "OK_MOVEMENT_MODE_SET" else 0
+            )
+            if (
+                acknowledged.movement_mode != pending.command.movement_mode
+                or acknowledged.revision != expected_revision
+            ):
+                self._protocol_failure(
+                    "Movement mode ACK did not match mode and next revision"
+                )
+                return True
         teleport_probes = None
         if (
             response.ok
@@ -6813,6 +6924,27 @@ class CalibrationOverlaySupervisor:
                     kind="runtime_pause",
                     pause_target=pause_target,
                     expected_epoch=expected_epoch,
+                )
+            elif kind == "movement_mode_select":
+                movement_mode = value.get("movement_mode")
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "movement_mode",
+                }:
+                    raise RuntimeError("invalid movement-mode intent schema")
+                try:
+                    validated_mode = MovementModeSet(
+                        movement_mode=movement_mode,
+                        expected_revision=0,
+                    ).movement_mode
+                except CommandParseError as exc:
+                    raise RuntimeError("invalid movement-mode intent schema") from exc
+                intent = OverlayIntent(
+                    kind="movement_mode_select",
+                    movement_mode=validated_mode,
                 )
             elif kind == "strategy_select":
                 if set(value) != {
@@ -7490,6 +7622,7 @@ def main() -> int:
         launcher_pid=args.restart_launcher_pid,
     )
     apply_restart_key = ApplyRestartKey()
+    movement_mode_cycle_key = MovementModeCycleKey()
     apply_return = ApplyReturnController()
     try:
         input_source = effective_input_source(
@@ -7786,6 +7919,7 @@ def main() -> int:
             command_state_changed = False
             video_settings_changed = False
             ui_settings_changed = False
+            pending_hot_movement_mode: tuple[str, int] | None = None
             game_command_client.checkpoint_celestial_clock()
             physical_keyboard = x11.poll()
             last_keyboard = physical_keyboard
@@ -7893,6 +8027,49 @@ def main() -> int:
                 calibration_neutral_frames >= 1
                 and (publisher is None or publisher.connected)
             )
+            movement_mode_cycle_edge = movement_mode_cycle_key.update(
+                physical_keyboard.movement_mode_cycle
+            )
+            if movement_mode_cycle_edge:
+                current_mode_settings = live_motion_settings(
+                    initial_motion_settings,
+                    game_command_client,
+                )
+                motion_input_neutral = bool(
+                    raw_keyboard.focused
+                    and not calibration.active
+                    and not any(
+                        (
+                            raw_keyboard.w,
+                            raw_keyboard.a,
+                            raw_keyboard.s,
+                            raw_keyboard.d,
+                            raw_keyboard.q,
+                            raw_keyboard.e,
+                        )
+                    )
+                    and math.hypot(raw_pad.right, raw_pad.forward)
+                    <= args.gamepad_move_deadzone
+                )
+                next_mode = next_movement_mode(
+                    current_mode_settings.movement_mode
+                )
+                if motion_input_neutral:
+                    pending_hot_movement_mode = (
+                        next_mode,
+                        current_mode_settings.revision,
+                    )
+                else:
+                    game_command_client.set_movement_mode(
+                        next_mode,
+                        current_mode_settings.revision,
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                        hot_switch=True,
+                        motion_input_neutral=False,
+                    )
+                command_state_changed = True
             panel_actions: list[str] = []
             for intent in panel_intents:
                 if intent.kind == "action":
@@ -7927,6 +8104,22 @@ def main() -> int:
                     command_state_changed = True
                     if runtime_pause_submitted:
                         apply_return.cancel_pending()
+                    continue
+                if intent.kind == "movement_mode_select":
+                    assert intent.movement_mode is not None
+                    current_mode_settings = live_motion_settings(
+                        initial_motion_settings,
+                        game_command_client,
+                    )
+                    game_command_client.set_movement_mode(
+                        intent.movement_mode,
+                        current_mode_settings.revision,
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    apply_return.cancel_pending()
                     continue
                 if intent.kind == "strategy_select":
                     assert intent.slot is not None
@@ -8094,6 +8287,7 @@ def main() -> int:
                         "command_edit",
                         "command_submit",
                         "runtime_pause",
+                        "movement_mode_select",
                         "strategy_select",
                         "creative_spawn",
                         "font_size",
@@ -8440,6 +8634,20 @@ def main() -> int:
             provider_packet_published = bool(
                 publisher is not None and neutral_delivered
             )
+            if (
+                pending_hot_movement_mode is not None
+                and provider_packet_published
+            ):
+                hot_mode, hot_revision = pending_hot_movement_mode
+                game_command_client.set_movement_mode(
+                    hot_mode,
+                    hot_revision,
+                    calibration_active=False,
+                    neutral_frame_ready=False,
+                    restart_requested=restart_requester.requested,
+                    hot_switch=True,
+                    motion_input_neutral=True,
+                )
             exact_external_published = bool(
                 provider_packet_published and publish_boundary_exact
             )

@@ -173,6 +173,46 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 receiver.close()
                 supervisor._action_socket = None
 
+    def test_movement_mode_intent_is_strict_and_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            try:
+                sender.send(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "session": supervisor._action_session,
+                            "sequence": 1,
+                            "kind": "movement_mode_select",
+                            "movement_mode": "body_relative",
+                        }
+                    ).encode("ascii")
+                )
+                self.assertEqual(
+                    supervisor.drain_intents(),
+                    (
+                        MODULE.OverlayIntent(
+                            kind="movement_mode_select",
+                            movement_mode="body_relative",
+                        ),
+                    ),
+                )
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
     def test_video_setting_intent_is_strict_cas_and_next_launch_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -551,15 +591,107 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
 )
 class GameCommandClientTest(unittest.TestCase):
     @staticmethod
-    def motion_settings_telemetry(*, revision: int = 0) -> dict[str, object]:
+    def motion_settings_telemetry(
+        *, revision: int = 0, movement_mode: str = "camera_face"
+    ) -> dict[str, object]:
         return {
             "settings_file": "/home/user/.config/matrix/hosts/trna/motion-control.json",
             "load_status": "loaded",
             "load_error": None,
             "settings": MOTION_SETTINGS.MotionSettings(
-                revision=revision
+                revision=revision,
+                movement_mode=movement_mode,
             ).to_mapping(),
         }
+
+    def test_movement_mode_hot_switch_skips_editor_and_tracks_exact_ack(self) -> None:
+        initial = self.motion_settings_telemetry()
+        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = MODULE.GameCommandClient(
+            provider.detach(), initial_motion_settings=initial
+        )
+        runtime.settimeout(1.0)
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+
+        self.assertTrue(
+            client.set_movement_mode(
+                "camera_strafe",
+                0,
+                calibration_active=False,
+                neutral_frame_ready=False,
+                restart_requested=False,
+                hot_switch=True,
+                motion_input_neutral=True,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(
+            request.command,
+            MC_COMMANDS.MovementModeSet("camera_strafe", 0),
+        )
+        self.assertFalse(client.editing)
+
+        updated = self.motion_settings_telemetry(
+            revision=1, movement_mode="camera_strafe"
+        )
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_MOVEMENT_MODE_SET",
+                    message="updated",
+                    data={"motion_settings": updated},
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertEqual(
+            MODULE.live_motion_settings(None, client).movement_mode,
+            "camera_strafe",
+        )
+
+    def test_movement_mode_switch_fails_closed_on_panel_and_hotkey_gates(self) -> None:
+        cases = (
+            (
+                dict(
+                    calibration_active=False,
+                    neutral_frame_ready=True,
+                    restart_requested=False,
+                ),
+                "E_NOT_PAUSED",
+            ),
+            (
+                dict(
+                    calibration_active=True,
+                    neutral_frame_ready=False,
+                    restart_requested=False,
+                ),
+                "E_NEUTRAL_REQUIRED",
+            ),
+            (
+                dict(
+                    calibration_active=False,
+                    neutral_frame_ready=False,
+                    restart_requested=False,
+                    hot_switch=True,
+                    motion_input_neutral=False,
+                ),
+                "E_NEUTRAL_REQUIRED",
+            ),
+        )
+        for arguments, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                client, runtime = self.make_client()
+                self.assertFalse(
+                    client.set_movement_mode("body_relative", 0, **arguments)
+                )
+                self.assertEqual(client.code, expected_code)
+                with self.assertRaises(BlockingIOError):
+                    runtime.recv(4096)
 
     def test_motion_settings_telemetry_prefers_latest_runtime_ack(self) -> None:
         initial = self.motion_settings_telemetry(revision=0)
@@ -4923,6 +5055,16 @@ class CalibrationModeTest(unittest.TestCase):
 
 
 class MouseSettingsAndRestartTest(unittest.TestCase):
+    def test_f6_cycle_requires_release_then_emits_only_fresh_edges(self) -> None:
+        key = MODULE.MovementModeCycleKey()
+        self.assertFalse(key.update(True))
+        self.assertFalse(key.update(True))
+        self.assertFalse(key.update(False))
+        self.assertTrue(key.update(True))
+        self.assertFalse(key.update(True))
+        self.assertFalse(key.update(False))
+        self.assertTrue(key.update(True))
+
     def test_applied_remote_scale_is_discrete_but_local_remains_one_x(self) -> None:
         remote = MODULE.AppliedMouseSettings(
             profile="remote", effective_scale=0.01
