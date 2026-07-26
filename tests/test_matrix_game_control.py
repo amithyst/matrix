@@ -14,6 +14,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "matrix_game_control.py"
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("matrix_game_control", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -557,14 +558,87 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(right_command.movement[0], 0.0, places=7)
         self.assertAlmostEqual(right_command.movement[1], -1.0, places=7)
 
-    def test_q_and_e_never_contribute_to_locomotion(self) -> None:
-        for key in ("q", "e", "q", "e"):
-            core = armed_core(immediate_config())
+    def test_q_and_e_turn_in_place_without_translation(self) -> None:
+        for key, expected_sign in (("q", 1.0), ("e", -1.0)):
+            core = armed_core(immediate_config(max_turn_rate_rad_s=1.0))
             core.accept_snapshot(snapshot(pressed=(key,)), received_at_s=10.0)
             command = core.command(now_s=10.0, dt_s=0.1)
-            self.assertEqual(command.mode, "idle")
+            self.assertEqual(command.mode, "turn")
+            self.assertEqual(command.reason, "manual_yaw")
             self.assertEqual(command.movement, (0.0, 0.0, 0.0))
             self.assertEqual(command.speed_mps, 0.0)
+            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+            self.assertEqual(
+                math.copysign(1.0, math.atan2(command.facing[1], command.facing[0])),
+                expected_sign,
+            )
+
+        both = armed_core(immediate_config())
+        both.accept_snapshot(snapshot(pressed=("q", "e")), received_at_s=10.0)
+        self.assertEqual(both.command(now_s=10.0, dt_s=0.1).mode, "idle")
+
+    def test_camera_strafe_moves_in_camera_frame_and_holds_body_heading(self) -> None:
+        core = armed_core(
+            immediate_config(movement_mode=MODULE.CAMERA_STRAFE)
+        )
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(yaw=math.pi / 2.0, pressed=("w",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        command = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(command.mode, "move")
+        self.assertAlmostEqual(command.movement[0], 0.0, places=7)
+        self.assertAlmostEqual(command.movement[1], 1.0, places=7)
+        self.assertAlmostEqual(command.facing[0], 1.0, places=7)
+        self.assertAlmostEqual(command.facing[1], 0.0, places=7)
+
+    def test_body_relative_ignores_camera_and_holds_body_heading(self) -> None:
+        core = armed_core(
+            immediate_config(movement_mode=MODULE.BODY_RELATIVE)
+        )
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(yaw=math.pi / 2.0, pressed=("w",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        command = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(command.mode, "move")
+        self.assertAlmostEqual(command.movement[0], 1.0, places=7)
+        self.assertAlmostEqual(command.movement[1], 0.0, places=7)
+        self.assertEqual(command.movement, command.facing)
+
+    def test_movement_mode_change_requires_neutral_and_fresh_input(self) -> None:
+        core = armed_core(immediate_config())
+        self.assertTrue(core.set_movement_mode(MODULE.CAMERA_STRAFE))
+        self.assertEqual(core.movement_mode, MODULE.CAMERA_STRAFE)
+        self.assertFalse(core.set_movement_mode(MODULE.CAMERA_STRAFE))
+
+        core.accept_snapshot(
+            snapshot(sequence=1, timestamp=10.0, pressed=("w",)),
+            received_at_s=10.0,
+        )
+        blocked = core.command(now_s=10.0, dt_s=0.1)
+        self.assertTrue(blocked.safe_stop)
+        self.assertEqual(blocked.reason, "awaiting_neutral")
+
+        core.accept_snapshot(
+            snapshot(sequence=2, timestamp=10.01),
+            received_at_s=10.01,
+        )
+        self.assertEqual(core.command(now_s=10.01, dt_s=0.1).mode, "idle")
+        core.accept_snapshot(
+            snapshot(sequence=3, timestamp=10.02, pressed=("w",)),
+            received_at_s=10.02,
+        )
+        self.assertEqual(core.command(now_s=10.02, dt_s=0.1).mode, "move")
+
+        with self.assertRaisesRegex(ValueError, "only while motion input is neutral"):
+            core.set_movement_mode(MODULE.BODY_RELATIVE)
 
     def test_turn_and_acceleration_are_rate_limited(self) -> None:
         config = MODULE.ControlConfig(

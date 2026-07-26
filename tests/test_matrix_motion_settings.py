@@ -15,6 +15,7 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts/matrix_motion_settings.py"
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("matrix_motion_settings_tested", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -38,6 +39,7 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(settings.run_double_tap_speed_mps, 2.75)
         self.assertEqual(settings.max_turn_rate_rad_s, 2.50)
         self.assertEqual(settings.keyboard_look_rate_deg_s, 120.0)
+        self.assertEqual(settings.movement_mode, "camera_face")
         self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 8)
 
     def test_strict_mapping_round_trip(self) -> None:
@@ -59,6 +61,15 @@ class MotionSettingsValueTest(unittest.TestCase):
                 "gears",
                 "max_turn_rate_rad_s",
                 "camera",
+                "movement",
+            },
+        )
+        self.assertEqual(
+            mapping["movement"],
+            {
+                "mode": "camera_face",
+                "translation_frame": "camera",
+                "facing_policy": "face_movement",
             },
         )
         self.assertEqual(
@@ -115,14 +126,32 @@ class MotionSettingsValueTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(MODULE.MotionSettingsError):
                 MODULE.MotionSettings.from_mapping(value)
 
-    def test_legacy_v1_mapping_without_camera_uses_safe_default(self) -> None:
+    def test_legacy_v1_without_camera_or_movement_uses_safe_defaults(self) -> None:
         legacy = MODULE.MotionSettings().to_mapping()
         del legacy["camera"]
+        del legacy["movement"]
         loaded = MODULE.MotionSettings.from_mapping(legacy)
         self.assertEqual(
             loaded.keyboard_look_rate_deg_s,
             MODULE.DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
         )
+        self.assertEqual(loaded.movement_mode, "camera_face")
+
+    def test_movement_mode_mapping_is_strict_and_self_consistent(self) -> None:
+        settings = MODULE.MotionSettings(movement_mode="body_relative")
+        self.assertEqual(
+            MODULE.MotionSettings.from_mapping(settings.to_mapping()), settings
+        )
+        for mode in ("unknown", "CAMERA_FACE", "", True, None):
+            with self.subTest(mode=mode), self.assertRaises(
+                MODULE.MotionSettingsError
+            ):
+                MODULE.MotionSettings(movement_mode=mode)
+
+        mismatched = settings.to_mapping()
+        mismatched["movement"]["translation_frame"] = "camera"
+        with self.assertRaisesRegex(MODULE.MotionSettingsError, "does not match"):
+            MODULE.MotionSettings.from_mapping(mismatched)
 
     def test_each_value_must_be_finite_numeric_and_inside_native_tier(self) -> None:
         cases = (
@@ -447,6 +476,30 @@ class MotionSettingsStepTest(unittest.TestCase):
 
 
 class MotionSettingsStoreTest(unittest.TestCase):
+    def test_movement_mode_modify_is_persisted_revisioned_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            file_path = Path(temporary) / "motion.json"
+            store = MODULE.MotionSettingsStore(
+                file_path, initial=MODULE.MotionSettings()
+            )
+            modified = store.modify_movement_mode(
+                "camera_strafe", expected_revision=0
+            )
+            self.assertTrue(modified.changed)
+            self.assertEqual(modified.path, MODULE.MOVEMENT_MODE_PATH)
+            self.assertEqual(modified.previous_value, "camera_face")
+            self.assertEqual(modified.value, "camera_strafe")
+            self.assertEqual(modified.settings.revision, 1)
+            self.assertEqual(
+                MODULE.load_settings(file_path).settings.movement_mode,
+                "camera_strafe",
+            )
+            unchanged = store.modify_movement_mode(
+                "camera_strafe", expected_revision=1
+            )
+            self.assertFalse(unchanged.changed)
+            self.assertEqual(unchanged.settings.revision, 1)
+
     def test_modify_is_persisted_revisioned_and_cas_guarded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             file_path = Path(temporary) / "motion.json"

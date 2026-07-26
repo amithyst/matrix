@@ -22,7 +22,8 @@ from matrix_world_state import (
     validate_tag,
     validate_world_id,
 )
-from matrix_motion_settings import MOTION_SETTING_PATHS
+from matrix_motion_settings import MAX_REVISION, MOTION_SETTING_PATHS
+from matrix_movement_modes import validate_movement_mode
 
 
 COMMAND_PROTOCOL = "matrix-game-command/v1"
@@ -383,6 +384,29 @@ class RuntimePause:
 
 
 @dataclass(frozen=True)
+class MovementModeSet:
+    """Select one persisted movement mode at a known settings revision."""
+
+    movement_mode: str
+    expected_revision: int
+
+    def __post_init__(self) -> None:
+        try:
+            movement_mode = validate_movement_mode(self.movement_mode)
+        except ValueError as exc:
+            raise CommandParseError("E_MOVEMENT_MODE", str(exc)) from exc
+        if (
+            type(self.expected_revision) is not int
+            or not 0 <= self.expected_revision <= MAX_REVISION
+        ):
+            raise CommandParseError(
+                "E_DATA_REVISION",
+                f"movement mode revision must be an integer in [0, {MAX_REVISION}]",
+            )
+        object.__setattr__(self, "movement_mode", movement_mode)
+
+
+@dataclass(frozen=True)
 class DataModifyNumber:
     """Set one whitelisted numeric Matrix entity-data path."""
 
@@ -455,6 +479,7 @@ McCommand: TypeAlias = (
     | PolicySlotAssignment
     | CreativeSpawnItem
     | RuntimePause
+    | MovementModeSet
     | DataModifyNumber
     | DataModifyInput
 )
@@ -732,6 +757,12 @@ def parse_mc_command(text: object) -> ParsedCommand:
 
 
 def command_to_mapping(command: McCommand) -> dict[str, object]:
+    if isinstance(command, MovementModeSet):
+        return {
+            "name": "movement_mode_set",
+            "movement_mode": command.movement_mode,
+            "expected_revision": command.expected_revision,
+        }
     if isinstance(command, RuntimePause):
         return {
             "name": "runtime_pause",
@@ -796,6 +827,16 @@ def command_from_mapping(value: object) -> McCommand:
     if not isinstance(value, dict) or not isinstance(value.get("name"), str):
         raise CommandProtocolError("command AST has an invalid schema")
     name = value["name"]
+    if name == "movement_mode_set":
+        if set(value) != {"name", "movement_mode", "expected_revision"}:
+            raise CommandProtocolError("movement mode set has an invalid schema")
+        try:
+            return MovementModeSet(
+                movement_mode=value.get("movement_mode"),
+                expected_revision=value.get("expected_revision"),
+            )
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
     if name == "runtime_pause":
         if set(value) != {"name", "target", "expected_epoch"}:
             raise CommandProtocolError("runtime pause has an invalid schema")
@@ -1319,6 +1360,7 @@ __all__ = [
     "GameCommandRequest",
     "GameCommandResponse",
     "MAX_TELEPORT_QUERY_TAGS",
+    "MovementModeSet",
     "ParsedCommand",
     "PolicySlotAssignment",
     "RuntimePause",
