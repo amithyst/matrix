@@ -79,8 +79,8 @@ class FakeModel:
             geom_body_ids.append(0)
             geom_data_ids.append(0)
             geom_types.append(1)
-            geom_contype.append(1)
-            geom_conaffinity.append(1)
+            geom_contype.append(0)
+            geom_conaffinity.append(0)
         for i, j in MODULE._EXPECTED_TILE_KEYS:
             self._geom_names.append(f"soil_{i}_{j}")
             geom_body_ids.append(body_id_by_key.get((i, j), 0))
@@ -301,8 +301,8 @@ class MoonDynamicGroundTest(unittest.TestCase):
             ),
             (
                 "collision mask",
-                {"geom_contype": 2, "geom_conaffinity": 2},
-                "contype=1 and conaffinity=1",
+                {"geom_contype": 1, "geom_conaffinity": 1},
+                "contype=0 and conaffinity=0",
             ),
         )
         for label, replacements, message in cases:

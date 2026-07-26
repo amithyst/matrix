@@ -5169,7 +5169,13 @@ class GameCommandClient:
                 ):
                     raise ValueError("strategy candidate has an invalid schema")
                 candidate_ids.add(validated.policy_id)
-            if selected not in candidate_ids:
+            disabled_recovery_slot = bool(
+                slot_id == "recovery"
+                and selected == "off"
+                and slot.get("locked") is True
+                and not candidate_ids
+            )
+            if selected not in candidate_ids and not disabled_recovery_slot:
                 raise ValueError("strategy slot selection is not a candidate")
         if slots and seen_slots != {"locomotion", "recovery"}:
             raise ValueError("strategy loadout must define both slots")

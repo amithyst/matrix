@@ -33,6 +33,7 @@ REQUIRED_MOON_GROUND_SUPPORT_HITS = 2
 MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M = 0.04
 MOON_CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
 MOON_CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
+MOON_SPAWN_PAD_GEOM_NAME = "matrix_moon_spawn_pad"
 _MUJOCO_HFIELD_GEOM_TYPE = 1
 _ROLLBACK_CLEARANCE_REASONS = frozenset(
     {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
@@ -646,6 +647,13 @@ def _geom_count(model: Any) -> int:
 
 
 def _moon_continuous_support_geom_id(model: Any, *, ngeom: int) -> int | None:
+    """Validate the Moon observation hfield and return its active support geom.
+
+    During spawn-pad acceptance the rolling hfield remains populated for PFNN
+    terrain observations but is non-colliding. The unique world-attached pad
+    is the only collision surface and therefore the only geom accepted by the
+    stricter two-foot Moon support gate.
+    """
     matches = [
         geom_id
         for geom_id in range(ngeom)
@@ -712,11 +720,46 @@ def _moon_continuous_support_geom_id(model: Any, *, ngeom: int) -> int | None:
         raise SpawnClearanceError(
             "MoonWorld continuous support geom must bind the named hfield asset"
         )
-    if contype != 1 or conaffinity != 1:
+    if contype != 0 or conaffinity != 0:
         raise SpawnClearanceError(
-            "MoonWorld continuous support must use contype=1 and conaffinity=1"
+            "MoonWorld observation hfield must use contype=0 and conaffinity=0"
         )
-    return geom_id
+    pad_matches = [
+        pad_id
+        for pad_id in range(ngeom)
+        if _optional_name(model, "geom", pad_id) == MOON_SPAWN_PAD_GEOM_NAME
+    ]
+    if not pad_matches:
+        raise SpawnClearanceError("MoonWorld collision-only spawn pad is missing")
+    if len(pad_matches) != 1:
+        raise SpawnClearanceError(
+            "MoonWorld collision-only spawn pad must be unique"
+        )
+    pad_id = pad_matches[0]
+    try:
+        pad_body_id = _index(
+            model.geom_bodyid[pad_id], label=f"model.geom_bodyid[{pad_id}]"
+        )
+        pad_contype = _index(
+            model.geom_contype[pad_id], label=f"model.geom_contype[{pad_id}]"
+        )
+        pad_conaffinity = _index(
+            model.geom_conaffinity[pad_id],
+            label=f"model.geom_conaffinity[{pad_id}]",
+        )
+    except (AttributeError, IndexError, KeyError, TypeError) as exc:
+        raise SpawnClearanceError(
+            "MoonWorld spawn-pad collision metadata is unavailable"
+        ) from exc
+    if pad_body_id != 0:
+        raise SpawnClearanceError(
+            "MoonWorld collision-only spawn pad must be attached to the world body"
+        )
+    if pad_contype != 1 or pad_conaffinity != 1:
+        raise SpawnClearanceError(
+            "MoonWorld collision-only spawn pad must use contype=1 and conaffinity=1"
+        )
+    return pad_id
 
 
 def _contact_mapping(

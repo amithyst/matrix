@@ -101,15 +101,25 @@ class FakeModel:
         return NamedItem(key, self._hfields[key])
 
     def enable_moon_continuous_support(self) -> None:
-        self._geoms[3] = MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+        self._geoms[3] = MODULE.MOON_SPAWN_PAD_GEOM_NAME
+        self._geoms[6] = MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
         self.nhfield = 1
         self._hfields[0] = MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME
         geom_types = list(self.geom_type)
-        geom_types[3] = FakeMujoco.mjtGeom.mjGEOM_HFIELD
+        geom_types[6] = FakeMujoco.mjtGeom.mjGEOM_HFIELD
         self.geom_type = tuple(geom_types)
         geom_data_ids = list(self.geom_dataid)
-        geom_data_ids[3] = 0
+        geom_data_ids[6] = 0
         self.geom_dataid = tuple(geom_data_ids)
+        geom_body_ids = list(self.geom_bodyid)
+        geom_body_ids[6] = 0
+        self.geom_bodyid = tuple(geom_body_ids)
+        geom_contype = list(self.geom_contype)
+        geom_conaffinity = list(self.geom_conaffinity)
+        geom_contype[6] = 0
+        geom_conaffinity[6] = 0
+        self.geom_contype = tuple(geom_contype)
+        self.geom_conaffinity = tuple(geom_conaffinity)
 
 
 class FakeData:
@@ -677,7 +687,7 @@ class GroundSupportProbeTest(unittest.TestCase):
             (
                 "collision mask",
                 {"geom_contype": 2, "geom_conaffinity": 2},
-                "contype=1 and conaffinity=1",
+                "contype=0 and conaffinity=0",
             ),
         )
         for label, replacements, message in cases:
@@ -689,7 +699,7 @@ class GroundSupportProbeTest(unittest.TestCase):
                     model._hfields[1] = "other_hfield"
                 for attribute, value in replacements.items():
                     table = list(getattr(model, attribute))
-                    table[3] = value
+                    table[6] = value
                     setattr(model, attribute, tuple(table))
                 with self.assertRaisesRegex(
                     MODULE.SpawnClearanceError,
@@ -700,7 +710,7 @@ class GroundSupportProbeTest(unittest.TestCase):
     def test_moon_gate_rejects_duplicate_support_geom_or_hfield(self) -> None:
         duplicate_geom = FakeModel()
         duplicate_geom.enable_moon_continuous_support()
-        duplicate_geom._geoms[6] = MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+        duplicate_geom._geoms[5] = MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
         with self.assertRaisesRegex(
             MODULE.SpawnClearanceError,
             "support geom must be unique",

@@ -455,7 +455,15 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("PIPELINE_VERSION=20", launcher)
+        self.assertIn("PIPELINE_VERSION=21", launcher)
+        self.assertEqual(
+            launcher.count(
+                'names = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")'
+            ),
+            2,
+        )
+        self.assertEqual(launcher.count('return {"fullinertia":'), 2)
+        self.assertEqual(launcher.count("rotate_inertia_to_body_frame("), 4)
         self.assertIn('collision_profile == "isaac-model12"', launcher)
         self.assertIn('type="capsule"', launcher)
         self.assertIn('"contype": "1"', launcher)

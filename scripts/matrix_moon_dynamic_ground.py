@@ -244,7 +244,7 @@ def _unique_named_model_id(
 
 
 def resolve_continuous_support(model: Any) -> dict[str, int]:
-    """Resolve and validate the single rolling collision hfield contract."""
+    """Resolve the non-colliding rolling hfield used for terrain observations."""
 
     try:
         ngeom = int(model.ngeom)
@@ -298,9 +298,9 @@ def resolve_continuous_support(model: Any) -> dict[str, int]:
         raise MoonDynamicGroundError(
             "continuous support geom must bind the named hfield asset"
         )
-    if geom_contype != 1 or geom_conaffinity != 1:
+    if geom_contype != 0 or geom_conaffinity != 0:
         raise MoonDynamicGroundError(
-            "continuous support geom must use contype=1 and conaffinity=1"
+            "continuous support geom must use contype=0 and conaffinity=0"
         )
     if (
         nrow != CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES

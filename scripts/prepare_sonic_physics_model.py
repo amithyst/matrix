@@ -27,7 +27,7 @@ from inject_creative_inventory import (  # noqa: E402
 )
 
 
-PIPELINE_VERSION = 10
+PIPELINE_VERSION = 13
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
@@ -53,10 +53,15 @@ MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES = 33
 MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M = 1.6
 MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M = 64.0
 MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
-# The pad covers a locked-map flat footprint.  Its top is intentionally 1 cm
-# above the coincident visual floor so startup clearance selects box contact.
-MOON_SPAWN_PAD_CENTER_M = (-94.7, -65.6, -6.101562023162842)
+# The pad covers a locked-map flat footprint.  Its top is exactly coincident
+# with the locked terrain height so the physical contact plane and the PFNN
+# terrain sample use the same world Z.
 MOON_SPAWN_PAD_HALF_SIZE_M = (6.0, 6.0, 0.01)
+MOON_SPAWN_PAD_CENTER_M = (
+    -94.7,
+    -65.6,
+    -6.101562023162842 - MOON_SPAWN_PAD_HALF_SIZE_M[2],
+)
 MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE = (1993, 2113)
 MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE = (2284, 2404)
 MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M = (
@@ -165,6 +170,25 @@ def _strip_canonical_scene_sections(
         ):
             continue
         robot_worldbody.remove(child)
+    retained_body_names = {
+        body.get("name")
+        for body in robot_worldbody.iter("body")
+        if body.get("name")
+    }
+    for equality in list(root.findall("equality")):
+        for constraint in list(equality):
+            referenced_bodies = tuple(
+                name
+                for name in (
+                    constraint.get("body1"),
+                    constraint.get("body2"),
+                )
+                if name
+            )
+            if any(name not in retained_body_names for name in referenced_bodies):
+                equality.remove(constraint)
+        if not list(equality):
+            root.remove(equality)
     for tag in ("statistic", "visual"):
         for element in list(root.findall(tag)):
             root.remove(element)
@@ -410,9 +434,10 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
             "update_timing": "before_each_mj_step",
             "fallback_support_plane": False,
             "collision": {
-                "mode": "rolling-heightfield-v1",
+                "mode": "rolling-heightfield-observation-only-v1",
                 "asset_name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
                 "geom_name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "collision_enabled": False,
                 "grid_shape": [
                     MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
                     MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
@@ -427,13 +452,14 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
                 "spawn_pad": {
                     "mode": "finite-collision-only-box-v1",
                     "geom_name": MOON_SPAWN_PAD_GEOM_NAME,
+                    "collision_enabled": True,
                     "center_m": list(MOON_SPAWN_PAD_CENTER_M),
                     "half_size_m": list(MOON_SPAWN_PAD_HALF_SIZE_M),
                     "top_z_m": (
                         MOON_SPAWN_PAD_CENTER_M[2]
                         + MOON_SPAWN_PAD_HALF_SIZE_M[2]
                     ),
-                    "top_offset_above_native_floor_m": MOON_SPAWN_PAD_HALF_SIZE_M[2],
+                    "top_offset_above_native_floor_m": 0.0,
                     "locked_footprint": {
                         "map_sha256": MOON_DYNAMIC_MAP_SHA256,
                         "pixel_x_range": list(
@@ -568,8 +594,12 @@ def _apply_scene_transform_additions(
                 "type": "hfield",
                 "hfield": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
                 "pos": f"0 0 {MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M:.12g}",
-                "contype": "1",
-                "conaffinity": "1",
+                # Keep the rolling heightfield updated for PFNN/terrain
+                # observation parity, but do not let it overlap the spawn
+                # acceptance plane.  Collision handoff is a separate atomic
+                # transition; two simultaneously active grounds are invalid.
+                "contype": "0",
+                "conaffinity": "0",
                 "friction": MOON_COLLISION_FRICTION,
                 "solref": MOON_COLLISION_SOLREF,
                 "solimp": MOON_COLLISION_SOLIMP,
@@ -599,8 +629,8 @@ def _apply_scene_transform_additions(
         0,
         ET.Comment(
             " converted official MoonWorld rolling tiles to non-colliding mocap visuals "
-            "and added one runtime-updated continuous collision hfield plus a "
-            "finite collision-only spawn pad "
+            "and added one runtime-updated observation hfield plus a "
+            "single collision-only spawn plane "
         ),
     )
     ET.indent(tree, space="  ")
