@@ -455,7 +455,10 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("PIPELINE_VERSION=19", launcher)
+        self.assertIn("PIPELINE_VERSION=20", launcher)
+        self.assertIn('collision_profile == "isaac-model12"', launcher)
+        self.assertIn('type="capsule"', launcher)
+        self.assertIn('"contype": "1"', launcher)
         self.assertIn("--describe-skin", launcher)
         self.assertIn("--ue-scope-tag", launcher)
         self.assertIn(

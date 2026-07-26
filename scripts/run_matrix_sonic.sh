@@ -759,6 +759,24 @@ find_first_dir() {
 }
 
 RUNTIME_ROOT="${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-native-v2}"
+if [[ "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" \
+    && -z "$CUSTOM_URDF" ]]; then
+    CUSTOM_URDF="${MATRIX_BFM_MODEL12_URDF:-}"
+    if [[ -z "$CUSTOM_URDF" || ! -f "$CUSTOM_URDF" ]]; then
+        echo "[ERROR] BFM Model12 URDF is missing: ${CUSTOM_URDF:-unset}" >&2
+        exit 2
+    fi
+    if [[ -z "${MATRIX_BFM_MODEL12_ASSETS:-}" \
+        || ! -d "$MATRIX_BFM_MODEL12_ASSETS" ]]; then
+        echo "[ERROR] BFM Model12 asset tree is missing: ${MATRIX_BFM_MODEL12_ASSETS:-unset}" >&2
+        exit 2
+    fi
+    CUSTOM_NAME="g1_model12"
+    export MATRIX_URDF_COLLISION_PROFILE="isaac-model12"
+    export MATRIX_SONIC_CANONICAL_MODEL="$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/custom/current.xml"
+    export MATRIX_SONIC_CANONICAL_MESHES="$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/custom/assets"
+    echo "[INFO] BFM Model12 physics source: $CUSTOM_URDF"
+fi
 MATRIX_SONIC_ROOT="${MATRIX_SONIC_ROOT:-$(find_first_dir \
     "$RUNTIME_ROOT/GR00T-WholeBodyControl" \
     "$HOME/worktrees/sonic-matrix-native-final" \

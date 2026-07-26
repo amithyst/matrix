@@ -192,9 +192,18 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         joint_by_name = {
             name: index for index, name in enumerate(joint_names)
         }
+        actuator_by_name = {
+            name.removesuffix("_joint"): index
+            for index, name in enumerate(joint_names)
+        }
+        baseline_efforts = [88.0] * len(joint_names)
         model = SimpleNamespace(
             jnt_dofadr=[6 + index for index in range(len(joint_names))],
             dof_armature=[0.0] * 6 + [0.01] * len(joint_names),
+            actuator_ctrlrange=[
+                [-effort, effort] for effort in baseline_efforts
+            ],
+            runtime_torque_limits=list(baseline_efforts),
         )
         data = SimpleNamespace(
             qpos=[float(index) / 100.0 for index in range(36)],
@@ -203,15 +212,17 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
 
         class FakeMujoco:
-            mjtObj = SimpleNamespace(mjOBJ_JOINT=7)
+            mjtObj = SimpleNamespace(mjOBJ_JOINT=7, mjOBJ_ACTUATOR=8)
             forward_calls = 0
             fail_forward_once = False
 
             @staticmethod
             def mj_name2id(_model, object_type, name):
-                if object_type != 7:
-                    raise AssertionError("unexpected object type")
-                return joint_by_name.get(name, -1)
+                if object_type == 7:
+                    return joint_by_name.get(name, -1)
+                if object_type == 8:
+                    return actuator_by_name.get(name, -1)
+                raise AssertionError("unexpected object type")
 
             @classmethod
             def mj_forward(cls, _model, _data):
@@ -308,7 +319,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         qpos_before = tuple(data.qpos)
         qvel_before = tuple(data.qvel)
         time_before = data.time
-        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        profiles = MODULE._LocomotionPhysicsProfiles(
+            mujoco,
+            model,
+            data,
+            torque_limits=model.runtime_torque_limits,
+        )
 
         self.assertEqual(
             profiles.active_profile_id,
@@ -325,6 +341,13 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(actual["left_ankle_pitch_joint"], 0.00721945)
         self.assertEqual(actual["left_wrist_pitch_joint"], 0.00425)
         self.assertEqual(actual["left_shoulder_pitch_joint"], 0.003609725)
+        efforts = profiles.telemetry()["active_effort_limits"]
+        self.assertEqual(efforts["left_hip_pitch_joint"], 139.0)
+        self.assertEqual(efforts["left_hip_roll_joint"], 139.0)
+        self.assertEqual(efforts["left_hip_yaw_joint"], 88.0)
+        self.assertEqual(efforts["left_knee_joint"], 139.0)
+        self.assertEqual(efforts["left_ankle_pitch_joint"], 50.0)
+        self.assertEqual(efforts["left_wrist_pitch_joint"], 5.0)
         self.assertEqual(tuple(data.qpos), qpos_before)
         self.assertEqual(tuple(data.qvel), qvel_before)
         self.assertEqual(data.time, time_before)
@@ -338,6 +361,11 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             profiles.apply(
                 MODULE._LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
             )
+        )
+        self.assertEqual(model.runtime_torque_limits, [88.0] * 29)
+        self.assertEqual(
+            model.actuator_ctrlrange,
+            [[-88.0, 88.0] for _ in range(29)],
         )
         self.assertEqual(mujoco.forward_calls, 2)
         self.assertTrue(

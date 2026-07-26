@@ -10,7 +10,7 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 FORCE_REIMPORT="${SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF:-0}"
 MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
-PIPELINE_VERSION=19
+PIPELINE_VERSION=20
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
 G1_MATERIAL_PALETTE=""
@@ -1319,6 +1319,7 @@ restore_generic_runtime_layout() {
     "$MATRIX_PYTHON" - "$mjcf_path" "$urdf_path" <<'PY'
 from pathlib import Path
 import math
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -1331,6 +1332,9 @@ root = tree.getroot()
 urdf_root = ET.parse(urdf_path).getroot() if urdf_path is not None and urdf_path.is_file() else None
 urdf_links = {}
 urdf_joint_effort = {}  # joint_name -> effort (float), from URDF <limit effort="...">
+urdf_visual_meshes = {}
+urdf_collision_specs = {}
+collision_profile = os.environ.get("MATRIX_URDF_COLLISION_PROFILE", "").strip()
 if urdf_root is not None:
     urdf_links = {
         link.get("name"): link
@@ -1345,7 +1349,6 @@ if urdf_root is not None:
                 urdf_joint_effort[jname] = float(limit_elem.get("effort", "0"))
             except (ValueError, TypeError):
                 pass
-
 def rpy_to_quat(roll: float, pitch: float, yaw: float) -> str:
     cr = math.cos(roll * 0.5)
     sr = math.sin(roll * 0.5)
@@ -1377,6 +1380,59 @@ def parse_quat_from_rpy(value: str | None) -> str:
         return rpy_to_quat(float(parts[0]), float(parts[1]), float(parts[2]))
     except ValueError:
         return "1 0 0 0"
+
+if urdf_root is not None:
+    for link_name, link in urdf_links.items():
+        visual_meshes = set()
+        for visual in link.findall("visual"):
+            mesh = visual.find("geometry/mesh")
+            filename = mesh.get("filename") if mesh is not None else None
+            if filename:
+                visual_meshes.add(Path(filename).stem)
+        urdf_visual_meshes[link_name] = visual_meshes
+
+        collision_specs = []
+        for index, collision in enumerate(link.findall("collision")):
+            geometry = collision.find("geometry")
+            if geometry is None or len(geometry) != 1:
+                raise RuntimeError(
+                    f"URDF collision {link_name}[{index}] must contain exactly one geometry"
+                )
+            shape = list(geometry)[0]
+            origin = collision.find("origin")
+            attrib = {
+                "name": f"{link_name}_urdf_collision_{index}",
+                "class": "collision",
+                "pos": parse_xyz(origin.get("xyz") if origin is not None else None),
+                "quat": parse_quat_from_rpy(origin.get("rpy") if origin is not None else None),
+            }
+            if shape.tag == "sphere":
+                attrib.update(type="sphere", size=shape.get("radius", ""))
+            elif shape.tag == "cylinder":
+                radius = float(shape.get("radius", "nan"))
+                length = float(shape.get("length", "nan"))
+                if not math.isfinite(radius) or not math.isfinite(length) or radius <= 0.0 or length <= 0.0:
+                    raise RuntimeError(f"invalid URDF cylinder collision {link_name}[{index}]")
+                if collision_profile == "isaac-model12":
+                    attrib.update(type="capsule", size=f"{radius:.17g} {0.5 * length:.17g}")
+                else:
+                    attrib.update(type="cylinder", size=f"{radius:.17g} {0.5 * length:.17g}")
+            elif shape.tag == "box":
+                values = [float(value) for value in shape.get("size", "").split()]
+                if len(values) != 3 or any(not math.isfinite(value) or value <= 0.0 for value in values):
+                    raise RuntimeError(f"invalid URDF box collision {link_name}[{index}]")
+                attrib.update(type="box", size=" ".join(f"{0.5 * value:.17g}" for value in values))
+            elif shape.tag == "mesh":
+                filename = shape.get("filename")
+                if not filename:
+                    raise RuntimeError(f"invalid URDF mesh collision {link_name}[{index}]")
+                attrib.update(type="mesh", mesh=Path(filename).stem)
+            else:
+                raise RuntimeError(
+                    f"unsupported URDF collision geometry {shape.tag!r} for {link_name}[{index}]"
+                )
+            collision_specs.append(attrib)
+        urdf_collision_specs[link_name] = collision_specs
 
 def xyz_to_tuple(value: str) -> tuple[float, float, float]:
     parts = value.split()
@@ -1476,6 +1532,16 @@ def is_visual_geom(geom: ET.Element) -> bool:
         return True
     if geom.get("group") == "2":
         return True
+    mesh_name = geom.get("mesh")
+    if mesh_name and urdf_root is not None:
+        collision_meshes = {
+            spec.get("mesh")
+            for specs in urdf_collision_specs.values()
+            for spec in specs
+            if spec.get("type") == "mesh"
+        }
+        if mesh_name not in collision_meshes:
+            return True
     return geom.get("contype") == "0" and geom.get("conaffinity") == "0"
 
 def strip_geom_attrs(geom: ET.Element, keep: set[str]) -> None:
@@ -1486,6 +1552,8 @@ def strip_geom_attrs(geom: ET.Element, keep: set[str]) -> None:
 def derive_motor_name(joint_name: str) -> str:
     if joint_name.endswith("_JOINT"):
         return joint_name[:-6] + "_LINK"
+    if joint_name.endswith("_joint"):
+        return joint_name[:-6]
     return joint_name
 
 def derive_sensor_base(joint_name: str) -> str:
@@ -1528,7 +1596,7 @@ else:
 
 robot_default = ET.SubElement(default_top, "default", attrib={"class": "robot"})
 motor_default = ET.SubElement(robot_default, "default", attrib={"class": "motor"})
-ET.SubElement(motor_default, "joint")
+ET.SubElement(motor_default, "joint", attrib={"armature": "0.01"})
 ET.SubElement(motor_default, "motor")
 visual_default = ET.SubElement(robot_default, "default", attrib={"class": "visual"})
 ET.SubElement(
@@ -1543,7 +1611,7 @@ ET.SubElement(
     attrib={
         "material": "default_material",
         "condim": "3",
-        "contype": "0",
+        "contype": "1" if collision_profile == "isaac-model12" else "0",
         "conaffinity": "1",
         "priority": "1",
         "group": "1",
@@ -1587,17 +1655,30 @@ for body in worldbody.findall("body"):
 if root_body is None:
     root_body = ET.SubElement(worldbody, "body", attrib={"name": "BASE_LINK", "pos": "0 0 0", "quat": "1 0 0 0"})
 
-root_link_name = next((name for name in ("BASE_LINK", "base_link", "ROOT_LINK") if name in urdf_links), root_body.get("name", "BASE_LINK"))
+urdf_child_links = {
+    child.get("link")
+    for joint in urdf_root.findall("joint")
+    for child in [joint.find("child")]
+    if child is not None and child.get("link")
+} if urdf_root is not None else set()
+urdf_root_link = next(
+    (name for name in urdf_links if name not in urdf_child_links),
+    None,
+)
+root_link_name = next(
+    (name for name in ("BASE_LINK", "base_link", "ROOT_LINK") if name in urdf_links),
+    urdf_root_link or root_body.get("name", "BASE_LINK"),
+)
 root_body.set("name", root_link_name)
 root_body.set("childclass", "robot")
 
 freejoints = root_body.findall("freejoint")
 if freejoints:
-    freejoints[0].set("name", "floating_base")
+    freejoints[0].set("name", "floating_base_joint")
     for redundant in freejoints[1:]:
         root_body.remove(redundant)
 elif not any(child.tag == "joint" for child in root_body):
-    root_body.insert(0, ET.Element("freejoint", attrib={"name": "floating_base"}))
+    root_body.insert(0, ET.Element("freejoint", attrib={"name": "floating_base_joint"}))
 
 restored_inertials = 0
 for body in root.iter("body"):
@@ -1611,6 +1692,71 @@ ensure_site(root_body, {"name": "BASE_LINK_site", "pos": "0 0 0", "quat": "1 0 0
 ensure_site(root_body, {"name": "imu", "pos": "0 0 0"})
 ensure_site(root_body, {"name": "livox_imu", "pos": "0.13011 0.02329 0.17598", "quat": "1 0 0 0"})
 ensure_site(root_body, {"name": "camera_imu", "pos": "0.29 0 0.01"})
+
+if collision_profile == "isaac-model12":
+    restored_collisions = 0
+    body_candidates = {}
+    for candidate in root.iter("body"):
+        candidate_name = candidate.get("name")
+        if candidate_name in urdf_links:
+            body_candidates.setdefault(candidate_name, []).append(candidate)
+    primary_bodies = {
+        name: max(
+            candidates,
+            key=lambda candidate: (
+                candidate.find("joint") is not None
+                or candidate.find("freejoint") is not None,
+                len(candidate.findall("body")),
+                len(candidate.findall("geom")),
+            ),
+        )
+        for name, candidates in body_candidates.items()
+    }
+    body_parents = {
+        child: parent
+        for parent in root.iter()
+        for child in parent.findall("body")
+    }
+    for name, candidates in body_candidates.items():
+        for duplicate in candidates:
+            if duplicate is primary_bodies[name]:
+                continue
+            if duplicate.findall("body"):
+                raise RuntimeError(
+                    f"cannot remove duplicate URDF body with children: {name}"
+                )
+            parent = body_parents.get(duplicate)
+            if parent is None:
+                raise RuntimeError(f"cannot locate duplicate URDF body parent: {name}")
+            parent.remove(duplicate)
+    for body in root.iter("body"):
+        body_name = body.get("name")
+        if body_name not in urdf_links:
+            continue
+        visual_meshes = urdf_visual_meshes.get(body_name, set())
+        for geom in list(body.findall("geom")):
+            mesh_name = geom.get("mesh")
+            if mesh_name and mesh_name in visual_meshes:
+                geom.set("class", "visual")
+                geom.set("contype", "0")
+                geom.set("conaffinity", "0")
+                geom.set("density", "0")
+                geom.set("group", "2")
+                continue
+            body.remove(geom)
+        for spec in urdf_collision_specs.get(body_name, ()):
+            insert_before_child_bodies(body, ET.Element("geom", attrib=dict(spec)))
+            restored_collisions += 1
+    expected_collisions = sum(len(specs) for specs in urdf_collision_specs.values())
+    if restored_collisions != expected_collisions:
+        raise RuntimeError(
+            "failed to restore every URDF collision geometry: "
+            f"expected={expected_collisions} restored={restored_collisions}"
+        )
+    print(
+        "[INFO] restored Isaac Model12 collision contract: "
+        f"collisions={restored_collisions} cylinders_as_capsules=true self_collision=true"
+    )
 
 for body in root.iter("body"):
     body_name = body.get("name", "body")
@@ -1683,6 +1829,7 @@ for joint_elem in root.iter("joint"):
             joint_elem.set("axis", " ".join("0" if v == 0.0 else f"{v:g}" for v in parts))
     for attr in ("damping", "armature", "limited", "ctrllimited", "ctrlrange", "gear"):
         joint_elem.attrib.pop(attr, None)
+    joint_elem.set("armature", "0.01")
     # Derive actuatorfrcrange from URDF <limit effort=...> instead of deleting it
     jname = joint_elem.get("name", "")
     effort = urdf_joint_effort.get(jname, 0.0)

@@ -8560,13 +8560,15 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
 
 
 class _LocomotionPhysicsProfiles:
-    """Transactionally switch policy-specific G1 MuJoCo armatures.
+    """Transactionally switch policy-specific G1 MuJoCo actuator physics.
 
     Native SONIC and the legacy resident recovery policies use the canonical
     Matrix model's uniform 0.01 armature.  BFM Teacher50k and AMP flat_v3 were
     qualified with policy-specific per-joint G1 armatures.  All policy families
     drive the same live MuJoCo model, so writer handoff must also hand off this
-    small part of the physics contract while every writer is fenced.
+    part of the physics contract while every writer is fenced.  BFM also uses
+    the Model12 effort limits, which must update both MuJoCo ``ctrlrange`` and
+    SONIC's final runtime torque clip as one transaction.
     """
 
     BASELINE_PROFILE_ID = "sonic-recovery"
@@ -8581,6 +8583,7 @@ class _LocomotionPhysicsProfiles:
         model: Any,
         data: Any,
         *,
+        torque_limits: Any | None = None,
         flat_v3_armatures: tuple[float, ...] | None = None,
     ) -> None:
         if mujoco_module is None or model is None or data is None:
@@ -8590,6 +8593,7 @@ class _LocomotionPhysicsProfiles:
         self.mujoco = mujoco_module
         self.model = model
         self.data = data
+        self.torque_limits = torque_limits
         joint_object = self.mujoco.mjtObj.mjOBJ_JOINT
         joint_ids: list[int] = []
         missing: list[str] = []
@@ -8619,6 +8623,40 @@ class _LocomotionPhysicsProfiles:
                 "live MuJoCo model has an invalid G1 joint-to-DoF mapping"
             )
 
+        self.actuator_ids: tuple[int, ...] | None = None
+        if self.torque_limits is not None:
+            actuator_object = self.mujoco.mjtObj.mjOBJ_ACTUATOR
+            actuator_ids = tuple(
+                int(
+                    self.mujoco.mj_name2id(
+                        self.model,
+                        actuator_object,
+                        name.removesuffix("_joint"),
+                    )
+                )
+                for name in G1_BODY_JOINT_NAMES
+            )
+            if any(actuator_id < 0 for actuator_id in actuator_ids):
+                missing_actuators = [
+                    name
+                    for name, actuator_id in zip(
+                        G1_BODY_JOINT_NAMES, actuator_ids
+                    )
+                    if actuator_id < 0
+                ]
+                raise ValueError(
+                    "live MuJoCo model is missing G1 body actuators: "
+                    + ", ".join(missing_actuators)
+                )
+            if len(set(actuator_ids)) != len(G1_BODY_JOINT_NAMES) or any(
+                actuator_id >= len(self.torque_limits)
+                for actuator_id in actuator_ids
+            ):
+                raise ValueError(
+                    "live MuJoCo model has an invalid G1 actuator mapping"
+                )
+            self.actuator_ids = actuator_ids
+
         baseline = self._read_armatures()
         invalid_baseline = [
             (name, value)
@@ -8645,6 +8683,22 @@ class _LocomotionPhysicsProfiles:
                 self._bfm_armature(name) for name in G1_BODY_JOINT_NAMES
             ),
         }
+        baseline_efforts = self._read_effort_limits(allow_mismatch=True)
+        # The legacy SONIC YAML and the imported URDF can encode different
+        # limits.  Preserve their effective pre-handoff minimum, then make the
+        # two final clipping layers explicit and synchronized for rollback.
+        self._write_effort_limits(baseline_efforts)
+        self.profile_effort_values = {
+            self.BASELINE_PROFILE_ID: baseline_efforts,
+            self.BFM_PROFILE_ID: (
+                tuple(
+                    self._bfm_effort_limit(name)
+                    for name in G1_BODY_JOINT_NAMES
+                )
+                if baseline_efforts is not None
+                else None
+            ),
+        }
         if flat_v3_armatures is not None:
             if len(flat_v3_armatures) != len(G1_BODY_JOINT_NAMES) or any(
                 not math.isfinite(value) or value <= 0.0
@@ -8656,6 +8710,9 @@ class _LocomotionPhysicsProfiles:
                 )
             self.profile_values[self.FLAT_V3_PROFILE_ID] = tuple(
                 float(value) for value in flat_v3_armatures
+            )
+            self.profile_effort_values[self.FLAT_V3_PROFILE_ID] = (
+                baseline_efforts
             )
         self.active_profile_id = self.BASELINE_PROFILE_ID
         self.switch_count = 0
@@ -8679,6 +8736,21 @@ class _LocomotionPhysicsProfiles:
         return 0.003609725
 
     @staticmethod
+    def _bfm_effort_limit(name: str) -> float:
+        if any(token in name for token in ("hip_pitch", "hip_roll", "knee")):
+            return 139.0
+        if "hip_yaw" in name or name == "waist_yaw_joint":
+            return 88.0
+        if "ankle_" in name or name in {
+            "waist_roll_joint",
+            "waist_pitch_joint",
+        }:
+            return 50.0
+        if "wrist_pitch" in name or "wrist_yaw" in name:
+            return 5.0
+        return 25.0
+
+    @staticmethod
     def _values_sha256(values: tuple[float, ...]) -> str:
         return hashlib.sha256(
             struct.pack(f"<{len(values)}d", *values)
@@ -8695,6 +8767,74 @@ class _LocomotionPhysicsProfiles:
             raise ValueError("armature profile has the wrong joint count")
         for address, value in zip(self.dof_addresses, values):
             self.model.dof_armature[address] = value
+
+    def _read_effort_limits(
+        self,
+        *,
+        allow_mismatch: bool = False,
+    ) -> tuple[float, ...] | None:
+        if self.actuator_ids is None:
+            return None
+        values: list[float] = []
+        for actuator_id in self.actuator_ids:
+            low = float(self.model.actuator_ctrlrange[actuator_id][0])
+            high = float(self.model.actuator_ctrlrange[actuator_id][1])
+            runtime = float(self.torque_limits[actuator_id])
+            unconstrained = (
+                allow_mismatch
+                and math.isclose(low, 0.0, rel_tol=0.0, abs_tol=1e-12)
+                and math.isclose(high, 0.0, rel_tol=0.0, abs_tol=1e-12)
+            )
+            if (
+                not math.isfinite(low)
+                or not math.isfinite(high)
+                or not math.isfinite(runtime)
+                or runtime <= 0.0
+                or (
+                    not unconstrained
+                    and (
+                        low >= 0.0
+                        or high <= 0.0
+                        or not math.isclose(
+                            -low,
+                            high,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                    )
+                )
+            ):
+                raise ValueError(
+                    "MuJoCo ctrlrange and SONIC torque clip disagree"
+                )
+            if (
+                not allow_mismatch
+                and not math.isclose(
+                    runtime,
+                    high,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError(
+                    "MuJoCo ctrlrange and SONIC torque clip disagree"
+                )
+            values.append(runtime if unconstrained else min(high, runtime))
+        return tuple(values)
+
+    def _write_effort_limits(self, values: tuple[float, ...] | None) -> None:
+        if values is None:
+            if self.actuator_ids is not None:
+                raise ValueError("effort profile is missing")
+            return
+        if self.actuator_ids is None or len(values) != len(self.actuator_ids):
+            raise ValueError("effort profile has the wrong actuator count")
+        for actuator_id, value in zip(self.actuator_ids, values):
+            self.model.actuator_ctrlrange[actuator_id][0] = -value
+            self.model.actuator_ctrlrange[actuator_id][1] = value
+            if hasattr(self.model, "actuator_ctrllimited"):
+                self.model.actuator_ctrllimited[actuator_id] = 1
+            self.torque_limits[actuator_id] = value
 
     def _matches(
         self,
@@ -8719,6 +8859,13 @@ class _LocomotionPhysicsProfiles:
                 "live MuJoCo armatures drifted from active locomotion "
                 f"physics profile {self.active_profile_id}"
             )
+        expected_efforts = self.profile_effort_values[self.active_profile_id]
+        actual_efforts = self._read_effort_limits()
+        if actual_efforts != expected_efforts:
+            raise RuntimeError(
+                "live MuJoCo/SONIC effort limits drifted from active "
+                f"locomotion physics profile {self.active_profile_id}"
+            )
 
     def apply(self, profile_id: str) -> bool:
         """Apply one profile without changing qpos, qvel, or simulation time."""
@@ -8729,10 +8876,12 @@ class _LocomotionPhysicsProfiles:
             )
         target = self.profile_values[profile_id]
         current = self._read_armatures()
+        target_efforts = self.profile_effort_values[profile_id]
+        current_efforts = self._read_effort_limits()
         qpos_before = tuple(float(value) for value in self.data.qpos)
         qvel_before = tuple(float(value) for value in self.data.qvel)
         time_before = float(self.data.time)
-        if self._matches(current, target):
+        if self._matches(current, target) and current_efforts == target_efforts:
             previous_profile = self.active_profile_id
             self.active_profile_id = profile_id
             self.last_error = None
@@ -8758,8 +8907,11 @@ class _LocomotionPhysicsProfiles:
         )
         try:
             self._write_armatures(target)
+            self._write_effort_limits(target_efforts)
             if not self._matches(self._read_armatures(), target):
                 raise RuntimeError("MuJoCo armature write did not read back")
+            if self._read_effort_limits() != target_efforts:
+                raise RuntimeError("actuator effort write did not read back")
             self.mujoco.mj_forward(self.model, self.data)
             if (
                 tuple(float(value) for value in self.data.qpos) != qpos_before
@@ -8773,10 +8925,15 @@ class _LocomotionPhysicsProfiles:
                 raise RuntimeError(
                     "MuJoCo armature changed during forward recomputation"
                 )
+            if self._read_effort_limits() != target_efforts:
+                raise RuntimeError(
+                    "actuator effort changed during forward recomputation"
+                )
         except Exception as exc:
             rollback_error: Exception | None = None
             try:
                 self._write_armatures(current)
+                self._write_effort_limits(current_efforts)
                 for index, value in enumerate(qpos_before):
                     self.data.qpos[index] = value
                 for index, value in enumerate(qvel_before):
@@ -8785,6 +8942,8 @@ class _LocomotionPhysicsProfiles:
                 self.mujoco.mj_forward(self.model, self.data)
                 if not self._matches(self._read_armatures(), current):
                     raise RuntimeError("armature rollback did not read back")
+                if self._read_effort_limits() != current_efforts:
+                    raise RuntimeError("actuator effort rollback did not read back")
             except Exception as rollback_exc:
                 rollback_error = rollback_exc
             self.last_error = str(exc)
@@ -8811,10 +8970,15 @@ class _LocomotionPhysicsProfiles:
     def telemetry(self) -> dict[str, object]:
         actual = self._read_armatures()
         expected = self.profile_values[self.active_profile_id]
+        actual_efforts = self._read_effort_limits()
+        expected_efforts = self.profile_effort_values[self.active_profile_id]
         return {
             "available": True,
             "active_profile_id": self.active_profile_id,
-            "profile_matches_live_model": self._matches(actual, expected),
+            "profile_matches_live_model": (
+                self._matches(actual, expected)
+                and actual_efforts == expected_efforts
+            ),
             "joint_count": len(self.dof_addresses),
             "switch_count": self.switch_count,
             "active_armature_sha256": self._values_sha256(actual),
@@ -8835,6 +8999,16 @@ class _LocomotionPhysicsProfiles:
                 name: value
                 for name, value in zip(G1_BODY_JOINT_NAMES, actual)
             },
+            "active_effort_limits": (
+                {
+                    name: value
+                    for name, value in zip(
+                        G1_BODY_JOINT_NAMES, actual_efforts
+                    )
+                }
+                if actual_efforts is not None
+                else None
+            ),
             "last_transition": self.last_transition,
             "last_error": self.last_error,
         }
@@ -8952,12 +9126,14 @@ class _DirectBfmRuntime:
         mujoco_module: Any,
         model: Any,
         data: Any,
+        torque_limits: Any,
     ) -> None:
         self.validate()
         self.physics_profiles = _LocomotionPhysicsProfiles(
             mujoco_module,
             model,
             data,
+            torque_limits=torque_limits,
         )
         self.control.open()
         worker_pid = processes.start_bfm_teacher(
@@ -9443,6 +9619,7 @@ class _PhysicalRecoveryCoordinator:
         mujoco_module: Any,
         model: Any,
         data: Any,
+        torque_limits: Any,
     ) -> None:
         if self.physics_profiles is not None:
             raise RuntimeError("locomotion physics profiles are already bound")
@@ -9450,6 +9627,7 @@ class _PhysicalRecoveryCoordinator:
             mujoco_module,
             model,
             data,
+            torque_limits=torque_limits,
             flat_v3_armatures=self.amp_flat_v3_armatures,
         )
 
@@ -12600,6 +12778,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     mujoco_module=mujoco_module,
                     model=model,
                     data=data,
+                    torque_limits=getattr(environment, "torque_limit", None),
                 )
             except (OSError, RuntimeError, ValueError) as exc:
                 raise SystemExit(f"cannot start direct BFM: {exc}") from exc
@@ -12933,6 +13112,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             mujoco_module,
                             getattr(environment, "mj_model", None),
                             getattr(environment, "mj_data", None),
+                            getattr(environment, "torque_limit", None),
                         )
                     physical_recovery.open(zmq_port=planner_port)
                     runtime_pause = _RuntimePauseState()
