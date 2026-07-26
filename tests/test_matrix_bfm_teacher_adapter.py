@@ -267,7 +267,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             200.0,
         )
 
-    def test_bfm_g1_pd_contract_keeps_hip_pitch_on_7520_14(self) -> None:
+    def test_bfm_g1_pd_contract_matches_model12_hip_pitch_7520_22(self) -> None:
         kp, kd, scale = MODULE._joint_control_vectors()
         names = list(MODULE.G1_29_JOINT_NAMES)
         hip_pitch = names.index("left_hip_pitch_joint")
@@ -275,10 +275,10 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         knee = names.index("left_knee_joint")
         hip_yaw = names.index("left_hip_yaw_joint")
 
-        self.assertAlmostEqual(kp[hip_pitch], kp[hip_yaw])
-        self.assertAlmostEqual(kd[hip_pitch], kd[hip_yaw])
-        self.assertAlmostEqual(scale[hip_pitch], scale[hip_yaw])
-        self.assertNotAlmostEqual(kp[hip_pitch], kp[hip_roll])
+        self.assertAlmostEqual(kp[hip_pitch], kp[hip_roll])
+        self.assertAlmostEqual(kd[hip_pitch], kd[hip_roll])
+        self.assertAlmostEqual(scale[hip_pitch], scale[hip_roll])
+        self.assertNotAlmostEqual(kp[hip_pitch], kp[hip_yaw])
         self.assertAlmostEqual(kp[hip_roll], kp[knee])
         self.assertAlmostEqual(scale[hip_roll], scale[knee])
 

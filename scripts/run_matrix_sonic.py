@@ -8665,9 +8665,9 @@ class _LocomotionPhysicsProfiles:
 
     @staticmethod
     def _bfm_armature(name: str) -> float:
-        if any(token in name for token in ("hip_roll", "knee")):
+        if any(token in name for token in ("hip_pitch", "hip_roll", "knee")):
             return 0.025101925
-        if "hip_pitch" in name or "hip_yaw" in name or name == "waist_yaw_joint":
+        if "hip_yaw" in name or name == "waist_yaw_joint":
             return 0.010177520
         if "ankle_" in name or name in {
             "waist_roll_joint",
