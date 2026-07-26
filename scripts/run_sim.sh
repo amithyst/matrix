@@ -1590,6 +1590,14 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_SCENE_TRANSFORM_ARGS=()
     SONIC_DYNAMIC_GROUND_ARGS=()
     SONIC_INVENTORY_ARGS=()
+    # The game-input provider always needs a stable world identity, even when
+    # durable checkpoints are disabled.  Persistence adds revision/state
+    # arguments below; identity by itself is intentionally non-persistent.
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+        GAME_WORLD_ROBOT_ID="${CUSTOM_NAME:-$ROBOT_ARG}"
+        GAME_WORLD_ID="${MATRIX_GAME_WORLD_ID:-${GAME_WORLD_ROBOT_ID}:${SCENE%.xml}}"
+        SONIC_WORLD_ARGS=(--game-world-id "$GAME_WORLD_ID")
+    fi
     if [[ -n "${MATRIX_CREATIVE_INVENTORY_CATALOG:-}" ]]; then
         if [[ ! -f "$MATRIX_CREATIVE_INVENTORY_CATALOG" ]]; then
             echo "[ERROR] Creative inventory catalog is missing: $MATRIX_CREATIVE_INVENTORY_CATALOG" >&2
@@ -1634,7 +1642,6 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] Persistent Matrix world state requires game control" >&2
             exit 1
         fi
-        GAME_WORLD_ID="${MATRIX_GAME_WORLD_ID:-${CUSTOM_NAME}:${SCENE%.xml}}"
         GAME_WORLD_REVISION="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 revision \
@@ -1760,8 +1767,7 @@ PY
                 "entity=${MATRIX_ROUTE_ENTRY_LINES[2]} " \
                 "world=$GAME_WORLD_ID scene=$SCENE_ID"
         fi
-        SONIC_WORLD_ARGS=(
-            --game-world-id "$GAME_WORLD_ID"
+        SONIC_WORLD_ARGS+=(
             --game-world-revision "$GAME_WORLD_REVISION"
             --game-world-state-file "$GAME_WORLD_STATE_FILE"
             --game-celestial-clock-state-file "$GAME_CELESTIAL_CLOCK_STATE_FILE"

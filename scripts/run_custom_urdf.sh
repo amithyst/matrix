@@ -10,7 +10,7 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 FORCE_REIMPORT="${SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF:-0}"
 MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
-PIPELINE_VERSION=20
+PIPELINE_VERSION=21
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
 G1_MATERIAL_PALETTE=""
@@ -1144,6 +1144,78 @@ def parse_quat_from_rpy(value: str | None) -> str:
     except ValueError:
         return "1 0 0 0"
 
+def parse_rpy(value: str | None) -> tuple[float, float, float]:
+    if not value:
+        return (0.0, 0.0, 0.0)
+    parts = value.split()
+    if len(parts) != 3:
+        return (0.0, 0.0, 0.0)
+    try:
+        return tuple(float(part) for part in parts)
+    except ValueError:
+        return (0.0, 0.0, 0.0)
+
+def rotate_inertia_to_body_frame(
+    values: tuple[float, float, float, float, float, float],
+    rpy: tuple[float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    ixx, iyy, izz, ixy, ixz, iyz = values
+    inertia = (
+        (ixx, ixy, ixz),
+        (ixy, iyy, iyz),
+        (ixz, iyz, izz),
+    )
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rotation = (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+        (-sp, cp * sr, cp * cr),
+    )
+    rotated = tuple(
+        tuple(
+            sum(
+                rotation[row][a] * inertia[a][b] * rotation[col][b]
+                for a in range(3)
+                for b in range(3)
+            )
+            for col in range(3)
+        )
+        for row in range(3)
+    )
+    return (
+        rotated[0][0],
+        rotated[1][1],
+        rotated[2][2],
+        rotated[0][1],
+        rotated[0][2],
+        rotated[1][2],
+    )
+
+def urdf_inertia_attrs(inertia: ET.Element, origin: ET.Element | None) -> dict | None:
+    names = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")
+    raw_values = [inertia.get(name) for name in names]
+    if any(value is None for value in raw_values):
+        return None
+    try:
+        values = tuple(float(value) for value in raw_values)
+    except (TypeError, ValueError):
+        return None
+    if any(abs(value) > 0.0 for value in values[3:]):
+        rotated = rotate_inertia_to_body_frame(
+            values,
+            parse_rpy(origin.get("rpy") if origin is not None else None),
+        )
+        return {"fullinertia": " ".join(f"{value:.17g}" for value in rotated)}
+    return {
+        "quat": parse_quat_from_rpy(
+            origin.get("rpy") if origin is not None else None
+        ),
+        "diaginertia": " ".join(raw_values[:3]),
+    }
+
 def add_inertial_from_urdf(body: ET.Element, link: ET.Element) -> None:
     inertial = link.find("inertial")
     if inertial is None:
@@ -1154,23 +1226,18 @@ def add_inertial_from_urdf(body: ET.Element, link: ET.Element) -> None:
         return
     origin = inertial.find("origin")
     pos = parse_xyz(origin.get("xyz") if origin is not None else None)
-    quat = parse_quat_from_rpy(origin.get("rpy") if origin is not None else None)
-    diag = [
-        inertia.get("ixx"),
-        inertia.get("iyy"),
-        inertia.get("izz"),
-    ]
-    if any(v is None for v in diag):
+    inertia_attrs = urdf_inertia_attrs(inertia, origin)
+    if inertia_attrs is None:
         return
+    attrs = {
+        "pos": pos,
+        "mass": mass.get("value"),
+        **inertia_attrs,
+    }
     ET.SubElement(
         body,
         "inertial",
-        attrib={
-            "pos": pos,
-            "quat": quat,
-            "mass": mass.get("value"),
-            "diaginertia": f"{diag[0]} {diag[1]} {diag[2]}",
-        },
+        attrib=attrs,
     )
 
 def add_visual_mesh_geom(body: ET.Element, link: ET.Element) -> None:
@@ -1381,6 +1448,78 @@ def parse_quat_from_rpy(value: str | None) -> str:
     except ValueError:
         return "1 0 0 0"
 
+def parse_rpy(value: str | None) -> tuple[float, float, float]:
+    if not value:
+        return (0.0, 0.0, 0.0)
+    parts = value.split()
+    if len(parts) != 3:
+        return (0.0, 0.0, 0.0)
+    try:
+        return tuple(float(part) for part in parts)
+    except ValueError:
+        return (0.0, 0.0, 0.0)
+
+def rotate_inertia_to_body_frame(
+    values: tuple[float, float, float, float, float, float],
+    rpy: tuple[float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    ixx, iyy, izz, ixy, ixz, iyz = values
+    inertia = (
+        (ixx, ixy, ixz),
+        (ixy, iyy, iyz),
+        (ixz, iyz, izz),
+    )
+    roll, pitch, yaw = rpy
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rotation = (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+        (-sp, cp * sr, cp * cr),
+    )
+    rotated = tuple(
+        tuple(
+            sum(
+                rotation[row][a] * inertia[a][b] * rotation[col][b]
+                for a in range(3)
+                for b in range(3)
+            )
+            for col in range(3)
+        )
+        for row in range(3)
+    )
+    return (
+        rotated[0][0],
+        rotated[1][1],
+        rotated[2][2],
+        rotated[0][1],
+        rotated[0][2],
+        rotated[1][2],
+    )
+
+def urdf_inertia_attrs(inertia: ET.Element, origin: ET.Element | None) -> dict | None:
+    names = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")
+    raw_values = [inertia.get(name) for name in names]
+    if any(value is None for value in raw_values):
+        return None
+    try:
+        values = tuple(float(value) for value in raw_values)
+    except (TypeError, ValueError):
+        return None
+    if any(abs(value) > 0.0 for value in values[3:]):
+        rotated = rotate_inertia_to_body_frame(
+            values,
+            parse_rpy(origin.get("rpy") if origin is not None else None),
+        )
+        return {"fullinertia": " ".join(f"{value:.17g}" for value in rotated)}
+    return {
+        "quat": parse_quat_from_rpy(
+            origin.get("rpy") if origin is not None else None
+        ),
+        "diaginertia": " ".join(raw_values[:3]),
+    }
+
 if urdf_root is not None:
     for link_name, link in urdf_links.items():
         visual_meshes = set()
@@ -1509,20 +1648,16 @@ def replace_inertial_from_urdf(body: ET.Element, link_name: str) -> bool:
     inertia = inertial.find("inertia")
     if mass is None or inertia is None or not mass.get("value"):
         return False
+    origin = inertial.find("origin")
+    inertia_attrs = urdf_inertia_attrs(inertia, origin)
+    if inertia_attrs is None:
+        return False
     for old in list(body.findall("inertial")):
         body.remove(old)
-    origin = inertial.find("origin")
     attrs = {
         "mass": mass.get("value"),
         "pos": parse_xyz(origin.get("xyz") if origin is not None else None),
-        "quat": parse_quat_from_rpy(origin.get("rpy") if origin is not None else None),
-        "diaginertia": " ".join(
-            [
-                inertia.get("ixx", "0"),
-                inertia.get("iyy", "0"),
-                inertia.get("izz", "0"),
-            ]
-        ),
+        **inertia_attrs,
     }
     body.insert(0, ET.Element("inertial", attrib=attrs))
     return True

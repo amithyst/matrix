@@ -203,6 +203,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             actuator_ctrlrange=[
                 [-effort, effort] for effort in baseline_efforts
             ],
+            jnt_actfrcrange=[
+                [-effort, effort] for effort in baseline_efforts
+            ],
+            jnt_actfrclimited=[1] * len(joint_names),
             runtime_torque_limits=list(baseline_efforts),
         )
         data = SimpleNamespace(
@@ -313,7 +317,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_locomotion_physics_profiles_switch_and_restore_without_pose_change(
         self,
     ) -> None:
-        mujoco, model, data, _joint_by_name = (
+        mujoco, model, data, joint_by_name = (
             self.fake_physics_profile_runtime()
         )
         qpos_before = tuple(data.qpos)
@@ -348,6 +352,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(efforts["left_knee_joint"], 139.0)
         self.assertEqual(efforts["left_ankle_pitch_joint"], 50.0)
         self.assertEqual(efforts["left_wrist_pitch_joint"], 5.0)
+        self.assertEqual(
+            model.jnt_actfrcrange[joint_by_name["left_hip_pitch_joint"]],
+            [-139.0, 139.0],
+        )
         self.assertEqual(tuple(data.qpos), qpos_before)
         self.assertEqual(tuple(data.qvel), qvel_before)
         self.assertEqual(data.time, time_before)
@@ -365,6 +373,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(model.runtime_torque_limits, [88.0] * 29)
         self.assertEqual(
             model.actuator_ctrlrange,
+            [[-88.0, 88.0] for _ in range(29)],
+        )
+        self.assertEqual(
+            model.jnt_actfrcrange,
             [[-88.0, 88.0] for _ in range(29)],
         )
         self.assertEqual(mujoco.forward_calls, 2)
@@ -7803,6 +7815,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(sent[-1]["command"], "PREPARE")
         self.assertEqual(sent[-1]["authority_epoch"], 1)
         self.assertIs(sent[-1]["aligned_initial"], False)
+        self.assertIs(sent[-1]["allow_idle_neutral"], False)
         control._handle_packet(
             json.dumps(
                 {
@@ -7857,9 +7870,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         # A later SONIC -> BFM switch must reuse the fenced resident writer;
         # requiring WAITING_NO_WRITER here killed the worker after recovery.
-        control.prepare_activation()
+        control.prepare_activation(allow_idle_neutral=True)
         self.assertEqual(sent[-1]["command"], "PREPARE")
         self.assertEqual(sent[-1]["authority_epoch"], 2)
+        self.assertIs(sent[-1]["allow_idle_neutral"], True)
         control._handle_packet(
             json.dumps(
                 {
@@ -7870,6 +7884,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "writer_created": True,
                     "writer_reused": True,
                     "write_authorized": False,
+                    "idle_neutral_handoff": True,
                     "reference_aligned": True,
                     "reference_pending_rebuild": False,
                     "reference_buffer_swapped": True,
@@ -7881,6 +7896,61 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             ).encode("utf-8")
         )
         self.assertTrue(control.activation_prepared)
+
+    def test_bfm_control_accepts_unlimited_exact_initial_target(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        sent: list[dict[str, object]] = []
+
+        def send(packet: bytes) -> int:
+            sent.append(json.loads(packet.decode("utf-8")))
+            return len(packet)
+
+        control.connection = SimpleNamespace(send=send)
+        control.ready = True
+        control.warmed = True
+        control.models_warmed = True
+        control.paused = True
+        control.reference_source = "robo_pfnn_formal7168"
+
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "STATUS",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 0,
+                    "world_sample_sequence": 17,
+                    "direct_initial_qpos": [0.0] * 36,
+                    "direct_initial_qvel": [0.0] * 35,
+                }
+            ).encode("utf-8")
+        )
+        self.assertEqual(control.direct_initial_status_sequence, 17)
+
+        control.prepare_activation(aligned_initial=True)
+        self.assertIs(sent[-1]["aligned_initial"], True)
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "ACTIVATION_PREPARED",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 1,
+                    "writer_created": False,
+                    "write_authorized": False,
+                    "exact_initial_alignment": True,
+                    "reference_aligned": True,
+                    "reference_pending_rebuild": False,
+                    "reference_buffer_swapped": False,
+                    "preview_steps": 1,
+                    "target_delta_max_rad": 1.75,
+                    "target_delta_limit_rad": 0.12,
+                }
+            ).encode("utf-8")
+        )
+
+        self.assertTrue(control.activation_prepared)
+        self.assertFalse(control.preparation_pending)
 
     def test_recovery_worker_tracks_first_write_authority_across_fallback(
         self,

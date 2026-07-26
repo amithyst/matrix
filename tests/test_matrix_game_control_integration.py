@@ -3166,8 +3166,14 @@ print(json.dumps(payload, sort_keys=True))
                     )
                     self.assertEqual(runtime_capture["world_persistence_env"], "0")
                     self.assertEqual(runtime_capture["auto_respawn_env"], "0")
+                    world_id_index = runtime_capture["argv"].index(
+                        "--game-world-id"
+                    )
+                    self.assertEqual(
+                        runtime_capture["argv"][world_id_index + 1],
+                        f"{robot_type}:scene_terrain_apart2",
+                    )
                     for flag in (
-                        "--game-world-id",
                         "--game-world-revision",
                         "--game-world-state-file",
                         "--game-world-checkpoint-seconds",

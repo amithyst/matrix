@@ -8210,6 +8210,8 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self.activation_prepared = False
         self.activation_rejected_reason: str | None = None
         self.activation_preparation_status: dict[str, object] | None = None
+        self.preparation_aligned_initial_requested = False
+        self.preparation_idle_neutral_requested = False
         self.activation_pending = False
         self.pause_pending = False
         self.authority_epoch = 0
@@ -8221,6 +8223,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self.reference_source: str | None = None
         self.direct_initial_qpos: tuple[float, ...] | None = None
         self.direct_initial_qvel: tuple[float, ...] | None = None
+        self.direct_initial_status_sequence: int | None = None
 
     @property
     def current_first_write(self) -> bool:
@@ -8311,6 +8314,8 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.paused = False
             self.activation_prepared = False
             self.activation_preparation_status = None
+            self.preparation_aligned_initial_requested = False
+            self.preparation_idle_neutral_requested = False
             self.activation_pending = False
         elif event == "ACTIVATION_PREPARED":
             if not self.preparation_pending:
@@ -8334,17 +8339,36 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 raise RuntimeError("BFM Teacher preparation gained authority")
             if payload.get("reference_aligned") is not True:
                 raise RuntimeError("BFM Teacher preparation is not root-aligned")
-            preview_steps = payload.get("preview_steps")
-            if type(preview_steps) is not int or preview_steps < 4:
-                raise RuntimeError("BFM Teacher preparation preview was too short")
             target_delta = payload.get("target_delta_max_rad")
             target_limit = payload.get("target_delta_limit_rad")
+            exact_initial_alignment = payload.get(
+                "exact_initial_alignment", False
+            )
+            idle_neutral_handoff = payload.get(
+                "idle_neutral_handoff", False
+            )
+            preview_steps = payload.get("preview_steps")
+            minimum_preview_steps = 1 if exact_initial_alignment is True else 4
+            if (
+                type(preview_steps) is not int
+                or preview_steps < minimum_preview_steps
+            ):
+                raise RuntimeError("BFM Teacher preparation preview was too short")
             if (
                 not isinstance(target_delta, (int, float))
                 or not isinstance(target_limit, (int, float))
                 or not math.isfinite(float(target_delta))
                 or not math.isfinite(float(target_limit))
-                or float(target_delta) > float(target_limit) + 1.0e-6
+                or type(exact_initial_alignment) is not bool
+                or type(idle_neutral_handoff) is not bool
+                or exact_initial_alignment
+                is not self.preparation_aligned_initial_requested
+                or idle_neutral_handoff
+                is not self.preparation_idle_neutral_requested
+                or (
+                    not exact_initial_alignment
+                    and float(target_delta) > float(target_limit) + 1.0e-6
+                )
             ):
                 raise RuntimeError("BFM Teacher preparation target gate failed")
             self.preparation_pending = False
@@ -8376,6 +8400,8 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.activation_rejected_reason = str(
                 payload.get("reason", "activation_preparation_rejected")
             )
+            self.preparation_aligned_initial_requested = False
+            self.preparation_idle_neutral_requested = False
             self.activation_preparation_status = dict(payload)
         elif event == "PAUSED_RESIDENT_WRITER":
             if not self.pause_pending:
@@ -8390,6 +8416,8 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.preparation_pending = False
             self.activation_prepared = False
             self.activation_preparation_status = None
+            self.preparation_aligned_initial_requested = False
+            self.preparation_idle_neutral_requested = False
             self.pause_pending = False
             self.epoch_first_write = False
         elif event == "STATUS":
@@ -8399,6 +8427,29 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             }:
                 raise RuntimeError("BFM Teacher STATUS epoch mismatch")
             self.last_status = dict(payload)
+            status_qpos = payload.get("direct_initial_qpos")
+            status_qvel = payload.get("direct_initial_qvel")
+            if status_qpos is not None or status_qvel is not None:
+                try:
+                    qpos = tuple(float(value) for value in status_qpos)
+                    qvel = tuple(float(value) for value in status_qvel)
+                    status_sequence = int(payload["world_sample_sequence"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "BFM Teacher STATUS has invalid current reference state"
+                    ) from exc
+                if (
+                    len(qpos) != 36
+                    or len(qvel) != 35
+                    or status_sequence < 0
+                    or any(not math.isfinite(value) for value in (*qpos, *qvel))
+                ):
+                    raise RuntimeError(
+                        "BFM Teacher STATUS reference must be finite 36D/35D"
+                    )
+                self.direct_initial_qpos = qpos
+                self.direct_initial_qvel = qvel
+                self.direct_initial_status_sequence = status_sequence
             if payload.get("models_warmed") is True:
                 self.warmed = True
                 self.models_warmed = True
@@ -8414,7 +8465,12 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         else:
             raise RuntimeError(f"unsupported BFM Teacher event: {event}")
 
-    def prepare_activation(self, *, aligned_initial: bool = False) -> None:
+    def prepare_activation(
+        self,
+        *,
+        aligned_initial: bool = False,
+        allow_idle_neutral: bool = False,
+    ) -> None:
         if self.connection is None or not self.ready or not self.warmed:
             raise RuntimeError("BFM Teacher is not connected and warmed")
         if (
@@ -8427,6 +8483,10 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             raise RuntimeError("BFM Teacher is not ready for preparation")
         if self.stopped:
             raise RuntimeError("BFM Teacher was stopped")
+        if aligned_initial and allow_idle_neutral:
+            raise RuntimeError(
+                "BFM Teacher initial alignment cannot use idle-neutral admission"
+            )
         requested_epoch = self.authority_epoch + 1
         self._send_payload(
             {
@@ -8434,10 +8494,13 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 "command": "PREPARE",
                 "authority_epoch": requested_epoch,
                 "aligned_initial": bool(aligned_initial),
+                "allow_idle_neutral": bool(allow_idle_neutral),
             }
         )
         self.requested_authority_epoch = requested_epoch
         self.preparation_pending = True
+        self.preparation_aligned_initial_requested = bool(aligned_initial)
+        self.preparation_idle_neutral_requested = bool(allow_idle_neutral)
         self.activation_rejected_reason = None
         self.activation_preparation_status = None
 
@@ -8650,6 +8713,7 @@ class _LocomotionPhysicsProfiles:
                 "live MuJoCo model is missing G1 body joints: "
                 + ", ".join(missing)
             )
+        self.joint_ids = tuple(joint_ids)
         self.dof_addresses = tuple(
             int(self.model.jnt_dofadr[joint_id]) for joint_id in joint_ids
         )
@@ -8817,14 +8881,27 @@ class _LocomotionPhysicsProfiles:
         if self.actuator_ids is None:
             return None
         values: list[float] = []
-        for actuator_id in self.actuator_ids:
+        for joint_id, actuator_id in zip(self.joint_ids, self.actuator_ids):
             low = float(self.model.actuator_ctrlrange[actuator_id][0])
             high = float(self.model.actuator_ctrlrange[actuator_id][1])
             runtime = float(self.torque_limits[actuator_id])
-            unconstrained = (
+            actuator_unconstrained = (
                 allow_mismatch
                 and math.isclose(low, 0.0, rel_tol=0.0, abs_tol=1e-12)
                 and math.isclose(high, 0.0, rel_tol=0.0, abs_tol=1e-12)
+            )
+            joint_limited = bool(
+                getattr(self.model, "jnt_actfrclimited", [False])[joint_id]
+            ) if hasattr(self.model, "jnt_actfrcrange") else False
+            joint_low = (
+                float(self.model.jnt_actfrcrange[joint_id][0])
+                if joint_limited
+                else -math.inf
+            )
+            joint_high = (
+                float(self.model.jnt_actfrcrange[joint_id][1])
+                if joint_limited
+                else math.inf
             )
             if (
                 not math.isfinite(low)
@@ -8832,7 +8909,7 @@ class _LocomotionPhysicsProfiles:
                 or not math.isfinite(runtime)
                 or runtime <= 0.0
                 or (
-                    not unconstrained
+                    not actuator_unconstrained
                     and (
                         low >= 0.0
                         or high <= 0.0
@@ -8844,23 +8921,54 @@ class _LocomotionPhysicsProfiles:
                         )
                     )
                 )
+                or (
+                    joint_limited
+                    and (
+                        not math.isfinite(joint_low)
+                        or not math.isfinite(joint_high)
+                        or joint_low >= 0.0
+                        or joint_high <= 0.0
+                        or not math.isclose(
+                            -joint_low,
+                            joint_high,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                    )
+                )
             ):
                 raise ValueError(
-                    "MuJoCo ctrlrange and SONIC torque clip disagree"
+                    "MuJoCo actuator/joint ranges and SONIC torque clip disagree"
                 )
+            effective = min(
+                runtime,
+                runtime if actuator_unconstrained else high,
+                joint_high,
+            )
             if (
                 not allow_mismatch
-                and not math.isclose(
-                    runtime,
-                    high,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
+                and (
+                    not math.isclose(
+                        runtime, effective, rel_tol=0.0, abs_tol=1e-9
+                    )
+                    or not math.isclose(
+                        high, effective, rel_tol=0.0, abs_tol=1e-9
+                    )
+                    or (
+                        joint_limited
+                        and not math.isclose(
+                            joint_high,
+                            effective,
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                    )
                 )
             ):
                 raise ValueError(
-                    "MuJoCo ctrlrange and SONIC torque clip disagree"
+                    "MuJoCo actuator/joint ranges and SONIC torque clip disagree"
                 )
-            values.append(runtime if unconstrained else min(high, runtime))
+            values.append(effective)
         return tuple(values)
 
     def _write_effort_limits(self, values: tuple[float, ...] | None) -> None:
@@ -8870,11 +8978,18 @@ class _LocomotionPhysicsProfiles:
             return
         if self.actuator_ids is None or len(values) != len(self.actuator_ids):
             raise ValueError("effort profile has the wrong actuator count")
-        for actuator_id, value in zip(self.actuator_ids, values):
+        for joint_id, actuator_id, value in zip(
+            self.joint_ids, self.actuator_ids, values
+        ):
             self.model.actuator_ctrlrange[actuator_id][0] = -value
             self.model.actuator_ctrlrange[actuator_id][1] = value
             if hasattr(self.model, "actuator_ctrllimited"):
                 self.model.actuator_ctrllimited[actuator_id] = 1
+            if hasattr(self.model, "jnt_actfrcrange"):
+                self.model.jnt_actfrcrange[joint_id][0] = -value
+                self.model.jnt_actfrcrange[joint_id][1] = value
+                if hasattr(self.model, "jnt_actfrclimited"):
+                    self.model.jnt_actfrclimited[joint_id] = 1
             self.torque_limits[actuator_id] = value
 
     def _matches(
@@ -9574,6 +9689,9 @@ class _PhysicalRecoveryCoordinator:
         self._initial_locomotion_policy_requested = (
             self.initial_locomotion_policy_id == "sonic"
         )
+        self._bfm_idle_handoff_armed = False
+        self._bfm_idle_return_pending = False
+        self._bfm_idle_transition_counter = 0
         self.bfm_control = _BfmTeacherControl(
             Path(args.bfm_teacher_control_socket)
         )
@@ -10011,7 +10129,23 @@ class _PhysicalRecoveryCoordinator:
                     "Locomotion policy can change only while game locomotion owns control",
                 )
             if command.policy_id == "sonic":
-                if not getattr(self, "bfm_switch_admission_ready", False):
+                admission_reason = str(
+                    getattr(self, "bfm_switch_admission_reason", "unknown")
+                )
+                auto_idle_handoff = bool(
+                    transition_id.startswith("auto-bfm-idle-sonic-")
+                    and admission_reason
+                    in {
+                        "ready",
+                        "root_linear_motion",
+                        "root_angular_motion",
+                        "joint_motion",
+                    }
+                )
+                if (
+                    not getattr(self, "bfm_switch_admission_ready", False)
+                    and not auto_idle_handoff
+                ):
                     raise CommandExecutionError(
                         "E_POLICY_SWITCH_UNSAFE",
                         "Locomotion switch requires neutral, upright, stable "
@@ -10267,11 +10401,29 @@ class _PhysicalRecoveryCoordinator:
                         if isinstance(status, dict)
                         else None
                     )
+                    auto_idle_return = transition_id.startswith(
+                        "auto-bfm-idle-return-"
+                    )
+                    shadow_neutral = bool(
+                        status.get("world_input_safe_stop") is True
+                        or (
+                            auto_idle_return
+                            and status.get("world_input_mode") == "idle"
+                            and isinstance(
+                                status.get("world_input_speed_mps"),
+                                (int, float),
+                            )
+                            and abs(
+                                float(status["world_input_speed_mps"])
+                            )
+                            <= 1.0e-6
+                        )
+                    ) if isinstance(status, dict) else False
                     shadow_ready = bool(
                         type(sequence) is int
                         and sequence > baseline_sequence
                         and status.get("shadow_preview") is True
-                        and status.get("world_input_safe_stop") is True
+                        and shadow_neutral
                         and status.get("reference_pending_rebuild") is False
                         and status.get("reference_transition_holding") is False
                         and isinstance(reference_root_error, (int, float))
@@ -10289,15 +10441,38 @@ class _PhysicalRecoveryCoordinator:
                         ):
                             return
                         self.sonic_writer.send("PAUSE")
+                        pending["initial_reference_status_baseline_sequence"] = (
+                            sequence
+                        )
                         pending["phase"] = "initial_pause_sonic"
                         return
-                    self.bfm_control.prepare_activation()
+                    # The automatic return follows a resident SONIC brake,
+                    # where the live game command is ordinary idle rather than
+                    # a deadman/safety-stop. Carry that fact explicitly to the
+                    # worker instead of weakening every hot-switch preparation.
+                    self.bfm_control.prepare_activation(
+                        allow_idle_neutral=auto_idle_return
+                    )
                     pending["phase"] = "prepare_bfm"
                     return
                 if (
                     phase == "initial_pause_sonic"
                     and self.sonic_writer.paused
                 ):
+                    reference_baseline = int(
+                        pending.get(
+                            "initial_reference_status_baseline_sequence",
+                            -1,
+                        )
+                    )
+                    reference_sequence = (
+                        self.bfm_control.direct_initial_status_sequence
+                    )
+                    if (
+                        reference_sequence is None
+                        or reference_sequence <= reference_baseline
+                    ):
+                        return
                     pending["prior_writer_fenced"] = True
                     self._align_initial_bfm_reference()
                     pending["initial_reference_alignment_result"] = dict(
@@ -10313,16 +10488,10 @@ class _PhysicalRecoveryCoordinator:
                     baseline = int(
                         pending.get("aligned_state_baseline_sequence", -1)
                     )
-                    aligned_at = float(
-                        pending.get("aligned_state_monotonic_s", requested_at)
-                    )
                     latest_sequence = int(
                         self.bfm_control.last_state_sequence or -1
                     )
-                    if (
-                        time.monotonic() - aligned_at < 0.15
-                        or latest_sequence <= baseline
-                    ):
+                    if latest_sequence <= baseline:
                         return
                     self.bfm_control.prepare_activation(aligned_initial=True)
                     pending["phase"] = "prepare_bfm"
@@ -10476,6 +10645,112 @@ class _PhysicalRecoveryCoordinator:
                 "OK_POLICY_SLOT_ASSIGNED",
                 f"Assigned {target} to locomotion",
                 loadout,
+            )
+
+    def _request_bfm_idle_sonic_handoff_if_needed(
+        self,
+        *,
+        neutral_confirmed: bool,
+    ) -> None:
+        """Use resident SONIC only for BFM's dynamic walk-to-stand braking.
+
+        Teacher50k remains the default and final locomotion writer.  After a
+        real BFM movement command, key release fences BFM, lets the already
+        resident SONIC writer bring the moving robot to neutral, then returns
+        to the warmed online-PFNN BFM stand once normal admission is safe.
+        """
+
+        if (
+            getattr(self, "initial_locomotion_policy_id", "sonic")
+            != BFM_TEACHER50K_POLICY_ID
+        ):
+            return
+        selected = getattr(self, "selected_locomotion_policy_id", "sonic")
+        pending = getattr(self, "_policy_selection_pending", None)
+        if selected == BFM_TEACHER50K_POLICY_ID:
+            if (
+                getattr(self, "_bfm_idle_return_pending", False)
+                and pending is None
+                and not getattr(self, "_bfm_idle_handoff_armed", False)
+            ):
+                self._bfm_idle_return_pending = False
+            if not neutral_confirmed:
+                self._bfm_idle_handoff_armed = True
+                return
+            if (
+                not getattr(self, "_bfm_idle_handoff_armed", False)
+                or pending is not None
+            ):
+                return
+            self._bfm_idle_transition_counter = int(
+                getattr(self, "_bfm_idle_transition_counter", 0)
+            ) + 1
+            transition_id = (
+                "auto-bfm-idle-sonic-"
+                f"{self._bfm_idle_transition_counter}"
+            )
+            try:
+                result = self.request_policy_slot_assignment(
+                    PolicySlotAssignment("locomotion", "sonic"),
+                    transition_id=transition_id,
+                )
+            except CommandExecutionError as exc:
+                if exc.code in {
+                    "E_POLICY_SWITCH_BUSY",
+                    "E_POLICY_SWITCH_UNSAFE",
+                    "E_POLICY_WORKER_NOT_READY",
+                }:
+                    return
+                raise
+            self._bfm_idle_handoff_armed = False
+            self._bfm_idle_return_pending = True
+            if result is not None:
+                self._policy_selection_results[transition_id] = (
+                    True,
+                    "OK_POLICY_SLOT_ASSIGNED",
+                    "Assigned sonic to locomotion for BFM idle braking",
+                    result,
+                )
+            return
+        if selected != "sonic" or not getattr(
+            self, "_bfm_idle_return_pending", False
+        ):
+            return
+        if (
+            not neutral_confirmed
+            or pending is not None
+            or not getattr(self, "bfm_switch_admission_ready", False)
+        ):
+            return
+        self._bfm_idle_transition_counter = int(
+            getattr(self, "_bfm_idle_transition_counter", 0)
+        ) + 1
+        transition_id = (
+            "auto-bfm-idle-return-"
+            f"{self._bfm_idle_transition_counter}"
+        )
+        try:
+            result = self.request_policy_slot_assignment(
+                PolicySlotAssignment(
+                    "locomotion",
+                    BFM_TEACHER50K_POLICY_ID,
+                ),
+                transition_id=transition_id,
+            )
+        except CommandExecutionError as exc:
+            if exc.code in {
+                "E_POLICY_SWITCH_BUSY",
+                "E_POLICY_SWITCH_UNSAFE",
+                "E_POLICY_WORKER_NOT_READY",
+            }:
+                return
+            raise
+        if result is not None:
+            self._policy_selection_results[transition_id] = (
+                True,
+                "OK_POLICY_SLOT_ASSIGNED",
+                f"Assigned {BFM_TEACHER50K_POLICY_ID} to locomotion",
+                result,
             )
 
     def _capture_restart_anchor(self, qpos: Any) -> None:
@@ -10916,6 +11191,10 @@ class _PhysicalRecoveryCoordinator:
         self._request_initial_locomotion_policy_if_ready(
             handoff_allowed=initial_locomotion_handoff_allowed,
         )
+        # Normal BFM key release remains a BFM walk -> stand transition. The
+        # resident SONIC writer is recovery/manual-switch infrastructure, not
+        # an idle brake. Keeping BFM authoritative preserves Teacher history,
+        # PrevActions, PFNN phase and the canonical double-buffer stop branch.
         if bool(getattr(self, "locomotion_slots_only", False)):
             self.last_output = ResidentRecoveryOutput(
                 previous_state=ResidentRecoveryState.GAME_SONIC,
@@ -11907,6 +12186,17 @@ class _PhysicalRecoveryCoordinator:
             "locomotion_switch_admission_reason": (
                 self.bfm_switch_admission_reason
             ),
+            "bfm_idle_brake_handoff": {
+                "armed": bool(
+                    getattr(self, "_bfm_idle_handoff_armed", False)
+                ),
+                "return_pending": bool(
+                    getattr(self, "_bfm_idle_return_pending", False)
+                ),
+                "transition_count": int(
+                    getattr(self, "_bfm_idle_transition_counter", 0)
+                ),
+            },
             "locomotion_policy_handoff": (
                 dict(self._policy_selection_pending)
                 if self._policy_selection_pending is not None
@@ -12365,20 +12655,33 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         args.game_world_revision,
         args.game_world_state_file,
     )
-    if any(value is not None for value in world_values) and not all(
-        value is not None for value in world_values
+    persistent_world_values = (
+        args.game_world_revision,
+        args.game_world_state_file,
+    )
+    # ``--game-world-id`` is also the non-persistent identity consumed by the
+    # authenticated keyboard provider.  Revision and state-file remain a
+    # strict pair and may only appear with that identity.
+    if any(value is not None for value in persistent_world_values) and not (
+        args.game_world_id is not None
+        and all(value is not None for value in persistent_world_values)
     ):
-        raise SystemExit("game world-state arguments are all-or-none")
+        raise SystemExit(
+            "game world revision/state arguments require an identity and are all-or-none"
+        )
+    persistent_world_configured = all(
+        value is not None for value in world_values
+    )
     try:
         _validate_game_world_resume_metadata(
             selected_checkpoint_id=args.game_world_resume_checkpoint_id,
             selected_generation=args.game_world_resume_generation,
             rollback_count=args.game_resume_rollback_count,
-            world_state_configured=all(value is not None for value in world_values),
+            world_state_configured=persistent_world_configured,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    if all(value is not None for value in world_values):
+    if persistent_world_configured:
         if args.control_source != "game":
             raise SystemExit("game world-state persistence requires game control")
         assert args.game_world_state_file is not None
@@ -12409,7 +12712,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     if game_celestial_clock_state_file is not None:
         if args.control_source != "game":
             raise SystemExit("celestial clock persistence requires game control")
-        if not all(value is not None for value in world_values):
+        if not persistent_world_configured:
             raise SystemExit(
                 "celestial clock persistence requires persistent game world state"
             )
@@ -12455,7 +12758,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "game celestial ephemeris assets must be absolute regular files"
                 )
     if args.game_auto_respawn:
-        if not all(value is not None for value in world_values):
+        if not persistent_world_configured:
             raise SystemExit("--game-auto-respawn requires game world-state persistence")
         if args.fail_on_fall:
             raise SystemExit("--game-auto-respawn conflicts with --fail-on-fall")
@@ -12989,6 +13292,32 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             print(
                 "matrix-sonic-runtime ERROR unsafe spawn clearance: "
                 f"reason={spawn_clearance_audit.get('reason')} worst={worst}",
+                flush=True,
+            )
+        if running and moon_dynamic_ground is not None:
+            environment = getattr(simulator, "sim_env", None)
+            model = getattr(environment, "mj_model", None)
+            data = getattr(environment, "mj_data", None)
+            if mujoco_module is None or model is None or data is None:
+                raise SystemExit(
+                    "MoonWorld collision handoff requires live MuJoCo model/data"
+                )
+            try:
+                collision_handoff = (
+                    moon_dynamic_ground.activate_collision_handoff(
+                        data,
+                        forward=mujoco_module.mj_forward,
+                    )
+                )
+            except (MoonDynamicGroundError, OSError, ValueError) as exc:
+                raise SystemExit(
+                    f"cannot activate MoonWorld rolling collision: {exc}"
+                ) from exc
+            print(
+                "matrix-sonic-runtime moon_collision_handoff=active "
+                f"ground_mode={collision_handoff['ground_mode']} "
+                f"tile_geom_count={collision_handoff['tile_geom_count']} "
+                f"spawn_pad_geom_id={collision_handoff['spawn_pad_geom_id']}",
                 flush=True,
             )
         if args.game_world_state_file is not None:

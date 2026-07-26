@@ -29,6 +29,27 @@ SPEC.loader.exec_module(MODULE)
 
 
 class MatrixBfmTeacherAdapterTest(unittest.TestCase):
+    def test_reference_stream_contract_matches_realscan_base_toml(self) -> None:
+        self.assertEqual(
+            MODULE.REALSCAN_REFERENCE_CONTRACT,
+            {
+                "source_hz": 60.0,
+                "output_hz": 50.0,
+                "future_frames": 10,
+                "future_stride_steps": 5,
+                "buffer_frames": 47,
+                "warmup_source_steps": 60,
+                "root_reanchor_threshold_m": 0.15,
+                "root_follow_deadband_m": 0.015,
+                "root_follow_gain": 0.25,
+                "root_follow_max_step_m": 0.015,
+                "command_replan_linear_delta_mps": 0.05,
+                "command_replan_yaw_delta_rad_s": 0.05,
+                "pending_min_steps": 4,
+                "pending_extra_frames": 8,
+            },
+        )
+
     @staticmethod
     def core():
         core = MODULE.BfmTeacherCore.__new__(MODULE.BfmTeacherCore)
@@ -50,7 +71,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             safe_stop=safe_stop,
         )
 
-    def test_safe_stop_is_zero_velocity_zero_yaw_stand(self) -> None:
+    def test_deadman_release_is_non_latched_zero_velocity_stand(self) -> None:
         command = self.core()._command(
             self.sample(safe_stop=True, mode="deadman")
         )
@@ -59,7 +80,53 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(command.vy, 0.0)
         self.assertEqual(command.yaw_rate, 0.0)
         self.assertEqual(command.gait, "stand")
+        self.assertFalse(command.stop_latched)
+
+    def test_explicit_safety_stop_latches_reference_stop(self) -> None:
+        command = self.core()._command(
+            self.sample(safe_stop=True, mode="safe_stop")
+        )
+
+        self.assertEqual(command.vx, 0.0)
+        self.assertEqual(command.vy, 0.0)
+        self.assertEqual(command.yaw_rate, 0.0)
+        self.assertEqual(command.gait, "stand")
         self.assertTrue(command.stop_latched)
+
+    def test_idle_neutral_handoff_requires_explicit_admission(self) -> None:
+        idle = self.sample(safe_stop=False, mode="idle")
+        idle.movement = np.zeros(3, dtype=np.float64)
+        idle.speed_mps = 0.0
+        idle.locomotion_mode = 0
+
+        self.assertFalse(
+            MODULE._handoff_input_is_neutral(
+                idle,
+                allow_idle_neutral=False,
+            )
+        )
+        self.assertTrue(
+            MODULE._handoff_input_is_neutral(
+                idle,
+                allow_idle_neutral=True,
+            )
+        )
+
+        idle.movement = np.asarray((0.01, 0.0, 0.0), dtype=np.float64)
+        self.assertFalse(
+            MODULE._handoff_input_is_neutral(
+                idle,
+                allow_idle_neutral=True,
+            )
+        )
+
+        safety_stop = self.sample(safe_stop=True, mode="deadman")
+        self.assertTrue(
+            MODULE._handoff_input_is_neutral(
+                safety_stop,
+                allow_idle_neutral=False,
+            )
+        )
 
     def test_turn_command_keeps_heading_control(self) -> None:
         sample = self.sample(safe_stop=False, mode="turn")
@@ -78,6 +145,20 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertGreater(command.yaw_rate, 0.0)
         self.assertEqual(command.gait, "walk")
         self.assertFalse(command.stop_latched)
+
+    def test_move_uses_camera_local_velocity_without_yaw_feedback(self) -> None:
+        sample = self.sample(safe_stop=False, mode="move")
+        sample.movement = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+        sample.facing = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
+        sample.root_yaw = 0.35
+        sample.speed_mps = 0.9
+
+        command = self.core()._command(sample)
+
+        self.assertAlmostEqual(command.vx, 0.9)
+        self.assertAlmostEqual(command.vy, 0.0)
+        self.assertEqual(command.yaw_rate, 0.0)
+        self.assertEqual(command.gait, "walk")
 
     def test_turn_reference_seed_does_not_activate_lateral_gait(self) -> None:
         sample = self.sample(safe_stop=False, mode="turn")
@@ -391,10 +472,14 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         core.last_reset_count = 0
         core.last_world_sequence = None
         core.reference_motion_active = False
+        core.last_motion_command = None
+        core.stop_handoff_grace_steps_remaining = 0
         core.reference_start_resets = 0
         core.reference_stop_resets = 0
         core.reference_transition = None
         core.reference_hold_target = None
+        core.reference_stop_blend_pending = False
+        core.canonical_reference_continuity = False
         core.idle_anchor_target = None
         core.activation_blend_steps = 4
         core.activation_origin = None
@@ -405,6 +490,468 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         core.direct_start = False
         core.direct_reference_start = None
         return core
+
+    def test_canonical_reference_continuity_does_not_freeze_pending_walk(
+        self,
+    ) -> None:
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        moving = self.world(sequence=1)
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+        moving.speed_mps = 0.9
+        moving.locomotion_mode = 2
+        moving.mode = "move"
+        moving.safe_stop = False
+
+        target, status = core.step(moving, self.lowstate(), active=True)
+
+        self.assertIsNone(status["reference_transition"])
+        self.assertFalse(status["reference_transition_holding"])
+        self.assertFalse(status["idle_anchor_hold"])
+        np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
+
+    def test_canonical_buffer_swap_blends_from_last_published_target(self) -> None:
+        class SwapStream:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def sample(self, command, *_args):
+                self.calls += 1
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=self.calls == 2,
+                    replan_reason=(
+                        "buffer_swap:gait" if self.calls == 2 else None
+                    ),
+                    plan_index=self.calls,
+                    root_error_before_m=0.0,
+                    pending_rebuild=False,
+                    buffer_swapped=self.calls == 2,
+                )
+
+        class StepTeacher:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.reset_count = 0
+
+            def reset(self) -> None:
+                self.reset_count += 1
+
+            def step(self, *_args):
+                self.calls += 1
+                return np.full(
+                    MODULE.NUM_JOINTS,
+                    0.0 if self.calls == 1 else 1.0,
+                    dtype=np.float32,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.reference_motion_active = True
+        core.stream = SwapStream()
+        core.teacher = StepTeacher()
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.9
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+
+        first, first_status = core.step(moving, self.lowstate(), active=True)
+        core.last_motion_command = None
+        core.stop_handoff_grace_steps_remaining = 0
+        stopped = self.world(sequence=2)
+        stopped.safe_stop = False
+        swapped, swap_status = core.step(stopped, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(first, np.zeros(MODULE.NUM_JOINTS))
+        np.testing.assert_allclose(swapped, first)
+        self.assertFalse(first_status["reference_swap_blend_started"])
+        self.assertTrue(swap_status["reference_buffer_swapped"])
+        self.assertTrue(swap_status["reference_swap_blend_started"])
+        self.assertTrue(swap_status["activation_settle_active"])
+        self.assertEqual(swap_status["published_target_step_delta_max_rad"], 0.0)
+        self.assertEqual(core.teacher.reset_count, 0)
+
+        stopped.sequence = 3
+        next_target, next_status = core.step(
+            stopped,
+            self.lowstate(),
+            active=True,
+        )
+        self.assertLessEqual(
+            next_status["published_target_step_delta_max_rad"],
+            MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
+        )
+        self.assertGreater(float(np.max(next_target)), 0.0)
+        self.assertEqual(core.teacher.reset_count, 0)
+
+    def test_canonical_motion_start_swap_publishes_teacher_directly(self) -> None:
+        class ImmediateSwapStream:
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=True,
+                    replan_reason="buffer_swap:gait",
+                    plan_index=1,
+                    root_error_before_m=0.0,
+                    pending_rebuild=False,
+                    buffer_swapped=True,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.last_published_target = np.zeros(
+            MODULE.NUM_JOINTS,
+            dtype=np.float32,
+        )
+        core.activation_origin = np.zeros(
+            MODULE.NUM_JOINTS,
+            dtype=np.float32,
+        )
+        core.activation_step = 2
+        core.reference_stop_blend_pending = True
+        core.stream = ImmediateSwapStream()
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.9
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+
+        target, status = core.step(moving, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
+        self.assertTrue(status["reference_buffer_swapped"])
+        self.assertFalse(status["reference_swap_blend_started"])
+        self.assertFalse(status["reference_stop_blend_pending"])
+        self.assertFalse(status["activation_settle_active"])
+
+    def test_canonical_root_anchor_swap_blends_while_walking(self) -> None:
+        class RootAnchorSwapStream:
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=True,
+                    replan_reason="buffer_swap:root_anchor",
+                    plan_index=1,
+                    root_error_before_m=0.16,
+                    pending_rebuild=False,
+                    buffer_swapped=True,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.reference_motion_active = True
+        core.reference_stop_blend_pending = False
+        core.last_published_target = np.zeros(
+            MODULE.NUM_JOINTS,
+            dtype=np.float32,
+        )
+        core.stream = RootAnchorSwapStream()
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.9
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+
+        target, status = core.step(moving, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(target, np.zeros(MODULE.NUM_JOINTS))
+        self.assertTrue(status["reference_buffer_swapped"])
+        self.assertTrue(status["reference_swap_blend_started"])
+        self.assertTrue(status["activation_settle_active"])
+        self.assertEqual(
+            status["activation_target_delta_limit_rad"],
+            MODULE.REFERENCE_SWAP_MAX_TARGET_DELTA_RAD,
+        )
+        self.assertEqual(status["published_target_step_delta_max_rad"], 0.0)
+        self.assertFalse(status["reference_stop_blend_pending"])
+
+    def test_canonical_stop_holds_last_target_while_branch_is_pending(self) -> None:
+        class PendingStandStream:
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=True,
+                    replan_reason="buffer_build:gait",
+                    plan_index=1,
+                    root_error_before_m=0.02,
+                    pending_rebuild=True,
+                    buffer_swapped=False,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.reference_motion_active = True
+        core.reference_stop_blend_pending = False
+        core.last_published_target = np.zeros(
+            MODULE.NUM_JOINTS,
+            dtype=np.float32,
+        )
+        core.stream = PendingStandStream()
+        stopped = self.world(sequence=1)
+        stopped.safe_stop = False
+        stopped.mode = "idle"
+        stopped.speed_mps = 0.0
+        stopped.locomotion_mode = 0
+        stopped.movement = np.zeros(3, dtype=np.float64)
+
+        target, status = core.step(stopped, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(target, np.zeros(MODULE.NUM_JOINTS))
+        self.assertTrue(status["reference_pending_rebuild"])
+        self.assertTrue(status["reference_stop_blend_pending"])
+        self.assertTrue(status["reference_stop_pending_hold"])
+        self.assertFalse(status["reference_swap_blend_started"])
+        self.assertEqual(status["published_target_step_delta_max_rad"], 0.0)
+
+    def test_canonical_key_release_rolls_active_pfnn_into_stand(self) -> None:
+        class RollingStream:
+            def __init__(self) -> None:
+                self._frames = [object()]
+                self._last_branch_command = SimpleNamespace(
+                    gait="walk",
+                    stop_latched=False,
+                )
+                self._pending = None
+                self._deferred_reason = None
+
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=False,
+                    replan_reason=None,
+                    plan_index=1,
+                    root_error_before_m=0.0,
+                    pending_rebuild=False,
+                    buffer_swapped=False,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.reference_motion_active = True
+        core.reference_stop_blend_pending = False
+        core.last_published_target = np.zeros(
+            MODULE.NUM_JOINTS,
+            dtype=np.float32,
+        )
+        core.stream = RollingStream()
+        resets_before = core.teacher.reset_count
+        stopped = self.world(sequence=1)
+        stopped.safe_stop = False
+        stopped.mode = "idle"
+        stopped.speed_mps = 0.0
+        stopped.locomotion_mode = 0
+        stopped.movement = np.zeros(3, dtype=np.float64)
+
+        target, status = core.step(stopped, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
+        self.assertEqual(core.teacher.reset_count, resets_before)
+        self.assertEqual(core.stream._last_branch_command.gait, "stand")
+        self.assertTrue(status["reference_realtime_rolling_stop"])
+        self.assertFalse(status["reference_pending_rebuild"])
+        self.assertFalse(status["reference_buffer_swapped"])
+        self.assertFalse(status["reference_stop_blend_pending"])
+        self.assertFalse(status["reference_stop_pending_hold"])
+
+    def test_canonical_motion_start_rolls_without_pending_branch(self) -> None:
+        class RollingStartStream:
+            def __init__(self) -> None:
+                self._frames = [object()]
+                self._last_branch_command = SimpleNamespace(
+                    gait="stand",
+                    stop_latched=False,
+                )
+                self._pending = None
+                self._deferred_reason = None
+
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=False,
+                    replan_reason=None,
+                    plan_index=1,
+                    root_error_before_m=0.0,
+                    pending_rebuild=False,
+                    buffer_swapped=False,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.stream = RollingStartStream()
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.9
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+        resets_before = core.teacher.reset_count
+
+        target, status = core.step(moving, self.lowstate(), active=True)
+
+        np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
+        self.assertEqual(core.teacher.reset_count, resets_before)
+        self.assertEqual(core.stream._last_branch_command.gait, "walk")
+        self.assertEqual(status["reference_realtime_rolling_reason"], "gait")
+        self.assertFalse(status["reference_realtime_rolling_stop"])
+        self.assertFalse(status["reference_pending_rebuild"])
+        self.assertFalse(status["reference_buffer_swapped"])
+
+    def test_canonical_tick_cancels_root_anchor_pending_before_barrier(self) -> None:
+        class PendingFuture:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        class PendingEvent:
+            def __init__(self) -> None:
+                self.set_called = False
+
+            def set(self) -> None:
+                self.set_called = True
+
+        class RootPendingStream:
+            def __init__(self) -> None:
+                self._frames = [object()]
+                self._last_branch_command = SimpleNamespace(
+                    gait="walk",
+                    stop_latched=False,
+                )
+                self.future = PendingFuture()
+                self.event = PendingEvent()
+                self._pending = SimpleNamespace(
+                    future=self.future,
+                    cancel_event=self.event,
+                )
+                self._deferred_reason = "root_anchor"
+                self._discard_count = 0
+
+            def _change_reason(self, _command, _previous):
+                return None
+
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=False,
+                    replan_reason=None,
+                    plan_index=1,
+                    root_error_before_m=0.0,
+                    pending_rebuild=False,
+                    buffer_swapped=False,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.reference_motion_active = True
+        core.stream = RootPendingStream()
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.9
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+
+        _, status = core.step(moving, self.lowstate(), active=True)
+
+        self.assertIsNone(core.stream._pending)
+        self.assertTrue(core.stream.future.cancelled)
+        self.assertTrue(core.stream.event.set_called)
+        self.assertEqual(core.stream._discard_count, 1)
+        self.assertIsNone(core.stream._deferred_reason)
+        self.assertEqual(
+            status["reference_realtime_rolling_reason"],
+            "pending_cancel",
+        )
+        self.assertFalse(status["reference_pending_rebuild"])
+
+    def test_explicit_safety_stop_keeps_pfnn_branch_rebuild(self) -> None:
+        class SafetyStream:
+            def __init__(self) -> None:
+                self._frames = [object()]
+                self._last_branch_command = SimpleNamespace(
+                    gait="walk",
+                    stop_latched=False,
+                )
+                self._pending = None
+                self._deferred_reason = None
+
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=0.0,
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=True,
+                    replan_reason="buffer_build:gait",
+                    plan_index=1,
+                    root_error_before_m=0.0,
+                    pending_rebuild=True,
+                    buffer_swapped=False,
+                )
+
+        core = self.inference_core()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.reference_motion_active = True
+        core.last_published_target = np.zeros(
+            MODULE.NUM_JOINTS,
+            dtype=np.float32,
+        )
+        core.stream = SafetyStream()
+        stopped = self.world(sequence=1)
+        stopped.safe_stop = True
+        stopped.mode = "safe_stop"
+        stopped.speed_mps = 0.0
+        stopped.locomotion_mode = 0
+        stopped.movement = np.zeros(3, dtype=np.float64)
+
+        _, status = core.step(stopped, self.lowstate(), active=True)
+
+        self.assertEqual(core.stream._last_branch_command.gait, "walk")
+        self.assertFalse(status["reference_realtime_rolling_stop"])
+        self.assertTrue(status["reference_pending_rebuild"])
+        self.assertTrue(status["reference_stop_pending_hold"])
 
     def test_direct_start_exports_reference_state_and_skips_hot_switch_blend(
         self,
@@ -503,29 +1050,20 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
     def test_aligned_initial_stand_uses_teacher_closed_loop(self) -> None:
         core = self.inference_core()
         lowstate = self.lowstate(joint_value=0.25)
-        core.prepare_activation(
+        core.prepare_aligned_initial_activation()
+
+        target, status = core.step(
+            self.world(sequence=1),
             lowstate,
-            lowstate.joint_pos_rad,
-            idle_anchor_enabled=False,
+            active=True,
+            handoff_preview=True,
         )
 
-        target = None
-        status = None
-        for sequence in range(1, 30):
-            target, status = core.step(
-                self.world(sequence=sequence),
-                lowstate,
-                active=True,
-                handoff_preview=sequence <= 4,
-            )
-            self.assertFalse(status["idle_anchor_hold"])
-            self.assertFalse(status["idle_anchor_enabled"])
-            if not status["activation_settle_active"]:
-                break
-
-        self.assertIsNotNone(target)
-        self.assertIsNotNone(status)
+        self.assertFalse(status["idle_anchor_hold"])
+        self.assertFalse(status["idle_anchor_enabled"])
         self.assertFalse(status["activation_settle_active"])
+        self.assertFalse(status["activation_target_limited"])
+        self.assertEqual(status["activation_blend_fraction"], 1.0)
         np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
 
     def test_hot_handoff_resets_reference_to_current_root_before_preview(
@@ -803,6 +1341,8 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(moving_status["reference_target_speed_mps"], 0.8)
         self.assertEqual(moving_status["reference_future_xy_delta_m"], 1.0)
 
+        core.last_motion_command = None
+        core.stop_handoff_grace_steps_remaining = 0
         stopped = self.world(sequence=2)
         target, stopped_status = core.step(stopped, lowstate, active=True)
 

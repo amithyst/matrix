@@ -1491,6 +1491,28 @@ class GameCommandClientTest(unittest.TestCase):
             )
         )
 
+    def test_disabled_recovery_slot_accepts_locked_off_sentinel(self) -> None:
+        loadout = self.strategy_loadout(status="loading")
+        recovery = loadout["slots"][1]
+        recovery["selected_policy_id"] = "off"
+        recovery["locked"] = True
+        recovery["candidates"] = []
+
+        provider, runtime = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        client = MODULE.GameCommandClient(
+            provider.detach(),
+            initial_strategy_loadout=loadout,
+        )
+        self.addCleanup(client.close)
+        self.addCleanup(runtime.close)
+        self.assertEqual(
+            client.strategy_loadout_mapping()["slots"][1],
+            recovery,
+        )
+
     def test_creative_spawn_skips_editor_and_tracks_remaining_inventory(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         client = MODULE.GameCommandClient(

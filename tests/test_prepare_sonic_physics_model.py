@@ -193,9 +193,13 @@ material="demo_ground_material" /></worldbody>
 <mesh name="body" file="body.stl" /></asset>
 <worldbody><body name="pelvis"><freejoint name="floating" />
 <joint name="joint_a" /><geom mesh="body" /></body>
+<body name="creative_item__prop__0"><freejoint name="stale_freejoint" />
+<geom type="box" size="0.1 0.1 0.1" /></body>
 <body name="demo_body"><geom type="box" size="1 1 1" /></body>
 <light name="demo_light" /></worldbody>
-<actuator><motor name="a" joint="joint_a" /></actuator></mujoco>""",
+<actuator><motor name="a" joint="joint_a" /></actuator>
+<equality><weld name="creative_item__prop__0__storage_weld"
+body1="creative_item__prop__0" active="true" /></equality></mujoco>""",
                 encoding="utf-8",
             )
             catalog.write_text(
@@ -254,6 +258,14 @@ material="demo_ground_material" /></worldbody>
             )
             self.assertIsNotNone(storage_weld)
             self.assertNotIn("relpose", storage_weld.attrib)
+            self.assertEqual(
+                len(
+                    robot.findall(
+                        ".//weld[@name='creative_item__prop__0__storage_weld']"
+                    )
+                ),
+                1,
+            )
             retained_assets = {
                 item.get("name") for item in robot.find("asset")
             }
@@ -467,8 +479,8 @@ material="demo_ground_material" /></worldbody>
                 support_geom.get("hfield"),
                 MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
             )
-            self.assertEqual(support_geom.get("contype"), "1")
-            self.assertEqual(support_geom.get("conaffinity"), "1")
+            self.assertEqual(support_geom.get("contype"), "0")
+            self.assertEqual(support_geom.get("conaffinity"), "0")
             self.assertEqual(
                 support_geom.get("friction"), MODULE.MOON_COLLISION_FRICTION
             )
@@ -497,8 +509,8 @@ material="demo_ground_material" /></worldbody>
             self.assertEqual(spawn_pad.get("solimp"), MODULE.MOON_COLLISION_SOLIMP)
             self.assertEqual(spawn_pad.get("rgba"), "0 0 0 0")
             for tile_geom in geoms[2:]:
-                self.assertEqual(tile_geom.get("contype"), "0")
-                self.assertEqual(tile_geom.get("conaffinity"), "0")
+                self.assertEqual(tile_geom.get("contype"), "1")
+                self.assertEqual(tile_geom.get("conaffinity"), "1")
             hfields = list(scene_root.iter("hfield"))
             self.assertEqual(len(hfields), 1)
             self.assertEqual(
@@ -541,23 +553,36 @@ material="demo_ground_material" /></worldbody>
                         "update_timing": "before_each_mj_step",
                         "fallback_support_plane": False,
                         "collision": {
-                            "mode": "rolling-heightfield-v1",
+                            "mode": "rolling-mocap-tiles-v1",
                             "asset_name": (
                                 MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME
                             ),
                             "geom_name": (
                                 MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
                             ),
+                            "collision_enabled_initial": False,
+                            "collision_enabled_after_handoff": False,
+                            "observation_hfield_only": True,
+                            "handoff": {
+                                "trigger": "initial_spawn_clearance_passed",
+                                "contract": "exactly-one-active-ground-v1",
+                                "mujoco_forward_after_mask_swap": True,
+                            },
                             "grid_shape": [33, 33],
                             "half_extent_m": 1.6,
                             "height_range_m": 64.0,
                             "base_depth_m": 1.0,
-                            "source_tile_collision_enabled": False,
+                            "source_tile_count": 2,
+                            "source_tile_compiled_collision_mask": [1, 1],
+                            "source_tile_collision_enabled_initial": False,
+                            "source_tile_collision_enabled_after_handoff": True,
                             "friction": MODULE.MOON_COLLISION_FRICTION,
                             "solref": MODULE.MOON_COLLISION_SOLREF,
                             "solimp": MODULE.MOON_COLLISION_SOLIMP,
                             "spawn_pad": {
                                 "mode": "finite-collision-only-box-v1",
+                                "collision_enabled_initial": True,
+                                "collision_enabled_after_handoff": False,
                                 "geom_name": MODULE.MOON_SPAWN_PAD_GEOM_NAME,
                                 "center_m": list(MODULE.MOON_SPAWN_PAD_CENTER_M),
                                 "half_size_m": list(
@@ -567,9 +592,7 @@ material="demo_ground_material" /></worldbody>
                                     MODULE.MOON_SPAWN_PAD_CENTER_M[2]
                                     + MODULE.MOON_SPAWN_PAD_HALF_SIZE_M[2]
                                 ),
-                                "top_offset_above_native_floor_m": (
-                                    MODULE.MOON_SPAWN_PAD_HALF_SIZE_M[2]
-                                ),
+                                "top_offset_above_native_floor_m": 0.0,
                                 "locked_footprint": {
                                     "map_sha256": MODULE.MOON_DYNAMIC_MAP_SHA256,
                                     "pixel_x_range": list(
