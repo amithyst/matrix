@@ -14249,6 +14249,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     # not the pre-readiness candidate returned by the core.
                     game_input.last_command = game_command
                     command_published = False
+                    bfm_shadow_published = False
                     if physical_output is not None:
                         # On the trigger frame publish one final neutral command
                         # before the deploy-only stop frame. Once the replacement
@@ -14281,6 +14282,32 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             command_published = True
                         if not running:
                             break
+                        # Recovery return may issue PREPARE below. Publish this
+                        # frame first so its freshness gate sees current state.
+                        if (
+                            physical_recovery is not None
+                            and physical_recovery.bfm_process_started
+                            and physical_recovery.bfm_control.ready
+                        ):
+                            try:
+                                physical_recovery.publish_bfm_shadow_state(
+                                    snapshot,
+                                    game_command,
+                                    height_map_z=bfm_height_map(snapshot),
+                                )
+                                bfm_shadow_published = True
+                            except (
+                                MoonDynamicGroundError,
+                                OSError,
+                                RuntimeError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
+                                stop_for_physical_recovery_exception(
+                                    exc,
+                                    action=False,
+                                )
+                                break
                         try:
                             deploy_generation_before = processes.deploy_generation
                             physical_recovery.execute(
@@ -14362,6 +14389,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         physical_recovery is not None
                         and physical_recovery.bfm_process_started
                         and physical_recovery.bfm_control.ready
+                        and not bfm_shadow_published
                     ):
                         try:
                             physical_recovery.publish_bfm_shadow_state(
