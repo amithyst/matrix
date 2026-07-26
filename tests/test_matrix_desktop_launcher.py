@@ -222,6 +222,27 @@ esac
             1,
         )
 
+    def test_explicit_scene_is_forwarded_to_the_runtime(self) -> None:
+        result = self.run_launcher(
+            "start", "--profile", "heyuan", "--scene", "15"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            parse_call_log(self.run_log),
+            [
+                [
+                    "--profile",
+                    "heyuan",
+                    "--scene",
+                    "15",
+                    "--control-source",
+                    "game",
+                ]
+            ],
+        )
+        self.assertIn("scene 15", result.stdout)
+
     def test_default_profile_status_attach_and_stop(self) -> None:
         started = self.run_launcher()
         status_result = self.run_launcher("status")
@@ -261,11 +282,14 @@ esac
             f"heyuan;touch {marker}",
         )
         unknown = self.run_launcher("start", "--unknown")
+        bad_scene = self.run_launcher("start", "--scene", "15;touch")
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("unsupported profile", result.stderr)
         self.assertEqual(unknown.returncode, 2)
         self.assertIn("unsupported argument", unknown.stderr)
+        self.assertEqual(bad_scene.returncode, 2)
+        self.assertIn("invalid scene id", bad_scene.stderr)
         self.assertFalse(marker.exists())
         self.assertEqual(parse_call_log(self.tmux_log), [])
 
@@ -389,25 +413,52 @@ class MatrixDesktopInstallerTest(unittest.TestCase):
                 self.assertIn("Terminal=false\n", content)
                 self.assertIn(f"Name=Matrix SONIC ({profile})\n", content)
                 self.assertIn(
-                    f'Exec=/usr/bin/bash "{launcher_path}" start --profile {profile}\n',
+                    f'Exec=/usr/bin/bash "{launcher_path}" start --profile {profile} --scene 2\n',
                     content,
                 )
                 self.assertIn(
-                    f'Exec=/usr/bin/bash "{launcher_path}" status --profile {profile}\n',
+                    f'Exec=/usr/bin/bash "{launcher_path}" status --profile {profile} --scene 2\n',
                     content,
                 )
                 self.assertIn(
-                    f'Exec=/usr/bin/bash "{launcher_path}" stop --profile {profile}\n',
+                    f'Exec=/usr/bin/bash "{launcher_path}" stop --profile {profile} --scene 2\n',
                     content,
                 )
                 self.assertIn(f"Icon={icon_path}\n", content)
                 self.assertIn(f"X-Matrix-Repository={self.project}\n", content)
                 self.assertIn(f"X-Matrix-Profile={profile}\n", content)
+                self.assertIn("X-Matrix-Scene=2\n", content)
                 self.assertNotIn("@MATRIX_", content)
                 self.assertEqual(
                     list(desktop.glob(".matrix-sonic.desktop.tmp.*")),
                     [],
                 )
+
+    def test_moon_shortcut_coexists_with_the_default_shortcut(self) -> None:
+        desktop = self.make_desktop_dir()
+        default_result = self.run_installer(
+            "--desktop-dir", os.fspath(desktop), "--profile", "heyuan"
+        )
+        moon_result = self.run_installer(
+            "--desktop-dir",
+            os.fspath(desktop),
+            "--profile",
+            "heyuan",
+            "--scene",
+            "15",
+        )
+
+        self.assertEqual(default_result.returncode, 0, default_result.stderr)
+        self.assertEqual(moon_result.returncode, 0, moon_result.stderr)
+        self.assertTrue((desktop / "matrix-sonic.desktop").is_file())
+        moon = desktop / "matrix-sonic-moon.desktop"
+        self.assertEqual(stat.S_IMODE(moon.stat().st_mode), 0o755)
+        content = moon.read_text(encoding="utf-8")
+        self.assertIn("Name=Matrix MoonWorld SONIC (heyuan)\n", content)
+        self.assertIn("MoonWorld scene 15", content)
+        self.assertIn("start --profile heyuan --scene 15\n", content)
+        self.assertIn("X-Matrix-Scene=15\n", content)
+        self.assertNotIn("@MATRIX_", content)
 
     def test_custom_icon_is_written_as_an_absolute_path(self) -> None:
         desktop = self.make_desktop_dir()
