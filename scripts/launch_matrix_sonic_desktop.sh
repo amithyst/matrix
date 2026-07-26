@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
-RUN_SCRIPT="$SCRIPT_DIR/run_matrix_sonic.sh"
+RUN_SCRIPT="$SCRIPT_DIR/run_matrix_sonic_moon_v1.sh"
 SESSION_NAME="matrix-sonic-desktop-${UID}"
 HOST_LOCK_PATH="${MATRIX_DESKTOP_HOST_LOCK_PATH:-/tmp/matrix-sonic-${UID}.lock}"
 PROFILE="heyuan"
@@ -23,6 +23,9 @@ Actions:
   attach   Attach this terminal to the Matrix SONIC tmux session
 
 Profiles: heyuan (default), trna, zza
+
+The desktop runtime always starts MoonWorld with BFM SONIC Teacher50k.
+Fall recovery remains enabled through the profile-aware auto policy.
 EOF
 }
 
@@ -190,8 +193,9 @@ start_session() {
         /usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
         /usr/bin/bash "$RUN_SCRIPT" \
         --profile "$PROFILE" \
-        --scene 2 \
-        --control-source game; then
+        --control-source game \
+        --initial-locomotion-policy bfm-sonic-teacher50k \
+        --game-fall-recovery auto; then
         sleep 0.20
         if ! session_is_live; then
             remove_stale_session || true

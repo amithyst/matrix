@@ -25,14 +25,19 @@ bash scripts/install_matrix_desktop_launcher.sh --profile zza
 
 ## 双击后的行为
 
-图标固定启动：
+图标固定启动月球场景，并将移动策略固定为 BFM SONIC Teacher50k：
 
 ```bash
-bash scripts/run_matrix_sonic.sh \
+bash scripts/run_matrix_sonic_moon_v1.sh \
   --profile <profile> \
-  --scene 2 \
-  --control-source game
+  --control-source game \
+  --initial-locomotion-policy bfm-sonic-teacher50k \
+  --game-fall-recovery auto
 ```
+
+`moon-v1` 固定 UE MoonWorld（scene 15）和月球动态物理场景。`auto` 在 TRNA/Heyuan
+交互运行中解析为物理倒地爬起；移动策略槽和倒地恢复槽彼此独立，因此恢复策略不会阻止
+BFM SONIC 就绪或接收键盘控制。
 
 桌面启动器会显式清除继承的 `LD_LIBRARY_PATH` 和 `PYTHONPATH`，并在
 `matrix-sonic-desktop-<uid>` tmux 会话中运行主链。重复双击不会创建第二套仿真。

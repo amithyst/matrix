@@ -45,7 +45,7 @@ class MatrixDesktopLauncherTest(unittest.TestCase):
 
         self.run_log = self.root / "run.log"
         write_executable(
-            scripts / "run_matrix_sonic.sh",
+            scripts / "run_matrix_sonic_moon_v1.sh",
             """#!/usr/bin/env bash
 set -euo pipefail
 {
@@ -171,13 +171,17 @@ esac
                     "-u",
                     "PYTHONPATH",
                     "/usr/bin/bash",
-                    os.fspath(self.project / "scripts/run_matrix_sonic.sh"),
+                    os.fspath(
+                        self.project / "scripts/run_matrix_sonic_moon_v1.sh"
+                    ),
                     "--profile",
                     "trna",
-                    "--scene",
-                    "2",
                     "--control-source",
                     "game",
+                    "--initial-locomotion-policy",
+                    "bfm-sonic-teacher50k",
+                    "--game-fall-recovery",
+                    "auto",
                 ]
             ],
         )
@@ -187,10 +191,12 @@ esac
                 [
                     "--profile",
                     "trna",
-                    "--scene",
-                    "2",
                     "--control-source",
                     "game",
+                    "--initial-locomotion-policy",
+                    "bfm-sonic-teacher50k",
+                    "--game-fall-recovery",
+                    "auto",
                 ]
             ],
         )
@@ -236,10 +242,12 @@ esac
             [
                 "--profile",
                 "heyuan",
-                "--scene",
-                "2",
                 "--control-source",
                 "game",
+                "--initial-locomotion-policy",
+                "bfm-sonic-teacher50k",
+                "--game-fall-recovery",
+                "auto",
             ],
         )
         self.assertEqual(status_result.returncode, 0, status_result.stderr)
