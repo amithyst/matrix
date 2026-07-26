@@ -83,6 +83,9 @@ GAMEPAD_LOOK_DEADZONE="${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
 GAMEPAD_LOOK_MIN_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG:--80.0}"
 GAMEPAD_LOOK_MAX_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG:-60.0}"
 GAME_MAX_SPEED="${MATRIX_GAME_MAX_SPEED:-0.30}"
+GAME_MAX_ACCELERATION="${MATRIX_GAME_MAX_ACCELERATION:-1.20}"
+GAME_MAX_DECELERATION="${MATRIX_GAME_MAX_DECELERATION:-2.40}"
+GAME_MAX_TURN_RATE="${MATRIX_GAME_MAX_TURN_RATE:-2.50}"
 GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
 GAME_WORLD_PERSISTENCE="${MATRIX_GAME_WORLD_PERSISTENCE:-auto}"
 GAME_AUTO_RESPAWN="${MATRIX_GAME_AUTO_RESPAWN:-auto}"
@@ -172,6 +175,9 @@ usage() {
         "  --gamepad-look-min-pitch DEG     Spectator pitch lower limit" \
         "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
         "  --game-max-speed MPS       Analog SLOW_WALK cap (default 0.30; max 0.80)" \
+        "  --game-max-acceleration MPS2  Linear command acceleration limit" \
+        "  --game-max-deceleration MPS2  Linear command deceleration limit" \
+        "  --game-max-turn-rate RAD_S    Heading command slew limit" \
         "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
         "  --game-world-persistence MODE  auto, on, or off (default: auto)" \
         "  --game-auto-respawn MODE   auto, on, or off; cold-reloads after a fall" \
@@ -240,6 +246,9 @@ while [[ $# -gt 0 ]]; do
         --gamepad-look-min-pitch) GAMEPAD_LOOK_MIN_PITCH_DEG="$2"; shift 2 ;;
         --gamepad-look-max-pitch) GAMEPAD_LOOK_MAX_PITCH_DEG="$2"; shift 2 ;;
         --game-max-speed) GAME_MAX_SPEED="$2"; shift 2 ;;
+        --game-max-acceleration) GAME_MAX_ACCELERATION="$2"; shift 2 ;;
+        --game-max-deceleration) GAME_MAX_DECELERATION="$2"; shift 2 ;;
+        --game-max-turn-rate) GAME_MAX_TURN_RATE="$2"; shift 2 ;;
         --game-input-timeout) GAME_INPUT_TIMEOUT="$2"; shift 2 ;;
         --game-world-persistence) GAME_WORLD_PERSISTENCE="$2"; shift 2 ;;
         --game-auto-respawn) GAME_AUTO_RESPAWN="$2"; shift 2 ;;
@@ -1244,6 +1253,9 @@ export MATRIX_GAMEPAD_LOOK_DEADZONE="$GAMEPAD_LOOK_DEADZONE"
 export MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG="$GAMEPAD_LOOK_MIN_PITCH_DEG"
 export MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG="$GAMEPAD_LOOK_MAX_PITCH_DEG"
 export MATRIX_GAME_MAX_SPEED="$GAME_MAX_SPEED"
+export MATRIX_GAME_MAX_ACCELERATION="$GAME_MAX_ACCELERATION"
+export MATRIX_GAME_MAX_DECELERATION="$GAME_MAX_DECELERATION"
+export MATRIX_GAME_MAX_TURN_RATE="$GAME_MAX_TURN_RATE"
 export MATRIX_GAME_INPUT_TIMEOUT="$GAME_INPUT_TIMEOUT"
 export MATRIX_GAME_WORLD_PERSISTENCE="$GAME_WORLD_PERSISTENCE"
 export MATRIX_GAME_AUTO_RESPAWN="$GAME_AUTO_RESPAWN"

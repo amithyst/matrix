@@ -22,4 +22,18 @@ else
     echo "[INFO] moon-v1 locomotion policy override: $MATRIX_INITIAL_LOCOMOTION_POLICY"
 fi
 
-exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"
+BFM_GAME_ARGS=()
+if [[ "$MATRIX_INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
+    # BFM-3DGS / bfm-sonic-realscan-play uses effectively one-frame keyboard
+    # slew at 50 Hz (90 m/s^2 linear, 240 rad/s^2 yaw) and a 2.40 rad/s turn
+    # request.  The BFM STATE boundary below owns the 0.90/1.40 m/s tier map;
+    # these core limits ensure Shift reaches the native RUN marker immediately.
+    BFM_GAME_ARGS+=(
+        --game-max-acceleration 90.0
+        --game-max-deceleration 90.0
+        --game-max-turn-rate 2.40
+    )
+    echo "[INFO] moon-v1 BFM controls: walk=0.90m/s jog=1.40m/s turn=2.40rad/s"
+fi
+
+exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "${BFM_GAME_ARGS[@]}" "$@"

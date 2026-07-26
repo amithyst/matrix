@@ -2000,7 +2000,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn('MATRIX_OFFLINE="${MATRIX_OFFLINE:-0}"', installer)
         self.assertIn("离线模式下禁止下载", installer)
 
-    def test_moon_launcher_is_a_thin_primary_launcher_wrapper(self) -> None:
+    def test_moon_launcher_applies_the_locked_bfm_keyboard_contract(self) -> None:
         moon = (
             REPO_ROOT / "scripts/run_matrix_sonic_moon_v1.sh"
         ).read_text(encoding="utf-8")
@@ -2010,7 +2010,14 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             moon,
         )
         self.assertIn("moon-v1 locomotion policy override", moon)
-        self.assertIn('exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"', moon)
+        self.assertIn("--game-max-acceleration 90.0", moon)
+        self.assertIn("--game-max-deceleration 90.0", moon)
+        self.assertIn("--game-max-turn-rate 2.40", moon)
+        self.assertIn(
+            'exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 '
+            '"${BFM_GAME_ARGS[@]}" "$@"',
+            moon,
+        )
         self.assertIn("visual MoonWorld does not by itself prove", moon)
         self.assertNotIn("run_sim.sh", moon)
         self.assertNotIn("androidtwin", moon.lower())

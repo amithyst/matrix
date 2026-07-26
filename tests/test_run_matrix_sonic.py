@@ -1608,7 +1608,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             low_cmd_fresh=True,
             sim_time=0.0,
         )
-        balancing.qvel[5] = 0.06
+        balancing.qvel[5] = 0.09
 
         probation.observe(balancing, idle, now_s=0.0)
         balancing.sim_time = 1.5
@@ -6378,6 +6378,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.bfm_switch_admission_ready = False
         coordinator.request_policy_slot_assignment = mock.Mock(return_value=None)
 
+        coordinator.bfm_switch_admission_ready = True
+        coordinator._request_initial_locomotion_policy_if_ready(
+            handoff_allowed=False
+        )
+        coordinator.request_policy_slot_assignment.assert_not_called()
+        self.assertFalse(coordinator._initial_locomotion_policy_requested)
+
+        coordinator.bfm_switch_admission_ready = False
         coordinator._request_initial_locomotion_policy_if_ready()
         coordinator.request_policy_slot_assignment.assert_not_called()
         self.assertFalse(coordinator._initial_locomotion_policy_requested)
@@ -6536,6 +6544,44 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         args.initial_locomotion_policy = MODULE.BFM_TEACHER50K_POLICY_ID
         args.bfm_direct = True
         self.assertFalse(MODULE._needs_resident_locomotion_policy_slots(args))
+
+    def test_bfm_game_command_uses_only_realscan_walk_and_jog_tiers(self) -> None:
+        base = GAME_CONTROL.RobotMotionCommand(
+            sequence=17,
+            movement=(1.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.80,
+            locomotion_mode=GAME_CONTROL.SONIC_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+
+        walk = MODULE._bfm_realscan_motion_command(base)
+        walk_boost = MODULE._bfm_realscan_motion_command(
+            replace(base, speed_mps=1.00)
+        )
+        jog = MODULE._bfm_realscan_motion_command(
+            replace(
+                base,
+                speed_mps=2.50,
+                locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
+            )
+        )
+        stopped = replace(
+            base,
+            movement=(0.0, 0.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+            mode="idle",
+        )
+
+        self.assertEqual(walk.speed_mps, 0.90)
+        self.assertEqual(walk.locomotion_mode, GAME_CONTROL.SONIC_WALK_MODE)
+        self.assertEqual(walk_boost.speed_mps, 0.90)
+        self.assertEqual(jog.speed_mps, 1.40)
+        self.assertEqual(jog.locomotion_mode, GAME_CONTROL.SONIC_RUN_MODE)
+        self.assertIs(MODULE._bfm_realscan_motion_command(stopped), stopped)
 
     def test_locomotion_slots_only_loadout_exposes_ready_bfm_without_standup(
         self,

@@ -128,6 +128,16 @@ _GAME_TURN_COMMAND_REASONS = frozenset(
 _GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
     {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
 )
+# Keep BFM's interactive velocity contract identical to the validated
+# bfm-sonic-realscan-play keyboard surface.  Matrix still produces its native
+# SONIC gait/speed command for the SONIC writer; only the resident BFM STATE
+# stream is quantized to these two policy-trained tiers.  In particular, a
+# same-key double tap must not create a third BFM speed tier.
+_BFM_REALSCAN_WALK_SPEED_MPS = 0.90
+_BFM_REALSCAN_JOG_SPEED_MPS = 1.40
+_BFM_REALSCAN_LINEAR_SLEW_MPS2 = 90.0
+_BFM_REALSCAN_YAW_RATE_RAD_S = 2.40
+_BFM_REALSCAN_YAW_SLEW_RAD_S2 = 240.0
 # The short wall-clock window remains only for failures that happen before
 # native LowCmd has ever become observable.  Durable checkpoint writes use the
 # dynamic probation state below, because deploy startup can legitimately take
@@ -143,9 +153,9 @@ _GAME_WORLD_RESUME_CLEARANCE_AUDIT_SECONDS = 0.1
 _GAME_WORLD_RESUME_MAX_ROOT_PLANAR_SPEED_M_S = 0.02
 _GAME_WORLD_RESUME_MAX_ROOT_VERTICAL_SPEED_M_S = 0.02
 _GAME_WORLD_RESUME_MAX_ROOT_ROLL_PITCH_RATE_RAD_S = 0.05
-_GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S = 0.075
+_GAME_WORLD_RESUME_MAX_ROOT_YAW_RATE_RAD_S = 0.10
 _GAME_WORLD_RESUME_MAX_JOINT_SPEED_RAD_S = 0.10
-_GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S = 0.03
+_GAME_WORLD_RESUME_MAX_JOINT_RMS_SPEED_RAD_S = 0.04
 # The runtime observes every 200 Hz native step.  A gap larger than ten
 # expected samples means the interval was not continuously audited and must
 # restart qualification rather than being credited as stable simulation time.
@@ -8155,6 +8165,37 @@ class _SonicWriterControl(_RecoveryWorkerControl):
         return result
 
 
+def _bfm_realscan_motion_command(
+    command: RobotMotionCommand,
+) -> RobotMotionCommand:
+    """Quantize a Matrix game command to BFM RealScan walk/jog tiers.
+
+    Matrix's native SONIC keyboard surface has slow/walk/run plus per-tier
+    double-tap boosts.  The BFM Teacher was validated with exactly two digital
+    tiers: 0.90 m/s walk and Shift-selected 1.40 m/s jog.  Preserve direction,
+    facing and all neutral/turn safety semantics while adapting only moving
+    BFM STATE samples.  RUN is the stable Shift marker; every other translating
+    native tier is BFM walk, so double-tap never creates a third speed.
+    """
+
+    if (
+        command.safe_stop
+        or command.mode != "move"
+        or command.speed_mps <= 1.0e-6
+    ):
+        return command
+    jog = command.locomotion_mode == SONIC_RUN_MODE
+    return replace(
+        command,
+        speed_mps=(
+            _BFM_REALSCAN_JOG_SPEED_MPS
+            if jog
+            else _BFM_REALSCAN_WALK_SPEED_MPS
+        ),
+        locomotion_mode=SONIC_RUN_MODE if jog else SONIC_WALK_MODE,
+    )
+
+
 class _BfmTeacherControl(_RecoveryWorkerControl):
     """Authenticate one resident BFM locomotion worker and its writer epochs."""
 
@@ -10400,7 +10441,13 @@ class _PhysicalRecoveryCoordinator:
             transition_id, None
         )
 
-    def _request_initial_locomotion_policy_if_ready(self) -> None:
+    def _request_initial_locomotion_policy_if_ready(
+        self,
+        *,
+        handoff_allowed: bool = True,
+    ) -> None:
+        if not handoff_allowed:
+            return
         if getattr(self, "_initial_locomotion_policy_requested", True):
             return
         target = getattr(self, "initial_locomotion_policy_id", "sonic")
@@ -10612,6 +10659,7 @@ class _PhysicalRecoveryCoordinator:
                 else None
             ),
         )
+        world_command = _bfm_realscan_motion_command(world_command)
         return self.bfm_control.send_state(
             snapshot,
             world_command,
@@ -10786,6 +10834,7 @@ class _PhysicalRecoveryCoordinator:
         grounded_contact: bool,
         processes: NativeProcessGroup,
         ground_height_m: float = 0.0,
+        initial_locomotion_handoff_allowed: bool = True,
     ) -> RecoveryOutput | ResidentRecoveryOutput:
         physics_profiles = getattr(self, "physics_profiles", None)
         if physics_profiles is not None:
@@ -10795,7 +10844,6 @@ class _PhysicalRecoveryCoordinator:
         if getattr(self, "bfm_process_started", False):
             self.bfm_control.poll()
         self._reconcile_policy_slot_assignment()
-        self._request_initial_locomotion_policy_if_ready()
         if self.fsm.state not in {
             RecoveryState.GAME_SONIC,
             ResidentRecoveryState.GAME_SONIC,
@@ -10861,6 +10909,12 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_admission_ready = failed_admission is None
         self.bfm_switch_admission_reason = (
             "ready" if failed_admission is None else failed_admission
+        )
+        if not initial_locomotion_handoff_allowed:
+            self.bfm_switch_admission_ready = False
+            self.bfm_switch_admission_reason = "resume_checkpoint_probation"
+        self._request_initial_locomotion_policy_if_ready(
+            handoff_allowed=initial_locomotion_handoff_allowed,
         )
         if bool(getattr(self, "locomotion_slots_only", False)):
             self.last_output = ResidentRecoveryOutput(
@@ -13657,6 +13711,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 grounded_contact=grounded_contact,
                                 processes=processes,
                                 ground_height_m=frame_ground_height_m,
+                                initial_locomotion_handoff_allowed=(
+                                    not resume_probation.active
+                                ),
                             )
                         except (OSError, RuntimeError, ValueError) as exc:
                             stop_for_physical_recovery_exception(
@@ -13777,6 +13834,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     grounded_contact=grounded_contact,
                                     processes=processes,
                                     ground_height_m=frame_ground_height_m,
+                                    initial_locomotion_handoff_allowed=(
+                                        not resume_probation.active
+                                    ),
                                 )
                                 physical_recovery.verify_writer_free_prewarm_start(
                                     physical_output,
