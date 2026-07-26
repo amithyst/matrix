@@ -7742,7 +7742,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "reference_pending_rebuild": False,
                     "reference_buffer_swapped": True,
                     "preview_steps": 4,
-                    "target_delta_max_rad": 0.01,
+                    "target_delta_max_rad": 0.12000000476837158,
                     "target_delta_limit_rad": 0.12,
                 }
             ).encode("utf-8")

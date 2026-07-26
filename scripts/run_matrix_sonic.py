@@ -8303,7 +8303,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 or not isinstance(target_limit, (int, float))
                 or not math.isfinite(float(target_delta))
                 or not math.isfinite(float(target_limit))
-                or float(target_delta) > float(target_limit)
+                or float(target_delta) > float(target_limit) + 1.0e-6
             ):
                 raise RuntimeError("BFM Teacher preparation target gate failed")
             self.preparation_pending = False
