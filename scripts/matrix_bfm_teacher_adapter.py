@@ -634,6 +634,7 @@ class BfmTeacherCore:
         self.reference_transition: str | None = None
         self.reference_hold_target: np.ndarray | None = None
         self.idle_anchor_target: np.ndarray | None = None
+        self.idle_anchor_enabled = True
         self.activation_blend_steps = max(
             2,
             int(round(float(activation_blend_seconds) * POLICY_HZ)),
@@ -672,6 +673,7 @@ class BfmTeacherCore:
         self.reference_transition = None
         self.reference_hold_target = None
         self.idle_anchor_target = None
+        self.idle_anchor_enabled = True
         self.activation_origin = None
         self.activation_step = 0
         self.last_published_target = None
@@ -681,6 +683,8 @@ class BfmTeacherCore:
         self,
         lowstate: LowStateSnapshot,
         prior_target: np.ndarray | None = None,
+        *,
+        idle_anchor_enabled: bool = True,
     ) -> None:
         """Start a policy-consistent handoff from the active LowCmd target.
 
@@ -703,7 +707,12 @@ class BfmTeacherCore:
         )
         if anchor.shape != (NUM_JOINTS,) or not np.all(np.isfinite(anchor)):
             raise ValueError("handoff anchor target must be finite 29D")
-        self.idle_anchor_target = anchor.astype(np.float32, copy=True)
+        self.idle_anchor_enabled = bool(idle_anchor_enabled)
+        self.idle_anchor_target = (
+            anchor.astype(np.float32, copy=True)
+            if self.idle_anchor_enabled
+            else None
+        )
         self.activation_origin = anchor.astype(np.float32, copy=True)
         self.activation_step = 0
         self.last_published_target = anchor.astype(np.float32, copy=True)
@@ -733,6 +742,7 @@ class BfmTeacherCore:
         self.reference_transition = None
         self.reference_hold_target = None
         self.idle_anchor_target = None
+        self.idle_anchor_enabled = False
         self.activation_origin = None
         self.activation_step = 0
         self.last_published_target = None
@@ -747,6 +757,7 @@ class BfmTeacherCore:
         self.reference_transition = None
         self.reference_hold_target = None
         self.idle_anchor_target = None
+        self.idle_anchor_enabled = True
         self.activation_origin = None
         self.activation_step = 0
         self.last_published_target = None
@@ -1358,6 +1369,7 @@ class BfmTeacherCore:
         target = desired_target
         idle_anchor_hold = bool(
             active
+            and getattr(self, "idle_anchor_enabled", True)
             and not command_motion_active
             and not holding_reference_transition
         )
@@ -1370,12 +1382,10 @@ class BfmTeacherCore:
                 )
             target = self.idle_anchor_target.copy()
             blend_fraction = 0.0
-            # Keep the exact observed/applied pose while the command is stand,
-            # both during writer-free PREPARE and after BFM receives authority.
-            # The Teacher's canonical stand target can be far from the live
-            # SONIC pose; converging to it without a motion command destabilizes
-            # an otherwise upright robot.  A real movement command clears this
-            # anchor through the reference-transition path below.
+            # Keep the exact observed/applied pose for an ordinary hot switch
+            # from an unrelated controller.  The initial PFNN-aligned path
+            # disables this compatibility hold and retains the canonical
+            # Teacher stand closed loop used by the validated runner.
             self.activation_step = 0
         elif active and holding_reference_transition:
             target = self.reference_hold_target.copy()
@@ -1478,6 +1488,9 @@ class BfmTeacherCore:
             "reference_buffer_swapped": reference_buffer_swapped,
             "reference_transition": self.reference_transition,
             "idle_anchor_hold": idle_anchor_hold,
+            "idle_anchor_enabled": bool(
+                getattr(self, "idle_anchor_enabled", True)
+            ),
             "idle_anchor_initialized": self.idle_anchor_target is not None,
             "reference_transition_completed": transition_completed,
             "reference_transition_holding": holding_reference_transition,
@@ -2014,6 +2027,7 @@ def run_worker(
                             core.prepare_activation(
                                 state,
                                 state.joint_pos_rad,
+                                idle_anchor_enabled=False,
                             )
                         else:
                             assert prior_command is not None

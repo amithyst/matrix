@@ -500,6 +500,34 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(status["activation_blend_fraction"], 0.0)
         self.assertEqual(status["published_target_delta_rms_rad"], 0.0)
 
+    def test_aligned_initial_stand_uses_teacher_closed_loop(self) -> None:
+        core = self.inference_core()
+        lowstate = self.lowstate(joint_value=0.25)
+        core.prepare_activation(
+            lowstate,
+            lowstate.joint_pos_rad,
+            idle_anchor_enabled=False,
+        )
+
+        target = None
+        status = None
+        for sequence in range(1, 30):
+            target, status = core.step(
+                self.world(sequence=sequence),
+                lowstate,
+                active=True,
+                handoff_preview=sequence <= 4,
+            )
+            self.assertFalse(status["idle_anchor_hold"])
+            self.assertFalse(status["idle_anchor_enabled"])
+            if not status["activation_settle_active"]:
+                break
+
+        self.assertIsNotNone(target)
+        self.assertIsNotNone(status)
+        self.assertFalse(status["activation_settle_active"])
+        np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
+
     def test_hot_handoff_resets_reference_to_current_root_before_preview(
         self,
     ) -> None:
