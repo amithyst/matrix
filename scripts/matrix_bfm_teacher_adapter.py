@@ -1989,12 +1989,17 @@ def run_worker(
                             or state is None
                             or now - state.received_monotonic
                             > LOWSTATE_MAX_AGE_S
-                            or prior_command is None
-                            or now - prior_command.received_monotonic
-                            > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                            or (
+                                not aligned_initial
+                                and (
+                                    prior_command is None
+                                    or now - prior_command.received_monotonic
+                                    > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                                )
+                            )
                         ):
                             raise RuntimeError(
-                                "BFM Teacher PREPARE lacks fresh warmed inputs/LowCmd"
+                                "BFM Teacher PREPARE lacks fresh warmed inputs"
                             )
                         if not latest_world.safe_stop:
                             raise RuntimeError(
@@ -2011,6 +2016,7 @@ def run_worker(
                                 state.joint_pos_rad,
                             )
                         else:
+                            assert prior_command is not None
                             core.prepare_handoff_activation(
                                 state,
                                 prior_command.joint_pos_rad,
