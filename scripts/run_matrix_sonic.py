@@ -520,12 +520,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--physical-recovery-model",
         type=Path,
+        default=(
+            Path(os.environ["MATRIX_PHYSICAL_RECOVERY_MODEL"])
+            if os.environ.get("MATRIX_PHYSICAL_RECOVERY_MODEL")
+            else None
+        ),
         help="Primary physical get-up ONNX model (required for physical mode)",
     )
     parser.add_argument(
         "--physical-recovery-fallback-model",
         action="append",
-        default=[],
+        default=(
+            [Path(os.environ["MATRIX_PHYSICAL_RECOVERY_FALLBACK_MODEL"])]
+            if os.environ.get("MATRIX_PHYSICAL_RECOVERY_FALLBACK_MODEL")
+            else []
+        ),
         type=Path,
         help="Optional physically continuous fallback ONNX (repeatable)",
     )
@@ -578,27 +587,63 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--physical-recovery-amp-config",
         type=Path,
+        default=(
+            Path(os.environ["MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG"])
+            if os.environ.get("MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG")
+            else None
+        ),
         help="AMP zero-command dynamic-hold JSON (required for physical mode)",
     )
     parser.add_argument(
         "--physical-recovery-amp-model",
         type=Path,
+        default=(
+            Path(os.environ["MATRIX_PHYSICAL_RECOVERY_AMP_MODEL"])
+            if os.environ.get("MATRIX_PHYSICAL_RECOVERY_AMP_MODEL")
+            else None
+        ),
         help="AMP zero-command dynamic-hold ONNX (required for physical mode)",
     )
-    parser.add_argument("--physical-recovery-amp-config-sha256")
-    parser.add_argument("--physical-recovery-amp-model-sha256")
+    parser.add_argument(
+        "--physical-recovery-amp-config-sha256",
+        default=os.environ.get("MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256"),
+    )
+    parser.add_argument(
+        "--physical-recovery-amp-model-sha256",
+        default=os.environ.get("MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256"),
+    )
     parser.add_argument(
         "--physical-recovery-amp-flat-v3-config",
         type=Path,
+        default=(
+            Path(os.environ["MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG"])
+            if os.environ.get("MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG")
+            else None
+        ),
         help="Optional AMP flat_v3 m14000 recovery JSON",
     )
     parser.add_argument(
         "--physical-recovery-amp-flat-v3-model",
         type=Path,
+        default=(
+            Path(os.environ["MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"])
+            if os.environ.get("MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL")
+            else None
+        ),
         help="Optional normalized AMP flat_v3 m14000 ONNX",
     )
-    parser.add_argument("--physical-recovery-amp-flat-v3-config-sha256")
-    parser.add_argument("--physical-recovery-amp-flat-v3-model-sha256")
+    parser.add_argument(
+        "--physical-recovery-amp-flat-v3-config-sha256",
+        default=os.environ.get(
+            "MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256"
+        ),
+    )
+    parser.add_argument(
+        "--physical-recovery-amp-flat-v3-model-sha256",
+        default=os.environ.get(
+            "MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"
+        ),
+    )
     parser.add_argument(
         "--physical-recovery-fallback-after-seconds", type=float, default=10.0
     )
@@ -1616,6 +1661,15 @@ def _validate_qualified_acceptance(args: argparse.Namespace) -> None:
             "qualified acceptance gates cannot weaken the runtime lock:\n  "
             + "\n  ".join(weaker)
         )
+
+
+def _needs_resident_locomotion_policy_slots(args: argparse.Namespace) -> bool:
+    return bool(
+        not getattr(args, "bfm_direct", False)
+        and getattr(args, "control_source", None) == "game"
+        and str(getattr(args, "initial_locomotion_policy", "sonic"))
+        == BFM_TEACHER50K_POLICY_ID
+    )
 
 
 def _validate_direct_bfm(args: argparse.Namespace) -> None:
@@ -6102,6 +6156,21 @@ class GameCommandRuntime:
                 else None
             ),
             "policy_change_pending": self.pending_policy_request is not None,
+            "strategy_loadout": (
+                self._command_strategy_loadout(
+                    self.policy_slots.strategy_loadout_mapping()
+                )
+                if self.policy_slots is not None
+                else {
+                    "version": 1,
+                    "available": False,
+                    "status": "unavailable",
+                    "active_slot": "locomotion",
+                    "pending": None,
+                    "slots": [],
+                    "resident_models": [],
+                }
+            ),
             "protocol_errors": self.protocol_errors,
             "rejected_commands": self.rejected_commands,
             "response_errors": self.response_errors,
@@ -9090,8 +9159,12 @@ class _PhysicalRecoveryCoordinator:
         initial_root_yaw_rad: float,
     ) -> None:
         timeout = float(args.physical_recovery_timeout_seconds)
+        self.locomotion_slots_only = bool(
+            getattr(args, "physical_recovery_locomotion_slots_only", False)
+        )
         self.resident_policies = bool(
-            getattr(args, "physical_recovery_resident_policies", False)
+            self.locomotion_slots_only
+            or getattr(args, "physical_recovery_resident_policies", False)
         )
         self.execution_provider = str(
             getattr(args, "physical_recovery_execution_provider", "cpu")
@@ -9473,7 +9546,8 @@ class _PhysicalRecoveryCoordinator:
             RecoveryState.GAME_SONIC,
             ResidentRecoveryState.GAME_SONIC,
         }
-        recovery_ids = self._configured_recovery_policy_ids()
+        slots_only = bool(getattr(self, "locomotion_slots_only", False))
+        recovery_ids = () if slots_only else self._configured_recovery_policy_ids()
         pending_value = getattr(self, "_policy_selection_pending", None)
         pending = (
             dict(pending_value)
@@ -9483,14 +9557,23 @@ class _PhysicalRecoveryCoordinator:
         worker = self.worker
         resident_ready = bool(
             self.resident_policies
-            and worker.ready
-            and worker.models_loaded_once
-            and worker.models_warmed
+            and (
+                slots_only
+                or (
+                    worker.ready
+                    and worker.models_loaded_once
+                    and worker.models_warmed
+                )
+            )
         )
         selected_recovery = (
-            worker.selected_policy_id
-            if getattr(worker, "selected_policy_id", None) in recovery_ids
-            else str(getattr(self, "initial_controller", "host"))
+            "off"
+            if slots_only
+            else (
+                worker.selected_policy_id
+                if getattr(worker, "selected_policy_id", None) in recovery_ids
+                else str(getattr(self, "initial_controller", "host"))
+            )
         )
         bfm_control = getattr(self, "bfm_control", None)
         locomotion_candidates = [
@@ -9565,7 +9648,7 @@ class _PhysicalRecoveryCoordinator:
                 {
                     "slot": "recovery",
                     "selected_policy_id": selected_recovery,
-                    "locked": not self.resident_policies,
+                    "locked": bool(slots_only or not self.resident_policies),
                     "candidates": [
                         {
                             "policy_id": policy_id,
@@ -10498,6 +10581,16 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_admission_reason = (
             "ready" if failed_admission is None else failed_admission
         )
+        if bool(getattr(self, "locomotion_slots_only", False)):
+            self.last_output = ResidentRecoveryOutput(
+                previous_state=ResidentRecoveryState.GAME_SONIC,
+                state=ResidentRecoveryState.GAME_SONIC,
+                authority_policy_id=getattr(
+                    self, "selected_locomotion_policy_id", "sonic"
+                ),
+                recovery_policy_id="off",
+            )
+            return self.last_output
         policy_alive = processes.recovery_policy_alive()
         worker_controller = (
             str(self.worker.last_status.get("controller"))
@@ -11165,6 +11258,7 @@ class _PhysicalRecoveryCoordinator:
         }
         resident_worker_ready = (
             not self.resident_policies
+            or bool(getattr(self, "locomotion_slots_only", False))
             or self._resident_worker_attested(
                 policy_alive=processes.recovery_policy_alive()
             )
@@ -11434,7 +11528,14 @@ class _PhysicalRecoveryCoordinator:
     ) -> dict[str, object]:
         output = self.last_output
         return {
-            "mode": "physical",
+            "mode": (
+                "locomotion_slots"
+                if bool(getattr(self, "locomotion_slots_only", False))
+                else "physical"
+            ),
+            "fall_recovery_enabled": not bool(
+                getattr(self, "locomotion_slots_only", False)
+            ),
             "policy_lifecycle": (
                 "resident_authority_switch"
                 if self.resident_policies
@@ -12041,6 +12142,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     ):
         raise SystemExit("qualification metadata requires --qualified-runtime")
     _validate_direct_bfm(args)
+    if (
+        str(getattr(args, "initial_locomotion_policy", "sonic"))
+        == BFM_TEACHER50K_POLICY_ID
+        and not getattr(args, "bfm_direct", False)
+        and args.control_source != "game"
+    ):
+        raise SystemExit(
+            f"--initial-locomotion-policy {BFM_TEACHER50K_POLICY_ID} "
+            "requires game control unless --bfm-direct owns the run"
+        )
     _validate_game_fall_recovery(args)
     qualification_receipt = _validate_qualification_receipt(args)
     _validate_qualified_acceptance(args)
@@ -12687,7 +12798,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     game_fall_recovery = _GameFallRecoveryGate(
                         timeout_s=args.game_fall_recovery_timeout
                     )
-                elif getattr(args, "game_fall_recovery", "off") == "physical":
+                locomotion_slots_only = bool(
+                    _needs_resident_locomotion_policy_slots(args)
+                    and getattr(args, "game_fall_recovery", "off") != "physical"
+                )
+                if (
+                    getattr(args, "game_fall_recovery", "off") == "physical"
+                    or locomotion_slots_only
+                ):
+                    args.physical_recovery_locomotion_slots_only = (
+                        locomotion_slots_only
+                    )
+                    if locomotion_slots_only:
+                        args.physical_recovery_resident_policies = True
                     physical_recovery = _PhysicalRecoveryCoordinator(
                         args,
                         initial_root_yaw_rad=initial_root_yaw_rad,

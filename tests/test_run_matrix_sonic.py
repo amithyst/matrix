@@ -6333,6 +6333,77 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator._request_initial_locomotion_policy_if_ready()
         coordinator.request_policy_slot_assignment.assert_called_once()
 
+    def test_initial_bfm_game_run_uses_locomotion_slots_only_when_fall_recovery_off(
+        self,
+    ) -> None:
+        args = SimpleNamespace(
+            bfm_direct=False,
+            control_source="game",
+            initial_locomotion_policy=MODULE.BFM_TEACHER50K_POLICY_ID,
+            game_fall_recovery="off",
+        )
+        self.assertTrue(MODULE._needs_resident_locomotion_policy_slots(args))
+
+        args.initial_locomotion_policy = "sonic"
+        self.assertFalse(MODULE._needs_resident_locomotion_policy_slots(args))
+
+        args.initial_locomotion_policy = MODULE.BFM_TEACHER50K_POLICY_ID
+        args.bfm_direct = True
+        self.assertFalse(MODULE._needs_resident_locomotion_policy_slots(args))
+
+    def test_locomotion_slots_only_loadout_exposes_ready_bfm_without_standup(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.locomotion_slots_only = True
+        coordinator.resident_policies = True
+        coordinator.fsm = SimpleNamespace(
+            state=MODULE.ResidentRecoveryState.GAME_SONIC
+        )
+        coordinator.worker = mock.Mock()
+        coordinator.initial_controller = "host"
+        coordinator.selected_locomotion_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator._policy_selection_pending = None
+        coordinator.bfm_control = mock.Mock(ready=True, warmed=True)
+        coordinator.locomotion_policy_candidates = (
+            MODULE.PolicyCandidateState(
+                policy_id=MODULE.BFM_TEACHER50K_POLICY_ID,
+                display_name="BFM SONIC Teacher50k",
+                slot="locomotion",
+                resident=True,
+                available=True,
+                provenance_verified=True,
+                unavailable_reasons=(),
+                provenance={
+                    "source_commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25"
+                },
+            ),
+        )
+
+        loadout = coordinator.strategy_loadout_mapping()
+
+        self.assertTrue(loadout["available"])
+        self.assertEqual(loadout["status"], "ready")
+        locomotion = next(
+            slot for slot in loadout["slots"] if slot["slot"] == "locomotion"
+        )
+        self.assertEqual(
+            locomotion["selected_policy_id"], MODULE.BFM_TEACHER50K_POLICY_ID
+        )
+        self.assertEqual(
+            [candidate["policy_id"] for candidate in locomotion["candidates"]],
+            ["sonic", MODULE.BFM_TEACHER50K_POLICY_ID],
+        )
+        self.assertTrue(locomotion["candidates"][1]["available"])
+        recovery = next(
+            slot for slot in loadout["slots"] if slot["slot"] == "recovery"
+        )
+        self.assertEqual(recovery["selected_policy_id"], "off")
+        self.assertTrue(recovery["locked"])
+        self.assertEqual(recovery["candidates"], [])
+
     def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
         self,
     ) -> None:

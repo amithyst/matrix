@@ -118,6 +118,7 @@ PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS="${MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SE
 PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS="${MATRIX_PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS:-0}"
 PHYSICAL_RECOVERY_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-sonic-recovery-${UID}-$$.sock}"
 PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-sonic-recovery-sonic-${UID}-$$.sock}"
+INITIAL_LOCOMOTION_POLICY="${MATRIX_INITIAL_LOCOMOTION_POLICY:-}"
 WALK_AFTER="-1"
 VX="0.30"
 VY="0.0"
@@ -195,6 +196,7 @@ usage() {
         "  --physical-recovery-stable-hold-seconds SEC  Parent snapshot stability hold" \
         "  --physical-recovery-policy-exit-hold-seconds SEC  Optional recovery-policy terminal dwell" \
         "  --physical-recovery-control-socket PATH  Private worker handoff socket" \
+        "  --initial-locomotion-policy POLICY  sonic or bfm-sonic-teacher50k" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -262,6 +264,7 @@ while [[ $# -gt 0 ]]; do
         --physical-recovery-stable-hold-seconds) PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS="$2"; shift 2 ;;
         --physical-recovery-policy-exit-hold-seconds) PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS="$2"; shift 2 ;;
         --physical-recovery-control-socket) PHYSICAL_RECOVERY_CONTROL_SOCKET="$2"; shift 2 ;;
+        --initial-locomotion-policy) INITIAL_LOCOMOTION_POLICY="$2"; shift 2 ;;
         --walk-after) WALK_AFTER="$2"; shift 2 ;;
         --vx) VX="$2"; shift 2 ;;
         --vy) VY="$2"; shift 2 ;;
@@ -299,6 +302,16 @@ fi
 
 if [[ -n "$G1_SKIN" ]]; then
     export MATRIX_G1_SKIN="$G1_SKIN"
+fi
+if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+    case "$INITIAL_LOCOMOTION_POLICY" in
+        sonic|bfm-sonic-teacher50k) ;;
+        *)
+            echo "[ERROR] --initial-locomotion-policy must be sonic or bfm-sonic-teacher50k" >&2
+            exit 2
+            ;;
+    esac
+    export MATRIX_INITIAL_LOCOMOTION_POLICY="$INITIAL_LOCOMOTION_POLICY"
 fi
 if [[ -n "$CELESTIAL_SPK" || -n "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
     if [[ -z "$CELESTIAL_SPK" || -z "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then

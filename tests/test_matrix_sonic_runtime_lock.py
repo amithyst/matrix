@@ -2005,6 +2005,11 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             REPO_ROOT / "scripts/run_matrix_sonic_moon_v1.sh"
         ).read_text(encoding="utf-8")
         self.assertIn("MoonWorld (scene 15)", moon)
+        self.assertIn(
+            "MATRIX_INITIAL_LOCOMOTION_POLICY=\"bfm-sonic-teacher50k\"",
+            moon,
+        )
+        self.assertIn("moon-v1 locomotion policy override", moon)
         self.assertIn('exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"', moon)
         self.assertIn("visual MoonWorld does not by itself prove", moon)
         self.assertNotIn("run_sim.sh", moon)
