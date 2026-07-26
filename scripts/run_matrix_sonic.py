@@ -6683,11 +6683,26 @@ class NativeProcessGroup:
         *,
         interface: str,
         zmq_port: int,
+        zmq_out_port: int | None = None,
         writer_control_socket: Path | None = None,
         physical_reentry: bool = False,
     ) -> int:
         if self.deploy_alive():
             raise RuntimeError("cannot start a second live SONIC deploy")
+        if zmq_out_port is None:
+            configured_out_port = self.env.get("MATRIX_SONIC_ZMQ_OUT_PORT")
+            try:
+                zmq_out_port = (
+                    int(configured_out_port)
+                    if configured_out_port is not None
+                    else zmq_port + 1
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "MATRIX_SONIC_ZMQ_OUT_PORT must be an integer"
+                ) from exc
+        if not 1 <= zmq_out_port <= 65535:
+            raise ValueError("SONIC ZMQ output port must be in 1..65535")
         deploy_root = self.sonic_root / "gear_sonic_deploy"
         command = [
             str(deploy_root / "target/release/g1_deploy_onnx_ref"),
@@ -6714,6 +6729,8 @@ class NativeProcessGroup:
             "localhost",
             "--zmq-port",
             str(zmq_port),
+            "--zmq-out-port",
+            str(zmq_out_port),
             "--disable-crc-check",
         ]
         if writer_control_socket is not None:

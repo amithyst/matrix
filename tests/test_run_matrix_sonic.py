@@ -7102,6 +7102,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "onnx",
         )
         self.assertEqual(command[command.index("--zmq-port") + 1], "6000")
+        self.assertEqual(command[command.index("--zmq-out-port") + 1], "6001")
         self.assertEqual(
             group.env["FASTRTPS_DEFAULT_PROFILES_FILE"],
             "/sonic/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
@@ -7109,6 +7110,18 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(group.env["ROS_LOCALHOST_ONLY"], "1")
         self.assertEqual(group.env["PYTHONNOUSERSITE"], "1")
         self.assertEqual(group.env["PYTHONPATH"], "/sonic")
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_native_process_group_accepts_zmq_output_port_override(self, popen) -> None:
+        popen.return_value = mock.Mock()
+        group = MODULE.NativeProcessGroup(
+            Path("/sonic"), {"MATRIX_SONIC_ZMQ_OUT_PORT": "16057"}
+        )
+        group.start_deploy(interface="lo", zmq_port=6000)
+
+        guarded_command = popen.call_args.args[0]
+        command = guarded_command[guarded_command.index("--") + 1 :]
+        self.assertEqual(command[command.index("--zmq-out-port") + 1], "16057")
 
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_replacement_deploy_receives_private_writer_gate(self, popen) -> None:
