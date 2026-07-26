@@ -572,7 +572,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         trna = (REPO_ROOT / "config/hosts/trna.env").read_text(encoding="utf-8")
         self.assertIn('MATRIX_GAME_AUTO_RESPAWN:-off', trna)
         self.assertIn('miniconda3/envs/sonic-h2-sim/bin/python', trna)
-        self.assertIn('MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-amp-flat-v3', trna)
+        self.assertIn('MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-kungfu', trna)
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_HANDOFF:-sonic', trna)
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES:-1', trna)
         self.assertIn('MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER:-cuda', trna)
