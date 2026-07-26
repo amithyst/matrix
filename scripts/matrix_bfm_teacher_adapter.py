@@ -1358,7 +1358,6 @@ class BfmTeacherCore:
         target = desired_target
         idle_anchor_hold = bool(
             active
-            and handoff_preview
             and not command_motion_active
             and not holding_reference_transition
         )
@@ -1371,10 +1370,12 @@ class BfmTeacherCore:
                 )
             target = self.idle_anchor_target.copy()
             blend_fraction = 0.0
-            # PREPARE is writer-free.  Keep the exact observed pose as the
-            # admission target, but preserve activation_origin so the first
-            # authoritative policy ticks can settle onto BFM's own stand
-            # target instead of holding a SONIC pose forever.
+            # Keep the exact observed/applied pose while the command is stand,
+            # both during writer-free PREPARE and after BFM receives authority.
+            # The Teacher's canonical stand target can be far from the live
+            # SONIC pose; converging to it without a motion command destabilizes
+            # an otherwise upright robot.  A real movement command clears this
+            # anchor through the reference-transition path below.
             self.activation_step = 0
         elif active and holding_reference_transition:
             target = self.reference_hold_target.copy()
@@ -1408,8 +1409,6 @@ class BfmTeacherCore:
                 activation_target_limited = True
             if progress >= 1.0 and not activation_target_limited:
                 self.activation_origin = None
-        if active and not handoff_preview:
-            self.idle_anchor_target = None
         if active:
             if idle_anchor_hold or holding_reference_transition:
                 # The old reference mode is deliberately discarded while the

@@ -538,8 +538,14 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         # anchored to the previously published target, not chase q_measured.
         for sequence in range(2, 20):
             falling = self.lowstate(joint_value=0.4 - sequence * 0.03)
+            moving = self.world(sequence=sequence)
+            moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+            moving.speed_mps = 0.3
+            moving.locomotion_mode = 1
+            moving.mode = "move"
+            moving.safe_stop = False
             target, status = core.step(
-                self.world(sequence=sequence),
+                moving,
                 falling,
                 active=True,
             )
@@ -599,7 +605,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             np.arange(MODULE.NUM_JOINTS, dtype=np.float32) / 10.0,
         )
 
-    def test_handoff_preview_holds_first_pose_but_authority_settles_to_stand(
+    def test_handoff_preview_and_authoritative_idle_hold_prepared_pose(
         self,
     ) -> None:
         core = self.inference_core()
@@ -636,33 +642,24 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             places=6,
         )
 
-        # Writer authority starts with the prepared target, then converges to
-        # the Teacher stand target under the same per-tick delta safety bound.
+        # Writer authority must keep the same stable pose while the requested
+        # command is stand.  The canonical BFM stand target is intentionally
+        # ignored until a real movement command releases the idle anchor.
         observed = self.lowstate(joint_value=0.36)
-        settled_status = None
-        settled_target = None
-        for sequence in range(3, 20):
-            settled_target, settled_status = core.step(
+        for sequence in range(3, 8):
+            idle_target, idle_status = core.step(
                 self.world(sequence=sequence),
                 observed,
                 active=True,
             )
-            self.assertLessEqual(
-                settled_status["published_target_delta_max_rad"],
-                MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
+            np.testing.assert_allclose(idle_target, first_lowstate.joint_pos_rad)
+            self.assertTrue(idle_status["idle_anchor_hold"])
+            self.assertFalse(idle_status["handoff_preview"])
+            self.assertTrue(idle_status["activation_settle_active"])
+            np.testing.assert_allclose(
+                core.previous_action,
+                np.zeros(MODULE.NUM_JOINTS),
             )
-            observed = self.lowstate(joint_value=float(settled_target[0]))
-            if not settled_status["activation_settle_active"]:
-                break
-
-        self.assertIsNotNone(settled_status)
-        self.assertFalse(settled_status["idle_anchor_hold"])
-        self.assertFalse(settled_status["handoff_preview"])
-        self.assertFalse(settled_status["activation_settle_active"])
-        np.testing.assert_allclose(
-            settled_target,
-            np.ones(MODULE.NUM_JOINTS),
-        )
 
     def test_handoff_preview_requires_active_policy_state(self) -> None:
         core = self.inference_core()
