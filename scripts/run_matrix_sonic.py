@@ -8242,22 +8242,21 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             reference_source = payload.get("reference_source")
             if reference_source != self.reference_source:
                 raise RuntimeError("BFM Teacher reference source changed during warmup")
-            if self.direct_start:
-                try:
-                    qpos = tuple(float(value) for value in payload["direct_initial_qpos"])
-                    qvel = tuple(float(value) for value in payload["direct_initial_qvel"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        "BFM Teacher direct warmup has invalid initial state"
-                    ) from exc
-                if len(qpos) != 36 or len(qvel) != 35 or any(
-                    not math.isfinite(value) for value in (*qpos, *qvel)
-                ):
-                    raise RuntimeError(
-                        "BFM Teacher direct initial state must be finite 36D/35D"
-                    )
-                self.direct_initial_qpos = qpos
-                self.direct_initial_qvel = qvel
+            try:
+                qpos = tuple(float(value) for value in payload["direct_initial_qpos"])
+                qvel = tuple(float(value) for value in payload["direct_initial_qvel"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "BFM Teacher warmup has invalid initial reference state"
+                ) from exc
+            if len(qpos) != 36 or len(qvel) != 35 or any(
+                not math.isfinite(value) for value in (*qpos, *qvel)
+            ):
+                raise RuntimeError(
+                    "BFM Teacher initial reference must be finite 36D/35D"
+                )
+            self.direct_initial_qpos = qpos
+            self.direct_initial_qvel = qvel
         elif event == "FIRST_WRITE":
             if not self.activation_pending:
                 raise RuntimeError("BFM Teacher wrote without supervisor activation")
@@ -8374,7 +8373,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         else:
             raise RuntimeError(f"unsupported BFM Teacher event: {event}")
 
-    def prepare_activation(self) -> None:
+    def prepare_activation(self, *, aligned_initial: bool = False) -> None:
         if self.connection is None or not self.ready or not self.warmed:
             raise RuntimeError("BFM Teacher is not connected and warmed")
         if (
@@ -8393,6 +8392,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 "schema": self.SCHEMA,
                 "command": "PREPARE",
                 "authority_epoch": requested_epoch,
+                "aligned_initial": bool(aligned_initial),
             }
         )
         self.requested_authority_epoch = requested_epoch
@@ -9394,6 +9394,8 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_admission_ready = False
         self.bfm_switch_admission_reason = "awaiting_runtime_observation"
         self.last_locomotion_handoff: dict[str, object] | None = None
+        self.initial_bfm_reference_aligned = False
+        self.initial_bfm_reference_alignment: dict[str, object] | None = None
         self.physics_profiles = None
         self.runtime_pause_policy_id: str | None = None
         self.runtime_pause_writer_epoch: int | None = None
@@ -9456,6 +9458,61 @@ class _PhysicalRecoveryCoordinator:
         if profiles is None:
             raise RuntimeError("locomotion physics profiles are not bound")
         profiles.apply(profile_id)
+
+    def _align_initial_bfm_reference(self) -> None:
+        """Align the initial game G1 once to the online-PFNN reference.
+
+        The validated BFM closed loop initializes the physical robot from the
+        first reference root/joints before Teacher control begins.  Matrix may
+        perform the same initialization only for the requested default BFM
+        policy, after SONIC is writer-fenced and before BFM gains authority.
+        """
+
+        if self.initial_bfm_reference_aligned:
+            return
+        profiles = getattr(self, "physics_profiles", None)
+        qpos = self.bfm_control.direct_initial_qpos
+        qvel = self.bfm_control.direct_initial_qvel
+        if profiles is None or qpos is None or qvel is None:
+            raise RuntimeError("initial BFM reference alignment is unavailable")
+        data = profiles.data
+        if len(data.qpos) < len(qpos) or len(data.qvel) < len(qvel):
+            raise RuntimeError("live MuJoCo state is smaller than BFM reference")
+        current_qpos = tuple(float(value) for value in data.qpos[: len(qpos)])
+        aligned_qpos = list(qpos)
+        # The PFNN stream is already seeded at the live G1 root.  Preserve the
+        # latest world XY exactly so asynchronous warmup cannot move the robot
+        # backward to an older root sample; reference Z/orientation/joints and
+        # velocity remain the validated first-frame state.
+        aligned_qpos[0] = current_qpos[0]
+        aligned_qpos[1] = current_qpos[1]
+        profiles.apply(_LocomotionPhysicsProfiles.BFM_PROFILE_ID)
+        for index, value in enumerate(aligned_qpos):
+            data.qpos[index] = value
+        for index, value in enumerate(qvel):
+            data.qvel[index] = value
+        profiles.mujoco.mj_forward(profiles.model, data)
+        profiles.verify_active()
+        actual_qpos = tuple(float(value) for value in data.qpos[: len(qpos)])
+        actual_qvel = tuple(float(value) for value in data.qvel[: len(qvel)])
+        if actual_qpos != tuple(aligned_qpos) or actual_qvel != qvel:
+            raise RuntimeError("initial BFM reference alignment did not read back")
+        joint_delta = max(
+            abs(after - before)
+            for before, after in zip(current_qpos[7:36], aligned_qpos[7:36])
+        )
+        root_shift = math.hypot(
+            float(qpos[0]) - current_qpos[0],
+            float(qpos[1]) - current_qpos[1],
+        )
+        self.initial_bfm_reference_aligned = True
+        self.initial_bfm_reference_alignment = {
+            "mode": "online_pfnn_first_frame_once",
+            "root_xy_preserved": True,
+            "reference_root_shift_discarded_m": root_shift,
+            "joint_delta_max_rad": joint_delta,
+            "physics_profile": _LocomotionPhysicsProfiles.BFM_PROFILE_ID,
+        }
 
     def _configured_recovery_policy_ids(self) -> tuple[str, ...]:
         configured = ["kungfu", "host", "amp"]
@@ -9825,6 +9882,9 @@ class _PhysicalRecoveryCoordinator:
                     "slot": "locomotion",
                     "policy_id": BFM_TEACHER50K_POLICY_ID,
                     "transition_id": transition_id,
+                    "initial_reference_alignment": transition_id.startswith(
+                        "initial-locomotion-"
+                    ),
                     "phase": "await_bfm_shadow",
                     "requested_monotonic_s": time.monotonic(),
                     "shadow_baseline_sequence": baseline_sequence,
@@ -10001,10 +10061,52 @@ class _PhysicalRecoveryCoordinator:
                     )
                     if not shadow_ready:
                         return
-                    self.bfm_control.prepare_activation()
-                    pending["phase"] = "prepare_bfm"
                     pending["reference_aligned"] = True
                     pending["reference_status_sequence"] = sequence
+                    if pending.get("initial_reference_alignment") is True:
+                        if (
+                            self.bfm_control.direct_initial_qpos is None
+                            or self.bfm_control.direct_initial_qvel is None
+                        ):
+                            return
+                        self.sonic_writer.send("PAUSE")
+                        pending["phase"] = "initial_pause_sonic"
+                        return
+                    self.bfm_control.prepare_activation()
+                    pending["phase"] = "prepare_bfm"
+                    return
+                if (
+                    phase == "initial_pause_sonic"
+                    and self.sonic_writer.paused
+                ):
+                    pending["prior_writer_fenced"] = True
+                    self._align_initial_bfm_reference()
+                    pending["initial_reference_alignment_result"] = dict(
+                        self.initial_bfm_reference_alignment or {}
+                    )
+                    pending["aligned_state_baseline_sequence"] = int(
+                        self.bfm_control.last_state_sequence or -1
+                    )
+                    pending["aligned_state_monotonic_s"] = time.monotonic()
+                    pending["phase"] = "initial_alignment_wait"
+                    return
+                if phase == "initial_alignment_wait":
+                    baseline = int(
+                        pending.get("aligned_state_baseline_sequence", -1)
+                    )
+                    aligned_at = float(
+                        pending.get("aligned_state_monotonic_s", requested_at)
+                    )
+                    latest_sequence = int(
+                        self.bfm_control.last_state_sequence or -1
+                    )
+                    if (
+                        time.monotonic() - aligned_at < 0.15
+                        or latest_sequence <= baseline
+                    ):
+                        return
+                    self.bfm_control.prepare_activation(aligned_initial=True)
+                    pending["phase"] = "prepare_bfm"
                     return
                 if (
                     phase == "prepare_bfm"
@@ -10026,7 +10128,8 @@ class _PhysicalRecoveryCoordinator:
                     pending["desired_target_delta_max_rad"] = preparation.get(
                         "desired_target_delta_max_rad"
                     )
-                    self.sonic_writer.send("PAUSE")
+                    if not self.sonic_writer.paused:
+                        self.sonic_writer.send("PAUSE")
                     pending["phase"] = "pause_sonic"
                     return
                 if phase == "pause_sonic" and self.sonic_writer.paused:
@@ -11581,6 +11684,15 @@ class _PhysicalRecoveryCoordinator:
                     if self.last_locomotion_handoff is not None
                     else None
                 )
+            ),
+            "initial_bfm_reference_aligned": bool(
+                getattr(self, "initial_bfm_reference_aligned", False)
+            ),
+            "initial_bfm_reference_alignment": (
+                dict(getattr(self, "initial_bfm_reference_alignment"))
+                if getattr(self, "initial_bfm_reference_alignment", None)
+                is not None
+                else None
             ),
             "resident_process_identity_stable": (
                 self.resident_policies

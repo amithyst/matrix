@@ -45,7 +45,7 @@
     {
       "name": "runtime_adapter",
       "path_env": "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
-      "sha256": "ab306f170dab94c69f310bfb9f7bdd6fd389fa3adb20c4f7f16ca8983a8a09da",
+      "sha256": "620896c1a20d54c88126a8e51687c5b6aebd989ef119a4e96e64a141e3999400",
       "executable": true
     },
     {

@@ -433,6 +433,18 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(status["activation_blend_fraction"], 1.0)
         self.assertFalse(status["reference_transition_holding"])
 
+    def test_shadow_warmup_exports_initial_reference_for_game_alignment(
+        self,
+    ) -> None:
+        core = self.inference_core()
+        core.direct_start = False
+
+        core.step(self.world(sequence=1), self.lowstate(), active=False)
+
+        self.assertIsNotNone(core.direct_reference_start)
+        self.assertEqual(len(core.direct_reference_start["qpos"]), 36)
+        self.assertEqual(len(core.direct_reference_start["qvel"]), 35)
+
     @staticmethod
     def world(sequence: int = 1):
         return SimpleNamespace(

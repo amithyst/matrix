@@ -385,6 +385,55 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         profiles.verify_active()
 
+    def test_initial_bfm_alignment_preserves_live_xy_and_writes_once(
+        self,
+    ) -> None:
+        mujoco, model, data, _joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        data.qpos[0] = 12.25
+        data.qpos[1] = -7.5
+        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        reference_qpos = tuple(1.0 + 0.01 * index for index in range(36))
+        reference_qvel = tuple(-0.02 * index for index in range(35))
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.physics_profiles = profiles
+        coordinator.bfm_control = SimpleNamespace(
+            direct_initial_qpos=reference_qpos,
+            direct_initial_qvel=reference_qvel,
+        )
+        coordinator.initial_bfm_reference_aligned = False
+        coordinator.initial_bfm_reference_alignment = None
+
+        coordinator._align_initial_bfm_reference()
+
+        self.assertTrue(coordinator.initial_bfm_reference_aligned)
+        self.assertEqual(tuple(data.qpos[:2]), (12.25, -7.5))
+        self.assertEqual(tuple(data.qpos[2:36]), reference_qpos[2:36])
+        self.assertEqual(tuple(data.qvel[:35]), reference_qvel)
+        self.assertEqual(
+            profiles.active_profile_id,
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID,
+        )
+        self.assertEqual(
+            coordinator.initial_bfm_reference_alignment["mode"],
+            "online_pfnn_first_frame_once",
+        )
+        self.assertTrue(
+            coordinator.initial_bfm_reference_alignment["root_xy_preserved"]
+        )
+        forward_calls = mujoco.forward_calls
+        qpos_after = tuple(data.qpos)
+        qvel_after = tuple(data.qvel)
+
+        coordinator._align_initial_bfm_reference()
+
+        self.assertEqual(mujoco.forward_calls, forward_calls)
+        self.assertEqual(tuple(data.qpos), qpos_after)
+        self.assertEqual(tuple(data.qvel), qvel_after)
+
     def test_flat_v3_physics_profile_comes_from_locked_policy_config(self) -> None:
         mujoco, model, data, _joint_by_name = (
             self.fake_physics_profile_runtime()
@@ -6333,6 +6382,115 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator._request_initial_locomotion_policy_if_ready()
         coordinator.request_policy_slot_assignment.assert_called_once()
 
+    def test_initial_bfm_handoff_aligns_before_prepare_and_writer_go(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator._policy_selection_pending = {
+            "slot": "locomotion",
+            "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+            "transition_id": "initial-locomotion-bfm-sonic-teacher50k",
+            "initial_reference_alignment": True,
+            "phase": "await_bfm_shadow",
+            "requested_monotonic_s": time.monotonic(),
+            "shadow_baseline_sequence": 10,
+            "prior_writer_policy_id": "sonic",
+            "prior_writer_epoch": 3,
+            "prior_writer_fenced": False,
+            "reference_aligned": False,
+        }
+        coordinator._policy_selection_results = {}
+        coordinator.last_locomotion_handoff = None
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.bfm_switch_timeout_s = 10.0
+        coordinator.initial_bfm_reference_alignment = None
+        coordinator.bfm_control = mock.Mock(
+            direct_initial_qpos=tuple(0.01 * index for index in range(36)),
+            direct_initial_qvel=tuple(-0.01 * index for index in range(35)),
+            last_state_sequence=41,
+            last_status={
+                "world_sample_sequence": 11,
+                "shadow_preview": True,
+                "world_input_safe_stop": True,
+                "reference_pending_rebuild": False,
+                "reference_transition_holding": False,
+                "reference_root_error_m": 0.0,
+            },
+            activation_rejected_reason=None,
+            activation_prepared=False,
+            activation_preparation_status=None,
+            current_first_write=False,
+            authority_epoch=0,
+        )
+        coordinator.sonic_writer = mock.Mock(
+            paused=False,
+            pause_pending=False,
+        )
+        coordinator.physics_profiles = mock.Mock()
+
+        def align_initial_reference() -> None:
+            coordinator.initial_bfm_reference_alignment = {
+                "mode": "online_pfnn_first_frame_once"
+            }
+
+        coordinator._align_initial_bfm_reference = mock.Mock(
+            side_effect=align_initial_reference
+        )
+
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_pause_sonic",
+        )
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+        coordinator.bfm_control.prepare_activation.assert_not_called()
+
+        coordinator.sonic_writer.paused = True
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator._align_initial_bfm_reference.assert_called_once_with()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_alignment_wait",
+        )
+
+        coordinator._policy_selection_pending["aligned_state_monotonic_s"] = (
+            time.monotonic() - 0.2
+        )
+        coordinator.bfm_control.last_state_sequence = 42
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator.bfm_control.prepare_activation.assert_called_once_with(
+            aligned_initial=True
+        )
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "prepare_bfm",
+        )
+
+        coordinator.bfm_control.activation_prepared = True
+        coordinator.bfm_control.activation_preparation_status = {
+            "reference_aligned": True,
+            "reference_buffer_swapped": False,
+            "preview_steps": 4,
+            "target_delta_max_rad": 0.01,
+            "desired_target_delta_max_rad": 0.02,
+        }
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "pause_sonic",
+        )
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator.physics_profiles.apply.assert_called_once_with(
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID
+        )
+        coordinator.bfm_control.activate.assert_called_once_with()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "activate_bfm",
+        )
+
     def test_initial_bfm_game_run_uses_locomotion_slots_only_when_fall_recovery_off(
         self,
     ) -> None:
@@ -7570,6 +7728,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(control.preparation_pending)
         self.assertEqual(sent[-1]["command"], "PREPARE")
         self.assertEqual(sent[-1]["authority_epoch"], 1)
+        self.assertIs(sent[-1]["aligned_initial"], False)
         control._handle_packet(
             json.dumps(
                 {

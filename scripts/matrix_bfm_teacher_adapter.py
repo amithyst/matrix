@@ -1253,7 +1253,7 @@ class BfmTeacherCore:
             height_field,
         )
         if (
-            getattr(self, "direct_start", False)
+            not active
             and getattr(self, "direct_reference_start", None) is None
         ):
             qpos_50hz = np.asarray(reference.plan.qpos_50hz, dtype=np.float32)
@@ -1947,6 +1947,11 @@ def run_worker(
                         continue
                     if command == "PREPARE":
                         requested_epoch = int(payload.get("authority_epoch"))
+                        aligned_initial = payload.get("aligned_initial", False)
+                        if type(aligned_initial) is not bool:
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE has invalid alignment mode"
+                            )
                         if direct_start:
                             raise RuntimeError(
                                 "direct BFM does not use hot-switch preparation"
@@ -1995,10 +2000,21 @@ def run_worker(
                             raise RuntimeError(
                                 "BFM Teacher PREPARE requires a safety-stop handoff"
                             )
-                        core.prepare_handoff_activation(
-                            state,
-                            prior_command.joint_pos_rad,
-                        )
+                        if aligned_initial:
+                            # Matrix has already aligned the physical G1 to the
+                            # first online-PFNN reference while SONIC is fenced.
+                            # Keep that reference cursor and prepare from the
+                            # measured aligned joints instead of resetting back
+                            # to the old SONIC posture.
+                            core.prepare_activation(
+                                state,
+                                state.joint_pos_rad,
+                            )
+                        else:
+                            core.prepare_handoff_activation(
+                                state,
+                                prior_command.joint_pos_rad,
+                            )
                         preparing_authority_epoch = requested_epoch
                         prepared_authority_epoch = None
                         prepare_ready_steps = 0
@@ -2281,9 +2297,9 @@ def run_worker(
                                     )
                         if not warmed:
                             direct_reference = core.direct_reference_start
-                            if direct_start and direct_reference is None:
+                            if direct_reference is None:
                                 raise RuntimeError(
-                                    "direct BFM warmup produced no reference start"
+                                    "BFM warmup produced no initial reference state"
                                 )
                             warmed = True
                             send_event(
