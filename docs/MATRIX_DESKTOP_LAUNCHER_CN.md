@@ -16,6 +16,15 @@ bash scripts/install_matrix_desktop_launcher.sh --profile heyuan
 `matrix-sonic.desktop`。生成文件包含当前仓库的绝对路径，但不会进入 Git；仓库中只保存
 可跨机器同步的模板和安装器。
 
+默认安装的是 MoonWorld/BFM 图标：
+
+```bash
+bash scripts/install_matrix_desktop_launcher.sh --profile heyuan --scene 15
+```
+
+其他原生场景也可传入 `--scene ID`，安装器会生成带场景编号的独立图标，不会覆盖
+默认 MoonWorld/BFM 入口。
+
 TRNA 或 ZZA 使用相同命令，只替换 profile：
 
 ```bash
@@ -25,7 +34,7 @@ bash scripts/install_matrix_desktop_launcher.sh --profile zza
 
 ## 双击后的行为
 
-图标固定启动月球场景，并将移动策略固定为 BFM SONIC Teacher50k：
+默认图标启动 MoonWorld，并将移动策略固定为 BFM SONIC Teacher50k：
 
 ```bash
 bash scripts/run_matrix_sonic_moon_v1.sh \
@@ -39,15 +48,19 @@ bash scripts/run_matrix_sonic_moon_v1.sh \
 交互运行中解析为物理倒地爬起；移动策略槽和倒地恢复槽彼此独立，因此恢复策略不会阻止
 BFM SONIC 就绪或接收键盘控制。
 
+非 15 场景使用同一桌面 wrapper，但会切到通用 `run_matrix_sonic.sh --scene <ID>`
+链路。同一主机仍只允许一套 Matrix SONIC 运行实例；需要换场景时应先用桌面图标右键
+菜单的 Stop，或执行下面的 `stop` 命令。
+
 桌面启动器会显式清除继承的 `LD_LIBRARY_PATH` 和 `PYTHONPATH`，并在
 `matrix-sonic-desktop-<uid>` tmux 会话中运行主链。重复双击不会创建第二套仿真。
 
 运维命令：
 
 ```bash
-bash scripts/launch_matrix_sonic_desktop.sh status --profile heyuan
-bash scripts/launch_matrix_sonic_desktop.sh attach --profile heyuan
-bash scripts/launch_matrix_sonic_desktop.sh stop --profile heyuan
+bash scripts/launch_matrix_sonic_desktop.sh status --profile heyuan --scene 15
+bash scripts/launch_matrix_sonic_desktop.sh attach --profile heyuan --scene 15
+bash scripts/launch_matrix_sonic_desktop.sh stop --profile heyuan --scene 15
 ```
 
 `stop` 会先向主 launcher 发送 `Ctrl+C` 并等待清理；只有清理超时才强制关闭 tmux

@@ -1,8 +1,8 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Matrix SONIC (@MATRIX_PROFILE@)
-Comment=Launch MoonWorld with BFM SONIC Teacher50k and fall recovery
+Name=@MATRIX_NAME@
+Comment=@MATRIX_COMMENT@
 Exec=@MATRIX_START_EXEC@
 Icon=@MATRIX_ICON@
 Terminal=false
@@ -11,6 +11,7 @@ Categories=Game;
 Actions=Status;Stop;
 X-Matrix-Repository=@MATRIX_REPOSITORY@
 X-Matrix-Profile=@MATRIX_PROFILE@
+X-Matrix-Scene=@MATRIX_SCENE@
 
 [Desktop Action Status]
 Name=Show Matrix SONIC Status
