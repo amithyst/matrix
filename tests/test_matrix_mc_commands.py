@@ -399,6 +399,40 @@ class McCommandProtocolTest(unittest.TestCase):
         self.assertNotIn(b"/data", payload)
         self.assertEqual(MODULE.decode_command_request(payload), request)
 
+    def test_movement_mode_set_round_trip_is_typed_and_strict(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=6,
+            request_id=REQUEST_ID,
+            command=MODULE.MovementModeSet("body_relative", 4),
+        )
+        payload = MODULE.encode_command_request(request)
+
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+        self.assertIn(b'"name":"movement_mode_set"', payload)
+        for mapping in (
+            {
+                "name": "movement_mode_set",
+                "movement_mode": "unknown",
+                "expected_revision": 4,
+            },
+            {
+                "name": "movement_mode_set",
+                "movement_mode": "camera_face",
+                "expected_revision": -1,
+            },
+            {
+                "name": "movement_mode_set",
+                "movement_mode": "camera_face",
+                "expected_revision": 4,
+                "extra": True,
+            },
+        ):
+            with self.subTest(mapping=mapping), self.assertRaises(
+                MODULE.CommandProtocolError
+            ):
+                MODULE.command_from_mapping(mapping)
+
     def test_teleport_list_round_trip_contains_only_typed_tags(self) -> None:
         request = MODULE.GameCommandRequest(
             session=SESSION,

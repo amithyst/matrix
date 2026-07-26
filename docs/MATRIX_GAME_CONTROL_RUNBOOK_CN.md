@@ -74,12 +74,14 @@ python3 scripts/matrixctl.py --profile trna command \
 
 已经实现的行为：
 
-- WASD 按相机水平朝向映射到世界坐标；
-- W/A/S/D 四个方向都让机器人自动面向运动方向；
+- 默认 `camera_face`：WASD 按相机水平朝向映射，机器人自动面向运动方向；
+- `camera_strafe`：WASD 仍相对相机，但保持机器人身体朝向；
+- `body_relative`：WASD 相对机器人身体且与相机无关，并保持身体朝向；
 - 斜向输入归一化，并限制速度、加速度、减速度和转向速度；
 - 键盘 WASD 使用原生静走/普通走/跑步：Ctrl 或 Alt、无修饰键、Shift 分别映射
   SONIC mode 1、2、3；同档同方向双击选择该档 boost；
-- Q/E 不再参与机器人 yaw；
+- Q/E 在 WASD 回中时发布原地左右转向，不产生平移；
+- F6 仅在 WASD、Q/E、左摇杆全部回中时循环三种移动模式；ESC 控制页可直接选择；
 - Left/Right 箭头键旋转实际 UE 相机 yaw，Up/Down 箭头键旋转 pitch；该路径复用主
   provider 和预枚举 uinput bridge，不启动第二套相机控制进程；
 - ESC 打开、UE 失焦或 uinput bridge 不可用时，箭头键相机输入 fail closed；桥接 I/O
@@ -117,6 +119,7 @@ Matrix 0.1.2 cooked 运行包目前**没有完成**以下能力：
 | 原生步态区间 | mode 1：0.10-0.80；mode 2：0.80-2.50；mode 3：2.50-7.50 m/s |
 | 加速度 / 减速度 | 1.20 / 2.40 m/s² |
 | 最大朝向变化率 | 2.50 rad/s |
+| 移动模式 | 默认 `camera_face`；F6 顺序为 `camera_face -> camera_strafe -> body_relative`，按 host 持久化 |
 | 箭头键相机转速 | 默认标称值 120；ESC 面板范围 30-360、步长 30，按 host 持久化；最终角速度以 UE final POV 为准 |
 | 平移朝向门 | 15 度内启动；超过 30 度停止 |
 | 原地转向 | 原生 `IDLE + facing`；禁止 `SLOW_WALK + speed=0` |
@@ -124,7 +127,7 @@ Matrix 0.1.2 cooked 运行包目前**没有完成**以下能力：
 | 输入 deadman 超时 | 0.15 s |
 | 快照最大年龄 | 0.15 s |
 | 松方向键 / 安全停机 | 当帧 mode 0 且指令归零，不走平滑减速 |
-| 恢复运动 | 必须先收到一帧有焦点的回中输入 |
+| 恢复运动 | 必须先收到一帧有焦点的回中输入；切换移动模式后还必须重新按键/推动摇杆 |
 
 河源首轮标定不要提高超时或 0.30 m/s 模拟量上限，并保留启动弹性带。非限时的
 `game` 交互启动默认使用世界存档和摔倒后的完整冷重启；带 `--max-seconds` 的 bounded

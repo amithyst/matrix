@@ -7,6 +7,7 @@ RUN_SCRIPT="$SCRIPT_DIR/run_matrix_sonic.sh"
 SESSION_NAME="matrix-sonic-desktop-${UID}"
 HOST_LOCK_PATH="${MATRIX_DESKTOP_HOST_LOCK_PATH:-/tmp/matrix-sonic-${UID}.lock}"
 PROFILE="heyuan"
+SCENE_ID="2"
 ACTION="start"
 SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
 STOP_GRACE_SECONDS=60
@@ -14,7 +15,7 @@ unset MATRIX_DESKTOP_LAUNCHER_LOCKED
 
 usage() {
     cat <<'EOF'
-Usage: bash scripts/launch_matrix_sonic_desktop.sh [ACTION] [--profile PROFILE]
+Usage: bash scripts/launch_matrix_sonic_desktop.sh [ACTION] [options]
 
 Actions:
   start    Start Matrix SONIC unless its tmux session is still live (default)
@@ -23,6 +24,10 @@ Actions:
   attach   Attach this terminal to the Matrix SONIC tmux session
 
 Profiles: heyuan (default), trna, zza
+
+Options:
+  --profile PROFILE  Host profile (default: heyuan)
+  --scene ID         Matrix native scene id (default: 2)
 EOF
 }
 
@@ -39,6 +44,11 @@ validate_profile() {
             die "unsupported profile: $1 (expected heyuan, trna, or zza)"
             ;;
     esac
+}
+
+validate_scene() {
+    [[ "$1" =~ ^(0|[1-9][0-9]?)$ ]] \
+        || die "invalid scene id: $1 (expected 0-99)"
 }
 
 session_lock_directory() {
@@ -72,7 +82,7 @@ run_with_session_lock() {
     MATRIX_DESKTOP_LAUNCHER_LOCKED=1 "$flock_bin" --exclusive --close \
         "$directory/matrix-sonic-desktop-${UID}.lock" \
         /usr/bin/bash "$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")" \
-        "$ACTION" --profile "$PROFILE"
+        "$ACTION" --profile "$PROFILE" --scene "$SCENE_ID"
 }
 
 notify_user() {
@@ -190,7 +200,7 @@ start_session() {
         /usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
         /usr/bin/bash "$RUN_SCRIPT" \
         --profile "$PROFILE" \
-        --scene 2 \
+        --scene "$SCENE_ID" \
         --control-source game; then
         sleep 0.20
         if ! session_is_live; then
@@ -199,8 +209,8 @@ start_session() {
             printf '[ERROR] Matrix SONIC exited during startup\n' >&2
             return 1
         fi
-        printf 'Started Matrix SONIC in tmux session %s (profile %s).\n' \
-            "$SESSION_NAME" "$PROFILE"
+        printf 'Started Matrix SONIC in tmux session %s (profile %s, scene %s).\n' \
+            "$SESSION_NAME" "$PROFILE" "$SCENE_ID"
         print_attach_hint
         notify_user "Started profile $PROFILE in $SESSION_NAME. Attach: tmux attach-session -t =$SESSION_NAME"
         return 0
@@ -329,6 +339,11 @@ while (($# > 0)); do
             PROFILE="$2"
             shift 2
             ;;
+        --scene)
+            (($# >= 2)) || die "--scene requires a value"
+            SCENE_ID="$2"
+            shift 2
+            ;;
         -h | --help)
             usage
             exit 0
@@ -340,6 +355,7 @@ while (($# > 0)); do
 done
 
 validate_profile "$PROFILE"
+validate_scene "$SCENE_ID"
 command -v tmux >/dev/null 2>&1 || die "tmux is required"
 
 if [[ "$SESSION_LOCK_HELD" != "1" \

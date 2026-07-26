@@ -392,6 +392,32 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertFalse(self.intersects(layout["title"], layout["profile_local"]))
         self.assertFalse(self.intersects(layout["title"], layout["profile_remote"]))
 
+    def test_movement_mode_selector_is_bounded_and_settings_page_only(self) -> None:
+        for geometry in (
+            MODULE.WindowGeometry(1, 0, 0, 480, 360),
+            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
+        ):
+            layout = MODULE.overlay_layout(geometry)
+            controls = [layout[action] for action in MODULE._MOVEMENT_MODE_ACTIONS]
+            for index, rectangle in enumerate(controls):
+                point = (
+                    rectangle[0] + rectangle[2] // 2,
+                    rectangle[1] + rectangle[3] // 2,
+                )
+                self.assertEqual(
+                    MODULE.panel_action_at(layout, *point, page="settings"),
+                    MODULE._MOVEMENT_MODE_ACTIONS[index],
+                )
+                self.assertNotEqual(
+                    MODULE.panel_action_at(layout, *point, page="loadout"),
+                    MODULE._MOVEMENT_MODE_ACTIONS[index],
+                )
+                self.assertFalse(
+                    self.intersects(rectangle, layout["crosshair_safe"])
+                )
+            for left, right in zip(controls, controls[1:]):
+                self.assertFalse(self.intersects(left, right))
+
     def test_runtime_pause_footer_is_bounded_distinct_and_on_every_page(self) -> None:
         for geometry in (
             MODULE.WindowGeometry(1, 0, 0, 480, 360),
@@ -958,6 +984,7 @@ class OverlayStateTest(unittest.TestCase):
 
         self.assertTrue(model.available)
         self.assertEqual(model.settings.revision, 7)
+        self.assertEqual(model.settings.movement_mode, "camera_face")
         self.assertEqual(model.value("walk", "double_tap_speed_mps"), 1.30)
         self.assertEqual(
             model.value("camera", MODULE.KEYBOARD_LOOK_RATE_FIELD),
@@ -2395,6 +2422,27 @@ class PointerActionPublisherTest(unittest.TestCase):
             self.assertEqual(packet["policy_id"], "kungfu")
             with self.assertRaisesRegex(ValueError, "invalid"):
                 publisher.publish_strategy_select("recovery", "bad policy")
+        finally:
+            publisher.close()
+            receiver.close()
+
+    def test_movement_mode_selection_is_a_strict_typed_intent(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish_movement_mode_select("body_relative")
+            packet = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(
+                set(packet),
+                {"version", "session", "sequence", "kind", "movement_mode"},
+            )
+            self.assertEqual(packet["kind"], "movement_mode_select")
+            self.assertEqual(packet["movement_mode"], "body_relative")
+            with self.assertRaisesRegex(ValueError, "movement mode"):
+                publisher.publish_movement_mode_select("unknown")
         finally:
             publisher.close()
             receiver.close()

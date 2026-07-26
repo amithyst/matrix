@@ -6,8 +6,12 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 TEMPLATE="$PROJECT_ROOT/packaging/matrix-sonic.desktop.in"
 LAUNCHER="$SCRIPT_DIR/launch_matrix_sonic_desktop.sh"
 PROFILE="heyuan"
+SCENE_ID="2"
 DESKTOP_DIR=""
 ICON_PATH="$PROJECT_ROOT/demo_gif/Launcher.png"
+SHORTCUT_NAME=""
+SHORTCUT_COMMENT=""
+TARGET_BASENAME=""
 
 usage() {
     cat <<'EOF'
@@ -15,6 +19,7 @@ Usage: bash scripts/install_matrix_desktop_launcher.sh [options]
 
 Options:
   --profile PROFILE     heyuan (default), trna, or zza
+  --scene ID            Matrix native scene id (default: 2)
   --desktop-dir DIR     Existing private Desktop directory (for tests or XDG overrides)
   --icon PATH           Existing icon file (default: demo_gif/Launcher.png)
   -h, --help            Show this help
@@ -47,6 +52,31 @@ validate_profile() {
             ;;
         *)
             die "unsupported profile: $1 (expected heyuan, trna, or zza)"
+            ;;
+    esac
+}
+
+validate_scene() {
+    [[ "$1" =~ ^(0|[1-9][0-9]?)$ ]] \
+        || die "invalid scene id: $1 (expected 0-99)"
+}
+
+configure_shortcut_identity() {
+    case "$SCENE_ID" in
+        2)
+            SHORTCUT_NAME="Matrix SONIC ($PROFILE)"
+            SHORTCUT_COMMENT="Launch Matrix SONIC scene 2 with game controls"
+            TARGET_BASENAME="matrix-sonic.desktop"
+            ;;
+        15)
+            SHORTCUT_NAME="Matrix MoonWorld SONIC ($PROFILE)"
+            SHORTCUT_COMMENT="Launch Matrix SONIC MoonWorld scene 15 with game controls"
+            TARGET_BASENAME="matrix-sonic-moon.desktop"
+            ;;
+        *)
+            SHORTCUT_NAME="Matrix SONIC scene $SCENE_ID ($PROFILE)"
+            SHORTCUT_COMMENT="Launch Matrix SONIC scene $SCENE_ID with game controls"
+            TARGET_BASENAME="matrix-sonic-scene-$SCENE_ID.desktop"
             ;;
     esac
 }
@@ -146,12 +176,15 @@ render_template() {
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
-            'Name=Matrix SONIC (@MATRIX_PROFILE@)')
-                printf 'Name=Matrix SONIC (%s)\n' "$PROFILE"
+            'Name=@MATRIX_NAME@')
+                printf 'Name=%s\n' "$(desktop_string "$SHORTCUT_NAME")"
+                ;;
+            'Comment=@MATRIX_COMMENT@')
+                printf 'Comment=%s\n' "$(desktop_string "$SHORTCUT_COMMENT")"
                 ;;
             'Exec=@MATRIX_START_EXEC@')
-                printf 'Exec=/usr/bin/bash %s start --profile %s\n' \
-                    "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE"
+                printf 'Exec=/usr/bin/bash %s start --profile %s --scene %s\n' \
+                    "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE" "$SCENE_ID"
                 ;;
             'Icon=@MATRIX_ICON@')
                 printf 'Icon=%s\n' "$(desktop_string "$ICON_PATH")"
@@ -162,13 +195,16 @@ render_template() {
             'X-Matrix-Profile=@MATRIX_PROFILE@')
                 printf 'X-Matrix-Profile=%s\n' "$PROFILE"
                 ;;
+            'X-Matrix-Scene=@MATRIX_SCENE@')
+                printf 'X-Matrix-Scene=%s\n' "$SCENE_ID"
+                ;;
             'Exec=@MATRIX_STATUS_EXEC@')
-                printf 'Exec=/usr/bin/bash %s status --profile %s\n' \
-                    "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE"
+                printf 'Exec=/usr/bin/bash %s status --profile %s --scene %s\n' \
+                    "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE" "$SCENE_ID"
                 ;;
             'Exec=@MATRIX_STOP_EXEC@')
-                printf 'Exec=/usr/bin/bash %s stop --profile %s\n' \
-                    "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE"
+                printf 'Exec=/usr/bin/bash %s stop --profile %s --scene %s\n' \
+                    "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE" "$SCENE_ID"
                 ;;
             *)
                 printf '%s\n' "$line"
@@ -178,8 +214,8 @@ render_template() {
         replacements=$((replacements + 1))
     done < "$TEMPLATE"
 
-    [[ "$replacements" == 7 ]] \
-        || die "desktop template replacement count was $replacements, expected 7"
+    [[ "$replacements" == 9 ]] \
+        || die "desktop template replacement count was $replacements, expected 9"
 }
 
 while (($# > 0)); do
@@ -187,6 +223,11 @@ while (($# > 0)); do
         --profile)
             require_value "$1" "$#"
             PROFILE="$2"
+            shift 2
+            ;;
+        --scene)
+            require_value "$1" "$#"
+            SCENE_ID="$2"
             shift 2
             ;;
         --desktop-dir)
@@ -210,6 +251,8 @@ while (($# > 0)); do
 done
 
 validate_profile "$PROFILE"
+validate_scene "$SCENE_ID"
+configure_shortcut_identity
 [[ -f "$TEMPLATE" && -r "$TEMPLATE" ]] \
     || die "desktop template is missing: $TEMPLATE"
 [[ -f "$LAUNCHER" && -r "$LAUNCHER" ]] \
@@ -223,7 +266,7 @@ DESKTOP_DIR="$(canonical_private_directory "$DESKTOP_DIR")"
 ICON_PATH="$(canonical_icon "$ICON_PATH")"
 validate_desktop_exec_path "icon path" "$ICON_PATH"
 
-TARGET="$DESKTOP_DIR/matrix-sonic.desktop"
+TARGET="$DESKTOP_DIR/$TARGET_BASENAME"
 if [[ -L "$TARGET" ]]; then
     die "refusing symlink desktop target: $TARGET"
 fi
@@ -235,7 +278,7 @@ if [[ -e "$TARGET" && "$(stat -c '%u' -- "$TARGET")" != "$UID" ]]; then
 fi
 
 umask 077
-TEMPORARY="$(mktemp "$DESKTOP_DIR/.matrix-sonic.desktop.tmp.XXXXXX")"
+TEMPORARY="$(mktemp "$DESKTOP_DIR/.$TARGET_BASENAME.tmp.XXXXXX")"
 cleanup() {
     if [[ -n "${TEMPORARY:-}" && -e "$TEMPORARY" ]]; then
         rm -f -- "$TEMPORARY"
@@ -257,4 +300,5 @@ fi
 
 printf 'Installed Matrix SONIC desktop launcher: %s\n' "$TARGET"
 printf 'Profile: %s\n' "$PROFILE"
+printf 'Scene: %s\n' "$SCENE_ID"
 printf 'Repository: %s\n' "$PROJECT_ROOT"

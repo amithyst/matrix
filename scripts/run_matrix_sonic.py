@@ -55,6 +55,7 @@ from matrix_mc_commands import (
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
     MAX_RUNTIME_PAUSE_EPOCH,
+    MovementModeSet,
     PolicySlotAssignment,
     RuntimePause,
     TeleportList,
@@ -82,6 +83,10 @@ from matrix_motion_settings import (
     MotionSettingsError,
     MotionSettingsPersistenceError,
     MotionSettingsStore,
+)
+from matrix_movement_modes import (
+    DEFAULT_MOVEMENT_MODE,
+    movement_mode_metadata,
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_moon_dynamic_ground import (
@@ -122,6 +127,7 @@ _GAME_INTERNAL_RESTART_REASONS = frozenset(
 _GAME_TURN_COMMAND_REASONS = frozenset(
     {
         "aligning_heading",
+        "manual_yaw",
         "recovery_heading_slew_limited",
     }
 )
@@ -4088,6 +4094,7 @@ def _game_control_status_fields(
     *,
     applied_camera_yaw_offset_deg: float | None = None,
     initial_root_yaw_rad: float | None = None,
+    motion_settings: MotionSettings | None = None,
 ) -> dict[str, object]:
     """Return the immutable input/camera claim carried by every status frame."""
 
@@ -4144,6 +4151,16 @@ def _game_control_status_fields(
         if applied_camera_yaw_offset_deg is None
         else applied_camera_yaw_offset_deg
     )
+    selected_movement_mode = (
+        motion_settings.movement_mode
+        if motion_settings is not None
+        else getattr(args, "game_movement_mode", DEFAULT_MOVEMENT_MODE)
+    )
+    selected_motion_revision = (
+        motion_settings.revision
+        if motion_settings is not None
+        else getattr(args, "game_motion_settings_revision", None)
+    )
     return {
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
@@ -4181,9 +4198,8 @@ def _game_control_status_fields(
         "motion_settings_load_status": getattr(
             args, "game_motion_settings_load_status", "disabled"
         ),
-        "motion_settings_revision": getattr(
-            args, "game_motion_settings_revision", None
-        ),
+        "motion_settings_revision": selected_motion_revision,
+        "movement_control": movement_mode_metadata(selected_movement_mode),
         # Preserve the historical status contract: maximum_speed_mps is the
         # configurable analog SLOW_WALK ceiling.  Keyboard tiers now have a
         # separate native RUN target and must not silently change that field.
@@ -4267,6 +4283,7 @@ def _control_config_with_motion_settings(
 
     return replace(
         config,
+        movement_mode=settings.movement_mode,
         max_turn_rate_rad_s=settings.max_turn_rate_rad_s,
         keyboard_slow_speed_mps=settings.slow_speed_mps,
         keyboard_slow_boost_speed_mps=settings.slow_double_tap_speed_mps,
@@ -5100,6 +5117,7 @@ class GameInputRuntime:
                 if self.core.measured_heading_rad is not None
                 else None
             ),
+            "movement_control": self.core.movement_mode_mapping(),
             "input_age_s": (
                 round(max(0.0, now_s - self.last_packet_at_s), 6)
                 if self.last_packet_at_s is not None
@@ -5454,6 +5472,7 @@ class GameCommandRuntime:
         self.pending_runtime_pause_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
         self.motion_settings_changes_executed = 0
+        self.movement_mode_changes_executed = 0
         self.runtime_pause_changes_executed = 0
 
     @staticmethod
@@ -5727,7 +5746,10 @@ class GameCommandRuntime:
                     )
                 )
                 continue
-            if not command_allowed and not isinstance(request.command, TeleportList):
+            if not command_allowed and not isinstance(
+                request.command,
+                (TeleportList, MovementModeSet),
+            ):
                 self.rejected_commands += 1
                 self._send(
                     self._response(
@@ -5793,7 +5815,10 @@ class GameCommandRuntime:
             if (
                 self.runtime_pause is not None
                 and self.runtime_pause.physics_frozen
-                and not isinstance(request.command, DataModifyNumber)
+                and not isinstance(
+                    request.command,
+                    (DataModifyNumber, MovementModeSet),
+                )
             ):
                 self.rejected_commands += 1
                 self._send(
@@ -5803,6 +5828,96 @@ class GameCommandRuntime:
                         code="E_RUNTIME_PAUSED",
                         message="Continue the simulation before changing the world",
                         data={"runtime_pause": self.runtime_pause.telemetry()},
+                    )
+                )
+                continue
+            if isinstance(request.command, MovementModeSet):
+                if self.motion_settings is None or self.control_core is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_DATA_UNAVAILABLE",
+                            message=(
+                                "Movement mode settings are unavailable for this run"
+                            ),
+                        )
+                    )
+                    continue
+                if (
+                    request.command.movement_mode != self.control_core.movement_mode
+                    and not command_allowed
+                    and not self.control_core.movement_mode_change_allowed()
+                ):
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_MOVEMENT_MODE_BUSY",
+                            message=(
+                                "Release WASD, Q/E, and the movement stick before "
+                                "changing movement mode"
+                            ),
+                            data={"motion_settings": self.motion_settings.mapping()},
+                        )
+                    )
+                    continue
+                try:
+                    modification = self.motion_settings.modify_movement_mode(
+                        request.command.movement_mode,
+                        expected_revision=request.command.expected_revision,
+                    )
+                    if modification.changed:
+                        self.control_core.set_movement_mode(
+                            modification.settings.movement_mode,
+                            neutral_authorized=command_allowed,
+                        )
+                    else:
+                        self.control_core.config = _control_config_with_motion_settings(
+                            self.control_core.config,
+                            modification.settings,
+                        )
+                except MotionSettingsError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={"motion_settings": self.motion_settings.mapping()},
+                        )
+                    )
+                    continue
+                except MotionSettingsPersistenceError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                            data={"motion_settings": self.motion_settings.mapping()},
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                if modification.changed:
+                    self.motion_settings_changes_executed += 1
+                    self.movement_mode_changes_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=(
+                            "OK_MOVEMENT_MODE_SET"
+                            if modification.changed
+                            else "OK_MOVEMENT_MODE_UNCHANGED"
+                        ),
+                        message=f"Movement mode is {modification.value}",
+                        data={"motion_settings": self.motion_settings.mapping()},
                     )
                 )
                 continue
@@ -6078,6 +6193,9 @@ class GameCommandRuntime:
             "inventory_spawns_executed": self.inventory_spawns_executed,
             "motion_settings_changes_executed": (
                 self.motion_settings_changes_executed
+            ),
+            "movement_mode_changes_executed": (
+                self.movement_mode_changes_executed
             ),
             "runtime_pause_changes_executed": (
                 self.runtime_pause_changes_executed
@@ -11763,9 +11881,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 motion_settings_store.load_status
             )
             args.game_motion_settings_revision = motion.revision
+            args.game_movement_mode = motion.movement_mode
         else:
             args.game_motion_settings_load_status = "disabled"
             args.game_motion_settings_revision = None
+            args.game_movement_mode = DEFAULT_MOVEMENT_MODE
         if args.game_max_speed > 0.8:
             raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
         if (
@@ -11781,6 +11901,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 max_acceleration_mps2=args.game_max_acceleration,
                 max_deceleration_mps2=args.game_max_deceleration,
                 max_turn_rate_rad_s=args.game_max_turn_rate,
+                movement_mode=args.game_movement_mode,
                 keyboard_slow_speed_mps=args.game_keyboard_slow_speed,
                 keyboard_slow_boost_speed_mps=(
                     args.game_keyboard_slow_boost_speed
@@ -12706,6 +12827,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     game_world is not None
                     or physical_recovery is not None
                     or creative_inventory is not None
+                    or motion_settings_store is not None
                 ):
                     command_parent, game_command_child_socket = socket.socketpair(
                         socket.AF_UNIX,
@@ -13853,6 +13975,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 applied_game_camera_yaw_offset_deg
                             ),
                             initial_root_yaw_rad=initial_root_yaw_rad,
+                            motion_settings=(
+                                motion_settings_store.settings
+                                if motion_settings_store is not None
+                                else None
+                            ),
                         )
                     )
                     current_root_yaw = _root_yaw_rad(snapshot.qpos)
@@ -14324,6 +14451,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         applied_game_camera_yaw_offset_deg
                     ),
                     initial_root_yaw_rad=initial_root_yaw_rad,
+                    motion_settings=(
+                        motion_settings_store.settings
+                        if motion_settings_store is not None
+                        else None
+                    ),
                 )
             )
             assert initial_root_yaw_rad is not None

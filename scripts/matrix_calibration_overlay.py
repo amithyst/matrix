@@ -60,6 +60,7 @@ from matrix_motion_settings import (
     SPEED_FIELD,
     step_motion_speed,
 )
+from matrix_movement_modes import MOVEMENT_MODES, validate_movement_mode
 
 
 _IS_VIEWABLE = 2
@@ -471,7 +472,11 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_width = max(1, (panel_width - 2 * margin - 6 * tab_gap) // 7)
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
-    profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
+    profile_gap = max(4, min(10, gap // 2))
+    profile_width = max(
+        1,
+        (panel_width - 2 * margin - 4 * profile_gap) // 5,
+    )
     settings_content_width = panel_width - 2 * margin
     settings_group_width = max(1, (settings_content_width - gap) // 2)
     speed_width = max(42, min(112, settings_group_width // 4))
@@ -656,7 +661,25 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             button_height,
         ),
         "profile_remote": (
-            panel_x + margin + profile_width + gap,
+            panel_x + margin + profile_width + profile_gap,
+            profile_y,
+            profile_width,
+            button_height,
+        ),
+        "movement_mode_camera_face": (
+            panel_x + margin + 2 * (profile_width + profile_gap),
+            profile_y,
+            profile_width,
+            button_height,
+        ),
+        "movement_mode_camera_strafe": (
+            panel_x + margin + 3 * (profile_width + profile_gap),
+            profile_y,
+            profile_width,
+            button_height,
+        ),
+        "movement_mode_body_relative": (
+            panel_x + margin + 4 * (profile_width + profile_gap),
             profile_y,
             profile_width,
             button_height,
@@ -963,6 +986,14 @@ _MOTION_STEP_ACTION_DETAILS.update(
     }
 )
 _MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
+_MOVEMENT_MODE_ACTIONS = tuple(
+    f"movement_mode_{movement_mode}" for movement_mode in MOVEMENT_MODES
+)
+_MOVEMENT_MODE_LABELS = {
+    "camera_face": "相机朝向",
+    "camera_strafe": "相机侧移",
+    "body_relative": "机身相对",
+}
 
 _VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
     "resolution": ("1280x720", "1600x900", "1920x1080", "2560x1440"),
@@ -1024,6 +1055,7 @@ _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
     + ("runtime_pause",)
+    + _MOVEMENT_MODE_ACTIONS
     + _MOTION_STEP_ACTIONS
     + ("command_input",)
     + _OVERLAY_LOCAL_HIT_TARGETS
@@ -1065,6 +1097,7 @@ def panel_action_at(
             _PANEL_TABS
             + _PANEL_ACTIONS
             + ("runtime_pause",)
+            + _MOVEMENT_MODE_ACTIONS
             + _MOTION_STEP_ACTIONS
             + _OVERLAY_LOCAL_HIT_TARGETS
         )
@@ -3215,6 +3248,10 @@ class PointerActionPublisher:
             raise ValueError("command submit text must be bounded printable ASCII")
         self._publish("command_submit", {"command": command})
 
+    def publish_movement_mode_select(self, movement_mode: object) -> None:
+        mode = validate_movement_mode(movement_mode)
+        self._publish("movement_mode_select", {"movement_mode": mode})
+
     def publish_strategy_select(self, slot: str, policy_id: str) -> None:
         if slot not in {"locomotion", "recovery"}:
             raise ValueError("strategy slot is invalid")
@@ -5289,6 +5326,14 @@ class X11CalibrationOverlay:
     ) -> None:
         local_selected = model.next_profile == "Local"
         controls_disabled = model.restart_requested or model.status == "restarting"
+        command_blocked = bool(
+            command_status.in_flight
+            or command_status.restart_required
+            or command_status.outcome_unknown
+            or command_status.status in {"pending", "restarting"}
+            or self._command_editor.editing
+            or self._command_editor.pending
+        )
         self._draw_button(
             layout,
             "profile_local",
@@ -5303,6 +5348,22 @@ class X11CalibrationOverlay:
             fill=self._colours["selected" if not local_selected else "button"],
             disabled=controls_disabled,
         )
+        movement_controls_disabled = bool(
+            controls_disabled or command_blocked or not motion_model.available
+        )
+        for movement_mode in MOVEMENT_MODES:
+            selected = movement_mode == motion_model.settings.movement_mode
+            self._draw_button(
+                layout,
+                f"movement_mode_{movement_mode}",
+                _MOVEMENT_MODE_LABELS[movement_mode],
+                fill=self._colours[
+                    "selected"
+                    if selected
+                    else "disabled" if movement_controls_disabled else "button"
+                ],
+                disabled=movement_controls_disabled,
+            )
         down_disabled = not model.action_enabled("speed_down")
         up_disabled = not model.action_enabled("speed_up")
         self._draw_button(
@@ -5386,14 +5447,6 @@ class X11CalibrationOverlay:
                 font_value[2],
                 font_value[3],
             ),
-        )
-        command_blocked = bool(
-            command_status.in_flight
-            or command_status.restart_required
-            or command_status.outcome_unknown
-            or command_status.status in {"pending", "restarting"}
-            or self._command_editor.editing
-            or self._command_editor.pending
         )
         compact_motion_labels = bool(
             layout["panel"][2] < 800 or layout["panel"][3] < 600
@@ -6352,6 +6405,27 @@ class X11CalibrationOverlay:
                                 candidate.policy_id,
                             )
                             emitted += 1
+                elif action in _MOVEMENT_MODE_ACTIONS:
+                    movement_mode = action.removeprefix("movement_mode_")
+                    motion_model = getattr(self, "_last_motion_model", None)
+                    panel_model = self._last_panel_model
+                    if (
+                        motion_model is not None
+                        and motion_model.available
+                        and panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and self._last_command_status.available
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting", "unavailable"}
+                    ):
+                        publisher.publish_movement_mode_select(movement_mode)
+                        emitted += 1
                 elif action in _VIDEO_STEP_ACTIONS:
                     video_model = getattr(self, "_last_video_model", None)
                     panel_model = self._last_panel_model
