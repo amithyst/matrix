@@ -88,7 +88,11 @@ TURN_COMMAND_YAW_DAMPING_SECONDS = 0.1
 HOT_SWITCH_PREVIEW_STEPS = 4
 HOT_SWITCH_MAX_TARGET_DELTA_RAD = 0.12
 REFERENCE_SWAP_MAX_TARGET_DELTA_RAD = 0.03
-STOP_HANDOFF_GRACE_STEPS = 15
+# Ordinary W release stays inside the BFM controller. Delaying the stand
+# command was only needed by the experimental BFM -> SONIC brake transaction;
+# it diverges from the accepted BFM-3DGS press/release contract and destroys
+# the continuous walk -> stand policy history.
+STOP_HANDOFF_GRACE_STEPS = 0
 HOT_SWITCH_MAX_REFERENCE_ROOT_ERROR_M = 0.25
 HOT_SWITCH_LOW_CMD_MAX_AGE_S = 0.10
 
@@ -856,6 +860,63 @@ class BfmTeacherCore:
             return last_target.astype(np.float32, copy=True)
         return lowstate.joint_pos_rad.astype(np.float32, copy=True)
 
+    def _prepare_realtime_rolling_command(self, command: Any) -> str | None:
+        """Roll an ordinary command change without a PFNN publish barrier.
+
+        The accepted RealScan stream builds a complete replacement branch in
+        the background and then waits synchronously at its deterministic swap
+        step. That is simulation-time safe, but Matrix physics keeps running:
+        while ``Future.result()`` blocks, the independent LowCmd publisher can
+        only repeat one stale walking target for hundreds of milliseconds.
+
+        For ordinary, non-latched keyboard motion, keep the active cursor and
+        let its existing 47-frame horizon roll into each new command one frame
+        per policy tick. This preserves PFNN phase, Teacher history,
+        PrevActions, and the 50 Hz writer. Explicit safety-stop latches retain
+        the upstream branch/rebuild behavior.
+        """
+
+        if bool(getattr(command, "stop_latched", False)):
+            return None
+        stream = self.stream
+        if not (
+            hasattr(stream, "_frames")
+            and hasattr(stream, "_last_branch_command")
+        ):
+            return None
+        pending_cancelled = False
+        pending = getattr(stream, "_pending", None)
+        if pending is not None:
+            # Root-anchor and terrain refreshes can start a pending branch even
+            # when the keyboard command itself is unchanged. Cancel it before
+            # the upstream four-step poll reaches Future.result(); the active
+            # buffer has already received the continuous root translation and
+            # keeps appending frames against the current height field.
+            pending.cancel_event.set()
+            pending.future.cancel()
+            stream._pending = None
+            pending_cancelled = True
+            if hasattr(stream, "_discard_count"):
+                stream._discard_count += 1
+            if hasattr(stream, "_deferred_reason"):
+                stream._deferred_reason = None
+        previous = getattr(stream, "_last_branch_command", None)
+        if previous is None:
+            return "pending_cancel" if pending_cancelled else None
+        change_reason = getattr(stream, "_change_reason", None)
+        if callable(change_reason):
+            reason = change_reason(command, previous)
+        elif getattr(command, "gait", None) != getattr(previous, "gait", None):
+            reason = "gait"
+        else:
+            reason = None
+        if reason is None:
+            return "pending_cancel" if pending_cancelled else None
+        if hasattr(stream, "_deferred_reason"):
+            stream._deferred_reason = None
+        stream._last_branch_command = command
+        return str(reason)
+
     def close(self) -> None:
         self.stream.close()
 
@@ -957,7 +1018,14 @@ class BfmTeacherCore:
             vy=float(local_vy),
             yaw_rate=yaw_rate,
             gait=gait,
-            stop_latched=bool(sample.safe_stop),
+            # A transient Matrix deadman frame is how the engine bridge
+            # releases a synthetic/remote key lease. BFM-3DGS treats W release
+            # as an ordinary non-latched stand command. Reserve the reference
+            # stop latch for explicit safety-stop modes so deadman -> idle does
+            # not manufacture a second, equivalent gait rebuild.
+            stop_latched=bool(
+                sample.safe_stop and sample.mode not in {"deadman", "idle"}
+            ),
         )
 
     @staticmethod
@@ -1172,6 +1240,18 @@ class BfmTeacherCore:
                 "pending_rebuild": bool(reference.pending_rebuild),
                 "buffer_swapped": bool(
                     getattr(reference, "buffer_swapped", False)
+                ),
+                "pending_build_ms": getattr(reference, "pending_build_ms", None),
+                "pending_clone_ms": getattr(reference, "pending_clone_ms", None),
+                "pending_advance_ms": getattr(
+                    reference, "pending_advance_ms", None
+                ),
+                "pending_publish_ms": getattr(
+                    reference, "pending_publish_ms", None
+                ),
+                "pending_block_ms": getattr(reference, "pending_block_ms", None),
+                "pending_elapsed_steps": getattr(
+                    reference, "pending_elapsed_steps", None
                 ),
                 "reference_ready": not bool(reference.pending_rebuild),
                 "continuity": self._reference_continuity_summary(
@@ -1397,6 +1477,21 @@ class BfmTeacherCore:
             )
             else 0.0
         )
+        realtime_rolling_reason = (
+            self._prepare_realtime_rolling_command(command)
+            if active and canonical_reference_continuity
+            else None
+        )
+        realtime_rolling_stop = bool(
+            active
+            and canonical_reference_continuity
+            and stop_reference_reset
+            and realtime_rolling_reason is not None
+        )
+        if realtime_rolling_stop:
+            # No atomic branch swap follows this rolling transition, so there
+            # is no swap target that needs the pending-hold/blend path.
+            self.reference_stop_blend_pending = False
         reference = self.stream.sample(
             command,
             world.root_position,
@@ -1695,6 +1790,26 @@ class BfmTeacherCore:
             "reference_root_error_m": float(reference.root_error_before_m),
             "reference_pending_rebuild": reference_pending_rebuild,
             "reference_buffer_swapped": reference_buffer_swapped,
+            "reference_realtime_rolling_reason": realtime_rolling_reason,
+            "reference_realtime_rolling_stop": realtime_rolling_stop,
+            "reference_pending_build_ms": getattr(
+                reference, "pending_build_ms", None
+            ),
+            "reference_pending_clone_ms": getattr(
+                reference, "pending_clone_ms", None
+            ),
+            "reference_pending_advance_ms": getattr(
+                reference, "pending_advance_ms", None
+            ),
+            "reference_pending_publish_ms": getattr(
+                reference, "pending_publish_ms", None
+            ),
+            "reference_pending_block_ms": getattr(
+                reference, "pending_block_ms", None
+            ),
+            "reference_pending_elapsed_steps": getattr(
+                reference, "pending_elapsed_steps", None
+            ),
             "reference_swap_blend_started": reference_swap_blend_started,
             "reference_stop_blend_pending": bool(
                 getattr(self, "reference_stop_blend_pending", False)

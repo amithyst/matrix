@@ -11191,9 +11191,10 @@ class _PhysicalRecoveryCoordinator:
         self._request_initial_locomotion_policy_if_ready(
             handoff_allowed=initial_locomotion_handoff_allowed,
         )
-        self._request_bfm_idle_sonic_handoff_if_needed(
-            neutral_confirmed=switch_neutral_confirmed,
-        )
+        # Normal BFM key release remains a BFM walk -> stand transition. The
+        # resident SONIC writer is recovery/manual-switch infrastructure, not
+        # an idle brake. Keeping BFM authoritative preserves Teacher history,
+        # PrevActions, PFNN phase and the canonical double-buffer stop branch.
         if bool(getattr(self, "locomotion_slots_only", False)):
             self.last_output = ResidentRecoveryOutput(
                 previous_state=ResidentRecoveryState.GAME_SONIC,
@@ -13291,6 +13292,32 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             print(
                 "matrix-sonic-runtime ERROR unsafe spawn clearance: "
                 f"reason={spawn_clearance_audit.get('reason')} worst={worst}",
+                flush=True,
+            )
+        if running and moon_dynamic_ground is not None:
+            environment = getattr(simulator, "sim_env", None)
+            model = getattr(environment, "mj_model", None)
+            data = getattr(environment, "mj_data", None)
+            if mujoco_module is None or model is None or data is None:
+                raise SystemExit(
+                    "MoonWorld collision handoff requires live MuJoCo model/data"
+                )
+            try:
+                collision_handoff = (
+                    moon_dynamic_ground.activate_collision_handoff(
+                        data,
+                        forward=mujoco_module.mj_forward,
+                    )
+                )
+            except (MoonDynamicGroundError, OSError, ValueError) as exc:
+                raise SystemExit(
+                    f"cannot activate MoonWorld rolling collision: {exc}"
+                ) from exc
+            print(
+                "matrix-sonic-runtime moon_collision_handoff=active "
+                f"ground_mode={collision_handoff['ground_mode']} "
+                f"tile_geom_count={collision_handoff['tile_geom_count']} "
+                f"spawn_pad_geom_id={collision_handoff['spawn_pad_geom_id']}",
                 flush=True,
             )
         if args.game_world_state_file is not None:

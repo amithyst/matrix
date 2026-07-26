@@ -434,10 +434,17 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
             "update_timing": "before_each_mj_step",
             "fallback_support_plane": False,
             "collision": {
-                "mode": "rolling-heightfield-observation-only-v1",
+                "mode": "rolling-mocap-tiles-v1",
                 "asset_name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
                 "geom_name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
-                "collision_enabled": False,
+                "collision_enabled_initial": False,
+                "collision_enabled_after_handoff": False,
+                "observation_hfield_only": True,
+                "handoff": {
+                    "trigger": "initial_spawn_clearance_passed",
+                    "contract": "exactly-one-active-ground-v1",
+                    "mujoco_forward_after_mask_swap": True,
+                },
                 "grid_shape": [
                     MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
                     MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
@@ -445,14 +452,18 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
                 "half_extent_m": MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
                 "height_range_m": MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
                 "base_depth_m": MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
-                "source_tile_collision_enabled": False,
+                "source_tile_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
+                "source_tile_compiled_collision_mask": [1, 1],
+                "source_tile_collision_enabled_initial": False,
+                "source_tile_collision_enabled_after_handoff": True,
                 "friction": MOON_COLLISION_FRICTION,
                 "solref": MOON_COLLISION_SOLREF,
                 "solimp": MOON_COLLISION_SOLIMP,
                 "spawn_pad": {
                     "mode": "finite-collision-only-box-v1",
                     "geom_name": MOON_SPAWN_PAD_GEOM_NAME,
-                    "collision_enabled": True,
+                    "collision_enabled_initial": True,
+                    "collision_enabled_after_handoff": False,
                     "center_m": list(MOON_SPAWN_PAD_CENTER_M),
                     "half_size_m": list(MOON_SPAWN_PAD_HALF_SIZE_M),
                     "top_z_m": (
@@ -556,11 +567,12 @@ def _apply_scene_transform_additions(
             raise SonicPhysicsModelError(
                 f"MoonWorld tile {body_name} collision source contract drifted"
             )
-        # Preserve the locked native tile geometry for visual/provenance parity,
-        # but fence it out of collision. Its 0.049 m half-width on a 0.1 m
-        # lattice leaves gaps and exposes vertical faces between samples.
-        tile_geom.set("contype", "0")
-        tile_geom.set("conaffinity", "0")
+        # Preserve the official rolling-box collision mechanism. Runtime
+        # briefly disarms these compiled collision geoms while the finite
+        # spawn pad owns the initial clearance audit, then enables all 256 in
+        # one handoff before the next MuJoCo step.
+        tile_geom.set("contype", "1")
+        tile_geom.set("conaffinity", "1")
 
     asset = root.find("asset")
     if asset is None:
@@ -594,10 +606,8 @@ def _apply_scene_transform_additions(
                 "type": "hfield",
                 "hfield": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
                 "pos": f"0 0 {MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M:.12g}",
-                # Keep the rolling heightfield updated for PFNN/terrain
-                # observation parity, but do not let it overlap the spawn
-                # acceptance plane.  Collision handoff is a separate atomic
-                # transition; two simultaneously active grounds are invalid.
+                # The hfield is for PFNN/terrain observations only. Official
+                # MoonWorld physics comes from the 256 rolling mocap boxes.
                 "contype": "0",
                 "conaffinity": "0",
                 "friction": MOON_COLLISION_FRICTION,
@@ -628,9 +638,9 @@ def _apply_scene_transform_additions(
     root.insert(
         0,
         ET.Comment(
-            " converted official MoonWorld rolling tiles to non-colliding mocap visuals "
-            "and added one runtime-updated observation hfield plus a "
-            "single collision-only spawn plane "
+            " converted official MoonWorld rolling tiles to mocap collision geoms, "
+            "added a runtime-updated observation hfield, and retained a finite "
+            "startup pad for atomic runtime handoff "
         ),
     )
     ET.indent(tree, space="  ")
