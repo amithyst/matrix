@@ -262,6 +262,7 @@ def validate_schema(lock: dict[str, Any]) -> None:
     required_matrix_critical = {
         "config/hosts/trna.env",
         "config/runtime/matrix-bfm-isaac-bootstrap-state.json",
+        "scripts/matrix_bfm_isaac_checkout_snapshot.py",
         "scripts/run_custom_urdf.sh",
         "scripts/run_sim.sh",
         "scripts/run_matrix_bfm_isaac.sh",

@@ -10,6 +10,7 @@ required_environment=(
     MATRIX_BFM_ISAAC_RELAY_LOG
     MATRIX_BFM_ISAAC_BOOTSTRAP_STATE
     MATRIX_BFM_ISAAC_RENDERER_NAMESPACE_PID_FILE
+    MATRIX_BFM_ISAAC_CHECKOUT_SNAPSHOT_DIR
 )
 for variable_name in "${required_environment[@]}"; do
     if [[ -z "${!variable_name:-}" ]]; then
@@ -23,9 +24,17 @@ RELAY_STATUS="$MATRIX_BFM_ISAAC_RELAY_STATUS"
 RELAY_LOG="$MATRIX_BFM_ISAAC_RELAY_LOG"
 BOOTSTRAP_STATE="$MATRIX_BFM_ISAAC_BOOTSTRAP_STATE"
 NAMESPACE_PID_FILE="$MATRIX_BFM_ISAAC_RENDERER_NAMESPACE_PID_FILE"
+CHECKOUT_SNAPSHOT_DIR="$MATRIX_BFM_ISAAC_CHECKOUT_SNAPSHOT_DIR"
+CHECKOUT_SNAPSHOT_HELPER="$SCRIPT_DIR/matrix_bfm_isaac_checkout_snapshot.py"
 KEYBOARD_SOCKET="${MATRIX_BFM_ISAAC_KEYBOARD_SOCKET:-}"
 RUN_SIM_PID=""
 RELAY_PID=""
+CHECKOUT_SNAPSHOT_ACTIVE=0
+TRACKED_MUTATION_PATHS=(
+    config/config.json
+    src/robot_mc/run_mc.sh
+    src/robot_mujoco/simulate/config.yaml
+)
 
 stop_exact_child() {
     local pid="$1"
@@ -49,11 +58,29 @@ stop_exact_child() {
 }
 
 cleanup() {
+    local exit_status="$?"
+    local cleanup_status=0
     trap - EXIT INT TERM HUP
     stop_exact_child "$RELAY_PID" 3
     stop_exact_child "$RUN_SIM_PID" 20
+    if [[ "$CHECKOUT_SNAPSHOT_ACTIVE" == "1" ]]; then
+        if python3 "$CHECKOUT_SNAPSHOT_HELPER" \
+            --root "$PROJECT_ROOT" \
+            --snapshot "$CHECKOUT_SNAPSHOT_DIR" \
+            restore --remove-snapshot; then
+            CHECKOUT_SNAPSHOT_ACTIVE=0
+        else
+            cleanup_status=70
+            echo "[ERROR] Matrix tracked-source restoration failed;" \
+                "preserving $CHECKOUT_SNAPSHOT_DIR" >&2
+        fi
+    fi
     rm -f -- "$STATE_SOCKET"
     rm -f -- "$NAMESPACE_PID_FILE"
+    if [[ "$cleanup_status" != "0" ]]; then
+        exit "$cleanup_status"
+    fi
+    exit "$exit_status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -65,6 +92,17 @@ NAMESPACE_PID_TMP="${NAMESPACE_PID_FILE}.tmp.$$"
 printf '%s\n' "$$" > "$NAMESPACE_PID_TMP"
 chmod 600 "$NAMESPACE_PID_TMP"
 mv -- "$NAMESPACE_PID_TMP" "$NAMESPACE_PID_FILE"
+
+SNAPSHOT_ARGS=(
+    --root "$PROJECT_ROOT"
+    --snapshot "$CHECKOUT_SNAPSHOT_DIR"
+    capture
+)
+for tracked_path in "${TRACKED_MUTATION_PATHS[@]}"; do
+    SNAPSHOT_ARGS+=(--path "$tracked_path")
+done
+python3 "$CHECKOUT_SNAPSHOT_HELPER" "${SNAPSHOT_ARGS[@]}"
+CHECKOUT_SNAPSHOT_ACTIVE=1
 
 export MATRIX_EXTERNAL_STATE=1
 export MATRIX_DISABLE_MC=1

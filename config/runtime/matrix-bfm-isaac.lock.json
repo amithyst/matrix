@@ -34,6 +34,10 @@
         "sha256": "59edfa35b9e2295c16a86e26b9f4605805fcf76943f0a42bf51c55dd4a64fdc9"
       },
       {
+        "path": "scripts/matrix_bfm_isaac_checkout_snapshot.py",
+        "sha256": "bcab526725c52a33adc910f0b63d5b7a9171f523e65b2c5aeec7d13a69ad5559"
+      },
+      {
         "path": "scripts/matrix_bfm_isaac_instance_ledger.py",
         "sha256": "6c3ccbaf4c6639f36a68d2fcf686493f96f07132c88b67627efaea01b78f650a"
       },
@@ -71,7 +75,7 @@
       },
       {
         "path": "scripts/run_matrix_bfm_isaac.sh",
-        "sha256": "c4f2266a43308dd38db4008b6275ec55281913306eff8ced6b77fa1f85f43c56"
+        "sha256": "7d7d239cfe8e8635e31202d4022afad6b71938ea0474bab78c646305024e5f43"
       },
       {
         "path": "scripts/run_matrix_bfm_isaac_guarded.sh",
@@ -83,7 +87,7 @@
       },
       {
         "path": "scripts/run_matrix_bfm_isaac_renderer_namespace.sh",
-        "sha256": "d8f08fb6f6725eabbefcd420af35599bf8cd3b911b3d17729dae98673ce81147"
+        "sha256": "8300f2d5e866bb47eb6909e169ecfeab091b4ba4f46be9c061891aa9cafad589"
       },
       {
         "path": "scripts/run_matrix_bfm_visual_python.sh",
@@ -107,7 +111,7 @@
       },
       {
         "path": "scripts/verify_matrix_bfm_isaac_runtime.py",
-        "sha256": "949bf9677c3c92218575bf0637685626ce4c2f61929a4c1f741456ccc0221ed6"
+        "sha256": "51b4915f95ea73484d43ed174aa3f417fa925dea436adc73cf7ff611bc485776"
       }
     ]
   },
