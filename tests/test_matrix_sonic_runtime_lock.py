@@ -591,6 +591,26 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         expected_profile_defaults = (
             'MATRIX_SONIC_CONTROL_SOURCE:-game',
             'MATRIX_GAME_INPUT_SOURCE:-auto',
+            'MATRIX_INITIAL_LOCOMOTION_POLICY:-bfm-sonic-teacher50k',
+            'MATRIX_BFM_ISAAC_UE_MAX_FPS:-30',
+            "MATRIX_BFM_ISAAC_RUNTIME_ROOT:-$MATRIX_PROJECT_ROOT/outputs/"
+            "runtime/matrix-bfm-isaac-sync-world16-v1/bfm_runtime",
+            "MATRIX_BFM_ISAAC_PYTHON:-$HOME/"
+            "matrix-bfm-sonic-clean-env/bin/python",
+            "MATRIX_BFM_ISAAC_CONFIG:-$MATRIX_BFM_ISAAC_RUNTIME_ROOT/"
+            "configs/alienware/moon-matrix.toml",
+            "MATRIX_BFM_ISAAC_TEACHER_PROFILE:-$HOME/matrix-artifacts/"
+            "bfm-teacher-world16-latest/current/teacher-profile.toml",
+            "MATRIX_BFM_ISAAC_PHYSICS_ASSET_ROOT:-$HOME/"
+            "matrix-bfm-sonic-clean-assets/g1-usd-20260725",
+            "MATRIX_BFM_ISAAC_COLLISION_ROOT:-$HOME/"
+            "matrix-bfm-sonic-clean-assets/moonworld-heightfield-v1",
+            "MATRIX_BFM_ISAAC_SOURCE_ROOT:-$HOME/"
+            "matrix-bfm-sonic-clean-assets/bfm-sonic-teacher50k-src",
+            "MATRIX_BFM_ISAAC_VISUAL_ROOT:-$HOME/matrix-artifacts/"
+            "matrix-sonic-native-v2-trna/g1-visual",
+            "MATRIX_BFM_ISAAC_VISUAL_URDF:-$MATRIX_BFM_ISAAC_VISUAL_ROOT/"
+            "g1_29dof.urdf",
             'MATRIX_GAME_CAMERA_YAW_SOURCE:-ue-final-pov',
             'MATRIX_GAME_LOOK_BUTTON:-left',
             'MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12',

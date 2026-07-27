@@ -7,6 +7,7 @@ SESSION_NAME="matrix-sonic-desktop-${UID}"
 HOST_LOCK_PATH="${MATRIX_DESKTOP_HOST_LOCK_PATH:-/tmp/matrix-sonic-${UID}.lock}"
 PROFILE="heyuan"
 SCENE_ID="15"
+INITIAL_LOCOMOTION_POLICY="${MATRIX_INITIAL_LOCOMOTION_POLICY:-bfm-sonic-teacher50k}"
 ACTION="start"
 SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
 STOP_GRACE_SECONDS=60
@@ -27,6 +28,8 @@ Profiles: heyuan (default), trna, zza
 Options:
   --profile PROFILE  Host profile (default: heyuan)
   --scene ID         Matrix native scene id (default: 15 / MoonWorld BFM)
+  --initial-locomotion-policy POLICY
+                     sonic or bfm-sonic-teacher50k (default: BFM Teacher50k)
 
 Scene 15 starts MoonWorld with BFM SONIC Teacher50k and profile-aware fall recovery.
 Other scenes use the generic Matrix SONIC game-control launcher.
@@ -51,6 +54,16 @@ validate_profile() {
 validate_scene() {
     [[ "$1" =~ ^(0|[1-9][0-9]?)$ ]] \
         || die "invalid scene id: $1 (expected 0-99)"
+}
+
+validate_initial_locomotion_policy() {
+    case "$1" in
+        sonic | bfm-sonic-teacher50k)
+            ;;
+        *)
+            die "invalid initial locomotion policy: $1 (expected sonic or bfm-sonic-teacher50k)"
+            ;;
+    esac
 }
 
 session_lock_directory() {
@@ -84,7 +97,8 @@ run_with_session_lock() {
     MATRIX_DESKTOP_LAUNCHER_LOCKED=1 "$flock_bin" --exclusive --close \
         "$directory/matrix-sonic-desktop-${UID}.lock" \
         /usr/bin/bash "$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")" \
-        "$ACTION" --profile "$PROFILE" --scene "$SCENE_ID"
+        "$ACTION" --profile "$PROFILE" --scene "$SCENE_ID" \
+        --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
 }
 
 notify_user() {
@@ -201,7 +215,7 @@ start_session() {
         runtime_args=(
             --profile "$PROFILE"
             --control-source game
-            --initial-locomotion-policy bfm-sonic-teacher50k
+            --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
             --game-fall-recovery auto
         )
     else
@@ -362,6 +376,11 @@ while (($# > 0)); do
             SCENE_ID="$2"
             shift 2
             ;;
+        --initial-locomotion-policy)
+            (($# >= 2)) || die "--initial-locomotion-policy requires a value"
+            INITIAL_LOCOMOTION_POLICY="$2"
+            shift 2
+            ;;
         -h | --help)
             usage
             exit 0
@@ -374,6 +393,7 @@ done
 
 validate_profile "$PROFILE"
 validate_scene "$SCENE_ID"
+validate_initial_locomotion_policy "$INITIAL_LOCOMOTION_POLICY"
 command -v tmux >/dev/null 2>&1 || die "tmux is required"
 
 if [[ "$SESSION_LOCK_HELD" != "1" \

@@ -25,9 +25,37 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 MATRIX_DISABLE_MC="${MATRIX_DISABLE_MC:-0}"
 MATRIX_SONIC="${MATRIX_SONIC:-0}"
+MATRIX_EXTERNAL_STATE="${MATRIX_EXTERNAL_STATE:-0}"
+case "$MATRIX_EXTERNAL_STATE" in
+    0) MATRIX_EXTERNAL_STATE_ENABLED=false ;;
+    1) MATRIX_EXTERNAL_STATE_ENABLED=true ;;
+    *)
+        echo "[ERROR] MATRIX_EXTERNAL_STATE must be the literal 0 or 1:" \
+            "$MATRIX_EXTERNAL_STATE" >&2
+        exit 2
+        ;;
+esac
+if $MATRIX_EXTERNAL_STATE_ENABLED && [[ "$MUJOCORUNNING" != "0" ]]; then
+    echo "[ERROR] MATRIX_EXTERNAL_STATE=1 requires positional MUJOCORUNNING=0" >&2
+    exit 2
+fi
 MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
 MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
+
+set_mc_motor_platform_type() {
+    local config_file="$1"
+    local platform_type="$2"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        return 0
+    fi
+    if [[ ! -f "$config_file" ]]; then
+        echo "[ERROR] Matrix MC config is missing: $config_file" >&2
+        return 1
+    fi
+    sed -i "s/motor_platform_type: .*/motor_platform_type: $platform_type/" \
+        "$config_file"
+}
 MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
 MATRIX_UE_CAMERA_LAYOUT="${MATRIX_UE_CAMERA_LAYOUT:-$PROJECT_ROOT/config/runtime/matrix-ue-camera-layout-v1.json}"
 MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
@@ -91,6 +119,11 @@ join_ld_library_path() {
 }
 
 setup_runtime_environment() {
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        # The external BFM/Isaac runtime owns physics and its Python closure.
+        # Matrix is only a cooked UE state consumer in this topology.
+        return
+    fi
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # The native SONIC launcher already constructed and verified the
@@ -157,6 +190,9 @@ run_env_check() {
     fi
 
     local checked_mujoco="$MUJOCORUNNING"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        checked_mujoco=0
+    fi
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # SONIC owns the external MuJoCo process. The bundled robot_mujoco
@@ -165,11 +201,19 @@ run_env_check() {
             ;;
     esac
 
-    "$checker" runtime \
-        --robot "$ROBOT_ARG" \
-        --scene "$SCENE_ID" \
-        --mujoco "$checked_mujoco" \
-        --offscreen "$OFFSCREEN"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        MATRIX_DISABLE_MC=1 "$checker" runtime \
+            --robot "$ROBOT_ARG" \
+            --scene "$SCENE_ID" \
+            --mujoco "$checked_mujoco" \
+            --offscreen "$OFFSCREEN"
+    else
+        "$checker" runtime \
+            --robot "$ROBOT_ARG" \
+            --scene "$SCENE_ID" \
+            --mujoco "$checked_mujoco" \
+            --offscreen "$OFFSCREEN"
+    fi
 }
 
 run_env_check
@@ -189,6 +233,11 @@ PROCESS_PATTERNS=(
 
 kill_known_processes() {
     local signal="$1"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        # External-state launches are instance-owned by their top-level
+        # launcher. Never pattern-kill an incumbent Matrix or robot runtime.
+        return 0
+    fi
     local pattern
     for pattern in "${PROCESS_PATTERNS[@]}"; do
         pkill "-${signal}" -f "${pattern}" 2>/dev/null || true
@@ -196,6 +245,9 @@ kill_known_processes() {
 }
 
 kill_known_processes TERM
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    echo "[INFO] External-state mode: name-wide process cleanup is disabled"
+fi
 
 
 PIDS=()
@@ -543,6 +595,9 @@ PY
 }
 
 schedule_forced_cleanup() {
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        return 0
+    fi
     (
         trap '' HUP
         sleep 1
@@ -947,10 +1002,12 @@ case "$ROBOT_ARG" in
         sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg-user-parameters.yaml 5
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg-user-parameters.yaml 8
         fi
         ;;
     2|xgw)
@@ -960,10 +1017,12 @@ case "$ROBOT_ARG" in
         sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 5
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 8
         fi
         ;;
     3|zgws)
@@ -973,10 +1032,12 @@ case "$ROBOT_ARG" in
         sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=ZGWS/' "$TARGET_FILE"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml 5
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml 8
         fi
         ;;
     6|xxg)
@@ -1006,10 +1067,12 @@ case "$ROBOT_ARG" in
                 sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 5
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 8
                 fi
                 ;;
             xxg)
@@ -1017,10 +1080,12 @@ case "$ROBOT_ARG" in
                 sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XXG/' "$TARGET_FILE"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xxg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xxg-user-parameters.yaml 5
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xxg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xxg-user-parameters.yaml 8
                 fi
                 ;;
             *)
@@ -1028,10 +1093,12 @@ case "$ROBOT_ARG" in
                 sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg-user-parameters.yaml 5
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg-user-parameters.yaml 8
                 fi
                 ;;
         esac
@@ -1055,8 +1122,18 @@ case "${MATRIX_DISABLE_MC,,}" in
         ;;
 esac
 
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    ENABLE_MUJOCO=false
+    ENABLE_MC=false
+    echo "[INFO] External-state mode: local MuJoCo and MC are disabled"
+fi
+
 case "${MATRIX_SONIC,,}" in
     1|true|yes|on)
+        if $MATRIX_EXTERNAL_STATE_ENABLED; then
+            echo "[ERROR] MATRIX_EXTERNAL_STATE=1 conflicts with MATRIX_SONIC" >&2
+            exit 2
+        fi
         MATRIX_SONIC_ENABLED=true
         ENABLE_MC=false
         if ! $ENABLE_MUJOCO; then
@@ -1087,8 +1164,9 @@ fi
 # These are startup console commands, not the Python camera-bridge contract.
 # `set Engine.SpringArmComponent` intentionally affects every live spring arm;
 # an operator can append a narrower/newer command via MATRIX_UE_EXTRA_EXEC_CMDS.
-if $MATRIX_SONIC_ENABLED \
-    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]] \
+if { $MATRIX_EXTERNAL_STATE_ENABLED \
+    || { $MATRIX_SONIC_ENABLED \
+        && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; }; } \
     && $GAME_CENTERED_CAMERA_ENABLED; then
     if [[ "$ROBOTTYPE" == "custom" \
         && -n "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" ]]; then
@@ -1157,8 +1235,9 @@ PY
     else
         echo "[INFO] Native centered game-camera startup enabled: viewclass=$GAME_CAMERA_VIEW_CLASS"
     fi
-elif $MATRIX_SONIC_ENABLED \
-    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+elif $MATRIX_EXTERNAL_STATE_ENABLED \
+    || { $MATRIX_SONIC_ENABLED \
+        && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; }; then
     echo "[INFO] Native centered game-camera startup disabled"
 fi
 
@@ -1206,8 +1285,11 @@ sed -i "s/^robot: .*/robot: \"$ROBOTTYPE\"/" src/robot_mujoco/simulate/config.ya
 # JSON 同步
 #######################################
 MUJOCO_RUNNING_JSON=false
-if $ENABLE_MUJOCO; then
+if $ENABLE_MUJOCO || $MATRIX_EXTERNAL_STATE_ENABLED; then
     MUJOCO_RUNNING_JSON=true
+fi
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    echo "[INFO] UE external-state consumer enabled without local MuJoCo"
 fi
 
 CONFIG_TMP="$(mktemp)"
@@ -1240,6 +1322,17 @@ cp scene/scene.json  src/UeSim/Linux/zsibot_mujoco_ue/Content/model/SceneLoder/s
 # launcher 选中的场景变体需要同步覆盖到该入口，否则 UE 会继续读取默认场景。
 compose_custom_runtime_scene() {
     if [[ "$ROBOTTYPE" != "custom" ]]; then
+        return
+    fi
+
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        local external_entry="$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model/custom/scene_terrain_custom.xml"
+        if [[ ! -f "$external_entry" ]]; then
+            echo "[ERROR] External-state custom UE entry is missing: $external_entry" >&2
+            exit 1
+        fi
+        echo "[INFO] External-state renderer uses fixed custom UE entry;" \
+            "Isaac owns the Moon collision scene"
         return
     fi
 
@@ -2423,5 +2516,18 @@ PY
     fi
     echo "[INFO] Matrix SONIC runtime exited with code $SONIC_EXIT_CODE"
     exit "$SONIC_EXIT_CODE"
+fi
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    set +e
+    wait_for_managed_child "$UE_SUPERVISOR_PID"
+    EXTERNAL_UE_EXIT_CODE="$WAITED_CHILD_STATUS"
+    set -e
+    UE_SUPERVISOR_REAPED=1
+    UE_SUPERVISOR_PID=""
+    if [[ "$EXTERNAL_UE_EXIT_CODE" != "0" ]]; then
+        record_ue_supervisor_failure
+    fi
+    echo "[INFO] Matrix external-state renderer exited with code $EXTERNAL_UE_EXIT_CODE"
+    exit "$EXTERNAL_UE_EXIT_CODE"
 fi
 wait

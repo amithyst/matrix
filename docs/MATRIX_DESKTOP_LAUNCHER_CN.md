@@ -34,7 +34,7 @@ bash scripts/install_matrix_desktop_launcher.sh --profile zza
 
 ## 双击后的行为
 
-默认图标启动 MoonWorld，并将移动策略固定为 BFM SONIC Teacher50k：
+默认图标启动 MoonWorld，并将初始移动策略设为 BFM SONIC Teacher50k：
 
 ```bash
 bash scripts/run_matrix_sonic_moon_v1.sh \
@@ -47,6 +47,16 @@ bash scripts/run_matrix_sonic_moon_v1.sh \
 `moon-v1` 固定 UE MoonWorld（scene 15）和月球动态物理场景。`auto` 在 TRNA/Heyuan
 交互运行中解析为物理倒地爬起；移动策略槽和倒地恢复槽彼此独立，因此恢复策略不会阻止
 BFM SONIC 就绪或接收键盘控制。
+
+需要对照旧 SONIC 时可显式覆盖默认值：
+
+```bash
+bash scripts/launch_matrix_sonic_desktop.sh start \
+  --profile trna --scene 15 --initial-locomotion-policy sonic
+```
+
+命令行参数优先于 `MATRIX_INITIAL_LOCOMOTION_POLICY`；不传参数时，tRNA host
+profile 的默认值仍是 `bfm-sonic-teacher50k`。
 
 非 15 场景使用同一桌面 wrapper，但会切到通用 `run_matrix_sonic.sh --scene <ID>`
 链路。同一主机仍只允许一套 Matrix SONIC 运行实例；需要换场景时应先用桌面图标右键

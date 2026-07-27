@@ -2386,8 +2386,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             moon_model,
             FakeData(),
         )
-        self.assertIsNone(
-            MODULE._spawn_clearance_rollback_reason(moon_one_foot)
+        self.assertEqual(
+            MODULE._spawn_clearance_rollback_reason(moon_one_foot),
+            "no_ground_support",
         )
         moon_height_delta = MODULE.audit_spawn_safety(
             FakeMujoco(
@@ -2400,8 +2401,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             moon_model,
             FakeData(),
         )
-        self.assertIsNone(
-            MODULE._spawn_clearance_rollback_reason(moon_height_delta)
+        self.assertEqual(
+            MODULE._spawn_clearance_rollback_reason(moon_height_delta),
+            "no_ground_support",
         )
         for invalid_audit in (
             {

@@ -455,7 +455,11 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("PIPELINE_VERSION=21", launcher)
+        self.assertIn("PIPELINE_VERSION=22", launcher)
+        self.assertIn("root_candidates.add(urdf_root_link)", launcher)
+        self.assertIn("validate_mujoco_model_load", launcher)
+        self.assertIn("mujoco.MjModel.from_xml_path", launcher)
+        self.assertNotIn('<hfield name="perlin_hfield"', launcher)
         self.assertEqual(
             launcher.count(
                 'names = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")'
