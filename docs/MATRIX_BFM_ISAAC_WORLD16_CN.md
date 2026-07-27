@@ -41,7 +41,13 @@ bash scripts/bootstrap_matrix_bfm_isaac.sh --profile trna
 ```
 
 它把冻结的 Leo BFM runtime 安装到本项目自己的 `outputs/runtime`，不会修改
-`/home/trna/matrix`；主机资产路径由 `config/hosts/trna.env` 提供。
+`/home/trna/matrix`；主机资产路径由 `config/hosts/trna.env` 提供。普通 bootstrap
+还会构建 `outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so`；
+`--verify-only` 不编译，但会对现有 bridge 的 UE Build ID、ELF 类型、架构和审计
+marker 做 fail-closed 校验，并将产物 SHA256 与 runtime lock 中固定的
+`9f64dd949bd44be61a11dcbbe3e5a49f6ef6f6f318c4771a24385e9781840b96`
+逐字节比对。缺失、软链接、错误 Build ID 或摘要不符都会失败；正式 launcher 也会在
+启动前和 acceptance 阶段重复校验，且不接受 `off` 或任意 preload 路径。
 
 交互进程必须放在 tmux 中：
 
@@ -66,8 +72,32 @@ bash scripts/run_matrix_bfm_isaac_guarded.sh interactive \
 - 方向键旋转/俯仰相机；
 - `Space` 停止，`R` 继续，`Esc` 正常结束并写最终证据。
 
-共卡模式只对该 renderer 使用 `MATRIX_BFM_ISAAC_UE_MAX_FPS=30`。普通 Matrix
-仍保留 tRNA profile 的 60 FPS；显式 A/B 可覆盖为 60/90/120。
+共卡 renderer 使用独立且被 runtime lock 哈希固定的
+`config/runtime/matrix-bfm-isaac-video-settings.json`，默认是
+`1280x720 / borderless / 30 FPS / low / medium`，内部渲染比例保持 `100%`。
+普通 Matrix 仍保留 tRNA profile 的 60 FPS 和用户视频面板；所有继承的
+`MATRIX_VIDEO_APPLIED_*` 都会在 BFM renderer 进程边界被清除，因而普通面板不会
+改变正式资格跑的分辨率或画质。
+
+显式 A/B 只能使用 BFM 专用覆盖：
+
+```bash
+MATRIX_BFM_ISAAC_VIDEO_RESOLUTION=1920x1080 \
+MATRIX_BFM_ISAAC_VIDEO_WINDOW_MODE=borderless \
+MATRIX_BFM_ISAAC_VIDEO_QUALITY=high \
+MATRIX_BFM_ISAAC_UE_MAX_FPS=60 \
+MATRIX_BFM_ISAAC_VIDEO_CAMERA_SMOOTHING=off \
+MATRIX_BFM_ISAAC_SCREEN_PERCENTAGE=75 \
+bash scripts/run_matrix_bfm_isaac_guarded.sh smoke --profile trna
+```
+
+可选分辨率、FPS、画质和相机平滑级别都经过白名单校验，screen percentage 只允许
+`25..200` 的整数。正式 BFM 链拒绝通用 `MATRIX_UE_EXTRA_EXEC_CMDS`，所有 A/B 只能
+使用上面的六个 `MATRIX_BFM_ISAAC_*` 白名单变量；普通 Matrix 启动链的通用命令行为
+不变。每轮实际解析值原子写入 `resolved-video-settings.json`，并原样进入
+`acceptance.json.resolved_video_settings`。实测
+screen percentage 75 相对 100 的 p95 改善只有约 `0.04 ms`、且 50 反而回退，属于
+噪声级非单调变化，所以默认保持 100，不以牺牲清晰度冒充实时性修复。
 
 自动 smoke 示例：
 
@@ -119,8 +149,9 @@ outputs/runs/matrix-bfm-isaac/<run-id>/
 - tRNA 的 runtime Python 通过 editable install 引用 `/home/trna/IsaacLab`。verifier
   已锁定 Python/Isaac Sim/IsaacLab 版本、checkout commit、两处兼容补丁 hash 和精确
   dirty allowlist；最终合并前仍建议把补丁迁入项目自有的冻结 checkout，消除共享依赖。
-- runtime lock schema 4 还锁定 Matrix port 关键文件、干净 Git checkout、启动姿态以及
-  G1 URDF 引用的 36 个 mesh；acceptance 会记录 Matrix commit 和 lock SHA。
+- runtime lock schema 5 还锁定 Matrix port 关键文件、干净 Git checkout、启动姿态、
+  UE material bridge 摘要/目标 Build ID 以及 G1 URDF 引用的 36 个 mesh；acceptance
+  会记录 Matrix commit、lock SHA、bridge 实际摘要和本轮最终视频配置。
 - 本 Isaac 链路没有旧 Matrix/SONIC 中的 `amp-flat-v3` 或 KungFu 物理起身策略；当前
   recovery 是 Leo runtime 自己的重置/搬运逻辑。
 - 只有功能、视觉、实时性、人工动作覆盖和正常 finalizer 全部签字后，才能视为完整

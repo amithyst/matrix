@@ -16,14 +16,14 @@ bash scripts/install_matrix_desktop_launcher.sh --profile heyuan
 `matrix-sonic.desktop`。生成文件包含当前仓库的绝对路径，但不会进入 Git；仓库中只保存
 可跨机器同步的模板和安装器。
 
-默认安装的是 MoonWorld/BFM 图标：
+默认安装的是 MoonWorld 图标；移动策略由所选 host profile 决定：
 
 ```bash
 bash scripts/install_matrix_desktop_launcher.sh --profile heyuan --scene 15
 ```
 
 其他原生场景也可传入 `--scene ID`，安装器会生成带场景编号的独立图标，不会覆盖
-默认 MoonWorld/BFM 入口。
+默认 MoonWorld 入口。
 
 TRNA 或 ZZA 使用相同命令，只替换 profile：
 
@@ -34,13 +34,12 @@ bash scripts/install_matrix_desktop_launcher.sh --profile zza
 
 ## 双击后的行为
 
-默认图标启动 MoonWorld，并将初始移动策略设为 BFM SONIC Teacher50k：
+默认图标启动 MoonWorld，但桌面层不提前写入移动策略：
 
 ```bash
 bash scripts/run_matrix_sonic_moon_v1.sh \
   --profile <profile> \
   --control-source game \
-  --initial-locomotion-policy bfm-sonic-teacher50k \
   --game-fall-recovery auto
 ```
 
@@ -48,15 +47,18 @@ bash scripts/run_matrix_sonic_moon_v1.sh \
 交互运行中解析为物理倒地爬起；移动策略槽和倒地恢复槽彼此独立，因此恢复策略不会阻止
 BFM SONIC 就绪或接收键盘控制。
 
-需要对照旧 SONIC 时可显式覆盖默认值：
+tRNA 的 `config/hosts/trna.env` 是默认策略的唯一权威，值为
+`bfm-sonic-teacher50k`；Heyuan/ZZA 没有该默认值，因而继续使用原生 SONIC。
+需要在 tRNA 对照旧 SONIC 时可显式覆盖：
 
 ```bash
 bash scripts/launch_matrix_sonic_desktop.sh start \
   --profile trna --scene 15 --initial-locomotion-policy sonic
 ```
 
-命令行参数优先于 `MATRIX_INITIAL_LOCOMOTION_POLICY`；不传参数时，tRNA host
-profile 的默认值仍是 `bfm-sonic-teacher50k`。
+命令行参数优先于显式 `MATRIX_INITIAL_LOCOMOTION_POLICY`，显式环境值又优先于
+host profile 默认值。桌面和 `moon-v1` wrapper 都不会把 tRNA 的 BFM 默认污染到
+Heyuan/ZZA。
 
 非 15 场景使用同一桌面 wrapper，但会切到通用 `run_matrix_sonic.sh --scene <ID>`
 链路。同一主机仍只允许一套 Matrix SONIC 运行实例；需要换场景时应先用桌面图标右键

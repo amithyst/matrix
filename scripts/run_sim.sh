@@ -834,11 +834,55 @@ USE_OFFSCREEN=""
 USE_PIXELSTREAMER=""
 [[ "$PIXELSTREAM" == "1" ]] && USE_PIXELSTREAMER="-PixelStreamingURL=ws://127.0.0.1:8888"
 
-VIDEO_WIDTH="${MATRIX_VIDEO_APPLIED_WIDTH:-1920}"
-VIDEO_HEIGHT="${MATRIX_VIDEO_APPLIED_HEIGHT:-1080}"
-VIDEO_WINDOW_MODE="${MATRIX_VIDEO_APPLIED_WINDOW_MODE:-borderless}"
-VIDEO_QUALITY="${MATRIX_VIDEO_APPLIED_QUALITY:-high}"
-VIDEO_CAMERA_SMOOTHING="${MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING:-medium}"
+BFM_ISAAC_RENDERER_VIDEO_LOCKED="${MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED:-0}"
+case "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" in
+    0)
+        VIDEO_WIDTH="${MATRIX_VIDEO_APPLIED_WIDTH:-1920}"
+        VIDEO_HEIGHT="${MATRIX_VIDEO_APPLIED_HEIGHT:-1080}"
+        VIDEO_WINDOW_MODE="${MATRIX_VIDEO_APPLIED_WINDOW_MODE:-borderless}"
+        VIDEO_QUALITY="${MATRIX_VIDEO_APPLIED_QUALITY:-high}"
+        VIDEO_CAMERA_SMOOTHING="${MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING:-medium}"
+        ;;
+    1)
+        # The co-resident BFM renderer has its own tracked settings contract.
+        # Generic panel state must never cross this process boundary, even as
+        # an explicitly empty variable, because it would make qualification
+        # depend on whichever ordinary Matrix session ran most recently.
+        for generic_name in \
+            MATRIX_VIDEO_APPLIED_WIDTH \
+            MATRIX_VIDEO_APPLIED_HEIGHT \
+            MATRIX_VIDEO_APPLIED_WINDOW_MODE \
+            MATRIX_VIDEO_APPLIED_FPS_LIMIT \
+            MATRIX_VIDEO_APPLIED_QUALITY \
+            MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING \
+            MATRIX_VIDEO_APPLIED_REVISION \
+            MATRIX_VIDEO_APPLIED_JSON \
+            MATRIX_UE_EXTRA_EXEC_CMDS; do
+            if [[ -v "$generic_name" ]]; then
+                echo "[ERROR] Generic video state reached the locked BFM renderer: $generic_name" >&2
+                exit 1
+            fi
+        done
+        VIDEO_WIDTH="${MATRIX_BFM_ISAAC_RENDER_WIDTH:-}"
+        VIDEO_HEIGHT="${MATRIX_BFM_ISAAC_RENDER_HEIGHT:-}"
+        VIDEO_WINDOW_MODE="${MATRIX_BFM_ISAAC_RENDER_WINDOW_MODE:-}"
+        VIDEO_QUALITY="${MATRIX_BFM_ISAAC_RENDER_QUALITY:-}"
+        VIDEO_CAMERA_SMOOTHING="${MATRIX_BFM_ISAAC_RENDER_CAMERA_SMOOTHING:-}"
+        VIDEO_SCREEN_PERCENTAGE="${MATRIX_BFM_ISAAC_RENDER_SCREEN_PERCENTAGE:-}"
+        ;;
+    *)
+        echo "[ERROR] MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    if [[ ! "$VIDEO_SCREEN_PERCENTAGE" =~ ^[0-9]+$ \
+        || "$VIDEO_SCREEN_PERCENTAGE" -lt 25 \
+        || "$VIDEO_SCREEN_PERCENTAGE" -gt 200 ]]; then
+        echo "[ERROR] Invalid locked BFM screen percentage: $VIDEO_SCREEN_PERCENTAGE" >&2
+        exit 1
+    fi
+fi
 case "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" in
     1280x720|1600x900|1920x1080|2560x1440) ;;
     *)
@@ -889,7 +933,11 @@ case "$VIDEO_CAMERA_SMOOTHING" in
         exit 1
         ;;
 esac
-UE_MAX_FPS="${MATRIX_VIDEO_APPLIED_FPS_LIMIT:-${MATRIX_UE_MAX_FPS:-30}}"
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    UE_MAX_FPS="${MATRIX_BFM_ISAAC_RENDER_FPS_LIMIT:-}"
+else
+    UE_MAX_FPS="${MATRIX_VIDEO_APPLIED_FPS_LIMIT:-${MATRIX_UE_MAX_FPS:-30}}"
+fi
 if [[ ! "$UE_MAX_FPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] MATRIX_UE_MAX_FPS must be a non-negative number: $UE_MAX_FPS" >&2
     exit 1
@@ -902,24 +950,41 @@ case "$UE_MAX_FPS" in
         exit 1
         ;;
 esac
-VIDEO_REVISION="${MATRIX_VIDEO_APPLIED_REVISION:-0}"
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    VIDEO_REVISION=0
+else
+    VIDEO_REVISION="${MATRIX_VIDEO_APPLIED_REVISION:-0}"
+fi
 if [[ ! "$VIDEO_REVISION" =~ ^[0-9]+$ ]]; then
     echo "[ERROR] Invalid Matrix video settings revision: $VIDEO_REVISION" >&2
     exit 1
 fi
-if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
-    MATRIX_VIDEO_APPLIED_JSON="$(
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    VIDEO_APPLIED_JSON="$(
         printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
             "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
             "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
             "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
     )"
-    export MATRIX_VIDEO_APPLIED_JSON
+else
+    if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
+        MATRIX_VIDEO_APPLIED_JSON="$(
+            printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+                "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+                "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
+                "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
+        )"
+        export MATRIX_VIDEO_APPLIED_JSON
+    fi
+    VIDEO_APPLIED_JSON="$MATRIX_VIDEO_APPLIED_JSON"
 fi
 UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS,r.MotionBlurQuality 0"
 for group in ViewDistance AntiAliasing Shadow PostProcess Texture Effects Foliage Shading; do
     UE_EXEC_CMDS="${UE_EXEC_CMDS},sg.${group}Quality ${VIDEO_QUALITY_LEVEL}"
 done
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},r.ScreenPercentage ${VIDEO_SCREEN_PERCENTAGE}"
+fi
 
 #######################################
 # 场景配置
@@ -1243,7 +1308,8 @@ fi
 
 # Keep operator commands last by contract.  They can deliberately override a
 # default set/viewclass command without editing the launcher.
-if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "0" \
+    && -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
     UE_EXEC_CMDS="${UE_EXEC_CMDS},${MATRIX_UE_EXTRA_EXEC_CMDS}"
 fi
 
@@ -1474,6 +1540,12 @@ case "${UE_MATERIAL_FIX_PRELOAD,,}" in
         ;;
     *) ;;
 esac
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" \
+    && "$UE_MATERIAL_FIX_PRELOAD" != "$UE_MATERIAL_FIX_DEFAULT" ]]; then
+    echo "[ERROR] Qualified BFM renderer requires the locked material bridge:" >&2
+    echo "[ERROR] expected=$UE_MATERIAL_FIX_DEFAULT actual=${UE_MATERIAL_FIX_PRELOAD:-disabled}" >&2
+    exit 1
+fi
 if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
     if [[ ! "$UE_G1_SKIN" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]; then
         echo "[ERROR] MATRIX_G1_SKIN must name a registered skin" >&2
@@ -2308,7 +2380,7 @@ PY
         --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/mouse-control.json}"
         --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/motion-control.json}"
         --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/video-settings.json}"
-        --game-applied-video-settings-json "${MATRIX_VIDEO_APPLIED_JSON:-}"
+        --game-applied-video-settings-json "$VIDEO_APPLIED_JSON"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"

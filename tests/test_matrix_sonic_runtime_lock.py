@@ -592,7 +592,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             'MATRIX_SONIC_CONTROL_SOURCE:-game',
             'MATRIX_GAME_INPUT_SOURCE:-auto',
             'MATRIX_INITIAL_LOCOMOTION_POLICY:-bfm-sonic-teacher50k',
-            'MATRIX_BFM_ISAAC_UE_MAX_FPS:-30',
             "MATRIX_BFM_ISAAC_RUNTIME_ROOT:-$MATRIX_PROJECT_ROOT/outputs/"
             "runtime/matrix-bfm-isaac-sync-world16-v1/bfm_runtime",
             "MATRIX_BFM_ISAAC_PYTHON:-$HOME/"
@@ -648,6 +647,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         names = (
             "MATRIX_SONIC_CONTROL_SOURCE",
             "MATRIX_GAME_INPUT_SOURCE",
+            "MATRIX_INITIAL_LOCOMOTION_POLICY",
             "MATRIX_GAME_CAMERA_YAW_SOURCE",
             "MATRIX_GAME_LOOK_BUTTON",
             "MATRIX_GAME_MOUSE_SENSITIVITY_DEG",
@@ -688,6 +688,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             [
                 "game",
                 "auto",
+                "bfm-sonic-teacher50k",
                 "ue-final-pov",
                 "left",
                 "0.12",
@@ -703,6 +704,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         overrides = {
             "MATRIX_SONIC_CONTROL_SOURCE": "planner",
             "MATRIX_GAME_INPUT_SOURCE": "keyboard",
+            "MATRIX_INITIAL_LOCOMOTION_POLICY": "sonic",
             "MATRIX_GAME_CAMERA_YAW_SOURCE": "fixed",
             "MATRIX_GAME_LOOK_BUTTON": "right",
             "MATRIX_GAME_MOUSE_SENSITIVITY_DEG": "0.25",
@@ -717,6 +719,42 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             load_profile(overrides),
             [*list(overrides.values())[:-2], "", ""],
         )
+
+    def test_initial_locomotion_default_is_scoped_to_trna(self) -> None:
+        command = (
+            'set -euo pipefail; source "$1"; '
+            'printf "%s" "${MATRIX_INITIAL_LOCOMOTION_POLICY-}"'
+        )
+
+        def policy(profile_name: str, override: str | None = None) -> str:
+            environment = {
+                "HOME": f"/home/{profile_name}",
+                "MATRIX_PROJECT_ROOT": "/matrix",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            }
+            if override is not None:
+                environment["MATRIX_INITIAL_LOCOMOTION_POLICY"] = override
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    command,
+                    "bash",
+                    os.fspath(REPO_ROOT / "config/hosts" / f"{profile_name}.env"),
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        self.assertEqual(policy("trna"), "bfm-sonic-teacher50k")
+        self.assertEqual(policy("heyuan"), "")
+        self.assertEqual(policy("zza"), "")
+        for profile_name in ("trna", "heyuan", "zza"):
+            self.assertEqual(policy(profile_name, "sonic"), "sonic")
 
     def test_env_check_skips_mc_only_for_external_control_topology(self) -> None:
         command = [
@@ -2020,27 +2058,34 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn('MATRIX_OFFLINE="${MATRIX_OFFLINE:-0}"', installer)
         self.assertIn("离线模式下禁止下载", installer)
 
-    def test_moon_launcher_applies_the_locked_bfm_keyboard_contract(self) -> None:
+    def test_moon_launcher_leaves_policy_selection_to_the_host_profile(self) -> None:
         moon = (
             REPO_ROOT / "scripts/run_matrix_sonic_moon_v1.sh"
         ).read_text(encoding="utf-8")
+        generic = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("MoonWorld (scene 15)", moon)
-        self.assertIn(
+        self.assertNotIn(
             "MATRIX_INITIAL_LOCOMOTION_POLICY=\"bfm-sonic-teacher50k\"",
             moon,
         )
-        self.assertIn("moon-v1 locomotion policy override", moon)
-        self.assertIn("--game-max-acceleration 90.0", moon)
-        self.assertIn("--game-max-deceleration 90.0", moon)
-        self.assertIn("--game-max-turn-rate 2.40", moon)
+        self.assertNotIn("moon-v1 locomotion policy override", moon)
+        self.assertNotIn("--game-max-acceleration 90.0", moon)
         self.assertIn(
-            'exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 '
-            '"${BFM_GAME_ARGS[@]}" "$@"',
+            'exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"',
             moon,
         )
         self.assertIn("visual MoonWorld does not by itself prove", moon)
         self.assertNotIn("run_sim.sh", moon)
         self.assertNotIn("androidtwin", moon.lower())
+        self.assertIn(
+            '"$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k"',
+            generic,
+        )
+        self.assertIn("GAME_MAX_ACCELERATION=90.0", generic)
+        self.assertIn("GAME_MAX_DECELERATION=90.0", generic)
+        self.assertIn("GAME_MAX_TURN_RATE=2.40", generic)
 
     def test_house_launcher_is_a_thin_primary_launcher_wrapper(self) -> None:
         house = (

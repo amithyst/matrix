@@ -418,6 +418,25 @@ class OuterLauncherSnapshotGateIntegrationTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         shutil.copy2(SCRIPT_DIR / "run_matrix_bfm_isaac.sh", scripts)
         shutil.copy2(SCRIPT_DIR / "matrix_bfm_isaac_path_guard.py", scripts)
+        shutil.copy2(SCRIPT_DIR / "matrix_bfm_isaac_video_settings.py", scripts)
+        self.write(
+            scripts / "build_matrix_ue_material_fix.sh",
+            """#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == *"--expected-sha256"* ]]
+[[ "$*" == *"--expected-ue-build-id"* ]]
+[[ "$*" == *"--verify-only"* ]]
+""",
+            executable=True,
+        )
+        video_settings = (
+            project / "config/runtime/matrix-bfm-isaac-video-settings.json"
+        )
+        video_settings.parent.mkdir(parents=True)
+        shutil.copy2(
+            REPO_ROOT / "config/runtime/matrix-bfm-isaac-video-settings.json",
+            video_settings,
+        )
         self.write(
             scripts / "matrix_local_env.sh",
             """#!/usr/bin/env bash
@@ -590,6 +609,18 @@ Path(os.environ["FAKE_PHYSICS_DONE"]).write_text("done\\n", encoding="utf-8")
         )
 
         lock = {
+            "ue_material_bridge": {
+                "relative_path": (
+                    "outputs/runtime/matrix-ue-material-fix/"
+                    "libmatrix_ue_material_fix.so"
+                ),
+                "sha256": "9f64dd949bd44be61a11dcbbe3e5a49f6ef6f6f318c4771a24385e9781840b96",
+                "ue_binary_relative_path": (
+                    "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/"
+                    "zsibot_mujoco_ue"
+                ),
+                "ue_binary_build_id": "056e17b8675b1006",
+            },
             "scene_collision_contract": {
                 "scene_id": 15,
                 "runtime_config_suffix": "configs/alienware/moon-matrix.toml",
@@ -604,7 +635,7 @@ Path(os.environ["FAKE_PHYSICS_DONE"]).write_text("done\\n", encoding="utf-8")
             "scene_assets": {"collision_usd": "collision.usda"},
         }
         lock_path = project / "config/runtime/matrix-bfm-isaac.lock.json"
-        lock_path.parent.mkdir(parents=True)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path.write_text(json.dumps(lock), encoding="utf-8")
 
         evidence = root / "evidence"
@@ -640,7 +671,57 @@ Path(os.environ["FAKE_PHYSICS_DONE"]).write_text("done\\n", encoding="utf-8")
             "MATRIX_BFM_ISAAC_VISUAL_VENV": os.fspath(visual_venv),
             "MATRIX_INSTANCE_ID": f"outer-{residual_kind}",
         }
+        environment.pop("MATRIX_UE_EXTRA_EXEC_CMDS", None)
+        environment.pop("MATRIX_UE_MATERIAL_FIX_PRELOAD", None)
         return project, environment, evidence
+
+    def test_qualified_launcher_rejects_generic_video_and_material_overrides(
+        self,
+    ) -> None:
+        for variable, value, expected_error in (
+            (
+                "MATRIX_UE_EXTRA_EXEC_CMDS",
+                "t.MaxFPS 1,r.ScreenPercentage 1",
+                "rejects MATRIX_UE_EXTRA_EXEC_CMDS",
+            ),
+            (
+                "MATRIX_UE_MATERIAL_FIX_PRELOAD",
+                "off",
+                "rejects material bridge overrides",
+            ),
+            (
+                "MATRIX_UE_MATERIAL_FIX_PRELOAD",
+                "/tmp/unreviewed.so",
+                "rejects material bridge overrides",
+            ),
+        ):
+            with self.subTest(variable=variable, value=value), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                project, environment, evidence = self.make_project(
+                    root, residual_kind="clean-exit70"
+                )
+                environment[variable] = value
+
+                result = subprocess.run(
+                    (
+                        "bash",
+                        os.fspath(project / "scripts/run_matrix_bfm_isaac.sh"),
+                        "smoke",
+                        "--run-dir",
+                        os.fspath(evidence),
+                    ),
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(evidence.exists())
+                self.assertFalse(Path(environment["FAKE_PHYSICS_DONE"]).exists())
 
     def test_physics_first_residual_or_symlink_snapshot_forces_outer_exit70(
         self,

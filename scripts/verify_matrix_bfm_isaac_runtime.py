@@ -25,10 +25,13 @@ except ModuleNotFoundError:  # Python 3.10 host bootstrap path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCK = REPO_ROOT / "config/runtime/matrix-bfm-isaac.lock.json"
 RELAY_STATUS_SCHEMA = "matrix_bfm_isaac_relay_status.v1"
-ACCEPTANCE_SCHEMA = "matrix_bfm_isaac_acceptance.v1"
+ACCEPTANCE_SCHEMA = "matrix_bfm_isaac_acceptance.v2"
+RUNTIME_VERIFICATION_SCHEMA = "matrix_bfm_isaac_runtime_verification.v1"
+VIDEO_SETTINGS_SCHEMA = "matrix_bfm_isaac_video_settings.v1"
 VISUAL_VENV_MARKER_SCHEMA = "matrix_bfm_isaac_visual_venv.v1"
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+BUILD_ID_PATTERN = re.compile(r"[0-9a-f]{16,64}")
 REQUIREMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]+)==([A-Za-z0-9_.+]+)")
 
 EXPECTED_MATRIX_JOINT_ORDER = (
@@ -209,6 +212,7 @@ def validate_schema(lock: dict[str, Any]) -> None:
             "schema_version",
             "runtime_id",
             "matrix_port",
+            "ue_material_bridge",
             "leo_release",
             "bfm_runtime",
             "isaac_runtime",
@@ -225,7 +229,7 @@ def validate_schema(lock: dict[str, Any]) -> None:
         },
         "lock",
     )
-    if lock["schema_version"] != 4:
+    if lock["schema_version"] != 5:
         raise ValueError("unsupported matrix-bfm-isaac lock schema")
     if lock["runtime_id"] != "matrix-bfm-isaac-sync-world16-v1":
         raise ValueError("unexpected runtime_id")
@@ -260,18 +264,61 @@ def validate_schema(lock: dict[str, Any]) -> None:
             f"matrix_port.critical_files[{index}].sha256",
         )
     required_matrix_critical = {
+        "config/hosts/heyuan.env",
         "config/hosts/trna.env",
+        "config/hosts/zza.env",
         "config/runtime/matrix-bfm-isaac-bootstrap-state.json",
+        "config/runtime/matrix-bfm-isaac-video-settings.json",
+        "scripts/bootstrap_matrix_bfm_isaac.sh",
+        "scripts/build_matrix_ue_material_fix.sh",
+        "scripts/launch_matrix_sonic_desktop.sh",
         "scripts/matrix_bfm_isaac_checkout_snapshot.py",
+        "scripts/matrix_bfm_isaac_video_settings.py",
+        "scripts/run_matrix_sonic.sh",
+        "scripts/run_matrix_sonic_moon_v1.sh",
         "scripts/run_custom_urdf.sh",
         "scripts/run_sim.sh",
         "scripts/run_matrix_bfm_isaac.sh",
         "scripts/run_matrix_bfm_isaac_guarded.sh",
         "scripts/matrix_external_state_relay.py",
         "scripts/verify_matrix_bfm_isaac_runtime.py",
+        "src/ue_shims/matrix_ue_material_fix.c",
     }
     if not required_matrix_critical.issubset(matrix_critical_paths):
         raise ValueError("matrix_port critical closure is incomplete")
+
+    material_bridge = lock["ue_material_bridge"]
+    if not isinstance(material_bridge, dict):
+        raise ValueError("ue_material_bridge must be an object")
+    _require_exact_keys(
+        material_bridge,
+        {
+            "relative_path",
+            "sha256",
+            "ue_binary_relative_path",
+            "ue_binary_build_id",
+        },
+        "ue_material_bridge",
+    )
+    if (
+        material_bridge["relative_path"]
+        != "outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
+        or not _safe_relative_path(material_bridge["relative_path"])
+    ):
+        raise ValueError("unexpected UE material bridge path")
+    if (
+        material_bridge["ue_binary_relative_path"]
+        != "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/"
+        "zsibot_mujoco_ue"
+        or not _safe_relative_path(material_bridge["ue_binary_relative_path"])
+    ):
+        raise ValueError("unexpected Matrix UE binary path")
+    _require_sha(material_bridge["sha256"], "ue_material_bridge.sha256")
+    build_id = material_bridge["ue_binary_build_id"]
+    if not isinstance(build_id, str) or BUILD_ID_PATTERN.fullmatch(build_id) is None:
+        raise ValueError("ue_material_bridge.ue_binary_build_id is invalid")
+    if build_id != "056e17b8675b1006":
+        raise ValueError("unexpected Matrix UE Build ID")
 
     release = lock["leo_release"]
     if not isinstance(release, dict):
@@ -952,6 +999,100 @@ def verify_matrix_port(
             )
         )
     return checks, actual_commit
+
+
+def verify_ue_material_bridge(
+    lock: dict[str, Any], matrix_root: Path, candidate: Path
+) -> tuple[list[Check], dict[str, object]]:
+    """Verify the exact bridge bytes and Matrix UE executable identity."""
+
+    bridge = lock["ue_material_bridge"]
+    expected_path = Path(
+        os.path.abspath(matrix_root / bridge["relative_path"])
+    )
+    candidate_path = Path(os.path.abspath(candidate))
+    checks = [
+        Check(
+            "ue_material_bridge_path",
+            candidate_path == expected_path,
+            f"expected={expected_path} actual={candidate_path}",
+        )
+    ]
+    actual_sha256: str | None = None
+    regular = candidate_path.is_file() and not candidate_path.is_symlink()
+    checks.append(
+        Check(
+            "ue_material_bridge_regular_file",
+            regular,
+            str(candidate_path),
+        )
+    )
+    checks.append(
+        Check(
+            "ue_material_bridge_executable",
+            regular and os.access(candidate_path, os.X_OK),
+            str(candidate_path),
+        )
+    )
+    if regular:
+        actual_sha256 = sha256_file(candidate_path)
+    checks.append(
+        Check(
+            "ue_material_bridge_sha256",
+            actual_sha256 == bridge["sha256"],
+            f"expected={bridge['sha256']} actual={actual_sha256}",
+        )
+    )
+
+    ue_binary = matrix_root / bridge["ue_binary_relative_path"]
+    actual_build_id: str | None = None
+    ue_binary_regular = ue_binary.is_file() and not ue_binary.is_symlink()
+    checks.append(
+        Check(
+            "matrix_ue_binary_regular_file",
+            ue_binary_regular,
+            str(ue_binary),
+        )
+    )
+    if ue_binary_regular:
+        try:
+            readelf = subprocess.run(
+                ("readelf", "-n", str(ue_binary)),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            checks.append(Check("matrix_ue_binary_build_id", False, str(exc)))
+        else:
+            match = re.search(r"Build ID:\s*([0-9a-f]+)", readelf.stdout)
+            actual_build_id = match.group(1) if match is not None else None
+            checks.append(
+                Check(
+                    "matrix_ue_binary_build_id",
+                    actual_build_id == bridge["ue_binary_build_id"],
+                    f"expected={bridge['ue_binary_build_id']} "
+                    f"actual={actual_build_id}",
+                )
+            )
+    else:
+        checks.append(
+            Check(
+                "matrix_ue_binary_build_id",
+                False,
+                "Matrix UE executable missing or symlink",
+            )
+        )
+    evidence = {
+        "relative_path": bridge["relative_path"],
+        "sha256": actual_sha256,
+        "expected_sha256": bridge["sha256"],
+        "ue_binary_relative_path": bridge["ue_binary_relative_path"],
+        "ue_binary_build_id": actual_build_id,
+        "expected_ue_binary_build_id": bridge["ue_binary_build_id"],
+    }
+    return checks, evidence
 
 
 def verify_isaac_runtime(
@@ -2368,6 +2509,81 @@ def _load_json_object(path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
+def load_resolved_video_settings(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"resolved video settings must be a regular file: {path}")
+    if path.stat().st_size > 16 * 1024:
+        raise ValueError("resolved video settings exceed the size limit")
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate resolved video field: {key}")
+            value[key] = item
+        return value
+
+    payload = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=strict_object
+    )
+    if not isinstance(payload, dict):
+        raise ValueError("resolved video settings must be a JSON object")
+    expected_keys = {
+        "schema",
+        "resolution",
+        "resolution_width",
+        "resolution_height",
+        "window_mode",
+        "fps_limit",
+        "quality",
+        "camera_smoothing",
+        "screen_percentage",
+    }
+    _require_exact_keys(payload, expected_keys, "resolved_video_settings")
+    if payload["schema"] != VIDEO_SETTINGS_SCHEMA:
+        raise ValueError("unexpected resolved video settings schema")
+    resolutions = {
+        "1280x720": (1280, 720),
+        "1600x900": (1600, 900),
+        "1920x1080": (1920, 1080),
+        "2560x1440": (2560, 1440),
+    }
+    resolution = payload["resolution"]
+    if not isinstance(resolution, str) or resolution not in resolutions:
+        raise ValueError("resolved video resolution is not allowed")
+    width = payload["resolution_width"]
+    height = payload["resolution_height"]
+    if (
+        not isinstance(width, int)
+        or isinstance(width, bool)
+        or not isinstance(height, int)
+        or isinstance(height, bool)
+        or (width, height) != resolutions[resolution]
+    ):
+        raise ValueError("resolved video dimensions disagree with resolution")
+    fps_limit = payload["fps_limit"]
+    screen_percentage = payload["screen_percentage"]
+    if (
+        not isinstance(fps_limit, int)
+        or isinstance(fps_limit, bool)
+        or fps_limit not in {30, 60, 90, 120}
+    ):
+        raise ValueError("resolved video FPS is not allowed")
+    if (
+        not isinstance(screen_percentage, int)
+        or isinstance(screen_percentage, bool)
+        or not 25 <= screen_percentage <= 200
+    ):
+        raise ValueError("resolved video screen percentage is not allowed")
+    if payload["window_mode"] not in {"windowed", "borderless", "fullscreen"}:
+        raise ValueError("resolved video window mode is not allowed")
+    if payload["quality"] not in {"low", "medium", "high", "epic"}:
+        raise ValueError("resolved video quality is not allowed")
+    if payload["camera_smoothing"] not in {"off", "low", "medium", "high"}:
+        raise ValueError("resolved video camera smoothing is not allowed")
+    return payload
+
+
 def _print_checks(checks: Iterable[Check]) -> None:
     for check in checks:
         print(
@@ -2389,8 +2605,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--visual-wheelhouse", type=Path)
     parser.add_argument("--visual-venv", type=Path)
     parser.add_argument("--matrix-visual-root", type=Path)
+    parser.add_argument("--material-bridge", type=Path)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--relay-status", type=Path)
+    parser.add_argument("--video-settings", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--correctness-only",
@@ -2403,8 +2621,42 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if (args.report is None) != (args.relay_status is None):
-        parser.error("--report and --relay-status must be supplied together")
+    evidence_paths = (args.report, args.relay_status, args.video_settings)
+    evidence_requested = any(path is not None for path in evidence_paths)
+    if evidence_requested and not all(
+        path is not None for path in evidence_paths
+    ):
+        parser.error(
+            "--report, --relay-status, and --video-settings must be supplied together"
+        )
+    if evidence_requested:
+        required_runtime_closure = {
+            "--matrix-root": args.matrix_root,
+            "--runtime-root": args.runtime_root,
+            "--runtime-python": args.runtime_python,
+            "--physics-asset-root": args.physics_asset_root,
+            "--collision-root": args.collision_root,
+            "--teacher-profile": args.teacher_profile,
+            "--visual-venv": args.visual_venv,
+            "--matrix-visual-root": args.matrix_visual_root,
+            "--material-bridge": args.material_bridge,
+        }
+        missing = [
+            option
+            for option, value in required_runtime_closure.items()
+            if value is None
+        ]
+        if missing:
+            parser.error(
+                "acceptance evidence requires the complete runtime closure; "
+                f"missing: {', '.join(missing)}"
+            )
+    elif args.output is not None or args.correctness_only:
+        parser.error(
+            "--output and --correctness-only require complete acceptance evidence"
+        )
+    if args.material_bridge is not None and args.matrix_root is None:
+        parser.error("--material-bridge requires --matrix-root")
     try:
         lock = load_lock(args.lock)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -2424,8 +2676,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.visual_wheelhouse,
                 args.visual_venv,
                 args.matrix_visual_root,
+                args.material_bridge,
                 args.report,
                 args.relay_status,
+                args.video_settings,
                 args.output,
             )
         ) or args.correctness_only:
@@ -2434,6 +2688,8 @@ def main(argv: list[str] | None = None) -> int:
 
     checks: list[Check] = []
     matrix_commit: str | None = None
+    material_bridge_evidence: dict[str, object] | None = None
+    resolved_video_settings: dict[str, Any] | None = None
     if args.matrix_root is not None:
         matrix_checks, matrix_commit = verify_matrix_port(
             lock, args.matrix_root.resolve()
@@ -2481,9 +2737,20 @@ def main(argv: list[str] | None = None) -> int:
                 args.matrix_visual_root.resolve(),
             )
         )
+    if args.material_bridge is not None:
+        bridge_checks, material_bridge_evidence = verify_ue_material_bridge(
+            lock,
+            args.matrix_root.resolve(),
+            args.material_bridge,
+        )
+        checks.extend(bridge_checks)
 
     metrics: dict[str, float | int | None] = {}
-    if args.report is not None and args.relay_status is not None:
+    if (
+        args.report is not None
+        and args.relay_status is not None
+        and args.video_settings is not None
+    ):
         try:
             report = _load_json_object(args.report, "runtime report")
             relay = _load_json_object(args.relay_status, "relay status")
@@ -2492,6 +2759,28 @@ def main(argv: list[str] | None = None) -> int:
         else:
             evidence_checks, metrics = verify_evidence(lock, report, relay)
             checks.extend(evidence_checks)
+        try:
+            resolved_video_settings = load_resolved_video_settings(
+                args.video_settings
+            )
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            checks.append(
+                Check(
+                    "resolved_video_settings",
+                    False,
+                    str(exc),
+                    "correctness",
+                )
+            )
+        else:
+            checks.append(
+                Check(
+                    "resolved_video_settings",
+                    True,
+                    json.dumps(resolved_video_settings, sort_keys=True),
+                    "correctness",
+                )
+            )
 
     if not checks:
         print("[INFO] No runtime checkout or evidence was requested")
@@ -2509,10 +2798,16 @@ def main(argv: list[str] | None = None) -> int:
         and manual_ok
     )
     result: dict[str, object] = {
-        "schema": ACCEPTANCE_SCHEMA,
+        "schema": (
+            ACCEPTANCE_SCHEMA
+            if evidence_requested
+            else RUNTIME_VERIFICATION_SCHEMA
+        ),
         "runtime_id": lock["runtime_id"],
         "matrix_commit": matrix_commit,
         "runtime_lock_sha256": sha256_file(args.lock),
+        "ue_material_bridge": material_bridge_evidence,
+        "resolved_video_settings": resolved_video_settings,
         "runtime_ok": runtime_ok,
         "correctness_ok": correctness_ok,
         "realtime_ok": realtime_ok,

@@ -1,13 +1,21 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "runtime_id": "matrix-bfm-isaac-sync-world16-v1",
   "matrix_port": {
     "repository": "https://github.com/amithyst/matrix",
     "base_commit": "550fb5bf2cbea4205e6d8b6817815b6fa5188b8b",
     "critical_files": [
       {
+        "path": "config/hosts/heyuan.env",
+        "sha256": "4065805eafe81eca24f643eb05faf055f18bb5cb48caf9690e6fa87f47b6e76d"
+      },
+      {
         "path": "config/hosts/trna.env",
-        "sha256": "ded1e50401570b909485a16a493ec19006b2b8b85ad9efbcf829d8a0731a3ad9"
+        "sha256": "c6e45bedcbec14081b2f43f5d0c2e33e77bb246dbd886601012d626c5c5fbd57"
+      },
+      {
+        "path": "config/hosts/zza.env",
+        "sha256": "46b49031391bcc28b0013f7ebedef01715abfef834928669717519e266592e8a"
       },
       {
         "path": "config/materials/matrix_g1_stock_v1.json",
@@ -18,8 +26,20 @@
         "sha256": "ac4deda28d6f5f50af182182246759aa9ce7a5b16994fca547c8aa75a474ccaa"
       },
       {
+        "path": "config/runtime/matrix-bfm-isaac-video-settings.json",
+        "sha256": "4bd4c08de19f1d267e318cb3cf0e3cdbfceb5ac120bcfa77e9e9dbeadbd5f1ac"
+      },
+      {
         "path": "scripts/apply_urdf_visual_materials.py",
         "sha256": "bee21a5f9f7927c9c1e5ceedc37bd6c2eeb0cb5509ef3341295106154c26ee6b"
+      },
+      {
+        "path": "scripts/bootstrap_matrix_bfm_isaac.sh",
+        "sha256": "192de19530ed0a3156f9e2b43b3a0a3f1a8e9e86b3ccbb1a234bc8965b065d81"
+      },
+      {
+        "path": "scripts/build_matrix_ue_material_fix.sh",
+        "sha256": "1c3161bfdf7fe9f67eb88f982bc6c62fdfa587e3b97b7bded201b81ecf2451ad"
       },
       {
         "path": "scripts/check_env.sh",
@@ -27,7 +47,7 @@
       },
       {
         "path": "scripts/launch_matrix_sonic_desktop.sh",
-        "sha256": "9723acb9f7c220ec7e9a04d615b5797479cebd849535df354b1ab3f5424af1b3"
+        "sha256": "01abb125958fde5e1415392aba37c913a62372c912e3d267e0b11b5e8d6085b3"
       },
       {
         "path": "scripts/matrix_bfm_isaac_command.py",
@@ -54,6 +74,10 @@
         "sha256": "5cc11feadc92850fb5eea129b58f0c7eef57892234e6bb13fe62372b0200714c"
       },
       {
+        "path": "scripts/matrix_bfm_isaac_video_settings.py",
+        "sha256": "af9a2be40b0a875e26f0f23b717ba811af2baba8f387476534189f9b4b6ebd9b"
+      },
+      {
         "path": "scripts/matrix_external_state_relay.py",
         "sha256": "7d5503ad19a3a1c5b2bb9c303c541f0df551f7bf2bf38019622c093b5cb9f26f"
       },
@@ -75,7 +99,7 @@
       },
       {
         "path": "scripts/run_matrix_bfm_isaac.sh",
-        "sha256": "5fe1bd03de48626295c099216e2d64d5d4591302f372b2dc31d2874139d5f6cc"
+        "sha256": "59c8914b59ac4419c1956faa420f5afe25939f24bbd0f69dc55515d334241151"
       },
       {
         "path": "scripts/run_matrix_bfm_isaac_guarded.sh",
@@ -94,8 +118,16 @@
         "sha256": "0410bc266182019b81e2f120405beea3f4b0eddfca1ea77638a40b6edad15c3d"
       },
       {
+        "path": "scripts/run_matrix_sonic.sh",
+        "sha256": "b3ad31e0b5ae38ecccf4019674a3b1c17b84b017fc56f4eb25d04458d2131e5b"
+      },
+      {
+        "path": "scripts/run_matrix_sonic_moon_v1.sh",
+        "sha256": "6e96d4156587b63c97805f277cac000e8cd70fb3fa1a99af3fb4cc1ca9052b8f"
+      },
+      {
         "path": "scripts/run_sim.sh",
-        "sha256": "220c7f6cda77a4461dcb65534a029191badd556e73ceb2b8dc9f98a4a3526548"
+        "sha256": "ed135be22a96dc626b2c50cd1769acf61a9004579f9b5670575765de330aa85f"
       },
       {
         "path": "scripts/stop_matrix_bfm_isaac_instance.sh",
@@ -111,9 +143,19 @@
       },
       {
         "path": "scripts/verify_matrix_bfm_isaac_runtime.py",
-        "sha256": "51b4915f95ea73484d43ed174aa3f417fa925dea436adc73cf7ff611bc485776"
+        "sha256": "98cdec63e55f192b6fafdbee1c5f282ca899bbbce1b930ade7504ac70742337f"
+      },
+      {
+        "path": "src/ue_shims/matrix_ue_material_fix.c",
+        "sha256": "6fae43ccf4f4fb3119fdebdc2f24f3965ababfba1cc35acff39af0c02c9243fb"
       }
     ]
+  },
+  "ue_material_bridge": {
+    "relative_path": "outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so",
+    "sha256": "9f64dd949bd44be61a11dcbbe3e5a49f6ef6f6f318c4771a24385e9781840b96",
+    "ue_binary_relative_path": "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/zsibot_mujoco_ue",
+    "ue_binary_build_id": "056e17b8675b1006"
   },
   "leo_release": {
     "integration_repository": "ssh://git@gitlab.xvirobotics.com:2222/bfms/matrix-bfm-sonic-clean.git",
@@ -123,7 +165,7 @@
   },
   "bfm_runtime": {
     "repository": "ssh://git@gitlab.xvirobotics.com:2222/bfms/bfm-sonic-realscan-play.git",
-    "commit": "ec3279aa78d5631ce37719778d5e39330c177cb6",
+    "commit": "8ca3a4aba5cf90b006101e6e7169f37581be941b",
     "critical_files": [
       {
         "path": "scripts/run_g1_teacher_closed_loop.py",
@@ -147,7 +189,7 @@
       },
       {
         "path": "src/bfm_sonic_realscan_play/robo_pfnn_reference.py",
-        "sha256": "bd645970054cfc55dfb31e3bef42dd2b77413ec809a11d2321c0f0d4e2adafe5"
+        "sha256": "7fc5d1712cd3fe4fa60a055dbcee355f983a8139cd427c9cbc62db58d9c4b68f"
       },
       {
         "path": "src/bfm_sonic_realscan_play/teacher_onnx.py",

@@ -191,8 +191,6 @@ esac
                     "trna",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "bfm-sonic-teacher50k",
                     "--game-fall-recovery",
                     "auto",
                 ]
@@ -206,8 +204,6 @@ esac
                     "trna",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "bfm-sonic-teacher50k",
                     "--game-fall-recovery",
                     "auto",
                 ]
@@ -241,7 +237,7 @@ esac
             1,
         )
 
-    def test_explicit_moon_scene_uses_bfm_runtime(self) -> None:
+    def test_moon_scene_does_not_inject_trna_policy_into_heyuan(self) -> None:
         result = self.run_launcher(
             "start", "--profile", "heyuan", "--scene", "15"
         )
@@ -255,8 +251,6 @@ esac
                     "heyuan",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "bfm-sonic-teacher50k",
                     "--game-fall-recovery",
                     "auto",
                 ]
@@ -284,10 +278,10 @@ esac
                     "trna",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "sonic",
                     "--game-fall-recovery",
                     "auto",
+                    "--initial-locomotion-policy",
+                    "sonic",
                 ]
             ],
         )
@@ -306,10 +300,10 @@ esac
                     "trna",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "sonic",
                     "--game-fall-recovery",
                     "auto",
+                    "--initial-locomotion-policy",
+                    "sonic",
                 ]
             ],
         )
@@ -360,8 +354,6 @@ esac
                 "heyuan",
                 "--control-source",
                 "game",
-                "--initial-locomotion-policy",
-                "bfm-sonic-teacher50k",
                 "--game-fall-recovery",
                 "auto",
             ],

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -207,6 +208,84 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
             },
         }
 
+    def resolved_video_settings(self) -> dict[str, object]:
+        return {
+            "schema": MODULE.VIDEO_SETTINGS_SCHEMA,
+            "resolution": "1280x720",
+            "resolution_width": 1280,
+            "resolution_height": 720,
+            "window_mode": "borderless",
+            "fps_limit": 30,
+            "quality": "low",
+            "camera_smoothing": "medium",
+            "screen_percentage": 100,
+        }
+
+    def acceptance_runtime_args(self, root: Path) -> list[str]:
+        return [
+            "--matrix-root",
+            str(root / "matrix"),
+            "--runtime-root",
+            str(root / "runtime"),
+            "--runtime-python",
+            str(root / "isaac/bin/python"),
+            "--physics-asset-root",
+            str(root / "physics"),
+            "--collision-root",
+            str(root / "collision"),
+            "--teacher-profile",
+            str(root / "teacher-profile.toml"),
+            "--visual-venv",
+            str(root / "visual-venv"),
+            "--matrix-visual-root",
+            str(root / "matrix-visual"),
+            "--material-bridge",
+            str(
+                root
+                / "matrix"
+                / self.lock["ue_material_bridge"]["relative_path"]
+            ),
+        ]
+
+    def acceptance_verifier_patches(self) -> mock._patch:
+        runtime_check = [MODULE.Check("fixture_runtime", True, "verified")]
+        return mock.patch.multiple(
+            MODULE,
+            verify_matrix_port=mock.Mock(
+                return_value=(runtime_check, "a" * 40)
+            ),
+            verify_runtime_checkout=mock.Mock(return_value=runtime_check),
+            verify_isaac_runtime=mock.Mock(return_value=runtime_check),
+            verify_physics_assets=mock.Mock(return_value=runtime_check),
+            verify_scene_assets=mock.Mock(return_value=runtime_check),
+            verify_teacher_profile=mock.Mock(return_value=runtime_check),
+            verify_visual_venv=mock.Mock(return_value=runtime_check),
+            verify_matrix_visual=mock.Mock(return_value=runtime_check),
+            verify_ue_material_bridge=mock.Mock(
+                return_value=(
+                    runtime_check,
+                    {
+                        "relative_path": self.lock["ue_material_bridge"][
+                            "relative_path"
+                        ],
+                        "sha256": self.lock["ue_material_bridge"]["sha256"],
+                        "expected_sha256": self.lock["ue_material_bridge"][
+                            "sha256"
+                        ],
+                        "ue_binary_relative_path": self.lock[
+                            "ue_material_bridge"
+                        ]["ue_binary_relative_path"],
+                        "ue_binary_build_id": self.lock["ue_material_bridge"][
+                            "ue_binary_build_id"
+                        ],
+                        "expected_ue_binary_build_id": self.lock[
+                            "ue_material_bridge"
+                        ]["ue_binary_build_id"],
+                    },
+                )
+            ),
+        )
+
     def test_lock_pins_matrix_order_and_isaaclab_source_indices(self) -> None:
         locked_order = tuple(self.lock["wire_contract"]["joint_order"])
         self.assertEqual(locked_order, MATRIX_MUJOCO_JOINT_ORDER)
@@ -241,21 +320,98 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
             launcher,
         )
 
-    def test_co_resident_renderer_uses_leos_30_fps_cap(self) -> None:
+    def test_co_resident_renderer_uses_locked_isolated_video_contract(self) -> None:
         launcher = (REPO_ROOT / "scripts/run_matrix_bfm_isaac.sh").read_text(
             encoding="utf-8"
         )
-        profile = (REPO_ROOT / "config/hosts/trna.env").read_text(
+        run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(
             encoding="utf-8"
         )
+        settings = json.loads(
+            (
+                REPO_ROOT
+                / "config/runtime/matrix-bfm-isaac-video-settings.json"
+            ).read_text(encoding="utf-8")
+        )
 
-        self.assertIn("MATRIX_BFM_ISAAC_UE_MAX_FPS:-30", profile)
+        self.assertEqual(
+            settings,
+            {
+                "schema": "matrix_bfm_isaac_video_settings.v1",
+                "resolution": "1280x720",
+                "window_mode": "borderless",
+                "fps_limit": 30,
+                "quality": "low",
+                "camera_smoothing": "medium",
+                "screen_percentage": 100,
+            },
+        )
+        for variable in (
+            "MATRIX_VIDEO_APPLIED_WIDTH",
+            "MATRIX_VIDEO_APPLIED_HEIGHT",
+            "MATRIX_VIDEO_APPLIED_WINDOW_MODE",
+            "MATRIX_VIDEO_APPLIED_FPS_LIMIT",
+            "MATRIX_VIDEO_APPLIED_QUALITY",
+            "MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING",
+            "MATRIX_VIDEO_APPLIED_REVISION",
+            "MATRIX_VIDEO_APPLIED_JSON",
+        ):
+            self.assertIn(f"-u {variable}", launcher)
+            self.assertIn(variable, run_sim)
+        self.assertIn("MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED=1", launcher)
         self.assertIn(
-            'BFM_ISAAC_UE_MAX_FPS="${MATRIX_BFM_ISAAC_UE_MAX_FPS:-30}"',
+            'MATRIX_BFM_ISAAC_RENDER_SCREEN_PERCENTAGE="$BFM_VIDEO_SCREEN_PERCENTAGE"',
             launcher,
         )
-        self.assertIn("env -u MATRIX_VIDEO_APPLIED_FPS_LIMIT", launcher)
-        self.assertIn('MATRIX_UE_MAX_FPS="$BFM_ISAAC_UE_MAX_FPS"', launcher)
+        self.assertNotIn("OPERATOR_UE_EXTRA_EXEC_CMDS", launcher)
+        self.assertIn(
+            "Qualified BFM/Isaac rejects MATRIX_UE_EXTRA_EXEC_CMDS",
+            launcher,
+        )
+        self.assertIn("Generic video state reached the locked BFM renderer", run_sim)
+        self.assertIn(
+            'UE_EXEC_CMDS="${UE_EXEC_CMDS},r.ScreenPercentage '
+            '${VIDEO_SCREEN_PERCENTAGE}"',
+            run_sim,
+        )
+        self.assertIn("resolved-video-settings.json", launcher)
+        self.assertIn('--video-settings "$RESOLVED_VIDEO_SETTINGS"', launcher)
+
+    def test_material_bridge_contract_is_pinned_and_verified_by_launcher(self) -> None:
+        launcher = (REPO_ROOT / "scripts/run_matrix_bfm_isaac.sh").read_text(
+            encoding="utf-8"
+        )
+        bootstrap = (
+            REPO_ROOT / "scripts/bootstrap_matrix_bfm_isaac.sh"
+        ).read_text(encoding="utf-8")
+        bridge = self.lock["ue_material_bridge"]
+
+        self.assertEqual(
+            bridge,
+            {
+                "relative_path": (
+                    "outputs/runtime/matrix-ue-material-fix/"
+                    "libmatrix_ue_material_fix.so"
+                ),
+                "sha256": (
+                    "9f64dd949bd44be61a11dcbbe3e5a49f6ef6f6f318c4771a24385e9781840b96"
+                ),
+                "ue_binary_relative_path": (
+                    "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/"
+                    "zsibot_mujoco_ue"
+                ),
+                "ue_binary_build_id": "056e17b8675b1006",
+            },
+        )
+        for source in (launcher, bootstrap):
+            self.assertIn("--expected-sha256", source)
+            self.assertIn("--expected-ue-build-id", source)
+        self.assertIn('--material-bridge "$MATERIAL_BRIDGE_PATH"', launcher)
+        self.assertIn(
+            'MATRIX_UE_MATERIAL_FIX_PRELOAD="$MATERIAL_BRIDGE_PATH"',
+            launcher,
+        )
+        self.assertIn("rejects material bridge overrides", launcher)
 
     def test_runtime_checkout_rejects_untracked_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -455,6 +611,101 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "lowercase SHA256"):
             MODULE.validate_schema(mutated)
+
+    def test_schema_rejects_material_bridge_contract_drift(self) -> None:
+        mutations = (
+            ("relative_path", "outputs/runtime/alternate.so"),
+            ("sha256", "not-a-hash"),
+            ("ue_binary_relative_path", "src/UeSim/alternate"),
+            ("ue_binary_build_id", "0" * 16),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                mutated = copy.deepcopy(self.lock)
+                mutated["ue_material_bridge"][field] = value
+                with self.assertRaises(ValueError):
+                    MODULE.validate_schema(mutated)
+
+    def test_material_bridge_verifier_rejects_tamper_symlink_and_wrong_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "matrix"
+            bridge = root / self.lock["ue_material_bridge"]["relative_path"]
+            ue_binary = (
+                root
+                / self.lock["ue_material_bridge"]["ue_binary_relative_path"]
+            )
+            bridge.parent.mkdir(parents=True)
+            ue_binary.parent.mkdir(parents=True)
+            bridge.write_bytes(b"audited bridge fixture")
+            bridge.chmod(0o755)
+            ue_binary.write_bytes(b"ue fixture")
+            lock = copy.deepcopy(self.lock)
+            lock["ue_material_bridge"]["sha256"] = MODULE.sha256_file(bridge)
+            readelf = subprocess.CompletedProcess(
+                args=("readelf",),
+                returncode=0,
+                stdout="    Build ID: 056e17b8675b1006\n",
+                stderr="",
+            )
+            with mock.patch.object(MODULE.subprocess, "run", return_value=readelf):
+                checks, evidence = MODULE.verify_ue_material_bridge(
+                    lock, root, bridge
+                )
+            self.assertTrue(all(check.ok for check in checks), checks)
+            self.assertEqual(evidence["sha256"], lock["ue_material_bridge"]["sha256"])
+
+            wrong_readelf = subprocess.CompletedProcess(
+                args=("readelf",),
+                returncode=0,
+                stdout=f"    Build ID: {'0' * 16}\n",
+                stderr="",
+            )
+            with mock.patch.object(
+                MODULE.subprocess, "run", return_value=wrong_readelf
+            ):
+                checks, _ = MODULE.verify_ue_material_bridge(lock, root, bridge)
+            self.assertFalse(
+                {check.name: check for check in checks}[
+                    "matrix_ue_binary_build_id"
+                ].ok
+            )
+
+            bridge.write_bytes(b"tampered")
+            with mock.patch.object(MODULE.subprocess, "run", return_value=readelf):
+                checks, _ = MODULE.verify_ue_material_bridge(lock, root, bridge)
+            self.assertFalse(
+                {check.name: check for check in checks}[
+                    "ue_material_bridge_sha256"
+                ].ok
+            )
+
+            bridge.unlink()
+            target = root / "target.so"
+            target.write_bytes(b"audited bridge fixture")
+            target.chmod(0o755)
+            bridge.symlink_to(target)
+            with mock.patch.object(MODULE.subprocess, "run", return_value=readelf):
+                checks, _ = MODULE.verify_ue_material_bridge(lock, root, bridge)
+            self.assertFalse(
+                {check.name: check for check in checks}[
+                    "ue_material_bridge_regular_file"
+                ].ok
+            )
+
+            alternate = root / "alternate.so"
+            alternate.write_bytes(b"audited bridge fixture")
+            alternate.chmod(0o755)
+            with mock.patch.object(MODULE.subprocess, "run", return_value=readelf):
+                checks, _ = MODULE.verify_ue_material_bridge(
+                    lock, root, alternate
+                )
+            self.assertFalse(
+                {check.name: check for check in checks}[
+                    "ue_material_bridge_path"
+                ].ok
+            )
 
     def test_repository_visual_lock_files_match_the_lock(self) -> None:
         checks = MODULE.verify_visual_lock_files(self.lock, REPO_ROOT)
@@ -741,12 +992,16 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
             root = Path(temporary)
             report_path = root / "report.json"
             relay_path = root / "relay.json"
+            video_path = root / "video.json"
             strict_output = root / "strict.json"
             diagnostic_output = root / "diagnostic.json"
             report_path.write_text(
                 json.dumps(self.runtime_report(wall_seconds=8.0)), encoding="utf-8"
             )
             relay_path.write_text(json.dumps(self.relay_status()), encoding="utf-8")
+            video_path.write_text(
+                json.dumps(self.resolved_video_settings()), encoding="utf-8"
+            )
             common = [
                 "--lock",
                 str(self.lock_path),
@@ -754,9 +1009,14 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
                 str(report_path),
                 "--relay-status",
                 str(relay_path),
+                "--video-settings",
+                str(video_path),
             ]
 
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            common += self.acceptance_runtime_args(root)
+            with self.acceptance_verifier_patches(), redirect_stdout(
+                io.StringIO()
+            ), redirect_stderr(io.StringIO()):
                 strict_exit = MODULE.main(common + ["--output", str(strict_output)])
                 diagnostic_exit = MODULE.main(
                     common
@@ -773,6 +1033,10 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
             self.assertTrue(strict["correctness_ok"])
             self.assertFalse(strict["realtime_ok"])
             self.assertFalse(strict["overall_ok"])
+            self.assertEqual(
+                strict["resolved_video_settings"], self.resolved_video_settings()
+            )
+            self.assertEqual(strict["schema"], MODULE.ACCEPTANCE_SCHEMA)
             self.assertEqual(diagnostic_exit, 0)
             self.assertTrue(diagnostic["correctness_ok"])
             self.assertFalse(diagnostic["realtime_ok"])
@@ -787,13 +1051,19 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
             report["schedule"] = None
             report_path = root / "report.json"
             relay_path = root / "relay.json"
+            video_path = root / "video.json"
             output_path = root / "acceptance.json"
             report_path.write_text(json.dumps(report), encoding="utf-8")
             relay_path.write_text(
                 json.dumps(self.relay_status()), encoding="utf-8"
             )
+            video_path.write_text(
+                json.dumps(self.resolved_video_settings()), encoding="utf-8"
+            )
 
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with self.acceptance_verifier_patches(), redirect_stdout(
+                io.StringIO()
+            ), redirect_stderr(io.StringIO()):
                 exit_code = MODULE.main(
                     [
                         "--lock",
@@ -802,6 +1072,9 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
                         str(report_path),
                         "--relay-status",
                         str(relay_path),
+                        "--video-settings",
+                        str(video_path),
+                        *self.acceptance_runtime_args(root),
                         "--output",
                         str(output_path),
                         "--correctness-only",
@@ -815,6 +1088,103 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
             self.assertFalse(acceptance["manual_ok"])
             self.assertTrue(acceptance["manual_review_required"])
             self.assertFalse(acceptance["overall_ok"])
+
+    def test_invalid_resolved_video_settings_fail_correctness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report.json"
+            relay_path = root / "relay.json"
+            video_path = root / "video.json"
+            output_path = root / "acceptance.json"
+            report_path.write_text(
+                json.dumps(self.runtime_report()), encoding="utf-8"
+            )
+            relay_path.write_text(
+                json.dumps(self.relay_status()), encoding="utf-8"
+            )
+            invalid = self.resolved_video_settings()
+            invalid["unknown"] = True
+            video_path.write_text(json.dumps(invalid), encoding="utf-8")
+
+            with self.acceptance_verifier_patches(), redirect_stdout(
+                io.StringIO()
+            ), redirect_stderr(io.StringIO()):
+                exit_code = MODULE.main(
+                    [
+                        "--lock",
+                        str(self.lock_path),
+                        "--report",
+                        str(report_path),
+                        "--relay-status",
+                        str(relay_path),
+                        "--video-settings",
+                        str(video_path),
+                        *self.acceptance_runtime_args(root),
+                        "--output",
+                        str(output_path),
+                    ]
+                )
+
+            acceptance = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(acceptance["correctness_ok"])
+            self.assertIsNone(acceptance["resolved_video_settings"])
+
+    def test_acceptance_evidence_rejects_an_incomplete_runtime_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report_path = root / "report.json"
+            relay_path = root / "relay.json"
+            video_path = root / "video.json"
+            report_path.write_text(
+                json.dumps(self.runtime_report()), encoding="utf-8"
+            )
+            relay_path.write_text(
+                json.dumps(self.relay_status()), encoding="utf-8"
+            )
+            video_path.write_text(
+                json.dumps(self.resolved_video_settings()), encoding="utf-8"
+            )
+
+            with redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    MODULE.main(
+                        [
+                            "--lock",
+                            str(self.lock_path),
+                            "--report",
+                            str(report_path),
+                            "--relay-status",
+                            str(relay_path),
+                            "--video-settings",
+                            str(video_path),
+                        ]
+                    )
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("complete runtime closure", stderr.getvalue())
+            self.assertIn("--material-bridge", stderr.getvalue())
+
+    def test_runtime_only_verification_cannot_write_an_acceptance_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_path = root / "acceptance.json"
+            with redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    MODULE.main(
+                        [
+                            "--lock",
+                            str(self.lock_path),
+                            "--runtime-root",
+                            str(root / "runtime"),
+                            "--output",
+                            str(output_path),
+                        ]
+                    )
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn(
+                "require complete acceptance evidence", stderr.getvalue()
+            )
+            self.assertFalse(output_path.exists())
 
 
 if __name__ == "__main__":

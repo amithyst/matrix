@@ -7,7 +7,7 @@ SESSION_NAME="matrix-sonic-desktop-${UID}"
 HOST_LOCK_PATH="${MATRIX_DESKTOP_HOST_LOCK_PATH:-/tmp/matrix-sonic-${UID}.lock}"
 PROFILE="heyuan"
 SCENE_ID="15"
-INITIAL_LOCOMOTION_POLICY="${MATRIX_INITIAL_LOCOMOTION_POLICY:-bfm-sonic-teacher50k}"
+INITIAL_LOCOMOTION_POLICY="${MATRIX_INITIAL_LOCOMOTION_POLICY:-}"
 ACTION="start"
 SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
 STOP_GRACE_SECONDS=60
@@ -27,11 +27,12 @@ Profiles: heyuan (default), trna, zza
 
 Options:
   --profile PROFILE  Host profile (default: heyuan)
-  --scene ID         Matrix native scene id (default: 15 / MoonWorld BFM)
+  --scene ID         Matrix native scene id (default: 15 / MoonWorld)
   --initial-locomotion-policy POLICY
-                     sonic or bfm-sonic-teacher50k (default: BFM Teacher50k)
+                     sonic or bfm-sonic-teacher50k
+                     (default: selected host profile; tRNA uses BFM Teacher50k)
 
-Scene 15 starts MoonWorld with BFM SONIC Teacher50k and profile-aware fall recovery.
+Scene 15 starts MoonWorld with the selected host profile's locomotion policy.
 Other scenes use the generic Matrix SONIC game-control launcher.
 EOF
 }
@@ -90,15 +91,21 @@ session_lock_directory() {
 run_with_session_lock() {
     local directory
     local flock_bin
+    local -a launcher_args
 
     flock_bin="$(command -v flock)" || die "flock is required"
     directory="$(session_lock_directory)"
+    launcher_args=(--profile "$PROFILE" --scene "$SCENE_ID")
+    if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+        launcher_args+=(
+            --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
+        )
+    fi
     umask 077
     MATRIX_DESKTOP_LAUNCHER_LOCKED=1 "$flock_bin" --exclusive --close \
         "$directory/matrix-sonic-desktop-${UID}.lock" \
         /usr/bin/bash "$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")" \
-        "$ACTION" --profile "$PROFILE" --scene "$SCENE_ID" \
-        --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
+        "$ACTION" "${launcher_args[@]}"
 }
 
 notify_user() {
@@ -215,7 +222,6 @@ start_session() {
         runtime_args=(
             --profile "$PROFILE"
             --control-source game
-            --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
             --game-fall-recovery auto
         )
     else
@@ -224,6 +230,11 @@ start_session() {
             --profile "$PROFILE"
             --scene "$SCENE_ID"
             --control-source game
+        )
+    fi
+    if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+        runtime_args+=(
+            --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
         )
     fi
     if [[ ! -f "$run_script" || ! -r "$run_script" ]]; then
@@ -393,7 +404,9 @@ done
 
 validate_profile "$PROFILE"
 validate_scene "$SCENE_ID"
-validate_initial_locomotion_policy "$INITIAL_LOCOMOTION_POLICY"
+if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+    validate_initial_locomotion_policy "$INITIAL_LOCOMOTION_POLICY"
+fi
 command -v tmux >/dev/null 2>&1 || die "tmux is required"
 
 if [[ "$SESSION_LOCK_HELD" != "1" \

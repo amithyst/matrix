@@ -145,6 +145,11 @@ if [[ -n "$PROFILE" ]]; then
     # shellcheck disable=SC1090
     source "$PROFILE_FILE"
 fi
+if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+    echo "[ERROR] Qualified BFM/Isaac rejects MATRIX_UE_EXTRA_EXEC_CMDS" >&2
+    echo "[ERROR] Use only the bounded MATRIX_BFM_ISAAC_* video overrides" >&2
+    exit 2
+fi
 
 LOCK_FILE="$PROJECT_ROOT/config/runtime/matrix-bfm-isaac.lock.json"
 PATH_GUARD="$SCRIPT_DIR/matrix_bfm_isaac_path_guard.py"
@@ -159,6 +164,43 @@ guard_path() {
     fi
     printf '%s\n' "$resolved"
 }
+
+readarray -t MATERIAL_BRIDGE_CONTRACT < <(python3 - "$LOCK_FILE" <<'PY'
+import json
+import sys
+
+bridge = json.load(open(sys.argv[1], encoding="utf-8"))["ue_material_bridge"]
+for key in (
+    "relative_path",
+    "sha256",
+    "ue_binary_relative_path",
+    "ue_binary_build_id",
+):
+    print(bridge[key])
+PY
+)
+if [[ "${#MATERIAL_BRIDGE_CONTRACT[@]}" != "4" ]]; then
+    echo "[ERROR] Could not read the UE material bridge contract" >&2
+    exit 1
+fi
+MATERIAL_BRIDGE_PATH="$PROJECT_ROOT/${MATERIAL_BRIDGE_CONTRACT[0]}"
+MATERIAL_BRIDGE_SHA256="${MATERIAL_BRIDGE_CONTRACT[1]}"
+MATERIAL_UE_BINARY="$PROJECT_ROOT/${MATERIAL_BRIDGE_CONTRACT[2]}"
+MATERIAL_UE_BUILD_ID="${MATERIAL_BRIDGE_CONTRACT[3]}"
+MATERIAL_BRIDGE_PATH="$(guard_path material-bridge subtree "$MATERIAL_BRIDGE_PATH")"
+MATERIAL_UE_BINARY="$(guard_path matrix-ue-binary subtree "$MATERIAL_UE_BINARY")"
+if [[ -v MATRIX_UE_MATERIAL_FIX_PRELOAD \
+    && "$MATRIX_UE_MATERIAL_FIX_PRELOAD" != "$MATERIAL_BRIDGE_PATH" ]]; then
+    echo "[ERROR] Qualified BFM/Isaac rejects material bridge overrides" >&2
+    echo "[ERROR] expected=$MATERIAL_BRIDGE_PATH actual=$MATRIX_UE_MATERIAL_FIX_PRELOAD" >&2
+    exit 2
+fi
+MATRIX_UE_BINARY="$MATERIAL_UE_BINARY" \
+    bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh" \
+    --output "$MATERIAL_BRIDGE_PATH" \
+    --expected-sha256 "$MATERIAL_BRIDGE_SHA256" \
+    --expected-ue-build-id "$MATERIAL_UE_BUILD_ID" \
+    --verify-only
 
 RUNTIME_ROOT="${RUNTIME_ROOT_OVERRIDE:-${MATRIX_BFM_ISAAC_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-bfm-isaac-sync-world16-v1/bfm_runtime}}"
 RUNTIME_PYTHON="${RUNTIME_PYTHON_OVERRIDE:-${MATRIX_BFM_ISAAC_PYTHON:-}}"
@@ -360,8 +402,20 @@ TRAJECTORY="$RUN_DIR/trajectory.npz"
 ACCEPTANCE_REPORT="$RUN_DIR/acceptance.json"
 PREFLIGHT_REPORT="$RUN_DIR/preflight.json"
 FINALIZER_STATUS="$RUN_DIR/finalizer-status.json"
+RESOLVED_VIDEO_SETTINGS="$RUN_DIR/resolved-video-settings.json"
 mkdir -p "$RUN_DIR" "$IPC_DIR"
 chmod 700 "$RUN_DIR" "$IPC_DIR"
+
+VIDEO_SETTINGS_TEMP="$RUN_DIR/.resolved-video-settings.json.tmp.$$"
+if ! python3 -I "$SCRIPT_DIR/matrix_bfm_isaac_video_settings.py" \
+    --file "$PROJECT_ROOT/config/runtime/matrix-bfm-isaac-video-settings.json" \
+    --format json > "$VIDEO_SETTINGS_TEMP"; then
+    rm -f -- "$VIDEO_SETTINGS_TEMP"
+    echo "[ERROR] Could not resolve the locked BFM/Isaac video settings" >&2
+    exit 2
+fi
+chmod 600 "$VIDEO_SETTINGS_TEMP"
+mv -- "$VIDEO_SETTINGS_TEMP" "$RESOLVED_VIDEO_SETTINGS"
 
 VERIFY_BASE=(
     "$SCRIPT_DIR/verify_matrix_bfm_isaac_runtime.py"
@@ -374,6 +428,7 @@ VERIFY_BASE=(
     --teacher-profile "$TEACHER_PROFILE"
     --visual-venv "$VISUAL_VENV_ROOT"
     --matrix-visual-root "$VISUAL_ROOT"
+    --material-bridge "$MATERIAL_BRIDGE_PATH"
 )
 python3 "${VERIFY_BASE[@]}"
 
@@ -580,20 +635,69 @@ export MATRIX_BFM_ISAAC_BOOTSTRAP_STATE="$PROJECT_ROOT/config/runtime/matrix-bfm
 export MATRIX_BFM_ISAAC_RENDERER_NAMESPACE_PID_FILE="$RENDERER_NAMESPACE_PID_FILE"
 export MATRIX_BFM_ISAAC_CHECKOUT_SNAPSHOT_DIR="$CHECKOUT_SNAPSHOT_DIR"
 export MATRIX_BFM_ISAAC_NO_INTERPOLATE="$NO_INTERPOLATE"
-BFM_ISAAC_UE_MAX_FPS="${MATRIX_BFM_ISAAC_UE_MAX_FPS:-30}"
-case "$BFM_ISAAC_UE_MAX_FPS" in
-    30|60|90|120) ;;
-    *)
-        echo "[ERROR] MATRIX_BFM_ISAAC_UE_MAX_FPS must be one of 30/60/90/120" >&2
-        exit 2
-        ;;
-esac
-# Leo's accepted co-resident stack capped Matrix UE at 30 FPS.  The regular
-# TRNA profile uses 60 FPS, so bind the lower cap only to this renderer child.
-# Discard a stale video-panel value because run_sim.sh gives it precedence over
-# MATRIX_UE_MAX_FPS and would otherwise silently restore the shared 60 FPS cap.
-setsid env -u MATRIX_VIDEO_APPLIED_FPS_LIMIT \
-    MATRIX_UE_MAX_FPS="$BFM_ISAAC_UE_MAX_FPS" \
+if ! BFM_VIDEO_LINES="$(
+    python3 -I - "$RESOLVED_VIDEO_SETTINGS" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for field in (
+    "resolution_width",
+    "resolution_height",
+    "window_mode",
+    "fps_limit",
+    "quality",
+    "camera_smoothing",
+    "screen_percentage",
+):
+    print(value[field])
+PY
+)"; then
+    echo "[ERROR] Could not resolve the locked BFM/Isaac video settings" >&2
+    exit 2
+fi
+mapfile -t BFM_VIDEO_FIELDS <<<"$BFM_VIDEO_LINES"
+if [[ "${#BFM_VIDEO_FIELDS[@]}" != "7" ]]; then
+    echo "[ERROR] Invalid BFM/Isaac video settings helper output" >&2
+    exit 2
+fi
+BFM_VIDEO_WIDTH="${BFM_VIDEO_FIELDS[0]}"
+BFM_VIDEO_HEIGHT="${BFM_VIDEO_FIELDS[1]}"
+BFM_VIDEO_WINDOW_MODE="${BFM_VIDEO_FIELDS[2]}"
+BFM_VIDEO_FPS_LIMIT="${BFM_VIDEO_FIELDS[3]}"
+BFM_VIDEO_QUALITY="${BFM_VIDEO_FIELDS[4]}"
+BFM_VIDEO_CAMERA_SMOOTHING="${BFM_VIDEO_FIELDS[5]}"
+BFM_VIDEO_SCREEN_PERCENTAGE="${BFM_VIDEO_FIELDS[6]}"
+echo "[INFO] BFM renderer video: ${BFM_VIDEO_WIDTH}x${BFM_VIDEO_HEIGHT}" \
+    "mode=$BFM_VIDEO_WINDOW_MODE fps=$BFM_VIDEO_FPS_LIMIT" \
+    "quality=$BFM_VIDEO_QUALITY smoothing=$BFM_VIDEO_CAMERA_SMOOTHING" \
+    "screen_percentage=$BFM_VIDEO_SCREEN_PERCENTAGE"
+
+# The BFM renderer has a tracked video contract independent from the ordinary
+# Matrix settings panel.  Strip every generic applied value at the process
+# boundary, then pass only validated BFM-specific fields to run_sim.sh.
+setsid env \
+    -u MATRIX_VIDEO_SETTINGS_FILE \
+    -u MATRIX_VIDEO_APPLIED_WIDTH \
+    -u MATRIX_VIDEO_APPLIED_HEIGHT \
+    -u MATRIX_VIDEO_APPLIED_WINDOW_MODE \
+    -u MATRIX_VIDEO_APPLIED_FPS_LIMIT \
+    -u MATRIX_VIDEO_APPLIED_QUALITY \
+    -u MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING \
+    -u MATRIX_VIDEO_APPLIED_REVISION \
+    -u MATRIX_VIDEO_APPLIED_JSON \
+    -u MATRIX_UE_EXTRA_EXEC_CMDS \
+    -u MATRIX_UE_MATERIAL_FIX_PRELOAD \
+    MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED=1 \
+    MATRIX_BFM_ISAAC_RENDER_WIDTH="$BFM_VIDEO_WIDTH" \
+    MATRIX_BFM_ISAAC_RENDER_HEIGHT="$BFM_VIDEO_HEIGHT" \
+    MATRIX_BFM_ISAAC_RENDER_WINDOW_MODE="$BFM_VIDEO_WINDOW_MODE" \
+    MATRIX_BFM_ISAAC_RENDER_FPS_LIMIT="$BFM_VIDEO_FPS_LIMIT" \
+    MATRIX_BFM_ISAAC_RENDER_QUALITY="$BFM_VIDEO_QUALITY" \
+    MATRIX_BFM_ISAAC_RENDER_CAMERA_SMOOTHING="$BFM_VIDEO_CAMERA_SMOOTHING" \
+    MATRIX_BFM_ISAAC_RENDER_SCREEN_PERCENTAGE="$BFM_VIDEO_SCREEN_PERCENTAGE" \
+    MATRIX_UE_MATERIAL_FIX_PRELOAD="$MATERIAL_BRIDGE_PATH" \
     bash "$SCRIPT_DIR/run_matrix_bfm_isaac_renderer_isolated.sh" \
     custom "$SCENE_ID" "$OFFSCREEN" 0 0 "$VISUAL_URDF" g1_29dof \
     > "$RUN_DIR/renderer.log" 2>&1 &
@@ -847,6 +951,7 @@ ACCEPTANCE_ARGS=(
     "${VERIFY_BASE[@]}"
     --report "$RUNTIME_REPORT"
     --relay-status "$RELAY_STATUS"
+    --video-settings "$RESOLVED_VIDEO_SETTINGS"
     --output "$ACCEPTANCE_REPORT"
 )
 if [[ "$CORRECTNESS_ONLY" == "1" ]]; then

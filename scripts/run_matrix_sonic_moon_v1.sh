@@ -15,25 +15,8 @@ echo "[INFO] moon-v1 physics: Matrix scene_terrain_moon_dynamic.xml plus SONIC G
 echo "[WARN] moon-v1 requires MoonWorld chunk 26 and dynamicmaps/moonworld.bin from the locked runtime."
 echo "[WARN] visual MoonWorld does not by itself prove 1.62 m/s^2 low-gravity physics acceptance."
 
-if [[ -z "${MATRIX_INITIAL_LOCOMOTION_POLICY+x}" ]]; then
-    export MATRIX_INITIAL_LOCOMOTION_POLICY="bfm-sonic-teacher50k"
-    echo "[INFO] moon-v1 default locomotion policy: bfm-sonic-teacher50k"
-else
-    echo "[INFO] moon-v1 locomotion policy override: $MATRIX_INITIAL_LOCOMOTION_POLICY"
-fi
-
-BFM_GAME_ARGS=()
-if [[ "$MATRIX_INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
-    # BFM-3DGS / bfm-sonic-realscan-play uses effectively one-frame keyboard
-    # slew at 50 Hz (90 m/s^2 linear, 240 rad/s^2 yaw) and a 2.40 rad/s turn
-    # request.  The BFM STATE boundary below owns the 0.90/1.40 m/s tier map;
-    # these core limits ensure Shift reaches the native RUN marker immediately.
-    BFM_GAME_ARGS+=(
-        --game-max-acceleration 90.0
-        --game-max-deceleration 90.0
-        --game-max-turn-rate 2.40
-    )
-    echo "[INFO] moon-v1 BFM controls: walk=0.90m/s jog=1.40m/s turn=2.40rad/s"
-fi
-
-exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "${BFM_GAME_ARGS[@]}" "$@"
+# The generic launcher loads the selected host profile before it resolves the
+# locomotion slot.  Keep this scene wrapper policy-neutral so tRNA's tracked
+# BFM default cannot leak into Heyuan/ZZA, while explicit environment or CLI
+# overrides still reach the authoritative launcher unchanged.
+exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"

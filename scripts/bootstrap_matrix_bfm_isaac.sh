@@ -136,14 +136,23 @@ import sys
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 print(payload["bfm_runtime"]["repository"])
 print(payload["bfm_runtime"]["commit"])
+bridge = payload["ue_material_bridge"]
+print(bridge["relative_path"])
+print(bridge["sha256"])
+print(bridge["ue_binary_relative_path"])
+print(bridge["ue_binary_build_id"])
 PY
 )
-if [[ "${#LOCK_VALUES[@]}" != "2" ]]; then
-    echo "[ERROR] Could not read BFM runtime source from lock" >&2
+if [[ "${#LOCK_VALUES[@]}" != "6" ]]; then
+    echo "[ERROR] Could not read BFM runtime/material closure from lock" >&2
     exit 1
 fi
 RUNTIME_REPOSITORY="${LOCK_VALUES[0]}"
 RUNTIME_COMMIT="${LOCK_VALUES[1]}"
+MATERIAL_BRIDGE="$PROJECT_ROOT/${LOCK_VALUES[2]}"
+MATERIAL_BRIDGE_SHA256="${LOCK_VALUES[3]}"
+MATERIAL_UE_BINARY="$PROJECT_ROOT/${LOCK_VALUES[4]}"
+MATERIAL_UE_BUILD_ID="${LOCK_VALUES[5]}"
 
 python3 "$SCRIPT_DIR/verify_matrix_bfm_isaac_runtime.py" \
     --lock "$LOCK_FILE" --schema-only
@@ -321,13 +330,29 @@ PY
     echo "[PASS] Locked visual-import venv is ready: $VISUAL_VENV"
 }
 
+MATERIAL_BRIDGE_ARGS=(
+    --output "$MATERIAL_BRIDGE"
+    --expected-sha256 "$MATERIAL_BRIDGE_SHA256"
+    --expected-ue-build-id "$MATERIAL_UE_BUILD_ID"
+)
 if [[ "$VERIFY_ONLY" == "1" ]]; then
     verify_visual_wheelhouse
     verify_visual_venv "$VISUAL_VENV"
+    MATRIX_UE_BINARY="$MATERIAL_UE_BINARY" \
+        bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh" \
+        "${MATERIAL_BRIDGE_ARGS[@]}" --verify-only
 else
     install_visual_venv
+    if ! MATRIX_UE_BINARY="$MATERIAL_UE_BINARY" \
+        bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh" \
+        "${MATERIAL_BRIDGE_ARGS[@]}" --verify-only; then
+        MATRIX_UE_BINARY="$MATERIAL_UE_BINARY" \
+            bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh" \
+            "${MATERIAL_BRIDGE_ARGS[@]}"
+    fi
 fi
 
 echo "[PASS] Frozen Leo BFM runtime is ready: $RUNTIME_ROOT"
 echo "[PASS] Frozen Matrix visual-import environment is ready: $VISUAL_VENV"
+echo "[PASS] Audited Matrix UE material bridge is ready"
 echo "[INFO] Next: bash scripts/run_matrix_bfm_isaac_guarded.sh smoke --profile ${PROFILE:-trna}"
