@@ -397,6 +397,8 @@ echo "[INFO] Running frozen BFM preflight"
 RENDERER_PID=""
 PHYSICS_PID=""
 KEYBOARD_PID=""
+WAIT_CHILD_EXIT_CODE=""
+RENDERER_FINAL_EXIT_CODE=""
 CLEANUP_STARTED=0
 SHUTDOWN_SIGNAL=""
 FORCE_REQUESTED=0
@@ -467,7 +469,11 @@ PY
     local attempt
     for ((attempt = 0; attempt < attempts; attempt++)); do
         managed_child_running "$pid" || {
-            wait "$pid" 2>/dev/null || true
+            if wait "$pid" 2>/dev/null; then
+                WAIT_CHILD_EXIT_CODE=0
+            else
+                WAIT_CHILD_EXIT_CODE=$?
+            fi
             return 0
         }
         sleep 0.1
@@ -478,6 +484,7 @@ PY
 stop_renderer() {
     local pid="$1"
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    RENDERER_FINAL_EXIT_CODE=""
     local namespace_pid=""
     if [[ -f "$RENDERER_NAMESPACE_PID_FILE" \
         && ! -L "$RENDERER_NAMESPACE_PID_FILE" ]]; then
@@ -488,6 +495,7 @@ stop_renderer() {
             --nonce "$MATRIX_BFM_CLEAN_RUN_NONCE" signal-pid \
             --pid "$namespace_pid" --signal TERM >/dev/null 2>&1; then
         if wait_child_exit "$pid" 25; then
+            RENDERER_FINAL_EXIT_CODE="$WAIT_CHILD_EXIT_CODE"
             return 0
         fi
         echo "[WARN] Renderer namespace did not finish graceful cleanup" >&2
@@ -775,6 +783,23 @@ stop_child "$KEYBOARD_PID" keyboard 3
 KEYBOARD_PID=""
 stop_renderer "$RENDERER_PID"
 RENDERER_PID=""
+# The namespace normally exits 143 after the exact TERM used for ordered UE and
+# relay teardown. Exit 70 is reserved for source-snapshot restoration failure;
+# retain it even when the helper already removed the snapshot and only its
+# final durability fsync failed.
+if [[ "$RENDERER_FINAL_EXIT_CODE" == "70" ]]; then
+    echo "[ERROR] Renderer namespace reported Matrix source restoration failure" >&2
+    STACK_FAILURE_CODE=70
+fi
+# wait_child_exit intentionally tolerates the renderer's non-zero status after
+# an operator-driven TERM, so the namespace's restore failure must also have a
+# durable outer-process witness. A dangling symlink does not satisfy -e; reject
+# both existing paths and symlinks before an otherwise successful acceptance.
+if [[ -e "$CHECKOUT_SNAPSHOT_DIR" || -L "$CHECKOUT_SNAPSHOT_DIR" ]]; then
+    echo "[ERROR] Renderer left an unretired Matrix source snapshot:" \
+        "$CHECKOUT_SNAPSHOT_DIR" >&2
+    STACK_FAILURE_CODE=70
+fi
 # The namespace performs ordered relay then UE cleanup. Bound the relay's
 # atomic final-status handoff before evaluating the evidence set.
 wait_for_nonempty_file "$RELAY_STATUS" 50 || true

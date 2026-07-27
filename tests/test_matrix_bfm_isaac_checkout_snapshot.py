@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -401,6 +402,329 @@ fi
                 )
                 self.assert_restored(project, expected, environment)
 
+
+class OuterLauncherSnapshotGateIntegrationTest(unittest.TestCase):
+    def write(self, path: Path, text: str, *, executable: bool = False) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        if executable:
+            path.chmod(0o755)
+
+    def make_project(
+        self, root: Path, *, residual_kind: str
+    ) -> tuple[Path, dict[str, str], Path]:
+        project = root / "matrix"
+        scripts = project / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(SCRIPT_DIR / "run_matrix_bfm_isaac.sh", scripts)
+        shutil.copy2(SCRIPT_DIR / "matrix_bfm_isaac_path_guard.py", scripts)
+        self.write(
+            scripts / "matrix_local_env.sh",
+            """#!/usr/bin/env bash
+load_matrix_local_env() { return 0; }
+""",
+        )
+        self.write(
+            scripts / "matrix_bfm_isaac_instance_ledger.py",
+            """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+
+args = sys.argv[1:]
+path = Path(args[args.index("--path") + 1])
+actions = ("init", "add", "signal", "signal-pid", "verify-empty")
+action = next(item for item in actions if item in args)
+if action == "init":
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"fixture": True}), encoding="utf-8")
+elif action == "signal-pid":
+    pid = int(args[args.index("--pid") + 1])
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+print(json.dumps({"ok": True, "action": action}))
+""",
+        )
+        self.write(
+            scripts / "verify_matrix_bfm_isaac_runtime.py",
+            """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if "--output" in args:
+    output = Path(args[args.index("--output") + 1])
+    output.write_text(json.dumps({"overall_ok": True}) + "\\n", encoding="utf-8")
+    Path(os.environ["FAKE_ACCEPTANCE_MARKER"]).write_text("called\\n", encoding="utf-8")
+print(json.dumps({"overall_ok": True}))
+""",
+        )
+        self.write(
+            scripts / "run_matrix_bfm_isaac_renderer_isolated.sh",
+            """#!/usr/bin/env bash
+set -euo pipefail
+snapshot="${MATRIX_BFM_ISAAC_CHECKOUT_SNAPSHOT_DIR:?}"
+case "${FAKE_RESIDUAL_KIND:?}" in
+    corrupt-directory)
+        mkdir "$snapshot"
+        printf 'corrupt\\n' > "$snapshot/0000.bin"
+        ;;
+    dangling-symlink)
+        ln -s "$snapshot.missing" "$snapshot"
+        ;;
+    clean-exit70|clean-term143)
+        ;;
+    *) exit 92 ;;
+esac
+printf '%s\\n' "$$" > "${MATRIX_BFM_ISAAC_RENDERER_NAMESPACE_PID_FILE:?}"
+printf '{}\\n' > "${MATRIX_BFM_ISAAC_RELAY_STATUS:?}"
+python3 - "${MATRIX_BFM_ISAAC_STATE_SOCKET:?}" <<'PY' &
+from pathlib import Path
+import signal
+import socket
+import sys
+import time
+path = Path(sys.argv[1])
+path.unlink(missing_ok=True)
+receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+receiver.bind(str(path))
+running = True
+def stop(_signum, _frame):
+    global running
+    running = False
+signal.signal(signal.SIGTERM, stop)
+while running:
+    time.sleep(0.02)
+receiver.close()
+path.unlink(missing_ok=True)
+PY
+socket_pid=$!
+cleanup() {
+    trap - TERM INT HUP
+    if [[ -f "${FAKE_PHYSICS_DONE:?}" ]]; then
+        printf 'physics-first\\n' > "${FAKE_RENDERER_STOP_AFTER_PHYSICS:?}"
+    fi
+    kill -TERM "$socket_pid" 2>/dev/null || true
+    wait "$socket_pid" 2>/dev/null || true
+    rm -f -- "${MATRIX_BFM_ISAAC_RENDERER_NAMESPACE_PID_FILE:?}"
+    exit "${FAKE_RENDERER_EXIT_CODE:?}"
+}
+trap cleanup TERM INT HUP
+wait "$socket_pid"
+""",
+            executable=True,
+        )
+
+        runtime = root / "runtime"
+        runtime_config = runtime / "configs/alienware/moon-matrix.toml"
+        runtime_runner = runtime / "scripts/run_g1_teacher_closed_loop.py"
+        physics = root / "physics"
+        collision = root / "collision"
+        source = root / "source"
+        visual = root / "visual"
+        visual_venv = root / "visual-venv"
+        teacher = root / "teacher-profile.toml"
+        for directory in (physics, collision, source, visual, visual_venv):
+            directory.mkdir(parents=True)
+        (physics / "main.usd").write_text("usd\n", encoding="utf-8")
+        (collision / "collision.usda").write_text("usd\n", encoding="utf-8")
+        (visual / "g1_29dof.urdf").write_text("<robot/>\n", encoding="utf-8")
+        teacher.write_text("profile = true\n", encoding="utf-8")
+        self.write(runtime_runner, "# fixture\n")
+        self.write(
+            runtime_config,
+            "\n".join(
+                (
+                    "[paths]",
+                    f'bfm_sonic_repo = "{source}"',
+                    f'g1_usd = "{physics / "main.usd"}"',
+                    f'scene_root = "{collision}"',
+                    f'collision_usd = "{collision / "collision.usda"}"',
+                    "",
+                )
+            ),
+        )
+        subprocess.run(("git", "init", "-q", os.fspath(runtime)), check=True)
+        subprocess.run(
+            ("git", "-C", os.fspath(runtime), "config", "user.email", "test@example.com"),
+            check=True,
+        )
+        subprocess.run(
+            ("git", "-C", os.fspath(runtime), "config", "user.name", "Test"),
+            check=True,
+        )
+        subprocess.run(("git", "-C", os.fspath(runtime), "add", "."), check=True)
+        subprocess.run(
+            ("git", "-C", os.fspath(runtime), "commit", "-qm", "fixture"),
+            check=True,
+        )
+
+        runtime_python = root / "runtime-python"
+        self.write(
+            runtime_python,
+            """#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["-I", "-"]:
+    os.execv(sys.executable, [sys.executable, *args])
+if args and args[0] == "-m":
+    report = Path(args[args.index("--report") + 1])
+    report.write_text("{}\\n", encoding="utf-8")
+    raise SystemExit(0)
+report = Path(args[args.index("--report") + 1])
+trajectory = Path(args[args.index("--trajectory") + 1])
+report.write_text("{}\\n", encoding="utf-8")
+trajectory.write_bytes(b"trajectory")
+Path(os.environ["FAKE_PHYSICS_DONE"]).write_text("done\\n", encoding="utf-8")
+""",
+            executable=True,
+        )
+
+        lock = {
+            "scene_collision_contract": {
+                "scene_id": 15,
+                "runtime_config_suffix": "configs/alienware/moon-matrix.toml",
+                "x_min_m": -97.0,
+                "x_max_m": 143.0,
+                "y_min_m": -107.0,
+                "y_max_m": 133.0,
+                "warning_margin_m": 20.0,
+                "stop_margin_m": 10.0,
+            },
+            "physics_assets": {"main_usd": "main.usd"},
+            "scene_assets": {"collision_usd": "collision.usda"},
+        }
+        lock_path = project / "config/runtime/matrix-bfm-isaac.lock.json"
+        lock_path.parent.mkdir(parents=True)
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+        evidence = root / "evidence"
+        state = root / "state"
+        acceptance_marker = root / "acceptance.called"
+        environment = {
+            **os.environ,
+            "FAKE_ACCEPTANCE_MARKER": os.fspath(acceptance_marker),
+            "FAKE_PHYSICS_DONE": os.fspath(root / "physics.done"),
+            "FAKE_RENDERER_STOP_AFTER_PHYSICS": os.fspath(
+                root / "renderer-stopped-after-physics"
+            ),
+            "FAKE_RENDERER_EXIT_CODE": (
+                "143" if residual_kind == "clean-term143" else "70"
+            ),
+            "FAKE_RESIDUAL_KIND": residual_kind,
+            "MATRIX_BFM_CLEAN_RUN_NONCE": "a" * 32,
+            "MATRIX_BFM_ISAAC_CACHE_ROOT": os.fspath(root / "cache"),
+            "MATRIX_BFM_ISAAC_COLLISION_ROOT": os.fspath(collision),
+            "MATRIX_BFM_ISAAC_CONFIG": os.fspath(runtime_config),
+            "MATRIX_BFM_ISAAC_CONFIG_ROOT": os.fspath(root / "config-home"),
+            "MATRIX_BFM_ISAAC_GUARDED": "1",
+            "MATRIX_BFM_ISAAC_IPC_ROOT": os.fspath(state / "ipc"),
+            "MATRIX_BFM_ISAAC_PHYSICS_ASSET_ROOT": os.fspath(physics),
+            "MATRIX_BFM_ISAAC_PYTHON": os.fspath(runtime_python),
+            "MATRIX_BFM_ISAAC_RUN_ROOT": os.fspath(root / "runs"),
+            "MATRIX_BFM_ISAAC_RUNTIME_ROOT": os.fspath(runtime),
+            "MATRIX_BFM_ISAAC_SOURCE_ROOT": os.fspath(source),
+            "MATRIX_BFM_ISAAC_STATE_ROOT": os.fspath(state),
+            "MATRIX_BFM_ISAAC_TEACHER_PROFILE": os.fspath(teacher),
+            "MATRIX_BFM_ISAAC_VISUAL_ROOT": os.fspath(visual),
+            "MATRIX_BFM_ISAAC_VISUAL_URDF": os.fspath(visual / "g1_29dof.urdf"),
+            "MATRIX_BFM_ISAAC_VISUAL_VENV": os.fspath(visual_venv),
+            "MATRIX_INSTANCE_ID": f"outer-{residual_kind}",
+        }
+        return project, environment, evidence
+
+    def test_physics_first_residual_or_symlink_snapshot_forces_outer_exit70(
+        self,
+    ) -> None:
+        for residual_kind in (
+            "corrupt-directory",
+            "dangling-symlink",
+            "clean-exit70",
+        ):
+            with self.subTest(
+                residual_kind=residual_kind
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                project, environment, evidence = self.make_project(
+                    root, residual_kind=residual_kind
+                )
+
+                result = subprocess.run(
+                    (
+                        "bash",
+                        os.fspath(project / "scripts/run_matrix_bfm_isaac.sh"),
+                        "smoke",
+                        "--run-dir",
+                        os.fspath(evidence),
+                    ),
+                    cwd=project,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 70, result.stderr)
+                if residual_kind == "clean-exit70":
+                    self.assertIn(
+                        "namespace reported Matrix source restoration failure",
+                        result.stderr,
+                    )
+                else:
+                    self.assertIn("unretired Matrix source snapshot", result.stderr)
+                self.assertTrue(Path(environment["FAKE_ACCEPTANCE_MARKER"]).is_file())
+                self.assertTrue(Path(environment["FAKE_PHYSICS_DONE"]).is_file())
+                self.assertTrue(
+                    Path(
+                        environment["FAKE_RENDERER_STOP_AFTER_PHYSICS"]
+                    ).is_file()
+                )
+                snapshot = evidence / "checkout-source-snapshot"
+                if residual_kind == "clean-exit70":
+                    self.assertFalse(snapshot.exists() or snapshot.is_symlink())
+                else:
+                    self.assertTrue(snapshot.exists() or snapshot.is_symlink())
+
+    def test_physics_first_clean_renderer_term143_remains_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, environment, evidence = self.make_project(
+                root, residual_kind="clean-term143"
+            )
+
+            result = subprocess.run(
+                (
+                    "bash",
+                    os.fspath(project / "scripts/run_matrix_bfm_isaac.sh"),
+                    "smoke",
+                    "--run-dir",
+                    os.fspath(evidence),
+                ),
+                cwd=project,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(Path(environment["FAKE_ACCEPTANCE_MARKER"]).is_file())
+            self.assertTrue(
+                Path(environment["FAKE_RENDERER_STOP_AFTER_PHYSICS"]).is_file()
+            )
+            snapshot = evidence / "checkout-source-snapshot"
+            self.assertFalse(snapshot.exists() or snapshot.is_symlink())
 
 if __name__ == "__main__":
     unittest.main()

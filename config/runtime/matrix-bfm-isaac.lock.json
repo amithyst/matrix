@@ -75,7 +75,7 @@
       },
       {
         "path": "scripts/run_matrix_bfm_isaac.sh",
-        "sha256": "7d7d239cfe8e8635e31202d4022afad6b71938ea0474bab78c646305024e5f43"
+        "sha256": "5fe1bd03de48626295c099216e2d64d5d4591302f372b2dc31d2874139d5f6cc"
       },
       {
         "path": "scripts/run_matrix_bfm_isaac_guarded.sh",
