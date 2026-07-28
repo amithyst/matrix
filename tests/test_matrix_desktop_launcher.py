@@ -579,6 +579,45 @@ class MatrixDesktopInstallerTest(unittest.TestCase):
         content = (desktop / "matrix-sonic.desktop").read_text(encoding="utf-8")
         self.assertIn(f"Icon={icon.resolve()}\n", content)
 
+    def test_entry_root_may_be_a_symlink_to_the_checkout(self) -> None:
+        desktop = self.make_desktop_dir()
+        linked_root = self.root / "matrix-mainline"
+        linked_root.symlink_to(self.project, target_is_directory=True)
+
+        result = self.run_installer(
+            "--desktop-dir",
+            os.fspath(desktop),
+            "--entry-root",
+            os.fspath(linked_root),
+            "--profile",
+            "trna",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = (desktop / "matrix-sonic.desktop").read_text(encoding="utf-8")
+        linked_launcher = linked_root / "scripts" / LAUNCHER.name
+        self.assertIn(
+            f'Exec=/usr/bin/bash "{linked_launcher}" start --profile trna --scene 15\n',
+            content,
+        )
+        self.assertIn(f"X-Matrix-Repository={linked_root}\n", content)
+
+    def test_entry_root_must_resolve_to_this_checkout(self) -> None:
+        desktop = self.make_desktop_dir()
+        other_root = self.root / "other-matrix"
+        other_root.mkdir()
+
+        result = self.run_installer(
+            "--desktop-dir",
+            os.fspath(desktop),
+            "--entry-root",
+            os.fspath(other_root),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("entry root must resolve to repository root", result.stderr)
+        self.assertFalse((desktop / "matrix-sonic.desktop").exists())
+
     def test_rejects_profile_and_path_injection(self) -> None:
         desktop = self.make_desktop_dir()
         marker = self.root / "installer-injection-ran"

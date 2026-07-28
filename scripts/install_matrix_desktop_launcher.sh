@@ -4,11 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 TEMPLATE="$PROJECT_ROOT/packaging/matrix-sonic.desktop.in"
-LAUNCHER="$SCRIPT_DIR/launch_matrix_sonic_desktop.sh"
 PROFILE="heyuan"
 SCENE_ID="15"
 DESKTOP_DIR=""
-ICON_PATH="$PROJECT_ROOT/demo_gif/Launcher.png"
+ENTRY_ROOT=""
+ICON_PATH=""
+LAUNCHER=""
 SHORTCUT_NAME=""
 SHORTCUT_COMMENT=""
 TARGET_BASENAME=""
@@ -21,6 +22,8 @@ Options:
   --profile PROFILE     heyuan (default), trna, or zza
   --scene ID            Matrix native scene id (default: 15 / MoonWorld BFM)
   --desktop-dir DIR     Existing private Desktop directory (for tests or XDG overrides)
+  --entry-root DIR      Logical repository root written into the desktop Exec
+                       path; may be a symlink but must resolve to this checkout
   --icon PATH           Existing icon file (default: demo_gif/Launcher.png)
   -h, --help            Show this help
 EOF
@@ -146,6 +149,21 @@ canonical_icon() {
     printf '%s\n' "$physical_path"
 }
 
+canonical_entry_root() {
+    local input="$1"
+    local logical_path
+    local physical_path
+
+    reject_control_characters "entry root" "$input"
+    logical_path="$(realpath -sm -- "$input")"
+    physical_path="$(realpath -e -- "$input")" \
+        || die "entry root does not exist: $input"
+    [[ -d "$physical_path" ]] || die "entry root is not a directory: $input"
+    [[ "$physical_path" == "$PROJECT_ROOT" ]] \
+        || die "entry root must resolve to repository root $PROJECT_ROOT: $input"
+    printf '%s\n' "$logical_path"
+}
+
 validate_desktop_exec_path() {
     local label="$1"
     local value="$2"
@@ -190,7 +208,7 @@ render_template() {
                 printf 'Icon=%s\n' "$(desktop_string "$ICON_PATH")"
                 ;;
             'X-Matrix-Repository=@MATRIX_REPOSITORY@')
-                printf 'X-Matrix-Repository=%s\n' "$(desktop_string "$PROJECT_ROOT")"
+                printf 'X-Matrix-Repository=%s\n' "$(desktop_string "$ENTRY_ROOT")"
                 ;;
             'X-Matrix-Profile=@MATRIX_PROFILE@')
                 printf 'X-Matrix-Profile=%s\n' "$PROFILE"
@@ -235,6 +253,11 @@ while (($# > 0)); do
             DESKTOP_DIR="$2"
             shift 2
             ;;
+        --entry-root)
+            require_value "$1" "$#"
+            ENTRY_ROOT="$2"
+            shift 2
+            ;;
         --icon)
             require_value "$1" "$#"
             ICON_PATH="$2"
@@ -253,11 +276,21 @@ done
 validate_profile "$PROFILE"
 validate_scene "$SCENE_ID"
 configure_shortcut_identity
+if [[ -z "$ENTRY_ROOT" ]]; then
+    ENTRY_ROOT="$PROJECT_ROOT"
+else
+    ENTRY_ROOT="$(canonical_entry_root "$ENTRY_ROOT")"
+fi
+LAUNCHER="$ENTRY_ROOT/scripts/launch_matrix_sonic_desktop.sh"
+if [[ -z "$ICON_PATH" ]]; then
+    ICON_PATH="$ENTRY_ROOT/demo_gif/Launcher.png"
+fi
 [[ -f "$TEMPLATE" && -r "$TEMPLATE" ]] \
     || die "desktop template is missing: $TEMPLATE"
 [[ -f "$LAUNCHER" && -r "$LAUNCHER" ]] \
     || die "desktop launcher is missing: $LAUNCHER"
 validate_desktop_exec_path "repository path" "$PROJECT_ROOT"
+validate_desktop_exec_path "desktop entry root" "$ENTRY_ROOT"
 
 if [[ -z "$DESKTOP_DIR" ]]; then
     DESKTOP_DIR="$(default_desktop_dir)"
