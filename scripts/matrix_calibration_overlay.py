@@ -484,8 +484,9 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     footer_space = 8 if compact else 42
     apply_y = panel_y + panel_height - footer_space - apply_height
     footer_width = panel_width - 2 * margin
-    pause_width = max(120, min(260, (footer_width - gap) // 3))
-    apply_width = max(1, footer_width - pause_width - gap)
+    pause_width = max(108, min(220, (footer_width - 2 * gap) // 4))
+    quit_width = max(112, min(240, (footer_width - 2 * gap) // 4))
+    apply_width = max(1, footer_width - pause_width - quit_width - 2 * gap)
     console_left = panel_x + margin
     console_width = panel_width - 2 * margin
     console_top = tab_y + tab_height + gap
@@ -540,9 +541,14 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             max(20, locomotion_height - (4 if compact else 34)),
         ),
     )
+    locomotion_progress_height = 8 if compact else 12
+    locomotion_progress_gap = 4 if compact else 8
     locomotion_candidate_y = max(
         locomotion_top,
-        locomotion_bottom - locomotion_candidate_height,
+        locomotion_bottom
+        - locomotion_progress_height
+        - locomotion_progress_gap
+        - locomotion_candidate_height,
     )
     motion_outer_gap = 6 if compact else 12
     motion_row_gap = 4 if compact else 8
@@ -701,7 +707,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             button_height,
         ),
         "apply_return": (
-            panel_x + margin + pause_width + gap,
+            panel_x + margin + pause_width + gap + quit_width + gap,
             apply_y,
             apply_width,
             apply_height,
@@ -710,6 +716,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             panel_x + margin,
             apply_y,
             pause_width,
+            apply_height,
+        ),
+        "quit_game": (
+            panel_x + margin + pause_width + gap,
+            apply_y,
+            quit_width,
             apply_height,
         ),
         "command_history": (
@@ -747,6 +759,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             locomotion_top,
             panel_width - 2 * margin,
             locomotion_height,
+        ),
+        "locomotion_progress": (
+            panel_x + margin + 18,
+            locomotion_bottom - locomotion_progress_height,
+            panel_width - 2 * margin - 36,
+            locomotion_progress_height,
         ),
         "recovery_slot": (
             panel_x + margin,
@@ -800,7 +818,13 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             * (locomotion_candidate_width + locomotion_candidate_gap),
             locomotion_candidate_y,
             locomotion_candidate_width,
-            max(1, locomotion_bottom - locomotion_candidate_y),
+            max(
+                1,
+                locomotion_bottom
+                - locomotion_progress_height
+                - locomotion_progress_gap
+                - locomotion_candidate_y,
+            ),
         )
     for row, gear in enumerate(GEARS):
         row_y = motion_top + row * (motion_row_height + motion_row_gap)
@@ -1054,7 +1078,7 @@ _NAVIGATION_HIT_TARGETS = (
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
-    + ("runtime_pause",)
+    + ("runtime_pause", "quit_game")
     + _MOVEMENT_MODE_ACTIONS
     + _MOTION_STEP_ACTIONS
     + ("command_input",)
@@ -1088,7 +1112,7 @@ def panel_action_at(
     if page == "loadout":
         targets = (
             _PANEL_TABS
-            + ("runtime_pause", "apply_return")
+            + ("runtime_pause", "quit_game", "apply_return")
             + _LOCOMOTION_POLICY_HIT_TARGETS
             + _POLICY_HIT_TARGETS
         )
@@ -1096,7 +1120,7 @@ def panel_action_at(
         targets = (
             _PANEL_TABS
             + _PANEL_ACTIONS
-            + ("runtime_pause",)
+            + ("runtime_pause", "quit_game")
             + _MOVEMENT_MODE_ACTIONS
             + _MOTION_STEP_ACTIONS
             + _OVERLAY_LOCAL_HIT_TARGETS
@@ -1104,29 +1128,30 @@ def panel_action_at(
     elif page == "console":
         targets = _PANEL_TABS + (
             "runtime_pause",
+            "quit_game",
             "apply_return",
             "command_input",
         )
     elif page == "inventory":
         targets = (
             _PANEL_TABS
-            + ("runtime_pause", "apply_return")
+            + ("runtime_pause", "quit_game", "apply_return")
             + _INVENTORY_HIT_TARGETS
         )
     elif page == "navigation":
         targets = (
             _PANEL_TABS
-            + ("runtime_pause", "apply_return")
+            + ("runtime_pause", "quit_game", "apply_return")
             + _NAVIGATION_HIT_TARGETS
         )
     elif page == "video":
         targets = (
             _PANEL_TABS
-            + ("runtime_pause", "apply_return")
+            + ("runtime_pause", "quit_game", "apply_return")
             + _VIDEO_STEP_ACTIONS
         )
     elif page == "system":
-        targets = _PANEL_TABS + ("runtime_pause", "apply_return")
+        targets = _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
     for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
@@ -1182,6 +1207,28 @@ class StrategyLoadoutModel:
             and candidate.resident
             for candidate in candidates
         )
+
+
+@dataclass(frozen=True)
+class StartupLoadingModel:
+    active: bool
+    message: str
+    progress: float
+
+
+def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
+    raw = state.get("startup_loading")
+    if not isinstance(raw, dict) or raw.get("active") is not True:
+        return StartupLoadingModel(False, "", 0.0)
+    message = raw.get("message")
+    progress = raw.get("progress")
+    if not isinstance(message, str) or not message:
+        message = "正在初始化 MATRIX"
+    if isinstance(progress, bool) or not isinstance(progress, (int, float)):
+        progress_value = 0.0
+    else:
+        progress_value = max(0.0, min(1.0, float(progress)))
+    return StartupLoadingModel(True, message[:80], progress_value)
 
 
 @dataclass(frozen=True)
@@ -3331,6 +3378,9 @@ class PointerActionPublisher:
             {"pause_target": target, "expected_epoch": expected_epoch},
         )
 
+    def publish_game_quit(self) -> None:
+        self._publish("game_quit", {})
+
     def publish_font_size(self, font_size: int) -> None:
         self._publish("font_size", {"font_size": canonical_font_size(font_size)})
 
@@ -3491,6 +3541,7 @@ class X11CalibrationOverlay:
         self._last_navigation_model: CelestialNavigationModel | None = None
         self._last_video_model: VideoSettingsPanelModel | None = None
         self._last_build_info_model: BuildInfoPanelModel | None = None
+        self._last_startup_loading_model = startup_loading_model({})
         self._last_runtime_pause_model = runtime_pause_panel_model({})
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
@@ -4817,6 +4868,70 @@ class X11CalibrationOverlay:
             centred_in=(x, y, width, height),
         )
 
+    def _draw_progress_bar(
+        self,
+        rectangle: tuple[int, int, int, int],
+        *,
+        progress: float,
+        label: str,
+        colour_name: str = "cyan",
+    ) -> None:
+        x, y, width, height = rectangle
+        progress = max(0.0, min(1.0, float(progress)))
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._x11.XSetForeground(self._display, gc, self._colours["disabled"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            width,
+            height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
+        )
+        fill_width = max(1, int(round((width - 2) * progress)))
+        self._x11.XSetForeground(self._display, gc, self._colours[colour_name])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            x + 1,
+            y + 1,
+            fill_width,
+            max(1, height - 2),
+        )
+        stripe_width = max(10, height * 2)
+        for offset in range(-stripe_width, width + stripe_width, stripe_width * 2):
+            stripe_x = x + offset + int((time.monotonic() * 40) % (stripe_width * 2))
+            if x < stripe_x < x + fill_width:
+                self._x11.XSetForeground(self._display, gc, self._colours["white"])
+                self._x11.XFillRectangle(
+                    self._display,
+                    panel,
+                    gc,
+                    stripe_x,
+                    y + 1,
+                    max(1, stripe_width // 3),
+                    max(1, height - 2),
+                )
+        self._draw_text(
+            label,
+            x=x,
+            y=max(12, y - 6),
+            colour=self._colours["muted"],
+        )
+
     @staticmethod
     def _clip_console_line(value: str, width: int) -> str:
         maximum = max(1, width // 10)
@@ -5224,6 +5339,7 @@ class X11CalibrationOverlay:
         self,
         layout: dict[str, tuple[int, int, int, int]],
         model: StrategyLoadoutModel,
+        command_status: CommandConsoleStatus | None = None,
     ) -> None:
         locomotion = self._fill_panel_band(
             layout,
@@ -5282,6 +5398,42 @@ class X11CalibrationOverlay:
                 y=0,
                 colour=self._colours["pending"],
                 centred_in=locomotion,
+            )
+        progress_state: tuple[float, str, str] | None = None
+        if model.status in {"loading", "switching"} or model.pending_policy_id:
+            progress = 0.35 if model.status == "loading" else 0.72
+            if model.status == "ready" and model.pending_policy_id:
+                progress = 0.55
+            pending_label = (
+                self._policy_display_name(model.pending_policy_id)
+                if model.pending_policy_id
+                else "resident policies"
+            )
+            progress_state = (
+                progress,
+                f"策略切换进度  {pending_label}",
+                "cyan",
+            )
+        elif (
+            command_status is not None
+            and command_status.status == "error"
+            and isinstance(command_status.code, str)
+            and command_status.code.startswith("E_POLICY")
+        ):
+            progress_state = (
+                1.0,
+                "策略切换失败  "
+                + (command_status.message or command_status.code),
+                "error",
+            )
+        if progress_state is not None:
+            progress, label, colour_name = progress_state
+            rectangle = self._panel_rectangle(layout, "locomotion_progress")
+            self._draw_progress_bar(
+                rectangle,
+                progress=progress,
+                label=self._clip_console_line(label, rectangle[2]),
+                colour_name=colour_name,
             )
 
         recovery = self._panel_rectangle(layout, "recovery_slot")
@@ -5931,6 +6083,72 @@ class X11CalibrationOverlay:
             return "返回游戏并应用"
         return "返回游戏"
 
+    def _draw_startup_loading(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: StartupLoadingModel,
+    ) -> None:
+        _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
+        content = (
+            48,
+            max(92, panel_height // 3),
+            max(1, panel_width - 96),
+            max(110, panel_height // 3),
+        )
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            0,
+            0,
+            panel_width,
+            panel_height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            18,
+            18,
+            max(1, panel_width - 37),
+            max(1, panel_height - 37),
+        )
+        self._draw_text(
+            "MATRIX BOOT SEQUENCE",
+            x=content[0],
+            y=content[1],
+            colour=self._colours["white"],
+            large=True,
+        )
+        self._draw_text(
+            model.message,
+            x=content[0],
+            y=content[1] + 36,
+            colour=self._colours["muted"],
+        )
+        bar = (
+            content[0],
+            content[1] + 72,
+            content[2],
+            18,
+        )
+        self._draw_progress_bar(
+            bar,
+            progress=model.progress,
+            label="正在挂载同屏 UI / 策略槽 / 输入桥",
+            colour_name="cyan",
+        )
+        self._draw_text(
+            f"{int(round(model.progress * 100)):02d}%  KEEP CONTROLS RELEASED",
+            x=content[0],
+            y=content[1] + 116,
+            colour=self._colours["cyan"],
+        )
+
     def _draw_panel(
         self,
         layout: dict[str, tuple[int, int, int, int]],
@@ -5943,10 +6161,14 @@ class X11CalibrationOverlay:
         video_model: VideoSettingsPanelModel | None = None,
         runtime_pause_model: RuntimePausePanelModel | None = None,
         build_info_model: BuildInfoPanelModel | None = None,
+        startup_loading: StartupLoadingModel | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
         self._x11.XClearWindow(self._display, panel)
+        if startup_loading is not None and startup_loading.active:
+            self._draw_startup_loading(layout, startup_loading)
+            return
         page = getattr(self, "_active_page", "settings")
         title_x, title_y, _title_width, title_height = self._panel_rectangle(
             layout, "title"
@@ -5965,6 +6187,8 @@ class X11CalibrationOverlay:
             self._draw_loadout_page(
                 layout,
                 strategy_model or strategy_loadout_model({}),
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
             )
         elif page == "settings":
             self._draw_control_settings_page(
@@ -6013,29 +6237,45 @@ class X11CalibrationOverlay:
             or self._command_editor.pending
             or model.restart_requested
         )
+        strategy_switch_busy = bool(
+            visible_command_status.in_flight
+            and isinstance(visible_command_status.message, str)
+            and visible_command_status.message.startswith("Switching resident policy")
+        )
         pause_disabled = bool(not pause_model.enabled or pause_busy)
         pause_label = (
             "处理中 / Busy"
-            if pause_busy and pause_model.state in {"running", "paused"}
+            if (
+                pause_busy
+                and not strategy_switch_busy
+                and pause_model.state in {"running", "paused"}
+            )
             else pause_model.label
         )
         if panel_height < 600:
             pause_label = {
-                "running": "处理中" if pause_busy else "暂停",
-                "paused": "处理中" if pause_busy else "继续",
+                "running": (
+                    "处理中" if pause_busy and not strategy_switch_busy else "暂停"
+                ),
+                "paused": (
+                    "处理中" if pause_busy and not strategy_switch_busy else "继续"
+                ),
                 "pausing": "暂停中",
                 "resuming": "继续中",
                 "busy": "处理中",
                 "fault": "暂停故障",
                 "unavailable": "暂停不可用",
             }[pause_model.state]
+        pause_pending_fill = (
+            (pause_busy and not strategy_switch_busy)
+            or pause_model.state in {"pausing", "resuming", "busy"}
+        )
         pause_fill_name = (
             "error"
             if pause_model.state == "fault"
             else (
                 "pending"
-                if pause_busy
-                or pause_model.state in {"pausing", "resuming", "busy"}
+                if pause_pending_fill
                 else ("selected" if pause_model.state == "paused" else "button")
             )
         )
@@ -6047,6 +6287,23 @@ class X11CalibrationOverlay:
                 "disabled" if pause_model.state == "unavailable" else pause_fill_name
             ],
             disabled=pause_disabled,
+        )
+        quit_disabled = bool(
+            not visible_command_status.available
+            or visible_command_status.in_flight
+            or visible_command_status.restart_required
+            or visible_command_status.outcome_unknown
+            or visible_command_status.status in {"pending", "restarting", "unavailable"}
+            or self._command_editor.editing
+            or self._command_editor.pending
+            or model.restart_requested
+        )
+        self._draw_button(
+            layout,
+            "quit_game",
+            "结束游戏" if panel_height >= 600 else "结束",
+            fill=self._colours["disabled" if quit_disabled else "error"],
+            disabled=quit_disabled,
         )
         apply_disabled = not model.action_enabled("apply_return")
         self._draw_button(
@@ -6224,6 +6481,12 @@ class X11CalibrationOverlay:
                 if layout is not None
                 else None
             )
+            if getattr(
+                self,
+                "_last_startup_loading_model",
+                startup_loading_model({}),
+            ).active:
+                action = None
             if event_type == _BUTTON_PRESS:
                 self._pressed_action = action
                 self._pressed_window = int(button.window)
@@ -6316,6 +6579,23 @@ class X11CalibrationOverlay:
                             pause_target,
                             expected_epoch=pause_model.epoch,
                         )
+                        emitted += 1
+                elif action == "quit_game":
+                    panel_model = self._last_panel_model
+                    if (
+                        panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                        and self._last_command_status.available
+                        and not self._last_command_status.in_flight
+                        and not self._last_command_status.restart_required
+                        and not self._last_command_status.outcome_unknown
+                        and self._last_command_status.status
+                        not in {"pending", "restarting", "unavailable"}
+                    ):
+                        publisher.publish_game_quit()
                         emitted += 1
                 elif action == "command_input":
                     if self._begin_command_editing(publisher):
@@ -6522,6 +6802,7 @@ class X11CalibrationOverlay:
         navigation_model = celestial_navigation_model(state)
         video_model = video_settings_panel_model(state)
         build_info_model = build_info_panel_model(state)
+        startup_model = startup_loading_model(state)
         command_status = command_console_status(state)
         runtime_pause_model = runtime_pause_panel_model(state)
         self._command_editor.reconcile(command_status)
@@ -6535,6 +6816,8 @@ class X11CalibrationOverlay:
             or navigation_model != getattr(self, "_last_navigation_model", None)
             or video_model != getattr(self, "_last_video_model", None)
             or build_info_model != getattr(self, "_last_build_info_model", None)
+            or startup_model
+            != getattr(self, "_last_startup_loading_model", startup_loading_model({}))
             or runtime_pause_model
             != getattr(self, "_last_runtime_pause_model", runtime_pause_panel_model({}))
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
@@ -6590,6 +6873,7 @@ class X11CalibrationOverlay:
                 video_model,
                 runtime_pause_model,
                 build_info_model,
+                startup_model,
             )
         pointer_recentered = False
         game_rectangle = (
@@ -6665,6 +6949,7 @@ class X11CalibrationOverlay:
         self._last_navigation_model = navigation_model
         self._last_video_model = video_model
         self._last_build_info_model = build_info_model
+        self._last_startup_loading_model = startup_model
         self._last_runtime_pause_model = runtime_pause_model
         self._last_rendered_font_size = getattr(
             self,
@@ -6698,6 +6983,7 @@ class X11CalibrationOverlay:
         self._last_navigation_model = None
         self._last_video_model = None
         self._last_build_info_model = None
+        self._last_startup_loading_model = startup_loading_model({})
         self._last_page = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision

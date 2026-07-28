@@ -120,6 +120,7 @@ from matrix_mc_commands import (
     CreativeSpawnItem,
     DataModifyInput,
     DataModifyNumber,
+    GameQuit,
     GameCommandRequest,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
@@ -172,7 +173,9 @@ _X11_ESCAPE_GRAB_MODIFIERS = (
     _X11_MOD2_MASK,
     _X11_LOCK_MASK | _X11_MOD2_MASK,
 )
+_X11_UI_GRAB_KEY_NAMES = ("escape", "q", "e")
 _MAX_X11_GRABBED_ESCAPE_EVENTS_PER_POLL = 128
+_STARTUP_LOADING_OVERLAY_SECONDS = 8.0
 
 
 class _XErrorEvent(ctypes.Structure):
@@ -3944,6 +3947,7 @@ class X11KeyboardMouse:
         }
         self._grab_escape = bool(grab_escape)
         self._escape_grabbed_modifiers: tuple[int, ...] = ()
+        self._grabbed_key_modifiers: dict[str, tuple[int, ...]] = {}
         self._grabbed_escape_down = False
         self._grabbed_escape_press_pending = False
         self._grabbed_escape_events = 0
@@ -4051,6 +4055,10 @@ class X11KeyboardMouse:
             ),
             "escape_grabbed": bool(
                 getattr(self, "_escape_grabbed_modifiers", ())
+            ),
+            "turn_keys_grabbed": all(
+                bool(getattr(self, "_grabbed_key_modifiers", {}).get(name))
+                for name in ("q", "e")
             ),
             "grabbed_escape_events": getattr(
                 self, "_grabbed_escape_events", 0
@@ -4438,40 +4446,54 @@ class X11KeyboardMouse:
         return True
 
     def _grab_escape_key(self) -> None:
-        """Route physical Escape to this provider instead of the focused UE window."""
+        """Route Matrix UI keys to this provider before the focused UE window.
 
-        keycode = int(self._keycodes.get("escape", 0))
-        if keycode <= 0:
-            raise RuntimeError("X11 keyboard map is missing Escape")
-        grabbed: list[int] = []
+        Escape opens/closes the Matrix panel.  Q/E remain movement-yaw inputs
+        sampled through XQueryKeymap, but packaged UE builds can also bind Q as
+        an application quit key.  The passive grabs consume those raw key events
+        while keeping the physical key level visible to the Matrix controller.
+        """
+
+        grabbed_by_name: dict[str, tuple[int, ...]] = {}
         try:
             with self._x11_error_scope("Escape passive grab"):
-                for modifiers in _X11_ESCAPE_GRAB_MODIFIERS:
-                    self._x11.XGrabKey(
-                        self._display,
-                        keycode,
-                        modifiers,
-                        self._root,
-                        0,  # owner_events=False: consume before UE/SDL sees it.
-                        _X11_GRAB_MODE_ASYNC,
-                        _X11_GRAB_MODE_ASYNC,
-                    )
-                    grabbed.append(modifiers)
+                for name in _X11_UI_GRAB_KEY_NAMES:
+                    keycode = int(self._keycodes.get(name, 0))
+                    if keycode <= 0:
+                        raise RuntimeError(f"X11 keyboard map is missing {name}")
+                    grabbed: list[int] = []
+                    for modifiers in _X11_ESCAPE_GRAB_MODIFIERS:
+                        self._x11.XGrabKey(
+                            self._display,
+                            keycode,
+                            modifiers,
+                            self._root,
+                            0,  # owner_events=False: consume before UE/SDL sees it.
+                            _X11_GRAB_MODE_ASYNC,
+                            _X11_GRAB_MODE_ASYNC,
+                        )
+                        grabbed.append(modifiers)
+                    grabbed_by_name[name] = tuple(grabbed)
                 self._x11.XSync(self._display, 0)
         except RuntimeError as exc:
-            raise RuntimeError(f"cannot grab Escape for Matrix UI: {exc}") from exc
-        self._escape_grabbed_modifiers = tuple(grabbed)
+            raise RuntimeError(f"cannot grab Matrix UI keys: {exc}") from exc
+        self._grabbed_key_modifiers = grabbed_by_name
+        self._escape_grabbed_modifiers = grabbed_by_name.get("escape", ())
 
     def _ungrab_escape_key(self) -> None:
-        keycode = int(getattr(self, "_keycodes", {}).get("escape", 0))
         display = getattr(self, "_display", None)
-        if not display or keycode <= 0:
+        if not display:
             return
-        modifiers = tuple(getattr(self, "_escape_grabbed_modifiers", ()))
-        for modifier in modifiers:
-            self._x11.XUngrabKey(display, keycode, modifier, self._root)
-        if modifiers:
+        grabbed_by_name = dict(getattr(self, "_grabbed_key_modifiers", {}))
+        for name, modifiers in grabbed_by_name.items():
+            keycode = int(getattr(self, "_keycodes", {}).get(name, 0))
+            if keycode <= 0:
+                continue
+            for modifier in modifiers:
+                self._x11.XUngrabKey(display, keycode, modifier, self._root)
+        if grabbed_by_name:
             self._x11.XFlush(display)
+        self._grabbed_key_modifiers = {}
         self._escape_grabbed_modifiers = ()
         self._grabbed_escape_down = False
         self._grabbed_escape_press_pending = False
@@ -6332,6 +6354,37 @@ class GameCommandClient:
             pending_message="Switching resident policy; waiting for writer ACK",
         )
 
+    def quit_game(
+        self,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        """Send one normal operator quit request from the ESC panel."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if not calibration_active:
+            self._local_error("E_NOT_PAUSED", "Open the ESC panel before quitting")
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        return self._send_typed_command(
+            GameQuit(),
+            warning=None,
+            pending_message="Ending Matrix game; waiting for runtime shutdown ACK",
+        )
+
     def spawn_creative_item(
         self,
         item_id: object,
@@ -7138,6 +7191,15 @@ class CalibrationOverlaySupervisor:
                     pause_target=pause_target,
                     expected_epoch=expected_epoch,
                 )
+            elif kind == "game_quit":
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                }:
+                    raise RuntimeError("invalid game-quit intent schema")
+                intent = OverlayIntent(kind="game_quit")
             elif kind == "movement_mode_select":
                 movement_mode = value.get("movement_mode")
                 if set(value) != {
@@ -8105,6 +8167,7 @@ def main() -> int:
     )
     external_telemetry_signature: tuple[object, ...] | None = None
     calibration_neutral_frames = 0
+    startup_loading_until = started + _STARTUP_LOADING_OVERLAY_SECONDS
     final_pov_observation: UeFinalPovObservation | None = None
     provider_yaw = tracker.yaw
     camera_yaw = transform_camera_yaw(
@@ -8132,6 +8195,12 @@ def main() -> int:
             overlay.start(
                 {
                     **source_claim,
+                    "active": True,
+                    "startup_loading": {
+                        "active": True,
+                        "message": "正在初始化 MATRIX / BFM-SONIC 控制链路",
+                        "progress": 0.05,
+                    },
                     "build_info": build_info,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "ui_settings": ui_settings.live_mapping(),
@@ -8359,6 +8428,16 @@ def main() -> int:
                     if intent.active:
                         apply_return.cancel_pending()
                     continue
+                if intent.kind == "game_quit":
+                    quit_submitted = game_command_client.quit_game(
+                        calibration_active=calibration.active,
+                        neutral_frame_ready=neutral_frame_ready,
+                        restart_requested=restart_requester.requested,
+                    )
+                    command_state_changed = True
+                    if quit_submitted:
+                        apply_return.cancel_pending()
+                    continue
                 if intent.kind == "runtime_pause":
                     assert intent.pause_target is not None
                     assert intent.expected_epoch is not None
@@ -8493,6 +8572,9 @@ def main() -> int:
                     now_s=now,
                 )
                 or command_state_changed
+            )
+            startup_loading_active = bool(
+                now < startup_loading_until and not calibration.active
             )
             if (
                 external_control is not None
@@ -8813,7 +8895,27 @@ def main() -> int:
                         {
                             **source_claim,
                             "build_info": build_info,
-                            "active": calibration.active,
+                            "active": calibration.active or startup_loading_active,
+                            "startup_loading": {
+                                "active": startup_loading_active,
+                                "message": (
+                                    "正在初始化 MATRIX / BFM-SONIC 控制链路"
+                                ),
+                                "progress": min(
+                                    0.98,
+                                    max(
+                                        0.05,
+                                        (
+                                            now
+                                            - (
+                                                startup_loading_until
+                                                - _STARTUP_LOADING_OVERLAY_SECONDS
+                                            )
+                                        )
+                                        / _STARTUP_LOADING_OVERLAY_SECONDS,
+                                    ),
+                                ),
+                            },
                             "toggle_count": calibration.toggle_count,
                             "updated_monotonic_s": now,
                             "expected_ue_pid": args.expected_ue_pid,
@@ -8861,7 +8963,9 @@ def main() -> int:
                             "external_control": external_telemetry,
                         }
                     )
-                    next_overlay_heartbeat = now + 1.0
+                    next_overlay_heartbeat = now + (
+                        0.2 if startup_loading_active else 1.0
+                    )
             last_teleport_rejections = teleport_rejections
             snapshot = build_snapshot(
                 sequence=sequence,

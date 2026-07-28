@@ -51,6 +51,7 @@ from matrix_mc_commands import (
     CreativeSpawnItem,
     DataModifyInput,
     DataModifyNumber,
+    GameQuit,
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
@@ -4568,7 +4569,7 @@ def _qualification_state(
         acceptance_failures.append("run_interrupted")
     if termination_reason == "unknown":
         acceptance_failures.append("unknown_termination")
-    completed = termination_reason in {"max_seconds", "scenario_complete"}
+    completed = termination_reason in {"max_seconds", "scenario_complete", "game_quit"}
     return {
         "acceptance_failures": acceptance_failures,
         "qualification_attempted": attempted,
@@ -5523,6 +5524,7 @@ class GameCommandRuntime:
         self.rejected_commands = 0
         self.response_errors = 0
         self.restart_requested = False
+        self.quit_requested = False
         self.last_response: dict[str, object] | None = None
         self.policy_slots = policy_slots
         self.creative_inventory = creative_inventory
@@ -5543,6 +5545,7 @@ class GameCommandRuntime:
         self.motion_settings_changes_executed = 0
         self.movement_mode_changes_executed = 0
         self.runtime_pause_changes_executed = 0
+        self.quit_requests_executed = 0
 
     @staticmethod
     def _command_strategy_loadout(
@@ -5817,7 +5820,7 @@ class GameCommandRuntime:
                 continue
             if not command_allowed and not isinstance(
                 request.command,
-                (TeleportList, MovementModeSet),
+                (TeleportList, MovementModeSet, GameQuit),
             ):
                 self.rejected_commands += 1
                 self._send(
@@ -5829,6 +5832,19 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, GameQuit):
+                self.commands_executed += 1
+                self.quit_requests_executed += 1
+                self.quit_requested = True
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code="OK_GAME_QUIT",
+                        message="Matrix game quit requested",
+                    )
+                )
+                return True
             if isinstance(request.command, RuntimePause):
                 if self.runtime_pause is None:
                     self.rejected_commands += 1
@@ -6269,6 +6285,8 @@ class GameCommandRuntime:
             "runtime_pause_changes_executed": (
                 self.runtime_pause_changes_executed
             ),
+            "quit_requests_executed": self.quit_requests_executed,
+            "quit_requested": self.quit_requested,
             "runtime_pause_pending": (
                 self.pending_runtime_pause_request is not None
             ),
@@ -14549,12 +14567,20 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             if command_restart:
                                 game_command = game_input.emergency_stop(
                                     now_s=time.perf_counter(),
-                                    reason="teleport_reload",
+                                    reason=(
+                                        "game_quit"
+                                        if game_commands.quit_requested
+                                        else "teleport_reload"
+                                    ),
                                 )
                                 planner.send_game_command(game_command)
                                 walking = False
                                 running = False
-                                termination_reason = "game_teleport"
+                                termination_reason = (
+                                    "game_quit"
+                                    if game_commands.quit_requested
+                                    else "game_teleport"
+                                )
                 else:
                     planner.send_velocity(
                         args.vx if walking else 0.0,

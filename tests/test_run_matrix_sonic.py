@@ -5387,6 +5387,44 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_game_command_runtime_accepts_operator_quit_as_normal_stop(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        runtime = MODULE.GameCommandRuntime(runtime_socket, None)
+        pose = WORLD_STATE.WorldPose(0.0, 0.0, 0.8, 0.0)
+        try:
+            request = self.game_command_request(
+                "/game quit",
+                sequence=1,
+                request_character="c",
+            )
+            provider_socket.send(
+                MC_COMMANDS.encode_command_request(request)
+            )
+
+            self.assertTrue(runtime.poll(current_pose=pose, command_allowed=True))
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_GAME_QUIT")
+            self.assertTrue(runtime.quit_requested)
+            self.assertEqual(runtime.quit_requests_executed, 1)
+            self.assertTrue(
+                MODULE._qualification_state(
+                    max_seconds=0.0,
+                    termination_reason="game_quit",
+                    failures=[],
+                    runtime_verified=False,
+                )["passed"]
+            )
+        finally:
+            provider_socket.close()
+            runtime.close()
+
     def test_game_command_runtime_waits_for_pause_and_continue_ack(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
             socket.AF_UNIX,
