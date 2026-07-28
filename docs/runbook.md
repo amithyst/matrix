@@ -174,6 +174,11 @@ password or another host's credentials to satisfy this prerequisite.
 
 ## Launch
 
+For the separate tRNA MoonWorld world16 Teacher/Isaac topology, use the
+[Matrix BFM/Isaac Chinese runbook](MATRIX_BFM_ISAAC_WORLD16_CN.md). That path
+has its own guarded launcher and acceptance gates; it is not a policy slot in
+the native SONIC launcher described below.
+
 For interactive camera-relative control, use `--control-source game` and follow
 the dedicated [game-control runbook](MATRIX_GAME_CONTROL_RUNBOOK.md) (or the
 [Chinese runbook](MATRIX_GAME_CONTROL_RUNBOOK_CN.md)). It separates fixed-frame

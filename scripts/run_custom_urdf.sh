@@ -9,8 +9,8 @@ MUJOCORUNNING="${5:-0}"
 CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 FORCE_REIMPORT="${SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF:-0}"
-MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
-PIPELINE_VERSION=21
+MATRIX_PYTHON="${MATRIX_CUSTOM_URDF_PYTHON:-${MATRIX_SONIC_PYTHON:-$(command -v python3)}}"
+PIPELINE_VERSION=22
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
 G1_MATERIAL_PALETTE=""
@@ -804,8 +804,6 @@ write_scene_terrain_custom_template() {
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
-    <hfield name="perlin_hfield" size="1.0 0.75 0.2 0.2" file="../height_field.png" />
-    <hfield name="image_hfield" size="1.0 1.0 0.02 0.1" file="../unitree_hfield.png" />
   </asset>
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true" />
@@ -890,9 +888,11 @@ sync_runtime_layout() {
         echo "[INFO] synced assets to: $active_assets_dir"
     fi
 
-    if [[ ! -f "$active_root/scene_terrain_custom.xml" ]]; then
-        write_scene_terrain_custom_template "$active_root/scene_terrain_custom.xml"
-    fi
+    # This is a generated handoff entry. Local-physics launches compose their
+    # requested scene over it later; external-state launches keep this minimal
+    # model because Isaac owns terrain/collision. Rewriting it also removes
+    # stale references to optional height-field PNGs that made mj_loadXML fail.
+    write_scene_terrain_custom_template "$active_root/scene_terrain_custom.xml"
 
     # Ensure height-field PNGs are present in active_root
     # (needed because meshdir="assets" makes MuJoCo resolve "../height_field.png" as
@@ -924,6 +924,31 @@ sync_runtime_layout() {
             echo "[WARN] Simulation may behave incorrectly. Check violations above." >&2
         fi
     fi
+}
+
+validate_mujoco_model_load() {
+    local model_path="$1"
+    if [[ ! -f "$model_path" ]]; then
+        echo "[ERROR] MuJoCo model-load gate is missing: $model_path" >&2
+        return 1
+    fi
+    "$MATRIX_PYTHON" - "$model_path" <<'PY'
+from pathlib import Path
+import sys
+
+import mujoco
+
+path = Path(sys.argv[1]).resolve()
+try:
+    model = mujoco.MjModel.from_xml_path(str(path))
+except Exception as exc:
+    print(f"[ERROR] MuJoCo model-load gate failed for {path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+print(
+    "[PASS] MuJoCo model-load gate: "
+    f"{path} nq={model.nq} nv={model.nv} nu={model.nu}"
+)
+PY
 }
 
 restore_urdf_visual_meshes() {
@@ -1782,14 +1807,6 @@ worldbody = root.find("worldbody")
 if worldbody is None:
     worldbody = ET.SubElement(root, "worldbody")
 
-root_body = None
-for body in worldbody.findall("body"):
-    if body.get("name") in {"BASE_LINK", "base_link", "ROOT_LINK", "root"}:
-        root_body = body
-        break
-if root_body is None:
-    root_body = ET.SubElement(worldbody, "body", attrib={"name": "BASE_LINK", "pos": "0 0 0", "quat": "1 0 0 0"})
-
 urdf_child_links = {
     child.get("link")
     for joint in urdf_root.findall("joint")
@@ -1800,6 +1817,17 @@ urdf_root_link = next(
     (name for name in urdf_links if name not in urdf_child_links),
     None,
 )
+root_candidates = {"BASE_LINK", "base_link", "ROOT_LINK", "root"}
+if urdf_root_link:
+    root_candidates.add(urdf_root_link)
+root_body = None
+for body in worldbody.findall("body"):
+    if body.get("name") in root_candidates:
+        root_body = body
+        break
+if root_body is None:
+    root_body = ET.SubElement(worldbody, "body", attrib={"name": "BASE_LINK", "pos": "0 0 0", "quat": "1 0 0 0"})
+
 root_link_name = next(
     (name for name in ("BASE_LINK", "base_link", "ROOT_LINK") if name in urdf_links),
     urdf_root_link or root_body.get("name", "BASE_LINK"),
@@ -2528,6 +2556,14 @@ PY
     echo "[INFO] wrote metadata: $TARGET_METADATA"
     echo "[INFO] wrote metadata: $UE_TARGET_METADATA"
 fi
+
+# The static XML validator cannot detect every mj_loadXML failure. In particular,
+# a previously duplicated free root body passed the shape/count checks but made
+# the cooked UE abort StartSimulation and render only the background world.
+validate_mujoco_model_load "$MUJOCO_ACTIVE_SCENE_XML"
+validate_mujoco_model_load "$UE_ACTIVE_SCENE_XML"
+validate_mujoco_model_load "$MUJOCO_CUSTOM_ROOT/scene_terrain_custom.xml"
+validate_mujoco_model_load "$UE_CUSTOM_ROOT/scene_terrain_custom.xml"
 
 if [[ "${MATRIX_CUSTOM_URDF_IMPORT_ONLY:-0}" == "1" ]]; then
     echo "[INFO] Custom URDF import-only mode completed: $CUSTOM_NAME"

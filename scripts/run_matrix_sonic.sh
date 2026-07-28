@@ -86,6 +86,9 @@ GAME_MAX_SPEED="${MATRIX_GAME_MAX_SPEED:-0.30}"
 GAME_MAX_ACCELERATION="${MATRIX_GAME_MAX_ACCELERATION:-1.20}"
 GAME_MAX_DECELERATION="${MATRIX_GAME_MAX_DECELERATION:-2.40}"
 GAME_MAX_TURN_RATE="${MATRIX_GAME_MAX_TURN_RATE:-2.50}"
+GAME_MAX_ACCELERATION_ARGUMENT_SET=0
+GAME_MAX_DECELERATION_ARGUMENT_SET=0
+GAME_MAX_TURN_RATE_ARGUMENT_SET=0
 GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
 GAME_WORLD_PERSISTENCE="${MATRIX_GAME_WORLD_PERSISTENCE:-auto}"
 GAME_AUTO_RESPAWN="${MATRIX_GAME_AUTO_RESPAWN:-auto}"
@@ -246,9 +249,9 @@ while [[ $# -gt 0 ]]; do
         --gamepad-look-min-pitch) GAMEPAD_LOOK_MIN_PITCH_DEG="$2"; shift 2 ;;
         --gamepad-look-max-pitch) GAMEPAD_LOOK_MAX_PITCH_DEG="$2"; shift 2 ;;
         --game-max-speed) GAME_MAX_SPEED="$2"; shift 2 ;;
-        --game-max-acceleration) GAME_MAX_ACCELERATION="$2"; shift 2 ;;
-        --game-max-deceleration) GAME_MAX_DECELERATION="$2"; shift 2 ;;
-        --game-max-turn-rate) GAME_MAX_TURN_RATE="$2"; shift 2 ;;
+        --game-max-acceleration) GAME_MAX_ACCELERATION="$2"; GAME_MAX_ACCELERATION_ARGUMENT_SET=1; shift 2 ;;
+        --game-max-deceleration) GAME_MAX_DECELERATION="$2"; GAME_MAX_DECELERATION_ARGUMENT_SET=1; shift 2 ;;
+        --game-max-turn-rate) GAME_MAX_TURN_RATE="$2"; GAME_MAX_TURN_RATE_ARGUMENT_SET=1; shift 2 ;;
         --game-input-timeout) GAME_INPUT_TIMEOUT="$2"; shift 2 ;;
         --game-world-persistence) GAME_WORLD_PERSISTENCE="$2"; shift 2 ;;
         --game-auto-respawn) GAME_AUTO_RESPAWN="$2"; shift 2 ;;
@@ -321,6 +324,22 @@ if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
             ;;
     esac
     export MATRIX_INITIAL_LOCOMOTION_POLICY="$INITIAL_LOCOMOTION_POLICY"
+fi
+if [[ "$SCENE_ID" == "15" \
+    && "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
+    # Resolve the profile/CLI policy first, then apply the former Moon wrapper
+    # BFM slew contract.  Explicit command-line motion tuning remains last and
+    # authoritative, but Heyuan/ZZA native SONIC launches never see BFM values.
+    if [[ "$GAME_MAX_ACCELERATION_ARGUMENT_SET" != "1" ]]; then
+        GAME_MAX_ACCELERATION=90.0
+    fi
+    if [[ "$GAME_MAX_DECELERATION_ARGUMENT_SET" != "1" ]]; then
+        GAME_MAX_DECELERATION=90.0
+    fi
+    if [[ "$GAME_MAX_TURN_RATE_ARGUMENT_SET" != "1" ]]; then
+        GAME_MAX_TURN_RATE=2.40
+    fi
+    echo "[INFO] moon-v1 BFM controls: walk=0.90m/s jog=1.40m/s turn=2.40rad/s"
 fi
 if [[ -n "$CELESTIAL_SPK" || -n "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
     if [[ -z "$CELESTIAL_SPK" || -z "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then

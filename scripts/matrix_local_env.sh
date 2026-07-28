@@ -39,3 +39,46 @@ load_matrix_local_env() {
         export "$name"
     done
 }
+
+# Enforce the tRNA desktop BFM/Isaac topology after every local/profile load.
+# This is deliberately scoped to the desktop sentinel: the legacy native
+# launcher retains its explicit PICO qualification path for controlled tests.
+matrix_bfm_isaac_enforce_desktop_sim_only() {
+    local profile="$1"
+    if [[ "${MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY:-0}" != "1" ]]; then
+        return 0
+    fi
+    if [[ "$profile" != "trna" ]]; then
+        echo "[ERROR] Desktop sim-only mode is restricted to the trna profile" >&2
+        return 2
+    fi
+
+    local assignment name expected actual
+    local -a topology_contract=(
+        "MATRIX_PICO_INPUT_ENABLED=0"
+        "MATRIX_EXTERNAL_STATE=1"
+        "MATRIX_DISABLE_MC=1"
+        "MATRIX_SONIC=0"
+        "MATRIX_SONIC_CONTROL_SOURCE=external"
+        "MATRIX_GAME_INPUT_SOURCE=keyboard"
+        "MATRIX_GAME_NO_INPUT_PROVIDER=1"
+    )
+    for assignment in "${topology_contract[@]}"; do
+        name="${assignment%%=*}"
+        expected="${assignment#*=}"
+        actual="${!name-}"
+        if [[ "$actual" != "$expected" ]]; then
+            echo "[ERROR] Desktop sim-only topology rejected $name=$actual (expected $expected)" >&2
+            return 2
+        fi
+    done
+
+    # .matrix/local.env intentionally supports PICO artifact paths for legacy
+    # qualification, so scrub again after loading it.  DDS/OpenXR settings are
+    # also excluded from this renderer/Isaac-only process tree.
+    unset MATRIX_PICO_PYTHON MATRIX_PICO_WHEEL
+    unset FASTRTPS_DEFAULT_PROFILES_FILE CYCLONEDDS_URI RMW_IMPLEMENTATION
+    unset ROS_DOMAIN_ID ROS_LOCALHOST_ONLY
+    unset XR_RUNTIME_JSON XR_API_LAYER_PATH
+    export MATRIX_PICO_INPUT_ENABLED=0
+}

@@ -191,8 +191,6 @@ esac
                     "trna",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "bfm-sonic-teacher50k",
                     "--game-fall-recovery",
                     "auto",
                 ]
@@ -206,8 +204,6 @@ esac
                     "trna",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "bfm-sonic-teacher50k",
                     "--game-fall-recovery",
                     "auto",
                 ]
@@ -241,7 +237,7 @@ esac
             1,
         )
 
-    def test_explicit_moon_scene_uses_bfm_runtime(self) -> None:
+    def test_moon_scene_does_not_inject_trna_policy_into_heyuan(self) -> None:
         result = self.run_launcher(
             "start", "--profile", "heyuan", "--scene", "15"
         )
@@ -255,14 +251,71 @@ esac
                     "heyuan",
                     "--control-source",
                     "game",
-                    "--initial-locomotion-policy",
-                    "bfm-sonic-teacher50k",
                     "--game-fall-recovery",
                     "auto",
                 ]
             ],
         )
         self.assertIn("scene 15", result.stdout)
+
+    def test_explicit_sonic_policy_overrides_the_moon_default(self) -> None:
+        result = self.run_launcher(
+            "start",
+            "--profile",
+            "trna",
+            "--scene",
+            "15",
+            "--initial-locomotion-policy",
+            "sonic",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            parse_call_log(self.run_log),
+            [
+                [
+                    "--profile",
+                    "trna",
+                    "--control-source",
+                    "game",
+                    "--game-fall-recovery",
+                    "auto",
+                    "--initial-locomotion-policy",
+                    "sonic",
+                ]
+            ],
+        )
+
+    def test_inherited_sonic_policy_overrides_the_moon_default(self) -> None:
+        self.environment["MATRIX_INITIAL_LOCOMOTION_POLICY"] = "sonic"
+
+        result = self.run_launcher("start", "--profile", "trna", "--scene", "15")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            parse_call_log(self.run_log),
+            [
+                [
+                    "--profile",
+                    "trna",
+                    "--control-source",
+                    "game",
+                    "--game-fall-recovery",
+                    "auto",
+                    "--initial-locomotion-policy",
+                    "sonic",
+                ]
+            ],
+        )
+
+    def test_invalid_initial_policy_is_rejected_before_tmux(self) -> None:
+        result = self.run_launcher(
+            "start", "--initial-locomotion-policy", "bfm;touch"
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid initial locomotion policy", result.stderr)
+        self.assertEqual(parse_call_log(self.tmux_log), [])
 
     def test_non_moon_scene_is_forwarded_to_generic_runtime(self) -> None:
         result = self.run_launcher(
@@ -301,8 +354,6 @@ esac
                 "heyuan",
                 "--control-source",
                 "game",
-                "--initial-locomotion-policy",
-                "bfm-sonic-teacher50k",
                 "--game-fall-recovery",
                 "auto",
             ],

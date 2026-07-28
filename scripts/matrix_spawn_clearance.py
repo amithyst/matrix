@@ -304,7 +304,11 @@ def spawn_clearance_rollback_reason(audit: dict[str, object] | None) -> str | No
                 )
                 or (
                     moon_spawn_gate
-                    and scene_geom.get("name") != MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+                    and scene_geom.get("name")
+                    not in {
+                        MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                        MOON_SPAWN_PAD_GEOM_NAME,
+                    }
                 )
             ):
                 return None

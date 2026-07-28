@@ -38,6 +38,27 @@ MOON_WORLD_ID = "g1_29dof:scene_terrain_moon_dynamic"
 WORLD_CLI_ARGS = ("--game-world-id", EARTH_WORLD_ID)
 
 
+class UiOnlyPublisherTest(unittest.TestCase):
+    def test_ui_only_publisher_drops_snapshots_without_socket_connection(self) -> None:
+        publisher = MODULE.UiOnlyPublisher()
+        snapshot = MODULE.build_snapshot(
+            sequence=1,
+            timestamp_monotonic_s=2.0,
+            keyboard=MODULE.KeyboardMouseSample(
+                w=True,
+                focused=True,
+            ),
+            gamepad=MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.0,
+            camera_available=True,
+        )
+
+        self.assertTrue(publisher.connected)
+        self.assertTrue(publisher.send(snapshot, now=3.0))
+        self.assertIsNone(publisher.close())
+
+
 class CalibrationOverlaySupervisorTest(unittest.TestCase):
     def test_isolated_overlay_explicitly_disables_bytecode_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -7749,6 +7770,116 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         self.assertIsNone(sample.focus_title)
         self.assertTrue(sample.focused)
 
+    def test_grabbed_escape_event_is_consumed_for_one_provider_frame(self) -> None:
+        escape_keycode = 37
+
+        class FakeX11:
+            def __init__(self) -> None:
+                press = MODULE._XEvent()
+                press.type = MODULE._X11_KEY_PRESS
+                press.xkey.keycode = escape_keycode
+                release = MODULE._XEvent()
+                release.type = MODULE._X11_KEY_RELEASE
+                release.xkey.keycode = escape_keycode
+                self.events = [press, release]
+
+            def XPending(self, _display) -> int:
+                return len(self.events)
+
+            def XNextEvent(self, _display, event_pointer) -> int:
+                event = self.events.pop(0)
+                event_pointer._obj.type = event.type
+                event_pointer._obj.xkey.keycode = event.xkey.keycode
+                return 1
+
+            @staticmethod
+            def XQueryKeymap(_display, _buffer) -> int:
+                return 1
+
+            @staticmethod
+            def XQueryPointer(*args) -> int:
+                args[4]._obj.value = 10
+                args[5]._obj.value = 0
+                args[8]._obj.value = 0
+                return 1
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 1
+        backend._root = 2
+        backend._keycodes = {
+            name: index
+            for index, name in enumerate(MODULE.X11KeyboardMouse._KEYSYMS, start=8)
+        }
+        backend._keycodes["escape"] = escape_keycode
+        backend._pressed = lambda _keymap, _code: False
+        backend._focus_pattern = None
+        backend._look_mask = 1 << 8
+        backend._previous_pointer = None
+        backend._previous_look_pressed = False
+        backend._maximum_mouse_delta = 200.0
+        backend._teleport_rejections = 0
+        backend._last_teleport_delta = None
+        backend._raw_motion = None
+        backend._absolute_motion = None
+        backend._expected_ue_pid = 1234
+        backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
+        backend._escape_grabbed_modifiers = (0,)
+        backend._grabbed_escape_down = False
+        backend._grabbed_escape_press_pending = False
+        backend._grabbed_escape_events = 0
+
+        one_frame = backend.poll()
+        released = backend.poll()
+
+        self.assertTrue(one_frame.escape)
+        self.assertFalse(released.escape)
+        self.assertEqual(backend.pointer_telemetry["grabbed_escape_events"], 2)
+        self.assertTrue(backend.pointer_telemetry["escape_grabbed"])
+
+    def test_close_ungrabs_passive_escape_before_closing_display(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        class FakeX11:
+            @staticmethod
+            def XUngrabKey(_display, _keycode, modifier, _root) -> int:
+                calls.append(("ungrab", modifier))
+                return 1
+
+            @staticmethod
+            def XFlush(_display) -> int:
+                calls.append(("flush", None))
+                return 1
+
+            @staticmethod
+            def XCloseDisplay(_display) -> int:
+                calls.append(("close", None))
+                return 1
+
+        backend = object.__new__(MODULE.X11KeyboardMouse)
+        backend._x11 = FakeX11()
+        backend._display = 11
+        backend._root = 22
+        backend._keycodes = {"escape": 37}
+        backend._raw_motion = None
+        backend._escape_grabbed_modifiers = (0, MODULE._X11_MOD2_MASK)
+        backend._grabbed_escape_down = True
+        backend._grabbed_escape_press_pending = True
+
+        backend.close()
+
+        self.assertEqual(
+            calls,
+            [
+                ("ungrab", 0),
+                ("ungrab", MODULE._X11_MOD2_MASK),
+                ("flush", None),
+                ("close", None),
+            ],
+        )
+        self.assertIsNone(backend._display)
+        self.assertEqual(backend._escape_grabbed_modifiers, ())
+
 
 @unittest.skipUnless(
     os.environ.get("MATRIX_RUN_X11_BADWINDOW_INTEGRATION") == "1",
@@ -8334,6 +8465,28 @@ class CameraYawSourceCliTest(unittest.TestCase):
             ):
                 args = MODULE._parse_args()
                 self.assertEqual(args.camera_yaw_source, source)
+
+    def test_provider_parser_accepts_explicit_escape_grab(self) -> None:
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            ["matrix_game_control_input.py", *WORLD_CLI_ARGS, "--dry-run"],
+        ):
+            default = MODULE._parse_args()
+        self.assertFalse(default.grab_escape)
+
+        with mock.patch.object(
+            os.sys,
+            "argv",
+            [
+                "matrix_game_control_input.py",
+                *WORLD_CLI_ARGS,
+                "--grab-escape",
+                "--dry-run",
+            ],
+        ):
+            explicit = MODULE._parse_args()
+        self.assertTrue(explicit.grab_escape)
 
     def test_provider_parser_accepts_final_pov_state_file(self) -> None:
         with mock.patch.object(
