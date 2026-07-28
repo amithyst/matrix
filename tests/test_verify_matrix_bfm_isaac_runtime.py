@@ -127,6 +127,17 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
         self.lock_path = REPO_ROOT / "config/runtime/matrix-bfm-isaac.lock.json"
         self.lock = MODULE.load_lock(self.lock_path)
 
+    def test_repository_matrix_port_files_match_lock(self) -> None:
+        for entry in self.lock["matrix_port"]["critical_files"]:
+            path = REPO_ROOT / entry["path"]
+            self.assertTrue(path.is_file(), entry["path"])
+            self.assertFalse(path.is_symlink(), entry["path"])
+            self.assertEqual(
+                MODULE.sha256_file(path),
+                entry["sha256"],
+                entry["path"],
+            )
+
     def runtime_report(self, *, wall_seconds: float = 2.0) -> dict[str, object]:
         control_steps = 100
         return {
