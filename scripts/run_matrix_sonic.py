@@ -772,6 +772,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gamepad-look-max-pitch-deg", type=float, default=60.0)
     parser.add_argument("--game-focus-title", default=r"(zsibot|matrix|unreal)")
     parser.add_argument("--game-input-status-file", type=Path)
+    parser.add_argument(
+        "--game-grab-escape",
+        action="store_true",
+        help="Ask the input provider to consume physical Escape for Matrix UI.",
+    )
     parser.add_argument("--no-game-input-provider", action="store_true")
     parser.add_argument("--game-world-id")
     parser.add_argument("--game-world-revision")
@@ -6446,6 +6451,7 @@ class NativeProcessGroup:
         focus_title: str,
         expected_ue_pid: int,
         status_file: Path | None,
+        grab_escape: bool = False,
         keyboard_double_tap_window_s: float = 0.30,
         ue_camera_state_file: Path | None = None,
         mouse_settings_file: Path | None = None,
@@ -6582,6 +6588,8 @@ class NativeProcessGroup:
             )
         if status_file is not None:
             command.extend(("--status-file", str(status_file)))
+        if grab_escape:
+            command.append("--grab-escape")
         if strategy_loadout_json is not None:
             command.extend(("--strategy-loadout-json", strategy_loadout_json))
         if creative_inventory_json is not None:
@@ -14143,6 +14151,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         focus_title=args.game_focus_title,
                         expected_ue_pid=args.ue_pid,
                         status_file=args.game_input_status_file,
+                        grab_escape=args.game_grab_escape,
                         ue_camera_state_file=args.game_ue_camera_state_file,
                         command_fd=(
                             game_command_child_socket.fileno()

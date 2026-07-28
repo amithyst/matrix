@@ -1946,6 +1946,7 @@ printf '%s\n%s\n%s\n' \
                 "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
                     fixture["stale_status"]
                 ),
+                "MATRIX_GAME_GRAB_ESCAPE": "1",
                 "MATRIX_MOUSE_SETTINGS_FILE": os.fspath(mouse_settings),
                 "MATRIX_VIDEO_SETTINGS_FILE": os.fspath(video_settings),
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
@@ -2155,6 +2156,7 @@ printf '%s\n%s\n%s\n' \
             self.assertEqual(parsed.gamepad_look_max_pitch_deg, 50.0)
             self.assertEqual(parsed.game_max_speed, 0.27)
             self.assertEqual(parsed.game_input_timeout, 0.14)
+            self.assertTrue(parsed.game_grab_escape)
             self.assertEqual(
                 parsed.game_world_id,
                 "g1_29dof:scene_terrain_apart2",

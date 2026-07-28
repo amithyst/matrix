@@ -2553,6 +2553,15 @@ PY
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
     GAME_INPUT_ARGS+=("${GAME_EXTERNAL_CONTROL_ARGS[@]}")
+    GAME_GRAB_ESCAPE_VALUE="${MATRIX_GAME_GRAB_ESCAPE:-0}"
+    case "${GAME_GRAB_ESCAPE_VALUE,,}" in
+        1|true|yes|on) GAME_INPUT_ARGS+=(--game-grab-escape) ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_GAME_GRAB_ESCAPE must be a boolean" >&2
+            exit 1
+            ;;
+    esac
     if [[ -n "${MATRIX_CELESTIAL_SPK:-}" \
         || -n "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
         if [[ -z "${MATRIX_CELESTIAL_SPK:-}" \

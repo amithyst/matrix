@@ -183,6 +183,7 @@ esac
                     "LD_LIBRARY_PATH",
                     "-u",
                     "PYTHONPATH",
+                    "MATRIX_GAME_GRAB_ESCAPE=1",
                     "/usr/bin/bash",
                     os.fspath(
                         self.project / "scripts/run_matrix_sonic_moon_v1.sh"
