@@ -27,7 +27,8 @@ bash scripts/run_matrix_bfm_isaac_guarded.sh interactive \
 ```
 
 实际进程位于 `matrix-bfm-isaac-mainline-<uid>` tmux 会话。重复双击幂等；右键菜单
-提供状态查询和安全停止。停止只向该会话发送 `Ctrl+C` 并等待 finalizer，超时会保留
+提供状态查询和安全停止。停止通过本次运行的受限 keyboard socket 发送 `SPACE` /
+`ESCAPE` finalizer 请求并等待自然退出；不会向整套进程发送 `Ctrl+C`，超时会保留
 现场而不会 `pkill`。桌面 wrapper 会清除视频、材质和 Python 路径覆盖，使用冻结验收
 配置，并把启动/锁冲突/停止结果及每次 guard 控制台输出写入：
 

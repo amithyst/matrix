@@ -158,6 +158,48 @@ raise SystemExit(0 if base_ok and termination_ok else 1)
 PY
 }
 
+keyboard_socket_for_run() {
+    local run_dir="$1"
+    python3 - "$run_dir/keyboard.log" "$PROJECT_ROOT" <<'PY'
+from pathlib import Path
+import sys
+
+log = Path(sys.argv[1])
+project = Path(sys.argv[2]).resolve()
+allowed = (project / "outputs/runtime/matrix-bfm-isaac/ipc").resolve()
+try:
+    content = log.read_text(encoding="utf-8")
+except OSError:
+    raise SystemExit(1)
+matches = []
+for line in content.splitlines():
+    if " socket=" not in line or " keys=" not in line:
+        continue
+    matches.append(line.split(" socket=", 1)[1].rsplit(" keys=", 1)[0])
+if not matches:
+    raise SystemExit(1)
+candidate = Path(matches[-1])
+try:
+    resolved = candidate.resolve(strict=True)
+    resolved.relative_to(allowed)
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not resolved.is_socket():
+    raise SystemExit(1)
+print(resolved)
+PY
+}
+
+request_runtime_finalizer() {
+    local run_dir="$1"
+    local keyboard_socket
+    if ! keyboard_socket="$(keyboard_socket_for_run "$run_dir")"; then
+        return 1
+    fi
+    python3 "$SCRIPT_DIR/matrix_bfm_isaac_command.py" \
+        --socket "$keyboard_socket" --key SPACE --key ESCAPE
+}
+
 print_attach_hint() {
     printf 'Attach with: tmux attach-session -t =%s\n' "$SESSION_NAME"
 }
@@ -355,7 +397,15 @@ stop_session() {
 
     run_dir="$(session_option @matrix_run_dir)"
     console_log="$(session_option @matrix_console_log)"
-    tmux send-keys -t "=$SESSION_NAME:0.0" C-c
+    if ! request_runtime_finalizer "$run_dir"; then
+        printf '[ERROR] Could not request the Matrix runtime finalizer; live session retained: %s\n' \
+            "$SESSION_NAME" >&2
+        print_evidence_hint "$run_dir" "$console_log" >&2
+        notify_user "无法请求自然 finalizer，运行会话保持不变"
+        log_event "STOP request_failed session=$SESSION_NAME run_dir=$run_dir console=$console_log"
+        return 1
+    fi
+    log_event "STOP finalizer_requested session=$SESSION_NAME run_dir=$run_dir"
     deadline=$((SECONDS + STOP_GRACE_SECONDS))
     while ((SECONDS < deadline)); do
         if ! session_is_live; then

@@ -18,6 +18,7 @@ INSTALLER = (
     REPO_ROOT / "scripts" / "install_matrix_bfm_isaac_desktop_launcher.sh"
 )
 TEMPLATE = REPO_ROOT / "packaging" / "matrix-bfm-isaac-mainline.desktop.in"
+COMMAND_TOOL = REPO_ROOT / "scripts" / "matrix_bfm_isaac_command.py"
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -40,6 +41,7 @@ class MatrixBfmIsaacDesktopLauncherTest(unittest.TestCase):
         scripts = self.project / "scripts"
         scripts.mkdir(parents=True)
         shutil.copy2(LAUNCHER, scripts / LAUNCHER.name)
+        shutil.copy2(COMMAND_TOOL, scripts / COMMAND_TOOL.name)
         self.launcher = scripts / LAUNCHER.name
         self.run_log = self.root / "run.log"
         write_executable(
@@ -55,10 +57,52 @@ for ((i=0; i<${#arguments[@]}; i++)); do
 done
 [[ -n "$run_dir" ]]
 mkdir -p -- "$run_dir"
+socket="${FAKE_KEYBOARD_SOCKET:?}"
+python3 -u - "$socket" "$FAKE_TMUX_STATE" \
+    >/dev/null 2>"${FAKE_SOCKET_ERROR_LOG:?}" <<'PY' &
+import os
+from pathlib import Path
+import socket
+import sys
+
+path = Path(sys.argv[1])
+tmux_state = Path(sys.argv[2])
+try:
+    path.unlink()
+except FileNotFoundError:
+    pass
+server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+server.bind(os.fspath(path))
+server.settimeout(10.0)
+try:
+    received = 0
+    try:
+        for _ in range(4):
+            server.recv(4096)
+            received += 1
+    except TimeoutError:
+        pass
+    if received == 4:
+        tmux_state.write_text("1\\n", encoding="utf-8")
+finally:
+    server.close()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+PY
+socket_pid=$!
+for _ in $(seq 1 100); do
+    [[ -S "$socket" ]] && break
+    sleep 0.01
+done
+[[ -S "$socket" ]]
+printf 'matrix-bfm-isaac-keyboard ready socket=%s keys=[]\n' "$socket" \
+    > "$run_dir/keyboard.log"
 if [[ "${FAKE_FINALIZER_INVALID:-0}" == "1" ]]; then
     printf '{"complete":false}\n' > "$run_dir/finalizer-status.json"
 else
-    printf '%s\n' '{"complete":true,"trigger":"signal_term","physics_exit_code":0,"stack_failure_code":143,"report_present":true,"trajectory_present":true,"relay_status_present":true}' > "$run_dir/finalizer-status.json"
+    printf '%s\n' '{"complete":true,"trigger":"natural","physics_exit_code":0,"stack_failure_code":0,"report_present":true,"trajectory_present":true,"relay_status_present":true}' > "$run_dir/finalizer-status.json"
 fi
 sleep "${FAKE_RUN_DELAY:-0}"
 {
@@ -75,6 +119,15 @@ sleep "${FAKE_RUN_DELAY:-0}"
         self.fake_bin.mkdir()
         self.tmux_state = self.root / "tmux.state"
         self.tmux_log = self.root / "tmux.log"
+        self.fake_keyboard_socket = (
+            self.project
+            / "outputs"
+            / "runtime"
+            / "matrix-bfm-isaac"
+            / "ipc"
+            / "k"
+        )
+        self.fake_keyboard_socket.parent.mkdir(parents=True)
         write_executable(
             self.fake_bin / "tmux",
             """#!/usr/bin/env bash
@@ -136,6 +189,12 @@ esac
                 "FAKE_RUN_LOG": os.fspath(self.run_log),
                 "FAKE_TMUX_LOG": os.fspath(self.tmux_log),
                 "FAKE_TMUX_STATE": os.fspath(self.tmux_state),
+                "FAKE_KEYBOARD_SOCKET": os.fspath(
+                    self.fake_keyboard_socket
+                ),
+                "FAKE_SOCKET_ERROR_LOG": os.fspath(
+                    self.root / "fake-socket.err"
+                ),
                 "MATRIX_SONIC_HOST_LOCK": os.fspath(self.root / "host.lock"),
                 "MATRIX_BFM_ISAAC_DESKTOP_SESSION_NAME": "test-mainline",
                 "MATRIX_BFM_ISAAC_DESKTOP_INSTANCE_ID": "test-mainline",
@@ -502,7 +561,9 @@ while child.poll() is None:
         interrupted = tmux("send-keys", "-t", "=signal-test:0.0", "C-c")
         self.assertEqual(interrupted.returncode, 0, interrupted.stderr)
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and not finalizer.exists():
+        while time.monotonic() < deadline and (
+            not finalizer.exists() or finalizer.stat().st_size == 0
+        ):
             time.sleep(0.05)
 
         self.assertEqual(finalizer.read_text(encoding="utf-8"), "finalized\n")
