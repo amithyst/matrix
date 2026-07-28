@@ -33,6 +33,7 @@ REQUIRED_MOON_GROUND_SUPPORT_HITS = 2
 MAXIMUM_MOON_FOOT_SUPPORT_HEIGHT_DELTA_M = 0.04
 MOON_CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
 MOON_CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
+MOON_SPAWN_PAD_GEOM_NAME = "matrix_moon_spawn_pad"
 _MUJOCO_HFIELD_GEOM_TYPE = 1
 _ROLLBACK_CLEARANCE_REASONS = frozenset(
     {"no_ground_support", "scene_penetration", "unsafe_foot_contact"}
@@ -303,7 +304,11 @@ def spawn_clearance_rollback_reason(audit: dict[str, object] | None) -> str | No
                 )
                 or (
                     moon_spawn_gate
-                    and scene_geom.get("name") != MOON_CONTINUOUS_SUPPORT_GEOM_NAME
+                    and scene_geom.get("name")
+                    not in {
+                        MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                        MOON_SPAWN_PAD_GEOM_NAME,
+                    }
                 )
             ):
                 return None
@@ -645,7 +650,12 @@ def _geom_count(model: Any) -> int:
     return _model_count(model, "ngeom")
 
 
-def _moon_continuous_support_geom_id(model: Any, *, ngeom: int) -> int | None:
+def _moon_ground_collision_contract(
+    model: Any,
+    *,
+    ngeom: int,
+) -> dict[str, object] | None:
+    """Validate one legal Moon phase and identify every active ground geom."""
     matches = [
         geom_id
         for geom_id in range(ngeom)
@@ -712,11 +722,93 @@ def _moon_continuous_support_geom_id(model: Any, *, ngeom: int) -> int | None:
         raise SpawnClearanceError(
             "MoonWorld continuous support geom must bind the named hfield asset"
         )
-    if contype != 1 or conaffinity != 1:
+    if (contype, conaffinity) != (0, 0):
         raise SpawnClearanceError(
-            "MoonWorld continuous support must use contype=1 and conaffinity=1"
+            "MoonWorld observation hfield must remain non-colliding"
         )
-    return geom_id
+    pad_matches = [
+        pad_id
+        for pad_id in range(ngeom)
+        if _optional_name(model, "geom", pad_id) == MOON_SPAWN_PAD_GEOM_NAME
+    ]
+    if not pad_matches:
+        raise SpawnClearanceError("MoonWorld collision-only spawn pad is missing")
+    if len(pad_matches) != 1:
+        raise SpawnClearanceError(
+            "MoonWorld collision-only spawn pad must be unique"
+        )
+    pad_id = pad_matches[0]
+    try:
+        pad_body_id = _index(
+            model.geom_bodyid[pad_id], label=f"model.geom_bodyid[{pad_id}]"
+        )
+        pad_contype = _index(
+            model.geom_contype[pad_id], label=f"model.geom_contype[{pad_id}]"
+        )
+        pad_conaffinity = _index(
+            model.geom_conaffinity[pad_id],
+            label=f"model.geom_conaffinity[{pad_id}]",
+        )
+    except (AttributeError, IndexError, KeyError, TypeError) as exc:
+        raise SpawnClearanceError(
+            "MoonWorld spawn-pad collision metadata is unavailable"
+        ) from exc
+    if pad_body_id != 0:
+        raise SpawnClearanceError(
+            "MoonWorld collision-only spawn pad must be attached to the world body"
+        )
+    tile_geom_ids: list[int] = []
+    tile_masks: set[tuple[int, int]] = set()
+    for tile_geom_id in range(ngeom):
+        geom_name = _optional_name(model, "geom", tile_geom_id)
+        if not isinstance(geom_name, str) or not geom_name.startswith("soil_"):
+            continue
+        try:
+            tile_body_id = _index(
+                model.geom_bodyid[tile_geom_id],
+                label=f"model.geom_bodyid[{tile_geom_id}]",
+            )
+            tile_contype = _index(
+                model.geom_contype[tile_geom_id],
+                label=f"model.geom_contype[{tile_geom_id}]",
+            )
+            tile_conaffinity = _index(
+                model.geom_conaffinity[tile_geom_id],
+                label=f"model.geom_conaffinity[{tile_geom_id}]",
+            )
+        except (AttributeError, IndexError, KeyError, TypeError) as exc:
+            raise SpawnClearanceError(
+                "MoonWorld rolling-tile collision metadata is unavailable"
+            ) from exc
+        if not _is_moon_mocap_body(model, tile_body_id, nbody=_model_count(model, "nbody")):
+            raise SpawnClearanceError(
+                f"MoonWorld rolling tile is not on a persistent mocap body: {geom_name}"
+            )
+        tile_geom_ids.append(tile_geom_id)
+        tile_masks.add((tile_contype, tile_conaffinity))
+
+    pad_mask = (pad_contype, pad_conaffinity)
+    if pad_mask == (1, 1) and (not tile_masks or tile_masks == {(0, 0)}):
+        return {
+            "phase": "spawn-pad",
+            "active_ground_geom_ids": frozenset((pad_id,)),
+            "observation_hfield_geom_id": geom_id,
+            "spawn_pad_geom_id": pad_id,
+            "rolling_tile_geom_ids": tuple(tile_geom_ids),
+        }
+    if pad_mask == (0, 0) and tile_geom_ids and tile_masks == {(1, 1)}:
+        return {
+            "phase": "rolling-tiles",
+            "active_ground_geom_ids": frozenset(tile_geom_ids),
+            "observation_hfield_geom_id": geom_id,
+            "spawn_pad_geom_id": pad_id,
+            "rolling_tile_geom_ids": tuple(tile_geom_ids),
+        }
+    raise SpawnClearanceError(
+        "MoonWorld collision handoff must have exactly one active ground: "
+        f"observation_hfield={(contype, conaffinity)} "
+        f"rolling_tiles={sorted(tile_masks)} spawn_pad={pad_mask}"
+    )
 
 
 def _contact_mapping(
@@ -791,11 +883,16 @@ def audit_spawn_clearance(
         )
         nbody = _model_count(model, "nbody")
         ngeom = _geom_count(model)
-        moon_support_geom_id = _moon_continuous_support_geom_id(
+        moon_ground = _moon_ground_collision_contract(
             model,
             ngeom=ngeom,
         )
-        moon_spawn_gate = moon_support_geom_id is not None
+        moon_spawn_gate = moon_ground is not None
+        moon_active_ground_geom_ids = (
+            moon_ground["active_ground_geom_ids"]
+            if moon_ground is not None
+            else frozenset()
+        )
         pelvis_id = _named_body_id(model, _PELVIS_BODY_NAME, nbody=nbody)
         foot_ids = tuple(
             _named_body_id(model, name, nbody=nbody) for name in _FOOT_BODY_NAMES
@@ -879,13 +976,17 @@ def audit_spawn_clearance(
             if robot_body_id in foot_ids:
                 support_normal = scene_to_robot_normal[2]
                 scene_body_id = body2 if robot1 else body1
+                scene_geom_id = geom2 if robot1 else geom1
                 moon_terrain_edge = _is_moon_mocap_body(
                     model,
                     scene_body_id,
                     nbody=nbody,
                 )
                 allowed = False
-                if moon_terrain_edge:
+                if (
+                    moon_terrain_edge
+                    and scene_geom_id not in moon_active_ground_geom_ids
+                ):
                     classification = "unsafe_foot_terrain_edge"
                 elif (
                     support_normal >= thresholds["minimum_foot_vertical_normal"]
@@ -965,7 +1066,19 @@ def audit_spawn_clearance(
             "thresholds": thresholds,
             "moon_spawn_gate": {
                 "enabled": moon_spawn_gate,
-                "continuous_support_geom_id": moon_support_geom_id,
+                "phase": (
+                    moon_ground["phase"] if moon_ground is not None else None
+                ),
+                "continuous_support_geom_id": (
+                    moon_ground["observation_hfield_geom_id"]
+                    if moon_ground is not None
+                    else None
+                ),
+                "active_ground_geom_ids": (
+                    sorted(moon_active_ground_geom_ids)
+                    if moon_ground is not None
+                    else []
+                ),
                 "required_supported_feet": (
                     REQUIRED_MOON_GROUND_SUPPORT_HITS if moon_spawn_gate else 1
                 ),
@@ -974,7 +1087,10 @@ def audit_spawn_clearance(
                     if moon_spawn_gate
                     else None
                 ),
-                "foot_terrain_edge_allowed": False,
+                "foot_terrain_edge_allowed": bool(
+                    moon_ground is not None
+                    and moon_ground["phase"] == "rolling-tiles"
+                ),
                 "body_contact_allowed": not moon_spawn_gate,
             },
             "robot": {
@@ -1364,11 +1480,16 @@ def probe_ground_support(
             "maximum foot-support height delta must be non-negative"
         )
     ngeom = _geom_count(model)
-    moon_support_geom_id = _moon_continuous_support_geom_id(
+    moon_ground = _moon_ground_collision_contract(
         model,
         ngeom=ngeom,
     )
-    moon_spawn_gate = moon_support_geom_id is not None
+    moon_spawn_gate = moon_ground is not None
+    moon_active_ground_geom_ids = (
+        moon_ground["active_ground_geom_ids"]
+        if moon_ground is not None
+        else frozenset()
+    )
     topology = _ground_support_topology(model)
     required_hits = (
         REQUIRED_MOON_GROUND_SUPPORT_HITS
@@ -1436,10 +1557,7 @@ def probe_ground_support(
                 probe_geom_id=probe_geom_id,
                 origin=origin,
             ):
-                if (
-                    moon_support_geom_id is not None
-                    and geom_id != moon_support_geom_id
-                ):
+                if moon_spawn_gate and geom_id not in moon_active_ground_geom_ids:
                     continue
                 distance, normal = _ray_distance_and_normal(
                     mujoco,

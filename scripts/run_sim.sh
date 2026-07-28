@@ -25,9 +25,37 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 MATRIX_DISABLE_MC="${MATRIX_DISABLE_MC:-0}"
 MATRIX_SONIC="${MATRIX_SONIC:-0}"
+MATRIX_EXTERNAL_STATE="${MATRIX_EXTERNAL_STATE:-0}"
+case "$MATRIX_EXTERNAL_STATE" in
+    0) MATRIX_EXTERNAL_STATE_ENABLED=false ;;
+    1) MATRIX_EXTERNAL_STATE_ENABLED=true ;;
+    *)
+        echo "[ERROR] MATRIX_EXTERNAL_STATE must be the literal 0 or 1:" \
+            "$MATRIX_EXTERNAL_STATE" >&2
+        exit 2
+        ;;
+esac
+if $MATRIX_EXTERNAL_STATE_ENABLED && [[ "$MUJOCORUNNING" != "0" ]]; then
+    echo "[ERROR] MATRIX_EXTERNAL_STATE=1 requires positional MUJOCORUNNING=0" >&2
+    exit 2
+fi
 MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
 MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
+
+set_mc_motor_platform_type() {
+    local config_file="$1"
+    local platform_type="$2"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        return 0
+    fi
+    if [[ ! -f "$config_file" ]]; then
+        echo "[ERROR] Matrix MC config is missing: $config_file" >&2
+        return 1
+    fi
+    sed -i "s/motor_platform_type: .*/motor_platform_type: $platform_type/" \
+        "$config_file"
+}
 MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
 MATRIX_UE_CAMERA_LAYOUT="${MATRIX_UE_CAMERA_LAYOUT:-$PROJECT_ROOT/config/runtime/matrix-ue-camera-layout-v1.json}"
 MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
@@ -91,6 +119,11 @@ join_ld_library_path() {
 }
 
 setup_runtime_environment() {
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        # The external BFM/Isaac runtime owns physics and its Python closure.
+        # Matrix is only a cooked UE state consumer in this topology.
+        return
+    fi
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # The native SONIC launcher already constructed and verified the
@@ -157,6 +190,9 @@ run_env_check() {
     fi
 
     local checked_mujoco="$MUJOCORUNNING"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        checked_mujoco=0
+    fi
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # SONIC owns the external MuJoCo process. The bundled robot_mujoco
@@ -165,11 +201,19 @@ run_env_check() {
             ;;
     esac
 
-    "$checker" runtime \
-        --robot "$ROBOT_ARG" \
-        --scene "$SCENE_ID" \
-        --mujoco "$checked_mujoco" \
-        --offscreen "$OFFSCREEN"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        MATRIX_DISABLE_MC=1 "$checker" runtime \
+            --robot "$ROBOT_ARG" \
+            --scene "$SCENE_ID" \
+            --mujoco "$checked_mujoco" \
+            --offscreen "$OFFSCREEN"
+    else
+        "$checker" runtime \
+            --robot "$ROBOT_ARG" \
+            --scene "$SCENE_ID" \
+            --mujoco "$checked_mujoco" \
+            --offscreen "$OFFSCREEN"
+    fi
 }
 
 run_env_check
@@ -189,6 +233,11 @@ PROCESS_PATTERNS=(
 
 kill_known_processes() {
     local signal="$1"
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        # External-state launches are instance-owned by their top-level
+        # launcher. Never pattern-kill an incumbent Matrix or robot runtime.
+        return 0
+    fi
     local pattern
     for pattern in "${PROCESS_PATTERNS[@]}"; do
         pkill "-${signal}" -f "${pattern}" 2>/dev/null || true
@@ -196,6 +245,9 @@ kill_known_processes() {
 }
 
 kill_known_processes TERM
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    echo "[INFO] External-state mode: name-wide process cleanup is disabled"
+fi
 
 
 PIDS=()
@@ -543,6 +595,9 @@ PY
 }
 
 schedule_forced_cleanup() {
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        return 0
+    fi
     (
         trap '' HUP
         sleep 1
@@ -779,11 +834,55 @@ USE_OFFSCREEN=""
 USE_PIXELSTREAMER=""
 [[ "$PIXELSTREAM" == "1" ]] && USE_PIXELSTREAMER="-PixelStreamingURL=ws://127.0.0.1:8888"
 
-VIDEO_WIDTH="${MATRIX_VIDEO_APPLIED_WIDTH:-1920}"
-VIDEO_HEIGHT="${MATRIX_VIDEO_APPLIED_HEIGHT:-1080}"
-VIDEO_WINDOW_MODE="${MATRIX_VIDEO_APPLIED_WINDOW_MODE:-borderless}"
-VIDEO_QUALITY="${MATRIX_VIDEO_APPLIED_QUALITY:-high}"
-VIDEO_CAMERA_SMOOTHING="${MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING:-medium}"
+BFM_ISAAC_RENDERER_VIDEO_LOCKED="${MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED:-0}"
+case "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" in
+    0)
+        VIDEO_WIDTH="${MATRIX_VIDEO_APPLIED_WIDTH:-1920}"
+        VIDEO_HEIGHT="${MATRIX_VIDEO_APPLIED_HEIGHT:-1080}"
+        VIDEO_WINDOW_MODE="${MATRIX_VIDEO_APPLIED_WINDOW_MODE:-borderless}"
+        VIDEO_QUALITY="${MATRIX_VIDEO_APPLIED_QUALITY:-high}"
+        VIDEO_CAMERA_SMOOTHING="${MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING:-medium}"
+        ;;
+    1)
+        # The co-resident BFM renderer has its own tracked settings contract.
+        # Generic panel state must never cross this process boundary, even as
+        # an explicitly empty variable, because it would make qualification
+        # depend on whichever ordinary Matrix session ran most recently.
+        for generic_name in \
+            MATRIX_VIDEO_APPLIED_WIDTH \
+            MATRIX_VIDEO_APPLIED_HEIGHT \
+            MATRIX_VIDEO_APPLIED_WINDOW_MODE \
+            MATRIX_VIDEO_APPLIED_FPS_LIMIT \
+            MATRIX_VIDEO_APPLIED_QUALITY \
+            MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING \
+            MATRIX_VIDEO_APPLIED_REVISION \
+            MATRIX_VIDEO_APPLIED_JSON \
+            MATRIX_UE_EXTRA_EXEC_CMDS; do
+            if [[ -v "$generic_name" ]]; then
+                echo "[ERROR] Generic video state reached the locked BFM renderer: $generic_name" >&2
+                exit 1
+            fi
+        done
+        VIDEO_WIDTH="${MATRIX_BFM_ISAAC_RENDER_WIDTH:-}"
+        VIDEO_HEIGHT="${MATRIX_BFM_ISAAC_RENDER_HEIGHT:-}"
+        VIDEO_WINDOW_MODE="${MATRIX_BFM_ISAAC_RENDER_WINDOW_MODE:-}"
+        VIDEO_QUALITY="${MATRIX_BFM_ISAAC_RENDER_QUALITY:-}"
+        VIDEO_CAMERA_SMOOTHING="${MATRIX_BFM_ISAAC_RENDER_CAMERA_SMOOTHING:-}"
+        VIDEO_SCREEN_PERCENTAGE="${MATRIX_BFM_ISAAC_RENDER_SCREEN_PERCENTAGE:-}"
+        ;;
+    *)
+        echo "[ERROR] MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    if [[ ! "$VIDEO_SCREEN_PERCENTAGE" =~ ^[0-9]+$ \
+        || "$VIDEO_SCREEN_PERCENTAGE" -lt 25 \
+        || "$VIDEO_SCREEN_PERCENTAGE" -gt 200 ]]; then
+        echo "[ERROR] Invalid locked BFM screen percentage: $VIDEO_SCREEN_PERCENTAGE" >&2
+        exit 1
+    fi
+fi
 case "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" in
     1280x720|1600x900|1920x1080|2560x1440) ;;
     *)
@@ -834,7 +933,11 @@ case "$VIDEO_CAMERA_SMOOTHING" in
         exit 1
         ;;
 esac
-UE_MAX_FPS="${MATRIX_VIDEO_APPLIED_FPS_LIMIT:-${MATRIX_UE_MAX_FPS:-30}}"
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    UE_MAX_FPS="${MATRIX_BFM_ISAAC_RENDER_FPS_LIMIT:-}"
+else
+    UE_MAX_FPS="${MATRIX_VIDEO_APPLIED_FPS_LIMIT:-${MATRIX_UE_MAX_FPS:-30}}"
+fi
 if [[ ! "$UE_MAX_FPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] MATRIX_UE_MAX_FPS must be a non-negative number: $UE_MAX_FPS" >&2
     exit 1
@@ -847,24 +950,41 @@ case "$UE_MAX_FPS" in
         exit 1
         ;;
 esac
-VIDEO_REVISION="${MATRIX_VIDEO_APPLIED_REVISION:-0}"
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    VIDEO_REVISION=0
+else
+    VIDEO_REVISION="${MATRIX_VIDEO_APPLIED_REVISION:-0}"
+fi
 if [[ ! "$VIDEO_REVISION" =~ ^[0-9]+$ ]]; then
     echo "[ERROR] Invalid Matrix video settings revision: $VIDEO_REVISION" >&2
     exit 1
 fi
-if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
-    MATRIX_VIDEO_APPLIED_JSON="$(
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    VIDEO_APPLIED_JSON="$(
         printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
             "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
             "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
             "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
     )"
-    export MATRIX_VIDEO_APPLIED_JSON
+else
+    if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
+        MATRIX_VIDEO_APPLIED_JSON="$(
+            printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+                "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+                "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
+                "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
+        )"
+        export MATRIX_VIDEO_APPLIED_JSON
+    fi
+    VIDEO_APPLIED_JSON="$MATRIX_VIDEO_APPLIED_JSON"
 fi
 UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS,r.MotionBlurQuality 0"
 for group in ViewDistance AntiAliasing Shadow PostProcess Texture Effects Foliage Shading; do
     UE_EXEC_CMDS="${UE_EXEC_CMDS},sg.${group}Quality ${VIDEO_QUALITY_LEVEL}"
 done
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},r.ScreenPercentage ${VIDEO_SCREEN_PERCENTAGE}"
+fi
 
 #######################################
 # 场景配置
@@ -947,10 +1067,12 @@ case "$ROBOT_ARG" in
         sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg-user-parameters.yaml 5
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg-user-parameters.yaml 8
         fi
         ;;
     2|xgw)
@@ -960,10 +1082,12 @@ case "$ROBOT_ARG" in
         sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 5
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 8
         fi
         ;;
     3|zgws)
@@ -973,10 +1097,12 @@ case "$ROBOT_ARG" in
         sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=ZGWS/' "$TARGET_FILE"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml 5
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml
+            set_mc_motor_platform_type \
+                src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml 8
         fi
         ;;
     6|xxg)
@@ -1006,10 +1132,12 @@ case "$ROBOT_ARG" in
                 sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 5
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 8
                 fi
                 ;;
             xxg)
@@ -1017,10 +1145,12 @@ case "$ROBOT_ARG" in
                 sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XXG/' "$TARGET_FILE"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xxg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xxg-user-parameters.yaml 5
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xxg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xxg-user-parameters.yaml 8
                 fi
                 ;;
             *)
@@ -1028,10 +1158,12 @@ case "$ROBOT_ARG" in
                 sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg-user-parameters.yaml 5
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+                    set_mc_motor_platform_type \
+                        src/robot_mc/build/export/config/xg-user-parameters.yaml 8
                 fi
                 ;;
         esac
@@ -1055,8 +1187,18 @@ case "${MATRIX_DISABLE_MC,,}" in
         ;;
 esac
 
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    ENABLE_MUJOCO=false
+    ENABLE_MC=false
+    echo "[INFO] External-state mode: local MuJoCo and MC are disabled"
+fi
+
 case "${MATRIX_SONIC,,}" in
     1|true|yes|on)
+        if $MATRIX_EXTERNAL_STATE_ENABLED; then
+            echo "[ERROR] MATRIX_EXTERNAL_STATE=1 conflicts with MATRIX_SONIC" >&2
+            exit 2
+        fi
         MATRIX_SONIC_ENABLED=true
         ENABLE_MC=false
         if ! $ENABLE_MUJOCO; then
@@ -1087,8 +1229,9 @@ fi
 # These are startup console commands, not the Python camera-bridge contract.
 # `set Engine.SpringArmComponent` intentionally affects every live spring arm;
 # an operator can append a narrower/newer command via MATRIX_UE_EXTRA_EXEC_CMDS.
-if $MATRIX_SONIC_ENABLED \
-    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]] \
+if { $MATRIX_EXTERNAL_STATE_ENABLED \
+    || { $MATRIX_SONIC_ENABLED \
+        && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; }; } \
     && $GAME_CENTERED_CAMERA_ENABLED; then
     if [[ "$ROBOTTYPE" == "custom" \
         && -n "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" ]]; then
@@ -1157,14 +1300,16 @@ PY
     else
         echo "[INFO] Native centered game-camera startup enabled: viewclass=$GAME_CAMERA_VIEW_CLASS"
     fi
-elif $MATRIX_SONIC_ENABLED \
-    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+elif $MATRIX_EXTERNAL_STATE_ENABLED \
+    || { $MATRIX_SONIC_ENABLED \
+        && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; }; then
     echo "[INFO] Native centered game-camera startup disabled"
 fi
 
 # Keep operator commands last by contract.  They can deliberately override a
 # default set/viewclass command without editing the launcher.
-if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "0" \
+    && -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
     UE_EXEC_CMDS="${UE_EXEC_CMDS},${MATRIX_UE_EXTRA_EXEC_CMDS}"
 fi
 
@@ -1206,8 +1351,11 @@ sed -i "s/^robot: .*/robot: \"$ROBOTTYPE\"/" src/robot_mujoco/simulate/config.ya
 # JSON 同步
 #######################################
 MUJOCO_RUNNING_JSON=false
-if $ENABLE_MUJOCO; then
+if $ENABLE_MUJOCO || $MATRIX_EXTERNAL_STATE_ENABLED; then
     MUJOCO_RUNNING_JSON=true
+fi
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    echo "[INFO] UE external-state consumer enabled without local MuJoCo"
 fi
 
 CONFIG_TMP="$(mktemp)"
@@ -1240,6 +1388,17 @@ cp scene/scene.json  src/UeSim/Linux/zsibot_mujoco_ue/Content/model/SceneLoder/s
 # launcher 选中的场景变体需要同步覆盖到该入口，否则 UE 会继续读取默认场景。
 compose_custom_runtime_scene() {
     if [[ "$ROBOTTYPE" != "custom" ]]; then
+        return
+    fi
+
+    if $MATRIX_EXTERNAL_STATE_ENABLED; then
+        local external_entry="$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model/custom/scene_terrain_custom.xml"
+        if [[ ! -f "$external_entry" ]]; then
+            echo "[ERROR] External-state custom UE entry is missing: $external_entry" >&2
+            exit 1
+        fi
+        echo "[INFO] External-state renderer uses fixed custom UE entry;" \
+            "Isaac owns the Moon collision scene"
         return
     fi
 
@@ -1381,6 +1540,12 @@ case "${UE_MATERIAL_FIX_PRELOAD,,}" in
         ;;
     *) ;;
 esac
+if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" \
+    && "$UE_MATERIAL_FIX_PRELOAD" != "$UE_MATERIAL_FIX_DEFAULT" ]]; then
+    echo "[ERROR] Qualified BFM renderer requires the locked material bridge:" >&2
+    echo "[ERROR] expected=$UE_MATERIAL_FIX_DEFAULT actual=${UE_MATERIAL_FIX_PRELOAD:-disabled}" >&2
+    exit 1
+fi
 if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
     if [[ ! "$UE_G1_SKIN" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]; then
         echo "[ERROR] MATRIX_G1_SKIN must name a registered skin" >&2
@@ -1590,6 +1755,14 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_SCENE_TRANSFORM_ARGS=()
     SONIC_DYNAMIC_GROUND_ARGS=()
     SONIC_INVENTORY_ARGS=()
+    # The game-input provider always needs a stable world identity, even when
+    # durable checkpoints are disabled.  Persistence adds revision/state
+    # arguments below; identity by itself is intentionally non-persistent.
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
+        GAME_WORLD_ROBOT_ID="${CUSTOM_NAME:-$ROBOT_ARG}"
+        GAME_WORLD_ID="${MATRIX_GAME_WORLD_ID:-${GAME_WORLD_ROBOT_ID}:${SCENE%.xml}}"
+        SONIC_WORLD_ARGS=(--game-world-id "$GAME_WORLD_ID")
+    fi
     if [[ -n "${MATRIX_CREATIVE_INVENTORY_CATALOG:-}" ]]; then
         if [[ ! -f "$MATRIX_CREATIVE_INVENTORY_CATALOG" ]]; then
             echo "[ERROR] Creative inventory catalog is missing: $MATRIX_CREATIVE_INVENTORY_CATALOG" >&2
@@ -1634,7 +1807,6 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] Persistent Matrix world state requires game control" >&2
             exit 1
         fi
-        GAME_WORLD_ID="${MATRIX_GAME_WORLD_ID:-${CUSTOM_NAME}:${SCENE%.xml}}"
         GAME_WORLD_REVISION="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 revision \
@@ -1760,8 +1932,7 @@ PY
                 "entity=${MATRIX_ROUTE_ENTRY_LINES[2]} " \
                 "world=$GAME_WORLD_ID scene=$SCENE_ID"
         fi
-        SONIC_WORLD_ARGS=(
-            --game-world-id "$GAME_WORLD_ID"
+        SONIC_WORLD_ARGS+=(
             --game-world-revision "$GAME_WORLD_REVISION"
             --game-world-state-file "$GAME_WORLD_STATE_FILE"
             --game-celestial-clock-state-file "$GAME_CELESTIAL_CLOCK_STATE_FILE"
@@ -2209,7 +2380,7 @@ PY
         --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/mouse-control.json}"
         --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/motion-control.json}"
         --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/video-settings.json}"
-        --game-applied-video-settings-json "${MATRIX_VIDEO_APPLIED_JSON:-}"
+        --game-applied-video-settings-json "$VIDEO_APPLIED_JSON"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
@@ -2417,5 +2588,18 @@ PY
     fi
     echo "[INFO] Matrix SONIC runtime exited with code $SONIC_EXIT_CODE"
     exit "$SONIC_EXIT_CODE"
+fi
+if $MATRIX_EXTERNAL_STATE_ENABLED; then
+    set +e
+    wait_for_managed_child "$UE_SUPERVISOR_PID"
+    EXTERNAL_UE_EXIT_CODE="$WAITED_CHILD_STATUS"
+    set -e
+    UE_SUPERVISOR_REAPED=1
+    UE_SUPERVISOR_PID=""
+    if [[ "$EXTERNAL_UE_EXIT_CODE" != "0" ]]; then
+        record_ue_supervisor_failure
+    fi
+    echo "[INFO] Matrix external-state renderer exited with code $EXTERNAL_UE_EXIT_CODE"
+    exit "$EXTERNAL_UE_EXIT_CODE"
 fi
 wait

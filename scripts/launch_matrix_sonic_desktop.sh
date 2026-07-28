@@ -3,11 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
-RUN_SCRIPT="$SCRIPT_DIR/run_matrix_sonic.sh"
 SESSION_NAME="matrix-sonic-desktop-${UID}"
 HOST_LOCK_PATH="${MATRIX_DESKTOP_HOST_LOCK_PATH:-/tmp/matrix-sonic-${UID}.lock}"
 PROFILE="heyuan"
-SCENE_ID="2"
+SCENE_ID="15"
+INITIAL_LOCOMOTION_POLICY="${MATRIX_INITIAL_LOCOMOTION_POLICY:-}"
 ACTION="start"
 SESSION_LOCK_HELD="${MATRIX_DESKTOP_LAUNCHER_LOCKED:-0}"
 STOP_GRACE_SECONDS=60
@@ -27,7 +27,13 @@ Profiles: heyuan (default), trna, zza
 
 Options:
   --profile PROFILE  Host profile (default: heyuan)
-  --scene ID         Matrix native scene id (default: 2)
+  --scene ID         Matrix native scene id (default: 15 / MoonWorld)
+  --initial-locomotion-policy POLICY
+                     sonic or bfm-sonic-teacher50k
+                     (default: selected host profile; tRNA uses BFM Teacher50k)
+
+Scene 15 starts MoonWorld with the selected host profile's locomotion policy.
+Other scenes use the generic Matrix SONIC game-control launcher.
 EOF
 }
 
@@ -49,6 +55,16 @@ validate_profile() {
 validate_scene() {
     [[ "$1" =~ ^(0|[1-9][0-9]?)$ ]] \
         || die "invalid scene id: $1 (expected 0-99)"
+}
+
+validate_initial_locomotion_policy() {
+    case "$1" in
+        sonic | bfm-sonic-teacher50k)
+            ;;
+        *)
+            die "invalid initial locomotion policy: $1 (expected sonic or bfm-sonic-teacher50k)"
+            ;;
+    esac
 }
 
 session_lock_directory() {
@@ -75,14 +91,21 @@ session_lock_directory() {
 run_with_session_lock() {
     local directory
     local flock_bin
+    local -a launcher_args
 
     flock_bin="$(command -v flock)" || die "flock is required"
     directory="$(session_lock_directory)"
+    launcher_args=(--profile "$PROFILE" --scene "$SCENE_ID")
+    if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+        launcher_args+=(
+            --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
+        )
+    fi
     umask 077
     MATRIX_DESKTOP_LAUNCHER_LOCKED=1 "$flock_bin" --exclusive --close \
         "$directory/matrix-sonic-desktop-${UID}.lock" \
         /usr/bin/bash "$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")" \
-        "$ACTION" --profile "$PROFILE" --scene "$SCENE_ID"
+        "$ACTION" "${launcher_args[@]}"
 }
 
 notify_user() {
@@ -172,10 +195,8 @@ describe_host_runtime_owner() {
 start_session() {
     local owner
     local message
-
-    if [[ ! -f "$RUN_SCRIPT" || ! -r "$RUN_SCRIPT" ]]; then
-        die "runtime launcher is missing: $RUN_SCRIPT"
-    fi
+    local run_script
+    local runtime_args
 
     if session_is_live; then
         report_running
@@ -196,12 +217,34 @@ start_session() {
         return 1
     fi
 
+    if [[ "$SCENE_ID" == "15" ]]; then
+        run_script="$SCRIPT_DIR/run_matrix_sonic_moon_v1.sh"
+        runtime_args=(
+            --profile "$PROFILE"
+            --control-source game
+            --game-fall-recovery auto
+        )
+    else
+        run_script="$SCRIPT_DIR/run_matrix_sonic.sh"
+        runtime_args=(
+            --profile "$PROFILE"
+            --scene "$SCENE_ID"
+            --control-source game
+        )
+    fi
+    if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+        runtime_args+=(
+            --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
+        )
+    fi
+    if [[ ! -f "$run_script" || ! -r "$run_script" ]]; then
+        die "runtime launcher is missing: $run_script"
+    fi
+
     if tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT" -- \
         /usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
-        /usr/bin/bash "$RUN_SCRIPT" \
-        --profile "$PROFILE" \
-        --scene "$SCENE_ID" \
-        --control-source game; then
+        /usr/bin/bash "$run_script" \
+        "${runtime_args[@]}"; then
         sleep 0.20
         if ! session_is_live; then
             remove_stale_session || true
@@ -344,6 +387,11 @@ while (($# > 0)); do
             SCENE_ID="$2"
             shift 2
             ;;
+        --initial-locomotion-policy)
+            (($# >= 2)) || die "--initial-locomotion-policy requires a value"
+            INITIAL_LOCOMOTION_POLICY="$2"
+            shift 2
+            ;;
         -h | --help)
             usage
             exit 0
@@ -356,6 +404,9 @@ done
 
 validate_profile "$PROFILE"
 validate_scene "$SCENE_ID"
+if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+    validate_initial_locomotion_policy "$INITIAL_LOCOMOTION_POLICY"
+fi
 command -v tmux >/dev/null 2>&1 || die "tmux is required"
 
 if [[ "$SESSION_LOCK_HELD" != "1" \

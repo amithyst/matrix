@@ -192,9 +192,22 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         joint_by_name = {
             name: index for index, name in enumerate(joint_names)
         }
+        actuator_by_name = {
+            name.removesuffix("_joint"): index
+            for index, name in enumerate(joint_names)
+        }
+        baseline_efforts = [88.0] * len(joint_names)
         model = SimpleNamespace(
             jnt_dofadr=[6 + index for index in range(len(joint_names))],
             dof_armature=[0.0] * 6 + [0.01] * len(joint_names),
+            actuator_ctrlrange=[
+                [-effort, effort] for effort in baseline_efforts
+            ],
+            jnt_actfrcrange=[
+                [-effort, effort] for effort in baseline_efforts
+            ],
+            jnt_actfrclimited=[1] * len(joint_names),
+            runtime_torque_limits=list(baseline_efforts),
         )
         data = SimpleNamespace(
             qpos=[float(index) / 100.0 for index in range(36)],
@@ -203,15 +216,17 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
 
         class FakeMujoco:
-            mjtObj = SimpleNamespace(mjOBJ_JOINT=7)
+            mjtObj = SimpleNamespace(mjOBJ_JOINT=7, mjOBJ_ACTUATOR=8)
             forward_calls = 0
             fail_forward_once = False
 
             @staticmethod
             def mj_name2id(_model, object_type, name):
-                if object_type != 7:
-                    raise AssertionError("unexpected object type")
-                return joint_by_name.get(name, -1)
+                if object_type == 7:
+                    return joint_by_name.get(name, -1)
+                if object_type == 8:
+                    return actuator_by_name.get(name, -1)
+                raise AssertionError("unexpected object type")
 
             @classmethod
             def mj_forward(cls, _model, _data):
@@ -302,13 +317,18 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_locomotion_physics_profiles_switch_and_restore_without_pose_change(
         self,
     ) -> None:
-        mujoco, model, data, _joint_by_name = (
+        mujoco, model, data, joint_by_name = (
             self.fake_physics_profile_runtime()
         )
         qpos_before = tuple(data.qpos)
         qvel_before = tuple(data.qvel)
         time_before = data.time
-        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        profiles = MODULE._LocomotionPhysicsProfiles(
+            mujoco,
+            model,
+            data,
+            torque_limits=model.runtime_torque_limits,
+        )
 
         self.assertEqual(
             profiles.active_profile_id,
@@ -318,13 +338,24 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             profiles.apply(MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID)
         )
         actual = profiles.telemetry()["active_armatures"]
-        self.assertEqual(actual["left_hip_pitch_joint"], 0.010177520)
+        self.assertEqual(actual["left_hip_pitch_joint"], 0.025101925)
         self.assertEqual(actual["left_hip_roll_joint"], 0.025101925)
         self.assertEqual(actual["left_hip_yaw_joint"], 0.010177520)
         self.assertEqual(actual["left_knee_joint"], 0.025101925)
         self.assertEqual(actual["left_ankle_pitch_joint"], 0.00721945)
         self.assertEqual(actual["left_wrist_pitch_joint"], 0.00425)
         self.assertEqual(actual["left_shoulder_pitch_joint"], 0.003609725)
+        efforts = profiles.telemetry()["active_effort_limits"]
+        self.assertEqual(efforts["left_hip_pitch_joint"], 139.0)
+        self.assertEqual(efforts["left_hip_roll_joint"], 139.0)
+        self.assertEqual(efforts["left_hip_yaw_joint"], 88.0)
+        self.assertEqual(efforts["left_knee_joint"], 139.0)
+        self.assertEqual(efforts["left_ankle_pitch_joint"], 50.0)
+        self.assertEqual(efforts["left_wrist_pitch_joint"], 5.0)
+        self.assertEqual(
+            model.jnt_actfrcrange[joint_by_name["left_hip_pitch_joint"]],
+            [-139.0, 139.0],
+        )
         self.assertEqual(tuple(data.qpos), qpos_before)
         self.assertEqual(tuple(data.qvel), qvel_before)
         self.assertEqual(data.time, time_before)
@@ -338,6 +369,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             profiles.apply(
                 MODULE._LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
             )
+        )
+        self.assertEqual(model.runtime_torque_limits, [88.0] * 29)
+        self.assertEqual(
+            model.actuator_ctrlrange,
+            [[-88.0, 88.0] for _ in range(29)],
+        )
+        self.assertEqual(
+            model.jnt_actfrcrange,
+            [[-88.0, 88.0] for _ in range(29)],
         )
         self.assertEqual(mujoco.forward_calls, 2)
         self.assertTrue(
@@ -384,6 +424,55 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID,
         )
         profiles.verify_active()
+
+    def test_initial_bfm_alignment_preserves_live_xy_and_writes_once(
+        self,
+    ) -> None:
+        mujoco, model, data, _joint_by_name = (
+            self.fake_physics_profile_runtime()
+        )
+        data.qpos[0] = 12.25
+        data.qpos[1] = -7.5
+        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
+        reference_qpos = tuple(1.0 + 0.01 * index for index in range(36))
+        reference_qvel = tuple(-0.02 * index for index in range(35))
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.physics_profiles = profiles
+        coordinator.bfm_control = SimpleNamespace(
+            direct_initial_qpos=reference_qpos,
+            direct_initial_qvel=reference_qvel,
+        )
+        coordinator.initial_bfm_reference_aligned = False
+        coordinator.initial_bfm_reference_alignment = None
+
+        coordinator._align_initial_bfm_reference()
+
+        self.assertTrue(coordinator.initial_bfm_reference_aligned)
+        self.assertEqual(tuple(data.qpos[:2]), (12.25, -7.5))
+        self.assertEqual(tuple(data.qpos[2:36]), reference_qpos[2:36])
+        self.assertEqual(tuple(data.qvel[:35]), reference_qvel)
+        self.assertEqual(
+            profiles.active_profile_id,
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID,
+        )
+        self.assertEqual(
+            coordinator.initial_bfm_reference_alignment["mode"],
+            "online_pfnn_first_frame_once",
+        )
+        self.assertTrue(
+            coordinator.initial_bfm_reference_alignment["root_xy_preserved"]
+        )
+        forward_calls = mujoco.forward_calls
+        qpos_after = tuple(data.qpos)
+        qvel_after = tuple(data.qvel)
+
+        coordinator._align_initial_bfm_reference()
+
+        self.assertEqual(mujoco.forward_calls, forward_calls)
+        self.assertEqual(tuple(data.qpos), qpos_after)
+        self.assertEqual(tuple(data.qvel), qvel_after)
 
     def test_flat_v3_physics_profile_comes_from_locked_policy_config(self) -> None:
         mujoco, model, data, _joint_by_name = (
@@ -1531,7 +1620,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             low_cmd_fresh=True,
             sim_time=0.0,
         )
-        balancing.qvel[5] = 0.06
+        balancing.qvel[5] = 0.09
 
         probation.observe(balancing, idle, now_s=0.0)
         balancing.sim_time = 1.5
@@ -6390,6 +6479,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.bfm_switch_admission_ready = False
         coordinator.request_policy_slot_assignment = mock.Mock(return_value=None)
 
+        coordinator.bfm_switch_admission_ready = True
+        coordinator._request_initial_locomotion_policy_if_ready(
+            handoff_allowed=False
+        )
+        coordinator.request_policy_slot_assignment.assert_not_called()
+        self.assertFalse(coordinator._initial_locomotion_policy_requested)
+
+        coordinator.bfm_switch_admission_ready = False
         coordinator._request_initial_locomotion_policy_if_ready()
         coordinator.request_policy_slot_assignment.assert_not_called()
         self.assertFalse(coordinator._initial_locomotion_policy_requested)
@@ -6421,6 +6518,225 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         coordinator._request_initial_locomotion_policy_if_ready()
         coordinator.request_policy_slot_assignment.assert_called_once()
+
+    def test_initial_bfm_handoff_aligns_before_prepare_and_writer_go(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator._policy_selection_pending = {
+            "slot": "locomotion",
+            "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+            "transition_id": "initial-locomotion-bfm-sonic-teacher50k",
+            "initial_reference_alignment": True,
+            "phase": "await_bfm_shadow",
+            "requested_monotonic_s": time.monotonic(),
+            "shadow_baseline_sequence": 10,
+            "prior_writer_policy_id": "sonic",
+            "prior_writer_epoch": 3,
+            "prior_writer_fenced": False,
+            "reference_aligned": False,
+        }
+        coordinator._policy_selection_results = {}
+        coordinator.last_locomotion_handoff = None
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.bfm_switch_timeout_s = 10.0
+        coordinator.initial_bfm_reference_alignment = None
+        coordinator.bfm_control = mock.Mock(
+            direct_initial_qpos=tuple(0.01 * index for index in range(36)),
+            direct_initial_qvel=tuple(-0.01 * index for index in range(35)),
+            direct_initial_status_sequence=12,
+            last_state_sequence=41,
+            last_status={
+                "world_sample_sequence": 11,
+                "shadow_preview": True,
+                "world_input_safe_stop": True,
+                "reference_pending_rebuild": False,
+                "reference_transition_holding": False,
+                "reference_root_error_m": 0.0,
+            },
+            activation_rejected_reason=None,
+            activation_prepared=False,
+            activation_preparation_status=None,
+            current_first_write=False,
+            authority_epoch=0,
+        )
+        coordinator.sonic_writer = mock.Mock(
+            paused=False,
+            pause_pending=False,
+        )
+        coordinator.physics_profiles = mock.Mock()
+
+        def align_initial_reference() -> None:
+            coordinator.initial_bfm_reference_alignment = {
+                "mode": "online_pfnn_first_frame_once"
+            }
+
+        coordinator._align_initial_bfm_reference = mock.Mock(
+            side_effect=align_initial_reference
+        )
+
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_pause_sonic",
+        )
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+        coordinator.bfm_control.prepare_activation.assert_not_called()
+
+        coordinator.sonic_writer.paused = True
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator._align_initial_bfm_reference.assert_called_once_with()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_alignment_wait",
+        )
+
+        coordinator._policy_selection_pending["aligned_state_monotonic_s"] = (
+            time.monotonic() - 0.2
+        )
+        coordinator.bfm_control.last_state_sequence = 42
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator.bfm_control.prepare_activation.assert_called_once_with(
+            aligned_initial=True
+        )
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "prepare_bfm",
+        )
+
+        coordinator.bfm_control.activation_prepared = True
+        coordinator.bfm_control.activation_preparation_status = {
+            "reference_aligned": True,
+            "reference_buffer_swapped": False,
+            "preview_steps": 4,
+            "target_delta_max_rad": 0.01,
+            "desired_target_delta_max_rad": 0.02,
+        }
+        coordinator._reconcile_policy_slot_assignment()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "pause_sonic",
+        )
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator.physics_profiles.apply.assert_called_once_with(
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID
+        )
+        coordinator.bfm_control.activate.assert_called_once_with()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "activate_bfm",
+        )
+
+    def test_initial_bfm_game_run_uses_locomotion_slots_only_when_fall_recovery_off(
+        self,
+    ) -> None:
+        args = SimpleNamespace(
+            bfm_direct=False,
+            control_source="game",
+            initial_locomotion_policy=MODULE.BFM_TEACHER50K_POLICY_ID,
+            game_fall_recovery="off",
+        )
+        self.assertTrue(MODULE._needs_resident_locomotion_policy_slots(args))
+
+        args.initial_locomotion_policy = "sonic"
+        self.assertFalse(MODULE._needs_resident_locomotion_policy_slots(args))
+
+        args.initial_locomotion_policy = MODULE.BFM_TEACHER50K_POLICY_ID
+        args.bfm_direct = True
+        self.assertFalse(MODULE._needs_resident_locomotion_policy_slots(args))
+
+    def test_bfm_game_command_uses_only_realscan_walk_and_jog_tiers(self) -> None:
+        base = GAME_CONTROL.RobotMotionCommand(
+            sequence=17,
+            movement=(1.0, 0.0, 0.0),
+            facing=(1.0, 0.0, 0.0),
+            speed_mps=0.80,
+            locomotion_mode=GAME_CONTROL.SONIC_WALK_MODE,
+            mode="move",
+            safe_stop=False,
+            reason=None,
+        )
+
+        walk = MODULE._bfm_realscan_motion_command(base)
+        walk_boost = MODULE._bfm_realscan_motion_command(
+            replace(base, speed_mps=1.00)
+        )
+        jog = MODULE._bfm_realscan_motion_command(
+            replace(
+                base,
+                speed_mps=2.50,
+                locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
+            )
+        )
+        stopped = replace(
+            base,
+            movement=(0.0, 0.0, 0.0),
+            speed_mps=0.0,
+            locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+            mode="idle",
+        )
+
+        self.assertEqual(walk.speed_mps, 0.90)
+        self.assertEqual(walk.locomotion_mode, GAME_CONTROL.SONIC_WALK_MODE)
+        self.assertEqual(walk_boost.speed_mps, 0.90)
+        self.assertEqual(jog.speed_mps, 1.40)
+        self.assertEqual(jog.locomotion_mode, GAME_CONTROL.SONIC_RUN_MODE)
+        self.assertIs(MODULE._bfm_realscan_motion_command(stopped), stopped)
+
+    def test_locomotion_slots_only_loadout_exposes_ready_bfm_without_standup(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.locomotion_slots_only = True
+        coordinator.resident_policies = True
+        coordinator.fsm = SimpleNamespace(
+            state=MODULE.ResidentRecoveryState.GAME_SONIC
+        )
+        coordinator.worker = mock.Mock()
+        coordinator.initial_controller = "host"
+        coordinator.selected_locomotion_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator._policy_selection_pending = None
+        coordinator.bfm_control = mock.Mock(ready=True, warmed=True)
+        coordinator.locomotion_policy_candidates = (
+            MODULE.PolicyCandidateState(
+                policy_id=MODULE.BFM_TEACHER50K_POLICY_ID,
+                display_name="BFM SONIC Teacher50k",
+                slot="locomotion",
+                resident=True,
+                available=True,
+                provenance_verified=True,
+                unavailable_reasons=(),
+                provenance={
+                    "source_commit": "5e264ae2bee2315dc0522c48c64b4506977b2e25"
+                },
+            ),
+        )
+
+        loadout = coordinator.strategy_loadout_mapping()
+
+        self.assertTrue(loadout["available"])
+        self.assertEqual(loadout["status"], "ready")
+        locomotion = next(
+            slot for slot in loadout["slots"] if slot["slot"] == "locomotion"
+        )
+        self.assertEqual(
+            locomotion["selected_policy_id"], MODULE.BFM_TEACHER50K_POLICY_ID
+        )
+        self.assertEqual(
+            [candidate["policy_id"] for candidate in locomotion["candidates"]],
+            ["sonic", MODULE.BFM_TEACHER50K_POLICY_ID],
+        )
+        self.assertTrue(locomotion["candidates"][1]["available"])
+        recovery = next(
+            slot for slot in loadout["slots"] if slot["slot"] == "recovery"
+        )
+        self.assertEqual(recovery["selected_policy_id"], "off")
+        self.assertTrue(recovery["locked"])
+        self.assertEqual(recovery["candidates"], [])
 
     def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
         self,
@@ -6544,7 +6860,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         coordinator.bfm_control.last_status["world_sample_sequence"] = 11
         coordinator._reconcile_policy_slot_assignment()
-        coordinator.bfm_control.prepare_activation.assert_called_once_with()
+        coordinator.bfm_control.prepare_activation.assert_called_once_with(
+            allow_idle_neutral=False
+        )
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
             "prepare_bfm",
@@ -6786,6 +7104,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "onnx",
         )
         self.assertEqual(command[command.index("--zmq-port") + 1], "6000")
+        self.assertEqual(command[command.index("--zmq-out-port") + 1], "6001")
         self.assertEqual(
             group.env["FASTRTPS_DEFAULT_PROFILES_FILE"],
             "/sonic/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
@@ -6793,6 +7112,18 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(group.env["ROS_LOCALHOST_ONLY"], "1")
         self.assertEqual(group.env["PYTHONNOUSERSITE"], "1")
         self.assertEqual(group.env["PYTHONPATH"], "/sonic")
+
+    @mock.patch.object(MODULE.subprocess, "Popen")
+    def test_native_process_group_accepts_zmq_output_port_override(self, popen) -> None:
+        popen.return_value = mock.Mock()
+        group = MODULE.NativeProcessGroup(
+            Path("/sonic"), {"MATRIX_SONIC_ZMQ_OUT_PORT": "16057"}
+        )
+        group.start_deploy(interface="lo", zmq_port=6000)
+
+        guarded_command = popen.call_args.args[0]
+        command = guarded_command[guarded_command.index("--") + 1 :]
+        self.assertEqual(command[command.index("--zmq-out-port") + 1], "16057")
 
     @mock.patch.object(MODULE.subprocess, "Popen")
     def test_replacement_deploy_receives_private_writer_gate(self, popen) -> None:
@@ -7588,6 +7919,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(control.preparation_pending)
         self.assertEqual(sent[-1]["command"], "PREPARE")
         self.assertEqual(sent[-1]["authority_epoch"], 1)
+        self.assertIs(sent[-1]["aligned_initial"], False)
+        self.assertIs(sent[-1]["allow_idle_neutral"], False)
         control._handle_packet(
             json.dumps(
                 {
@@ -7601,7 +7934,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "reference_pending_rebuild": False,
                     "reference_buffer_swapped": True,
                     "preview_steps": 4,
-                    "target_delta_max_rad": 0.01,
+                    "target_delta_max_rad": 0.12000000476837158,
                     "target_delta_limit_rad": 0.12,
                 }
             ).encode("utf-8")
@@ -7642,9 +7975,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         # A later SONIC -> BFM switch must reuse the fenced resident writer;
         # requiring WAITING_NO_WRITER here killed the worker after recovery.
-        control.prepare_activation()
+        control.prepare_activation(allow_idle_neutral=True)
         self.assertEqual(sent[-1]["command"], "PREPARE")
         self.assertEqual(sent[-1]["authority_epoch"], 2)
+        self.assertIs(sent[-1]["allow_idle_neutral"], True)
         control._handle_packet(
             json.dumps(
                 {
@@ -7655,6 +7989,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "writer_created": True,
                     "writer_reused": True,
                     "write_authorized": False,
+                    "idle_neutral_handoff": True,
                     "reference_aligned": True,
                     "reference_pending_rebuild": False,
                     "reference_buffer_swapped": True,
@@ -7666,6 +8001,61 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             ).encode("utf-8")
         )
         self.assertTrue(control.activation_prepared)
+
+    def test_bfm_control_accepts_unlimited_exact_initial_target(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        sent: list[dict[str, object]] = []
+
+        def send(packet: bytes) -> int:
+            sent.append(json.loads(packet.decode("utf-8")))
+            return len(packet)
+
+        control.connection = SimpleNamespace(send=send)
+        control.ready = True
+        control.warmed = True
+        control.models_warmed = True
+        control.paused = True
+        control.reference_source = "robo_pfnn_formal7168"
+
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "STATUS",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 0,
+                    "world_sample_sequence": 17,
+                    "direct_initial_qpos": [0.0] * 36,
+                    "direct_initial_qvel": [0.0] * 35,
+                }
+            ).encode("utf-8")
+        )
+        self.assertEqual(control.direct_initial_status_sequence, 17)
+
+        control.prepare_activation(aligned_initial=True)
+        self.assertIs(sent[-1]["aligned_initial"], True)
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "ACTIVATION_PREPARED",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 1,
+                    "writer_created": False,
+                    "write_authorized": False,
+                    "exact_initial_alignment": True,
+                    "reference_aligned": True,
+                    "reference_pending_rebuild": False,
+                    "reference_buffer_swapped": False,
+                    "preview_steps": 1,
+                    "target_delta_max_rad": 1.75,
+                    "target_delta_limit_rad": 0.12,
+                }
+            ).encode("utf-8")
+        )
+
+        self.assertTrue(control.activation_prepared)
+        self.assertFalse(control.preparation_pending)
 
     def test_recovery_worker_tracks_first_write_authority_across_fallback(
         self,

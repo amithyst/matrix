@@ -6,7 +6,7 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 TEMPLATE="$PROJECT_ROOT/packaging/matrix-sonic.desktop.in"
 LAUNCHER="$SCRIPT_DIR/launch_matrix_sonic_desktop.sh"
 PROFILE="heyuan"
-SCENE_ID="2"
+SCENE_ID="15"
 DESKTOP_DIR=""
 ICON_PATH="$PROJECT_ROOT/demo_gif/Launcher.png"
 SHORTCUT_NAME=""
@@ -19,7 +19,7 @@ Usage: bash scripts/install_matrix_desktop_launcher.sh [options]
 
 Options:
   --profile PROFILE     heyuan (default), trna, or zza
-  --scene ID            Matrix native scene id (default: 2)
+  --scene ID            Matrix native scene id (default: 15 / MoonWorld BFM)
   --desktop-dir DIR     Existing private Desktop directory (for tests or XDG overrides)
   --icon PATH           Existing icon file (default: demo_gif/Launcher.png)
   -h, --help            Show this help
@@ -63,15 +63,15 @@ validate_scene() {
 
 configure_shortcut_identity() {
     case "$SCENE_ID" in
-        2)
-            SHORTCUT_NAME="Matrix SONIC ($PROFILE)"
-            SHORTCUT_COMMENT="Launch Matrix SONIC scene 2 with game controls"
-            TARGET_BASENAME="matrix-sonic.desktop"
-            ;;
         15)
             SHORTCUT_NAME="Matrix MoonWorld SONIC ($PROFILE)"
-            SHORTCUT_COMMENT="Launch Matrix SONIC MoonWorld scene 15 with game controls"
-            TARGET_BASENAME="matrix-sonic-moon.desktop"
+            SHORTCUT_COMMENT="Launch MoonWorld with BFM SONIC Teacher50k and fall recovery"
+            TARGET_BASENAME="matrix-sonic.desktop"
+            ;;
+        2)
+            SHORTCUT_NAME="Matrix SONIC scene 2 ($PROFILE)"
+            SHORTCUT_COMMENT="Launch Matrix SONIC scene 2 with game controls"
+            TARGET_BASENAME="matrix-sonic-scene-2.desktop"
             ;;
         *)
             SHORTCUT_NAME="Matrix SONIC scene $SCENE_ID ($PROFILE)"

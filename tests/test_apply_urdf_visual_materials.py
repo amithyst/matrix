@@ -455,7 +455,22 @@ class ApplyUrdfVisualMaterialsTest(unittest.TestCase):
         launcher = (REPO_ROOT / "scripts" / "run_custom_urdf.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("PIPELINE_VERSION=19", launcher)
+        self.assertIn("PIPELINE_VERSION=22", launcher)
+        self.assertIn("root_candidates.add(urdf_root_link)", launcher)
+        self.assertIn("validate_mujoco_model_load", launcher)
+        self.assertIn("mujoco.MjModel.from_xml_path", launcher)
+        self.assertNotIn('<hfield name="perlin_hfield"', launcher)
+        self.assertEqual(
+            launcher.count(
+                'names = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")'
+            ),
+            2,
+        )
+        self.assertEqual(launcher.count('return {"fullinertia":'), 2)
+        self.assertEqual(launcher.count("rotate_inertia_to_body_frame("), 4)
+        self.assertIn('collision_profile == "isaac-model12"', launcher)
+        self.assertIn('type="capsule"', launcher)
+        self.assertIn('"contype": "1"', launcher)
         self.assertIn("--describe-skin", launcher)
         self.assertIn("--ue-scope-tag", launcher)
         self.assertIn(

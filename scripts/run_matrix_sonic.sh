@@ -83,6 +83,12 @@ GAMEPAD_LOOK_DEADZONE="${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
 GAMEPAD_LOOK_MIN_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG:--80.0}"
 GAMEPAD_LOOK_MAX_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG:-60.0}"
 GAME_MAX_SPEED="${MATRIX_GAME_MAX_SPEED:-0.30}"
+GAME_MAX_ACCELERATION="${MATRIX_GAME_MAX_ACCELERATION:-1.20}"
+GAME_MAX_DECELERATION="${MATRIX_GAME_MAX_DECELERATION:-2.40}"
+GAME_MAX_TURN_RATE="${MATRIX_GAME_MAX_TURN_RATE:-2.50}"
+GAME_MAX_ACCELERATION_ARGUMENT_SET=0
+GAME_MAX_DECELERATION_ARGUMENT_SET=0
+GAME_MAX_TURN_RATE_ARGUMENT_SET=0
 GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
 GAME_WORLD_PERSISTENCE="${MATRIX_GAME_WORLD_PERSISTENCE:-auto}"
 GAME_AUTO_RESPAWN="${MATRIX_GAME_AUTO_RESPAWN:-auto}"
@@ -118,6 +124,7 @@ PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS="${MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SE
 PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS="${MATRIX_PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS:-0}"
 PHYSICAL_RECOVERY_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-sonic-recovery-${UID}-$$.sock}"
 PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-sonic-recovery-sonic-${UID}-$$.sock}"
+INITIAL_LOCOMOTION_POLICY="${MATRIX_INITIAL_LOCOMOTION_POLICY:-}"
 WALK_AFTER="-1"
 VX="0.30"
 VY="0.0"
@@ -171,6 +178,9 @@ usage() {
         "  --gamepad-look-min-pitch DEG     Spectator pitch lower limit" \
         "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
         "  --game-max-speed MPS       Analog SLOW_WALK cap (default 0.30; max 0.80)" \
+        "  --game-max-acceleration MPS2  Linear command acceleration limit" \
+        "  --game-max-deceleration MPS2  Linear command deceleration limit" \
+        "  --game-max-turn-rate RAD_S    Heading command slew limit" \
         "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
         "  --game-world-persistence MODE  auto, on, or off (default: auto)" \
         "  --game-auto-respawn MODE   auto, on, or off; cold-reloads after a fall" \
@@ -195,6 +205,7 @@ usage() {
         "  --physical-recovery-stable-hold-seconds SEC  Parent snapshot stability hold" \
         "  --physical-recovery-policy-exit-hold-seconds SEC  Optional recovery-policy terminal dwell" \
         "  --physical-recovery-control-socket PATH  Private worker handoff socket" \
+        "  --initial-locomotion-policy POLICY  sonic or bfm-sonic-teacher50k" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -238,6 +249,9 @@ while [[ $# -gt 0 ]]; do
         --gamepad-look-min-pitch) GAMEPAD_LOOK_MIN_PITCH_DEG="$2"; shift 2 ;;
         --gamepad-look-max-pitch) GAMEPAD_LOOK_MAX_PITCH_DEG="$2"; shift 2 ;;
         --game-max-speed) GAME_MAX_SPEED="$2"; shift 2 ;;
+        --game-max-acceleration) GAME_MAX_ACCELERATION="$2"; GAME_MAX_ACCELERATION_ARGUMENT_SET=1; shift 2 ;;
+        --game-max-deceleration) GAME_MAX_DECELERATION="$2"; GAME_MAX_DECELERATION_ARGUMENT_SET=1; shift 2 ;;
+        --game-max-turn-rate) GAME_MAX_TURN_RATE="$2"; GAME_MAX_TURN_RATE_ARGUMENT_SET=1; shift 2 ;;
         --game-input-timeout) GAME_INPUT_TIMEOUT="$2"; shift 2 ;;
         --game-world-persistence) GAME_WORLD_PERSISTENCE="$2"; shift 2 ;;
         --game-auto-respawn) GAME_AUTO_RESPAWN="$2"; shift 2 ;;
@@ -262,6 +276,7 @@ while [[ $# -gt 0 ]]; do
         --physical-recovery-stable-hold-seconds) PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS="$2"; shift 2 ;;
         --physical-recovery-policy-exit-hold-seconds) PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS="$2"; shift 2 ;;
         --physical-recovery-control-socket) PHYSICAL_RECOVERY_CONTROL_SOCKET="$2"; shift 2 ;;
+        --initial-locomotion-policy) INITIAL_LOCOMOTION_POLICY="$2"; shift 2 ;;
         --walk-after) WALK_AFTER="$2"; shift 2 ;;
         --vx) VX="$2"; shift 2 ;;
         --vy) VY="$2"; shift 2 ;;
@@ -299,6 +314,32 @@ fi
 
 if [[ -n "$G1_SKIN" ]]; then
     export MATRIX_G1_SKIN="$G1_SKIN"
+fi
+if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+    case "$INITIAL_LOCOMOTION_POLICY" in
+        sonic|bfm-sonic-teacher50k) ;;
+        *)
+            echo "[ERROR] --initial-locomotion-policy must be sonic or bfm-sonic-teacher50k" >&2
+            exit 2
+            ;;
+    esac
+    export MATRIX_INITIAL_LOCOMOTION_POLICY="$INITIAL_LOCOMOTION_POLICY"
+fi
+if [[ "$SCENE_ID" == "15" \
+    && "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
+    # Resolve the profile/CLI policy first, then apply the former Moon wrapper
+    # BFM slew contract.  Explicit command-line motion tuning remains last and
+    # authoritative, but Heyuan/ZZA native SONIC launches never see BFM values.
+    if [[ "$GAME_MAX_ACCELERATION_ARGUMENT_SET" != "1" ]]; then
+        GAME_MAX_ACCELERATION=90.0
+    fi
+    if [[ "$GAME_MAX_DECELERATION_ARGUMENT_SET" != "1" ]]; then
+        GAME_MAX_DECELERATION=90.0
+    fi
+    if [[ "$GAME_MAX_TURN_RATE_ARGUMENT_SET" != "1" ]]; then
+        GAME_MAX_TURN_RATE=2.40
+    fi
+    echo "[INFO] moon-v1 BFM controls: walk=0.90m/s jog=1.40m/s turn=2.40rad/s"
 fi
 if [[ -n "$CELESTIAL_SPK" || -n "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
     if [[ -z "$CELESTIAL_SPK" || -z "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
@@ -746,6 +787,24 @@ find_first_dir() {
 }
 
 RUNTIME_ROOT="${MATRIX_RUNTIME_ROOT:-$PROJECT_ROOT/outputs/runtime/matrix-sonic-native-v2}"
+if [[ "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" \
+    && -z "$CUSTOM_URDF" ]]; then
+    CUSTOM_URDF="${MATRIX_BFM_MODEL12_URDF:-}"
+    if [[ -z "$CUSTOM_URDF" || ! -f "$CUSTOM_URDF" ]]; then
+        echo "[ERROR] BFM Model12 URDF is missing: ${CUSTOM_URDF:-unset}" >&2
+        exit 2
+    fi
+    if [[ -z "${MATRIX_BFM_MODEL12_ASSETS:-}" \
+        || ! -d "$MATRIX_BFM_MODEL12_ASSETS" ]]; then
+        echo "[ERROR] BFM Model12 asset tree is missing: ${MATRIX_BFM_MODEL12_ASSETS:-unset}" >&2
+        exit 2
+    fi
+    CUSTOM_NAME="g1_model12"
+    export MATRIX_URDF_COLLISION_PROFILE="isaac-model12"
+    export MATRIX_SONIC_CANONICAL_MODEL="$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/custom/current.xml"
+    export MATRIX_SONIC_CANONICAL_MESHES="$PROJECT_ROOT/src/robot_mujoco/zsibot_robots/custom/assets"
+    echo "[INFO] BFM Model12 physics source: $CUSTOM_URDF"
+fi
 MATRIX_SONIC_ROOT="${MATRIX_SONIC_ROOT:-$(find_first_dir \
     "$RUNTIME_ROOT/GR00T-WholeBodyControl" \
     "$HOME/worktrees/sonic-matrix-native-final" \
@@ -1213,6 +1272,9 @@ export MATRIX_GAMEPAD_LOOK_DEADZONE="$GAMEPAD_LOOK_DEADZONE"
 export MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG="$GAMEPAD_LOOK_MIN_PITCH_DEG"
 export MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG="$GAMEPAD_LOOK_MAX_PITCH_DEG"
 export MATRIX_GAME_MAX_SPEED="$GAME_MAX_SPEED"
+export MATRIX_GAME_MAX_ACCELERATION="$GAME_MAX_ACCELERATION"
+export MATRIX_GAME_MAX_DECELERATION="$GAME_MAX_DECELERATION"
+export MATRIX_GAME_MAX_TURN_RATE="$GAME_MAX_TURN_RATE"
 export MATRIX_GAME_INPUT_TIMEOUT="$GAME_INPUT_TIMEOUT"
 export MATRIX_GAME_WORLD_PERSISTENCE="$GAME_WORLD_PERSISTENCE"
 export MATRIX_GAME_AUTO_RESPAWN="$GAME_AUTO_RESPAWN"

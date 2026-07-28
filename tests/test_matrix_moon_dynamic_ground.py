@@ -37,7 +37,7 @@ class FakeModel:
         unmapped: tuple[int, int] | None = None,
         duplicate_mocap: tuple[tuple[int, int], tuple[int, int]] | None = None,
         continuous_support: bool = True,
-        tile_collision_enabled: bool = False,
+        tile_collision_enabled: bool = True,
     ) -> None:
         names: list[str | None] = ["world", "pelvis"]
         keys: list[tuple[int, int] | None] = [None, None]
@@ -79,6 +79,12 @@ class FakeModel:
             geom_body_ids.append(0)
             geom_data_ids.append(0)
             geom_types.append(1)
+            geom_contype.append(0)
+            geom_conaffinity.append(0)
+            self._geom_names.append(MODULE.SPAWN_PAD_GEOM_NAME)
+            geom_body_ids.append(0)
+            geom_data_ids.append(-1)
+            geom_types.append(6)
             geom_contype.append(1)
             geom_conaffinity.append(1)
         for i, j in MODULE._EXPECTED_TILE_KEYS:
@@ -250,10 +256,12 @@ class MoonDynamicGroundTest(unittest.TestCase):
         self.assertEqual(mocap_ids.shape, (MODULE.TILE_COUNT,))
         self.assertEqual(mocap_ids.tolist(), list(range(MODULE.TILE_COUNT)))
         self.assertFalse(mocap_ids.flags.writeable)
-        self.assertEqual(
-            MODULE.resolve_continuous_support(model),
-            {"geom_id": 0, "hfield_id": 0, "data_adr": 0},
-        )
+        support = MODULE.resolve_continuous_support(model)
+        self.assertEqual(support["geom_id"], 0)
+        self.assertEqual(support["hfield_id"], 0)
+        self.assertEqual(support["data_adr"], 0)
+        self.assertEqual(support["spawn_pad_geom_id"], 1)
+        self.assertEqual(len(support["tile_geom_ids"]), MODULE.TILE_COUNT)
 
         drifted_models = (
             FakeModel(missing=(15, 15)),
@@ -276,10 +284,10 @@ class MoonDynamicGroundTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(
             MODULE.MoonDynamicGroundError,
-            "remains collidable",
+            "compiled collidable",
         ):
             MODULE.resolve_continuous_support(
-                FakeModel(tile_collision_enabled=True)
+                FakeModel(tile_collision_enabled=False)
             )
 
     def test_rejects_drifted_continuous_support_binding_and_collision(self) -> None:
@@ -301,8 +309,8 @@ class MoonDynamicGroundTest(unittest.TestCase):
             ),
             (
                 "collision mask",
-                {"geom_contype": 2, "geom_conaffinity": 2},
-                "contype=1 and conaffinity=1",
+                {"geom_contype": 1, "geom_conaffinity": 1},
+                "contype=0 and conaffinity=0",
             ),
         )
         for label, replacements, message in cases:
@@ -340,6 +348,110 @@ class MoonDynamicGroundTest(unittest.TestCase):
             "hfield .* must be unique",
         ):
             MODULE.resolve_continuous_support(duplicate_hfield)
+
+    def test_collision_handoff_activates_only_populated_support(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            path = Path(temporary_dir) / "moonworld.bin"
+            write_sparse_map(path)
+            model = FakeModel()
+            data = FakeData()
+            forward_states: list[
+                tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+            ] = []
+
+            def forward(_model: FakeModel, _data: FakeData) -> None:
+                forward_states.append(
+                    (
+                        (
+                            int(model.geom_contype[0]),
+                            int(model.geom_conaffinity[0]),
+                        ),
+                        (
+                            int(model.geom_contype[1]),
+                            int(model.geom_conaffinity[1]),
+                        ),
+                        (
+                            int(model.geom_contype[2]),
+                            int(model.geom_conaffinity[2]),
+                        ),
+                    )
+                )
+
+            with MODULE.MoonDynamicGround(path, model) as ground:
+                with self.assertRaisesRegex(
+                    MODULE.MoonDynamicGroundError,
+                    "populated rolling hfield",
+                ):
+                    ground.activate_collision_handoff(data, forward=forward)
+                ground.update_mocap(data)
+                handoff = ground.activate_collision_handoff(
+                    data,
+                    forward=forward,
+                )
+
+                self.assertTrue(handoff["active"])
+                self.assertTrue(ground.collision_handoff_active)
+                self.assertEqual(
+                    forward_states,
+                    [((0, 0), (0, 0), (1, 1))],
+                )
+                self.assertEqual(
+                    tuple(model.geom_contype[:2]),
+                    (0, 0),
+                )
+                self.assertEqual(
+                    tuple(model.geom_conaffinity[:2]),
+                    (0, 0),
+                )
+                self.assertTrue(np.all(model.geom_contype[2:] == 1))
+                self.assertTrue(np.all(model.geom_conaffinity[2:] == 1))
+                telemetry = ground.telemetry()
+                self.assertTrue(telemetry["collision_handoff"]["active"])
+                self.assertFalse(
+                    telemetry["continuous_support"]["collision_enabled"]
+                )
+                self.assertEqual(
+                    telemetry["collision_handoff"][
+                        "rolling_tile_collision_mask"
+                    ],
+                    [1, 1],
+                )
+                with self.assertRaisesRegex(
+                    MODULE.MoonDynamicGroundError,
+                    "already active",
+                ):
+                    ground.activate_collision_handoff(data, forward=forward)
+
+    def test_collision_handoff_rolls_back_masks_when_forward_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            path = Path(temporary_dir) / "moonworld.bin"
+            write_sparse_map(path)
+            model = FakeModel()
+            data = FakeData()
+            call_count = 0
+
+            def fail_once(_model: FakeModel, _data: FakeData) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise RuntimeError("injected forward failure")
+
+            with MODULE.MoonDynamicGround(path, model) as ground:
+                ground.update_mocap(data)
+                with self.assertRaisesRegex(
+                    MODULE.MoonDynamicGroundError,
+                    "collision handoff failed",
+                ):
+                    ground.activate_collision_handoff(
+                        data,
+                        forward=fail_once,
+                    )
+                self.assertFalse(ground.collision_handoff_active)
+                self.assertEqual(call_count, 2)
+                self.assertEqual(tuple(model.geom_contype[:2]), (0, 1))
+                self.assertEqual(tuple(model.geom_conaffinity[:2]), (0, 1))
+                self.assertTrue(np.all(model.geom_contype[2:] == 0))
+                self.assertTrue(np.all(model.geom_conaffinity[2:] == 0))
 
     def test_rejects_size_hash_and_non_finite_samples(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

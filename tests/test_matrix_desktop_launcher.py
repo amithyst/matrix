@@ -45,6 +45,19 @@ class MatrixDesktopLauncherTest(unittest.TestCase):
 
         self.run_log = self.root / "run.log"
         write_executable(
+            scripts / "run_matrix_sonic_moon_v1.sh",
+            """#!/usr/bin/env bash
+set -euo pipefail
+{
+    printf 'CALL'
+    for argument in "$@"; do
+        printf '\\t%s' "$argument"
+    done
+    printf '\\n'
+} >> "${FAKE_RUN_LOG:?}"
+""",
+        )
+        write_executable(
             scripts / "run_matrix_sonic.sh",
             """#!/usr/bin/env bash
 set -euo pipefail
@@ -171,13 +184,15 @@ esac
                     "-u",
                     "PYTHONPATH",
                     "/usr/bin/bash",
-                    os.fspath(self.project / "scripts/run_matrix_sonic.sh"),
+                    os.fspath(
+                        self.project / "scripts/run_matrix_sonic_moon_v1.sh"
+                    ),
                     "--profile",
                     "trna",
-                    "--scene",
-                    "2",
                     "--control-source",
                     "game",
+                    "--game-fall-recovery",
+                    "auto",
                 ]
             ],
         )
@@ -187,10 +202,10 @@ esac
                 [
                     "--profile",
                     "trna",
-                    "--scene",
-                    "2",
                     "--control-source",
                     "game",
+                    "--game-fall-recovery",
+                    "auto",
                 ]
             ],
         )
@@ -222,7 +237,7 @@ esac
             1,
         )
 
-    def test_explicit_scene_is_forwarded_to_the_runtime(self) -> None:
+    def test_moon_scene_does_not_inject_trna_policy_into_heyuan(self) -> None:
         result = self.run_launcher(
             "start", "--profile", "heyuan", "--scene", "15"
         )
@@ -234,14 +249,94 @@ esac
                 [
                     "--profile",
                     "heyuan",
+                    "--control-source",
+                    "game",
+                    "--game-fall-recovery",
+                    "auto",
+                ]
+            ],
+        )
+        self.assertIn("scene 15", result.stdout)
+
+    def test_explicit_sonic_policy_overrides_the_moon_default(self) -> None:
+        result = self.run_launcher(
+            "start",
+            "--profile",
+            "trna",
+            "--scene",
+            "15",
+            "--initial-locomotion-policy",
+            "sonic",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            parse_call_log(self.run_log),
+            [
+                [
+                    "--profile",
+                    "trna",
+                    "--control-source",
+                    "game",
+                    "--game-fall-recovery",
+                    "auto",
+                    "--initial-locomotion-policy",
+                    "sonic",
+                ]
+            ],
+        )
+
+    def test_inherited_sonic_policy_overrides_the_moon_default(self) -> None:
+        self.environment["MATRIX_INITIAL_LOCOMOTION_POLICY"] = "sonic"
+
+        result = self.run_launcher("start", "--profile", "trna", "--scene", "15")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            parse_call_log(self.run_log),
+            [
+                [
+                    "--profile",
+                    "trna",
+                    "--control-source",
+                    "game",
+                    "--game-fall-recovery",
+                    "auto",
+                    "--initial-locomotion-policy",
+                    "sonic",
+                ]
+            ],
+        )
+
+    def test_invalid_initial_policy_is_rejected_before_tmux(self) -> None:
+        result = self.run_launcher(
+            "start", "--initial-locomotion-policy", "bfm;touch"
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid initial locomotion policy", result.stderr)
+        self.assertEqual(parse_call_log(self.tmux_log), [])
+
+    def test_non_moon_scene_is_forwarded_to_generic_runtime(self) -> None:
+        result = self.run_launcher(
+            "start", "--profile", "heyuan", "--scene", "2"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            parse_call_log(self.run_log),
+            [
+                [
+                    "--profile",
+                    "heyuan",
                     "--scene",
-                    "15",
+                    "2",
                     "--control-source",
                     "game",
                 ]
             ],
         )
-        self.assertIn("scene 15", result.stdout)
+        self.assertIn("scene 2", result.stdout)
 
     def test_default_profile_status_attach_and_stop(self) -> None:
         started = self.run_launcher()
@@ -257,10 +352,10 @@ esac
             [
                 "--profile",
                 "heyuan",
-                "--scene",
-                "2",
                 "--control-source",
                 "game",
+                "--game-fall-recovery",
+                "auto",
             ],
         )
         self.assertEqual(status_result.returncode, 0, status_result.stderr)
@@ -411,53 +506,60 @@ class MatrixDesktopInstallerTest(unittest.TestCase):
                 content = target.read_text(encoding="utf-8")
                 self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
                 self.assertIn("Terminal=false\n", content)
-                self.assertIn(f"Name=Matrix SONIC ({profile})\n", content)
                 self.assertIn(
-                    f'Exec=/usr/bin/bash "{launcher_path}" start --profile {profile} --scene 2\n',
+                    f"Name=Matrix MoonWorld SONIC ({profile})\n",
                     content,
                 )
                 self.assertIn(
-                    f'Exec=/usr/bin/bash "{launcher_path}" status --profile {profile} --scene 2\n',
+                    "Comment=Launch MoonWorld with BFM SONIC Teacher50k and fall recovery\n",
                     content,
                 )
                 self.assertIn(
-                    f'Exec=/usr/bin/bash "{launcher_path}" stop --profile {profile} --scene 2\n',
+                    f'Exec=/usr/bin/bash "{launcher_path}" start --profile {profile} --scene 15\n',
+                    content,
+                )
+                self.assertIn(
+                    f'Exec=/usr/bin/bash "{launcher_path}" status --profile {profile} --scene 15\n',
+                    content,
+                )
+                self.assertIn(
+                    f'Exec=/usr/bin/bash "{launcher_path}" stop --profile {profile} --scene 15\n',
                     content,
                 )
                 self.assertIn(f"Icon={icon_path}\n", content)
                 self.assertIn(f"X-Matrix-Repository={self.project}\n", content)
                 self.assertIn(f"X-Matrix-Profile={profile}\n", content)
-                self.assertIn("X-Matrix-Scene=2\n", content)
+                self.assertIn("X-Matrix-Scene=15\n", content)
                 self.assertNotIn("@MATRIX_", content)
                 self.assertEqual(
                     list(desktop.glob(".matrix-sonic.desktop.tmp.*")),
                     [],
                 )
 
-    def test_moon_shortcut_coexists_with_the_default_shortcut(self) -> None:
+    def test_city_shortcut_coexists_with_the_default_moon_shortcut(self) -> None:
         desktop = self.make_desktop_dir()
         default_result = self.run_installer(
             "--desktop-dir", os.fspath(desktop), "--profile", "heyuan"
         )
-        moon_result = self.run_installer(
+        city_result = self.run_installer(
             "--desktop-dir",
             os.fspath(desktop),
             "--profile",
             "heyuan",
             "--scene",
-            "15",
+            "2",
         )
 
         self.assertEqual(default_result.returncode, 0, default_result.stderr)
-        self.assertEqual(moon_result.returncode, 0, moon_result.stderr)
+        self.assertEqual(city_result.returncode, 0, city_result.stderr)
         self.assertTrue((desktop / "matrix-sonic.desktop").is_file())
-        moon = desktop / "matrix-sonic-moon.desktop"
-        self.assertEqual(stat.S_IMODE(moon.stat().st_mode), 0o755)
-        content = moon.read_text(encoding="utf-8")
-        self.assertIn("Name=Matrix MoonWorld SONIC (heyuan)\n", content)
-        self.assertIn("MoonWorld scene 15", content)
-        self.assertIn("start --profile heyuan --scene 15\n", content)
-        self.assertIn("X-Matrix-Scene=15\n", content)
+        city = desktop / "matrix-sonic-scene-2.desktop"
+        self.assertEqual(stat.S_IMODE(city.stat().st_mode), 0o755)
+        content = city.read_text(encoding="utf-8")
+        self.assertIn("Name=Matrix SONIC scene 2 (heyuan)\n", content)
+        self.assertIn("Launch Matrix SONIC scene 2", content)
+        self.assertIn("start --profile heyuan --scene 2\n", content)
+        self.assertIn("X-Matrix-Scene=2\n", content)
         self.assertNotIn("@MATRIX_", content)
 
     def test_custom_icon_is_written_as_an_absolute_path(self) -> None:

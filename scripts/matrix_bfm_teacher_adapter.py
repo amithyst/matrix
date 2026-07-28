@@ -87,6 +87,12 @@ TURN_COMMAND_YAW_DAMPING_SECONDS = 0.1
 # invariants, not policy/action-scale tuning parameters.
 HOT_SWITCH_PREVIEW_STEPS = 4
 HOT_SWITCH_MAX_TARGET_DELTA_RAD = 0.12
+REFERENCE_SWAP_MAX_TARGET_DELTA_RAD = 0.03
+# Ordinary W release stays inside the BFM controller. Delaying the stand
+# command was only needed by the experimental BFM -> SONIC brake transaction;
+# it diverges from the accepted BFM-3DGS press/release contract and destroys
+# the continuous walk -> stand policy history.
+STOP_HANDOFF_GRACE_STEPS = 0
 HOT_SWITCH_MAX_REFERENCE_ROOT_ERROR_M = 0.25
 HOT_SWITCH_LOW_CMD_MAX_AGE_S = 0.10
 
@@ -128,6 +134,29 @@ CONTRACT_DIMS = {
     "history_length": 10,
     "compatibility_zero_dim": 99,
     "action_dim": NUM_JOINTS,
+}
+
+# Keep the online reference stream byte-for-byte explicit with the accepted
+# BFM-3DGS/RealScan base.toml contract.  RoboPfnnReferenceStream's library
+# default for root_reanchor_threshold_m is intentionally more permissive
+# (0.25 m); relying on that default lets a fast 0.9 m/s reference get much
+# farther ahead of the Matrix G1 before it is pulled back.  The qualified
+# interactive runner uses 0.15 m and passes every field explicitly.
+REALSCAN_REFERENCE_CONTRACT = {
+    "source_hz": 60.0,
+    "output_hz": 50.0,
+    "future_frames": 10,
+    "future_stride_steps": 5,
+    "buffer_frames": 47,
+    "warmup_source_steps": 60,
+    "root_reanchor_threshold_m": 0.15,
+    "root_follow_deadband_m": 0.015,
+    "root_follow_gain": 0.25,
+    "root_follow_max_step_m": 0.015,
+    "command_replan_linear_delta_mps": 0.05,
+    "command_replan_yaw_delta_rad_s": 0.05,
+    "pending_min_steps": 4,
+    "pending_extra_frames": 8,
 }
 
 
@@ -423,13 +452,12 @@ def _joint_control_vectors() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     kd: list[float] = []
     effort: list[float] = []
     for name in G1_29_JOINT_NAMES:
-        if any(token in name for token in ("hip_roll", "knee")):
+        if any(token in name for token in ("hip_pitch", "hip_roll", "knee")):
             kp.append(stiffness_7520_22)
             kd.append(damping_7520_22)
             effort.append(139.0)
         elif (
-            "hip_pitch" in name
-            or "hip_yaw" in name
+            "hip_yaw" in name
             or name == "waist_yaw_joint"
         ):
             kp.append(stiffness_7520_14)
@@ -520,6 +548,24 @@ class WorldSample:
         )
 
 
+def _handoff_input_is_neutral(
+    world: WorldSample,
+    *,
+    allow_idle_neutral: bool,
+) -> bool:
+    """Validate the two explicit writer-fenced BFM handoff inputs."""
+
+    if world.safe_stop:
+        return True
+    return bool(
+        allow_idle_neutral
+        and world.mode == "idle"
+        and world.locomotion_mode == 0
+        and abs(float(world.speed_mps)) <= 1.0e-6
+        and float(np.linalg.norm(world.movement)) <= 1.0e-6
+    )
+
+
 def _load_module_from_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -602,19 +648,14 @@ class BfmTeacherCore:
             model_path,
             providers=providers,
         )
-        self.forward = NumpyPfnnForward(weights_dir)
         if reference_clip is None:
             self.stream = self.reference_module.RoboPfnnReferenceStream(
                 repo=robo_pfnn_root,
                 weights=weights_dir,
                 g1_xml=g1_xml,
-                device="cpu",
+                device="cuda:0",
+                **REALSCAN_REFERENCE_CONTRACT,
             )
-            # The upstream stream accepts a preloaded forward instance.
-            # Supplying the NumPy implementation avoids a Torch dependency in
-            # Matrix's DDS runtime while preserving the same four-bank network
-            # calculation.
-            self.stream._forward = self.forward
             self.reference_source = "robo_pfnn_formal7168"
         else:
             self.stream = self.recorded_reference_module.RecordedMotionReferenceStream(
@@ -629,17 +670,28 @@ class BfmTeacherCore:
         self.last_reset_count: int | None = None
         self.last_world_sequence: int | None = None
         self.reference_motion_active = False
+        self.last_motion_command: Any | None = None
+        self.stop_handoff_grace_steps_remaining = 0
         self.reference_start_resets = 0
         self.reference_stop_resets = 0
         self.reference_transition: str | None = None
         self.reference_hold_target: np.ndarray | None = None
+        self.reference_stop_blend_pending = False
+        # The accepted BFM-3DGS loop keeps applying Teacher on the active
+        # reference while Robo-PFNN builds a pending branch, then swaps that
+        # branch atomically.  Freezing joints or clearing actor history during
+        # the build changes the trained closed loop and can make root error
+        # cross the hard-reanchor threshold immediately after W.
+        self.canonical_reference_continuity = True
         self.idle_anchor_target: np.ndarray | None = None
+        self.idle_anchor_enabled = True
         self.activation_blend_steps = max(
             2,
             int(round(float(activation_blend_seconds) * POLICY_HZ)),
         )
         self.activation_origin: np.ndarray | None = None
         self.activation_step = 0
+        self.activation_target_step_limit_rad = HOT_SWITCH_MAX_TARGET_DELTA_RAD
         self.last_published_target: np.ndarray | None = None
         self.trace_file = trace_file
         self.trace_ticks = max(0, int(trace_ticks))
@@ -669,11 +721,16 @@ class BfmTeacherCore:
         self.previous_action.fill(0.0)
         self.last_world_sequence = None
         self.reference_motion_active = False
+        self.last_motion_command = None
+        self.stop_handoff_grace_steps_remaining = 0
         self.reference_transition = None
         self.reference_hold_target = None
+        self.reference_stop_blend_pending = False
         self.idle_anchor_target = None
+        self.idle_anchor_enabled = True
         self.activation_origin = None
         self.activation_step = 0
+        self.activation_target_step_limit_rad = HOT_SWITCH_MAX_TARGET_DELTA_RAD
         self.last_published_target = None
         self.direct_reference_start = None
 
@@ -681,6 +738,8 @@ class BfmTeacherCore:
         self,
         lowstate: LowStateSnapshot,
         prior_target: np.ndarray | None = None,
+        *,
+        idle_anchor_enabled: bool = True,
     ) -> None:
         """Start a policy-consistent handoff from the active LowCmd target.
 
@@ -694,8 +753,11 @@ class BfmTeacherCore:
         self.previous_action.fill(0.0)
         self.last_world_sequence = None
         self.reference_motion_active = False
+        self.last_motion_command = None
+        self.stop_handoff_grace_steps_remaining = 0
         self.reference_transition = None
         self.reference_hold_target = None
+        self.reference_stop_blend_pending = False
         anchor = (
             lowstate.joint_pos_rad
             if prior_target is None
@@ -703,9 +765,15 @@ class BfmTeacherCore:
         )
         if anchor.shape != (NUM_JOINTS,) or not np.all(np.isfinite(anchor)):
             raise ValueError("handoff anchor target must be finite 29D")
-        self.idle_anchor_target = anchor.astype(np.float32, copy=True)
+        self.idle_anchor_enabled = bool(idle_anchor_enabled)
+        self.idle_anchor_target = (
+            anchor.astype(np.float32, copy=True)
+            if self.idle_anchor_enabled
+            else None
+        )
         self.activation_origin = anchor.astype(np.float32, copy=True)
         self.activation_step = 0
+        self.activation_target_step_limit_rad = HOT_SWITCH_MAX_TARGET_DELTA_RAD
         self.last_published_target = anchor.astype(np.float32, copy=True)
 
     def prepare_handoff_activation(
@@ -730,12 +798,39 @@ class BfmTeacherCore:
         self.previous_action.fill(0.0)
         self.last_world_sequence = None
         self.reference_motion_active = True
+        self.last_motion_command = None
+        self.stop_handoff_grace_steps_remaining = 0
         self.reference_transition = None
         self.reference_hold_target = None
+        self.reference_stop_blend_pending = False
         self.idle_anchor_target = None
+        self.idle_anchor_enabled = False
         self.activation_origin = None
         self.activation_step = 0
+        self.activation_target_step_limit_rad = HOT_SWITCH_MAX_TARGET_DELTA_RAD
         self.last_published_target = None
+
+    def prepare_aligned_initial_activation(self) -> None:
+        """Start the canonical Teacher loop after an exact PFNN pose write.
+
+        This is deliberately different from a live controller hot-switch.  The
+        physical G1 has already been written to the first PFNN root, velocity,
+        and joint state while every LowCmd writer is fenced.  Applying the
+        hot-switch blend/step limiter after that exact alignment changes the
+        Teacher action sequence and can keep the closed loop permanently one
+        or more targets behind.  The accepted BFM-3DGS runner publishes the
+        first Teacher target directly from the aligned state, so the Matrix
+        initial-policy path must do the same.
+        """
+
+        self.prepare_direct_activation()
+        # Direct runs are admitted with a non-zero command and therefore mark
+        # the reference as moving.  The default game policy is admitted while
+        # safely standing, so preserve the already-warmed stand branch instead
+        # of manufacturing a motion-to-stand transition on the first tick.
+        self.reference_motion_active = False
+        self.last_motion_command = None
+        self.stop_handoff_grace_steps_remaining = 0
 
     def enter_standby(self) -> None:
         """Discard actor state produced while another controller owns LowCmd."""
@@ -746,9 +841,12 @@ class BfmTeacherCore:
         self.reference_motion_active = False
         self.reference_transition = None
         self.reference_hold_target = None
+        self.reference_stop_blend_pending = False
         self.idle_anchor_target = None
+        self.idle_anchor_enabled = True
         self.activation_origin = None
         self.activation_step = 0
+        self.activation_target_step_limit_rad = HOT_SWITCH_MAX_TARGET_DELTA_RAD
         self.last_published_target = None
 
     def _command_continuity_anchor(
@@ -761,6 +859,63 @@ class BfmTeacherCore:
         if last_target is not None:
             return last_target.astype(np.float32, copy=True)
         return lowstate.joint_pos_rad.astype(np.float32, copy=True)
+
+    def _prepare_realtime_rolling_command(self, command: Any) -> str | None:
+        """Roll an ordinary command change without a PFNN publish barrier.
+
+        The accepted RealScan stream builds a complete replacement branch in
+        the background and then waits synchronously at its deterministic swap
+        step. That is simulation-time safe, but Matrix physics keeps running:
+        while ``Future.result()`` blocks, the independent LowCmd publisher can
+        only repeat one stale walking target for hundreds of milliseconds.
+
+        For ordinary, non-latched keyboard motion, keep the active cursor and
+        let its existing 47-frame horizon roll into each new command one frame
+        per policy tick. This preserves PFNN phase, Teacher history,
+        PrevActions, and the 50 Hz writer. Explicit safety-stop latches retain
+        the upstream branch/rebuild behavior.
+        """
+
+        if bool(getattr(command, "stop_latched", False)):
+            return None
+        stream = self.stream
+        if not (
+            hasattr(stream, "_frames")
+            and hasattr(stream, "_last_branch_command")
+        ):
+            return None
+        pending_cancelled = False
+        pending = getattr(stream, "_pending", None)
+        if pending is not None:
+            # Root-anchor and terrain refreshes can start a pending branch even
+            # when the keyboard command itself is unchanged. Cancel it before
+            # the upstream four-step poll reaches Future.result(); the active
+            # buffer has already received the continuous root translation and
+            # keeps appending frames against the current height field.
+            pending.cancel_event.set()
+            pending.future.cancel()
+            stream._pending = None
+            pending_cancelled = True
+            if hasattr(stream, "_discard_count"):
+                stream._discard_count += 1
+            if hasattr(stream, "_deferred_reason"):
+                stream._deferred_reason = None
+        previous = getattr(stream, "_last_branch_command", None)
+        if previous is None:
+            return "pending_cancel" if pending_cancelled else None
+        change_reason = getattr(stream, "_change_reason", None)
+        if callable(change_reason):
+            reason = change_reason(command, previous)
+        elif getattr(command, "gait", None) != getattr(previous, "gait", None):
+            reason = "gait"
+        else:
+            reason = None
+        if reason is None:
+            return "pending_cancel" if pending_cancelled else None
+        if hasattr(stream, "_deferred_reason"):
+            stream._deferred_reason = None
+        stream._last_branch_command = command
+        return str(reason)
 
     def close(self) -> None:
         self.stream.close()
@@ -782,15 +937,25 @@ class BfmTeacherCore:
             world_velocity = movement_xy / norm * sample.speed_mps
         else:
             world_velocity = np.zeros(2, dtype=np.float64)
-        cosine = math.cos(sample.root_yaw)
-        sine = math.sin(sample.root_yaw)
-        local_vx = cosine * world_velocity[0] + sine * world_velocity[1]
-        local_vy = -sine * world_velocity[0] + cosine * world_velocity[1]
         requested_facing = sample.facing
         facing_norm = float(np.linalg.norm(requested_facing[:2]))
+        # Match the accepted BFM-3DGS keyboard contract: W/Shift-W are PFNN
+        # local forward walk/jog commands and carry no implicit yaw feedback.
+        # Matrix has already expressed movement in the camera-facing world
+        # frame, so rotate it back by that same facing.  A/D arrives as the
+        # explicit ``turn`` mode and remains the sole yaw command surface.
+        movement_frame_yaw = (
+            math.atan2(requested_facing[1], requested_facing[0])
+            if sample.mode == "move" and facing_norm > 1.0e-8
+            else sample.root_yaw
+        )
+        cosine = math.cos(movement_frame_yaw)
+        sine = math.sin(movement_frame_yaw)
+        local_vx = cosine * world_velocity[0] + sine * world_velocity[1]
+        local_vy = -sine * world_velocity[0] + cosine * world_velocity[1]
         if (
             sample.safe_stop
-            or sample.mode not in {"move", "turn"}
+            or sample.mode != "turn"
             or facing_norm <= 1.0e-8
         ):
             yaw_rate = 0.0
@@ -853,7 +1018,14 @@ class BfmTeacherCore:
             vy=float(local_vy),
             yaw_rate=yaw_rate,
             gait=gait,
-            stop_latched=bool(sample.safe_stop),
+            # A transient Matrix deadman frame is how the engine bridge
+            # releases a synthetic/remote key lease. BFM-3DGS treats W release
+            # as an ordinary non-latched stand command. Reserve the reference
+            # stop latch for explicit safety-stop modes so deadman -> idle does
+            # not manufacture a second, equivalent gait rebuild.
+            stop_latched=bool(
+                sample.safe_stop and sample.mode not in {"deadman", "idle"}
+            ),
         )
 
     @staticmethod
@@ -1046,6 +1218,10 @@ class BfmTeacherCore:
                 "base_ang_vel": self._array_summary(lowstate.body_gyro_rad_s),
                 "joint_pos": self._array_summary(lowstate.joint_pos_rad),
                 "joint_vel": self._array_summary(lowstate.joint_vel_rad_s),
+                "base_quat_wxyz_values": lowstate.quaternion_wxyz.tolist(),
+                "base_ang_vel_values": lowstate.body_gyro_rad_s.tolist(),
+                "joint_pos_values": lowstate.joint_pos_rad.tolist(),
+                "joint_vel_values": lowstate.joint_vel_rad_s.tolist(),
             },
             "observation": {
                 "base_quat_wxyz": self._array_summary(
@@ -1065,6 +1241,18 @@ class BfmTeacherCore:
                 "buffer_swapped": bool(
                     getattr(reference, "buffer_swapped", False)
                 ),
+                "pending_build_ms": getattr(reference, "pending_build_ms", None),
+                "pending_clone_ms": getattr(reference, "pending_clone_ms", None),
+                "pending_advance_ms": getattr(
+                    reference, "pending_advance_ms", None
+                ),
+                "pending_publish_ms": getattr(
+                    reference, "pending_publish_ms", None
+                ),
+                "pending_block_ms": getattr(reference, "pending_block_ms", None),
+                "pending_elapsed_steps": getattr(
+                    reference, "pending_elapsed_steps", None
+                ),
                 "reference_ready": not bool(reference.pending_rebuild),
                 "continuity": self._reference_continuity_summary(
                     reference.plan,
@@ -1076,6 +1264,13 @@ class BfmTeacherCore:
             "action_matrix": self._array_summary(action_matrix),
             "desired_target": self._array_summary(desired_target),
             "published_target": self._array_summary(target),
+            "action_isaac_values": action_isaac.tolist(),
+            "action_matrix_values": action_matrix.tolist(),
+            "desired_target_values": desired_target.tolist(),
+            "published_target_values": target.tolist(),
+            "reference_joint_values": np.asarray(
+                reference.plan.future_qpos[0, 7:], dtype=np.float32
+            ).tolist(),
             "joint_ledger": self._joint_order_ledger(),
             "joint_argmax": {
                 "published_target_minus_current": self._max_abs_entry(
@@ -1156,6 +1351,29 @@ class BfmTeacherCore:
             world.height_map_z,
         )
         command = self._command(world, lowstate)
+        raw_command_motion_active = bool(
+            command.gait != "stand"
+            or abs(float(command.vx)) > 1.0e-6
+            or abs(float(command.vy)) > 1.0e-6
+            or abs(float(command.yaw_rate)) > 1.0e-6
+        )
+        stop_handoff_grace_active = False
+        if raw_command_motion_active:
+            self.last_motion_command = command
+            self.stop_handoff_grace_steps_remaining = STOP_HANDOFF_GRACE_STEPS
+        elif (
+            active
+            and self.reference_motion_active
+            and self.last_motion_command is not None
+            and self.stop_handoff_grace_steps_remaining > 0
+        ):
+            # Keep the last qualified moving branch alive just long enough for
+            # the resident-writer transaction to fence BFM and resume SONIC.
+            # Entering PFNN stand immediately on key-up can destabilize the
+            # moving MuJoCo plant before the writer acknowledgement arrives.
+            command = self.last_motion_command
+            self.stop_handoff_grace_steps_remaining -= 1
+            stop_handoff_grace_active = True
         command_motion_active = bool(
             command.gait != "stand"
             or abs(float(command.vx)) > 1.0e-6
@@ -1168,7 +1386,20 @@ class BfmTeacherCore:
         stop_reference_reset = bool(
             self.reference_motion_active and not command_motion_active
         )
-        if start_reference_reset:
+        canonical_reference_continuity = bool(
+            getattr(self, "canonical_reference_continuity", True)
+        )
+        if start_reference_reset and canonical_reference_continuity:
+            # A completed/ongoing stand-branch settle must not throttle the
+            # first requested motion branch.  BFM-3DGS publishes the new walk
+            # actor target directly; keeping an old stand activation origin
+            # here made the CPU-side PFNN build pause hold the wrong target.
+            self.activation_origin = None
+            self.activation_step = 0
+            self.reference_stop_blend_pending = False
+        elif stop_reference_reset and canonical_reference_continuity:
+            self.reference_stop_blend_pending = True
+        if start_reference_reset and not canonical_reference_continuity:
             # Let RoboPfnnReferenceStream branch from its continuously tracked
             # stand cursor in the background.  A synchronous reset performs a
             # full PFNN warmup and future-buffer fill on the 50 Hz policy
@@ -1182,7 +1413,7 @@ class BfmTeacherCore:
             self.activation_origin = None
             self.activation_step = 0
             self.reference_start_resets += 1
-        elif stop_reference_reset:
+        elif stop_reference_reset and not canonical_reference_continuity:
             # A background walk -> stand branch must not leave the old walking
             # target in control.  Hold the exact observed pose until the stand
             # buffer is ready, then restart Teacher history and blend from the
@@ -1246,16 +1477,28 @@ class BfmTeacherCore:
             )
             else 0.0
         )
+        realtime_rolling_reason = (
+            self._prepare_realtime_rolling_command(command)
+            if active and canonical_reference_continuity
+            else None
+        )
+        realtime_rolling_stop = bool(
+            active
+            and canonical_reference_continuity
+            and stop_reference_reset
+            and realtime_rolling_reason is not None
+        )
+        if realtime_rolling_stop:
+            # No atomic branch swap follows this rolling transition, so there
+            # is no swap target that needs the pending-hold/blend path.
+            self.reference_stop_blend_pending = False
         reference = self.stream.sample(
             command,
             world.root_position,
             world.root_yaw,
             height_field,
         )
-        if (
-            getattr(self, "direct_start", False)
-            and getattr(self, "direct_reference_start", None) is None
-        ):
+        if not active:
             qpos_50hz = np.asarray(reference.plan.qpos_50hz, dtype=np.float32)
             joint_vel_50hz = np.asarray(
                 reference.plan.joint_vel_50hz,
@@ -1287,6 +1530,7 @@ class BfmTeacherCore:
         reference_pending_rebuild = bool(reference.pending_rebuild)
         if (
             active
+            and not canonical_reference_continuity
             and self.reference_transition is None
             and reference_pending_rebuild
             and not reference_buffer_swapped
@@ -1302,6 +1546,8 @@ class BfmTeacherCore:
             self.activation_origin = None
             self.activation_step = 0
         transition_completed = bool(
+            not canonical_reference_continuity
+            and
             self.reference_transition is not None
             and (
                 reference_buffer_swapped
@@ -1319,6 +1565,46 @@ class BfmTeacherCore:
                 self.activation_step = 0
             self.reference_transition = None
             self.reference_hold_target = None
+        reference_swap_blend_started = False
+        reference_root_anchor_swap = bool(
+            reference_buffer_swapped
+            and "root_anchor" in str(reference.replan_reason or "")
+        )
+        reference_stop_swap = bool(
+            reference_buffer_swapped
+            and not command_motion_active
+            and getattr(self, "reference_stop_blend_pending", False)
+        )
+        if (
+            active
+            and canonical_reference_continuity
+            and (reference_root_anchor_swap or reference_stop_swap)
+            and getattr(self, "last_published_target", None) is not None
+            and not (
+                getattr(self, "idle_anchor_enabled", True)
+                and not command_motion_active
+            )
+        ):
+            # Keep the BFM-3DGS active/pending PFNN stream and Teacher history
+            # continuous, but do not expose a branch-swap discontinuity as one
+            # MuJoCo LowCmd step.  PhysX tolerates the canonical atomic swap;
+            # Matrix observed 0.36-0.90 rad target jumps specifically when a
+            # terrain/root-anchor branch swapped, followed immediately by a
+            # fall.  Blend root-anchor swaps and real walk -> stand swaps from
+            # the last target actually published.  The Teacher still advances
+            # every tick and sees the applied blended action as PrevActions;
+            # no PFNN or actor reset is introduced and terrain keeps updating.
+            self.activation_origin = self.last_published_target.astype(
+                np.float32,
+                copy=True,
+            )
+            self.activation_step = 0
+            self.activation_target_step_limit_rad = (
+                REFERENCE_SWAP_MAX_TARGET_DELTA_RAD
+            )
+            if reference_stop_swap:
+                self.reference_stop_blend_pending = False
+            reference_swap_blend_started = True
         holding_reference_transition = bool(
             self.reference_transition in {"starting", "stopping", "rebuilding"}
             and self.reference_hold_target is not None
@@ -1356,9 +1642,18 @@ class BfmTeacherCore:
         )
         blend_fraction = 1.0
         target = desired_target
+        canonical_stop_pending_hold = bool(
+            active
+            and canonical_reference_continuity
+            and getattr(self, "reference_stop_blend_pending", False)
+            and not command_motion_active
+            and reference_pending_rebuild
+            and not reference_buffer_swapped
+            and prior_published_target is not None
+        )
         idle_anchor_hold = bool(
             active
-            and handoff_preview
+            and getattr(self, "idle_anchor_enabled", True)
             and not command_motion_active
             and not holding_reference_transition
         )
@@ -1371,14 +1666,24 @@ class BfmTeacherCore:
                 )
             target = self.idle_anchor_target.copy()
             blend_fraction = 0.0
-            # PREPARE is writer-free.  Keep the exact observed pose as the
-            # admission target, but preserve activation_origin so the first
-            # authoritative policy ticks can settle onto BFM's own stand
-            # target instead of holding a SONIC pose forever.
+            # Keep the exact observed/applied pose for an ordinary hot switch
+            # from an unrelated controller.  The initial PFNN-aligned path
+            # disables this compatibility hold and retains the canonical
+            # Teacher stand closed loop used by the validated runner.
             self.activation_step = 0
         elif active and holding_reference_transition:
             target = self.reference_hold_target.copy()
             blend_fraction = 0.0
+        elif canonical_stop_pending_hold:
+            # Continue publishing the last admitted walking target while the
+            # stand branch is built.  Letting the actor consume the still-live
+            # walking branch during these few pending frames produced target
+            # jumps above 0.5 rad before the swap blend could even start.
+            # Teacher/PFNN state still advances, and PrevActions below records
+            # this exact held target, so the eventual swap remains continuous.
+            target = prior_published_target.copy()
+            blend_fraction = 0.0
+            self.activation_step = 0
         elif active and self.activation_origin is not None:
             progress = min(
                 1.0,
@@ -1396,20 +1701,28 @@ class BfmTeacherCore:
                 else self.activation_origin
             )
             target_step = target - continuity_anchor
-            if float(np.max(np.abs(target_step))) > HOT_SWITCH_MAX_TARGET_DELTA_RAD:
+            target_step_limit_rad = float(
+                getattr(
+                    self,
+                    "activation_target_step_limit_rad",
+                    HOT_SWITCH_MAX_TARGET_DELTA_RAD,
+                )
+            )
+            if float(np.max(np.abs(target_step))) > target_step_limit_rad:
                 target = (
                     continuity_anchor
                     + np.clip(
                         target_step,
-                        -HOT_SWITCH_MAX_TARGET_DELTA_RAD,
-                        HOT_SWITCH_MAX_TARGET_DELTA_RAD,
+                        -target_step_limit_rad,
+                        target_step_limit_rad,
                     )
                 ).astype(np.float32)
                 activation_target_limited = True
             if progress >= 1.0 and not activation_target_limited:
                 self.activation_origin = None
-        if active and not handoff_preview:
-            self.idle_anchor_target = None
+                self.activation_target_step_limit_rad = (
+                    HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                )
         if active:
             if idle_anchor_hold or holding_reference_transition:
                 # The old reference mode is deliberately discarded while the
@@ -1477,8 +1790,36 @@ class BfmTeacherCore:
             "reference_root_error_m": float(reference.root_error_before_m),
             "reference_pending_rebuild": reference_pending_rebuild,
             "reference_buffer_swapped": reference_buffer_swapped,
+            "reference_realtime_rolling_reason": realtime_rolling_reason,
+            "reference_realtime_rolling_stop": realtime_rolling_stop,
+            "reference_pending_build_ms": getattr(
+                reference, "pending_build_ms", None
+            ),
+            "reference_pending_clone_ms": getattr(
+                reference, "pending_clone_ms", None
+            ),
+            "reference_pending_advance_ms": getattr(
+                reference, "pending_advance_ms", None
+            ),
+            "reference_pending_publish_ms": getattr(
+                reference, "pending_publish_ms", None
+            ),
+            "reference_pending_block_ms": getattr(
+                reference, "pending_block_ms", None
+            ),
+            "reference_pending_elapsed_steps": getattr(
+                reference, "pending_elapsed_steps", None
+            ),
+            "reference_swap_blend_started": reference_swap_blend_started,
+            "reference_stop_blend_pending": bool(
+                getattr(self, "reference_stop_blend_pending", False)
+            ),
+            "reference_stop_pending_hold": canonical_stop_pending_hold,
             "reference_transition": self.reference_transition,
             "idle_anchor_hold": idle_anchor_hold,
+            "idle_anchor_enabled": bool(
+                getattr(self, "idle_anchor_enabled", True)
+            ),
             "idle_anchor_initialized": self.idle_anchor_target is not None,
             "reference_transition_completed": transition_completed,
             "reference_transition_holding": holding_reference_transition,
@@ -1518,6 +1859,10 @@ class BfmTeacherCore:
             "world_input_safe_stop": bool(world.safe_stop),
             "world_input_speed_mps": float(world.speed_mps),
             "world_input_locomotion_mode": int(world.locomotion_mode),
+            "stop_handoff_grace_active": stop_handoff_grace_active,
+            "stop_handoff_grace_steps_remaining": int(
+                self.stop_handoff_grace_steps_remaining
+            ),
             "reference_target_speed_mps": float(reference.plan.target_speed),
             "reference_future_xy_delta_m": reference_future_xy_delta_m,
             "shadow_preview": not active or handoff_preview,
@@ -1526,7 +1871,13 @@ class BfmTeacherCore:
             "activation_blend_steps": int(self.activation_blend_steps),
             "activation_settle_active": self.activation_origin is not None,
             "activation_target_limited": activation_target_limited,
-            "activation_target_delta_limit_rad": HOT_SWITCH_MAX_TARGET_DELTA_RAD,
+            "activation_target_delta_limit_rad": float(
+                getattr(
+                    self,
+                    "activation_target_step_limit_rad",
+                    HOT_SWITCH_MAX_TARGET_DELTA_RAD,
+                )
+            ),
             "raw_action_l2": float(np.linalg.norm(action_isaac)),
             "raw_action_max_abs": float(np.max(np.abs(action_isaac))),
             "desired_target_delta_rms_rad": float(
@@ -1854,6 +2205,7 @@ def run_worker(
     prepared_authority_epoch: int | None = None
     prepare_ready_steps = 0
     prepare_reference_buffer_swapped = False
+    preparing_aligned_initial = False
 
     def send_event(event: str, fields: Mapping[str, Any] | None = None) -> None:
         payload: dict[str, Any] = {
@@ -1906,8 +2258,12 @@ def run_worker(
     next_policy = now
     next_status = now
     policy_period = 1.0 / POLICY_HZ
-    status_period = 1.0
+    # Initial-policy alignment consumes the freshest online-PFNN state from
+    # STATUS after the prior writer is fenced.  Keep this control-plane sample
+    # close to the 50 Hz reference without flooding the socket at policy rate.
+    status_period = 0.1
     transient_stale_active = False
+    preparing_allow_idle_neutral = False
     transient_stale_events = 0
     transient_stale_max_overage_s = 0.0
 
@@ -1948,6 +2304,22 @@ def run_worker(
                         continue
                     if command == "PREPARE":
                         requested_epoch = int(payload.get("authority_epoch"))
+                        aligned_initial = payload.get("aligned_initial", False)
+                        allow_idle_neutral = payload.get(
+                            "allow_idle_neutral", False
+                        )
+                        if type(aligned_initial) is not bool:
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE has invalid alignment mode"
+                            )
+                        if type(allow_idle_neutral) is not bool:
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE has invalid idle-neutral mode"
+                            )
+                        if aligned_initial and allow_idle_neutral:
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE mixes initial and idle-neutral modes"
+                            )
                         if direct_start:
                             raise RuntimeError(
                                 "direct BFM does not use hot-switch preparation"
@@ -1985,23 +2357,45 @@ def run_worker(
                             or state is None
                             or now - state.received_monotonic
                             > LOWSTATE_MAX_AGE_S
-                            or prior_command is None
-                            or now - prior_command.received_monotonic
-                            > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                            or (
+                                not aligned_initial
+                                and (
+                                    prior_command is None
+                                    or now - prior_command.received_monotonic
+                                    > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                                )
+                            )
                         ):
                             raise RuntimeError(
-                                "BFM Teacher PREPARE lacks fresh warmed inputs/LowCmd"
+                                "BFM Teacher PREPARE lacks fresh warmed inputs"
                             )
-                        if not latest_world.safe_stop:
+                        if not _handoff_input_is_neutral(
+                            latest_world,
+                            allow_idle_neutral=allow_idle_neutral,
+                        ):
                             raise RuntimeError(
-                                "BFM Teacher PREPARE requires a safety-stop handoff"
+                                "BFM Teacher PREPARE requires a safety-stop or "
+                                "authorized idle-neutral handoff"
                             )
-                        core.prepare_handoff_activation(
-                            state,
-                            prior_command.joint_pos_rad,
-                        )
+                        if aligned_initial:
+                            # Matrix has already aligned the physical G1 to the
+                            # first online-PFNN reference while SONIC is fenced.
+                            # Keep that reference cursor and use the canonical
+                            # BFM-3DGS first target directly.  The simulator is
+                            # already at the exact PFNN state, so a live-policy
+                            # hot-switch blend would alter the trained closed
+                            # loop rather than improve safety.
+                            core.prepare_aligned_initial_activation()
+                        else:
+                            assert prior_command is not None
+                            core.prepare_handoff_activation(
+                                state,
+                                prior_command.joint_pos_rad,
+                            )
                         preparing_authority_epoch = requested_epoch
                         prepared_authority_epoch = None
+                        preparing_aligned_initial = aligned_initial
+                        preparing_allow_idle_neutral = allow_idle_neutral
                         prepare_ready_steps = 0
                         prepare_reference_buffer_swapped = False
                         next_policy = monotonic()
@@ -2029,9 +2423,18 @@ def run_worker(
                             raise RuntimeError(
                                 "BFM Teacher GO lacks fresh world/LowState input"
                             )
-                        if not direct_start and not latest_world.safe_stop:
+                        if (
+                            not direct_start
+                            and not _handoff_input_is_neutral(
+                                latest_world,
+                                allow_idle_neutral=(
+                                    preparing_allow_idle_neutral
+                                ),
+                            )
+                        ):
                             raise RuntimeError(
-                                "BFM Teacher GO requires a safety-stop handoff"
+                                "BFM Teacher GO requires a safety-stop or "
+                                "authorized idle-neutral handoff"
                             )
                         if direct_start:
                             core.prepare_direct_activation()
@@ -2041,6 +2444,8 @@ def run_worker(
                                     "BFM Teacher GO arrived before safe preparation"
                                 )
                             if (
+                                not preparing_aligned_initial
+                                and (
                                 latest_policy_status.get(
                                     "published_target_step_delta_max_rad"
                                 )
@@ -2050,7 +2455,8 @@ def run_worker(
                                         "published_target_step_delta_max_rad"
                                     ]
                                 )
-                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6
+                                )
                             ):
                                 raise RuntimeError(
                                     "BFM Teacher prepared target exceeded safety gate"
@@ -2070,6 +2476,8 @@ def run_worker(
                         authority_epoch = requested_epoch
                         preparing_authority_epoch = None
                         prepared_authority_epoch = None
+                        preparing_aligned_initial = False
+                        preparing_allow_idle_neutral = False
                         prepare_ready_steps = 0
                         with writer_lock:
                             handoff.command("GO")
@@ -2083,6 +2491,7 @@ def run_worker(
                         core.enter_standby()
                         preparing_authority_epoch = None
                         prepared_authority_epoch = None
+                        preparing_aligned_initial = False
                         prepare_ready_steps = 0
                         continue
                     if command == "STOP":
@@ -2199,8 +2608,11 @@ def run_worker(
                                 )
                             )
                             if (
+                                not preparing_aligned_initial
+                                and (
                                 target_step_delta
-                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD
+                                > HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6
+                                )
                             ):
                                 rejected_epoch = (
                                     preparing_authority_epoch
@@ -2231,6 +2643,8 @@ def run_worker(
                                 )
                                 preparing_authority_epoch = None
                                 prepared_authority_epoch = None
+                                preparing_aligned_initial = False
+                                preparing_allow_idle_neutral = False
                                 prepare_ready_steps = 0
                                 core.enter_standby()
                             elif preparing_authority_epoch is not None:
@@ -2239,7 +2653,12 @@ def run_worker(
                                     if reference_ready
                                     else 0
                                 )
-                                if prepare_ready_steps >= HOT_SWITCH_PREVIEW_STEPS:
+                                required_preview_steps = (
+                                    1
+                                    if preparing_aligned_initial
+                                    else HOT_SWITCH_PREVIEW_STEPS
+                                )
+                                if prepare_ready_steps >= required_preview_steps:
                                     prepared_authority_epoch = (
                                         preparing_authority_epoch
                                     )
@@ -2257,6 +2676,12 @@ def run_worker(
                                                 handoff.publisher is not None
                                             ),
                                             "write_authorized": False,
+                                            "exact_initial_alignment": bool(
+                                                preparing_aligned_initial
+                                            ),
+                                            "idle_neutral_handoff": bool(
+                                                preparing_allow_idle_neutral
+                                            ),
                                             "reference_aligned": True,
                                             "reference_pending_rebuild": False,
                                             "reference_buffer_swapped": (
@@ -2282,9 +2707,9 @@ def run_worker(
                                     )
                         if not warmed:
                             direct_reference = core.direct_reference_start
-                            if direct_start and direct_reference is None:
+                            if direct_reference is None:
                                 raise RuntimeError(
-                                    "direct BFM warmup produced no reference start"
+                                    "BFM warmup produced no initial reference state"
                                 )
                             warmed = True
                             send_event(
@@ -2370,7 +2795,12 @@ def run_worker(
                     "prepared_authority_epoch": prepared_authority_epoch,
                     "activation_preview_ready_steps": prepare_ready_steps,
                     "activation_preview_steps_required": (
-                        HOT_SWITCH_PREVIEW_STEPS
+                        1
+                        if preparing_aligned_initial
+                        else HOT_SWITCH_PREVIEW_STEPS
+                    ),
+                    "activation_exact_initial_alignment": bool(
+                        preparing_aligned_initial
                     ),
                     "activation_target_delta_limit_rad": (
                         HOT_SWITCH_MAX_TARGET_DELTA_RAD
@@ -2393,6 +2823,16 @@ def run_worker(
                     ),
                     "policy_trace_ticks_requested": int(core.trace_ticks),
                     "policy_trace_ticks_written": int(core.trace_written),
+                    "direct_initial_qpos": (
+                        core.direct_reference_start["qpos"]
+                        if core.direct_reference_start is not None
+                        else None
+                    ),
+                    "direct_initial_qvel": (
+                        core.direct_reference_start["qvel"]
+                        if core.direct_reference_start is not None
+                        else None
+                    ),
                     "observed_lowcmd_target": observed_command is not None,
                     "observed_lowcmd_target_age_ms": (
                         max(

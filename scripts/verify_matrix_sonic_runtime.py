@@ -8,6 +8,7 @@ import base64
 import configparser
 import csv
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 from typing import Any
@@ -780,6 +782,47 @@ def _is_loadable_site_packages_file(relative: str) -> bool:
     )
 
 
+def _is_exact_record_owned_pep3147_pyc(
+    relative: str,
+    site_packages: Path,
+    expected_files: dict[str, tuple[str | None, int | None, str]],
+) -> bool:
+    path = Path(relative)
+    if path.suffix != ".pyc" or "__pycache__" not in path.parts:
+        return False
+    try:
+        source_relative = Path(importlib.util.source_from_cache(relative)).as_posix()
+    except (IndexError, ValueError):
+        return False
+    if (
+        not source_relative.endswith(".py")
+        or not is_safe_relative_path(source_relative)
+        or source_relative not in expected_files
+    ):
+        return False
+
+    source_path = site_packages / source_relative
+    cache_path = site_packages / relative
+    try:
+        header = cache_path.read_bytes()[:16]
+        if len(header) != 16 or header[:4] != importlib.util.MAGIC_NUMBER:
+            return False
+        flags = struct.unpack("<I", header[4:8])[0]
+        if flags & ~0b11:
+            return False
+        source_stat = source_path.stat()
+        if flags & 0b1:
+            return header[8:16] == importlib.util.source_hash(
+                source_path.read_bytes()
+            )
+        timestamp, source_size = struct.unpack("<II", header[8:16])
+        return timestamp == (int(source_stat.st_mtime) & 0xFFFFFFFF) and (
+            source_size == (source_stat.st_size & 0xFFFFFFFF)
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def verify_python_wheel_records(
     wheelhouse: Path,
     site_packages: Path,
@@ -1128,17 +1171,22 @@ def verify_python_wheel_records(
         and Path(relative).parts[0] in installer_metadata_roots
         and Path(relative).name in generated_metadata_names
     }
+    unexpected_inventory = unexpected_files - allowed_generated_metadata
+    derived_owned_pycache = {
+        relative
+        for relative in unexpected_inventory
+        if _is_exact_record_owned_pep3147_pyc(
+            relative, site_packages, expected_files
+        )
+    }
     unowned_loadable = sorted(
         relative
-        for relative in (
-            unexpected_files
-            - allowed_generated_metadata
-        )
+        for relative in unexpected_inventory - derived_owned_pycache
         if _is_loadable_site_packages_file(relative)
     )
     unowned_other = sorted(
-        unexpected_files
-        - allowed_generated_metadata
+        unexpected_inventory
+        - derived_owned_pycache
         - set(unowned_loadable)
     )
     inventory_errors = list(non_regular)
@@ -1150,6 +1198,7 @@ def verify_python_wheel_records(
     inventory_detail = (
         f"exact content closure; installer-metadata={len(allowed_generated_metadata)}; "
         f"entry-point-wrappers={len(generated_entry_point_files)}; "
+        f"derived-pyc={len(derived_owned_pycache)}; "
         "unowned-pycache-files=0"
         if inventory_ok
         else _compact_failures(inventory_errors)

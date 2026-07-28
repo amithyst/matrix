@@ -15,4 +15,8 @@ echo "[INFO] moon-v1 physics: Matrix scene_terrain_moon_dynamic.xml plus SONIC G
 echo "[WARN] moon-v1 requires MoonWorld chunk 26 and dynamicmaps/moonworld.bin from the locked runtime."
 echo "[WARN] visual MoonWorld does not by itself prove 1.62 m/s^2 low-gravity physics acceptance."
 
+# The generic launcher loads the selected host profile before it resolves the
+# locomotion slot.  Keep this scene wrapper policy-neutral so tRNA's tracked
+# BFM default cannot leak into Heyuan/ZZA, while explicit environment or CLI
+# overrides still reach the authoritative launcher unchanged.
 exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"
