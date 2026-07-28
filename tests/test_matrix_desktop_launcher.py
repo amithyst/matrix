@@ -184,6 +184,10 @@ esac
                     "-u",
                     "PYTHONPATH",
                     "MATRIX_GAME_GRAB_ESCAPE=1",
+                    "MATRIX_ESC_OVERLAY_MODAL_SHIELD=0",
+                    "MATRIX_ESC_OVERLAY_RECENTER_POINTER=0",
+                    "MATRIX_ESC_OVERLAY_KEEP_RAISED=0",
+                    "MATRIX_ESC_OVERLAY_CLOSE_ON_FOCUS_LOSS=1",
                     "/usr/bin/bash",
                     os.fspath(
                         self.project / "scripts/run_matrix_sonic_moon_v1.sh"

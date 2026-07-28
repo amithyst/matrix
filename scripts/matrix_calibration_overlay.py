@@ -3386,6 +3386,9 @@ class X11CalibrationOverlay:
         expected_ue_pid: int,
         font_scale: float = 1.0,
         font_size: int | None = None,
+        modal_shield: bool = True,
+        pointer_recenter: bool = True,
+        keep_raised: bool = True,
         x11: Any | None = None,
         xfixes: Any | None = None,
         xft: Any | None = None,
@@ -3450,6 +3453,9 @@ class X11CalibrationOverlay:
             self.close()
             raise RuntimeError("XFixes extension is unavailable")
         self.expected_ue_pid = expected_ue_pid
+        self._modal_shield = bool(modal_shield)
+        self._pointer_recenter = bool(pointer_recenter)
+        self._keep_raised = bool(keep_raised)
         self._font_scale = canonical_font_scale(font_scale)
         self._initial_font_size = (
             _font_size_for_scale(self._font_scale)
@@ -6542,7 +6548,12 @@ class X11CalibrationOverlay:
             layout = overlay_layout(geometry)
         else:
             layout = self._last_layout
-        static_order = ("shield",) + self._VISUAL_WINDOW_ORDER
+        modal_shield = bool(getattr(self, "_modal_shield", True))
+        pointer_recenter = bool(getattr(self, "_pointer_recenter", True))
+        keep_raised = bool(getattr(self, "_keep_raised", True))
+        static_order = (
+            (("shield",) if modal_shield else ()) + self._VISUAL_WINDOW_ORDER
+        )
         if first_show or geometry_changed:
             for name in static_order:
                 window = self._windows[name]
@@ -6553,8 +6564,13 @@ class X11CalibrationOverlay:
         raise_due = bool(
             first_show
             or geometry_changed
-            or self._last_raise_s is None
-            or now - self._last_raise_s >= self._RAISE_INTERVAL_S
+            or (
+                keep_raised
+                and (
+                    self._last_raise_s is None
+                    or now - self._last_raise_s >= self._RAISE_INTERVAL_S
+                )
+            )
         )
         if first_show:
             for name in static_order:
@@ -6586,7 +6602,7 @@ class X11CalibrationOverlay:
             pointer[0] in {geometry.x, geometry.x + geometry.width - 1}
             or pointer[1] in {geometry.y, geometry.y + geometry.height - 1}
         )
-        if (
+        if pointer_recenter and (
             not point_in_rectangle(pointer, game_rectangle)
             or pointer_on_confinement_edge
         ):
@@ -6758,6 +6774,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--font-scale", type=float, default=1.0)
     parser.add_argument("--font-size", type=int)
     parser.add_argument("--poll-hz", type=float, default=30.0)
+    parser.add_argument(
+        "--modal-shield",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Map the transparent modal input shield over the UE client",
+    )
+    parser.add_argument(
+        "--pointer-recenter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Warp the pointer back to the overlay safe area at confinement edges",
+    )
+    parser.add_argument(
+        "--keep-raised",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Periodically raise overlay windows above the UE client",
+    )
     return parser.parse_args()
 
 
@@ -6818,6 +6852,9 @@ def main() -> int:
             expected_ue_pid=args.expected_ue_pid,
             font_scale=args.font_scale,
             font_size=args.font_size,
+            modal_shield=args.modal_shield,
+            pointer_recenter=args.pointer_recenter,
+            keep_raised=args.keep_raised,
         )
         font_diagnostics = overlay.font_diagnostics
         x11_diagnostics = overlay.x11_diagnostics
