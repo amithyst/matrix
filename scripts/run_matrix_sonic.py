@@ -9668,6 +9668,8 @@ class _PhysicalRecoveryCoordinator:
     POSE_TRIGGER_UP_Z = 0.5
     POSE_TRIGGER_HOLD_S = 0.35
     STANDBY_HEARTBEAT_TIMEOUT_S = 2.0
+    LOCOMOTION_SWITCH_UPRIGHT_HEIGHT_M = 0.45
+    LOCOMOTION_SWITCH_UPRIGHT_UP_Z = 0.85
     FALLBACK_NEAR_UPRIGHT_HEIGHT_M = 0.62
     FALLBACK_NEAR_UPRIGHT_UP_Z = 0.85
     FALLBACK_NEAR_UPRIGHT_GRACE_S = 2.0
@@ -9676,6 +9678,7 @@ class _PhysicalRecoveryCoordinator:
     FALLBACK_MAX_ANGULAR_SPEED_RAD_S = 1.5
     FALLBACK_MAX_JOINT_VELOCITY_RMS_RAD_S = 1.5
     BFM_SWITCH_ADMISSION_HOLD_S = 1.5
+    BFM_SWITCH_MAX_DESIRED_TARGET_DELTA_RAD = 0.75
     # Conservative first qualification after a replacement deploy.  At the
     # 50 Hz game command rate this is 1 rad/s and prevents a frame transform
     # from bypassing the core's own yaw slew limiter.
@@ -9960,6 +9963,20 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_admission_reason = "awaiting_runtime_observation"
         self.bfm_switch_admission_since_s: float | None = None
         self.bfm_switch_admission_elapsed_s = 0.0
+        self.bfm_switch_admission_telemetry: dict[str, object] = {
+            "reason": self.bfm_switch_admission_reason,
+            "ready": False,
+            "raw_ready": False,
+            "root_z_m": None,
+            "root_up_z": None,
+            "root_linear_speed_m_s": None,
+            "root_angular_speed_rad_s": None,
+            "joint_velocity_rms_rad_s": None,
+            "height_threshold_m": self.LOCOMOTION_SWITCH_UPRIGHT_HEIGHT_M,
+            "up_z_threshold": self.LOCOMOTION_SWITCH_UPRIGHT_UP_Z,
+            "stability_hold_seconds": self.BFM_SWITCH_ADMISSION_HOLD_S,
+            "stability_elapsed_seconds": 0.0,
+        }
         self.last_locomotion_handoff: dict[str, object] | None = None
         self.initial_bfm_reference_aligned = False
         self.initial_bfm_reference_alignment: dict[str, object] | None = None
@@ -10544,6 +10561,33 @@ class _PhysicalRecoveryCoordinator:
         }
         return None
 
+    def _bfm_hot_switch_preparation_rejection(
+        self,
+        pending: dict[str, object],
+        preparation: dict[str, object],
+    ) -> str | None:
+        if pending.get("initial_reference_alignment") is True:
+            return None
+        if preparation.get("exact_initial_alignment") is True:
+            return None
+        if preparation.get("lowstate_anchor_handoff") is True:
+            return None
+        if preparation.get("reference_buffer_swapped") is not True:
+            return "BFM hot switch reference buffer was not swapped"
+        desired_delta = preparation.get("desired_target_delta_max_rad")
+        if (
+            not isinstance(desired_delta, (int, float))
+            or not math.isfinite(float(desired_delta))
+        ):
+            return "BFM hot switch desired target delta is invalid"
+        limit = self.BFM_SWITCH_MAX_DESIRED_TARGET_DELTA_RAD
+        if float(desired_delta) > limit:
+            return (
+                "BFM hot switch desired target delta too large: "
+                f"{float(desired_delta):.3f} rad > {limit:.3f} rad"
+            )
+        return None
+
     def _reconcile_policy_slot_assignment(self) -> None:
         pending = getattr(self, "_policy_selection_pending", None)
         if pending is None:
@@ -10733,6 +10777,15 @@ class _PhysicalRecoveryCoordinator:
                     pending["desired_target_delta_max_rad"] = preparation.get(
                         "desired_target_delta_max_rad"
                     )
+                    rejection = self._bfm_hot_switch_preparation_rejection(
+                        pending,
+                        preparation,
+                    )
+                    if rejection is not None:
+                        pending["bfm_prepare_rejection_reason"] = rejection
+                        self.bfm_control.cancel_preparation()
+                        begin_sonic_rollback(rejection)
+                        return
                     if not self.sonic_writer.paused:
                         pending["sonic_pause_sent_monotonic_s"] = time.monotonic()
                         self.sonic_writer.send("PAUSE")
@@ -11441,7 +11494,11 @@ class _PhysicalRecoveryCoordinator:
                 ),
                 "fall_detected",
             ),
-            (root_z >= 0.62 and root_up_z >= 0.85, "pose_not_upright"),
+            (
+                root_z >= self.LOCOMOTION_SWITCH_UPRIGHT_HEIGHT_M
+                and root_up_z >= self.LOCOMOTION_SWITCH_UPRIGHT_UP_Z,
+                "pose_not_upright",
+            ),
             (root_linear_speed <= 0.15, "root_linear_motion"),
             (root_angular_speed <= 0.35, "root_angular_motion"),
             (joint_rms <= 0.75, "joint_motion"),
@@ -11474,6 +11531,26 @@ class _PhysicalRecoveryCoordinator:
             self._update_bfm_switch_admission_hold(False, now_s=now_s)
             self.bfm_switch_admission_ready = False
             self.bfm_switch_admission_reason = "resume_checkpoint_probation"
+        self.bfm_switch_admission_telemetry = {
+            "ready": bool(self.bfm_switch_admission_ready),
+            "raw_ready": bool(raw_admission_ready),
+            "reason": self.bfm_switch_admission_reason,
+            "failed_reason": failed_admission,
+            "root_z_m": round(root_z, 6),
+            "root_up_z": round(root_up_z, 6),
+            "root_linear_speed_m_s": round(root_linear_speed, 6),
+            "root_angular_speed_rad_s": round(root_angular_speed, 6),
+            "joint_velocity_rms_rad_s": round(joint_rms, 6),
+            "height_threshold_m": self.LOCOMOTION_SWITCH_UPRIGHT_HEIGHT_M,
+            "up_z_threshold": self.LOCOMOTION_SWITCH_UPRIGHT_UP_Z,
+            "max_root_linear_speed_m_s": 0.15,
+            "max_root_angular_speed_rad_s": 0.35,
+            "max_joint_velocity_rms_rad_s": 0.75,
+            "stability_hold_seconds": self.BFM_SWITCH_ADMISSION_HOLD_S,
+            "stability_elapsed_seconds": round(
+                float(getattr(self, "bfm_switch_admission_elapsed_s", 0.0)), 6
+            ),
+        }
         self._request_initial_locomotion_policy_if_ready(
             handoff_allowed=initial_locomotion_handoff_allowed,
         )
@@ -12699,6 +12776,26 @@ class _PhysicalRecoveryCoordinator:
             ),
             "locomotion_switch_admission_elapsed_seconds": float(
                 getattr(self, "bfm_switch_admission_elapsed_s", 0.0)
+            ),
+            "locomotion_switch_admission": dict(
+                getattr(
+                    self,
+                    "bfm_switch_admission_telemetry",
+                    {
+                        "ready": bool(self.bfm_switch_admission_ready),
+                        "reason": self.bfm_switch_admission_reason,
+                        "height_threshold_m": (
+                            self.LOCOMOTION_SWITCH_UPRIGHT_HEIGHT_M
+                        ),
+                        "up_z_threshold": self.LOCOMOTION_SWITCH_UPRIGHT_UP_Z,
+                        "stability_hold_seconds": (
+                            self.BFM_SWITCH_ADMISSION_HOLD_S
+                        ),
+                        "stability_elapsed_seconds": float(
+                            getattr(self, "bfm_switch_admission_elapsed_s", 0.0)
+                        ),
+                    },
+                )
             ),
             "bfm_idle_brake_handoff": {
                 "armed": bool(

@@ -6747,6 +6747,123 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             coordinator._update_bfm_switch_admission_hold(True, now_s=20.0)
         )
 
+    def make_locomotion_switch_admission_coordinator(self):
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.locomotion_slots_only = True
+        coordinator.physics_profiles = None
+        coordinator.fsm = SimpleNamespace(
+            state=MODULE.ResidentRecoveryState.GAME_SONIC
+        )
+        coordinator.worker = mock.Mock(error=None)
+        coordinator.worker.poll = mock.Mock()
+        coordinator.sonic_writer = mock.Mock(error=None, ready=False)
+        coordinator.sonic_writer.poll = mock.Mock()
+        coordinator.replacement_sonic_ready_s = None
+        coordinator._reconcile_policy_slot_assignment = mock.Mock()
+        coordinator._fall_level = mock.Mock(return_value=False)
+        coordinator._request_initial_locomotion_policy_if_ready = mock.Mock()
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.bfm_switch_admission_ready = False
+        coordinator.bfm_switch_admission_reason = "awaiting_runtime_observation"
+        coordinator.bfm_switch_admission_since_s = None
+        coordinator.bfm_switch_admission_elapsed_s = 0.0
+        return coordinator
+
+    def observe_locomotion_switch_admission(
+        self,
+        coordinator,
+        *,
+        root_z_m: float,
+        now_s: float,
+        root_up_z: float = 1.0,
+        qvel: list[float] | None = None,
+    ) -> None:
+        snapshot = self.snapshot(low_cmd_fresh=True, low_cmd_age_s=0.0)
+        snapshot.qpos[2] = root_z_m
+        # Identity orientation keeps root_up_z at 1.0.  Use x-axis tilt when a
+        # lower diagnostic up vector is requested.
+        if root_up_z < 1.0:
+            snapshot.qpos[3] = math.sqrt(max(0.0, (1.0 + root_up_z) * 0.5))
+            snapshot.qpos[4] = math.sqrt(max(0.0, (1.0 - root_up_z) * 0.5))
+        else:
+            snapshot.qpos[3] = 1.0
+        if qvel is not None:
+            snapshot.qvel = qvel
+
+        coordinator.observe(
+            snapshot,
+            now_s=now_s,
+            neutral_confirmed=True,
+            locomotion_switch_neutral_confirmed=True,
+            foot_contact=True,
+            grounded_contact=True,
+            processes=mock.Mock(),
+        )
+
+    def test_locomotion_switch_admission_accepts_trna_upright_clearance_after_hold(
+        self,
+    ) -> None:
+        coordinator = self.make_locomotion_switch_admission_coordinator()
+
+        self.observe_locomotion_switch_admission(
+            coordinator,
+            root_z_m=0.494208,
+            now_s=1.0,
+        )
+
+        self.assertFalse(coordinator.bfm_switch_admission_ready)
+        self.assertEqual(coordinator.bfm_switch_admission_reason, "stability_hold")
+        self.assertTrue(coordinator.bfm_switch_admission_telemetry["raw_ready"])
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry["height_threshold_m"],
+            0.45,
+        )
+
+        self.observe_locomotion_switch_admission(
+            coordinator,
+            root_z_m=0.494208,
+            now_s=2.5,
+        )
+
+        self.assertTrue(coordinator.bfm_switch_admission_ready)
+        self.assertEqual(coordinator.bfm_switch_admission_reason, "ready")
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry["root_z_m"],
+            0.494208,
+        )
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry[
+                "stability_elapsed_seconds"
+            ],
+            1.5,
+        )
+
+    def test_locomotion_switch_admission_rejects_low_pose(
+        self,
+    ) -> None:
+        coordinator = self.make_locomotion_switch_admission_coordinator()
+
+        self.observe_locomotion_switch_admission(
+            coordinator,
+            root_z_m=0.12,
+            now_s=1.0,
+        )
+
+        self.assertFalse(coordinator.bfm_switch_admission_ready)
+        self.assertEqual(
+            coordinator.bfm_switch_admission_reason,
+            "pose_not_upright",
+        )
+        self.assertFalse(coordinator.bfm_switch_admission_telemetry["raw_ready"])
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry[
+                "stability_elapsed_seconds"
+            ],
+            0.0,
+        )
+
     def test_initial_bfm_game_run_uses_locomotion_slots_only_when_fall_recovery_off(
         self,
     ) -> None:
@@ -6877,6 +6994,58 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(recovery["selected_policy_id"], "off")
         self.assertTrue(recovery["locked"])
         self.assertEqual(recovery["candidates"], [])
+
+    def test_bfm_hot_switch_rejects_unswapped_large_target_delta(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        transition_id = "transition-bfm-unsafe"
+        coordinator._policy_selection_pending = {
+            "slot": "locomotion",
+            "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+            "transition_id": transition_id,
+            "phase": "prepare_bfm",
+            "requested_monotonic_s": time.monotonic(),
+        }
+        coordinator._policy_selection_results = {}
+        coordinator.last_locomotion_handoff = None
+        coordinator.bfm_switch_timeout_s = 10.0
+        coordinator.strategy_loadout_mapping = mock.Mock(
+            return_value={"version": 1}
+        )
+        coordinator.sonic_writer = mock.Mock(
+            paused=False,
+            pause_pending=False,
+        )
+        coordinator.bfm_control = mock.Mock(
+            activation_rejected_reason=None,
+            activation_prepared=True,
+            activation_preparation_status={
+                "reference_aligned": True,
+                "reference_buffer_swapped": False,
+                "preview_steps": 4,
+                "target_delta_max_rad": 0.0,
+                "desired_target_delta_max_rad": 1.72,
+                "target_delta_limit_rad": 0.12,
+            },
+        )
+
+        coordinator._reconcile_policy_slot_assignment()
+
+        coordinator.bfm_control.cancel_preparation.assert_called_once_with()
+        coordinator.sonic_writer.send.assert_not_called()
+        self.assertIsNone(coordinator._policy_selection_pending)
+        result = coordinator._policy_selection_results[transition_id]
+        self.assertFalse(result[0])
+        self.assertEqual(result[1], "E_POLICY_SWITCH_REJECTED")
+        self.assertIn("reference buffer", result[2])
+        self.assertEqual(result[3], {"version": 1})
+        self.assertEqual(
+            coordinator.last_locomotion_handoff["bfm_prepare_rejection_reason"],
+            result[2],
+        )
 
     def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
         self,
