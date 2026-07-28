@@ -21,6 +21,9 @@ TEMPLATE = REPO_ROOT / "packaging" / "matrix-bfm-isaac-mainline.desktop.in"
 COMMAND_TOOL = REPO_ROOT / "scripts" / "matrix_bfm_isaac_command.py"
 LOCAL_ENV_LOADER = REPO_ROOT / "scripts" / "matrix_local_env.sh"
 LOCAL_ENV_UPDATER = REPO_ROOT / "scripts" / "update_matrix_local_env.py"
+SHORTCUT_VALIDATOR = (
+    REPO_ROOT / "scripts" / "validate_matrix_bfm_isaac_desktop_shortcut.sh"
+)
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -515,6 +518,150 @@ printf 'unreachable\n'
             "matrix_bfm_isaac_enforce_desktop_sim_only",
             legacy,
         )
+
+
+class MatrixBfmIsaacDesktopShortcutValidatorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.active_root = self.root / "matrix-mainline"
+        (self.active_root / "scripts").mkdir(parents=True)
+        write_executable(
+            self.active_root / "scripts" / LAUNCHER.name,
+            "#!/usr/bin/env bash\nexit 0\n",
+        )
+        self.desktop = self.root / "Desktop" / "matrix-sonic.desktop"
+        self.desktop.parent.mkdir()
+        self.desktop.write_text(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Matrix\n"
+            f'Exec=/usr/bin/bash "{self.active_root / "scripts" / LAUNCHER.name}" start --profile trna\n'
+            f"X-Matrix-Active-Root={self.active_root}\n"
+            "X-Matrix-Profile=trna\n",
+            encoding="utf-8",
+        )
+        self.fake_bin = self.root / "fake-bin"
+        self.fake_bin.mkdir()
+        self.tmux_state = self.root / "tmux.state"
+        self.run_dir = self.root / "run"
+        self.console = self.root / "console.log"
+        self.gio_log = self.root / "gio.log"
+        write_executable(
+            self.fake_bin / "gio",
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s' "$1" > "${FAKE_GIO_LOG:?}"
+shift
+for value in "$@"; do printf '\t%s' "$value" >> "$FAKE_GIO_LOG"; done
+printf '\n' >> "$FAKE_GIO_LOG"
+[[ "${1:-}" != "" ]]
+mkdir -p -- "${FAKE_RUN_DIR:?}"
+if [[ "${FAKE_KEYS_INCLUDE_ESCAPE:-0}" == "1" ]]; then
+    printf "matrix-bfm-isaac-keyboard ready display=:0 socket=/tmp/k keys=['A', 'ESCAPE', 'W']\\n" > "$FAKE_RUN_DIR/keyboard.log"
+else
+    printf "matrix-bfm-isaac-keyboard ready display=:0 socket=/tmp/k keys=['A', 'W']\\n" > "$FAKE_RUN_DIR/keyboard.log"
+fi
+printf 'Interactive controls: W/S walk, Esc quit\\n' > "$FAKE_RUN_DIR/physics.log"
+printf '[INFO] Starting UE\\n' > "$FAKE_RUN_DIR/renderer.log"
+printf '[INFO] console ready\\n' > "${FAKE_CONSOLE_LOG:?}"
+printf '%s\\n' "$FAKE_RUN_DIR" > "${FAKE_TMUX_STATE:?}.run_dir"
+printf '%s\\n' "$FAKE_CONSOLE_LOG" > "$FAKE_TMUX_STATE.console"
+printf '0\\n' > "$FAKE_TMUX_STATE"
+""",
+        )
+        write_executable(
+            self.fake_bin / "tmux",
+            """#!/usr/bin/env bash
+set -euo pipefail
+command_name="${1:-}"
+shift || true
+case "$command_name" in
+    has-session) [[ -f "${FAKE_TMUX_STATE:?}" ]] ;;
+    list-panes) cat "${FAKE_TMUX_STATE:?}" ;;
+    show-options)
+        option="${@: -1}"
+        case "$option" in
+            @matrix_run_dir) cat "$FAKE_TMUX_STATE.run_dir" ;;
+            @matrix_console_log) cat "$FAKE_TMUX_STATE.console" ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    *) exit 64 ;;
+esac
+""",
+        )
+        self.environment = os.environ.copy()
+        self.environment.update(
+            {
+                "FAKE_GIO_LOG": os.fspath(self.gio_log),
+                "FAKE_RUN_DIR": os.fspath(self.run_dir),
+                "FAKE_CONSOLE_LOG": os.fspath(self.console),
+                "FAKE_TMUX_STATE": os.fspath(self.tmux_state),
+                "PATH": os.fspath(self.fake_bin)
+                + os.pathsep
+                + self.environment.get("PATH", "/usr/bin:/bin"),
+            }
+        )
+
+    def run_validator(
+        self, *arguments: str, timeout: float = 10.0
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "/bin/bash",
+                os.fspath(SHORTCUT_VALIDATOR),
+                "--desktop-file",
+                os.fspath(self.desktop),
+                "--session-name",
+                "test-mainline",
+                "--ready-timeout",
+                "5",
+                "--settle-seconds",
+                "1",
+                *arguments,
+            ],
+            env=self.environment,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def test_launches_desktop_file_via_gio_and_reports_ready(self) -> None:
+        result = self.run_validator("--profile", "trna")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("READY_FOR_PLAY", result.stdout)
+        self.assertIn("Matrix desktop shortcut launch is healthy", result.stdout)
+        self.assertEqual(
+            self.gio_log.read_text(encoding="utf-8").strip().split("\t"),
+            ["launch", os.fspath(self.desktop)],
+        )
+
+    def test_refuses_to_launch_while_known_recorder_is_active(self) -> None:
+        status = self.root / "record-status.json"
+        status.write_text(
+            '{"state":"RECORDING","episode":12,"recording_active":true}\n',
+            encoding="utf-8",
+        )
+        self.environment["MATRIX_BFM_ISAAC_RECORDER_STATUS_FILES"] = os.fspath(status)
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 75)
+        self.assertIn("known recorder is active", result.stderr)
+        self.assertFalse(self.gio_log.exists())
+
+    def test_fails_if_desktop_keyboard_still_forwards_escape(self) -> None:
+        self.environment["FAKE_KEYS_INCLUDE_ESCAPE"] = "1"
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("desktop_keyboard_still_forwards_escape", result.stderr)
+        self.assertTrue(self.gio_log.exists())
 
 
 class MatrixBfmIsaacDesktopInstallerTest(unittest.TestCase):

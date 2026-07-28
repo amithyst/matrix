@@ -118,6 +118,10 @@
         "sha256": "8300f2d5e866bb47eb6909e169ecfeab091b4ba4f46be9c061891aa9cafad589"
       },
       {
+        "path": "scripts/validate_matrix_bfm_isaac_desktop_shortcut.sh",
+        "sha256": "5afba10407d4102c92d6f8bc90aedbb4fe808a4851f98660569547b5a7a91b4e"
+      },
+      {
         "path": "scripts/run_matrix_bfm_visual_python.sh",
         "sha256": "0410bc266182019b81e2f120405beea3f4b0eddfca1ea77638a40b6edad15c3d"
       },
@@ -147,7 +151,7 @@
       },
       {
         "path": "scripts/verify_matrix_bfm_isaac_runtime.py",
-        "sha256": "8b23d7d80da59c02c5ef1067736442d62b473f7bafd2b4db1aec6f54864eee5b"
+        "sha256": "355855a4c1ed41861c259bd35b45968f5f1172f9ac7cacf1250d1571699e84f3"
       },
       {
         "path": "src/ue_shims/matrix_ue_material_fix.c",

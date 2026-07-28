@@ -283,6 +283,7 @@ def validate_schema(lock: dict[str, Any]) -> None:
         "scripts/run_matrix_bfm_isaac.sh",
         "scripts/run_matrix_bfm_isaac_guarded.sh",
         "scripts/matrix_external_state_relay.py",
+        "scripts/validate_matrix_bfm_isaac_desktop_shortcut.sh",
         "scripts/verify_matrix_bfm_isaac_runtime.py",
         "src/ue_shims/matrix_ue_material_fix.c",
     }
