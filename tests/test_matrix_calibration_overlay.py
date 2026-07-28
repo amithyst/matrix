@@ -2969,7 +2969,13 @@ class OverlayRenderCacheTest(unittest.TestCase):
             },
         }
 
-    def make_overlay(self):
+    def make_overlay(
+        self,
+        *,
+        modal_shield: bool = True,
+        pointer_recenter: bool = True,
+        keep_raised: bool = True,
+    ):
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
         overlay._x11 = mock.Mock()
         overlay._display = 1
@@ -2991,6 +2997,9 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay._pressed_action = None
         overlay._pressed_window = None
         overlay._pointer_recenter_count = 0
+        overlay._modal_shield = modal_shield
+        overlay._pointer_recenter = pointer_recenter
+        overlay._keep_raised = keep_raised
         overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
         overlay._last_rendered_font_size = None
         overlay._font_slider_dragging = False
@@ -3047,6 +3056,22 @@ class OverlayRenderCacheTest(unittest.TestCase):
         self.assertEqual(overlay._last_pointer, expected)
         self.assertEqual(overlay._pointer_recenter_count, 1)
 
+    def test_desktop_overlay_can_skip_shield_and_pointer_recenter(self) -> None:
+        overlay = self.make_overlay(modal_shield=False, pointer_recenter=False)
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        pointer = (100, 80)
+
+        overlay.show(geometry, pointer, self.state(), now_s=10.0)
+
+        overlay._x11.XWarpPointer.assert_not_called()
+        self.assertEqual(overlay._last_pointer, pointer)
+        self.assertEqual(overlay._pointer_recenter_count, 0)
+        shield = overlay._windows["shield"]
+        for call in overlay._x11.XMoveResizeWindow.call_args_list:
+            self.assertNotEqual(call.args[1], shield)
+        for call in overlay._x11.XMapRaised.call_args_list:
+            self.assertNotEqual(call.args[1], shield)
+
     def test_steady_30hz_frames_only_move_cursor_and_do_not_redraw(self) -> None:
         overlay = self.make_overlay()
         geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
@@ -3081,6 +3106,16 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay.show(geometry, (301, 302), changed, now_s=11.2)
         self.assertEqual(overlay._draw_panel.call_count, 2)
         self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
+
+    def test_desktop_overlay_can_avoid_periodic_top_raise(self) -> None:
+        overlay = self.make_overlay(keep_raised=False)
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        state = self.state()
+
+        overlay.show(geometry, (300, 300), state, now_s=10.0)
+        overlay.show(geometry, (300, 300), state, now_s=11.2)
+
+        overlay._x11.XRaiseWindow.assert_not_called()
 
     def test_local_font_change_invalidates_the_static_panel_render_key(self) -> None:
         overlay = self.make_overlay()

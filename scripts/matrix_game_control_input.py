@@ -251,6 +251,18 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
 
+def env_bool(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{name} must be a boolean")
+
+
 @dataclass(frozen=True)
 class KeyboardMouseSample:
     w: bool = False
@@ -1013,6 +1025,16 @@ class CalibrationModeController:
             return False
         self.active = False
         self.toggle_count += 1
+        return True
+
+    def exit_on_focus_loss(self, *, enabled: bool, ue_focused: bool) -> bool:
+        """Optionally leave the ESC interlock when the supervised UE loses focus."""
+
+        if not enabled or ue_focused or not self.active:
+            return False
+        self.active = False
+        self.toggle_count += 1
+        self._escape_was_down = False
         return True
 
 
@@ -6882,6 +6904,9 @@ class CalibrationOverlaySupervisor:
         expected_ue_pid: int,
         font_scale: float = 1.0,
         font_size: int | None = None,
+        modal_shield: bool = True,
+        pointer_recenter: bool = True,
+        keep_raised: bool = True,
         script: Path | None = None,
         python: str = sys.executable,
         startup_timeout_s: float = 3.0,
@@ -6893,6 +6918,9 @@ class CalibrationOverlaySupervisor:
         ui = UiSettings(font_scale=font_scale, font_size=font_size)
         self.font_scale = ui.font_scale
         self.font_size = ui.font_size
+        self.modal_shield = bool(modal_shield)
+        self.pointer_recenter = bool(pointer_recenter)
+        self.keep_raised = bool(keep_raised)
         self.script = script or Path(__file__).with_name(
             "matrix_calibration_overlay.py"
         )
@@ -6950,6 +6978,12 @@ class CalibrationOverlaySupervisor:
             "--font-size",
             str(self.font_size),
         ]
+        if not self.modal_shield:
+            command.append("--no-modal-shield")
+        if not self.pointer_recenter:
+            command.append("--no-pointer-recenter")
+        if not self.keep_raised:
+            command.append("--no-keep-raised")
         if self.display_name:
             command.extend(("--display", self.display_name))
         try:
@@ -7536,6 +7570,30 @@ def _parse_args() -> argparse.Namespace:
             "the focused UE/SDL window treats it as an engine exit key."
         ),
     )
+    parser.add_argument(
+        "--overlay-modal-shield",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("MATRIX_ESC_OVERLAY_MODAL_SHIELD", default=True),
+        help="Map the ESC overlay's transparent full-client input shield",
+    )
+    parser.add_argument(
+        "--overlay-pointer-recenter",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("MATRIX_ESC_OVERLAY_RECENTER_POINTER", default=True),
+        help="Warp the pointer back to the ESC overlay safe area at X11 boundaries",
+    )
+    parser.add_argument(
+        "--overlay-keep-raised",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("MATRIX_ESC_OVERLAY_KEEP_RAISED", default=True),
+        help="Periodically raise ESC overlay windows above other X11 clients",
+    )
+    parser.add_argument(
+        "--overlay-close-on-focus-loss",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("MATRIX_ESC_OVERLAY_CLOSE_ON_FOCUS_LOSS", default=False),
+        help="Close the ESC overlay when a non-UE window takes focus",
+    )
     return parser.parse_args()
 
 
@@ -7862,6 +7920,9 @@ def main() -> int:
             expected_ue_pid=args.expected_ue_pid,
             font_scale=ui_settings.desired.font_scale,
             font_size=ui_settings.desired.font_size,
+            modal_shield=args.overlay_modal_shield,
+            pointer_recenter=args.overlay_pointer_recenter,
+            keep_raised=args.overlay_keep_raised,
         )
     gamepad = LinuxJoystick(
         args.gamepad,
@@ -8220,7 +8281,13 @@ def main() -> int:
                 escape_pressed=panel_escape,
                 ue_focused=raw_keyboard.focused,
             )
-            if calibration_toggled or not calibration.active:
+            focus_loss_closed = calibration.exit_on_focus_loss(
+                enabled=args.overlay_close_on_focus_loss,
+                ue_focused=raw_keyboard.focused,
+            )
+            if focus_loss_closed:
+                apply_return.cancel_pending()
+            if calibration_toggled or focus_loss_closed or not calibration.active:
                 calibration_neutral_frames = 0
             if panel_was_active and not calibration.active:
                 command_state_changed = bool(

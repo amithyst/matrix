@@ -244,6 +244,10 @@ start_session() {
     if tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT" -- \
         /usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
         MATRIX_GAME_GRAB_ESCAPE=1 \
+        MATRIX_ESC_OVERLAY_MODAL_SHIELD=0 \
+        MATRIX_ESC_OVERLAY_RECENTER_POINTER=0 \
+        MATRIX_ESC_OVERLAY_KEEP_RAISED=0 \
+        MATRIX_ESC_OVERLAY_CLOSE_ON_FOCUS_LOSS=1 \
         /usr/bin/bash "$run_script" \
         "${runtime_args[@]}"; then
         sleep 0.20

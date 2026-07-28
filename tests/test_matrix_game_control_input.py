@@ -99,6 +99,43 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
             supervisor._action_socket = None
             supervisor.process = None
 
+    def test_overlay_supervisor_can_disable_desktop_modal_behaviors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                modal_shield=False,
+                pointer_recenter=False,
+                keep_raised=False,
+                script=script,
+                startup_timeout_s=0.1,
+            )
+
+            class ReadyProcess:
+                def poll(self):
+                    supervisor.ready_file.write_text(
+                        json.dumps({"ready": True}), encoding="utf-8"
+                    )
+                    return None
+
+            with mock.patch.object(
+                MODULE.subprocess, "Popen", return_value=ReadyProcess()
+            ) as popen:
+                supervisor.start()
+
+            command = popen.call_args.args[0]
+            self.assertIn("--no-modal-shield", command)
+            self.assertIn("--no-pointer-recenter", command)
+            self.assertIn("--no-keep-raised", command)
+            assert supervisor._action_socket is not None
+            supervisor._action_socket.close()
+            supervisor._action_socket = None
+            supervisor.process = None
+
     def test_private_action_socket_drains_ordered_validated_intents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4984,6 +5021,19 @@ class CalibrationModeTest(unittest.TestCase):
         controller = MODULE.CalibrationModeController()
         self.assertFalse(controller.update(escape_pressed=True, ue_focused=False))
         self.assertFalse(controller.active)
+
+    def test_focus_loss_exit_is_opt_in_for_desktop_overlay(self) -> None:
+        controller = MODULE.CalibrationModeController()
+        self.assertTrue(controller.update(escape_pressed=True, ue_focused=True))
+        self.assertFalse(
+            controller.exit_on_focus_loss(enabled=False, ue_focused=False)
+        )
+        self.assertTrue(controller.active)
+        self.assertTrue(
+            controller.exit_on_focus_loss(enabled=True, ue_focused=False)
+        )
+        self.assertFalse(controller.active)
+        self.assertEqual(controller.toggle_count, 2)
 
     def test_ui_and_escape_exit_frames_drop_release_delta_and_require_rearm(self) -> None:
         for exit_kind in ("ui", "escape"):
