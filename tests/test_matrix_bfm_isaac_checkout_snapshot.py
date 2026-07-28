@@ -441,6 +441,7 @@ set -euo pipefail
             scripts / "matrix_local_env.sh",
             """#!/usr/bin/env bash
 load_matrix_local_env() { return 0; }
+matrix_bfm_isaac_enforce_desktop_sim_only() { return 0; }
 """,
         )
         self.write(

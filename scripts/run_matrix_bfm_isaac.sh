@@ -145,6 +145,9 @@ if [[ -n "$PROFILE" ]]; then
     # shellcheck disable=SC1090
     source "$PROFILE_FILE"
 fi
+if ! matrix_bfm_isaac_enforce_desktop_sim_only "$PROFILE"; then
+    exit 2
+fi
 if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
     echo "[ERROR] Qualified BFM/Isaac rejects MATRIX_UE_EXTRA_EXEC_CMDS" >&2
     echo "[ERROR] Use only the bounded MATRIX_BFM_ISAAC_* video overrides" >&2
@@ -800,15 +803,21 @@ setsid "$RUNTIME_PYTHON" "$RUNTIME_ROOT/scripts/run_g1_teacher_closed_loop.py" \
 PHYSICS_PID=$!
 register_owned_group "$PHYSICS_PID" physics
 if [[ "$MODE" == "interactive" ]]; then
-    setsid python3 -u "$SCRIPT_DIR/matrix_bfm_isaac_keyboard.py" \
-        --socket "$KEYBOARD_SOCKET" \
-        --display "${DISPLAY:-:0}" \
-        --xauthority "${XAUTHORITY:-/run/user/${UID}/gdm/Xauthority}" \
+    KEYBOARD_ARGS=(
+        --socket "$KEYBOARD_SOCKET"
+        --display "${DISPLAY:-:0}"
+        --xauthority "${XAUTHORITY:-/run/user/${UID}/gdm/Xauthority}"
         --allowed-process-root \
-            "$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux" \
-        --camera-look-backend "${MATRIX_CAMERA_ARROW_BACKEND:-xtest}" \
+            "$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux"
+        --camera-look-backend "${MATRIX_CAMERA_ARROW_BACKEND:-xtest}"
         --camera-look-pixels-per-second \
-            "${MATRIX_CAMERA_ARROW_PIXELS_PER_SECOND:-600}" \
+            "${MATRIX_CAMERA_ARROW_PIXELS_PER_SECOND:-600}"
+    )
+    if [[ "${MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT:-1}" == "0" ]]; then
+        KEYBOARD_ARGS+=(--ignore-escape)
+    fi
+    setsid python3 -u "$SCRIPT_DIR/matrix_bfm_isaac_keyboard.py" \
+        "${KEYBOARD_ARGS[@]}" \
         > "$RUN_DIR/keyboard.log" 2>&1 &
     KEYBOARD_PID=$!
     register_owned_group "$KEYBOARD_PID" keyboard

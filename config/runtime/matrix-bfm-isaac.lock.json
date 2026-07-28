@@ -11,7 +11,7 @@
       },
       {
         "path": "config/hosts/trna.env",
-        "sha256": "c6e45bedcbec14081b2f43f5d0c2e33e77bb246dbd886601012d626c5c5fbd57"
+        "sha256": "202bc19f218cbe5cb068475e2bffacf41f6bcf1ed2f5da241bee9c0167ec189b"
       },
       {
         "path": "config/hosts/zza.env",
@@ -46,6 +46,10 @@
         "sha256": "a83577e139987de4d498926903002b4154cd46dbeef0e1618bad29917f3c76c5"
       },
       {
+        "path": "scripts/launch_matrix_bfm_isaac_desktop.sh",
+        "sha256": "eed3bbf3c5fa5a87f85e4ccd1501a8cdad14a693cedd12390fb87d9fa25885cb"
+      },
+      {
         "path": "scripts/launch_matrix_sonic_desktop.sh",
         "sha256": "01abb125958fde5e1415392aba37c913a62372c912e3d267e0b11b5e8d6085b3"
       },
@@ -63,7 +67,7 @@
       },
       {
         "path": "scripts/matrix_bfm_isaac_keyboard.py",
-        "sha256": "817828357db1ef7bc513e469183a3f132fcafed09692e3d337d127a7a770ba97"
+        "sha256": "83f2871e208f8987e98d1f9ddb8e506cfd3075c7e67905b58bc9c1ebfdfc46d3"
       },
       {
         "path": "scripts/matrix_bfm_isaac_path_guard.py",
@@ -83,7 +87,7 @@
       },
       {
         "path": "scripts/matrix_local_env.sh",
-        "sha256": "a63cbac9e707372f3947eb6ab721289aff4fa217175931daec0e3f6e7c1bae6e"
+        "sha256": "cb7e10ce30adcaba43f863217e9351dc3388ad8eac1a507cf6b81d3e8b450b1f"
       },
       {
         "path": "scripts/matrix_spawn_clearance.py",
@@ -99,11 +103,11 @@
       },
       {
         "path": "scripts/run_matrix_bfm_isaac.sh",
-        "sha256": "e1d72185c93f5f986ff3a252efd0f6ff06c01586f7efdf997267101d03c0e984"
+        "sha256": "469f2dbd9f331797a0752c24e90c82e26e9bf15da6c15a15e78202061e26f167"
       },
       {
         "path": "scripts/run_matrix_bfm_isaac_guarded.sh",
-        "sha256": "9e8639614e2bc1741067c7a94925566815a6f927a943b0444ebde6e855ee327b"
+        "sha256": "27e2851829c4206d190a7b367f3d31f4ca4beae09d226c0338aafbce74b264be"
       },
       {
         "path": "scripts/run_matrix_bfm_isaac_renderer_isolated.sh",
@@ -143,7 +147,7 @@
       },
       {
         "path": "scripts/verify_matrix_bfm_isaac_runtime.py",
-        "sha256": "98cdec63e55f192b6fafdbee1c5f282ca899bbbce1b930ade7504ac70742337f"
+        "sha256": "8b23d7d80da59c02c5ef1067736442d62b473f7bafd2b4db1aec6f54864eee5b"
       },
       {
         "path": "src/ue_shims/matrix_ue_material_fix.c",

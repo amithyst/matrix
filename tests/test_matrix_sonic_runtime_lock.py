@@ -589,6 +589,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         profile = REPO_ROOT / "config/hosts/trna.env"
         profile_text = profile.read_text(encoding="utf-8")
         expected_profile_defaults = (
+            'MATRIX_PICO_INPUT_ENABLED:-0',
             'MATRIX_SONIC_CONTROL_SOURCE:-game',
             'MATRIX_GAME_INPUT_SOURCE:-auto',
             'MATRIX_INITIAL_LOCOMOTION_POLICY:-bfm-sonic-teacher50k',
@@ -645,6 +646,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         )
 
         names = (
+            "MATRIX_PICO_INPUT_ENABLED",
             "MATRIX_SONIC_CONTROL_SOURCE",
             "MATRIX_GAME_INPUT_SOURCE",
             "MATRIX_INITIAL_LOCOMOTION_POLICY",
@@ -686,6 +688,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertEqual(
             load_profile({}),
             [
+                "0",
                 "game",
                 "auto",
                 "bfm-sonic-teacher50k",
@@ -702,6 +705,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             ],
         )
         overrides = {
+            "MATRIX_PICO_INPUT_ENABLED": "1",
             "MATRIX_SONIC_CONTROL_SOURCE": "planner",
             "MATRIX_GAME_INPUT_SOURCE": "keyboard",
             "MATRIX_INITIAL_LOCOMOTION_POLICY": "sonic",

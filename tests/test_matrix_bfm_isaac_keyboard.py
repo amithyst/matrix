@@ -32,6 +32,7 @@ class MatrixBfmIsaacKeyboardTest(unittest.TestCase):
         )
         self.assertEqual(defaults.camera_look_backend, "xtest")
         self.assertEqual(defaults.camera_look_pixels_per_second, 600.0)
+        self.assertFalse(defaults.ignore_escape)
 
         disabled = MODULE._parser().parse_args(
             [
@@ -47,6 +48,17 @@ class MatrixBfmIsaacKeyboardTest(unittest.TestCase):
         )
         self.assertEqual(disabled.camera_look_backend, "off")
         self.assertEqual(disabled.camera_look_pixels_per_second, 720.5)
+
+        no_escape = MODULE._parser().parse_args(
+            [
+                "--socket",
+                "/tmp/keyboard.sock",
+                "--allowed-process-root",
+                "/opt/matrix",
+                "--ignore-escape",
+            ]
+        )
+        self.assertTrue(no_escape.ignore_escape)
 
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             MODULE._parser().parse_args(
@@ -65,6 +77,7 @@ class MatrixBfmIsaacKeyboardTest(unittest.TestCase):
             (
                 "keycode  25 = w W w W",
                 "keycode  50 = Shift_L NoSymbol Shift_L",
+                "keycode   9 = Escape NoSymbol Escape",
                 "keycode 113 = Left NoSymbol Left",
                 "keycode 114 = Right NoSymbol Right",
                 "keycode 111 = Up NoSymbol Up",
@@ -78,6 +91,7 @@ class MatrixBfmIsaacKeyboardTest(unittest.TestCase):
             {
                 25: "W",
                 50: "LEFT_SHIFT",
+                9: "ESCAPE",
                 113: "LEFT",
                 114: "RIGHT",
                 111: "UP",
@@ -88,6 +102,18 @@ class MatrixBfmIsaacKeyboardTest(unittest.TestCase):
             MODULE.ARROW_KEYS,
             frozenset(("LEFT", "RIGHT", "UP", "DOWN")),
         )
+
+    def test_xmodmap_can_filter_desktop_escape_exit(self) -> None:
+        mapping = MODULE.parse_xmodmap(
+            (
+                "keycode   9 = Escape NoSymbol Escape",
+                "keycode  25 = w W w W",
+                "keycode  65 = space NoSymbol space",
+            ),
+            include_escape=False,
+        )
+
+        self.assertEqual(mapping, {25: "W", 65: "SPACE"})
 
     def test_raw_event_parser_pairs_press_and_release_with_detail(self) -> None:
         events = tuple(

@@ -42,6 +42,9 @@ if [[ -n "$PROFILE" ]]; then
     # shellcheck disable=SC1090
     source "$PROFILE_FILE"
 fi
+if ! matrix_bfm_isaac_enforce_desktop_sim_only "$PROFILE"; then
+    exit 2
+fi
 
 # Share the host-wide Matrix lock with the native SONIC launcher and desktop
 # entry point.  The renderer runs in a private network namespace, so UDP 9999

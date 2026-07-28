@@ -159,7 +159,9 @@ class XTestCameraDrag:
             self._pressed = False
 
 
-def parse_xmodmap(lines: Iterable[str]) -> dict[int, str]:
+def parse_xmodmap(
+    lines: Iterable[str], *, include_escape: bool = True
+) -> dict[int, str]:
     mapping: dict[int, str] = {}
     pattern = re.compile(r"^keycode\s+(\d+)\s+=\s+(\S+)")
     for line in lines:
@@ -168,6 +170,8 @@ def parse_xmodmap(lines: Iterable[str]) -> dict[int, str]:
             continue
         key = KEY_SYMBOLS.get(match.group(2))
         if key is not None:
+            if key == "ESCAPE" and not include_escape:
+                continue
             mapping[int(match.group(1))] = key
     return mapping
 
@@ -269,6 +273,7 @@ def run_bridge(
     wait_s: float,
     camera_look_backend: str,
     camera_look_pixels_per_second: float,
+    forward_escape: bool,
 ) -> int:
     if camera_look_backend not in ("off", "xtest"):
         raise ValueError("camera look backend must be off or xtest")
@@ -289,7 +294,9 @@ def run_bridge(
         text=True,
         timeout=10,
     )
-    keymap = parse_xmodmap(keymap_result.stdout.splitlines())
+    keymap = parse_xmodmap(
+        keymap_result.stdout.splitlines(), include_escape=forward_escape
+    )
     if not keymap:
         raise RuntimeError("X keymap contains no supported BFM controls")
 
@@ -460,6 +467,11 @@ def _parser() -> argparse.ArgumentParser:
         "--camera-look-backend", choices=("off", "xtest"), default="xtest"
     )
     parser.add_argument("--camera-look-pixels-per-second", type=float, default=600.0)
+    parser.add_argument(
+        "--ignore-escape",
+        action="store_true",
+        help="Do not forward physical Escape key events to the BFM runtime.",
+    )
     return parser
 
 
@@ -476,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
         wait_s=args.wait,
         camera_look_backend=args.camera_look_backend,
         camera_look_pixels_per_second=args.camera_look_pixels_per_second,
+        forward_escape=not args.ignore_escape,
     )
 
 

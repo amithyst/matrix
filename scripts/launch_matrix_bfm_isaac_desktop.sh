@@ -285,9 +285,27 @@ start_session() {
         -u MATRIX_BFM_ISAAC_VIDEO_QUALITY
         -u MATRIX_BFM_ISAAC_VIDEO_CAMERA_SMOOTHING
         -u MATRIX_BFM_ISAAC_SCREEN_PERCENTAGE
+        -u MATRIX_PICO_PYTHON
+        -u MATRIX_PICO_WHEEL
+        -u FASTRTPS_DEFAULT_PROFILES_FILE
+        -u CYCLONEDDS_URI
+        -u RMW_IMPLEMENTATION
+        -u ROS_DOMAIN_ID
+        -u ROS_LOCALHOST_ONLY
+        -u XR_RUNTIME_JSON
+        -u XR_API_LAYER_PATH
         "DISPLAY=$display_value"
         "XAUTHORITY=$xauthority_value"
         "MATRIX_INSTANCE_ID=$INSTANCE_ID"
+        "MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY=1"
+        "MATRIX_PICO_INPUT_ENABLED=0"
+        "MATRIX_EXTERNAL_STATE=1"
+        "MATRIX_DISABLE_MC=1"
+        "MATRIX_SONIC=0"
+        "MATRIX_SONIC_CONTROL_SOURCE=external"
+        "MATRIX_GAME_INPUT_SOURCE=keyboard"
+        "MATRIX_GAME_NO_INPUT_PROVIDER=1"
+        "MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT=0"
         /usr/bin/bash "$run_script" interactive
         --profile "$PROFILE"
         --onscreen

@@ -19,6 +19,8 @@ INSTALLER = (
 )
 TEMPLATE = REPO_ROOT / "packaging" / "matrix-bfm-isaac-mainline.desktop.in"
 COMMAND_TOOL = REPO_ROOT / "scripts" / "matrix_bfm_isaac_command.py"
+LOCAL_ENV_LOADER = REPO_ROOT / "scripts" / "matrix_local_env.sh"
+LOCAL_ENV_UPDATER = REPO_ROOT / "scripts" / "update_matrix_local_env.py"
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -108,10 +110,32 @@ sleep "${FAKE_RUN_DELAY:-0}"
 {
     printf 'ARGV'
     for value in "$@"; do printf '\t%s' "$value"; done
-    printf '\nENV\t%s\t%s\t%s\n' \
-        "${MATRIX_INSTANCE_ID:-}" \
-        "${MATRIX_UE_EXTRA_EXEC_CMDS-unset}" \
-        "${MATRIX_BFM_ISAAC_VIDEO_QUALITY-unset}"
+    printf '\nENV'
+    for variable_name in \
+        MATRIX_INSTANCE_ID \
+        MATRIX_UE_EXTRA_EXEC_CMDS \
+        MATRIX_BFM_ISAAC_VIDEO_QUALITY \
+        MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY \
+        MATRIX_PICO_INPUT_ENABLED \
+        MATRIX_EXTERNAL_STATE \
+        MATRIX_DISABLE_MC \
+        MATRIX_SONIC \
+        MATRIX_SONIC_CONTROL_SOURCE \
+        MATRIX_GAME_INPUT_SOURCE \
+        MATRIX_GAME_NO_INPUT_PROVIDER \
+        MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT \
+        MATRIX_PICO_PYTHON \
+        MATRIX_PICO_WHEEL \
+        FASTRTPS_DEFAULT_PROFILES_FILE \
+        CYCLONEDDS_URI \
+        RMW_IMPLEMENTATION \
+        ROS_DOMAIN_ID \
+        ROS_LOCALHOST_ONLY \
+        XR_RUNTIME_JSON \
+        XR_API_LAYER_PATH; do
+        printf '\t%s=%s' "$variable_name" "${!variable_name-unset}"
+    done
+    printf '\n'
 } >> "${FAKE_RUN_LOG:?}"
 """,
         )
@@ -206,6 +230,24 @@ esac
                 ),
                 "MATRIX_UE_EXTRA_EXEC_CMDS": "unsafe",
                 "MATRIX_BFM_ISAAC_VIDEO_QUALITY": "epic",
+                "MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY": "0",
+                "MATRIX_PICO_INPUT_ENABLED": "1",
+                "MATRIX_EXTERNAL_STATE": "0",
+                "MATRIX_DISABLE_MC": "0",
+                "MATRIX_SONIC": "1",
+                "MATRIX_SONIC_CONTROL_SOURCE": "pico",
+                "MATRIX_GAME_INPUT_SOURCE": "auto",
+                "MATRIX_GAME_NO_INPUT_PROVIDER": "0",
+                "MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT": "1",
+                "MATRIX_PICO_PYTHON": "/poison/pico/python",
+                "MATRIX_PICO_WHEEL": "/poison/pico.whl",
+                "FASTRTPS_DEFAULT_PROFILES_FILE": "/poison/fastdds.xml",
+                "CYCLONEDDS_URI": "file:///poison/cyclonedds.xml",
+                "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp",
+                "ROS_DOMAIN_ID": "42",
+                "ROS_LOCALHOST_ONLY": "1",
+                "XR_RUNTIME_JSON": "/poison/openxr.json",
+                "XR_API_LAYER_PATH": "/poison/openxr-layers",
                 "PATH": os.fspath(self.fake_bin)
                 + os.pathsep
                 + self.environment.get("PATH", "/usr/bin:/bin"),
@@ -243,7 +285,30 @@ esac
         ])
         self.assertEqual(calls[0][8], "--run-dir")
         self.assertIn("desktop_", calls[0][9])
-        self.assertEqual(calls[1], ["ENV", "test-mainline", "unset", "unset"])
+        self.assertEqual(calls[1], [
+            "ENV",
+            "MATRIX_INSTANCE_ID=test-mainline",
+            "MATRIX_UE_EXTRA_EXEC_CMDS=unset",
+            "MATRIX_BFM_ISAAC_VIDEO_QUALITY=unset",
+            "MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY=1",
+            "MATRIX_PICO_INPUT_ENABLED=0",
+            "MATRIX_EXTERNAL_STATE=1",
+            "MATRIX_DISABLE_MC=1",
+            "MATRIX_SONIC=0",
+            "MATRIX_SONIC_CONTROL_SOURCE=external",
+            "MATRIX_GAME_INPUT_SOURCE=keyboard",
+            "MATRIX_GAME_NO_INPUT_PROVIDER=1",
+            "MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT=0",
+            "MATRIX_PICO_PYTHON=unset",
+            "MATRIX_PICO_WHEEL=unset",
+            "FASTRTPS_DEFAULT_PROFILES_FILE=unset",
+            "CYCLONEDDS_URI=unset",
+            "RMW_IMPLEMENTATION=unset",
+            "ROS_DOMAIN_ID=unset",
+            "ROS_LOCALHOST_ONLY=unset",
+            "XR_RUNTIME_JSON=unset",
+            "XR_API_LAYER_PATH=unset",
+        ])
         tmux_calls = parse_call_log(self.tmux_log)
         self.assertEqual(
             sum(call[0] == "new-session" for call in tmux_calls), 1
@@ -252,6 +317,17 @@ esac
         self.assertIn("already running", second.stdout)
         log = self.root / "launcher-log" / "mainline-desktop-launcher.log"
         self.assertIn("START ok", log.read_text(encoding="utf-8"))
+
+    def test_desktop_escape_filter_keeps_finalizer_escape_available(self) -> None:
+        launcher = LAUNCHER.read_text(encoding="utf-8")
+        runner = (REPO_ROOT / "scripts" / "run_matrix_bfm_isaac.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT=0", launcher)
+        self.assertIn("MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT:-1", runner)
+        self.assertIn("KEYBOARD_ARGS+=(--ignore-escape)", runner)
+        self.assertIn('--socket "$keyboard_socket" --key SPACE --key ESCAPE', launcher)
 
     def test_status_and_graceful_stop_remove_session(self) -> None:
         started = self.run_launcher("start")
@@ -331,6 +407,114 @@ esac
         self.assertEqual(duration.returncode, 2)
         self.assertEqual(unknown.returncode, 2)
         self.assertFalse(self.tmux_log.exists())
+
+
+class MatrixBfmIsaacDesktopEnvironmentTest(unittest.TestCase):
+    def test_sim_only_gate_scrubs_local_pico_dds_and_xr_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copy2(LOCAL_ENV_UPDATER, scripts / LOCAL_ENV_UPDATER.name)
+            local_env = root / ".matrix" / "local.env"
+            local_env.parent.mkdir()
+            local_env.write_text(
+                "MATRIX_PICO_PYTHON=/local/pico/python\n"
+                "MATRIX_PICO_WHEEL=/local/pico.whl\n",
+                encoding="utf-8",
+            )
+            command = r'''
+set -euo pipefail
+source "$1"
+load_matrix_local_env "$2"
+export MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY=1
+export MATRIX_PICO_INPUT_ENABLED=0
+export MATRIX_EXTERNAL_STATE=1
+export MATRIX_DISABLE_MC=1
+export MATRIX_SONIC=0
+export MATRIX_SONIC_CONTROL_SOURCE=external
+export MATRIX_GAME_INPUT_SOURCE=keyboard
+export MATRIX_GAME_NO_INPUT_PROVIDER=1
+matrix_bfm_isaac_enforce_desktop_sim_only trna
+printf '%s\0' \
+    "${MATRIX_PICO_INPUT_ENABLED-unset}" \
+    "${MATRIX_PICO_PYTHON-unset}" \
+    "${MATRIX_PICO_WHEEL-unset}" \
+    "${FASTRTPS_DEFAULT_PROFILES_FILE-unset}" \
+    "${CYCLONEDDS_URI-unset}" \
+    "${RMW_IMPLEMENTATION-unset}" \
+    "${ROS_DOMAIN_ID-unset}" \
+    "${ROS_LOCALHOST_ONLY-unset}" \
+    "${XR_RUNTIME_JSON-unset}" \
+    "${XR_API_LAYER_PATH-unset}"
+'''
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "FASTRTPS_DEFAULT_PROFILES_FILE": "/poison/fastdds.xml",
+                    "CYCLONEDDS_URI": "file:///poison/cyclonedds.xml",
+                    "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp",
+                    "ROS_DOMAIN_ID": "42",
+                    "ROS_LOCALHOST_ONLY": "1",
+                    "XR_RUNTIME_JSON": "/poison/openxr.json",
+                    "XR_API_LAYER_PATH": "/poison/openxr-layers",
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    command,
+                    "bash",
+                    os.fspath(LOCAL_ENV_LOADER),
+                    os.fspath(root),
+                ],
+                env=environment,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(
+                result.stdout.removesuffix(b"\0").split(b"\0"),
+                [b"0", *([b"unset"] * 9)],
+            )
+
+    def test_sim_only_gate_rejects_topology_poison_before_launch(self) -> None:
+        command = r'''
+set -euo pipefail
+source "$1"
+export MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY=1
+export MATRIX_PICO_INPUT_ENABLED=0
+export MATRIX_EXTERNAL_STATE=1
+export MATRIX_DISABLE_MC=1
+export MATRIX_SONIC=1
+export MATRIX_SONIC_CONTROL_SOURCE=external
+export MATRIX_GAME_INPUT_SOURCE=keyboard
+export MATRIX_GAME_NO_INPUT_PROVIDER=1
+matrix_bfm_isaac_enforce_desktop_sim_only trna
+printf 'unreachable\n'
+'''
+        result = subprocess.run(
+            ["bash", "-c", command, "bash", os.fspath(LOCAL_ENV_LOADER)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn("unreachable", result.stdout)
+        self.assertIn(
+            "Desktop sim-only topology rejected MATRIX_SONIC=1",
+            result.stderr,
+        )
+
+    def test_sim_only_gate_is_scoped_away_from_legacy_native_launcher(self) -> None:
+        legacy = (REPO_ROOT / "scripts" / "run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "matrix_bfm_isaac_enforce_desktop_sim_only",
+            legacy,
+        )
 
 
 class MatrixBfmIsaacDesktopInstallerTest(unittest.TestCase):
