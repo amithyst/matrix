@@ -1019,6 +1019,39 @@ class RecoveryFsmTests(unittest.TestCase):
 
 
 class ResidentRecoveryFsmTests(unittest.TestCase):
+    def test_stable_policy_handoff_enters_writer_fenced_pipeline_without_fall(self):
+        machine = recovery.ResidentPolicyRecoveryFSM(
+            recovery_policy_id="amp-flat-v3"
+        )
+        initial = resident_sample(0.0)
+        machine.step(initial)
+
+        output = machine.begin_stable_policy_handoff(
+            replace(initial, now_s=2.0)
+        )
+
+        self.assertTrue(output.request_sonic_pause)
+        self.assertFalse(output.fail_closed)
+        self.assertEqual(
+            output.state,
+            recovery.ResidentRecoveryState.SONIC_PAUSE_REQUESTED,
+        )
+        self.assertEqual(machine.recovery_policy_id, "amp-flat-v3")
+        self.assertFalse(machine._fall_latched)
+        self.assertEqual(machine._episode_started_s, 2.0)
+
+    def test_stable_policy_handoff_rejects_a_fallen_start(self):
+        machine = recovery.ResidentPolicyRecoveryFSM(
+            recovery_policy_id="amp-flat-v3"
+        )
+        initial = resident_sample(0.0)
+        machine.step(initial)
+
+        with self.assertRaisesRegex(ValueError, "cannot start from a fall"):
+            machine.begin_stable_policy_handoff(
+                replace(initial, now_s=1.0, fall_detected=True)
+            )
+
     def test_recovery_policy_slot_changes_only_while_sonic_owns_control(self):
         machine = recovery.ResidentPolicyRecoveryFSM(
             recovery_policy_id="kungfu"
@@ -1225,6 +1258,168 @@ class ResidentRecoveryFsmTests(unittest.TestCase):
             recovery.ResidentRecoveryState.SONIC_PAUSE_REQUESTED,
         )
         self.assertEqual(machine._episode_started_s, 2.5)
+
+    def test_refall_before_sonic_first_write_restarts_recovery_cycle(self):
+        machine = recovery.ResidentPolicyRecoveryFSM()
+        machine.step(resident_sample(0.0))
+        machine._baseline_reset_count = 0
+        machine._episode_started_s = 1.0
+        machine._sonic_generation = 11
+        machine._state_entered_s = 2.0
+        machine.state = recovery.ResidentRecoveryState.SONIC_RESUME_REQUESTED
+
+        out = machine.step(
+            resident_sample(
+                2.1,
+                fall_detected=True,
+                sonic_writer_active=False,
+                sonic_writer_paused=True,
+                sonic_resume_first_write=False,
+            )
+        )
+
+        self.assertTrue(out.request_sonic_pause)
+        self.assertFalse(out.fail_closed)
+        self.assertEqual(
+            out.state,
+            recovery.ResidentRecoveryState.SONIC_PAUSE_REQUESTED,
+        )
+        self.assertEqual(machine._episode_started_s, 2.1)
+
+    def test_instability_before_policy_pause_keeps_recovery_writer_active(self):
+        machine = recovery.ResidentPolicyRecoveryFSM()
+        machine.step(resident_sample(0.0))
+        machine._baseline_reset_count = 0
+        machine._episode_started_s = 1.0
+        machine._sonic_generation = 11
+        machine._state_entered_s = 2.0
+        machine._stable_since_s = 1.5
+        machine.state = recovery.ResidentRecoveryState.POLICY_PAUSE_REQUESTED
+
+        out = machine.step(
+            resident_sample(
+                2.1,
+                fall_detected=True,
+                sonic_writer_active=False,
+                sonic_writer_paused=True,
+                sonic_resume_first_write=False,
+                policy_writer_active=True,
+                policy_writer_paused=False,
+                policy_first_write=True,
+            )
+        )
+
+        self.assertFalse(out.request_policy_pause)
+        self.assertFalse(out.fail_closed)
+        self.assertEqual(
+            out.state,
+            recovery.ResidentRecoveryState.POLICY_RECOVERING,
+        )
+
+    def test_amp_flat_v3_uses_linear_capture_gate_then_strict_hold(self):
+        machine = recovery.ResidentPolicyRecoveryFSM(
+            recovery.RecoveryConfig(use_amp_hold=True),
+            recovery_policy_id="amp-flat-v3",
+        )
+        machine._baseline_reset_count = 0
+        machine._episode_started_s = 0.0
+        machine._sonic_generation = 11
+        machine._state_entered_s = 0.0
+        machine.state = recovery.ResidentRecoveryState.POLICY_RECOVERING
+        moving = resident_sample(
+            10.0,
+            sonic_writer_active=False,
+            sonic_writer_paused=True,
+            sonic_resume_first_write=False,
+            policy_writer_active=True,
+            policy_writer_paused=False,
+            policy_first_write=True,
+            root_linear_speed_m_s=0.75,
+            root_angular_speed_rad_s=0.95,
+            joint_velocity_rms_rad_s=0.95,
+        )
+
+        captured = machine.step(moving)
+        self.assertEqual(
+            captured.state, recovery.ResidentRecoveryState.POLICY_STABLE
+        )
+        self.assertEqual(
+            machine.last_policy_handoff_gate[
+                "linear_relaxation_fraction"
+            ],
+            1.0,
+        )
+        hold = machine.step(replace(moving, now_s=10.21))
+        self.assertTrue(hold.request_policy_hold)
+
+        first_hold = machine.step(
+            replace(
+                moving,
+                now_s=10.23,
+                policy_hold_first_write=True,
+            )
+        )
+        self.assertEqual(
+            first_hold.state, recovery.ResidentRecoveryState.POLICY_STABLE
+        )
+        self.assertFalse(first_hold.request_policy_pause)
+
+        stable = replace(
+            moving,
+            now_s=10.3,
+            policy_hold_first_write=True,
+            root_linear_speed_m_s=0.05,
+            root_angular_speed_rad_s=0.1,
+            joint_velocity_rms_rad_s=0.2,
+        )
+        machine.step(stable)
+        prepare = machine.step(
+            replace(
+                stable,
+                now_s=11.81,
+                locomotion_writer_prepared=False,
+            )
+        )
+        self.assertTrue(prepare.prepare_locomotion_writer)
+        self.assertFalse(prepare.request_policy_pause)
+        pause = machine.step(
+            replace(
+                stable,
+                now_s=11.82,
+                locomotion_writer_prepared=True,
+            )
+        )
+        self.assertTrue(pause.request_policy_pause)
+        self.assertEqual(
+            pause.state,
+            recovery.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+        )
+
+    def test_amp_flat_v3_linearly_relaxes_capture_pose_but_not_stable_pose(self):
+        machine = recovery.ResidentPolicyRecoveryFSM(
+            recovery.RecoveryConfig(use_amp_hold=True),
+            recovery_policy_id="amp-flat-v3",
+        )
+        machine._episode_started_s = 0.0
+        tilted = resident_sample(
+            5.0,
+            root_up_z=0.87,
+            root_linear_speed_m_s=0.20,
+        )
+
+        self.assertFalse(machine._policy_handoff_ready(tilted))
+        self.assertAlmostEqual(
+            machine.last_policy_handoff_gate["root_up_z_min"],
+            0.90,
+        )
+        self.assertTrue(
+            machine._policy_handoff_ready(replace(tilted, now_s=10.0))
+        )
+        self.assertAlmostEqual(
+            machine.last_policy_handoff_gate["root_up_z_min"],
+            0.85,
+        )
+        self.assertFalse(machine._stable(replace(tilted, now_s=10.0)))
 
     def test_resident_sonic_generation_change_fails_closed(self):
         machine = recovery.ResidentPolicyRecoveryFSM()

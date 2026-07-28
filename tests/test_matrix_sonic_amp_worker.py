@@ -106,6 +106,42 @@ class PolicyCoreTests(unittest.TestCase):
         second_input = runner.inputs[1].reshape(4, 96)
         np.testing.assert_array_equal(second_input[-1, 67:96], clipped)
 
+    def test_physical_continuation_starts_at_measured_pose_and_tracks_applied_action(self):
+        config = worker.PolicyConfig.from_mapping(config_mapping())
+        runner = RecordingRunner([np.zeros(29), np.zeros(29), np.zeros(29)])
+        policy = worker.AmpPolicyCore(config, runner)
+        initial = snapshot()
+        policy.reset_history(initial)
+        policy.begin_physical_continuation(
+            initial,
+            now=10.0,
+            duration_s=0.4,
+        )
+
+        first = policy.infer(initial, now=10.0)
+        np.testing.assert_allclose(first.target_joint_pos, initial.joint_pos_rad)
+        self.assertEqual(policy.physical_continuation_alpha, 0.0)
+        expected_applied = np.clip(
+            (initial.joint_pos_rad - config.default_joint_pos)
+            / config.action_scale,
+            -config.action_clip,
+            config.action_clip,
+        )
+        np.testing.assert_allclose(policy.previous_raw_action, expected_applied)
+
+        midpoint_state = snapshot(0.2)
+        midpoint = policy.infer(midpoint_state, now=10.2)
+        np.testing.assert_allclose(
+            midpoint.target_joint_pos,
+            initial.joint_pos_rad * 0.5 + config.default_joint_pos * 0.5,
+            rtol=1.0e-6,
+        )
+        self.assertAlmostEqual(policy.physical_continuation_alpha, 0.5)
+
+        final = policy.infer(snapshot(0.4), now=10.4)
+        np.testing.assert_allclose(final.target_joint_pos, config.default_joint_pos)
+        self.assertEqual(policy.physical_continuation_alpha, 1.0)
+
     def test_identity_imu_projects_world_gravity_down(self):
         np.testing.assert_allclose(
             worker.projected_gravity_body((1.0, 0.0, 0.0, 0.0)),
@@ -115,6 +151,28 @@ class PolicyCoreTests(unittest.TestCase):
 
 
 class HandoffProtocolTests(unittest.TestCase):
+    def test_writer_can_be_prepared_without_write_authority(self):
+        publisher_calls = []
+        publisher = object()
+        state = worker.HandoffStateMachine(
+            lambda: publisher_calls.append("created") or publisher,
+            lambda _event, _fields: None,
+        )
+        state.announce_ready()
+
+        state.prepare_writer()
+        state.prepare_writer()
+
+        self.assertEqual(publisher_calls, ["created"])
+        self.assertIs(state.publisher, publisher)
+        self.assertEqual(state.state, worker.HandoffStateMachine.PAUSED)
+        self.assertFalse(state.first_write_reported)
+        with self.assertRaisesRegex(RuntimeError, "active publisher"):
+            state.record_successful_write()
+        state.command("GO")
+        self.assertEqual(publisher_calls, ["created"])
+        self.assertEqual(state.state, worker.HandoffStateMachine.ACTIVE)
+
     def test_go_is_only_transition_that_constructs_writer(self):
         publisher_calls = []
         events = []

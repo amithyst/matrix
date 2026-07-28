@@ -718,9 +718,9 @@ def _moon_ground_collision_contract(
         raise SpawnClearanceError(
             "MoonWorld continuous support geom must bind the named hfield asset"
         )
-    if (contype, conaffinity) != (0, 0):
+    if (contype, conaffinity) not in {(0, 0), (1, 1)}:
         raise SpawnClearanceError(
-            "MoonWorld observation hfield must remain non-colliding"
+            "MoonWorld continuous hfield collision mask is invalid"
         )
     pad_matches = [
         pad_id
@@ -784,7 +784,12 @@ def _moon_ground_collision_contract(
         tile_masks.add((tile_contype, tile_conaffinity))
 
     pad_mask = (pad_contype, pad_conaffinity)
-    if pad_mask == (1, 1) and (not tile_masks or tile_masks == {(0, 0)}):
+    support_mask = (contype, conaffinity)
+    if (
+        support_mask == (0, 0)
+        and pad_mask == (1, 1)
+        and (not tile_masks or tile_masks == {(0, 0)})
+    ):
         return {
             "phase": "spawn-pad",
             "active_ground_geom_ids": frozenset((pad_id,)),
@@ -792,18 +797,23 @@ def _moon_ground_collision_contract(
             "spawn_pad_geom_id": pad_id,
             "rolling_tile_geom_ids": tuple(tile_geom_ids),
         }
-    if pad_mask == (0, 0) and tile_geom_ids and tile_masks == {(1, 1)}:
+    if (
+        support_mask == (1, 1)
+        and pad_mask == (0, 0)
+        and tile_geom_ids
+        and tile_masks == {(0, 0)}
+    ):
         return {
-            "phase": "rolling-tiles",
-            "active_ground_geom_ids": frozenset(tile_geom_ids),
+            "phase": "rolling-heightfield",
+            "active_ground_geom_ids": frozenset((geom_id,)),
             "observation_hfield_geom_id": geom_id,
             "spawn_pad_geom_id": pad_id,
             "rolling_tile_geom_ids": tuple(tile_geom_ids),
         }
     raise SpawnClearanceError(
         "MoonWorld collision handoff must have exactly one active ground: "
-        f"observation_hfield={(contype, conaffinity)} "
-        f"rolling_tiles={sorted(tile_masks)} spawn_pad={pad_mask}"
+        f"continuous_hfield={support_mask} "
+        f"visual_tiles={sorted(tile_masks)} spawn_pad={pad_mask}"
     )
 
 
@@ -1083,10 +1093,7 @@ def audit_spawn_clearance(
                     if moon_spawn_gate
                     else None
                 ),
-                "foot_terrain_edge_allowed": bool(
-                    moon_ground is not None
-                    and moon_ground["phase"] == "rolling-tiles"
-                ),
+                "foot_terrain_edge_allowed": False,
                 "body_contact_allowed": not moon_spawn_gate,
             },
             "robot": {

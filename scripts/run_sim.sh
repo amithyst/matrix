@@ -1629,13 +1629,36 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
         && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
-        SONIC_SPAWN_ARGS=(
-            "--spawn-x=-94.7"
-            "--spawn-y=-65.6"
-            "--spawn-z=-5.251562023162842"
-            "--spawn-yaw=0"
+        MOON_SPAWN_OVERRIDE=(
+            "${MATRIX_MOON_SPAWN_X:-}"
+            "${MATRIX_MOON_SPAWN_Y:-}"
+            "${MATRIX_MOON_SPAWN_Z:-}"
+            "${MATRIX_MOON_SPAWN_YAW:-}"
         )
-        echo "[INFO] MoonWorld map-default spawn aligned to locked terrain height"
+        MOON_SPAWN_OVERRIDE_COUNT=0
+        for value in "${MOON_SPAWN_OVERRIDE[@]}"; do
+            [[ -n "$value" ]] && ((MOON_SPAWN_OVERRIDE_COUNT += 1))
+        done
+        if [[ "$MOON_SPAWN_OVERRIDE_COUNT" == "0" ]]; then
+            SONIC_SPAWN_ARGS=(
+                "--spawn-x=-94.7"
+                "--spawn-y=-65.6"
+                "--spawn-z=-5.251562023162842"
+                "--spawn-yaw=0"
+            )
+            echo "[INFO] MoonWorld map-default spawn aligned to locked terrain height"
+        elif [[ "$MOON_SPAWN_OVERRIDE_COUNT" == "4" ]]; then
+            SONIC_SPAWN_ARGS=(
+                "--spawn-x=${MATRIX_MOON_SPAWN_X}"
+                "--spawn-y=${MATRIX_MOON_SPAWN_Y}"
+                "--spawn-z=${MATRIX_MOON_SPAWN_Z}"
+                "--spawn-yaw=${MATRIX_MOON_SPAWN_YAW}"
+            )
+            echo "[INFO] MoonWorld explicit spawn aligned by caller"
+        else
+            echo "[ERROR] MATRIX_MOON_SPAWN_X/Y/Z/YAW are all-or-none" >&2
+            exit 2
+        fi
     fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then

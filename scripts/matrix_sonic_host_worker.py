@@ -34,6 +34,7 @@ import os
 import select
 import socket
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -85,6 +86,11 @@ JOINT_POSE_HOLD_CONTROLLER = "JOINT_POSE_HOLD"
 POLICY_SWITCH_BLEND_S = 0.4
 JOINT_HOLD_CAPTURE_MAX_AGE_S = 0.05
 JOINT_HOLD_LOWSTATE_TIMEOUT_S = 1.0
+# The supervisor intentionally proves a fresh-to-stale edge after SONIC PAUSE
+# before authorizing the resident writer. MuJoCo retains that last accepted PD
+# command during the writer-free fence, so its sample may predate AMP GO by the
+# several-second policy-prewarm handshake without being superseded.
+INITIAL_LOW_CMD_MAX_AGE_S = 10.0
 
 # HoST public policies omit waist roll/pitch and the four wrist pitch/yaw
 # joints.  These 23 indices preserve the Unitree G1/Matrix DDS order.
@@ -259,6 +265,179 @@ class PdWriteFrame:
             kd=vectors[2],
             controller=str(controller),
         )
+
+
+@dataclass(frozen=True)
+class LowCmdSnapshot:
+    """Complete authoritative 29D PD command observed before worker GO."""
+
+    joint_pos_rad: np.ndarray
+    joint_vel_rad_s: np.ndarray
+    feedforward_torque_nm: np.ndarray
+    kp: np.ndarray
+    kd: np.ndarray
+    received_monotonic: float
+
+    @classmethod
+    def validated(
+        cls,
+        *,
+        joint_pos_rad: Sequence[float],
+        joint_vel_rad_s: Sequence[float],
+        feedforward_torque_nm: Sequence[float],
+        kp: Sequence[float],
+        kd: Sequence[float],
+        received_monotonic: float,
+    ) -> "LowCmdSnapshot":
+        vectors = tuple(
+            _finite_vector(value, NUM_JOINTS, name)
+            for name, value in (
+                ("joint_pos_rad", joint_pos_rad),
+                ("joint_vel_rad_s", joint_vel_rad_s),
+                ("feedforward_torque_nm", feedforward_torque_nm),
+                ("kp", kp),
+                ("kd", kd),
+            )
+        )
+        received = float(received_monotonic)
+        if not math.isfinite(received):
+            raise ValueError("received_monotonic must be finite")
+        return cls(*vectors, received)
+
+    def sha256(self) -> str:
+        digest = hashlib.sha256()
+        for label, vector in (
+            ("q", self.joint_pos_rad),
+            ("dq", self.joint_vel_rad_s),
+            ("tau_ff", self.feedforward_torque_nm),
+            ("kp", self.kp),
+            ("kd", self.kd),
+        ):
+            digest.update(label.encode("ascii"))
+            digest.update(np.asarray(vector, dtype="<f4").tobytes())
+        return digest.hexdigest()
+
+
+class LatestLowCmd:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._command: LowCmdSnapshot | None = None
+
+    def set(self, command: LowCmdSnapshot) -> None:
+        with self._lock:
+            self._command = command
+
+    def get(self) -> LowCmdSnapshot | None:
+        with self._lock:
+            return self._command
+
+
+class ObservingUnitreeDdsRuntime(UnitreeDdsRuntime):
+    """Read LowCmd before GO without creating a second command writer."""
+
+    def __init__(
+        self,
+        *,
+        interface: str,
+        state_store: LatestLowState,
+        command_store: LatestLowCmd,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(
+            interface=interface,
+            state_store=state_store,
+            monotonic=monotonic,
+        )
+        channel = importlib.import_module("unitree_sdk2py.core.channel")
+        messages = importlib.import_module("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+        self._command_store = command_store
+        self._command_monotonic = monotonic
+        self._command_subscriber = channel.ChannelSubscriber(
+            "rt/lowcmd", messages.LowCmd_
+        )
+        self._command_subscriber.Init(self._on_low_cmd, 10)
+
+    def _on_low_cmd(self, message: Any) -> None:
+        try:
+            motors = message.motor_cmd
+            if len(motors) < NUM_JOINTS or any(
+                int(motors[index].mode) != 1 for index in range(NUM_JOINTS)
+            ):
+                return
+            command = LowCmdSnapshot.validated(
+                joint_pos_rad=[motors[index].q for index in range(NUM_JOINTS)],
+                joint_vel_rad_s=[motors[index].dq for index in range(NUM_JOINTS)],
+                feedforward_torque_nm=[
+                    motors[index].tau for index in range(NUM_JOINTS)
+                ],
+                kp=[motors[index].kp for index in range(NUM_JOINTS)],
+                kd=[motors[index].kd for index in range(NUM_JOINTS)],
+                received_monotonic=self._command_monotonic(),
+            )
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return
+        self._command_store.set(command)
+
+
+def torque_continuity_anchor(
+    *,
+    prior_command: LowCmdSnapshot,
+    state: LowStateSnapshot,
+    target_config: HostControlConfig | PolicyConfig,
+    now: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Express the observed PD torque through immutable target-policy gains."""
+
+    age_s = float(now) - prior_command.received_monotonic
+    if not math.isfinite(age_s) or age_s < 0.0 or age_s > INITIAL_LOW_CMD_MAX_AGE_S:
+        raise ValueError(
+            "observed LowCmd is stale at resident GO: "
+            f"age_s={age_s:.6f} max_s={INITIAL_LOW_CMD_MAX_AGE_S:.6f}"
+        )
+    current_q = np.asarray(state.joint_pos_rad, dtype=np.float32)
+    current_dq = np.asarray(state.joint_vel_rad_s, dtype=np.float32)
+    target_kp = np.asarray(target_config.kp, dtype=np.float32)
+    target_kd = np.asarray(target_config.kd, dtype=np.float32)
+    if target_kp.shape != (NUM_JOINTS,) or np.any(target_kp <= 0.0):
+        raise ValueError("target policy kp must be a positive 29D vector")
+    prior_torque = (
+        prior_command.kp * (prior_command.joint_pos_rad - current_q)
+        + prior_command.kd * (prior_command.joint_vel_rad_s - current_dq)
+        + prior_command.feedforward_torque_nm
+    ).astype(np.float32, copy=False)
+    target_q = (
+        current_q + (prior_torque + target_kd * current_dq) / target_kp
+    ).astype(np.float32, copy=False)
+    target_torque = (
+        target_kp * (target_q - current_q) - target_kd * current_dq
+    ).astype(np.float32, copy=False)
+    if not np.all(np.isfinite(target_q)) or not np.all(np.isfinite(target_torque)):
+        raise ValueError("torque-continuity anchor produced non-finite values")
+
+    prior_argmax = int(np.argmax(np.abs(prior_torque)))
+    target_argmax = int(np.argmax(np.abs(target_torque)))
+    delta = target_q - current_q
+    delta_argmax = int(np.argmax(np.abs(delta)))
+    joint_order = list(G1_29_JOINT_NAMES)
+    joint_order_sha256 = hashlib.sha256(
+        ("\n".join(joint_order) + "\n").encode("utf-8")
+    ).hexdigest()
+    return target_q, {
+        "go_anchor_source": "torque_equivalent_observed_lowcmd",
+        "go_lowcmd_age_ms": age_s * 1000.0,
+        "go_lowcmd_sha256": prior_command.sha256(),
+        "go_joint_order": joint_order,
+        "go_joint_order_sha256": joint_order_sha256,
+        "go_prior_torque_max_abs_nm": float(abs(prior_torque[prior_argmax])),
+        "go_prior_torque_argmax_index": prior_argmax,
+        "go_prior_torque_argmax_joint": joint_order[prior_argmax],
+        "go_target_torque_max_abs_nm": float(abs(target_torque[target_argmax])),
+        "go_target_torque_argmax_index": target_argmax,
+        "go_target_torque_argmax_joint": joint_order[target_argmax],
+        "go_anchor_delta_max_rad": float(abs(delta[delta_argmax])),
+        "go_anchor_delta_argmax_index": delta_argmax,
+        "go_anchor_delta_argmax_joint": joint_order[delta_argmax],
+    }
 
 
 class HostRunner(Protocol):
@@ -692,14 +871,19 @@ def build_resident_policy_registry(
                 start_episode_fn=lambda state, _now: (
                     amp_flat_v3_policy.reset_history(state)
                 ),
-                infer_target_fn=lambda state, _now: amp_flat_v3_policy.infer(
-                    state
+                infer_target_fn=lambda state, now: amp_flat_v3_policy.infer(
+                    state,
+                    now=now,
                 ).target_joint_pos,
                 status_fields_fn=lambda now, started: {
                     "policy_index": None,
                     "policy": "amp_flat_v3_m14000",
                     "policy_elapsed_s": now - started,
                     "command": [0.0, 0.0, 0.0],
+                    "physical_continuation_alpha": (
+                        amp_flat_v3_policy.physical_continuation_alpha
+                    ),
+                    "physical_continuation_seconds": POLICY_SWITCH_BLEND_S,
                 },
             )
         )
@@ -748,6 +932,7 @@ def run_worker(
     initial_controller: str = "host",
     resident_policies: Sequence[Mapping[str, Any]] = (),
     execution_provider: str = "cpu",
+    command_store: LatestLowCmd | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     if publish_hz < POLICY_HZ:
@@ -821,6 +1006,8 @@ def run_worker(
     last_successful_pd_write: PdWriteFrame | None = None
     kungfu_host_blend_origin: PdWriteFrame | None = None
     kungfu_host_first_write_pending = False
+    initial_handoff_first_write_fields: dict[str, Any] | None = None
+    initial_handoff_pd_write: PdWriteFrame | None = None
 
     def reset_episode_controller(state: LowStateSnapshot, start_now: float) -> None:
         nonlocal controller
@@ -836,6 +1023,8 @@ def run_worker(
         nonlocal resident_fallback_pending
         nonlocal last_successful_pd_write, kungfu_host_blend_origin
         nonlocal kungfu_host_first_write_pending
+        nonlocal initial_handoff_first_write_fields
+        nonlocal initial_handoff_pd_write
 
         controller = selected_policy.controller
         latest_target = None
@@ -860,12 +1049,37 @@ def run_worker(
         last_successful_pd_write = None
         kungfu_host_blend_origin = None
         kungfu_host_first_write_pending = False
+        initial_handoff_first_write_fields = None
+        initial_handoff_pd_write = None
         active_policy = policy_registry.for_controller(controller)
         if active_policy is None:
             raise RuntimeError(
                 f"initial resident controller is not registered: {controller!r}"
             )
         active_policy.start_episode(state, start_now)
+        if controller == AMP_FLAT_V3_GETUP_CONTROLLER:
+            assert amp_flat_v3_policy is not None
+            target_origin = None
+            if command_store is not None:
+                prior_command = command_store.get()
+                if prior_command is None:
+                    raise RuntimeError(
+                        "observed LowCmd unavailable at AMP flat-v3 resident GO"
+                    )
+                target_origin, initial_handoff_first_write_fields = (
+                    torque_continuity_anchor(
+                        prior_command=prior_command,
+                        state=state,
+                        target_config=amp_flat_v3_policy.config,
+                        now=start_now,
+                    )
+                )
+            amp_flat_v3_policy.begin_physical_continuation(
+                state,
+                now=start_now,
+                duration_s=POLICY_SWITCH_BLEND_S,
+                target_origin=target_origin,
+            )
         if controller == KUNGFU_GETUP_CONTROLLER:
             kungfu_started_monotonic = start_now
         elif controller in {
@@ -975,7 +1189,11 @@ def run_worker(
                             return 2
                         # Every model remains loaded. Only per-episode observation
                         # history and physical reference alignment are reset.
-                        reset_episode_controller(start_state, start_now)
+                        try:
+                            reset_episode_controller(start_state, start_now)
+                        except (RuntimeError, ValueError) as exc:
+                            send_event("ERROR", {"message": str(exc)})
+                            return 2
                     handoff.command(command)
                     if command == "GO" and go_time is None:
                         go_time = monotonic()
@@ -1192,6 +1410,8 @@ def run_worker(
                         HOST_GETUP_CONTROLLER,
                         KUNGFU_GETUP_CONTROLLER,
                         AMP_GETUP_CONTROLLER,
+                        AMP_FLAT_V3_GETUP_CONTROLLER,
+                        AMP_ZERO_COMMAND_HOLD_CONTROLLER,
                     }:
                         send_event(
                             "ERROR",
@@ -1210,6 +1430,23 @@ def run_worker(
                                 "message": (
                                     "ENTER_JOINT_HOLD cannot interrupt an "
                                     "unacknowledged policy switch"
+                                )
+                            },
+                        )
+                        continue
+                    hold_source = (
+                        initial_handoff_pd_write
+                        if controller == AMP_FLAT_V3_GETUP_CONTROLLER
+                        and initial_handoff_pd_write is not None
+                        else last_successful_pd_write
+                    )
+                    if hold_source is None or hold_source.controller != controller:
+                        send_event(
+                            "ERROR",
+                            {
+                                "message": (
+                                    "ENTER_JOINT_HOLD requires a successful "
+                                    "PD write from the active controller"
                                 )
                             },
                         )
@@ -1265,22 +1502,19 @@ def run_worker(
                             },
                         )
                         continue
-                    # Freeze the measured physical pose through the same DDS
-                    # publisher and the same joint PD gains.  This lets the
-                    # already-upright robot remain supported while replacement
-                    # SONIC finishes writer-free prewarming.
+                    # Reuse the exact accepted PD command. A measured pose would
+                    # erase the position error that supplies gravity support.
                     joint_hold_previous_controller = controller
                     latest_target = None
                     latest_target_state = None
-                    joint_hold_target = transition_state.joint_pos_rad.copy()
-                    joint_hold_config = (
-                        cascade.config
-                        if controller == HOST_GETUP_CONTROLLER
-                        else (
-                            kungfu_policy.config
-                            if controller == KUNGFU_GETUP_CONTROLLER
-                            else amp_hold_policy.config
-                        )
+                    joint_hold_target = (
+                        hold_source.target_joint_pos.copy()
+                    )
+                    joint_hold_config = HostControlConfig(
+                        action_rescale=1.0,
+                        action_clip=1.0,
+                        kp=hold_source.kp.copy(),
+                        kd=hold_source.kd.copy(),
                     )
                     joint_hold_started_monotonic = transition_now
                     joint_hold_capture_age_s = transition_state_age
@@ -1311,6 +1545,7 @@ def run_worker(
                         HOST_GETUP_CONTROLLER,
                         KUNGFU_GETUP_CONTROLLER,
                         AMP_GETUP_CONTROLLER,
+                        AMP_FLAT_V3_GETUP_CONTROLLER,
                     }:
                         send_event(
                             "ERROR",
@@ -1395,6 +1630,7 @@ def run_worker(
                     amp_hold_history_reset = controller in {
                         HOST_GETUP_CONTROLLER,
                         KUNGFU_GETUP_CONTROLLER,
+                        AMP_FLAT_V3_GETUP_CONTROLLER,
                     }
                     if amp_hold_history_reset:
                         # HoST and AMP have different observation histories;
@@ -1630,12 +1866,18 @@ def run_worker(
                 )
                 write_succeeded = dds.write(handoff.publisher, command)
                 if write_succeeded:
-                    last_successful_pd_write = PdWriteFrame.capture(
+                    write_frame = PdWriteFrame.capture(
                         target_joint_pos=published_target,
                         config=published_config,
                         controller=controller,
                     )
-                    handoff.record_successful_write()
+                    last_successful_pd_write = write_frame
+                    if initial_handoff_first_write_fields is not None:
+                        initial_handoff_pd_write = write_frame
+                    handoff.record_successful_write(
+                        initial_handoff_first_write_fields
+                    )
+                    initial_handoff_first_write_fields = None
                     if kungfu_host_first_write_pending:
                         assert kungfu_host_blend_origin is not None
                         cascade.mark_physical_continuation(
@@ -1671,8 +1913,16 @@ def run_worker(
                                 "controller": JOINT_POSE_HOLD_CONTROLLER,
                                 "transition_id": joint_hold_transition_id,
                                 "writer_reused": True,
-                                "measured_joint_target": True,
-                                "measured_joint_count": NUM_JOINTS,
+                                "measured_joint_target": False,
+                                "prior_pd_target_reused": True,
+                                "prior_pd_source": (
+                                    "initial_torque_continuity_frame"
+                                    if joint_hold_previous_controller
+                                    == AMP_FLAT_V3_GETUP_CONTROLLER
+                                    and initial_handoff_pd_write is not None
+                                    else "latest_successful_frame"
+                                ),
+                                "prior_pd_joint_count": NUM_JOINTS,
                                 "capture_once": True,
                                 "lowstate_capture_age_s": (
                                     joint_hold_capture_age_s
@@ -1719,10 +1969,18 @@ def run_worker(
                     status.update(
                         {
                             "policy_index": cascade.index,
-                            "policy": "measured_joint_pose_hold",
+                            "policy": "prior_pd_command_hold",
                             "policy_elapsed_s": now
                             - joint_hold_started_monotonic,
-                            "measured_joint_target": True,
+                            "measured_joint_target": False,
+                            "prior_pd_target_reused": True,
+                            "prior_pd_source": (
+                                "initial_torque_continuity_frame"
+                                if joint_hold_previous_controller
+                                == AMP_FLAT_V3_GETUP_CONTROLLER
+                                and initial_handoff_pd_write is not None
+                                else "latest_successful_frame"
+                            ),
                             "capture_once": True,
                             "lowstate_capture_age_s": joint_hold_capture_age_s,
                             "previous_controller": (
@@ -1985,7 +2243,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.initial_controller == "kungfu" and kungfu_policy is None:
         raise SystemExit("KungFu-first recovery requires valid KungFu artifacts")
     state_store = LatestLowState()
-    dds = UnitreeDdsRuntime(interface=args.interface, state_store=state_store)
+    command_store = LatestLowCmd()
+    dds = ObservingUnitreeDdsRuntime(
+        interface=args.interface,
+        state_store=state_store,
+        command_store=command_store,
+    )
     control = _connect_control(args.control_socket)
     resident_policies: list[dict[str, Any]] = [
         {
@@ -2040,6 +2303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             initial_controller=args.initial_controller,
             resident_policies=resident_policies,
             execution_provider=args.execution_provider,
+            command_store=command_store,
         )
     except (BrokenPipeError, ConnectionResetError):
         return 3

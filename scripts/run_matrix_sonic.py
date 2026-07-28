@@ -134,13 +134,6 @@ _GAME_TURN_COMMAND_REASONS = frozenset(
 _GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
     {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
 )
-# Keep BFM's interactive velocity contract identical to the validated
-# bfm-sonic-realscan-play keyboard surface.  Matrix still produces its native
-# SONIC gait/speed command for the SONIC writer; only the resident BFM STATE
-# stream is quantized to these two policy-trained tiers.  In particular, a
-# same-key double tap must not create a third BFM speed tier.
-_BFM_REALSCAN_WALK_SPEED_MPS = 0.90
-_BFM_REALSCAN_JOG_SPEED_MPS = 1.40
 _BFM_REALSCAN_LINEAR_SLEW_MPS2 = 90.0
 _BFM_REALSCAN_YAW_RATE_RAD_S = 2.40
 _BFM_REALSCAN_YAW_SLEW_RAD_S2 = 240.0
@@ -7146,6 +7139,7 @@ class _RecoveryWorkerControl:
         self.connection: socket.socket | None = None
         self.ready = False
         self.first_write = False
+        self.first_write_receipt: dict[str, Any] | None = None
         self.amp_hold_first_write = False
         self.joint_hold_first_write = False
         self.stopped = False
@@ -7196,6 +7190,7 @@ class _RecoveryWorkerControl:
         return {
             "ready_no_writer": self.ready,
             "first_write": self.first_write,
+            "first_write_receipt": self.first_write_receipt,
             "amp_hold_first_write": self.amp_hold_first_write,
             "joint_hold_first_write": self.joint_hold_first_write,
             "stopped": self.stopped,
@@ -7273,6 +7268,7 @@ class _RecoveryWorkerControl:
             self.connection = None
         self.ready = False
         self.first_write = False
+        self.first_write_receipt = None
         self.amp_hold_first_write = False
         self.joint_hold_first_write = False
         self.stopped = False
@@ -7335,6 +7331,7 @@ class _RecoveryWorkerControl:
             self.episode_id = self.episode_counter
             self.episode_started_monotonic = time.monotonic()
         self.first_write = False
+        self.first_write_receipt = None
         self.active_policy_id = None
         self.amp_hold_first_write = False
         self.joint_hold_first_write = False
@@ -7484,6 +7481,7 @@ class _RecoveryWorkerControl:
             if not self.go_sent:
                 raise RuntimeError("recovery worker wrote before supervisor GO")
             self.first_write = True
+            self.first_write_receipt = dict(payload)
             self.paused = False
             self.active_policy_id = self.selected_policy_id
         elif event == "AMP_HOLD_FIRST_WRITE":
@@ -7504,10 +7502,12 @@ class _RecoveryWorkerControl:
                 raise RuntimeError("joint hold transition_id mismatch")
             if payload.get("writer_reused") is not True:
                 raise RuntimeError("joint hold created an unexpected writer")
-            if payload.get("measured_joint_target") is not True:
-                raise RuntimeError("joint hold did not use measured joint targets")
-            if payload.get("measured_joint_count") != 29:
-                raise RuntimeError("joint hold did not capture all 29 joints")
+            if payload.get("measured_joint_target") is not False:
+                raise RuntimeError("joint hold unexpectedly used measured joints")
+            if payload.get("prior_pd_target_reused") is not True:
+                raise RuntimeError("joint hold did not reuse the prior PD target")
+            if payload.get("prior_pd_joint_count") != 29:
+                raise RuntimeError("joint hold did not preserve all 29 joints")
             if payload.get("capture_once") is not True:
                 raise RuntimeError("joint hold target was not captured once")
             if payload.get("target_velocity_zero") is not True:
@@ -7761,7 +7761,15 @@ class _RecoveryWorkerControl:
         elif command in {"ENTER_AMP_HOLD", "ENTER_JOINT_HOLD"}:
             if not self.go_sent or not self.first_write:
                 raise RuntimeError("cannot request policy hold before HoST ownership")
-            if self.stop_sent or self.amp_hold_sent or self.joint_hold_sent:
+            amp_to_joint = bool(
+                command == "ENTER_JOINT_HOLD"
+                and self.amp_hold_sent
+                and self.amp_hold_first_write
+                and not self.joint_hold_sent
+            )
+            if self.stop_sent or self.joint_hold_sent or (
+                self.amp_hold_sent and not amp_to_joint
+            ):
                 raise RuntimeError("policy hold request is not valid in current state")
             if self.advance_transition_id is not None:
                 raise RuntimeError("cannot enter policy hold during a policy switch")
@@ -7904,6 +7912,7 @@ class _RecoveryWorkerControl:
             "connected": self.connection is not None,
             "ready_no_writer": self.ready,
             "first_write": self.first_write,
+            "first_write_receipt": self.first_write_receipt,
             "amp_hold_first_write": self.amp_hold_first_write,
             "joint_hold_first_write": self.joint_hold_first_write,
             "stopped": self.stopped,
@@ -8303,15 +8312,7 @@ class _SonicWriterControl(_RecoveryWorkerControl):
 def _bfm_realscan_motion_command(
     command: RobotMotionCommand,
 ) -> RobotMotionCommand:
-    """Quantize a Matrix game command to BFM RealScan walk/jog tiers.
-
-    Matrix's native SONIC keyboard surface has slow/walk/run plus per-tier
-    double-tap boosts.  The BFM Teacher was validated with exactly two digital
-    tiers: 0.90 m/s walk and Shift-selected 1.40 m/s jog.  Preserve direction,
-    facing and all neutral/turn safety semantics while adapting only moving
-    BFM STATE samples.  RUN is the stable Shift marker; every other translating
-    native tier is BFM walk, so double-tap never creates a third speed.
-    """
+    """Preserve the live Matrix motion-setting speed for BFM Reference."""
 
     if (
         command.safe_stop
@@ -8319,15 +8320,9 @@ def _bfm_realscan_motion_command(
         or command.speed_mps <= 1.0e-6
     ):
         return command
-    jog = command.locomotion_mode == SONIC_RUN_MODE
     return replace(
         command,
-        speed_mps=(
-            _BFM_REALSCAN_JOG_SPEED_MPS
-            if jog
-            else _BFM_REALSCAN_WALK_SPEED_MPS
-        ),
-        locomotion_mode=SONIC_RUN_MODE if jog else SONIC_WALK_MODE,
+        speed_mps=float(command.speed_mps),
     )
 
 
@@ -8347,6 +8342,8 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self.activation_preparation_status: dict[str, object] | None = None
         self.preparation_aligned_initial_requested = False
         self.preparation_idle_neutral_requested = False
+        self.preparation_lowstate_anchor_requested = False
+        self.preparation_cancel_pending = False
         self.activation_pending = False
         self.pause_pending = False
         self.authority_epoch = 0
@@ -8359,6 +8356,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self.direct_initial_qpos: tuple[float, ...] | None = None
         self.direct_initial_qvel: tuple[float, ...] | None = None
         self.direct_initial_status_sequence: int | None = None
+        self.last_first_write: dict[str, object] | None = None
 
     @property
     def current_first_write(self) -> bool:
@@ -8446,11 +8444,14 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.authority_epoch = epoch
             self.epoch_first_write = True
             self.first_write = True
+            self.last_first_write = dict(payload)
             self.paused = False
             self.activation_prepared = False
             self.activation_preparation_status = None
             self.preparation_aligned_initial_requested = False
             self.preparation_idle_neutral_requested = False
+            self.preparation_lowstate_anchor_requested = False
+            self.preparation_cancel_pending = False
             self.activation_pending = False
         elif event == "ACTIVATION_PREPARED":
             if not self.preparation_pending:
@@ -8464,11 +8465,10 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 raise RuntimeError("BFM Teacher preparation has invalid writer state")
             if writer_created and (
                 payload.get("writer_reused") is not True
-                or not self.first_write
                 or not self.paused
             ):
                 raise RuntimeError(
-                    "BFM Teacher preparation did not reuse a fenced writer"
+                    "BFM Teacher preparation did not retain a fenced writer"
                 )
             if payload.get("write_authorized") is not False:
                 raise RuntimeError("BFM Teacher preparation gained authority")
@@ -8481,6 +8481,9 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             )
             idle_neutral_handoff = payload.get(
                 "idle_neutral_handoff", False
+            )
+            lowstate_anchor_handoff = payload.get(
+                "lowstate_anchor_handoff", False
             )
             preview_steps = payload.get("preview_steps")
             minimum_preview_steps = 1 if exact_initial_alignment is True else 4
@@ -8496,10 +8499,13 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 or not math.isfinite(float(target_limit))
                 or type(exact_initial_alignment) is not bool
                 or type(idle_neutral_handoff) is not bool
+                or type(lowstate_anchor_handoff) is not bool
                 or exact_initial_alignment
                 is not self.preparation_aligned_initial_requested
                 or idle_neutral_handoff
                 is not self.preparation_idle_neutral_requested
+                or lowstate_anchor_handoff
+                is not self.preparation_lowstate_anchor_requested
                 or (
                     not exact_initial_alignment
                     and float(target_delta) > float(target_limit) + 1.0e-6
@@ -8537,7 +8543,27 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             )
             self.preparation_aligned_initial_requested = False
             self.preparation_idle_neutral_requested = False
+            self.preparation_lowstate_anchor_requested = False
             self.activation_preparation_status = dict(payload)
+        elif event == "ACTIVATION_CANCELLED":
+            if not self.preparation_cancel_pending:
+                raise RuntimeError(
+                    "BFM Teacher cancelled an unrequested preparation"
+                )
+            if epoch != self.requested_authority_epoch:
+                raise RuntimeError("BFM Teacher cancellation epoch mismatch")
+            if payload.get("write_authorized") is not False:
+                raise RuntimeError(
+                    "BFM Teacher cancellation retained write authority"
+                )
+            self.preparation_pending = False
+            self.activation_prepared = False
+            self.activation_rejected_reason = None
+            self.activation_preparation_status = None
+            self.preparation_aligned_initial_requested = False
+            self.preparation_idle_neutral_requested = False
+            self.preparation_lowstate_anchor_requested = False
+            self.preparation_cancel_pending = False
         elif event == "PAUSED_RESIDENT_WRITER":
             if not self.pause_pending:
                 raise RuntimeError("BFM Teacher paused without supervisor request")
@@ -8553,6 +8579,8 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.activation_preparation_status = None
             self.preparation_aligned_initial_requested = False
             self.preparation_idle_neutral_requested = False
+            self.preparation_lowstate_anchor_requested = False
+            self.preparation_cancel_pending = False
             self.pause_pending = False
             self.epoch_first_write = False
         elif event == "STATUS":
@@ -8597,6 +8625,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             self.activation_prepared = False
             self.activation_pending = False
             self.pause_pending = False
+            self.preparation_cancel_pending = False
         else:
             raise RuntimeError(f"unsupported BFM Teacher event: {event}")
 
@@ -8605,6 +8634,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         *,
         aligned_initial: bool = False,
         allow_idle_neutral: bool = False,
+        allow_lowstate_anchor: bool = False,
     ) -> None:
         if self.connection is None or not self.ready or not self.warmed:
             raise RuntimeError("BFM Teacher is not connected and warmed")
@@ -8614,13 +8644,21 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             or self.preparation_pending
             or self.activation_prepared
             or self.activation_pending
+            or self.preparation_cancel_pending
         ):
             raise RuntimeError("BFM Teacher is not ready for preparation")
         if self.stopped:
             raise RuntimeError("BFM Teacher was stopped")
-        if aligned_initial and allow_idle_neutral:
+        if sum(
+            bool(value)
+            for value in (
+                aligned_initial,
+                allow_idle_neutral,
+                allow_lowstate_anchor,
+            )
+        ) > 1:
             raise RuntimeError(
-                "BFM Teacher initial alignment cannot use idle-neutral admission"
+                "BFM Teacher preparation cannot mix handoff anchor modes"
             )
         requested_epoch = self.authority_epoch + 1
         self._send_payload(
@@ -8630,19 +8668,44 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 "authority_epoch": requested_epoch,
                 "aligned_initial": bool(aligned_initial),
                 "allow_idle_neutral": bool(allow_idle_neutral),
+                "allow_lowstate_anchor": bool(allow_lowstate_anchor),
             }
         )
         self.requested_authority_epoch = requested_epoch
         self.preparation_pending = True
         self.preparation_aligned_initial_requested = bool(aligned_initial)
         self.preparation_idle_neutral_requested = bool(allow_idle_neutral)
+        self.preparation_lowstate_anchor_requested = bool(allow_lowstate_anchor)
         self.activation_rejected_reason = None
         self.activation_preparation_status = None
+
+    def cancel_preparation(self) -> None:
+        if self.connection is None or not self.ready or not self.warmed:
+            raise RuntimeError("BFM Teacher is not connected and warmed")
+        if self.activation_pending or not self.paused:
+            raise RuntimeError("BFM Teacher cannot cancel an active writer")
+        if self.preparation_cancel_pending:
+            return
+        if not (self.preparation_pending or self.activation_prepared):
+            return
+        self._send_payload(
+            {
+                "schema": self.SCHEMA,
+                "command": "CANCEL_PREPARE",
+                "authority_epoch": self.requested_authority_epoch,
+            }
+        )
+        self.preparation_cancel_pending = True
 
     def activate(self) -> None:
         if self.connection is None or not self.ready or not self.warmed:
             raise RuntimeError("BFM Teacher is not connected and warmed")
-        if not self.paused or self.pause_pending or self.activation_pending:
+        if (
+            not self.paused
+            or self.pause_pending
+            or self.activation_pending
+            or self.preparation_cancel_pending
+        ):
             raise RuntimeError("BFM Teacher is not in writer-fenced standby")
         if not self.direct_start and not self.activation_prepared:
             raise RuntimeError("BFM Teacher was not safely prepared")
@@ -8665,6 +8728,13 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self.activation_prepared = False
         self.paused = False
         self.epoch_first_write = False
+
+    def retry_transient_preparation(self) -> bool:
+        if self.activation_rejected_reason != "inputs_not_fresh":
+            return False
+        self.activation_rejected_reason = None
+        self.activation_preparation_status = None
+        return True
 
     def pause(self) -> None:
         if self.connection is None or not self.current_first_write:
@@ -8792,6 +8862,11 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
                 "direct_initial_state_received": bool(
                     self.direct_initial_qpos is not None
                     and self.direct_initial_qvel is not None
+                ),
+                "last_first_write": (
+                    dict(self.last_first_write)
+                    if self.last_first_write is not None
+                    else None
                 ),
             }
         )
@@ -9592,6 +9667,7 @@ class _PhysicalRecoveryCoordinator:
     FALLBACK_MAX_LINEAR_SPEED_M_S = 0.5
     FALLBACK_MAX_ANGULAR_SPEED_RAD_S = 1.5
     FALLBACK_MAX_JOINT_VELOCITY_RMS_RAD_S = 1.5
+    BFM_SWITCH_ADMISSION_HOLD_S = 1.5
     # Conservative first qualification after a replacement deploy.  At the
     # 50 Hz game command rate this is 1 rad/s and prevents a frame transform
     # from bypassing the core's own yaw slew limiter.
@@ -9644,9 +9720,14 @@ class _PhysicalRecoveryCoordinator:
             stable_root_z_m=self.FALLBACK_NEAR_UPRIGHT_HEIGHT_M,
             max_lowcmd_age_s=float(args.low_cmd_fresh_timeout_seconds),
             policy_recovery_timeout_s=timeout,
+            # Resident BFM keeps the recovery hold writer authoritative while
+            # its online PFNN preview becomes ready.  That writer-fenced
+            # preview can legitimately consume the original five-second
+            # policy-pause budget before PAUSE is even sent.
+            policy_stop_timeout_s=15.0 if self.resident_policies else 5.0,
             use_amp_hold=(
-                not self.resident_policies
-                and str(getattr(args, "physical_recovery_handoff", "amp"))
+                self.resident_policies
+                or str(getattr(args, "physical_recovery_handoff", "amp"))
                 == "amp"
             ),
             sonic_prewarm_timeout_s=float(
@@ -9824,6 +9905,12 @@ class _PhysicalRecoveryCoordinator:
         self._initial_locomotion_policy_requested = (
             self.initial_locomotion_policy_id == "sonic"
         )
+        self._initial_bfm_amp_bootstrap_started = False
+        self._initial_bfm_amp_bootstrap_target_selected = False
+        self._initial_bfm_amp_bootstrap_hold_requested = False
+        self._initial_bfm_amp_bootstrap_joint_hold_requested = False
+        self._initial_bfm_amp_bootstrap_completed = False
+        self._initial_bfm_amp_bootstrap_started_monotonic_s: float | None = None
         self._bfm_idle_handoff_armed = False
         self._bfm_idle_return_pending = False
         self._bfm_idle_transition_counter = 0
@@ -9863,6 +9950,8 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_timeout_s = 10.0
         self.bfm_switch_admission_ready = False
         self.bfm_switch_admission_reason = "awaiting_runtime_observation"
+        self.bfm_switch_admission_since_s: float | None = None
+        self.bfm_switch_admission_elapsed_s = 0.0
         self.last_locomotion_handoff: dict[str, object] | None = None
         self.initial_bfm_reference_aligned = False
         self.initial_bfm_reference_alignment: dict[str, object] | None = None
@@ -9932,13 +10021,27 @@ class _PhysicalRecoveryCoordinator:
         profiles.apply(profile_id)
 
     def _align_initial_bfm_reference(self) -> None:
-        """Align the initial game G1 once to the online-PFNN reference.
+        """Record the stable low-state anchor used for initial BFM handoff.
 
-        The validated BFM closed loop initializes the physical robot from the
-        first reference root/joints before Teacher control begins.  Matrix may
-        perform the same initialization only for the requested default BFM
-        policy, after SONIC is writer-fenced and before BFM gains authority.
+        A game-policy switch must not teleport MuJoCo to PFNN's first frame.
+        The worker's low-state-anchor PREPARE path resets PFNN/history and
+        previews an exact current-pose idle target while SONIC still owns the
+        writer. Physics changes only after that preview is admitted.
         """
+
+        if self.initial_bfm_reference_aligned:
+            return
+        self.initial_bfm_reference_aligned = True
+        self.initial_bfm_reference_alignment = {
+            "mode": "stable_lowstate_idle_anchor",
+            "simulator_state_mutation": False,
+            "history_reset": True,
+            "previous_action_zeroed": True,
+            "joint_delta_max_rad": 0.0,
+        }
+
+    def _align_initial_bfm_reference_oracle(self) -> None:
+        """Apply the validated BFM-3DGS first-frame initialization once."""
 
         if self.initial_bfm_reference_aligned:
             return
@@ -9946,16 +10049,12 @@ class _PhysicalRecoveryCoordinator:
         qpos = self.bfm_control.direct_initial_qpos
         qvel = self.bfm_control.direct_initial_qvel
         if profiles is None or qpos is None or qvel is None:
-            raise RuntimeError("initial BFM reference alignment is unavailable")
+            raise RuntimeError("initial BFM oracle alignment is unavailable")
         data = profiles.data
         if len(data.qpos) < len(qpos) or len(data.qvel) < len(qvel):
             raise RuntimeError("live MuJoCo state is smaller than BFM reference")
         current_qpos = tuple(float(value) for value in data.qpos[: len(qpos)])
         aligned_qpos = list(qpos)
-        # The PFNN stream is already seeded at the live G1 root.  Preserve the
-        # latest world XY exactly so asynchronous warmup cannot move the robot
-        # backward to an older root sample; reference Z/orientation/joints and
-        # velocity remain the validated first-frame state.
         aligned_qpos[0] = current_qpos[0]
         aligned_qpos[1] = current_qpos[1]
         profiles.apply(_LocomotionPhysicsProfiles.BFM_PROFILE_ID)
@@ -9968,7 +10067,7 @@ class _PhysicalRecoveryCoordinator:
         actual_qpos = tuple(float(value) for value in data.qpos[: len(qpos)])
         actual_qvel = tuple(float(value) for value in data.qvel[: len(qvel)])
         if actual_qpos != tuple(aligned_qpos) or actual_qvel != qvel:
-            raise RuntimeError("initial BFM reference alignment did not read back")
+            raise RuntimeError("initial BFM oracle alignment did not read back")
         joint_delta = max(
             abs(after - before)
             for before, after in zip(current_qpos[7:36], aligned_qpos[7:36])
@@ -9980,10 +10079,12 @@ class _PhysicalRecoveryCoordinator:
         self.initial_bfm_reference_aligned = True
         self.initial_bfm_reference_alignment = {
             "mode": "online_pfnn_first_frame_once",
+            "oracle": "bfm-3dgs-c591af3-7ae16b3",
             "root_xy_preserved": True,
             "reference_root_shift_discarded_m": root_shift,
             "joint_delta_max_rad": joint_delta,
             "physics_profile": _LocomotionPhysicsProfiles.BFM_PROFILE_ID,
+            "simulator_state_mutation": True,
         }
 
     def _configured_recovery_policy_ids(self) -> tuple[str, ...]:
@@ -10570,16 +10671,29 @@ class _PhysicalRecoveryCoordinator:
                     pending["reference_aligned"] = True
                     pending["reference_status_sequence"] = sequence
                     if pending.get("initial_reference_alignment") is True:
-                        if (
-                            self.bfm_control.direct_initial_qpos is None
-                            or self.bfm_control.direct_initial_qvel is None
-                        ):
-                            return
-                        self.sonic_writer.send("PAUSE")
-                        pending["initial_reference_status_baseline_sequence"] = (
-                            sequence
+                        oracle_alignment = (
+                            os.environ.get(
+                                "MATRIX_BFM_INITIAL_HANDOFF_MODE",
+                                "amp-stable",
+                            ).strip().lower()
+                            == "oracle"
                         )
-                        pending["phase"] = "initial_pause_sonic"
+                        if oracle_alignment:
+                            self._align_initial_bfm_reference_oracle()
+                        else:
+                            self._align_initial_bfm_reference()
+                        pending["initial_reference_alignment_result"] = dict(
+                            self.initial_bfm_reference_alignment or {}
+                        )
+                        if oracle_alignment:
+                            self.bfm_control.prepare_activation(
+                                aligned_initial=True
+                            )
+                        else:
+                            self.bfm_control.prepare_activation(
+                                allow_lowstate_anchor=True
+                            )
+                        pending["phase"] = "prepare_bfm"
                         return
                     # The automatic return follows a resident SONIC brake,
                     # where the live game command is ordinary idle rather than
@@ -10591,50 +10705,10 @@ class _PhysicalRecoveryCoordinator:
                     pending["phase"] = "prepare_bfm"
                     return
                 if (
-                    phase == "initial_pause_sonic"
-                    and self.sonic_writer.paused
-                ):
-                    reference_baseline = int(
-                        pending.get(
-                            "initial_reference_status_baseline_sequence",
-                            -1,
-                        )
-                    )
-                    reference_sequence = (
-                        self.bfm_control.direct_initial_status_sequence
-                    )
-                    if (
-                        reference_sequence is None
-                        or reference_sequence <= reference_baseline
-                    ):
-                        return
-                    pending["prior_writer_fenced"] = True
-                    self._align_initial_bfm_reference()
-                    pending["initial_reference_alignment_result"] = dict(
-                        self.initial_bfm_reference_alignment or {}
-                    )
-                    pending["aligned_state_baseline_sequence"] = int(
-                        self.bfm_control.last_state_sequence or -1
-                    )
-                    pending["aligned_state_monotonic_s"] = time.monotonic()
-                    pending["phase"] = "initial_alignment_wait"
-                    return
-                if phase == "initial_alignment_wait":
-                    baseline = int(
-                        pending.get("aligned_state_baseline_sequence", -1)
-                    )
-                    latest_sequence = int(
-                        self.bfm_control.last_state_sequence or -1
-                    )
-                    if latest_sequence <= baseline:
-                        return
-                    self.bfm_control.prepare_activation(aligned_initial=True)
-                    pending["phase"] = "prepare_bfm"
-                    return
-                if (
                     phase == "prepare_bfm"
                     and self.bfm_control.activation_prepared
                 ):
+                    pending["bfm_prepare_ack_monotonic_s"] = time.monotonic()
                     preparation = (
                         self.bfm_control.activation_preparation_status or {}
                     )
@@ -10652,6 +10726,7 @@ class _PhysicalRecoveryCoordinator:
                         "desired_target_delta_max_rad"
                     )
                     if not self.sonic_writer.paused:
+                        pending["sonic_pause_sent_monotonic_s"] = time.monotonic()
                         self.sonic_writer.send("PAUSE")
                     pending["phase"] = "pause_sonic"
                     return
@@ -10662,10 +10737,18 @@ class _PhysicalRecoveryCoordinator:
                         )
                         return
                     pending["prior_writer_fenced"] = True
+                    pending["sonic_pause_ack_monotonic_s"] = time.monotonic()
+                    pending["physics_profile_apply_started_monotonic_s"] = (
+                        time.monotonic()
+                    )
                     self._apply_locomotion_physics_profile(
                         _LocomotionPhysicsProfiles.BFM_PROFILE_ID
                     )
+                    pending["physics_profile_apply_done_monotonic_s"] = (
+                        time.monotonic()
+                    )
                     self.bfm_control.activate()
+                    pending["bfm_go_sent_monotonic_s"] = time.monotonic()
                     pending["phase"] = "activate_bfm"
                     return
                 if (
@@ -10675,6 +10758,11 @@ class _PhysicalRecoveryCoordinator:
                 ):
                     self.selected_locomotion_policy_id = target
                     pending["authority_epoch"] = self.bfm_control.authority_epoch
+                    pending["bfm_first_write_ack_monotonic_s"] = time.monotonic()
+                    if self.bfm_control.last_first_write is not None:
+                        pending["bfm_first_write"] = dict(
+                            self.bfm_control.last_first_write
+                        )
                     pending["completed_monotonic_s"] = time.monotonic()
                     self.last_locomotion_handoff = dict(pending)
                     self._policy_selection_pending = None
@@ -10754,6 +10842,11 @@ class _PhysicalRecoveryCoordinator:
             return
         if getattr(self, "_initial_locomotion_policy_requested", True):
             return
+        if self._initial_bfm_amp_bootstrap_required():
+            # The resident recovery FSM performs the initial assignment through
+            # an AMP-authoritative stable state.  Do not race it with the normal
+            # SONIC -> BFM slot switch.
+            return
         target = getattr(self, "initial_locomotion_policy_id", "sonic")
         if target == getattr(self, "selected_locomotion_policy_id", "sonic"):
             self._initial_locomotion_policy_requested = True
@@ -10781,6 +10874,21 @@ class _PhysicalRecoveryCoordinator:
                 f"Assigned {target} to locomotion",
                 loadout,
             )
+
+    def _initial_bfm_amp_bootstrap_required(self) -> bool:
+        return bool(
+            os.environ.get(
+                "MATRIX_BFM_INITIAL_HANDOFF_MODE",
+                "amp-stable",
+            ).strip().lower()
+            != "oracle"
+            and
+            self.resident_policies
+            and not getattr(self, "locomotion_slots_only", False)
+            and getattr(self, "initial_locomotion_policy_id", "sonic")
+            == BFM_TEACHER50K_POLICY_ID
+            and getattr(self, "initial_controller", "host") == "amp-flat-v3"
+        )
 
     def _request_bfm_idle_sonic_handoff_if_needed(
         self,
@@ -11233,6 +11341,28 @@ class _PhysicalRecoveryCoordinator:
             and required_loaded
         )
 
+    def _update_bfm_switch_admission_hold(
+        self,
+        raw_ready: bool,
+        *,
+        now_s: float,
+    ) -> bool:
+        """Reject one-frame zero-velocity crossings as stable handoffs."""
+
+        if not math.isfinite(now_s):
+            raise ValueError("BFM switch admission time must be finite")
+        if not raw_ready:
+            self.bfm_switch_admission_since_s = None
+            self.bfm_switch_admission_elapsed_s = 0.0
+            return False
+        since = getattr(self, "bfm_switch_admission_since_s", None)
+        if since is None or now_s < since:
+            since = now_s
+            self.bfm_switch_admission_since_s = since
+        elapsed = max(0.0, now_s - since)
+        self.bfm_switch_admission_elapsed_s = elapsed
+        return elapsed >= self.BFM_SWITCH_ADMISSION_HOLD_S
+
     def observe(
         self,
         snapshot: Any,
@@ -11316,11 +11446,24 @@ class _PhysicalRecoveryCoordinator:
             ),
             None,
         )
-        self.bfm_switch_admission_ready = failed_admission is None
+        raw_admission_ready = failed_admission is None
+        self.bfm_switch_admission_ready = (
+            self._update_bfm_switch_admission_hold(
+                raw_admission_ready,
+                now_s=now_s,
+            )
+        )
         self.bfm_switch_admission_reason = (
-            "ready" if failed_admission is None else failed_admission
+            "ready"
+            if self.bfm_switch_admission_ready
+            else (
+                "stability_hold"
+                if raw_admission_ready
+                else failed_admission
+            )
         )
         if not initial_locomotion_handoff_allowed:
+            self._update_bfm_switch_admission_hold(False, now_s=now_s)
             self.bfm_switch_admission_ready = False
             self.bfm_switch_admission_reason = "resume_checkpoint_probation"
         self._request_initial_locomotion_policy_if_ready(
@@ -11351,6 +11494,26 @@ class _PhysicalRecoveryCoordinator:
             policy_ready = self._resident_worker_attested(
                 policy_alive=policy_alive
             )
+            bootstrap_required = self._initial_bfm_amp_bootstrap_required()
+            if (
+                bootstrap_required
+                and self._initial_bfm_amp_bootstrap_started
+                and not self._initial_bfm_amp_bootstrap_target_selected
+                and self.fsm.state
+                in {
+                    ResidentRecoveryState.POLICY_RECOVERING,
+                    ResidentRecoveryState.POLICY_STABLE,
+                }
+                and self.worker.first_write
+                and not self.worker.paused
+                and self.worker.active_policy_id == "amp-flat-v3"
+            ):
+                # AMP now owns a fresh LowCmd epoch.  From this point the normal
+                # resident recovery return path prepares BFM in shadow while AMP
+                # remains authoritative, then fences AMP before BFM GO.
+                self.selected_locomotion_policy_id = BFM_TEACHER50K_POLICY_ID
+                self._initial_bfm_amp_bootstrap_target_selected = True
+                self._align_initial_bfm_reference()
             selected_bfm = (
                 getattr(self, "selected_locomotion_policy_id", "sonic")
                 == BFM_TEACHER50K_POLICY_ID
@@ -11414,11 +11577,119 @@ class _PhysicalRecoveryCoordinator:
                 ),
                 policy_writer_paused=self.worker.paused,
                 policy_first_write=self.worker.first_write,
+                policy_hold_first_write=bool(
+                    self.worker.amp_hold_first_write
+                    or self.worker.joint_hold_first_write
+                ),
+                locomotion_writer_prepared=bool(
+                    not selected_bfm
+                    or self.bfm_control.activation_prepared
+                ),
+                locomotion_preparation_active=bool(
+                    selected_bfm
+                    and (
+                        self.bfm_control.preparation_pending
+                        or self.bfm_control.activation_prepared
+                        or self.bfm_control.preparation_cancel_pending
+                    )
+                ),
                 reset_count=int(snapshot.reset_count),
                 foot_contact=bool(foot_contact),
                 grounded_contact=bool(grounded_contact),
                 neutral_confirmed=bool(neutral_confirmed),
             )
+            if (
+                bootstrap_required
+                and self._initial_bfm_amp_bootstrap_started
+                and self._initial_bfm_amp_bootstrap_target_selected
+                and not self._initial_bfm_amp_bootstrap_hold_requested
+                and self.fsm.state is ResidentRecoveryState.POLICY_RECOVERING
+                and self.worker.first_write
+                and not self.worker.paused
+                and self.worker.active_policy_id == "amp-flat-v3"
+            ):
+                # The bootstrap starts from an already-upright SONIC state.  The
+                # exact flat-v3 first write proves policy/writer continuity; now
+                # capture that still-stable pose before the learned get-up policy
+                # can begin a maneuver the robot does not need.  Real falls keep
+                # using the normal flat-v3 recovery state machine.
+                self._initial_bfm_amp_bootstrap_hold_requested = True
+                self._initial_bfm_amp_bootstrap_joint_hold_requested = True
+                self.fsm.mark_policy_hold_requested()
+                output_resident = ResidentRecoveryOutput(
+                    previous_state=ResidentRecoveryState.POLICY_RECOVERING,
+                    state=ResidentRecoveryState.POLICY_RECOVERING,
+                    request_policy_joint_hold=True,
+                    inhibit_game_input=True,
+                    authority_policy_id="amp-flat-v3",
+                    recovery_policy_id="amp-flat-v3",
+                )
+                self.last_output = output_resident
+                return output_resident
+            joint_hold_gate = {
+                "controller_ready": worker_controller
+                == "AMP_ZERO_COMMAND_HOLD",
+                "fall_clear": not resident_observation.fall_detected,
+                "foot_contact": resident_observation.foot_contact,
+                "grounded_contact": resident_observation.grounded_contact,
+                "root_z_m": root_z,
+                "root_z_ready": root_z >= 0.62,
+                "root_up_z": root_up_z,
+                "root_up_ready": root_up_z >= 0.95,
+                "root_linear_speed_m_s": root_linear_speed,
+                "root_linear_ready": root_linear_speed <= 0.8,
+                "root_angular_speed_rad_s": root_angular_speed,
+                "root_angular_ready": root_angular_speed <= 1.0,
+                "joint_velocity_rms_rad_s": joint_rms,
+                "joint_velocity_ready": joint_rms <= 1.0,
+            }
+            self._initial_bfm_amp_bootstrap_joint_hold_gate = joint_hold_gate
+            if (
+                bootstrap_required
+                and self._initial_bfm_amp_bootstrap_hold_requested
+                and not self._initial_bfm_amp_bootstrap_joint_hold_requested
+                and self.fsm.state is ResidentRecoveryState.POLICY_RECOVERING
+                and all(
+                    bool(value)
+                    for key, value in joint_hold_gate.items()
+                    if key.endswith("_ready")
+                    or key in {
+                        "fall_clear",
+                        "grounded_contact",
+                    }
+                )
+            ):
+                # AMP's learned zero-command hold can retain locomotion.  Once
+                # it has produced an upright in-envelope sample, capture that
+                # exact pose through the same publisher so the strict stable
+                # gate can verify a genuinely neutral LowState before BFM shadow.
+                self._initial_bfm_amp_bootstrap_joint_hold_requested = True
+                output_resident = ResidentRecoveryOutput(
+                    previous_state=ResidentRecoveryState.POLICY_RECOVERING,
+                    state=ResidentRecoveryState.POLICY_RECOVERING,
+                    request_policy_joint_hold=True,
+                    inhibit_game_input=True,
+                    authority_policy_id="amp",
+                    recovery_policy_id="amp-flat-v3",
+                )
+                self.last_output = output_resident
+                return output_resident
+            if (
+                bootstrap_required
+                and not self._initial_locomotion_policy_requested
+                and not self._initial_bfm_amp_bootstrap_started
+                and self.bfm_switch_admission_ready
+                and policy_ready
+                and self.fsm.state is ResidentRecoveryState.GAME_SONIC
+            ):
+                output_resident = self.fsm.begin_stable_policy_handoff(
+                    resident_observation
+                )
+                self._initial_bfm_amp_bootstrap_started = True
+                self._initial_bfm_amp_bootstrap_started_monotonic_s = now_s
+                self.last_transition_s = now_s
+                self.last_output = output_resident
+                return output_resident
             previous_resident = self.fsm.state
             self._maybe_authorize_policy_advance(
                 now_s=now_s,
@@ -11434,6 +11705,31 @@ class _PhysicalRecoveryCoordinator:
             )
             output_resident = self.fsm.step(resident_observation)
             self.last_output = output_resident
+            if (
+                bootstrap_required
+                and self._initial_bfm_amp_bootstrap_started
+                and self._initial_bfm_amp_bootstrap_target_selected
+                and not self._initial_bfm_amp_bootstrap_completed
+                and output_resident.resume_game
+                and self.bfm_control.current_first_write
+            ):
+                completed_at = time.monotonic()
+                self._initial_bfm_amp_bootstrap_completed = True
+                self._initial_locomotion_policy_requested = True
+                self.last_locomotion_handoff = {
+                    "slot": "locomotion",
+                    "policy_id": BFM_TEACHER50K_POLICY_ID,
+                    "transition_id": "initial-amp-stable-bfm",
+                    "phase": "completed",
+                    "prior_writer_policy_id": "amp-flat-v3",
+                    "reference_aligned": True,
+                    "prior_writer_fenced": bool(self.worker.paused),
+                    "authority_epoch": self.bfm_control.authority_epoch,
+                    "requested_monotonic_s": (
+                        self._initial_bfm_amp_bootstrap_started_monotonic_s
+                    ),
+                    "completed_monotonic_s": completed_at,
+                }
             if output_resident.state is not previous_resident:
                 self.last_transition_s = now_s
                 if (
@@ -12029,6 +12325,24 @@ class _PhysicalRecoveryCoordinator:
                 getattr(self, "selected_locomotion_policy_id", "sonic")
                 == BFM_TEACHER50K_POLICY_ID
             )
+            if (
+                selected_bfm
+                and (
+                    (
+                        output.previous_state
+                        is ResidentRecoveryState.POLICY_PAUSE_REQUESTED
+                        and output.state
+                        is ResidentRecoveryState.POLICY_RECOVERING
+                    )
+                    or (
+                        output.previous_state
+                        is ResidentRecoveryState.SONIC_RESUME_REQUESTED
+                        and output.state
+                        is ResidentRecoveryState.SONIC_PAUSE_REQUESTED
+                    )
+                )
+            ):
+                self.bfm_control.cancel_preparation()
             if output.request_sonic_pause:
                 if selected_bfm:
                     if not (
@@ -12062,23 +12376,74 @@ class _PhysicalRecoveryCoordinator:
                 episode_id = self.worker.begin_resident_episode()
                 self.current_recovery_worker_episode_id = episode_id
                 self.worker.send("GO")
+            if output.request_policy_hold:
+                if self.worker.selected_policy_id == "amp-flat-v3":
+                    # ENTER_AMP_HOLD runs the separately loaded legacy AMP
+                    # zero-command policy.  Switch the plant from flat-v3's
+                    # qualified armatures to that policy's baseline contract at
+                    # the same writer boundary.
+                    self._apply_locomotion_physics_profile(
+                        _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+                    )
+                self.worker.send("ENTER_AMP_HOLD")
+            if output.request_policy_joint_hold:
+                self._apply_locomotion_physics_profile(
+                    _LocomotionPhysicsProfiles.BASELINE_PROFILE_ID
+                )
+                self.worker.send("ENTER_JOINT_HOLD")
+            if output.cancel_locomotion_preparation and selected_bfm:
+                self.bfm_control.cancel_preparation()
+                return
+            if output.prepare_locomotion_writer and selected_bfm:
+                if self.bfm_control.preparation_cancel_pending:
+                    return
+                if self.bfm_control.activation_rejected_reason is not None:
+                    if self.bfm_control.retry_transient_preparation():
+                        return
+                    raise RuntimeError(
+                        "BFM recovery-return preparation rejected: "
+                        f"{self.bfm_control.activation_rejected_reason}"
+                    )
+                if not self.bfm_control.activation_prepared:
+                    if not self.bfm_control.preparation_pending:
+                        self.bfm_control.prepare_activation(
+                            allow_lowstate_anchor=True
+                        )
+                return
             if output.request_policy_pause:
+                if selected_bfm:
+                    if not self.bfm_control.activation_prepared:
+                        raise RuntimeError(
+                            "BFM recovery writer pause requested before "
+                            "activation preparation"
+                        )
                 if not self.worker.paused and not self.worker.pause_sent:
                     self.worker.send("PAUSE")
-            if output.resume_sonic_writer:
+            if (
+                output.resume_sonic_writer
+                or (
+                    selected_bfm
+                    and output.state
+                    is ResidentRecoveryState.SONIC_RESUME_REQUESTED
+                )
+            ):
                 if selected_bfm:
                     if (
                         self.bfm_control.paused
                         and not self.bfm_control.activation_pending
                     ):
                         if self.bfm_control.activation_rejected_reason is not None:
+                            if self.bfm_control.retry_transient_preparation():
+                                return
                             raise RuntimeError(
                                 "BFM recovery-return preparation rejected: "
                                 f"{self.bfm_control.activation_rejected_reason}"
                             )
                         if not self.bfm_control.activation_prepared:
                             if not self.bfm_control.preparation_pending:
-                                self.bfm_control.prepare_activation()
+                                self.bfm_control.prepare_activation(
+                                    allow_lowstate_anchor=True
+                                )
                         else:
                             self._apply_locomotion_physics_profile(
                                 _LocomotionPhysicsProfiles.BFM_PROFILE_ID
@@ -12321,6 +12686,12 @@ class _PhysicalRecoveryCoordinator:
             "locomotion_switch_admission_reason": (
                 self.bfm_switch_admission_reason
             ),
+            "locomotion_switch_admission_hold_seconds": (
+                self.BFM_SWITCH_ADMISSION_HOLD_S
+            ),
+            "locomotion_switch_admission_elapsed_seconds": float(
+                getattr(self, "bfm_switch_admission_elapsed_s", 0.0)
+            ),
             "bfm_idle_brake_handoff": {
                 "armed": bool(
                     getattr(self, "_bfm_idle_handoff_armed", False)
@@ -12330,6 +12701,48 @@ class _PhysicalRecoveryCoordinator:
                 ),
                 "transition_count": int(
                     getattr(self, "_bfm_idle_transition_counter", 0)
+                ),
+            },
+            "initial_bfm_amp_bootstrap": {
+                "required": self._initial_bfm_amp_bootstrap_required(),
+                "started": bool(
+                    getattr(self, "_initial_bfm_amp_bootstrap_started", False)
+                ),
+                "target_selected": bool(
+                    getattr(
+                        self,
+                        "_initial_bfm_amp_bootstrap_target_selected",
+                        False,
+                    )
+                ),
+                "hold_requested": bool(
+                    getattr(
+                        self,
+                        "_initial_bfm_amp_bootstrap_hold_requested",
+                        False,
+                    )
+                ),
+                "joint_hold_requested": bool(
+                    getattr(
+                        self,
+                        "_initial_bfm_amp_bootstrap_joint_hold_requested",
+                        False,
+                    )
+                ),
+                "joint_hold_gate": dict(
+                    getattr(
+                        self,
+                        "_initial_bfm_amp_bootstrap_joint_hold_gate",
+                        {},
+                    )
+                ),
+                "completed": bool(
+                    getattr(self, "_initial_bfm_amp_bootstrap_completed", False)
+                ),
+                "started_monotonic_s": getattr(
+                    self,
+                    "_initial_bfm_amp_bootstrap_started_monotonic_s",
+                    None,
                 ),
             },
             "locomotion_policy_handoff": (
@@ -12431,6 +12844,9 @@ class _PhysicalRecoveryCoordinator:
             "policy_fallback_quiet_since_s": self.policy_fallback_quiet_since_s,
             "policy_fallback_last_near_upright_s": (
                 self.policy_fallback_last_near_upright_s
+            ),
+            "policy_handoff_gate": dict(
+                getattr(self.fsm, "last_policy_handoff_gate", {})
             ),
             "initial_controller": self.initial_controller,
             "strategy_loadout": self.strategy_loadout_mapping(),
@@ -13449,7 +13865,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 )
             except (MoonDynamicGroundError, OSError, ValueError) as exc:
                 raise SystemExit(
-                    f"cannot activate MoonWorld rolling collision: {exc}"
+                    f"cannot activate MoonWorld continuous collision: {exc}"
                 ) from exc
             print(
                 "matrix-sonic-runtime moon_collision_handoff=active "
@@ -14481,9 +14897,17 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 # per-step sleep otherwise accumulates scheduler overshoot.
                 if moon_dynamic_ground is not None:
                     try:
-                        moon_dynamic_ground.update_mocap(
+                        ground_update = moon_dynamic_ground.update_mocap(
                             simulator.sim_env.mj_data
                         )
+                        if (
+                            moon_dynamic_ground.collision_handoff_active
+                            and ground_update.get("continuous_support_updated")
+                        ):
+                            mujoco_module.mj_forward(
+                                simulator.sim_env.mj_model,
+                                simulator.sim_env.mj_data,
+                            )
                     except MoonDynamicGroundError as exc:
                         unstable = True
                         running = False
