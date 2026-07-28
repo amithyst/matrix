@@ -121,6 +121,7 @@ sleep "${FAKE_RUN_DELAY:-0}"
         MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY \
         MATRIX_PICO_INPUT_ENABLED \
         MATRIX_EXTERNAL_STATE \
+        MATRIX_EXTERNAL_STATE_ESC_UI \
         MATRIX_DISABLE_MC \
         MATRIX_SONIC \
         MATRIX_SONIC_CONTROL_SOURCE \
@@ -236,6 +237,7 @@ esac
                 "MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY": "0",
                 "MATRIX_PICO_INPUT_ENABLED": "1",
                 "MATRIX_EXTERNAL_STATE": "0",
+                "MATRIX_EXTERNAL_STATE_ESC_UI": "0",
                 "MATRIX_DISABLE_MC": "0",
                 "MATRIX_SONIC": "1",
                 "MATRIX_SONIC_CONTROL_SOURCE": "pico",
@@ -296,6 +298,7 @@ esac
             "MATRIX_BFM_ISAAC_DESKTOP_SIM_ONLY=1",
             "MATRIX_PICO_INPUT_ENABLED=0",
             "MATRIX_EXTERNAL_STATE=1",
+            "MATRIX_EXTERNAL_STATE_ESC_UI=1",
             "MATRIX_DISABLE_MC=1",
             "MATRIX_SONIC=0",
             "MATRIX_SONIC_CONTROL_SOURCE=external",
@@ -326,8 +329,12 @@ esac
         runner = (REPO_ROOT / "scripts" / "run_matrix_bfm_isaac.sh").read_text(
             encoding="utf-8"
         )
+        run_sim = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(encoding="utf-8")
 
         self.assertIn("MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT=0", launcher)
+        self.assertIn("MATRIX_EXTERNAL_STATE_ESC_UI=1", launcher)
+        self.assertIn("MATRIX_EXTERNAL_STATE_ESC_UI", run_sim)
+        self.assertIn("--ui-only", run_sim)
         self.assertIn("MATRIX_BFM_ISAAC_KEYBOARD_ESCAPE_EXIT:-1", runner)
         self.assertIn("KEYBOARD_ARGS+=(--ignore-escape)", runner)
         self.assertIn('--socket "$keyboard_socket" --key SPACE --key ESCAPE', launcher)
@@ -564,7 +571,7 @@ else
     printf "matrix-bfm-isaac-keyboard ready display=:0 socket=/tmp/k keys=['A', 'W']\\n" > "$FAKE_RUN_DIR/keyboard.log"
 fi
 printf 'Interactive controls: W/S walk, Esc quit\\n' > "$FAKE_RUN_DIR/physics.log"
-printf '[INFO] Starting UE\\n' > "$FAKE_RUN_DIR/renderer.log"
+printf '[INFO] Starting UE\\n[INFO] External-state Matrix ESC UI provider ready: /tmp/calibration.json\\n' > "$FAKE_RUN_DIR/renderer.log"
 printf '[INFO] console ready\\n' > "${FAKE_CONSOLE_LOG:?}"
 printf '%s\\n' "$FAKE_RUN_DIR" > "${FAKE_TMUX_STATE:?}.run_dir"
 printf '%s\\n' "$FAKE_CONSOLE_LOG" > "$FAKE_TMUX_STATE.console"

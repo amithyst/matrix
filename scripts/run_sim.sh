@@ -254,6 +254,7 @@ PIDS=()
 WATCHDOG_PID=""
 FORCED_CLEANUP_PID=""
 SONIC_PID=""
+EXTERNAL_ESC_UI_PID=""
 UE_PID=""
 UE_SUPERVISOR_PID=""
 UE_SUPERVISOR_REAPED=0
@@ -416,6 +417,119 @@ stop_supervised_ue() {
         record_ue_supervisor_failure
     fi
     UE_SUPERVISOR_PID=""
+}
+
+start_external_state_esc_ui_provider() {
+    if ! $MATRIX_EXTERNAL_STATE_ENABLED; then
+        return 0
+    fi
+    local enabled="${MATRIX_EXTERNAL_STATE_ESC_UI:-0}"
+    case "${enabled,,}" in
+        1|true|yes|on) ;;
+        0|false|no|off|"") return 0 ;;
+        *)
+            echo "[ERROR] MATRIX_EXTERNAL_STATE_ESC_UI must be a boolean: $enabled" >&2
+            return 1
+            ;;
+    esac
+    if [[ ! "$UE_PID" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[ERROR] External-state ESC UI requires the supervised UE PID" >&2
+        return 1
+    fi
+    if [[ -z "${DISPLAY:-}" ]]; then
+        echo "[ERROR] External-state ESC UI requires DISPLAY" >&2
+        return 1
+    fi
+
+    local provider_python="${MATRIX_EXTERNAL_STATE_ESC_UI_PYTHON:-${MATRIX_SONIC_PYTHON:-$(command -v python3)}}"
+    if [[ "$provider_python" != */* ]]; then
+        provider_python="$(command -v "$provider_python" || true)"
+    fi
+    if [[ -z "$provider_python" || ! -x "$provider_python" ]]; then
+        echo "[ERROR] External-state ESC UI Python is not executable: $provider_python" >&2
+        return 1
+    fi
+    local runtime_dir="${MATRIX_EXTERNAL_STATE_ESC_UI_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/matrix-external-state-esc-ui-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}}"
+    if ! "$provider_python" -I - "$runtime_dir" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+path.mkdir(mode=0o700, parents=True, exist_ok=True)
+metadata = path.stat(follow_symlinks=False)
+if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+    raise SystemExit("runtime path is not an owned directory")
+os.chmod(path, 0o700)
+PY
+    then
+        echo "[ERROR] Could not prepare external-state ESC UI runtime directory" >&2
+        return 1
+    fi
+
+    local ui_socket="$runtime_dir/input.sock"
+    local calibration_state="$runtime_dir/calibration.json"
+    local overlay_ready="$runtime_dir/.calibration.json.overlay-status.json"
+    local status_file="$runtime_dir/status.json"
+    local log_file="$PROJECT_ROOT/outputs/logs/matrix_external_state_esc_ui.log"
+    local world_id="${MATRIX_EXTERNAL_STATE_ESC_UI_WORLD_ID:-external-state:${ROBOTTYPE}-${SCENE_ID}}"
+    local max_seconds="${MATRIX_EXTERNAL_STATE_ESC_UI_MAX_SECONDS:-0}"
+    local startup_timeout="${MATRIX_EXTERNAL_STATE_ESC_UI_STARTUP_TIMEOUT_SECONDS:-5}"
+    mkdir -p "$PROJECT_ROOT/outputs/logs"
+    rm -f -- "$ui_socket" "$overlay_ready"
+    local -a command=(
+        "$provider_python" -u "$PROJECT_ROOT/scripts/matrix_game_control_input.py"
+        --socket "$ui_socket"
+        --input-source keyboard
+        --display "$DISPLAY"
+        --expected-ue-pid "$UE_PID"
+        --focus-title "${MATRIX_GAME_FOCUS_TITLE:-(zsibot|matrix|unreal)}"
+        --look-button "${MATRIX_GAME_LOOK_BUTTON:-left}"
+        --status-file "$status_file"
+        --calibration-state-file "$calibration_state"
+        --mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/mouse-control.json}"
+        --video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/video-settings.json}"
+        --applied-video-settings-json "$VIDEO_APPLIED_JSON"
+        --applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
+        --applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
+        --game-world-id "$world_id"
+        --max-seconds "$max_seconds"
+        --ui-only
+    )
+    echo "[INFO] Starting external-state Matrix ESC UI provider"
+    "${command[@]}" > "$log_file" 2>&1 &
+    EXTERNAL_ESC_UI_PID=$!
+    PIDS+=("$EXTERNAL_ESC_UI_PID")
+
+    local attempts
+    attempts="$("$provider_python" -I - "$startup_timeout" <<'PY'
+import math
+import sys
+
+timeout = float(sys.argv[1])
+if not math.isfinite(timeout) or timeout < 0:
+    raise SystemExit("timeout must be finite and non-negative")
+print(max(1, math.ceil(timeout / 0.05) + 1))
+PY
+    )" || return 1
+    local attempt
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        if ! managed_child_job_is_running "$EXTERNAL_ESC_UI_PID"; then
+            echo "[ERROR] External-state ESC UI provider exited during startup" >&2
+            tail -80 "$log_file" >&2 || true
+            return 1
+        fi
+        if [[ -s "$overlay_ready" ]]; then
+            echo "[INFO] External-state Matrix ESC UI provider ready: $calibration_state"
+            return 0
+        fi
+        if ((attempt + 1 < attempts)); then
+            sleep 0.05
+        fi
+    done
+    echo "[ERROR] External-state ESC UI provider did not become ready: $log_file" >&2
+    return 1
 }
 
 install_centered_camera_overlay() {
@@ -1656,6 +1770,7 @@ fi
 if $CENTERED_CAMERA_OVERLAY_ENABLED; then
     verify_centered_camera_overlay_mount "$UE_LOG" "$UE_LOG_START_OFFSET"
 fi
+start_external_state_esc_ui_provider
 
 if $MATRIX_SONIC_ENABLED; then
     MATRIX_SONIC_PYTHON="${MATRIX_SONIC_PYTHON:-python3}"

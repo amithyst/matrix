@@ -38,6 +38,27 @@ MOON_WORLD_ID = "g1_29dof:scene_terrain_moon_dynamic"
 WORLD_CLI_ARGS = ("--game-world-id", EARTH_WORLD_ID)
 
 
+class UiOnlyPublisherTest(unittest.TestCase):
+    def test_ui_only_publisher_drops_snapshots_without_socket_connection(self) -> None:
+        publisher = MODULE.UiOnlyPublisher()
+        snapshot = MODULE.build_snapshot(
+            sequence=1,
+            timestamp_monotonic_s=2.0,
+            keyboard=MODULE.KeyboardMouseSample(
+                w=True,
+                focused=True,
+            ),
+            gamepad=MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.0,
+            camera_available=True,
+        )
+
+        self.assertTrue(publisher.connected)
+        self.assertTrue(publisher.send(snapshot, now=3.0))
+        self.assertIsNone(publisher.close())
+
+
 class CalibrationOverlaySupervisorTest(unittest.TestCase):
     def test_isolated_overlay_explicitly_disables_bytecode_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

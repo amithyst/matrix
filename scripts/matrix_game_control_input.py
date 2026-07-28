@@ -4684,6 +4684,28 @@ class UnixSeqpacketPublisher:
             connection.close()
 
 
+class UiOnlyPublisher:
+    """Drop input snapshots while keeping the ESC overlay provider alive.
+
+    External-state BFM/Isaac launches need the Matrix ESC panel and its X11
+    overlay, but their locomotion authority belongs to the BFM runtime rather
+    than the Matrix game-control socket.  This publisher preserves the normal
+    provider frame loop and overlay heartbeat without connecting to, printing,
+    or mutating any control channel.
+    """
+
+    @property
+    def connected(self) -> bool:
+        return True
+
+    def send(self, snapshot: InputSnapshot, *, now: float) -> bool:
+        _ = (snapshot, now)
+        return True
+
+    def close(self) -> None:
+        return None
+
+
 def build_snapshot(
     *,
     sequence: int,
@@ -7341,6 +7363,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run", action="store_true", help="Print canonical packets; do not connect"
     )
+    parser.add_argument(
+        "--ui-only",
+        action="store_true",
+        help=(
+            "Run the ESC overlay/UI provider without publishing locomotion "
+            "snapshots to a Matrix game-control socket."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -7353,6 +7383,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--socket must be an absolute path")
     if not args.socket.parent.is_dir():
         raise SystemExit(f"--socket parent does not exist: {args.socket.parent}")
+    if args.dry_run and args.ui_only:
+        raise SystemExit("--dry-run and --ui-only are mutually exclusive")
     if not math.isfinite(args.rate_hz) or not 1.0 <= args.rate_hz <= 200.0:
         raise SystemExit("--rate-hz must be finite and in [1, 200]")
     for name in (
@@ -7708,7 +7740,12 @@ def main() -> int:
             raise SystemExit(
                 f"Matrix game-control input cannot initialize UE final-POV reader: {exc}"
             ) from exc
-    publisher = None if args.dry_run else UnixSeqpacketPublisher(args.socket)
+    if args.ui_only:
+        publisher = UiOnlyPublisher()
+    elif args.dry_run:
+        publisher = None
+    else:
+        publisher = UnixSeqpacketPublisher(args.socket)
     initial_strategy_loadout: object = None
     initial_creative_inventory: object = None
     if args.strategy_loadout_json is not None:

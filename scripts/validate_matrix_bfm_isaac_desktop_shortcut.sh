@@ -7,6 +7,7 @@ DESKTOP_FILE="${MATRIX_BFM_ISAAC_DESKTOP_FILE:-${HOME:?}/Desktop/matrix-sonic.de
 SESSION_NAME="${MATRIX_BFM_ISAAC_DESKTOP_SESSION_NAME:-matrix-bfm-isaac-mainline-${UID}}"
 READY_TIMEOUT_SECONDS="${MATRIX_BFM_ISAAC_DESKTOP_READY_TIMEOUT_S:-240}"
 SETTLE_SECONDS="${MATRIX_BFM_ISAAC_DESKTOP_SETTLE_S:-10}"
+REQUIRE_ESC_UI_READY="${MATRIX_BFM_ISAAC_DESKTOP_REQUIRE_ESC_UI_READY:-1}"
 RECORDER_GUARD=1
 PROFILE_EXPECTED=""
 
@@ -101,6 +102,11 @@ done
 validate_identifier "session name" "$SESSION_NAME"
 validate_positive_integer "ready timeout" "$READY_TIMEOUT_SECONDS"
 validate_positive_integer "settle seconds" "$SETTLE_SECONDS"
+case "${REQUIRE_ESC_UI_READY,,}" in
+    1|true|yes|on) REQUIRE_ESC_UI_READY=1 ;;
+    0|false|no|off) REQUIRE_ESC_UI_READY=0 ;;
+    *) die "MATRIX_BFM_ISAAC_DESKTOP_REQUIRE_ESC_UI_READY must be a boolean" ;;
+esac
 [[ -f "$DESKTOP_FILE" && ! -L "$DESKTOP_FILE" ]] \
     || die "desktop shortcut must be a regular non-symlink file: $DESKTOP_FILE"
 command -v gio >/dev/null || die "gio is required to launch the desktop shortcut"
@@ -231,12 +237,13 @@ session_option() {
 health_state() {
     local run_dir="$1"
     local console_log="$2"
-    python3 - "$run_dir" "$console_log" <<'PY'
+    python3 - "$run_dir" "$console_log" "$REQUIRE_ESC_UI_READY" <<'PY'
 from pathlib import Path
 import sys
 
 run_dir = Path(sys.argv[1])
 console = Path(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+require_esc_ui_ready = len(sys.argv) > 3 and sys.argv[3] == "1"
 
 def read(path: Path) -> str:
     try:
@@ -283,7 +290,12 @@ renderer_ready = (
     "Starting UE" in renderer
     or "Starting canonical Matrix G1 renderer" in console_text
 )
-if keyboard_ready and physics_ready and renderer_ready:
+esc_ui_ready = (
+    not require_esc_ui_ready
+    or "External-state Matrix ESC UI provider ready" in renderer
+    or "External-state Matrix ESC UI provider ready" in console_text
+)
+if keyboard_ready and physics_ready and renderer_ready and esc_ui_ready:
     print("READY")
     raise SystemExit(0)
 missing = []
@@ -293,6 +305,8 @@ if not physics_ready:
     missing.append("physics_interactive_controls")
 if not renderer_ready:
     missing.append("renderer_started")
+if not esc_ui_ready:
+    missing.append("esc_ui_ready")
 print("PENDING missing=" + ",".join(missing))
 raise SystemExit(1)
 PY
