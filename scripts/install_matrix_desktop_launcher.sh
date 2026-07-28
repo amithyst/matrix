@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 TEMPLATE="$PROJECT_ROOT/packaging/matrix-sonic.desktop.in"
 PROFILE="heyuan"
 SCENE_ID="15"
+INITIAL_LOCOMOTION_POLICY=""
 DESKTOP_DIR=""
 ENTRY_ROOT=""
 ICON_PATH=""
@@ -21,6 +22,9 @@ Usage: bash scripts/install_matrix_desktop_launcher.sh [options]
 Options:
   --profile PROFILE     heyuan (default), trna, or zza
   --scene ID            Matrix native scene id (default: 15 / MoonWorld BFM)
+  --initial-locomotion-policy POLICY
+                       Initial policy for the start action: sonic or
+                       bfm-sonic-teacher50k (default: host profile)
   --desktop-dir DIR     Existing private Desktop directory (for tests or XDG overrides)
   --entry-root DIR      Logical repository root written into the desktop Exec
                        path; may be a symlink but must resolve to this checkout
@@ -62,6 +66,16 @@ validate_profile() {
 validate_scene() {
     [[ "$1" =~ ^(0|[1-9][0-9]?)$ ]] \
         || die "invalid scene id: $1 (expected 0-99)"
+}
+
+validate_initial_locomotion_policy() {
+    case "$1" in
+        sonic | bfm-sonic-teacher50k)
+            ;;
+        *)
+            die "invalid initial locomotion policy: $1 (expected sonic or bfm-sonic-teacher50k)"
+            ;;
+    esac
 }
 
 configure_shortcut_identity() {
@@ -201,8 +215,14 @@ render_template() {
                 printf 'Comment=%s\n' "$(desktop_string "$SHORTCUT_COMMENT")"
                 ;;
             'Exec=@MATRIX_START_EXEC@')
-                printf 'Exec=/usr/bin/bash %s start --profile %s --scene %s\n' \
-                    "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE" "$SCENE_ID"
+                if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+                    printf 'Exec=/usr/bin/bash %s start --profile %s --scene %s --initial-locomotion-policy %s\n' \
+                        "$(desktop_exec_argument "$LAUNCHER")" \
+                        "$PROFILE" "$SCENE_ID" "$INITIAL_LOCOMOTION_POLICY"
+                else
+                    printf 'Exec=/usr/bin/bash %s start --profile %s --scene %s\n' \
+                        "$(desktop_exec_argument "$LAUNCHER")" "$PROFILE" "$SCENE_ID"
+                fi
                 ;;
             'Icon=@MATRIX_ICON@')
                 printf 'Icon=%s\n' "$(desktop_string "$ICON_PATH")"
@@ -248,6 +268,11 @@ while (($# > 0)); do
             SCENE_ID="$2"
             shift 2
             ;;
+        --initial-locomotion-policy)
+            require_value "$1" "$#"
+            INITIAL_LOCOMOTION_POLICY="$2"
+            shift 2
+            ;;
         --desktop-dir)
             require_value "$1" "$#"
             DESKTOP_DIR="$2"
@@ -275,6 +300,9 @@ done
 
 validate_profile "$PROFILE"
 validate_scene "$SCENE_ID"
+if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
+    validate_initial_locomotion_policy "$INITIAL_LOCOMOTION_POLICY"
+fi
 configure_shortcut_identity
 if [[ -z "$ENTRY_ROOT" ]]; then
     ENTRY_ROOT="$PROJECT_ROOT"

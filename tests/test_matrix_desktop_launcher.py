@@ -579,6 +579,48 @@ class MatrixDesktopInstallerTest(unittest.TestCase):
         content = (desktop / "matrix-sonic.desktop").read_text(encoding="utf-8")
         self.assertIn(f"Icon={icon.resolve()}\n", content)
 
+    def test_start_action_can_pin_initial_locomotion_policy(self) -> None:
+        desktop = self.make_desktop_dir()
+        launcher_path = self.project / "scripts" / LAUNCHER.name
+
+        result = self.run_installer(
+            "--desktop-dir",
+            os.fspath(desktop),
+            "--profile",
+            "trna",
+            "--initial-locomotion-policy",
+            "sonic",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = (desktop / "matrix-sonic.desktop").read_text(encoding="utf-8")
+        self.assertIn(
+            f'Exec=/usr/bin/bash "{launcher_path}" start --profile trna --scene 15 --initial-locomotion-policy sonic\n',
+            content,
+        )
+        self.assertIn(
+            f'Exec=/usr/bin/bash "{launcher_path}" status --profile trna --scene 15\n',
+            content,
+        )
+        self.assertIn(
+            f'Exec=/usr/bin/bash "{launcher_path}" stop --profile trna --scene 15\n',
+            content,
+        )
+
+    def test_invalid_initial_locomotion_policy_is_rejected(self) -> None:
+        desktop = self.make_desktop_dir()
+
+        result = self.run_installer(
+            "--desktop-dir",
+            os.fspath(desktop),
+            "--initial-locomotion-policy",
+            "bfm;touch",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid initial locomotion policy", result.stderr)
+        self.assertFalse((desktop / "matrix-sonic.desktop").exists())
+
     def test_entry_root_may_be_a_symlink_to_the_checkout(self) -> None:
         desktop = self.make_desktop_dir()
         linked_root = self.root / "matrix-mainline"
