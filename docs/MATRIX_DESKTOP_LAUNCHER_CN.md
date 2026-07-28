@@ -4,6 +4,53 @@
 SONIC 游戏链路放入可恢复的 tmux 会话；游戏内配置、世界导航和版本信息仍在 ESC
 战术终端中完成。
 
+## tRNA 当前验收主线（BFM/Isaac world16）
+
+tRNA 桌面只保留一个 `matrix-sonic.desktop`。当前发布入口不使用下面的 legacy
+native/MuJoCo wrapper，而是通过稳定发布指针启动已验收的 BFM/Isaac world16 链：
+
+```bash
+ln -sfn /home/trna/<qualified-matrix-release> /home/trna/matrix-mainline
+bash /home/trna/matrix-mainline/scripts/install_matrix_bfm_isaac_desktop_launcher.sh \
+  --active-root /home/trna/matrix-mainline \
+  --profile trna
+```
+
+安装器会原子覆盖同名桌面入口，因此不会产生第二个 Matrix 图标。双击执行：
+
+```bash
+bash scripts/run_matrix_bfm_isaac_guarded.sh interactive \
+  --profile trna \
+  --onscreen \
+  --duration 7200 \
+  --correctness-only
+```
+
+实际进程位于 `matrix-bfm-isaac-mainline-<uid>` tmux 会话。重复双击幂等；右键菜单
+提供状态查询和安全停止。停止只向该会话发送 `Ctrl+C` 并等待 finalizer，超时会保留
+现场而不会 `pkill`。桌面 wrapper 会清除视频、材质和 Python 路径覆盖，使用冻结验收
+配置，并把启动/锁冲突/停止结果及每次 guard 控制台输出写入：
+
+```text
+~/.local/state/matrix-bfm-isaac/mainline-desktop-launcher.log
+~/.local/state/matrix-bfm-isaac/desktop_<UTC>_<pid>.console.log
+```
+
+`matrix-mainline` 只在一个版本完成验证后由发布流程原子切换；双击不会执行 `git pull`。
+本链固定使用已锁定的 world16 step079000 profile，不能把 native 入口中的策略热切换、
+KungFu/AMP 起身或 `MATRIX_INITIAL_LOCOMOTION_POLICY` 语义套到本链上。
+
+如果启动失败或 finalizer 未通过，下一次双击不会覆盖失败现场。检查上面的 console log
+和 evidence 目录后，可显式清理已经死亡的 tmux 会话：
+
+```bash
+bash /home/trna/matrix-mainline/scripts/launch_matrix_bfm_isaac_desktop.sh \
+  dismiss --profile trna
+```
+
+下面的安装器和 wrapper 属于 legacy native/MuJoCo 多场景链，保留给 Heyuan/ZZA、
+回归和对照，不应再作为 tRNA 桌面的主入口。
+
 ## 安装桌面图标
 
 从当前 Matrix 仓库执行：
