@@ -675,6 +675,54 @@ Path(os.environ["FAKE_PHYSICS_DONE"]).write_text("done\\n", encoding="utf-8")
         environment.pop("MATRIX_UE_MATERIAL_FIX_PRELOAD", None)
         return project, environment, evidence
 
+    def test_python310_paths_fallback_rejects_decoy_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, environment, evidence = self.make_project(
+                root, residual_kind="clean-term143"
+            )
+            runtime_config = Path(environment["MATRIX_BFM_ISAAC_CONFIG"])
+            expected = {
+                "bfm_sonic_repo": Path(environment["MATRIX_BFM_ISAAC_SOURCE_ROOT"]),
+                "g1_usd": (
+                    Path(environment["MATRIX_BFM_ISAAC_PHYSICS_ASSET_ROOT"])
+                    / "main.usd"
+                ),
+                "scene_root": Path(environment["MATRIX_BFM_ISAAC_COLLISION_ROOT"]),
+                "collision_usd": (
+                    Path(environment["MATRIX_BFM_ISAAC_COLLISION_ROOT"])
+                    / "collision.usda"
+                ),
+            }
+            lines = ["[paths]"]
+            for key in expected:
+                lines.append(f'"{key}" = "/unverified/{key}"')
+            # This is valid TOML.  A fallback parser must leave [paths] at the
+            # commented table header instead of accepting decoy values below.
+            lines.extend(("", '[decoy] # = "still a table header"'))
+            for key, value in expected.items():
+                lines.append(f"{key} = {json.dumps(os.fspath(value))}")
+            runtime_config.write_text("\n".join((*lines, "")), encoding="utf-8")
+
+            result = subprocess.run(
+                (
+                    "bash",
+                    os.fspath(project / "scripts/run_matrix_bfm_isaac.sh"),
+                    "smoke",
+                    "--run-dir",
+                    os.fspath(evidence),
+                ),
+                cwd=project,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse(Path(environment["FAKE_ACCEPTANCE_MARKER"]).exists())
+
     def test_qualified_launcher_rejects_generic_video_and_material_overrides(
         self,
     ) -> None:

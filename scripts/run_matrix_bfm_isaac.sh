@@ -297,15 +297,68 @@ if ! "$RUNTIME_PYTHON" -I - \
     "$BFM_SOURCE_ROOT" <<'PY'
 import json
 from pathlib import Path
+import re
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
+
+def load_paths(text):
+    if tomllib is not None:
+        config = tomllib.loads(text)
+        return config.get("paths")
+
+    # Python 3.10 has no stdlib TOML reader.  This frozen closure check only
+    # needs the string-valued [paths] table, so reject anything ambiguous in
+    # that table and ignore unrelated runtime sections.
+    paths = None
+    in_paths = False
+    seen_paths = False
+    decoder = json.JSONDecoder()
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("["):
+            match = re.fullmatch(
+                r"\[\s*([A-Za-z0-9_-]+)\s*\]\s*(?:#.*)?",
+                stripped,
+            )
+            if match is None:
+                raise SystemExit(f"unsupported TOML table at line {line_number}")
+            section = match.group(1)
+            in_paths = section == "paths"
+            if in_paths:
+                if seen_paths:
+                    raise SystemExit(f"duplicate paths table at line {line_number}")
+                paths = {}
+                seen_paths = True
+            continue
+        if not in_paths:
+            continue
+        if "=" not in stripped:
+            raise SystemExit(f"invalid paths assignment at line {line_number}")
+        key, encoded = (part.strip() for part in stripped.split("=", 1))
+        if re.fullmatch(r"[A-Za-z0-9_-]+", key) is None or key in paths:
+            raise SystemExit(f"invalid or duplicate paths key at line {line_number}")
+        try:
+            value, end = decoder.raw_decode(encoded)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"invalid paths string at line {line_number}") from exc
+        remainder = encoded[end:].strip()
+        if not isinstance(value, str) or (remainder and not remainder.startswith("#")):
+            raise SystemExit(f"unsupported paths value at line {line_number}")
+        paths[key] = value
+    return paths
 
 lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-config = tomllib.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+paths = load_paths(Path(sys.argv[2]).read_text(encoding="utf-8"))
 physics_root = Path(sys.argv[3]).resolve(strict=True)
 collision_root = Path(sys.argv[4]).resolve(strict=True)
 bfm_source_root = Path(sys.argv[5]).resolve(strict=True)
-paths = config.get("paths")
 if not isinstance(paths, dict):
     raise SystemExit("runtime config has no [paths] table")
 
