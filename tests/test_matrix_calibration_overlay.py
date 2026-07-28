@@ -418,7 +418,7 @@ class OverlayLayoutTest(unittest.TestCase):
             for left, right in zip(controls, controls[1:]):
                 self.assertFalse(self.intersects(left, right))
 
-    def test_runtime_pause_footer_is_bounded_distinct_and_on_every_page(self) -> None:
+    def test_footer_actions_are_bounded_distinct_and_on_every_page(self) -> None:
         for geometry in (
             MODULE.WindowGeometry(1, 0, 0, 480, 360),
             MODULE.WindowGeometry(1, 40, 60, 1280, 800),
@@ -427,9 +427,12 @@ class OverlayLayoutTest(unittest.TestCase):
                 layout = MODULE.overlay_layout(geometry)
                 panel = layout["panel"]
                 pause = layout["runtime_pause"]
+                quit_game = layout["quit_game"]
                 apply = layout["apply_return"]
+                self.assertFalse(self.intersects(pause, quit_game))
+                self.assertFalse(self.intersects(quit_game, apply))
                 self.assertFalse(self.intersects(pause, apply))
-                for rectangle in (pause, apply):
+                for rectangle in (pause, quit_game, apply):
                     self.assertTrue(
                         MODULE.point_in_rectangle(rectangle[:2], panel)
                     )
@@ -446,6 +449,10 @@ class OverlayLayoutTest(unittest.TestCase):
                     pause[0] + pause[2] // 2,
                     pause[1] + pause[3] // 2,
                 )
+                quit_centre = (
+                    quit_game[0] + quit_game[2] // 2,
+                    quit_game[1] + quit_game[3] // 2,
+                )
                 for page in (
                     "loadout",
                     "settings",
@@ -453,10 +460,15 @@ class OverlayLayoutTest(unittest.TestCase):
                     "inventory",
                     "navigation",
                     "video",
+                    "system",
                 ):
                     self.assertEqual(
                         MODULE.panel_action_at(layout, *centre, page=page),
                         "runtime_pause",
+                    )
+                    self.assertEqual(
+                        MODULE.panel_action_at(layout, *quit_centre, page=page),
+                        "quit_game",
                     )
 
     def test_motion_speed_grid_is_bounded_page_scoped_and_avoids_crosshair(self) -> None:
@@ -1732,6 +1744,149 @@ class OverlayStateTest(unittest.TestCase):
             "amp-flat-v3",
         )
 
+    def test_loadout_draws_locomotion_progress_for_strategy_switch(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.StrategyLoadoutModel(
+            available=True,
+            status="switching",
+            active_slot="locomotion",
+            locomotion_policy_id="sonic",
+            recovery_policy_id="kungfu",
+            locomotion_candidates=(
+                MODULE.StrategyPolicyModel("sonic", True, True, "SONIC"),
+                MODULE.StrategyPolicyModel(
+                    "bfm-sonic-teacher50k",
+                    True,
+                    True,
+                    "BFM SONIC Teacher50k",
+                ),
+            ),
+            recovery_candidates=(),
+            pending_policy_id="bfm-sonic-teacher50k",
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+        overlay._draw_progress_bar = mock.Mock()
+
+        overlay._draw_loadout_page(layout, model)
+
+        overlay._draw_progress_bar.assert_called_once()
+        self.assertIn("BFM", overlay._draw_progress_bar.call_args.kwargs["label"])
+
+    def test_loadout_draws_policy_rejection_status(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.strategy_loadout_model(
+            {
+                "strategy_loadout": {
+                    "version": 1,
+                    "available": True,
+                    "status": "ready",
+                    "active_slot": "locomotion",
+                    "pending": None,
+                    "slots": [
+                        {
+                            "slot": "locomotion",
+                            "selected_policy_id": "sonic",
+                            "locked": False,
+                            "candidates": [
+                                {
+                                    "policy_id": "sonic",
+                                    "name": "SONIC",
+                                    "available": True,
+                                    "resident": True,
+                                },
+                                {
+                                    "policy_id": "bfm-sonic-teacher50k",
+                                    "name": "BFM SONIC Teacher50k",
+                                    "available": True,
+                                    "resident": True,
+                                },
+                            ],
+                        },
+                        {
+                            "slot": "recovery",
+                            "selected_policy_id": "kungfu",
+                            "locked": False,
+                            "candidates": [],
+                        },
+                    ],
+                }
+            }
+        )
+        status = MODULE.CommandConsoleStatus(
+            available=True,
+            provider_editing=False,
+            in_flight=False,
+            status="error",
+            request_id="cmd-test",
+            sequence=1,
+            result_revision=1,
+            ok=False,
+            code="E_POLICY_SWITCH_REJECTED",
+            message="BFM hot switch reference buffer was not swapped",
+            warning=None,
+            restart_required=False,
+            outcome_unknown=False,
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                    "error",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+        overlay._draw_progress_bar = mock.Mock()
+
+        overlay._draw_loadout_page(layout, model, status)
+
+        overlay._draw_progress_bar.assert_called_once()
+        self.assertEqual(
+            overlay._draw_progress_bar.call_args.kwargs["colour_name"],
+            "error",
+        )
+        self.assertIn(
+            "策略切换失败",
+            overlay._draw_progress_bar.call_args.kwargs["label"],
+        )
+
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):
             return MODULE.settings_panel_model(
@@ -2277,6 +2432,26 @@ class RuntimePausePointerTest(unittest.TestCase):
 
 
 class PointerActionPublisherTest(unittest.TestCase):
+    def test_game_quit_intent_is_typed(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(), session="known-session"
+        )
+        try:
+            publisher.publish_game_quit()
+            self.assertEqual(
+                json.loads(receiver.recv(1024).decode("ascii")),
+                {
+                    "version": 1,
+                    "session": "known-session",
+                    "sequence": 1,
+                    "kind": "game_quit",
+                },
+            )
+        finally:
+            publisher.close()
+            receiver.close()
+
     def test_runtime_pause_intent_is_typed_and_epoch_guarded(self) -> None:
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         publisher = MODULE.PointerActionPublisher(

@@ -62,6 +62,7 @@ _RUNTIME_PAUSE_RE = re.compile(
     r"(?P<epoch>0|[1-9][0-9]{0,9})\s*\Z",
     re.IGNORECASE,
 )
+_GAME_QUIT_RE = re.compile(r"/?(?:game\s+)?quit\s*\Z", re.IGNORECASE)
 _DATA_MODIFY_RE = re.compile(
     r"/?data\s+modify\s+entity\s+@s\s+"
     r"(?P<path>[A-Za-z0-9_.:-]+)\s+set\s+value\s+"
@@ -384,6 +385,19 @@ class RuntimePause:
 
 
 @dataclass(frozen=True)
+class GameQuit:
+    """Request a normal operator-initiated Matrix runtime shutdown."""
+
+    reason: str = "operator"
+
+    def __post_init__(self) -> None:
+        reason = str(self.reason).strip().lower()
+        if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", reason) is None:
+            raise CommandParseError("E_GAME_QUIT_REASON", "game quit reason is invalid")
+        object.__setattr__(self, "reason", reason)
+
+
+@dataclass(frozen=True)
 class MovementModeSet:
     """Select one persisted movement mode at a known settings revision."""
 
@@ -479,6 +493,7 @@ McCommand: TypeAlias = (
     | PolicySlotAssignment
     | CreativeSpawnItem
     | RuntimePause
+    | GameQuit
     | MovementModeSet
     | DataModifyNumber
     | DataModifyInput
@@ -661,6 +676,9 @@ def _parse_data_modify(path: str, raw_value: str) -> DataModifyNumber | DataModi
 
 def parse_mc_command(text: object) -> ParsedCommand:
     command_text = _validate_text(text)
+    game_quit = _GAME_QUIT_RE.fullmatch(command_text)
+    if game_quit is not None:
+        return ParsedCommand(GameQuit())
     runtime_pause = _RUNTIME_PAUSE_RE.fullmatch(command_text)
     if runtime_pause is not None:
         return ParsedCommand(
@@ -752,7 +770,7 @@ def parse_mc_command(text: object) -> ParsedCommand:
     raise CommandParseError(
         "E_COMMAND_UNKNOWN",
         "supported commands are /summon, /tp, /teleport list, /policy, "
-        "/item spawn, /runtime pause, and /data modify",
+        "/item spawn, /runtime pause, /game quit, and /data modify",
     )
 
 
@@ -769,6 +787,8 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "target": command.target,
             "expected_epoch": command.expected_epoch,
         }
+    if isinstance(command, GameQuit):
+        return {"name": "game_quit", "reason": command.reason}
     if isinstance(command, CreativeSpawnItem):
         return {"name": "creative_spawn_item", "item_id": command.item_id}
     if isinstance(command, DataModifyInput):
@@ -845,6 +865,13 @@ def command_from_mapping(value: object) -> McCommand:
                 target=value.get("target"),
                 expected_epoch=value.get("expected_epoch"),
             )
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "game_quit":
+        if set(value) != {"name", "reason"}:
+            raise CommandProtocolError("game quit has an invalid schema")
+        try:
+            return GameQuit(reason=value.get("reason"))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     if name == "creative_spawn_item":
@@ -1357,6 +1384,7 @@ __all__ = [
     "CreativeSpawnItem",
     "DataModifyInput",
     "DataModifyNumber",
+    "GameQuit",
     "GameCommandRequest",
     "GameCommandResponse",
     "MAX_TELEPORT_QUERY_TAGS",

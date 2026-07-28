@@ -427,6 +427,12 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "slot": "recovery",
                     "policy_id": "kungfu",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 4,
+                    "kind": "game_quit",
+                },
             )
             try:
                 for packet in packets:
@@ -443,6 +449,7 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                             slot="recovery",
                             policy_id="kungfu",
                         ),
+                        MODULE.OverlayIntent(kind="game_quit"),
                     ),
                 )
             finally:
@@ -893,6 +900,61 @@ class GameCommandClientTest(unittest.TestCase):
         self.addCleanup(client.close)
         self.addCleanup(runtime.close)
         return client, runtime
+
+    def test_quit_game_skips_editor_and_tracks_ack(self) -> None:
+        client, runtime = self.make_client()
+        self.assertTrue(
+            client.quit_game(
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+            )
+        )
+        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        self.assertEqual(request.command, MC_COMMANDS.GameQuit())
+        self.assertFalse(client.editing)
+
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_GAME_QUIT",
+                    message="Matrix game quit requested",
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertEqual(client.status, "success")
+        self.assertEqual(client.code, "OK_GAME_QUIT")
+
+    def test_quit_game_requires_panel_and_neutral_frame(self) -> None:
+        for arguments, expected_code in (
+            (
+                dict(
+                    calibration_active=False,
+                    neutral_frame_ready=True,
+                    restart_requested=False,
+                ),
+                "E_NOT_PAUSED",
+            ),
+            (
+                dict(
+                    calibration_active=True,
+                    neutral_frame_ready=False,
+                    restart_requested=False,
+                ),
+                "E_NEUTRAL_REQUIRED",
+            ),
+        ):
+            with self.subTest(expected_code=expected_code):
+                client, runtime = self.make_client()
+                self.assertFalse(client.quit_game(**arguments))
+                self.assertEqual(client.code, expected_code)
+                with self.assertRaises(BlockingIOError):
+                    runtime.recv(4096)
 
     def make_celestial_client(self):
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -7875,6 +7937,7 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         backend._expected_ue_pid = 1234
         backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
         backend._escape_grabbed_modifiers = (0,)
+        backend._grabbed_key_modifiers = {"escape": (0,), "q": (0,), "e": (0,)}
         backend._grabbed_escape_down = False
         backend._grabbed_escape_press_pending = False
         backend._grabbed_escape_events = 0
@@ -7886,6 +7949,7 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         self.assertFalse(released.escape)
         self.assertEqual(backend.pointer_telemetry["grabbed_escape_events"], 2)
         self.assertTrue(backend.pointer_telemetry["escape_grabbed"])
+        self.assertTrue(backend.pointer_telemetry["turn_keys_grabbed"])
 
     def test_close_ungrabs_passive_escape_before_closing_display(self) -> None:
         calls: list[tuple[str, object]] = []
@@ -7910,8 +7974,13 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         backend._x11 = FakeX11()
         backend._display = 11
         backend._root = 22
-        backend._keycodes = {"escape": 37}
+        backend._keycodes = {"escape": 37, "q": 24, "e": 26}
         backend._raw_motion = None
+        backend._grabbed_key_modifiers = {
+            "escape": (0, MODULE._X11_MOD2_MASK),
+            "q": (0, MODULE._X11_MOD2_MASK),
+            "e": (0, MODULE._X11_MOD2_MASK),
+        }
         backend._escape_grabbed_modifiers = (0, MODULE._X11_MOD2_MASK)
         backend._grabbed_escape_down = True
         backend._grabbed_escape_press_pending = True
@@ -7923,11 +7992,16 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             [
                 ("ungrab", 0),
                 ("ungrab", MODULE._X11_MOD2_MASK),
+                ("ungrab", 0),
+                ("ungrab", MODULE._X11_MOD2_MASK),
+                ("ungrab", 0),
+                ("ungrab", MODULE._X11_MOD2_MASK),
                 ("flush", None),
                 ("close", None),
             ],
         )
         self.assertIsNone(backend._display)
+        self.assertEqual(backend._grabbed_key_modifiers, {})
         self.assertEqual(backend._escape_grabbed_modifiers, ())
 
 

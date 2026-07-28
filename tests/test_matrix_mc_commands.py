@@ -19,6 +19,16 @@ REQUEST_ID = "cmd-" + "b" * 32
 
 
 class McCommandParserTest(unittest.TestCase):
+    def test_parses_game_quit(self) -> None:
+        self.assertEqual(
+            MODULE.parse_mc_command("/game quit").command,
+            MODULE.GameQuit(),
+        )
+        self.assertEqual(
+            MODULE.parse_mc_command("quit").command,
+            MODULE.GameQuit(),
+        )
+
     def test_parses_runtime_pause_with_expected_epoch(self) -> None:
         self.assertEqual(
             MODULE.parse_mc_command("/runtime pause paused 0").command,
@@ -289,6 +299,27 @@ class McCommandParserTest(unittest.TestCase):
 
 
 class McCommandProtocolTest(unittest.TestCase):
+    def test_game_quit_round_trip_is_typed(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=2,
+            request_id=REQUEST_ID,
+            command=MODULE.GameQuit(),
+        )
+        payload = MODULE.encode_command_request(request)
+
+        self.assertNotIn(b"/quit", payload)
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+        for mapping in (
+            {"name": "game_quit"},
+            {"name": "game_quit", "reason": "operator", "extra": 1},
+            {"name": "game_quit", "reason": "../shell"},
+        ):
+            with self.subTest(mapping=mapping), self.assertRaises(
+                MODULE.CommandProtocolError
+            ):
+                MODULE.command_from_mapping(mapping)
+
     def test_runtime_pause_round_trip_is_typed_and_strict(self) -> None:
         request = MODULE.GameCommandRequest(
             session=SESSION,
