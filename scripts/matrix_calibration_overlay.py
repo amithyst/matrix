@@ -100,6 +100,13 @@ _MAX_INTENT_PACKET_BYTES = 2048
 _MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 _MAX_LOCOMOTION_POLICY_BUTTONS = 3
 _MAX_RECOVERY_POLICY_BUTTONS = 4
+_POLICY_STATUS_DISPLAY_SECONDS = 4.0
+_STARTUP_MEDIA_FRAME_RATE_HZ = 2.0
+_STARTUP_MEDIA_MAX_FRAMES = 24
+_STARTUP_MEDIA_MAX_PIXELS = 640 * 360
+_STARTUP_MEDIA_GRID_COLUMNS = 72
+_STARTUP_MEDIA_GRID_ROWS = 42
+_STARTUP_MEDIA_COLOUR_STEP = 32
 _MIN_OVERLAY_FONT_SIZE = 1
 _DEFAULT_OVERLAY_FONT_SIZE = 13
 _MAX_OVERLAY_FONT_SIZE = 22
@@ -1214,6 +1221,75 @@ class StartupLoadingModel:
     active: bool
     message: str
     progress: float
+    media_frames_dir: str | None = None
+    media_frame_rate_hz: float = _STARTUP_MEDIA_FRAME_RATE_HZ
+
+
+@dataclass(frozen=True)
+class StartupMediaFrame:
+    width: int
+    height: int
+    pixels: bytes
+
+
+_PPM_WHITESPACE = b" \t\r\n"
+
+
+def _skip_ppm_header_space(data: bytes, index: int) -> int:
+    while index < len(data):
+        value = data[index]
+        if value in _PPM_WHITESPACE:
+            index += 1
+            continue
+        if value == ord("#"):
+            while index < len(data) and data[index] not in b"\r\n":
+                index += 1
+            continue
+        break
+    return index
+
+
+def _read_ppm_token(data: bytes, index: int) -> tuple[bytes, int]:
+    index = _skip_ppm_header_space(data, index)
+    start = index
+    while index < len(data):
+        value = data[index]
+        if value in _PPM_WHITESPACE or value == ord("#"):
+            break
+        index += 1
+    if index == start:
+        raise ValueError("missing PPM header token")
+    return data[start:index], index
+
+
+def read_startup_media_ppm(path: Path) -> StartupMediaFrame:
+    data = path.read_bytes()
+    magic, index = _read_ppm_token(data, 0)
+    if magic != b"P6":
+        raise ValueError("startup media frame is not binary PPM/P6")
+    width_token, index = _read_ppm_token(data, index)
+    height_token, index = _read_ppm_token(data, index)
+    max_value_token, index = _read_ppm_token(data, index)
+    try:
+        width = int(width_token)
+        height = int(height_token)
+        max_value = int(max_value_token)
+    except ValueError as exc:
+        raise ValueError("startup media frame has a non-numeric PPM header") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("startup media frame has non-positive dimensions")
+    if width * height > _STARTUP_MEDIA_MAX_PIXELS:
+        raise ValueError("startup media frame is larger than the runtime overlay cap")
+    if max_value != 255:
+        raise ValueError("startup media frame must use 8-bit RGB samples")
+    if index >= len(data) or data[index] not in _PPM_WHITESPACE:
+        raise ValueError("startup media frame has no pixel-data separator")
+    index += 1
+    expected = width * height * 3
+    payload = data[index : index + expected]
+    if len(payload) != expected:
+        raise ValueError("startup media frame pixel payload is truncated")
+    return StartupMediaFrame(width=width, height=height, pixels=payload)
 
 
 def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
@@ -1228,7 +1304,26 @@ def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
         progress_value = 0.0
     else:
         progress_value = max(0.0, min(1.0, float(progress)))
-    return StartupLoadingModel(True, message[:80], progress_value)
+    media_frames_dir_raw = raw.get("media_frames_dir")
+    media_frames_dir = (
+        media_frames_dir_raw[:500]
+        if isinstance(media_frames_dir_raw, str)
+        and media_frames_dir_raw
+        and "\0" not in media_frames_dir_raw
+        else None
+    )
+    frame_rate_raw = raw.get("media_frame_rate_hz", raw.get("media_frame_rate"))
+    if isinstance(frame_rate_raw, bool) or not isinstance(frame_rate_raw, (int, float)):
+        media_frame_rate_hz = _STARTUP_MEDIA_FRAME_RATE_HZ
+    else:
+        media_frame_rate_hz = max(0.1, min(12.0, float(frame_rate_raw)))
+    return StartupLoadingModel(
+        True,
+        message[:80],
+        progress_value,
+        media_frames_dir,
+        media_frame_rate_hz,
+    )
 
 
 @dataclass(frozen=True)
@@ -2704,6 +2799,7 @@ class CommandConsoleStatus:
     warning: str | None
     restart_required: bool
     outcome_unknown: bool
+    result_age_s: float | None = None
 
     @property
     def result_identity(self) -> tuple[object, ...]:
@@ -2751,6 +2847,16 @@ def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
     ok = ok_value if type(ok_value) is bool else None
     warning = _bounded_status_text(raw.get("warning"), maximum=512)
     warning = _WARNING_DISPLAY_ALIASES.get(warning, warning)
+    result_age_value = raw.get("result_age_s")
+    result_age_s = (
+        max(0.0, float(result_age_value))
+        if (
+            not isinstance(result_age_value, bool)
+            and isinstance(result_age_value, (int, float))
+            and math.isfinite(float(result_age_value))
+        )
+        else None
+    )
     return CommandConsoleStatus(
         available=raw.get("available") is True,
         provider_editing=raw.get("editing") is True,
@@ -2765,6 +2871,7 @@ def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
         warning=warning,
         restart_required=raw.get("restart_required") is True,
         outcome_unknown=raw.get("outcome_unknown") is True,
+        result_age_s=result_age_s,
     )
 
 
@@ -3530,6 +3637,9 @@ class X11CalibrationOverlay:
         self._pending_font_slider_action: str | None = None
         self._pending_font_slider_size: int | None = None
         self._colours: dict[str, int] = {}
+        self._startup_media_frame_dir: str | None = None
+        self._startup_media_frames: tuple[StartupMediaFrame, ...] = ()
+        self._startup_media_colour_cache: dict[tuple[int, int, int], int] = {}
         self._visible = False
         self._cursor_visible = False
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
@@ -5419,6 +5529,8 @@ class X11CalibrationOverlay:
             and command_status.status == "error"
             and isinstance(command_status.code, str)
             and command_status.code.startswith("E_POLICY")
+            and command_status.result_age_s is not None
+            and command_status.result_age_s <= _POLICY_STATUS_DISPLAY_SECONDS
         ):
             progress_state = (
                 1.0,
@@ -6083,21 +6195,69 @@ class X11CalibrationOverlay:
             return "返回游戏并应用"
         return "返回游戏"
 
-    def _draw_startup_loading(
+    def _load_startup_media_frames(
         self,
-        layout: dict[str, tuple[int, int, int, int]],
-        model: StartupLoadingModel,
-    ) -> None:
-        _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
-        content = (
-            48,
-            max(92, panel_height // 3),
-            max(1, panel_width - 96),
-            max(110, panel_height // 3),
+        media_frames_dir: str | None,
+    ) -> tuple[StartupMediaFrame, ...]:
+        if not media_frames_dir:
+            self._startup_media_frame_dir = None
+            self._startup_media_frames = ()
+            return ()
+        try:
+            directory = Path(media_frames_dir).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            directory = Path(media_frames_dir).expanduser()
+        directory_key = os.fspath(directory)
+        if (
+            getattr(self, "_startup_media_frame_dir", None) == directory_key
+            and getattr(self, "_startup_media_frames", ())
+        ):
+            return self._startup_media_frames
+        frames: list[StartupMediaFrame] = []
+        try:
+            paths = sorted(directory.glob("*.ppm"))[:_STARTUP_MEDIA_MAX_FRAMES]
+        except OSError:
+            paths = []
+        for path in paths:
+            try:
+                frames.append(read_startup_media_ppm(path))
+            except (OSError, ValueError):
+                continue
+        self._startup_media_frame_dir = directory_key
+        self._startup_media_frames = tuple(frames)
+        return self._startup_media_frames
+
+    def _startup_media_pixel(self, red: int, green: int, blue: int) -> int:
+        luminance = max(
+            0,
+            min(255, (int(red) * 2126 + int(green) * 7152 + int(blue) * 722) // 10000),
         )
-        panel = self._windows["panel"]
-        gc = ctypes.c_void_p(self._panel_gc)
-        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        level = max(0, min(15, luminance // 16))
+        tinted = (
+            min(255, 4 + level * 7),
+            min(255, 16 + level * 10),
+            min(255, 32 + level * 13),
+        )
+        cache = getattr(self, "_startup_media_colour_cache", None)
+        if cache is None:
+            cache = {}
+            self._startup_media_colour_cache = cache
+        if tinted not in cache:
+            cache[tinted] = self._named_colour(
+                f"#{tinted[0]:02x}{tinted[1]:02x}{tinted[2]:02x}".encode("ascii"),
+                self._colours["button"],
+            )
+        return cache[tinted]
+
+    def _draw_startup_background(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        panel_width: int,
+        panel_height: int,
+        model: StartupLoadingModel,
+    ) -> bool:
+        self._x11.XSetForeground(self._display, gc, self._colours["disabled"])
         self._x11.XFillRectangle(
             self._display,
             panel,
@@ -6107,45 +6267,278 @@ class X11CalibrationOverlay:
             panel_width,
             panel_height,
         )
-        self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+        frames = self._load_startup_media_frames(model.media_frames_dir)
+        if frames:
+            frame_index = int(time.monotonic() * model.media_frame_rate_hz) % len(
+                frames
+            )
+            frame = frames[frame_index]
+            columns = min(_STARTUP_MEDIA_GRID_COLUMNS, max(24, panel_width // 14))
+            rows = min(_STARTUP_MEDIA_GRID_ROWS, max(18, panel_height // 14))
+            for row in range(rows):
+                sample_y = min(
+                    frame.height - 1,
+                    max(0, int((row + 0.5) * frame.height / rows)),
+                )
+                top = row * panel_height // rows
+                bottom = max(top + 1, (row + 1) * panel_height // rows)
+                for column in range(columns):
+                    sample_x = min(
+                        frame.width - 1,
+                        max(0, int((column + 0.5) * frame.width / columns)),
+                    )
+                    offset = (sample_y * frame.width + sample_x) * 3
+                    pixel = self._startup_media_pixel(
+                        frame.pixels[offset],
+                        frame.pixels[offset + 1],
+                        frame.pixels[offset + 2],
+                    )
+                    left = column * panel_width // columns
+                    right = max(left + 1, (column + 1) * panel_width // columns)
+                    self._x11.XSetForeground(self._display, gc, pixel)
+                    self._x11.XFillRectangle(
+                        self._display,
+                        panel,
+                        gc,
+                        left,
+                        top,
+                        right - left,
+                        bottom - top,
+                    )
+
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        for y in range(0, panel_height, 18):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                0,
+                y,
+                panel_width,
+                1,
+            )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        grid_step_x = max(72, panel_width // 10)
+        grid_step_y = max(54, panel_height // 8)
+        for x in range(grid_step_x, panel_width, grid_step_x):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                x,
+                0,
+                1,
+                panel_height,
+            )
+        for y in range(grid_step_y, panel_height, grid_step_y):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                0,
+                y,
+                panel_width,
+                1,
+            )
+        return bool(frames)
+
+    def _draw_startup_corner_brackets(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        colour_name: str = "cyan",
+    ) -> None:
+        length = max(24, min(72, width // 7))
+        thickness = 3
+        self._x11.XSetForeground(self._display, gc, self._colours[colour_name])
+        for left, top, vertical_sign in (
+            (x, y, 1),
+            (x + width - length, y, 1),
+            (x, y + height - thickness, -1),
+            (x + width - length, y + height - thickness, -1),
+        ):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                left,
+                top,
+                length,
+                thickness,
+            )
+            vertical_x = left if left == x else x + width - thickness
+            vertical_y = y if vertical_sign > 0 else y + height - length
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                vertical_x,
+                vertical_y,
+                thickness,
+                length,
+            )
+
+    def _draw_startup_segmented_progress_bar(
+        self,
+        rectangle: tuple[int, int, int, int],
+        *,
+        progress: float,
+        label: str,
+        colour_name: str = "cyan",
+    ) -> None:
+        x, y, width, height = rectangle
+        progress = max(0.0, min(1.0, float(progress)))
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._draw_text(
+            label,
+            x=x,
+            y=max(12, y - 8),
+            colour=self._colours["muted"],
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["disabled"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            width,
+            height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
         self._x11.XDrawRectangle(
             self._display,
             panel,
             gc,
-            18,
-            18,
-            max(1, panel_width - 37),
-            max(1, panel_height - 37),
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
         )
+        segment_count = max(12, min(30, width // 28))
+        gap = 3
+        usable = max(1, width - 2 - gap * (segment_count - 1))
+        shimmer = int(time.monotonic() * 9) % segment_count
+        for index in range(segment_count):
+            left = x + 1 + index * (usable + gap) // segment_count + index * gap
+            right = x + 1 + (index + 1) * usable // segment_count + index * gap
+            right = max(left + 1, min(x + width - 1, right))
+            segment_progress = progress * segment_count - index
+            if segment_progress <= 0:
+                continue
+            fill_width = right - left
+            if segment_progress < 1.0:
+                fill_width = max(1, int(round(fill_width * segment_progress)))
+            self._x11.XSetForeground(
+                self._display,
+                gc,
+                self._colours["white" if index == shimmer else colour_name],
+            )
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                left,
+                y + 3,
+                fill_width,
+                max(1, height - 6),
+            )
         self._draw_text(
-            "MATRIX BOOT SEQUENCE",
-            x=content[0],
-            y=content[1],
+            f"{int(round(progress * 100)):02d}%",
+            x=x + max(1, width - 48),
+            y=y + height + 24,
+            colour=self._colours["cyan"],
+        )
+
+    def _draw_startup_loading(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: StartupLoadingModel,
+    ) -> None:
+        _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        media_online = self._draw_startup_background(
+            panel,
+            gc,
+            panel_width,
+            panel_height,
+            model,
+        )
+        content_width = max(1, min(860, panel_width - 80))
+        content_height = max(216, min(300, panel_height - 100))
+        content_x = max(24, (panel_width - content_width) // 2)
+        content_y = max(42, (panel_height - content_height) // 2)
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            content_x,
+            content_y,
+            content_width,
+            content_height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            content_x + 8,
+            content_y + 8,
+            max(1, content_width - 17),
+            max(1, content_height - 17),
+        )
+        self._draw_startup_corner_brackets(
+            panel,
+            gc,
+            content_x,
+            content_y,
+            content_width,
+            content_height,
+        )
+        text_x = content_x + 34
+        text_y = content_y + 58
+        self._draw_text(
+            "MATRIX // BFM-SONIC BOOT",
+            x=text_x,
+            y=text_y,
             colour=self._colours["white"],
             large=True,
         )
         self._draw_text(
             model.message,
-            x=content[0],
-            y=content[1] + 36,
+            x=text_x,
+            y=text_y + 36,
             colour=self._colours["muted"],
         )
-        bar = (
-            content[0],
-            content[1] + 72,
-            content[2],
-            18,
+        feed_status = (
+            "LUNAR VIDEO BUFFER ONLINE"
+            if media_online
+            else "LUNAR VIDEO BUFFER STANDBY"
         )
-        self._draw_progress_bar(
+        bar = (
+            text_x,
+            text_y + 86,
+            max(1, content_width - 68),
+            26,
+        )
+        self._draw_startup_segmented_progress_bar(
             bar,
             progress=model.progress,
-            label="正在挂载同屏 UI / 策略槽 / 输入桥",
+            label=f"{feed_status}  ·  UI BRIDGE HOT  ·  POLICY SLOT SYNC",
             colour_name="cyan",
         )
         self._draw_text(
-            f"{int(round(model.progress * 100)):02d}%  KEEP CONTROLS RELEASED",
-            x=content[0],
-            y=content[1] + 116,
+            "保持控制释放 · 启动完成后自动进入 MATRIX 操作界面",
+            x=text_x,
+            y=text_y + 154,
             colour=self._colours["cyan"],
         )
 

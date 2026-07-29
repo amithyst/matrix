@@ -145,6 +145,17 @@ DEFAULT_SOCKET = Path(
         ),
     )
 )
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+_DEFAULT_STARTUP_MEDIA_FRAMES_DIR = (
+    _REPO_ROOT / "outputs" / "runtime" / "matrix-startup-media" / "frames"
+)
+_STARTUP_MEDIA_FRAMES_DIR = Path(
+    os.environ.get(
+        "MATRIX_STARTUP_MEDIA_FRAMES_DIR",
+        os.fspath(_DEFAULT_STARTUP_MEDIA_FRAMES_DIR),
+    )
+).expanduser()
 _JS_EVENT = struct.Struct("IhBB")
 _JS_EVENT_BUTTON = 0x01
 _JS_EVENT_AXIS = 0x02
@@ -176,6 +187,22 @@ _X11_ESCAPE_GRAB_MODIFIERS = (
 _X11_UI_GRAB_KEY_NAMES = ("escape", "q", "e")
 _MAX_X11_GRABBED_ESCAPE_EVENTS_PER_POLL = 128
 _STARTUP_LOADING_OVERLAY_SECONDS = 8.0
+_STARTUP_MEDIA_FRAME_RATE_HZ = 2.0
+
+
+def startup_loading_overlay_state(
+    *,
+    active: bool,
+    message: str,
+    progress: float,
+) -> dict[str, object]:
+    return {
+        "active": active,
+        "message": message,
+        "progress": progress,
+        "media_frames_dir": os.fspath(_STARTUP_MEDIA_FRAMES_DIR),
+        "media_frame_rate_hz": _STARTUP_MEDIA_FRAME_RATE_HZ,
+    }
 
 
 class _XErrorEvent(ctypes.Structure):
@@ -5248,6 +5275,7 @@ class GameCommandClient:
         self._session = os.urandom(16).hex()
         self._sequence = 0
         self._result_revision = 0
+        self._result_monotonic_s: float | None = None
         self._pending: GameCommandRequest | None = None
         self._pending_external_input: PendingExternalInputPublish | None = None
         self._pending_warning: str | None = None
@@ -5718,8 +5746,12 @@ class GameCommandClient:
     def outcome_unknown(self) -> bool:
         return self._outcome_unknown
 
-    def _local_error(self, code: str, message: str) -> None:
+    def _mark_result_changed(self) -> None:
         self._result_revision += 1
+        self._result_monotonic_s = time.monotonic()
+
+    def _local_error(self, code: str, message: str) -> None:
+        self._mark_result_changed()
         self._outcome_unknown = False
         self.status = "error"
         self.ok = False
@@ -5750,7 +5782,7 @@ class GameCommandClient:
             # summon if the operator retried.  Preserve the correlation id and
             # make the ambiguity terminal for this provider generation.
             detail = message[:256]
-            self._result_revision += 1
+            self._mark_result_changed()
             self._outcome_unknown = True
             self.status = "error"
             self.ok = None
@@ -6119,7 +6151,7 @@ class GameCommandClient:
                 warning=parsed.warning,
                 data=data,
             )
-            self._result_revision += 1
+            self._mark_result_changed()
             self._outcome_unknown = False
             self.status = "pending"
             self.ok = None
@@ -6251,7 +6283,7 @@ class GameCommandClient:
         if pending is None:
             return False
         self._pending_external_input = None
-        self._result_revision += 1
+        self._mark_result_changed()
         self._outcome_unknown = False
         self.status = "success" if ok else "error"
         self.ok = ok
@@ -6305,7 +6337,7 @@ class GameCommandClient:
             return False
         self._pending = request
         self._pending_warning = warning
-        self._result_revision += 1
+        self._mark_result_changed()
         self.status = "pending"
         self.ok = None
         self.code = None
@@ -6760,7 +6792,7 @@ class GameCommandClient:
         self._pending_runtime_pause = None
         warning = self._pending_warning
         self._pending_warning = None
-        self._result_revision += 1
+        self._mark_result_changed()
         self._outcome_unknown = False
         self.ok = response.ok
         self.code = response.code
@@ -6802,6 +6834,11 @@ class GameCommandClient:
             "request_id": self.last_request_id,
             "sequence": self._sequence,
             "result_revision": self._result_revision,
+            "result_age_s": (
+                None
+                if self._result_monotonic_s is None
+                else max(0.0, time.monotonic() - self._result_monotonic_s)
+            ),
             "ok": self.ok,
             "code": self.code,
             "message": self.message,
@@ -6828,7 +6865,7 @@ class GameCommandClient:
         pending_external = self._pending_external_input
         if pending_external is not None:
             self._pending_external_input = None
-            self._result_revision += 1
+            self._mark_result_changed()
             self._outcome_unknown = True
             self.status = "error"
             self.ok = None
@@ -8196,11 +8233,11 @@ def main() -> int:
                 {
                     **source_claim,
                     "active": True,
-                    "startup_loading": {
-                        "active": True,
-                        "message": "正在初始化 MATRIX / BFM-SONIC 控制链路",
-                        "progress": 0.05,
-                    },
+                    "startup_loading": startup_loading_overlay_state(
+                        active=True,
+                        message="正在初始化 MATRIX / BFM-SONIC 控制链路",
+                        progress=0.05,
+                    ),
                     "build_info": build_info,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
                     "ui_settings": ui_settings.live_mapping(),
@@ -8896,12 +8933,10 @@ def main() -> int:
                             **source_claim,
                             "build_info": build_info,
                             "active": calibration.active or startup_loading_active,
-                            "startup_loading": {
-                                "active": startup_loading_active,
-                                "message": (
-                                    "正在初始化 MATRIX / BFM-SONIC 控制链路"
-                                ),
-                                "progress": min(
+                            "startup_loading": startup_loading_overlay_state(
+                                active=startup_loading_active,
+                                message="正在初始化 MATRIX / BFM-SONIC 控制链路",
+                                progress=min(
                                     0.98,
                                     max(
                                         0.05,
@@ -8915,7 +8950,7 @@ def main() -> int:
                                         / _STARTUP_LOADING_OVERLAY_SECONDS,
                                     ),
                                 ),
-                            },
+                            ),
                             "toggle_count": calibration.toggle_count,
                             "updated_monotonic_s": now,
                             "expected_ue_pid": args.expected_ue_pid,

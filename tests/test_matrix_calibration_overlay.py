@@ -337,6 +337,54 @@ class OverlayLayoutTest(unittest.TestCase):
             self.assertGreaterEqual(panel[3], 760)
             self.assertLessEqual(panel[3], 800)
 
+    def test_startup_loading_model_accepts_media_metadata(self) -> None:
+        model = MODULE.startup_loading_model(
+            {
+                "startup_loading": {
+                    "active": True,
+                    "message": "加载月球视频背景",
+                    "progress": 0.45,
+                    "media_frames_dir": "/tmp/matrix-moon-frames",
+                    "media_frame_rate_hz": 3.5,
+                }
+            }
+        )
+
+        self.assertTrue(model.active)
+        self.assertEqual(model.message, "加载月球视频背景")
+        self.assertEqual(model.progress, 0.45)
+        self.assertEqual(model.media_frames_dir, "/tmp/matrix-moon-frames")
+        self.assertEqual(model.media_frame_rate_hz, 3.5)
+
+    def test_startup_loading_model_rejects_invalid_media_metadata(self) -> None:
+        model = MODULE.startup_loading_model(
+            {
+                "startup_loading": {
+                    "active": True,
+                    "media_frames_dir": True,
+                    "media_frame_rate_hz": True,
+                }
+            }
+        )
+
+        self.assertTrue(model.active)
+        self.assertIsNone(model.media_frames_dir)
+        self.assertEqual(model.media_frame_rate_hz, MODULE._STARTUP_MEDIA_FRAME_RATE_HZ)
+
+    def test_read_startup_media_ppm_accepts_binary_rgb_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "moon.ppm"
+            path.write_bytes(
+                b"P6\n# generated from Feishu startup video\n2 1\n255\n"
+                + bytes([1, 2, 3, 250, 251, 252])
+            )
+
+            frame = MODULE.read_startup_media_ppm(path)
+
+        self.assertEqual(frame.width, 2)
+        self.assertEqual(frame.height, 1)
+        self.assertEqual(frame.pixels, bytes([1, 2, 3, 250, 251, 252]))
+
     def test_compact_layout_is_bounded_and_too_small_client_hides_safely(self) -> None:
         geometry = MODULE.WindowGeometry(1, 20, 30, 640, 420)
         self.assertTrue(MODULE.overlay_supported(geometry))
@@ -1133,6 +1181,7 @@ class OverlayStateTest(unittest.TestCase):
                     "status": "success",
                     "sequence": 4,
                     "result_revision": 7,
+                    "result_age_s": 1.25,
                     "ok": True,
                     "warning": "已兼容执行；标准命令是 /summon",
                 }
@@ -1141,6 +1190,7 @@ class OverlayStateTest(unittest.TestCase):
         self.assertTrue(status.available)
         self.assertFalse(status.provider_editing)
         self.assertEqual(status.result_revision, 7)
+        self.assertEqual(status.result_age_s, 1.25)
         self.assertEqual(status.warning, "Accepted /summom alias; standard command is /summon")
         malformed = MODULE.command_console_status(
             {
@@ -1148,12 +1198,14 @@ class OverlayStateTest(unittest.TestCase):
                     "status": {},
                     "sequence": True,
                     "result_revision": True,
+                    "result_age_s": True,
                 }
             }
         )
         self.assertEqual(malformed.status, "unavailable")
         self.assertIsNone(malformed.sequence)
         self.assertEqual(malformed.result_revision, 0)
+        self.assertIsNone(malformed.result_age_s)
 
     def test_strategy_loadout_model_exposes_two_slots_and_pending_selection(self) -> None:
         model = MODULE.strategy_loadout_model(
@@ -1848,6 +1900,7 @@ class OverlayStateTest(unittest.TestCase):
             warning=None,
             restart_required=False,
             outcome_unknown=False,
+            result_age_s=1.0,
         )
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
         overlay._colours = {
@@ -1886,6 +1939,92 @@ class OverlayStateTest(unittest.TestCase):
             "策略切换失败",
             overlay._draw_progress_bar.call_args.kwargs["label"],
         )
+
+    def test_loadout_hides_stale_policy_rejection_status(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.strategy_loadout_model(
+            {
+                "strategy_loadout": {
+                    "version": 1,
+                    "available": True,
+                    "status": "ready",
+                    "active_slot": "locomotion",
+                    "pending": None,
+                    "slots": [
+                        {
+                            "slot": "locomotion",
+                            "selected_policy_id": "sonic",
+                            "locked": False,
+                            "candidates": [
+                                {
+                                    "policy_id": "sonic",
+                                    "name": "SONIC",
+                                    "available": True,
+                                    "resident": True,
+                                },
+                                {
+                                    "policy_id": "bfm-sonic-teacher50k",
+                                    "name": "BFM SONIC Teacher50k",
+                                    "available": True,
+                                    "resident": True,
+                                },
+                            ],
+                        },
+                        {
+                            "slot": "recovery",
+                            "selected_policy_id": "kungfu",
+                            "locked": False,
+                            "candidates": [],
+                        },
+                    ],
+                }
+            }
+        )
+        status = MODULE.CommandConsoleStatus(
+            available=True,
+            provider_editing=False,
+            in_flight=False,
+            status="error",
+            request_id="cmd-test",
+            sequence=1,
+            result_revision=1,
+            ok=False,
+            code="E_POLICY_SWITCH_REJECTED",
+            message="BFM hot switch reference buffer was not swapped",
+            warning=None,
+            restart_required=False,
+            outcome_unknown=False,
+            result_age_s=10.0,
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                    "error",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+        overlay._draw_progress_bar = mock.Mock()
+
+        overlay._draw_loadout_page(layout, model, status)
+
+        overlay._draw_progress_bar.assert_not_called()
 
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):

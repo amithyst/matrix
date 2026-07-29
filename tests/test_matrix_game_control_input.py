@@ -929,6 +929,7 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertTrue(client.poll())
         self.assertEqual(client.status, "success")
         self.assertEqual(client.code, "OK_GAME_QUIT")
+        self.assertIsInstance(client.mapping()["result_age_s"], float)
 
     def test_quit_game_requires_panel_and_neutral_frame(self) -> None:
         for arguments, expected_code in (
@@ -1197,8 +1198,10 @@ class GameCommandClientTest(unittest.TestCase):
         runtime.send(MC_COMMANDS.encode_command_response(response))
         self.assertTrue(client.poll())
         self.assertFalse(client.in_flight)
+        mapping = client.mapping()
+        self.assertIsInstance(mapping.pop("result_age_s"), float)
         self.assertEqual(
-            client.mapping(),
+            mapping,
             {
                 "available": True,
                 "editing": True,
