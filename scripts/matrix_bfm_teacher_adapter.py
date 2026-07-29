@@ -10,7 +10,6 @@ authority is granted only by the supervisor over an authenticated local
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import hashlib
 import importlib
 import importlib.util
@@ -47,8 +46,6 @@ POLICY_ID = "bfm-sonic-teacher50k"
 CONTROL_SCHEMA = "matrix.bfm_teacher_worker.control.v1"
 POLICY_HZ = 50.0
 PUBLISH_HZ = 500.0
-EXPECTED_WORLD_SEQUENCE_DELTA = 4
-MAX_POLICY_INPUT_QUEUE = 8
 WORLD_SAMPLE_MAX_AGE_S = 0.15
 LOWSTATE_MAX_AGE_S = 0.10
 # A single delayed scheduler/DDS frame must not tear down an otherwise healthy
@@ -84,7 +81,7 @@ TURN_COMMAND_YAW_DAMPING_SECONDS = 0.1
 
 # A hot locomotion handoff is prepared while the existing controller still
 # owns LowCmd.  The BFM worker resets its online PFNN stream onto the current
-# physical root/terrain, runs four write-authority-free policy ticks, and admits the
+# physical root/terrain, runs four writer-free policy ticks, and admits the
 # next authority epoch only if the target that would be published remains a
 # small continuation of the measured joint pose.  These are writer-safety
 # invariants, not policy/action-scale tuning parameters.
@@ -158,20 +155,16 @@ REALSCAN_REFERENCE_CONTRACT = {
     "root_follow_max_step_m": 0.015,
     "command_replan_linear_delta_mps": 0.05,
     "command_replan_yaw_delta_rad_s": 0.05,
-    "pending_min_steps": 16,
-    "pending_extra_frames": 24,
+    "pending_min_steps": 4,
+    "pending_extra_frames": 8,
 }
 
 
 @dataclass(frozen=True)
 class LowCmdTargetSnapshot:
-    """Newest finite 29-DoF PD command observed on ``rt/lowcmd``."""
+    """Newest finite 29-DoF position target observed on ``rt/lowcmd``."""
 
     joint_pos_rad: np.ndarray
-    joint_vel_rad_s: np.ndarray
-    feedforward_torque_nm: np.ndarray
-    kp: np.ndarray
-    kd: np.ndarray
     received_monotonic: float
 
     @classmethod
@@ -179,34 +172,15 @@ class LowCmdTargetSnapshot:
         cls,
         *,
         joint_pos_rad: Any,
-        joint_vel_rad_s: Any,
-        feedforward_torque_nm: Any,
-        kp: Any,
-        kd: Any,
         received_monotonic: float,
     ) -> "LowCmdTargetSnapshot":
-        arrays = tuple(
-            np.asarray(values, dtype=np.float32).reshape(-1)
-            for values in (
-                joint_pos_rad,
-                joint_vel_rad_s,
-                feedforward_torque_nm,
-                kp,
-                kd,
-            )
-        )
+        values = np.asarray(joint_pos_rad, dtype=np.float32).reshape(-1)
         received = float(received_monotonic)
-        if any(
-            values.shape != (NUM_JOINTS,)
-            or not np.all(np.isfinite(values))
-            for values in arrays
-        ):
-            raise ValueError("LowCmd PD fields must be finite 29D")
-        if np.any(arrays[3] <= 0.0) or np.any(arrays[4] < 0.0):
-            raise ValueError("LowCmd PD gains must be positive/non-negative")
+        if values.shape != (NUM_JOINTS,) or not np.all(np.isfinite(values)):
+            raise ValueError("LowCmd target must be finite 29D")
         if not math.isfinite(received):
             raise ValueError("LowCmd target timestamp must be finite")
-        return cls(*(values.copy() for values in arrays), received)
+        return cls(values.copy(), received)
 
 
 class LatestLowCmdTarget:
@@ -271,14 +245,6 @@ class BfmUnitreeDdsRuntime(UnitreeDdsRuntime):
                 joint_pos_rad=[
                     motors[index].q for index in range(NUM_JOINTS)
                 ],
-                joint_vel_rad_s=[
-                    motors[index].dq for index in range(NUM_JOINTS)
-                ],
-                feedforward_torque_nm=[
-                    motors[index].tau for index in range(NUM_JOINTS)
-                ],
-                kp=[motors[index].kp for index in range(NUM_JOINTS)],
-                kd=[motors[index].kd for index in range(NUM_JOINTS)],
                 received_monotonic=self._command_monotonic(),
             )
         except (AttributeError, IndexError, TypeError, ValueError):
@@ -600,27 +566,6 @@ def _handoff_input_is_neutral(
     )
 
 
-def _policy_world_sample_is_new(
-    latest_world: WorldSample | None,
-    last_world_sequence: int | None,
-) -> bool:
-    """Admit each host 50 Hz state exactly once into the policy loop."""
-
-    return bool(
-        latest_world is not None
-        and latest_world.sequence != last_world_sequence
-    )
-
-
-def _policy_sequence_skip_count(delta: int) -> int:
-    """Return missing 50 Hz host samples represented by one sequence delta."""
-
-    value = int(delta)
-    if value <= 0 or value % EXPECTED_WORLD_SEQUENCE_DELTA != 0:
-        return 0
-    return max(0, value // EXPECTED_WORLD_SEQUENCE_DELTA - 1)
-
-
 def _load_module_from_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -719,7 +664,6 @@ class BfmTeacherCore:
             self.reference_source = (
                 f"formal7168_clip:{self.stream.motion_key}"
             )
-        self._install_matrix_realtime_reference_contract()
         self.direct_start = bool(direct_start)
         self.direct_reference_start: dict[str, list[float]] | None = None
         self.previous_action = np.zeros(NUM_JOINTS, dtype=np.float32)
@@ -752,11 +696,6 @@ class BfmTeacherCore:
         self.trace_file = trace_file
         self.trace_ticks = max(0, int(trace_ticks))
         self.trace_written = 0
-        self.trace_motion_only = os.environ.get(
-            "MATRIX_BFM_POLICY_TRACE_MOTION_ONLY",
-            "",
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        self.trace_triggered = not self.trace_motion_only
         if self.trace_file is not None and self.trace_ticks > 0:
             self.trace_file.parent.mkdir(parents=True, exist_ok=True)
             self.trace_file.write_text("", encoding="utf-8")
@@ -852,94 +791,6 @@ class BfmTeacherCore:
             dtype=np.float32,
         ).copy()
 
-    def release_idle_anchor(self) -> None:
-        """Enter Teacher's dynamic stand without exposing a target jump."""
-
-        if (
-            not bool(getattr(self, "idle_anchor_enabled", False))
-            or getattr(self, "idle_anchor_target", None) is None
-        ):
-            raise RuntimeError("BFM idle anchor is not prepared")
-        anchor = (
-            self.last_published_target
-            if self.last_published_target is not None
-            else self.idle_anchor_target
-        )
-        self.idle_anchor_enabled = False
-        self.idle_anchor_target = None
-        self.activation_origin = np.asarray(
-            anchor,
-            dtype=np.float32,
-        ).copy()
-        self.activation_step = 0
-        self.activation_target_step_limit_rad = HOT_SWITCH_MAX_TARGET_DELTA_RAD
-
-    def reanchor_prepared_activation(
-        self,
-        lowstate: LowStateSnapshot,
-        prior_target: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Refresh the handoff anchor at the writer-authority boundary.
-
-        PREPARE may spend hundreds of milliseconds rebuilding Robo-PFNN while
-        the prior controller remains authoritative. Its original pose is
-        therefore only a preview anchor. Once that writer is fenced, reset
-        actor history against the latest physical state and make the first BFM
-        LowCmd exactly continuous with the selected final anchor.
-        """
-
-        anchor = (
-            lowstate.joint_pos_rad
-            if prior_target is None
-            else np.asarray(prior_target, dtype=np.float32)
-        )
-        if anchor.shape != (NUM_JOINTS,) or not np.all(np.isfinite(anchor)):
-            raise ValueError("authority-boundary anchor must be finite 29D")
-        anchor = anchor.astype(np.float32, copy=True)
-        self.teacher.reset()
-        self.previous_action.fill(0.0)
-        self.reference_motion_active = False
-        self.last_motion_command = None
-        self.stop_handoff_grace_steps_remaining = 0
-        self.reference_transition = None
-        self.reference_hold_target = None
-        self.reference_stop_blend_pending = False
-        self.idle_anchor_enabled = True
-        self.idle_anchor_target = anchor.copy()
-        self.activation_origin = anchor.copy()
-        self.activation_step = 0
-        self.activation_target_step_limit_rad = HOT_SWITCH_MAX_TARGET_DELTA_RAD
-        self.last_published_target = anchor.copy()
-        return anchor
-
-    def torque_continuous_handoff_target(
-        self,
-        lowstate: LowStateSnapshot,
-        prior_command: LowCmdTargetSnapshot,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Express the prior PD torque using BFM's immutable PD gains."""
-
-        position_error = prior_command.joint_pos_rad - lowstate.joint_pos_rad
-        velocity_error = (
-            prior_command.joint_vel_rad_s - lowstate.joint_vel_rad_s
-        )
-        prior_torque = (
-            prior_command.kp * position_error
-            + prior_command.kd * velocity_error
-            + prior_command.feedforward_torque_nm
-        ).astype(np.float32)
-        target = (
-            lowstate.joint_pos_rad
-            + (
-                prior_torque
-                + self.kd * lowstate.joint_vel_rad_s
-            )
-            / self.kp
-        ).astype(np.float32)
-        if not np.all(np.isfinite(target)) or not np.all(np.isfinite(prior_torque)):
-            raise RuntimeError("torque-continuous handoff target is not finite")
-        return target, prior_torque
-
     def prepare_direct_activation(self) -> None:
         """Reset actor history without perturbing the aligned reference cursor."""
 
@@ -1009,49 +860,49 @@ class BfmTeacherCore:
             return last_target.astype(np.float32, copy=True)
         return lowstate.joint_pos_rad.astype(np.float32, copy=True)
 
-    def _install_matrix_realtime_reference_contract(self) -> None:
-        """Keep root following non-blocking under an independent 200 Hz plant."""
-
-        stream = self.stream
-        start_pending = getattr(stream, "_start_pending", None)
-        if not callable(start_pending):
-            return
-
-        def start_pending_without_root_anchor(
-            cursor: Any,
-            command: Any,
-            height_field: Any,
-            reason: str,
-        ) -> bool:
-            if "root_anchor" in str(reason):
-                stream._matrix_root_anchor_suppressed_count = int(
-                    getattr(stream, "_matrix_root_anchor_suppressed_count", 0)
-                ) + 1
-                return False
-            return bool(start_pending(cursor, command, height_field, reason))
-
-        stream._matrix_root_anchor_suppressed_count = 0
-        stream._start_pending = start_pending_without_root_anchor
-
     def _prepare_realtime_rolling_command(self, command: Any) -> str | None:
-        """Apply ordinary keyboard command changes to the active PFNN cursor.
+        """Roll an ordinary command change without a PFNN publish barrier.
 
-        RealScan's deterministic branch barrier is valid when policy and
-        physics advance in one loop. Matrix physics is an independent 200 Hz
-        process, so a rendered PFNN branch build can repeat one stale LowCmd
-        for hundreds of milliseconds. Rolling the already phase-continuous
-        cursor keeps the 50 Hz writer live; explicit latched safety stops still
-        use the upstream branch contract.
+        The accepted RealScan stream builds a complete replacement branch in
+        the background and then waits synchronously at its deterministic swap
+        step. That is simulation-time safe, but Matrix physics keeps running:
+        while ``Future.result()`` blocks, the independent LowCmd publisher can
+        only repeat one stale walking target for hundreds of milliseconds.
+
+        For ordinary, non-latched keyboard motion, keep the active cursor and
+        let its existing 47-frame horizon roll into each new command one frame
+        per policy tick. This preserves PFNN phase, Teacher history,
+        PrevActions, and the 50 Hz writer. Explicit safety-stop latches retain
+        the upstream branch/rebuild behavior.
         """
 
         if bool(getattr(command, "stop_latched", False)):
             return None
         stream = self.stream
-        if not hasattr(stream, "_last_branch_command"):
+        if not (
+            hasattr(stream, "_frames")
+            and hasattr(stream, "_last_branch_command")
+        ):
             return None
+        pending_cancelled = False
+        pending = getattr(stream, "_pending", None)
+        if pending is not None:
+            # Root-anchor and terrain refreshes can start a pending branch even
+            # when the keyboard command itself is unchanged. Cancel it before
+            # the upstream four-step poll reaches Future.result(); the active
+            # buffer has already received the continuous root translation and
+            # keeps appending frames against the current height field.
+            pending.cancel_event.set()
+            pending.future.cancel()
+            stream._pending = None
+            pending_cancelled = True
+            if hasattr(stream, "_discard_count"):
+                stream._discard_count += 1
+            if hasattr(stream, "_deferred_reason"):
+                stream._deferred_reason = None
         previous = getattr(stream, "_last_branch_command", None)
         if previous is None:
-            return None
+            return "pending_cancel" if pending_cancelled else None
         change_reason = getattr(stream, "_change_reason", None)
         if callable(change_reason):
             reason = change_reason(command, previous)
@@ -1060,14 +911,7 @@ class BfmTeacherCore:
         else:
             reason = None
         if reason is None:
-            return None
-        pending = getattr(stream, "_pending", None)
-        if pending is not None:
-            pending.cancel_event.set()
-            pending.future.cancel()
-            stream._pending = None
-            if hasattr(stream, "_discard_count"):
-                stream._discard_count += 1
+            return "pending_cancel" if pending_cancelled else None
         if hasattr(stream, "_deferred_reason"):
             stream._deferred_reason = None
         stream._last_branch_command = command
@@ -1345,10 +1189,6 @@ class BfmTeacherCore:
             or trace_written >= trace_ticks
         ):
             return
-        if not bool(getattr(self, "trace_triggered", True)):
-            if abs(float(status.get("command_speed_mps", 0.0))) <= 1.0e-6:
-                return
-            self.trace_triggered = True
         matrix_names = list(G1_29_JOINT_NAMES)
         isaac_names = [
             matrix_names[int(matrix_index)]
@@ -1488,7 +1328,6 @@ class BfmTeacherCore:
         active: bool = True,
         handoff_preview: bool = False,
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        step_started = time.perf_counter()
         if handoff_preview and not active:
             raise ValueError("BFM handoff preview requires active policy state")
         if self.last_reset_count is None:
@@ -1555,19 +1394,8 @@ class BfmTeacherCore:
             # first requested motion branch.  BFM-3DGS publishes the new walk
             # actor target directly; keeping an old stand activation origin
             # here made the CPU-side PFNN build pause hold the wrong target.
-            if (
-                getattr(self, "idle_anchor_enabled", False)
-                and self.idle_anchor_target is not None
-            ):
-                # A hot switch keeps the torque-continuous prior-controller
-                # target while idle. The first real movement command releases
-                # that hold through the existing blend/step limiter.
-                self.idle_anchor_enabled = False
-                self.idle_anchor_target = None
-                self.activation_step = 0
-            else:
-                self.activation_origin = None
-                self.activation_step = 0
+            self.activation_origin = None
+            self.activation_step = 0
             self.reference_stop_blend_pending = False
         elif stop_reference_reset and canonical_reference_continuity:
             self.reference_stop_blend_pending = True
@@ -1661,15 +1489,15 @@ class BfmTeacherCore:
             and realtime_rolling_reason is not None
         )
         if realtime_rolling_stop:
+            # No atomic branch swap follows this rolling transition, so there
+            # is no swap target that needs the pending-hold/blend path.
             self.reference_stop_blend_pending = False
-        reference_started = time.perf_counter()
         reference = self.stream.sample(
             command,
             world.root_position,
             world.root_yaw,
             height_field,
         )
-        reference_finished = time.perf_counter()
         if not active:
             qpos_50hz = np.asarray(reference.plan.qpos_50hz, dtype=np.float32)
             joint_vel_50hz = np.asarray(
@@ -1790,13 +1618,11 @@ class BfmTeacherCore:
             previous_action=self.previous_action,
         )
         previous_action_before = self.previous_action.copy()
-        teacher_started = time.perf_counter()
         action_isaac = self.teacher.step(
             reference.plan,
             observation,
             world.height_map_z,
         )
-        teacher_finished = time.perf_counter()
         action_isaac = np.clip(
             action_isaac,
             -ACTION_CLIP,
@@ -1958,18 +1784,6 @@ class BfmTeacherCore:
             )
         )
         status = {
-            "pre_reference_ms": (
-                reference_started - step_started
-            ) * 1000.0,
-            "reference_step_ms": (
-                reference_finished - reference_started
-            ) * 1000.0,
-            "teacher_step_ms": (
-                teacher_finished - teacher_started
-            ) * 1000.0,
-            "post_teacher_ms": (
-                time.perf_counter() - teacher_finished
-            ) * 1000.0,
             "reference_replanned": bool(reference.replanned),
             "reference_reason": reference.replan_reason,
             "reference_plan_index": int(reference.plan_index),
@@ -1978,13 +1792,6 @@ class BfmTeacherCore:
             "reference_buffer_swapped": reference_buffer_swapped,
             "reference_realtime_rolling_reason": realtime_rolling_reason,
             "reference_realtime_rolling_stop": realtime_rolling_stop,
-            "reference_root_anchor_suppressed_count": int(
-                getattr(
-                    self.stream,
-                    "_matrix_root_anchor_suppressed_count",
-                    0,
-                )
-            ),
             "reference_pending_build_ms": getattr(
                 reference, "pending_build_ms", None
             ),
@@ -2392,7 +2199,6 @@ def run_worker(
     writer_lock = threading.Lock()
     event_lock = threading.Lock()
     latest_policy_status: dict[str, Any] = {}
-    activation_boundary_audit: dict[str, Any] = {}
     warmed = False
     stopped_event_sent = False
     preparing_authority_epoch: int | None = None
@@ -2407,11 +2213,8 @@ def run_worker(
             "event": event,
             "policy_id": POLICY_ID,
             "authority_epoch": authority_epoch,
-            "worker_monotonic_s": monotonic(),
         }
         payload.update(fields or {})
-        if event == "FIRST_WRITE":
-            payload.update(activation_boundary_audit)
         packet = json.dumps(
             payload,
             separators=(",", ":"),
@@ -2461,25 +2264,8 @@ def run_worker(
     status_period = 0.1
     transient_stale_active = False
     preparing_allow_idle_neutral = False
-    preparing_lowstate_anchor = False
     transient_stale_events = 0
     transient_stale_max_overage_s = 0.0
-    policy_inputs: deque[
-        tuple[WorldSample, LowStateSnapshot]
-    ] = deque()
-    last_queued_world_sequence: int | None = None
-    policy_input_queue_max_depth = 0
-    active_policy_tick_count = 0
-    active_policy_sequence_delta_last: int | None = None
-    active_policy_sequence_delta_max = 0
-    active_policy_sequence_delta_counts: dict[int, int] = {}
-    active_policy_skipped_state_count = 0
-    active_policy_inference_ms_max = 0.0
-    active_policy_inference_overrun_count = 0
-    active_policy_pre_reference_ms_max = 0.0
-    active_policy_reference_step_ms_max = 0.0
-    active_policy_teacher_step_ms_max = 0.0
-    active_policy_post_teacher_ms_max = 0.0
 
     try:
         while handoff.state != HandoffStateMachine.STOPPED:
@@ -2511,62 +2297,16 @@ def run_worker(
                         )
                     command = str(payload.get("command", "")).upper()
                     if command == "STATE":
-                        received_world = WorldSample.from_packet(
+                        latest_world = WorldSample.from_packet(
                             payload,
                             received_monotonic=monotonic(),
                         )
-                        latest_world = received_world
-                        sequence = int(received_world.sequence)
-                        if (
-                            last_queued_world_sequence is not None
-                            and sequence < last_queued_world_sequence
-                        ):
-                            raise RuntimeError(
-                                "BFM Teacher received out-of-order world sequence"
-                            )
-                        received_state = state_store.get()
-                        if (
-                            received_state is not None
-                            and sequence != last_queued_world_sequence
-                            and sequence != core.last_world_sequence
-                        ):
-                            if len(policy_inputs) >= MAX_POLICY_INPUT_QUEUE:
-                                if handoff.state == HandoffStateMachine.ACTIVE:
-                                    raise RuntimeError(
-                                        "BFM Teacher policy input queue exceeded "
-                                        f"{MAX_POLICY_INPUT_QUEUE} samples"
-                                    )
-                                policy_inputs.popleft()
-                            # Preserve the LowState observed with each host
-                            # 50 Hz STATE.  If one inference overruns 20 ms,
-                            # the next sample remains available to advance the
-                            # Teacher history/reference cursor instead of being
-                            # overwritten by the newest packet.
-                            policy_inputs.append(
-                                (received_world, received_state)
-                            )
-                            last_queued_world_sequence = sequence
-                            policy_input_queue_max_depth = max(
-                                policy_input_queue_max_depth,
-                                len(policy_inputs),
-                            )
-                            next_policy = monotonic()
-                            if handoff.state == HandoffStateMachine.ACTIVE:
-                                # Leave later packets in the kernel queue until
-                                # this state has advanced the policy.  Draining
-                                # an ACTIVE burst before inference recreates the
-                                # same newest-state overwrite as the old timer
-                                # loop, only in user-space.
-                                break
                         continue
                     if command == "PREPARE":
                         requested_epoch = int(payload.get("authority_epoch"))
                         aligned_initial = payload.get("aligned_initial", False)
                         allow_idle_neutral = payload.get(
                             "allow_idle_neutral", False
-                        )
-                        allow_lowstate_anchor = payload.get(
-                            "allow_lowstate_anchor", False
                         )
                         if type(aligned_initial) is not bool:
                             raise RuntimeError(
@@ -2576,20 +2316,9 @@ def run_worker(
                             raise RuntimeError(
                                 "BFM Teacher PREPARE has invalid idle-neutral mode"
                             )
-                        if type(allow_lowstate_anchor) is not bool:
+                        if aligned_initial and allow_idle_neutral:
                             raise RuntimeError(
-                                "BFM Teacher PREPARE has invalid low-state anchor mode"
-                            )
-                        if sum(
-                            bool(value)
-                            for value in (
-                                aligned_initial,
-                                allow_idle_neutral,
-                                allow_lowstate_anchor,
-                            )
-                        ) > 1:
-                            raise RuntimeError(
-                                "BFM Teacher PREPARE mixes handoff anchor modes"
+                                "BFM Teacher PREPARE mixes initial and idle-neutral modes"
                             )
                         if direct_start:
                             raise RuntimeError(
@@ -2620,45 +2349,26 @@ def run_worker(
                         now = monotonic()
                         state = state_store.get()
                         prior_command = command_store.get()
-                        world_age_s = (
-                            now - latest_world.received_monotonic
-                            if latest_world is not None
-                            else None
-                        )
-                        state_age_s = (
-                            now - state.received_monotonic
-                            if state is not None
-                            else None
-                        )
-                        lowcmd_age_s = (
-                            now - prior_command.received_monotonic
-                            if prior_command is not None
-                            else None
-                        )
                         if (
                             not warmed
-                            or world_age_s is None
-                            or world_age_s > WORLD_SAMPLE_MAX_AGE_S
-                            or state_age_s is None
-                            or state_age_s > LOWSTATE_MAX_AGE_S
-                            or lowcmd_age_s is None
-                            or lowcmd_age_s > HOT_SWITCH_LOW_CMD_MAX_AGE_S
-                        ):
-                            send_event(
-                                "ACTIVATION_REJECTED",
-                                {
-                                    "authority_epoch": requested_epoch,
-                                    "writer_created": handoff.publisher is not None,
-                                    "writer_reused": handoff.publisher is not None,
-                                    "write_authorized": False,
-                                    "reason": "inputs_not_fresh",
-                                    "models_warmed": bool(warmed),
-                                    "world_age_s": world_age_s,
-                                    "lowstate_age_s": state_age_s,
-                                    "lowcmd_age_s": lowcmd_age_s,
-                                },
+                            or latest_world is None
+                            or now - latest_world.received_monotonic
+                            > WORLD_SAMPLE_MAX_AGE_S
+                            or state is None
+                            or now - state.received_monotonic
+                            > LOWSTATE_MAX_AGE_S
+                            or (
+                                not aligned_initial
+                                and (
+                                    prior_command is None
+                                    or now - prior_command.received_monotonic
+                                    > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                                )
                             )
-                            continue
+                        ):
+                            raise RuntimeError(
+                                "BFM Teacher PREPARE lacks fresh warmed inputs"
+                            )
                         if not _handoff_input_is_neutral(
                             latest_world,
                             allow_idle_neutral=allow_idle_neutral,
@@ -2667,12 +2377,6 @@ def run_worker(
                                 "BFM Teacher PREPARE requires a safety-stop or "
                                 "authorized idle-neutral handoff"
                             )
-                        # Publisher construction can take about 200 ms on the
-                        # first DDS endpoint. Do it while SONIC still owns and
-                        # publishes LowCmd; PAUSED state guarantees this BFM
-                        # endpoint cannot write before the supervisor's GO.
-                        with writer_lock:
-                            handoff.prepare_writer()
                         if aligned_initial:
                             # Matrix has already aligned the physical G1 to the
                             # first online-PFNN reference while SONIC is fenced.
@@ -2683,56 +2387,18 @@ def run_worker(
                             # loop rather than improve safety.
                             core.prepare_aligned_initial_activation()
                         else:
+                            assert prior_command is not None
                             core.prepare_handoff_activation(
                                 state,
-                                (
-                                    state.joint_pos_rad
-                                    if allow_lowstate_anchor
-                                    else prior_command.joint_pos_rad
-                                ),
+                                prior_command.joint_pos_rad,
                             )
                         preparing_authority_epoch = requested_epoch
                         prepared_authority_epoch = None
                         preparing_aligned_initial = aligned_initial
                         preparing_allow_idle_neutral = allow_idle_neutral
-                        preparing_lowstate_anchor = allow_lowstate_anchor
                         prepare_ready_steps = 0
                         prepare_reference_buffer_swapped = False
                         next_policy = monotonic()
-                        continue
-                    if command == "CANCEL_PREPARE":
-                        requested_epoch = int(payload.get("authority_epoch"))
-                        if requested_epoch != authority_epoch + 1:
-                            raise RuntimeError(
-                                "BFM Teacher cancellation epoch did not advance"
-                            )
-                        if requested_epoch not in {
-                            preparing_authority_epoch,
-                            prepared_authority_epoch,
-                        } and (
-                            preparing_authority_epoch is not None
-                            or prepared_authority_epoch is not None
-                        ):
-                            raise RuntimeError(
-                                "BFM Teacher cancellation epoch mismatch"
-                            )
-                        core.enter_standby()
-                        preparing_authority_epoch = None
-                        prepared_authority_epoch = None
-                        preparing_aligned_initial = False
-                        preparing_allow_idle_neutral = False
-                        preparing_lowstate_anchor = False
-                        prepare_ready_steps = 0
-                        prepare_reference_buffer_swapped = False
-                        send_event(
-                            "ACTIVATION_CANCELLED",
-                            {
-                                "authority_epoch": requested_epoch,
-                                "writer_created": handoff.publisher is not None,
-                                "writer_reused": handoff.publisher is not None,
-                                "write_authorized": False,
-                            },
-                        )
                         continue
                     if command == "GO":
                         requested_epoch = int(payload.get("authority_epoch"))
@@ -2746,7 +2412,6 @@ def run_worker(
                             )
                         now = monotonic()
                         state = state_store.get()
-                        prior_command = command_store.get()
                         if (
                             latest_world is None
                             or now - latest_world.received_monotonic
@@ -2757,21 +2422,6 @@ def run_worker(
                         ):
                             raise RuntimeError(
                                 "BFM Teacher GO lacks fresh world/LowState input"
-                            )
-                        lowcmd_age_s = (
-                            now - prior_command.received_monotonic
-                            if prior_command is not None
-                            else None
-                        )
-                        if (
-                            not direct_start
-                            and (
-                                lowcmd_age_s is None
-                                or lowcmd_age_s > HOT_SWITCH_LOW_CMD_MAX_AGE_S
-                            )
-                        ):
-                            raise RuntimeError(
-                                "BFM Teacher GO lacks a fresh prior LowCmd anchor"
                             )
                         if (
                             not direct_start
@@ -2823,120 +2473,12 @@ def run_worker(
                             latest_policy_status["inference_ms"] = (
                                 monotonic() - started
                             ) * 1000.0
-                        elif preparing_aligned_initial:
-                            boundary_anchor = np.asarray(
-                                latest_target,
-                                dtype=np.float32,
-                            ).copy()
-                            if boundary_anchor.shape != (NUM_JOINTS,) or not np.all(
-                                np.isfinite(boundary_anchor)
-                            ):
-                                raise RuntimeError(
-                                    "aligned BFM target must be a finite 29D vector"
-                                )
-                            anchor_delta = boundary_anchor - state.joint_pos_rad
-                            anchor_argmax = int(np.argmax(np.abs(anchor_delta)))
-                            activation_boundary_audit.clear()
-                            activation_boundary_audit.update(
-                                {
-                                    "go_received_monotonic_s": now,
-                                    "go_world_sample_sequence": int(
-                                        latest_world.sequence
-                                    ),
-                                    "go_lowstate_age_ms": max(
-                                        0.0,
-                                        now - state.received_monotonic,
-                                    )
-                                    * 1000.0,
-                                    "go_lowcmd_age_ms": (
-                                        max(0.0, float(lowcmd_age_s)) * 1000.0
-                                        if lowcmd_age_s is not None
-                                        else None
-                                    ),
-                                    "go_anchor_source": (
-                                        "aligned_pfnn_first_frame"
-                                    ),
-                                    "go_observation_anchor_source": (
-                                        "aligned_mujoco_state"
-                                    ),
-                                    "go_anchor_delta_max_rad": float(
-                                        np.max(np.abs(anchor_delta))
-                                    ),
-                                    "go_anchor_delta_argmax_index": anchor_argmax,
-                                    "go_anchor_delta_argmax_joint": (
-                                        G1_29_JOINT_NAMES[anchor_argmax]
-                                    ),
-                                    "go_previous_action_zeroed": True,
-                                    "go_history_reset": True,
-                                    "go_exact_initial_alignment": True,
-                                }
-                            )
-                        else:
-                            boundary_anchor, prior_torque = (
-                                core.torque_continuous_handoff_target(
-                                    state,
-                                    prior_command,
-                                )
-                            )
-                            boundary_anchor = core.reanchor_prepared_activation(
-                                state,
-                                boundary_anchor,
-                            )
-                            with target_lock:
-                                latest_target = boundary_anchor
-                            anchor_delta = boundary_anchor - state.joint_pos_rad
-                            anchor_argmax = int(np.argmax(np.abs(anchor_delta)))
-                            activation_boundary_audit.clear()
-                            activation_boundary_audit.update(
-                                {
-                                    "go_received_monotonic_s": now,
-                                    "go_world_sample_sequence": int(
-                                        latest_world.sequence
-                                    ),
-                                    "go_lowstate_age_ms": max(
-                                        0.0,
-                                        now - state.received_monotonic,
-                                    )
-                                    * 1000.0,
-                                    "go_lowcmd_age_ms": (
-                                        max(0.0, float(lowcmd_age_s)) * 1000.0
-                                        if lowcmd_age_s is not None
-                                        else None
-                                    ),
-                                    "go_anchor_source": (
-                                        "torque_equivalent_observed_lowcmd"
-                                    ),
-                                    "go_observation_anchor_source": (
-                                        "latest_lowstate"
-                                    ),
-                                    "go_anchor_delta_max_rad": float(
-                                        np.max(np.abs(anchor_delta))
-                                    ),
-                                    "go_anchor_delta_argmax_index": anchor_argmax,
-                                    "go_anchor_delta_argmax_joint": (
-                                        G1_29_JOINT_NAMES[anchor_argmax]
-                                    ),
-                                    "go_previous_action_zeroed": True,
-                                    "go_history_reset": True,
-                                    "go_prior_torque_max_abs_nm": float(
-                                        np.max(np.abs(prior_torque))
-                                    ),
-                                }
-                            )
                         authority_epoch = requested_epoch
                         preparing_authority_epoch = None
                         prepared_authority_epoch = None
                         preparing_aligned_initial = False
                         preparing_allow_idle_neutral = False
-                        preparing_lowstate_anchor = False
                         prepare_ready_steps = 0
-                        # PREPARE already advanced the shadow policy through
-                        # the freshest admitted state.  Do not carry queued
-                        # writer-fenced samples across the authority epoch;
-                        # the prepared target is the handoff boundary and the
-                        # next host STATE must become the first active tick.
-                        policy_inputs.clear()
-                        last_queued_world_sequence = core.last_world_sequence
                         with writer_lock:
                             handoff.command("GO")
                         publisher.wake()
@@ -2964,15 +2506,10 @@ def run_worker(
 
             now = monotonic()
             if now >= next_policy:
-                queued_policy_input = bool(policy_inputs)
-                if queued_policy_input:
-                    policy_world, state = policy_inputs[0]
-                else:
-                    policy_world = latest_world
-                    state = state_store.get()
+                state = state_store.get()
                 world_age_s = (
-                    now - policy_world.received_monotonic
-                    if policy_world is not None
+                    now - latest_world.received_monotonic
+                    if latest_world is not None
                     else None
                 )
                 state_age_s = (
@@ -2988,38 +2525,25 @@ def run_worker(
                     state_age_s is not None
                     and 0.0 <= state_age_s <= LOWSTATE_MAX_AGE_S
                 )
-                if (
-                    world_fresh
-                    and state_fresh
-                    and _policy_world_sample_is_new(
-                        policy_world,
-                        core.last_world_sequence,
-                    )
-                ):
+                if world_fresh and state_fresh:
                     transient_stale_active = False
-                    assert policy_world is not None
+                    assert latest_world is not None
                     assert state is not None
                     if (
                         direct_start
                         and warmed
                         and handoff.state == HandoffStateMachine.WAITING
                     ):
-                        if queued_policy_input:
-                            policy_inputs.popleft()
                         next_policy = _advance_deadline(
                             next_policy,
                             policy_period,
                             now,
                         )
                         continue
-                    previous_world_sequence = core.last_world_sequence
-                    authority_active = (
-                        handoff.state == HandoffStateMachine.ACTIVE
-                    )
                     started = monotonic()
                     try:
                         target, latest_policy_status = core.step(
-                            policy_world,
+                            latest_world,
                             state,
                             active=(
                                 handoff.state == HandoffStateMachine.ACTIVE
@@ -3042,76 +2566,11 @@ def run_worker(
                         if "duplicate world sequence" not in str(exc):
                             raise
                     else:
-                        inference_ms = (monotonic() - started) * 1000.0
                         with target_lock:
                             latest_target = target
-                        latest_policy_status["inference_ms"] = inference_ms
-                        if authority_active:
-                            active_policy_tick_count += 1
-                            active_policy_inference_ms_max = max(
-                                active_policy_inference_ms_max,
-                                inference_ms,
-                            )
-                            if inference_ms > policy_period * 1000.0:
-                                active_policy_inference_overrun_count += 1
-                            active_policy_pre_reference_ms_max = max(
-                                active_policy_pre_reference_ms_max,
-                                float(
-                                    latest_policy_status.get(
-                                        "pre_reference_ms",
-                                        0.0,
-                                    )
-                                ),
-                            )
-                            active_policy_reference_step_ms_max = max(
-                                active_policy_reference_step_ms_max,
-                                float(
-                                    latest_policy_status.get(
-                                        "reference_step_ms",
-                                        0.0,
-                                    )
-                                ),
-                            )
-                            active_policy_teacher_step_ms_max = max(
-                                active_policy_teacher_step_ms_max,
-                                float(
-                                    latest_policy_status.get(
-                                        "teacher_step_ms",
-                                        0.0,
-                                    )
-                                ),
-                            )
-                            active_policy_post_teacher_ms_max = max(
-                                active_policy_post_teacher_ms_max,
-                                float(
-                                    latest_policy_status.get(
-                                        "post_teacher_ms",
-                                        0.0,
-                                    )
-                                ),
-                            )
-                            if previous_world_sequence is not None:
-                                sequence_delta = (
-                                    int(policy_world.sequence)
-                                    - int(previous_world_sequence)
-                                )
-                                active_policy_sequence_delta_last = sequence_delta
-                                active_policy_sequence_delta_max = max(
-                                    active_policy_sequence_delta_max,
-                                    sequence_delta,
-                                )
-                                active_policy_sequence_delta_counts[
-                                    sequence_delta
-                                ] = (
-                                    active_policy_sequence_delta_counts.get(
-                                        sequence_delta,
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                active_policy_skipped_state_count += (
-                                    _policy_sequence_skip_count(sequence_delta)
-                                )
+                        latest_policy_status["inference_ms"] = (
+                            monotonic() - started
+                        ) * 1000.0
                         if (
                             handoff.state
                             in {
@@ -3186,7 +2645,6 @@ def run_worker(
                                 prepared_authority_epoch = None
                                 preparing_aligned_initial = False
                                 preparing_allow_idle_neutral = False
-                                preparing_lowstate_anchor = False
                                 prepare_ready_steps = 0
                                 core.enter_standby()
                             elif preparing_authority_epoch is not None:
@@ -3223,9 +2681,6 @@ def run_worker(
                                             ),
                                             "idle_neutral_handoff": bool(
                                                 preparing_allow_idle_neutral
-                                            ),
-                                            "lowstate_anchor_handoff": bool(
-                                                preparing_lowstate_anchor
                                             ),
                                             "reference_aligned": True,
                                             "reference_pending_rebuild": False,
@@ -3277,15 +2732,6 @@ def run_worker(
                                     ),
                                 },
                             )
-                    if queued_policy_input:
-                        policy_inputs.popleft()
-                elif world_fresh and state_fresh:
-                    # A timer wakeup before the next host state must not
-                    # consume a policy tick.  The STATE handler above will
-                    # re-arm inference immediately when sequence advances.
-                    transient_stale_active = False
-                    if queued_policy_input:
-                        policy_inputs.popleft()
                 elif handoff.state == HandoffStateMachine.ACTIVE:
                     ages = (world_age_s, state_age_s)
                     if any(
@@ -3319,16 +2765,10 @@ def run_worker(
                         )
                 else:
                     transient_stale_active = False
-                    if queued_policy_input:
-                        policy_inputs.popleft()
-                next_policy = (
-                    monotonic()
-                    if policy_inputs
-                    else _advance_deadline(
-                        next_policy,
-                        policy_period,
-                        now,
-                    )
+                next_policy = _advance_deadline(
+                    next_policy,
+                    policy_period,
+                    now,
                 )
 
             if now >= next_status:
@@ -3372,44 +2812,6 @@ def run_worker(
                     ),
                     "transient_input_stale_max_overage_ms": (
                         transient_stale_max_overage_s * 1000.0
-                    ),
-                    "policy_input_queue_depth": len(policy_inputs),
-                    "policy_input_queue_max_depth": (
-                        policy_input_queue_max_depth
-                    ),
-                    "active_policy_tick_count": active_policy_tick_count,
-                    "active_policy_sequence_delta_last": (
-                        active_policy_sequence_delta_last
-                    ),
-                    "active_policy_sequence_delta_max": (
-                        active_policy_sequence_delta_max
-                    ),
-                    "active_policy_sequence_delta_counts": {
-                        str(delta): count
-                        for delta, count in sorted(
-                            active_policy_sequence_delta_counts.items()
-                        )
-                    },
-                    "active_policy_skipped_state_count": (
-                        active_policy_skipped_state_count
-                    ),
-                    "active_policy_inference_ms_max": (
-                        active_policy_inference_ms_max
-                    ),
-                    "active_policy_inference_overrun_count": (
-                        active_policy_inference_overrun_count
-                    ),
-                    "active_policy_pre_reference_ms_max": (
-                        active_policy_pre_reference_ms_max
-                    ),
-                    "active_policy_reference_step_ms_max": (
-                        active_policy_reference_step_ms_max
-                    ),
-                    "active_policy_teacher_step_ms_max": (
-                        active_policy_teacher_step_ms_max
-                    ),
-                    "active_policy_post_teacher_ms_max": (
-                        active_policy_post_teacher_ms_max
                     ),
                     "world_sample_sequence": (
                         latest_world.sequence

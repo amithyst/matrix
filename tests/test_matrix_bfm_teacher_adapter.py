@@ -45,8 +45,8 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
                 "root_follow_max_step_m": 0.015,
                 "command_replan_linear_delta_mps": 0.05,
                 "command_replan_yaw_delta_rad_s": 0.05,
-                "pending_min_steps": 16,
-                "pending_extra_frames": 24,
+                "pending_min_steps": 4,
+                "pending_extra_frames": 8,
             },
         )
 
@@ -127,21 +127,6 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
                 allow_idle_neutral=False,
             )
         )
-
-    def test_policy_world_sample_is_admitted_once_per_host_sequence(self) -> None:
-        world = SimpleNamespace(sequence=104)
-
-        self.assertTrue(MODULE._policy_world_sample_is_new(world, None))
-        self.assertFalse(MODULE._policy_world_sample_is_new(world, 104))
-        self.assertTrue(MODULE._policy_world_sample_is_new(world, 100))
-        self.assertFalse(MODULE._policy_world_sample_is_new(None, 104))
-
-    def test_policy_sequence_skip_count_uses_four_step_host_contract(self) -> None:
-        self.assertEqual(MODULE._policy_sequence_skip_count(4), 0)
-        self.assertEqual(MODULE._policy_sequence_skip_count(8), 1)
-        self.assertEqual(MODULE._policy_sequence_skip_count(12), 2)
-        self.assertEqual(MODULE._policy_sequence_skip_count(0), 0)
-        self.assertEqual(MODULE._policy_sequence_skip_count(5), 0)
 
     def test_turn_command_keeps_heading_control(self) -> None:
         sample = self.sample(safe_stop=False, mode="turn")
@@ -523,7 +508,6 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertIsNone(status["reference_transition"])
         self.assertFalse(status["reference_transition_holding"])
         self.assertFalse(status["idle_anchor_hold"])
-
         np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
 
     def test_canonical_buffer_swap_blends_from_last_published_target(self) -> None:
@@ -751,6 +735,9 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
                     gait="walk",
                     stop_latched=False,
                 )
+                self._pending = None
+                self._deferred_reason = None
+
             def sample(self, command, *_args):
                 plan = SimpleNamespace(
                     future_qpos=np.zeros((10, 36), dtype=np.float32),
@@ -789,7 +776,6 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         np.testing.assert_allclose(target, np.ones(MODULE.NUM_JOINTS))
         self.assertEqual(core.teacher.reset_count, resets_before)
         self.assertEqual(core.stream._last_branch_command.gait, "stand")
-        self.assertEqual(status["reference_realtime_rolling_reason"], "gait")
         self.assertTrue(status["reference_realtime_rolling_stop"])
         self.assertFalse(status["reference_pending_rebuild"])
         self.assertFalse(status["reference_buffer_swapped"])
@@ -804,6 +790,9 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
                     gait="stand",
                     stop_latched=False,
                 )
+                self._pending = None
+                self._deferred_reason = None
+
             def sample(self, command, *_args):
                 plan = SimpleNamespace(
                     future_qpos=np.zeros((10, 36), dtype=np.float32),
@@ -841,26 +830,79 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertFalse(status["reference_pending_rebuild"])
         self.assertFalse(status["reference_buffer_swapped"])
 
-    def test_realtime_contract_suppresses_root_anchor_worker_only(self) -> None:
-        class PendingStream:
+    def test_canonical_tick_cancels_root_anchor_pending_before_barrier(self) -> None:
+        class PendingFuture:
             def __init__(self) -> None:
-                self.calls = []
+                self.cancelled = False
 
-            def _start_pending(self, cursor, command, height_field, reason):
-                self.calls.append((cursor, command, height_field, reason))
-                return True
+            def cancel(self) -> None:
+                self.cancelled = True
+
+        class PendingEvent:
+            def __init__(self) -> None:
+                self.set_called = False
+
+            def set(self) -> None:
+                self.set_called = True
+
+        class RootPendingStream:
+            def __init__(self) -> None:
+                self._frames = [object()]
+                self._last_branch_command = SimpleNamespace(
+                    gait="walk",
+                    stop_latched=False,
+                )
+                self.future = PendingFuture()
+                self.event = PendingEvent()
+                self._pending = SimpleNamespace(
+                    future=self.future,
+                    cancel_event=self.event,
+                )
+                self._deferred_reason = "root_anchor"
+                self._discard_count = 0
+
+            def _change_reason(self, _command, _previous):
+                return None
+
+            def sample(self, command, *_args):
+                plan = SimpleNamespace(
+                    future_qpos=np.zeros((10, 36), dtype=np.float32),
+                    target_speed=math.hypot(command.vx, command.vy),
+                )
+                return SimpleNamespace(
+                    plan=plan,
+                    replanned=False,
+                    replan_reason=None,
+                    plan_index=1,
+                    root_error_before_m=0.0,
+                    pending_rebuild=False,
+                    buffer_swapped=False,
+                )
 
         core = self.inference_core()
-        core.stream = PendingStream()
-        core._install_matrix_realtime_reference_contract()
+        core.canonical_reference_continuity = True
+        core.idle_anchor_enabled = False
+        core.reference_motion_active = True
+        core.stream = RootPendingStream()
+        moving = self.world(sequence=1)
+        moving.safe_stop = False
+        moving.mode = "move"
+        moving.speed_mps = 0.9
+        moving.locomotion_mode = 2
+        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
 
-        self.assertFalse(core.stream._start_pending(1, 2, 3, "root_anchor"))
-        self.assertFalse(
-            core.stream._start_pending(1, 2, 3, "velocity+root_anchor")
+        _, status = core.step(moving, self.lowstate(), active=True)
+
+        self.assertIsNone(core.stream._pending)
+        self.assertTrue(core.stream.future.cancelled)
+        self.assertTrue(core.stream.event.set_called)
+        self.assertEqual(core.stream._discard_count, 1)
+        self.assertIsNone(core.stream._deferred_reason)
+        self.assertEqual(
+            status["reference_realtime_rolling_reason"],
+            "pending_cancel",
         )
-        self.assertTrue(core.stream._start_pending(1, 2, 3, "safety_stop"))
-        self.assertEqual(core.stream._matrix_root_anchor_suppressed_count, 2)
-        self.assertEqual(core.stream.calls, [(1, 2, 3, "safety_stop")])
+        self.assertFalse(status["reference_pending_rebuild"])
 
     def test_explicit_safety_stop_keeps_pfnn_branch_rebuild(self) -> None:
         class SafetyStream:
@@ -1126,14 +1168,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         runtime._command_monotonic = lambda: 12.5
         message = SimpleNamespace(
             motor_cmd=[
-                SimpleNamespace(
-                    mode=1,
-                    q=float(index) / 10.0,
-                    dq=float(index) / 100.0,
-                    tau=float(index) / 1000.0,
-                    kp=20.0 + index,
-                    kd=0.5 + float(index) / 100.0,
-                )
+                SimpleNamespace(mode=1, q=float(index) / 10.0)
                 for index in range(35)
             ]
         )
@@ -1147,20 +1182,11 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             captured.joint_pos_rad,
             np.arange(MODULE.NUM_JOINTS, dtype=np.float32) / 10.0,
         )
-        np.testing.assert_allclose(
-            captured.joint_vel_rad_s,
-            np.arange(MODULE.NUM_JOINTS, dtype=np.float32) / 100.0,
-        )
-        np.testing.assert_allclose(
-            captured.feedforward_torque_nm,
-            np.arange(MODULE.NUM_JOINTS, dtype=np.float32) / 1000.0,
-        )
 
     def test_handoff_preview_and_authoritative_idle_hold_prepared_pose(
         self,
     ) -> None:
         core = self.inference_core()
-        core.canonical_reference_continuity = True
         first_lowstate = self.lowstate(joint_value=0.41)
         second_lowstate = self.lowstate(joint_value=0.36)
         core.prepare_activation(first_lowstate)
@@ -1212,135 +1238,6 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
                 core.previous_action,
                 np.zeros(MODULE.NUM_JOINTS),
             )
-
-        moving = self.world(sequence=8)
-        moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
-        moving.speed_mps = 0.9
-        moving.locomotion_mode = 2
-        moving.mode = "move"
-        moving.safe_stop = False
-        moving_target, moving_status = core.step(
-            moving,
-            observed,
-            active=True,
-        )
-        self.assertFalse(moving_status["idle_anchor_hold"])
-        self.assertFalse(moving_status["idle_anchor_enabled"])
-        self.assertLessEqual(
-            float(np.max(np.abs(moving_target - idle_target))),
-            MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
-        )
-
-    def test_release_idle_anchor_enters_dynamic_stand_with_bounded_steps(
-        self,
-    ) -> None:
-        core = self.inference_core()
-        lowstate = self.lowstate(joint_value=0.41)
-        core.prepare_handoff_activation(
-            lowstate,
-            lowstate.joint_pos_rad,
-        )
-        preview, preview_status = core.step(
-            self.world(sequence=1),
-            lowstate,
-            active=True,
-            handoff_preview=True,
-        )
-        self.assertTrue(preview_status["idle_anchor_hold"])
-
-        core.release_idle_anchor()
-        previous = preview
-        settled = False
-        for sequence in range(2, 40):
-            target, status = core.step(
-                self.world(sequence=sequence),
-                lowstate,
-                active=True,
-            )
-            self.assertFalse(status["idle_anchor_hold"])
-            self.assertLessEqual(
-                float(np.max(np.abs(target - previous))),
-                MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
-            )
-            previous = target
-            if not status["activation_settle_active"]:
-                settled = True
-                break
-
-        self.assertTrue(settled)
-        np.testing.assert_allclose(previous, np.ones(MODULE.NUM_JOINTS))
-
-    def test_release_idle_anchor_requires_prepared_anchor(self) -> None:
-        core = self.inference_core()
-        with self.assertRaisesRegex(RuntimeError, "not prepared"):
-            core.release_idle_anchor()
-
-    def test_authority_boundary_reanchor_discards_stale_preview_pose(self) -> None:
-        core = self.inference_core()
-        prepared = self.lowstate(joint_value=0.41)
-        core.prepare_handoff_activation(prepared, prepared.joint_pos_rad)
-        core.step(
-            self.world(sequence=1),
-            prepared,
-            active=True,
-            handoff_preview=True,
-        )
-
-        fenced = self.lowstate(joint_value=-0.27)
-        anchor = core.reanchor_prepared_activation(fenced)
-
-        np.testing.assert_allclose(anchor, fenced.joint_pos_rad)
-        np.testing.assert_allclose(core.last_published_target, fenced.joint_pos_rad)
-        np.testing.assert_allclose(core.idle_anchor_target, fenced.joint_pos_rad)
-        np.testing.assert_allclose(core.previous_action, np.zeros(MODULE.NUM_JOINTS))
-        self.assertTrue(core.idle_anchor_enabled)
-        self.assertIsNone(core.reference_transition)
-
-        core.release_idle_anchor()
-        target, status = core.step(
-            self.world(sequence=2),
-            fenced,
-            active=True,
-        )
-        self.assertLessEqual(
-            float(np.max(np.abs(target - fenced.joint_pos_rad))),
-            MODULE.HOT_SWITCH_MAX_TARGET_DELTA_RAD + 1.0e-6,
-        )
-        self.assertFalse(status["idle_anchor_hold"])
-
-        prior_target = np.full(MODULE.NUM_JOINTS, 0.08, dtype=np.float32)
-        torque_anchor = core.reanchor_prepared_activation(
-            fenced,
-            prior_target,
-        )
-        np.testing.assert_allclose(torque_anchor, prior_target)
-        np.testing.assert_allclose(core.last_published_target, prior_target)
-
-    def test_handoff_target_preserves_prior_pd_torque(self) -> None:
-        core = self.inference_core()
-        core.kp = np.full(MODULE.NUM_JOINTS, 45.0, dtype=np.float32)
-        core.kd = np.full(MODULE.NUM_JOINTS, 2.0, dtype=np.float32)
-        lowstate = self.lowstate(joint_value=0.2)
-        lowstate.joint_vel_rad_s[:] = 0.3
-        command = MODULE.LowCmdTargetSnapshot.validated(
-            joint_pos_rad=np.full(MODULE.NUM_JOINTS, 0.7),
-            joint_vel_rad_s=np.full(MODULE.NUM_JOINTS, -0.1),
-            feedforward_torque_nm=np.full(MODULE.NUM_JOINTS, 0.25),
-            kp=np.full(MODULE.NUM_JOINTS, 30.0),
-            kd=np.full(MODULE.NUM_JOINTS, 1.5),
-            received_monotonic=1.0,
-        )
-
-        target, prior_torque = core.torque_continuous_handoff_target(
-            lowstate,
-            command,
-        )
-        bfm_torque = (
-            core.kp * (target - lowstate.joint_pos_rad)
-            - core.kd * lowstate.joint_vel_rad_s
-        )
-
-        np.testing.assert_allclose(bfm_torque, prior_torque, atol=1.0e-5)
 
     def test_handoff_preview_requires_active_policy_state(self) -> None:
         core = self.inference_core()
@@ -1429,36 +1326,6 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             0.0,
         )
         self.assertEqual(core.trace_written, 1)
-
-    def test_policy_trace_motion_gate_skips_idle_ticks(self) -> None:
-        core = self.inference_core()
-        with tempfile.TemporaryDirectory() as temporary:
-            trace_file = Path(temporary) / "bfm-motion-trace.jsonl"
-            core.trace_file = trace_file
-            core.trace_ticks = 1
-            core.trace_written = 0
-            core.trace_triggered = False
-
-            core.step(self.world(), self.lowstate(), active=True)
-            self.assertFalse(trace_file.exists())
-
-            moving = self.world(sequence=2)
-            moving.safe_stop = False
-            moving.mode = "move"
-            moving.speed_mps = 0.8
-            moving.locomotion_mode = 2
-            moving.movement = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
-            core.step(moving, self.lowstate(), active=True)
-
-            records = trace_file.read_text(encoding="utf-8").splitlines()
-
-        self.assertTrue(core.trace_triggered)
-        self.assertEqual(core.trace_written, 1)
-        self.assertEqual(len(records), 1)
-        self.assertGreater(
-            json.loads(records[0])["status"]["command_speed_mps"],
-            0.0,
-        )
 
     def test_motion_to_idle_discards_stale_walking_reference(self) -> None:
         core = self.inference_core()

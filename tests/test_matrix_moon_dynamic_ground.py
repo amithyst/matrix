@@ -37,7 +37,7 @@ class FakeModel:
         unmapped: tuple[int, int] | None = None,
         duplicate_mocap: tuple[tuple[int, int], tuple[int, int]] | None = None,
         continuous_support: bool = True,
-        tile_collision_enabled: bool = False,
+        tile_collision_enabled: bool = True,
     ) -> None:
         names: list[str | None] = ["world", "pelvis"]
         keys: list[tuple[int, int] | None] = [None, None]
@@ -79,8 +79,8 @@ class FakeModel:
             geom_body_ids.append(0)
             geom_data_ids.append(0)
             geom_types.append(1)
-            geom_contype.append(1)
-            geom_conaffinity.append(1)
+            geom_contype.append(0)
+            geom_conaffinity.append(0)
             self._geom_names.append(MODULE.SPAWN_PAD_GEOM_NAME)
             geom_body_ids.append(0)
             geom_data_ids.append(-1)
@@ -284,10 +284,10 @@ class MoonDynamicGroundTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(
             MODULE.MoonDynamicGroundError,
-            "remains collidable",
+            "compiled collidable",
         ):
             MODULE.resolve_continuous_support(
-                FakeModel(tile_collision_enabled=True)
+                FakeModel(tile_collision_enabled=False)
             )
 
     def test_rejects_drifted_continuous_support_binding_and_collision(self) -> None:
@@ -309,8 +309,8 @@ class MoonDynamicGroundTest(unittest.TestCase):
             ),
             (
                 "collision mask",
-                {"geom_contype": 0, "geom_conaffinity": 0},
-                "compiled with contype=1",
+                {"geom_contype": 1, "geom_conaffinity": 1},
+                "contype=0 and conaffinity=0",
             ),
         )
         for label, replacements, message in cases:
@@ -393,28 +393,28 @@ class MoonDynamicGroundTest(unittest.TestCase):
                 self.assertTrue(ground.collision_handoff_active)
                 self.assertEqual(
                     forward_states,
-                    [((1, 1), (0, 0), (0, 0))],
+                    [((0, 0), (0, 0), (1, 1))],
                 )
                 self.assertEqual(
                     tuple(model.geom_contype[:2]),
-                    (1, 0),
+                    (0, 0),
                 )
                 self.assertEqual(
                     tuple(model.geom_conaffinity[:2]),
-                    (1, 0),
+                    (0, 0),
                 )
-                self.assertTrue(np.all(model.geom_contype[2:] == 0))
-                self.assertTrue(np.all(model.geom_conaffinity[2:] == 0))
+                self.assertTrue(np.all(model.geom_contype[2:] == 1))
+                self.assertTrue(np.all(model.geom_conaffinity[2:] == 1))
                 telemetry = ground.telemetry()
                 self.assertTrue(telemetry["collision_handoff"]["active"])
-                self.assertTrue(
+                self.assertFalse(
                     telemetry["continuous_support"]["collision_enabled"]
                 )
                 self.assertEqual(
                     telemetry["collision_handoff"][
                         "rolling_tile_collision_mask"
                     ],
-                    [0, 0],
+                    [1, 1],
                 )
                 with self.assertRaisesRegex(
                     MODULE.MoonDynamicGroundError,
@@ -569,7 +569,7 @@ class MoonDynamicGroundTest(unittest.TestCase):
                 self.assertEqual(telemetry["tiles"]["count"], MODULE.TILE_COUNT)
                 self.assertEqual(
                     telemetry["continuous_support"]["mode"],
-                    "rolling-heightfield-v2",
+                    "rolling-heightfield-v1",
                 )
                 self.assertFalse(
                     telemetry["continuous_support"][

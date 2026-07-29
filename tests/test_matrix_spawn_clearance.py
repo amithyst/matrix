@@ -135,8 +135,8 @@ class FakeModel:
         geom_conaffinity = list(self.geom_conaffinity)
         geom_contype[3] = 0
         geom_conaffinity[3] = 0
-        geom_contype[6] = 1
-        geom_conaffinity[6] = 1
+        geom_contype[4] = 1
+        geom_conaffinity[4] = 1
         self.geom_contype = tuple(geom_contype)
         self.geom_conaffinity = tuple(geom_conaffinity)
 
@@ -372,21 +372,19 @@ class SpawnClearanceAuditTest(unittest.TestCase):
         self.assertTrue(result["moon_spawn_gate"]["enabled"])
         self.assertFalse(result["moon_spawn_gate"]["body_contact_allowed"])
 
-    def test_moon_gate_allows_active_heightfield_foot_contacts(self) -> None:
+    def test_moon_gate_allows_active_rolling_tile_foot_contacts(self) -> None:
         self.model.activate_moon_continuous_support()
         result = MODULE.audit_spawn_clearance(
             self.model,
             FakeData(
-                Contact(0, 6, dist=-0.004, frame=(0.0, 0.0, -1.0)),
-                Contact(6, 1, dist=-0.004, frame=VERTICAL),
+                Contact(0, 4, dist=-0.004, frame=(0.0, 0.0, -1.0)),
+                Contact(4, 1, dist=-0.004, frame=VERTICAL),
             ),
         )
 
         self.assertTrue(result["safe"])
-        self.assertEqual(
-            result["moon_spawn_gate"]["phase"], "rolling-heightfield"
-        )
-        self.assertFalse(
+        self.assertEqual(result["moon_spawn_gate"]["phase"], "rolling-tiles")
+        self.assertTrue(
             result["moon_spawn_gate"]["foot_terrain_edge_allowed"]
         )
         self.assertEqual(
@@ -685,14 +683,14 @@ class GroundSupportProbeTest(unittest.TestCase):
         self.assertAlmostEqual(support["height_delta_m"], 0.0)
         self.assertTrue(support["height_delta_safe"])
 
-    def test_moon_gate_accepts_active_heightfield_after_handoff(self) -> None:
+    def test_moon_gate_accepts_active_rolling_tiles_after_handoff(self) -> None:
         self.model.activate_moon_continuous_support()
         support = MODULE.probe_ground_support(
             FakeMujoco(
                 default_support=False,
                 ray_hits={
-                    (0.0, 6): (0.04, VERTICAL),
-                    (1.0, 6): (0.04, VERTICAL),
+                    (0.0, 4): (0.04, VERTICAL),
+                    (1.0, 4): (0.04, VERTICAL),
                 },
             ),
             self.model,
@@ -705,8 +703,8 @@ class GroundSupportProbeTest(unittest.TestCase):
         self.assertEqual(
             [probe["scene_geom"]["name"] for probe in support["probes"]],
             [
-                MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
-                MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "soil_0_0",
+                "soil_0_0",
             ],
         )
 
@@ -753,7 +751,7 @@ class GroundSupportProbeTest(unittest.TestCase):
             (
                 "collision mask",
                 {"geom_contype": 2, "geom_conaffinity": 2},
-                "continuous hfield collision mask is invalid",
+                "observation hfield must remain non-colliding",
             ),
         )
         for label, replacements, message in cases:

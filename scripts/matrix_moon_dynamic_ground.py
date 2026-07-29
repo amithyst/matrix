@@ -245,7 +245,7 @@ def _unique_named_model_id(
 
 
 def resolve_continuous_support(model: Any) -> dict[str, object]:
-    """Resolve the compiled collision hfield, visual tiles, and spawn pad."""
+    """Resolve observation hfield, compiled rolling tiles, and spawn pad."""
 
     try:
         ngeom = int(model.ngeom)
@@ -299,10 +299,9 @@ def resolve_continuous_support(model: Any) -> dict[str, object]:
         raise MoonDynamicGroundError(
             "continuous support geom must bind the named hfield asset"
         )
-    if geom_contype != 1 or geom_conaffinity != 1:
+    if geom_contype != 0 or geom_conaffinity != 0:
         raise MoonDynamicGroundError(
-            "continuous support must be compiled with contype=1 and "
-            "conaffinity=1 before runtime disarm"
+            "continuous support geom must use contype=0 and conaffinity=0"
         )
     spawn_pad_geom_id = _unique_named_model_id(
         model,
@@ -361,9 +360,10 @@ def resolve_continuous_support(model: Any) -> dict[str, object]:
             raise MoonDynamicGroundError(
                 f"MuJoCo tile geom collision metadata is unavailable: {geom_name}"
             ) from exc
-        if contype != 0 or conaffinity != 0:
+        if contype != 1 or conaffinity != 1:
             raise MoonDynamicGroundError(
-                f"MoonWorld visual tile geom remains collidable: {geom_name}"
+                "MoonWorld rolling tile must be compiled collidable before "
+                f"runtime disarm: {geom_name}"
             )
     return {
         "geom_id": geom_id,
@@ -479,11 +479,11 @@ class MoonDynamicGround:
             self.tile_geom_ids = tuple(
                 int(value) for value in support["tile_geom_ids"]
             )
-            # Compile the hfield as collidable so MuJoCo builds its collision
-            # structures, then disarm it until the finite spawn pad passes the
-            # initial clearance audit. Tiles remain visual-only throughout.
-            self._model.geom_contype[self.support_geom_id] = 0
-            self._model.geom_conaffinity[self.support_geom_id] = 0
+            # The tiles must be collidable at model compile time so MuJoCo
+            # builds their dynamic collision structures. Disarm them before
+            # the first forward/step; the spawn pad is the sole startup ground.
+            self._model.geom_contype[list(self.tile_geom_ids)] = 0
+            self._model.geom_conaffinity[list(self.tile_geom_ids)] = 0
             self._cache_sentinel_mocap_ids = tuple(
                 int(self.mocap_ids[tile_index])
                 for tile_index in _CACHE_SENTINEL_TILE_INDICES
@@ -601,10 +601,10 @@ class MoonDynamicGround:
         *,
         forward: Any,
     ) -> dict[str, object]:
-        """Atomically replace the finite spawn pad with the rolling hfield.
+        """Atomically replace the finite spawn pad with official rolling tiles.
 
-        The tile poses and continuous hfield must have been populated once.
-        All support and pad masks are changed before ``forward`` runs, so MuJoCo
+        The tile poses and observation hfield must have been populated once.
+        All tile and pad masks are changed before ``forward`` runs, so MuJoCo
         never advances a physics step with both grounds enabled or with
         neither one enabled.
         """
@@ -649,14 +649,14 @@ class MoonDynamicGround:
         ):
             raise MoonDynamicGroundError(
                 "MoonWorld pre-handoff collision contract drifted: "
-                f"continuous_hfield={support_mask} "
-                f"visual_tiles={sorted(tile_masks_before)} "
+                f"observation_hfield={support_mask} "
+                f"rolling_tiles={sorted(tile_masks_before)} "
                 f"spawn_pad={pad_before}"
             )
 
         try:
-            self._model.geom_contype[self.support_geom_id] = 1
-            self._model.geom_conaffinity[self.support_geom_id] = 1
+            self._model.geom_contype[list(self.tile_geom_ids)] = 1
+            self._model.geom_conaffinity[list(self.tile_geom_ids)] = 1
             self._model.geom_contype[self.spawn_pad_geom_id] = 0
             self._model.geom_conaffinity[self.spawn_pad_geom_id] = 0
             forward(self._model, data)
@@ -676,21 +676,21 @@ class MoonDynamicGround:
                 for geom_id in self.tile_geom_ids
             }
             if (
-                support_after != (1, 1)
-                or tile_masks_after != {(0, 0)}
+                support_after != (0, 0)
+                or tile_masks_after != {(1, 1)}
                 or pad_after != (0, 0)
             ):
                 raise MoonDynamicGroundError(
                     "MoonWorld active collision contract drifted: "
-                    f"continuous_hfield={support_after} "
-                    f"visual_tiles={sorted(tile_masks_after)} "
+                    f"observation_hfield={support_after} "
+                    f"rolling_tiles={sorted(tile_masks_after)} "
                     f"spawn_pad={pad_after}"
                 )
         except Exception as exc:
             rollback_error: Exception | None = None
             try:
-                self._model.geom_contype[self.support_geom_id] = 0
-                self._model.geom_conaffinity[self.support_geom_id] = 0
+                self._model.geom_contype[list(self.tile_geom_ids)] = 0
+                self._model.geom_conaffinity[list(self.tile_geom_ids)] = 0
                 self._model.geom_contype[self.spawn_pad_geom_id] = 1
                 self._model.geom_conaffinity[self.spawn_pad_geom_id] = 1
                 forward(self._model, data)
@@ -710,11 +710,9 @@ class MoonDynamicGround:
         self._collision_handoff_active = True
         return {
             "active": True,
-            "ground_mode": "rolling-heightfield-v2",
-            "support_geom_id": self.support_geom_id,
-            "support_collision_mask": [1, 1],
+            "ground_mode": "rolling-mocap-tiles-v1",
             "tile_geom_count": len(self.tile_geom_ids),
-            "tile_collision_mask": [0, 0],
+            "tile_collision_mask": [1, 1],
             "spawn_pad_geom_id": self.spawn_pad_geom_id,
             "spawn_pad_collision_mask": [0, 0],
         }
@@ -1068,7 +1066,7 @@ class MoonDynamicGround:
                 ),
             },
             "continuous_support": {
-                "mode": "rolling-heightfield-v2",
+                "mode": "rolling-heightfield-v1",
                 "geom_name": CONTINUOUS_SUPPORT_GEOM_NAME,
                 "asset_name": CONTINUOUS_SUPPORT_ASSET_NAME,
                 "geom_id": getattr(self, "support_geom_id", None),
@@ -1080,20 +1078,20 @@ class MoonDynamicGround:
                 "half_extent_m": CONTINUOUS_SUPPORT_HALF_EXTENT_M,
                 "height_range_m": CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
                 "base_depth_m": CONTINUOUS_SUPPORT_BASE_DEPTH_M,
-                "source_tile_collision_enabled": False,
-                "collision_enabled": self._collision_handoff_active,
+                "source_tile_collision_enabled": self._collision_handoff_active,
+                "collision_enabled": False,
             },
             "collision_handoff": {
                 "active": self._collision_handoff_active,
-                "contract": "spawn-pad-to-rolling-heightfield-v2",
+                "contract": "spawn-pad-to-rolling-mocap-tiles-v1",
                 "support_geom_id": getattr(self, "support_geom_id", None),
-                "support_collision_mask": (
-                    [1, 1] if self._collision_handoff_active else [0, 0]
-                ),
+                "support_collision_mask": [0, 0],
                 "rolling_tile_geom_count": len(
                     getattr(self, "tile_geom_ids", ())
                 ),
-                "rolling_tile_collision_mask": [0, 0],
+                "rolling_tile_collision_mask": (
+                    [1, 1] if self._collision_handoff_active else [0, 0]
+                ),
                 "spawn_pad_geom_name": SPAWN_PAD_GEOM_NAME,
                 "spawn_pad_geom_id": getattr(self, "spawn_pad_geom_id", None),
                 "spawn_pad_collision_mask": (

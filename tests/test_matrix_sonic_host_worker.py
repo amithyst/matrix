@@ -105,119 +105,6 @@ class BlockingRunner:
 
 
 class HostPolicyTests(unittest.TestCase):
-    def test_torque_continuity_anchor_preserves_full_observed_pd_torque(self):
-        state = snapshot(
-            joint_vel_rad_s=np.linspace(-0.5, 0.5, 29, dtype=np.float32)
-        )
-        prior = worker.LowCmdSnapshot.validated(
-            joint_pos_rad=state.joint_pos_rad
-            + np.linspace(-0.2, 0.3, 29, dtype=np.float32),
-            joint_vel_rad_s=np.linspace(0.4, -0.4, 29, dtype=np.float32),
-            feedforward_torque_nm=np.linspace(-2.0, 2.0, 29, dtype=np.float32),
-            kp=np.linspace(20.0, 48.0, 29, dtype=np.float32),
-            kd=np.linspace(1.0, 3.8, 29, dtype=np.float32),
-            received_monotonic=9.96,
-        )
-        target_config = worker.PolicyConfig.from_mapping(amp_config_mapping())
-
-        target_q, receipt = worker.torque_continuity_anchor(
-            prior_command=prior,
-            state=state,
-            target_config=target_config,
-            now=10.0,
-        )
-
-        prior_torque = (
-            prior.kp * (prior.joint_pos_rad - state.joint_pos_rad)
-            + prior.kd * (prior.joint_vel_rad_s - state.joint_vel_rad_s)
-            + prior.feedforward_torque_nm
-        )
-        target_torque = (
-            target_config.kp * (target_q - state.joint_pos_rad)
-            - target_config.kd * state.joint_vel_rad_s
-        )
-        np.testing.assert_allclose(target_torque, prior_torque, atol=5e-5)
-        self.assertEqual(
-            receipt["go_anchor_source"], "torque_equivalent_observed_lowcmd"
-        )
-        self.assertEqual(receipt["go_joint_order"], list(worker.G1_29_JOINT_NAMES))
-        self.assertEqual(receipt["go_lowcmd_sha256"], prior.sha256())
-        self.assertAlmostEqual(receipt["go_lowcmd_age_ms"], 40.0)
-
-    def test_torque_continuity_anchor_rejects_stale_lowcmd(self):
-        state = snapshot(joint_vel_rad_s=np.zeros(29, dtype=np.float32))
-        prior = worker.LowCmdSnapshot.validated(
-            joint_pos_rad=state.joint_pos_rad,
-            joint_vel_rad_s=np.zeros(29),
-            feedforward_torque_nm=np.zeros(29),
-            kp=np.ones(29),
-            kd=np.ones(29),
-            received_monotonic=-1.0,
-        )
-        with self.assertRaisesRegex(ValueError, "stale"):
-            worker.torque_continuity_anchor(
-                prior_command=prior,
-                state=state,
-                target_config=worker.PolicyConfig.from_mapping(
-                    amp_config_mapping()
-                ),
-                now=10.0,
-            )
-
-    def test_observing_dds_runtime_captures_complete_lowcmd(self):
-        store = worker.LatestLowCmd()
-        runtime = worker.ObservingUnitreeDdsRuntime.__new__(
-            worker.ObservingUnitreeDdsRuntime
-        )
-        runtime._command_store = store
-        runtime._command_monotonic = lambda: 12.5
-        motors = [
-            SimpleNamespace(
-                mode=1,
-                q=index + 0.1,
-                dq=index + 0.2,
-                tau=index + 0.3,
-                kp=index + 20.0,
-                kd=index + 1.0,
-            )
-            for index in range(29)
-        ]
-
-        runtime._on_low_cmd(SimpleNamespace(motor_cmd=motors))
-
-        observed = store.get()
-        self.assertIsNotNone(observed)
-        assert observed is not None
-        self.assertEqual(observed.received_monotonic, 12.5)
-        np.testing.assert_allclose(
-            observed.feedforward_torque_nm,
-            np.arange(29, dtype=np.float32) + 0.3,
-        )
-        motors[7].mode = 0
-        runtime._on_low_cmd(SimpleNamespace(motor_cmd=motors))
-        self.assertIs(store.get(), observed)
-
-    def test_amp_physical_continuation_accepts_torque_anchor(self):
-        config = worker.PolicyConfig.from_mapping(amp_config_mapping())
-        policy = worker.AmpPolicyCore(
-            config,
-            RecordingRunner("flat_v3", [np.ones(29)]),
-        )
-        state = snapshot(joint_vel_rad_s=np.zeros(29, dtype=np.float32))
-        anchor = state.joint_pos_rad + np.linspace(-0.3, 0.3, 29)
-
-        policy.reset_history(state)
-        policy.begin_physical_continuation(
-            state,
-            now=10.0,
-            duration_s=worker.POLICY_SWITCH_BLEND_S,
-            target_origin=anchor,
-        )
-        output = policy.infer(state, now=10.0)
-
-        np.testing.assert_allclose(output.target_joint_pos, anchor)
-        self.assertEqual(policy.physical_continuation_alpha, 0.0)
-
     def test_resident_registry_keeps_flat_v3_as_an_independent_policy(self):
         cascade = worker.HostPolicyCascade(
             config=worker.HostControlConfig.create(),
@@ -1542,7 +1429,7 @@ class WorkerHandoffTests(unittest.TestCase):
             supervisor.close()
             child.close()
 
-    def test_joint_pose_hold_reuses_last_successful_pd_command(self):
+    def test_joint_pose_hold_reuses_writer_and_holds_measured_q(self):
         supervisor, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         supervisor.settimeout(2.0)
         state_store = worker.LatestLowState()
@@ -1580,7 +1467,6 @@ class WorkerHandoffTests(unittest.TestCase):
             event = None
             while event != "FIRST_WRITE":
                 event = json.loads(supervisor.recv(4096).decode("utf-8"))["event"]
-            prior_pd_command = command_pd_vectors(dds.commands[-1])
 
             measured = snapshot(joint_vel_rad_s=np.zeros(29))
             state_store.set(measured)
@@ -1591,9 +1477,8 @@ class WorkerHandoffTests(unittest.TestCase):
                 if packet["event"] == "JOINT_HOLD_FIRST_WRITE":
                     held = packet
             self.assertTrue(held["writer_reused"])
-            self.assertFalse(held["measured_joint_target"])
-            self.assertTrue(held["prior_pd_target_reused"])
-            self.assertEqual(held["prior_pd_joint_count"], 29)
+            self.assertTrue(held["measured_joint_target"])
+            self.assertEqual(held["measured_joint_count"], 29)
             self.assertTrue(held["capture_once"])
             self.assertTrue(held["target_velocity_zero"])
             self.assertTrue(held["feedforward_torque_zero"])
@@ -1602,10 +1487,11 @@ class WorkerHandoffTests(unittest.TestCase):
                 worker.JOINT_HOLD_CAPTURE_MAX_AGE_S,
             )
             self.assertEqual(dds.publisher_calls, 1)
-            for actual, expected in zip(
-                command_pd_vectors(dds.commands[-1]), prior_pd_command
-            ):
-                np.testing.assert_array_equal(actual, expected)
+            for index in range(29):
+                self.assertAlmostEqual(
+                    dds.commands[-1].motor_cmd[index].q,
+                    float(measured.joint_pos_rad[index]),
+                )
 
             command_count = len(dds.commands)
             state_store.set(
@@ -1615,10 +1501,11 @@ class WorkerHandoffTests(unittest.TestCase):
             while len(dds.commands) == command_count and time.monotonic() < deadline:
                 time.sleep(0.005)
             self.assertGreater(len(dds.commands), command_count)
-            for actual, expected in zip(
-                command_pd_vectors(dds.commands[-1]), prior_pd_command
-            ):
-                np.testing.assert_array_equal(actual, expected)
+            for index in range(29):
+                self.assertAlmostEqual(
+                    dds.commands[-1].motor_cmd[index].q,
+                    float(measured.joint_pos_rad[index]),
+                )
 
             supervisor.send(b"STOP")
             stopped = None
@@ -1878,23 +1765,6 @@ class WorkerHandoffTests(unittest.TestCase):
             self.assertFalse(hold_event["host_target_cleared"])
             self.assertTrue(hold_event["writer_reused"])
             self.assertFalse(hold_event["history_reset_from_latest_lowstate"])
-
-            supervisor.send(b"ENTER_JOINT_HOLD")
-            joint_hold_event = None
-            while (
-                joint_hold_event is None
-                or joint_hold_event["event"] != "JOINT_HOLD_FIRST_WRITE"
-            ):
-                joint_hold_event = json.loads(
-                    supervisor.recv(4096).decode("utf-8")
-                )
-            self.assertEqual(
-                joint_hold_event["previous_controller"],
-                worker.AMP_ZERO_COMMAND_HOLD_CONTROLLER,
-            )
-            self.assertFalse(joint_hold_event["measured_joint_target"])
-            self.assertTrue(joint_hold_event["prior_pd_target_reused"])
-            self.assertTrue(joint_hold_event["writer_reused"])
 
             supervisor.send(b"STOP")
             stopped = None

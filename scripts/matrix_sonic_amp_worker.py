@@ -276,51 +276,12 @@ class AmpPolicyCore:
         self.runner = runner
         self.previous_raw_action = np.zeros(NUM_JOINTS, dtype=np.float32)
         self._history: deque[np.ndarray] = deque(maxlen=HISTORY_LENGTH)
-        self._physical_continuation_origin: np.ndarray | None = None
-        self._physical_continuation_started_monotonic: float | None = None
-        self._physical_continuation_duration_s: float | None = None
-        self.physical_continuation_alpha = 1.0
 
     def reset_history(self, state: LowStateSnapshot) -> None:
         self.previous_raw_action.fill(0.0)
         frame = self.observation_frame(state)
         self._history.clear()
         self._history.extend(frame.copy() for _ in range(HISTORY_LENGTH))
-        self._physical_continuation_origin = None
-        self._physical_continuation_started_monotonic = None
-        self._physical_continuation_duration_s = None
-        self.physical_continuation_alpha = 1.0
-
-    def begin_physical_continuation(
-        self,
-        state: LowStateSnapshot,
-        *,
-        now: float,
-        duration_s: float,
-        target_origin: np.ndarray | None = None,
-    ) -> None:
-        """Blend first policy targets from one torque-continuous anchor."""
-
-        started = float(now)
-        duration = float(duration_s)
-        if not math.isfinite(started):
-            raise ValueError("physical continuation time must be finite")
-        if not math.isfinite(duration) or duration <= 0.0:
-            raise ValueError("physical continuation duration must be positive")
-        if np.any(np.abs(self.config.action_scale) <= 1.0e-8):
-            raise ValueError("physical continuation requires non-zero action scales")
-        origin = state.joint_pos_rad if target_origin is None else target_origin
-        origin_vector = np.asarray(origin, dtype=np.float32)
-        if origin_vector.shape != (NUM_JOINTS,) or not np.all(
-            np.isfinite(origin_vector)
-        ):
-            raise ValueError(
-                f"physical continuation target must be a finite {NUM_JOINTS}-vector"
-            )
-        self._physical_continuation_origin = origin_vector.copy()
-        self._physical_continuation_started_monotonic = started
-        self._physical_continuation_duration_s = duration
-        self.physical_continuation_alpha = 0.0
 
     def observation_frame(self, state: LowStateSnapshot) -> np.ndarray:
         frame = np.concatenate(
@@ -350,12 +311,7 @@ class AmpPolicyCore:
             raise AssertionError(f"internal AMP history shape error: {observation.shape}")
         return observation
 
-    def infer(
-        self,
-        state: LowStateSnapshot,
-        *,
-        now: float | None = None,
-    ) -> PolicyOutput:
+    def infer(self, state: LowStateSnapshot) -> PolicyOutput:
         observation = self.build_observation(state)
         raw_action = _finite_vector(
             self.runner(observation[None, :]), NUM_JOINTS, "ONNX raw action"
@@ -364,47 +320,14 @@ class AmpPolicyCore:
             raw_action, -self.config.action_clip, self.config.action_clip
         ).astype(np.float32, copy=False)
         target = self.config.default_joint_pos + self.config.action_scale * clipped_action
-        published_action = clipped_action
-        if (
-            self._physical_continuation_origin is not None
-            and self._physical_continuation_started_monotonic is not None
-            and self._physical_continuation_duration_s is not None
-        ):
-            blend_now = state.received_monotonic if now is None else float(now)
-            alpha = float(
-                np.clip(
-                    (
-                        blend_now
-                        - self._physical_continuation_started_monotonic
-                    )
-                    / self._physical_continuation_duration_s,
-                    0.0,
-                    1.0,
-                )
-            )
-            self.physical_continuation_alpha = alpha
-            target = (
-                self._physical_continuation_origin * (1.0 - alpha)
-                + target * alpha
-            ).astype(np.float32, copy=False)
-            published_action = np.clip(
-                (target - self.config.default_joint_pos)
-                / self.config.action_scale,
-                -self.config.action_clip,
-                self.config.action_clip,
-            ).astype(np.float32, copy=False)
-            if alpha >= 1.0:
-                self._physical_continuation_origin = None
-                self._physical_continuation_started_monotonic = None
-                self._physical_continuation_duration_s = None
         # PrevActions is the previous action-space value after the configured
         # actor clip, never the scaled q target.  This matches the upstream
         # PolicyRunner's ``lastActions`` buffer.  "Raw" here distinguishes
         # action space from joint-position targets, not pre-clip telemetry.
-        self.previous_raw_action[:] = published_action
+        self.previous_raw_action[:] = clipped_action
         return PolicyOutput(
             raw_action=raw_action.copy(),
-            clipped_action=published_action.copy(),
+            clipped_action=clipped_action.copy(),
             target_joint_pos=target.astype(np.float32, copy=False),
             observation=observation.copy(),
         )
@@ -477,17 +400,6 @@ class HandoffStateMachine:
         payload["writer_created"] = False
         self._event_sink("READY_NO_WRITER", payload)
 
-    def prepare_writer(self) -> None:
-        """Construct a resident publisher without authorizing any writes."""
-
-        if self.state == self.PAUSED and self.publisher is not None:
-            return
-        if self.state != self.WAITING or self.publisher is not None:
-            raise RuntimeError("writer preparation requires writer-free standby")
-        self.publisher = self._publisher_factory()
-        self.state = self.PAUSED
-        self.first_write_reported = False
-
     def command(self, command: str) -> None:
         normalized = command.upper()
         if normalized == "GO":
@@ -539,17 +451,12 @@ class HandoffStateMachine:
         if callable(close):
             close()
 
-    def record_successful_write(
-        self, first_write_fields: Mapping[str, Any] | None = None
-    ) -> None:
+    def record_successful_write(self) -> None:
         if self.state != self.ACTIVE or self.publisher is None:
             raise RuntimeError("cannot record a write without the active publisher")
         if not self.first_write_reported:
             self.first_write_reported = True
-            fields = {"writer_created": True}
-            if first_write_fields is not None:
-                fields.update(dict(first_write_fields))
-            self._event_sink("FIRST_WRITE", fields)
+            self._event_sink("FIRST_WRITE", {"writer_created": True})
 
 
 class HgLowCmdCrc:
