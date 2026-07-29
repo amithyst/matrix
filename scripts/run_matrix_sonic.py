@@ -58,6 +58,7 @@ from matrix_mc_commands import (
     MAX_RUNTIME_PAUSE_EPOCH,
     MovementModeSet,
     PolicySlotAssignment,
+    PolicySlotQuery,
     RuntimePause,
     TeleportList,
     TeleportRoute,
@@ -5820,7 +5821,7 @@ class GameCommandRuntime:
                 continue
             if not command_allowed and not isinstance(
                 request.command,
-                (TeleportList, MovementModeSet, GameQuit),
+                (TeleportList, MovementModeSet, PolicySlotQuery, GameQuit),
             ):
                 self.rejected_commands += 1
                 self._send(
@@ -5902,7 +5903,7 @@ class GameCommandRuntime:
                 and self.runtime_pause.physics_frozen
                 and not isinstance(
                     request.command,
-                    (DataModifyNumber, MovementModeSet),
+                    (DataModifyNumber, MovementModeSet, PolicySlotQuery),
                 )
             ):
                 self.rejected_commands += 1
@@ -5913,6 +5914,31 @@ class GameCommandRuntime:
                         code="E_RUNTIME_PAUSED",
                         message="Continue the simulation before changing the world",
                         data={"runtime_pause": self.runtime_pause.telemetry()},
+                    )
+                )
+                continue
+            if isinstance(request.command, PolicySlotQuery):
+                if self.policy_slots is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_POLICY_UNAVAILABLE",
+                            message="Resident policy slots are unavailable for this run",
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code="OK_POLICY_SLOT_STATUS",
+                        message="Resident policy loadout refreshed",
+                        data=self._policy_response_data(
+                            self.policy_slots.strategy_loadout_mapping()
+                        ),
                     )
                 )
                 continue

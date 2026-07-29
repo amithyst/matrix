@@ -6400,6 +6400,72 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_game_command_runtime_policy_query_is_read_only(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.setblocking(False)
+        loadout = {
+            "version": 1,
+            "available": True,
+            "status": "ready",
+            "active_slot": "locomotion",
+            "pending": None,
+            "slots": [
+                {
+                    "slot": "locomotion",
+                    "selected_policy_id": "bfm-sonic-teacher50k",
+                    "locked": False,
+                    "candidates": [],
+                }
+            ],
+            "resident_models": [],
+        }
+
+        class PolicySlots:
+            @staticmethod
+            def strategy_loadout_mapping():
+                return loadout
+
+            def request_policy_slot_assignment(self, *_args, **_kwargs):
+                raise AssertionError("a policy query must not assign a slot")
+
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            policy_slots=PolicySlots(),
+        )
+        request = self.game_command_request(
+            "/policy status",
+            sequence=1,
+            request_character="a",
+        )
+        pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+
+            self.assertFalse(
+                runtime.poll(current_pose=pose, command_allowed=False)
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(4096)
+            )
+
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_POLICY_SLOT_STATUS")
+            self.assertEqual(
+                response.data["strategy_loadout"]["slots"][0][
+                    "selected_policy_id"
+                ],
+                "bfm-sonic-teacher50k",
+            )
+            self.assertEqual(runtime.commands_executed, 1)
+            self.assertEqual(runtime.policy_changes_executed, 0)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
     def test_policy_response_projects_large_provenance_to_packet_bound(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
             socket.AF_UNIX,

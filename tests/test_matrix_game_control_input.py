@@ -1683,10 +1683,7 @@ class GameCommandClientTest(unittest.TestCase):
             client.refresh_loading_strategy_loadout(now_s=10.0, **gates)
         )
         request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.PolicySlotAssignment("locomotion", "sonic"),
-        )
+        self.assertEqual(request.command, MC_COMMANDS.PolicySlotQuery())
         self.assertFalse(
             client.refresh_loading_strategy_loadout(now_s=11.0, **gates)
         )
@@ -1697,8 +1694,8 @@ class GameCommandClientTest(unittest.TestCase):
                     sequence=request.sequence,
                     request_id=request.request_id,
                     ok=True,
-                    code="OK_POLICY_SLOT_ASSIGNED",
-                    message="unchanged",
+                    code="OK_POLICY_SLOT_STATUS",
+                    message="loading",
                     data={"strategy_loadout": self.strategy_loadout(status="loading")},
                 )
             )
@@ -1727,7 +1724,7 @@ class GameCommandClientTest(unittest.TestCase):
                     sequence=retry.sequence,
                     request_id=retry.request_id,
                     ok=True,
-                    code="OK_POLICY_SLOT_ASSIGNED",
+                    code="OK_POLICY_SLOT_STATUS",
                     message="ready",
                     data={"strategy_loadout": ready},
                 )

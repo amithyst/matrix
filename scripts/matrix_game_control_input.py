@@ -127,6 +127,7 @@ from matrix_mc_commands import (
     MAX_RUNTIME_PAUSE_EPOCH,
     MovementModeSet,
     PolicySlotAssignment,
+    PolicySlotQuery,
     RuntimePause,
     TeleportList,
     TeleportSelector,
@@ -5497,33 +5498,10 @@ class GameCommandClient:
             and now - last_refresh < _STRATEGY_LOADOUT_REFRESH_INTERVAL_S
         ):
             return False
-        slots = self._strategy_loadout.get("slots")
-        if not isinstance(slots, list):
-            return False
-        locomotion = next(
-            (
-                slot
-                for slot in slots
-                if isinstance(slot, dict) and slot.get("slot") == "locomotion"
-            ),
-            None,
-        )
-        if not isinstance(locomotion, dict):
-            return False
-        selected = locomotion.get("selected_policy_id")
-        if not isinstance(selected, str):
-            return False
-        try:
-            command = PolicySlotAssignment(
-                slot="locomotion",
-                policy_id=selected,
-            )
-        except CommandParseError:
-            return False
         submitted = self._send_typed_command(
-            command,
+            PolicySlotQuery(),
             warning=None,
-            pending_message="Refreshing resident policy readiness",
+            pending_message="Reading resident policy state",
         )
         if submitted:
             self._last_strategy_loadout_refresh_s = now
