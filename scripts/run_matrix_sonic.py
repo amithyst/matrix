@@ -1719,8 +1719,10 @@ def _validate_direct_bfm(args: argparse.Namespace) -> None:
         if reference_clip is not None or reference_sha256 is not None:
             raise SystemExit("--bfm-reference-clip requires --bfm-direct")
         return
-    if args.control_source != "planner":
-        raise SystemExit("--bfm-direct requires --control-source planner")
+    if args.control_source not in {"planner", "game"}:
+        raise SystemExit(
+            "--bfm-direct requires --control-source planner or game"
+        )
     if getattr(args, "game_fall_recovery", "off") != "off":
         raise SystemExit("--bfm-direct forbids fall recovery")
     if bool(getattr(args, "physical_recovery_resident_policies", False)):
@@ -1730,11 +1732,14 @@ def _validate_direct_bfm(args: argparse.Namespace) -> None:
             "--bfm-direct requires --initial-locomotion-policy "
             f"{BFM_TEACHER50K_POLICY_ID}"
         )
-    if not math.isclose(float(args.walk_after), 0.0, abs_tol=1e-12):
-        raise SystemExit("--bfm-direct requires --walk-after 0")
-    speed = math.hypot(float(args.vx), float(args.vy))
-    if not math.isfinite(speed) or speed <= 1.0e-8:
-        raise SystemExit("--bfm-direct requires a finite nonzero planar velocity")
+    if args.control_source == "planner":
+        if not math.isclose(float(args.walk_after), 0.0, abs_tol=1e-12):
+            raise SystemExit("planner --bfm-direct requires --walk-after 0")
+        speed = math.hypot(float(args.vx), float(args.vy))
+        if not math.isfinite(speed) or speed <= 1.0e-8:
+            raise SystemExit(
+                "planner --bfm-direct requires a finite nonzero planar velocity"
+            )
     timeout = float(args.bfm_direct_startup_timeout_seconds)
     if not math.isfinite(timeout) or timeout <= 0.0:
         raise SystemExit(
@@ -4282,6 +4287,9 @@ def _game_control_status_fields(
         ),
         "keyboard_run_boost_speed_mps": getattr(
             args, "game_keyboard_run_boost_speed", 2.75
+        ),
+        "keyboard_speed_cap_mps": getattr(
+            args, "game_keyboard_speed_cap_mps", None
         ),
         "keyboard_double_tap_window_s": getattr(
             args, "game_keyboard_double_tap_window", 0.30
@@ -8391,6 +8399,8 @@ class _SonicWriterControl(_RecoveryWorkerControl):
 
 def _bfm_realscan_motion_command(
     command: RobotMotionCommand,
+    *,
+    root_yaw_rad: float | None = None,
 ) -> RobotMotionCommand:
     """Quantize a Matrix game command to BFM RealScan walk/jog tiers.
 
@@ -8412,29 +8422,37 @@ def _bfm_realscan_motion_command(
     ):
         return command
     jog = command.locomotion_mode == SONIC_RUN_MODE
-    facing_xy = command.facing[:2]
-    facing_norm = math.hypot(facing_xy[0], facing_xy[1])
-    if facing_norm <= 1.0e-8:
-        movement_xy = command.movement[:2]
-        facing_norm = math.hypot(movement_xy[0], movement_xy[1])
-        if facing_norm <= 1.0e-8:
-            raise ValueError(
-                "BFM RealScan moving command has no horizontal heading"
-            )
-        forward = (
-            movement_xy[0] / facing_norm,
-            movement_xy[1] / facing_norm,
-            0.0,
-        )
+    if root_yaw_rad is not None:
+        root_yaw = float(root_yaw_rad)
+        if not math.isfinite(root_yaw):
+            raise ValueError("BFM RealScan root_yaw_rad must be finite")
+        forward = (math.cos(root_yaw), math.sin(root_yaw), 0.0)
     else:
-        forward = (
-            facing_xy[0] / facing_norm,
-            facing_xy[1] / facing_norm,
-            0.0,
-        )
+        facing_xy = command.facing[:2]
+        facing_norm = math.hypot(facing_xy[0], facing_xy[1])
+        if facing_norm <= 1.0e-8:
+            movement_xy = command.movement[:2]
+            facing_norm = math.hypot(movement_xy[0], movement_xy[1])
+            if facing_norm <= 1.0e-8:
+                raise ValueError(
+                    "BFM RealScan moving command has no horizontal heading"
+                )
+            forward = (
+                movement_xy[0] / facing_norm,
+                movement_xy[1] / facing_norm,
+                0.0,
+            )
+        else:
+            forward = (
+                facing_xy[0] / facing_norm,
+                facing_xy[1] / facing_norm,
+                0.0,
+            )
     return replace(
         command,
         movement=forward,
+        facing=forward,
+        desired_facing=forward,
         speed_mps=(
             _BFM_REALSCAN_JOG_SPEED_MPS
             if jog
@@ -9606,8 +9624,36 @@ class _DirectBfmRuntime:
         if self.control.error is not None:
             raise RuntimeError(f"BFM Teacher worker: {self.control.error}")
 
-    def command(self, snapshot: Any, *, walking: bool = True) -> RobotMotionCommand:
+    def command(
+        self,
+        snapshot: Any,
+        *,
+        walking: bool = True,
+        game_command: RobotMotionCommand | None = None,
+    ) -> RobotMotionCommand:
         root_yaw = _root_yaw_rad(snapshot.qpos)
+        if game_command is not None:
+            if (
+                game_command.safe_stop
+                or game_command.mode != "move"
+                or not math.isfinite(float(game_command.speed_mps))
+                or float(game_command.speed_mps) <= 1.0e-8
+            ):
+                forward = (math.cos(root_yaw), math.sin(root_yaw), 0.0)
+                return replace(
+                    game_command,
+                    sequence=int(snapshot.step_index),
+                    movement=(0.0, 0.0, 0.0),
+                    facing=forward,
+                    desired_facing=forward,
+                    speed_mps=0.0,
+                    locomotion_mode=SONIC_IDLE_MODE,
+                    reason=game_command.reason or "direct_bfm_game_idle",
+                )
+            return _bfm_realscan_motion_command(
+                game_command,
+                root_yaw_rad=root_yaw,
+            )
         speed = math.hypot(float(self.args.vx), float(self.args.vy))
         if not walking or speed <= 1.0e-8:
             return RobotMotionCommand(
@@ -9642,10 +9688,17 @@ class _DirectBfmRuntime:
             reason=None,
         )
 
-    def publish_state(self, snapshot: Any, *, height_map_z: Any) -> bool:
+    def publish_state(
+        self,
+        snapshot: Any,
+        *,
+        height_map_z: Any,
+        walking: bool = True,
+        game_command: RobotMotionCommand | None = None,
+    ) -> bool:
         return self.control.send_state(
             snapshot,
-            self.command(snapshot, walking=True),
+            self.command(snapshot, walking=walking, game_command=game_command),
             root_yaw=_root_yaw_rad(snapshot.qpos),
             height_map_z=height_map_z,
         )
@@ -11449,11 +11502,15 @@ class _PhysicalRecoveryCoordinator:
                 else None
             ),
         )
-        world_command = _bfm_realscan_motion_command(world_command)
+        root_yaw = _root_yaw_rad(snapshot.qpos)
+        world_command = _bfm_realscan_motion_command(
+            world_command,
+            root_yaw_rad=root_yaw,
+        )
         return self.bfm_control.send_state(
             snapshot,
             world_command,
-            root_yaw=_root_yaw_rad(snapshot.qpos),
+            root_yaw=root_yaw,
             height_map_z=height_map_z,
         )
 
@@ -13077,6 +13134,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     game_config = None
     motion_settings_store: MotionSettingsStore | None = None
     if args.control_source == "game":
+        args.game_keyboard_speed_cap_mps = None
         motion_settings_path = getattr(args, "game_motion_settings_file", None)
         if motion_settings_path is not None:
             if not motion_settings_path.is_absolute():
@@ -13133,6 +13191,33 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             args.game_motion_settings_load_status = "disabled"
             args.game_motion_settings_revision = None
             args.game_movement_mode = DEFAULT_MOVEMENT_MODE
+        if (
+            args.moon_dynamic_map is not None
+            and str(getattr(args, "initial_locomotion_policy", "sonic"))
+            == BFM_TEACHER50K_POLICY_ID
+        ):
+            raw_keyboard_cap = (
+                os.environ.get("MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP")
+                or os.environ.get("MATRIX_MOON_BFM_SPEED_CAP")
+            )
+            if raw_keyboard_cap:
+                try:
+                    keyboard_cap = float(raw_keyboard_cap)
+                except ValueError as exc:
+                    raise SystemExit(
+                        "MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP must be numeric"
+                    ) from exc
+                if (
+                    not math.isfinite(keyboard_cap)
+                    or keyboard_cap <= 0.0
+                    or keyboard_cap
+                    > SONIC_GAIT_SPEED_RANGES_MPS[SONIC_RUN_MODE][1]
+                ):
+                    raise SystemExit(
+                        "MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP must be finite, "
+                        "positive, and no greater than native RUN maximum"
+                    )
+                args.game_keyboard_speed_cap_mps = keyboard_cap
         if args.game_max_speed > 0.8:
             raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
         if (
@@ -13163,6 +13248,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 keyboard_run_boost_speed_mps=(
                     args.game_keyboard_run_boost_speed
                 ),
+                keyboard_speed_cap_mps=args.game_keyboard_speed_cap_mps,
                 stick_deadzone=args.game_stick_deadzone,
                 input_timeout_s=args.game_input_timeout,
                 max_snapshot_age_s=args.game_max_snapshot_age,
@@ -14084,17 +14170,14 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         # failure during the historical seven-second startup window is already
         # present here and must prevent deploy/PICO from starting.
         poll_failed_child()
-        if (
-            running
-            and direct_bfm is None
-            and args.control_source in {"planner", "game"}
-        ):
-            planner = NativePlannerClient(
-                args.planner_bind,
-                zmq_module=zmq,
-                build_command_message=build_command_message,
-                build_planner_message=build_planner_message,
-            )
+        if running and args.control_source in {"planner", "game"}:
+            if direct_bfm is None:
+                planner = NativePlannerClient(
+                    args.planner_bind,
+                    zmq_module=zmq,
+                    build_command_message=build_command_message,
+                    build_planner_message=build_planner_message,
+                )
             if args.control_source == "game":
                 assert game_config is not None
                 game_control_core = GameControlCore(game_config)
@@ -14103,17 +14186,24 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     game_control_core,
                 )
                 game_readiness = _GameSonicReadinessGate(snapshot)
-                if getattr(args, "game_fall_recovery", "off") == "sonic":
+                if (
+                    direct_bfm is None
+                    and getattr(args, "game_fall_recovery", "off") == "sonic"
+                ):
                     game_fall_recovery = _GameFallRecoveryGate(
                         timeout_s=args.game_fall_recovery_timeout
                     )
                 locomotion_slots_only = bool(
-                    _needs_resident_locomotion_policy_slots(args)
+                    direct_bfm is None
+                    and _needs_resident_locomotion_policy_slots(args)
                     and getattr(args, "game_fall_recovery", "off") != "physical"
                 )
                 if (
-                    getattr(args, "game_fall_recovery", "off") == "physical"
-                    or locomotion_slots_only
+                    direct_bfm is None
+                    and (
+                        getattr(args, "game_fall_recovery", "off") == "physical"
+                        or locomotion_slots_only
+                    )
                 ):
                     args.physical_recovery_locomotion_slots_only = (
                         locomotion_slots_only
@@ -14556,7 +14646,54 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 and active_elapsed >= args.walk_after
             )
             if direct_bfm is not None:
+                direct_game_command: RobotMotionCommand | None = None
                 try:
+                    if game_input is not None:
+                        assert initial_root_yaw_rad is not None
+                        assert game_readiness is not None
+                        measured_heading = _root_yaw_rad(snapshot.qpos)
+                        game_input.core.synchronize_heading(measured_heading)
+                        game_readiness.begin_frame(snapshot, game_input.core)
+                        candidate_game_command = game_input.poll(
+                            now_s=frame_wall,
+                            dt_s=1.0 / args.control_hz,
+                        )
+                        game_command = game_readiness.apply(
+                            candidate_game_command,
+                            game_input.core,
+                        )
+                        game_input.last_command = game_command
+                        game_input.record_published_command(game_command)
+                        if game_commands is not None:
+                            command_restart = game_commands.poll(
+                                current_pose=_snapshot_world_pose(snapshot),
+                                command_allowed=_game_command_poll_allowed(
+                                    game_command,
+                                    resume_probation_active=resume_probation.active,
+                                ),
+                                runtime_pause_busy_reason=None,
+                            )
+                            if command_restart:
+                                game_command = game_input.emergency_stop(
+                                    now_s=time.perf_counter(),
+                                    reason=(
+                                        "game_quit"
+                                        if game_commands.quit_requested
+                                        else "teleport_reload"
+                                    ),
+                                )
+                                game_input.record_published_command(game_command)
+                                running = False
+                                termination_reason = (
+                                    "game_quit"
+                                    if game_commands.quit_requested
+                                    else "game_teleport"
+                                )
+                        direct_game_command = game_command
+                        walking = (
+                            game_command.mode == "move"
+                            and not game_command.safe_stop
+                        )
                     direct_bfm.poll()
                     if not direct_bfm.observe_first_write():
                         raise RuntimeError(
@@ -14567,6 +14704,12 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     direct_bfm.publish_state(
                         snapshot,
                         height_map_z=bfm_height_map(snapshot),
+                        walking=(
+                            walking
+                            if direct_game_command is not None
+                            else args.control_source == "planner"
+                        ),
+                        game_command=direct_game_command,
                     )
                 except (
                     EOFError,
@@ -14575,6 +14718,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     RuntimeError,
                     TypeError,
                     ValueError,
+                    WorldStateError,
                 ) as exc:
                     unstable = True
                     running = False
@@ -14585,7 +14729,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         flush=True,
                     )
                     break
-                walking = True
+                if direct_game_command is None:
+                    walking = True
             elif planner is not None and not runtime_pause_transition_frame:
                 if game_input is not None:
                     assert initial_root_yaw_rad is not None

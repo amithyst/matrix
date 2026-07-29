@@ -719,7 +719,6 @@ class BfmTeacherCore:
             self.reference_source = (
                 f"formal7168_clip:{self.stream.motion_key}"
             )
-        self._install_matrix_realtime_reference_contract()
         self.direct_start = bool(direct_start)
         self.direct_reference_start: dict[str, list[float]] | None = None
         self.previous_action = np.zeros(NUM_JOINTS, dtype=np.float32)
@@ -1047,11 +1046,30 @@ class BfmTeacherCore:
         if bool(getattr(command, "stop_latched", False)):
             return None
         stream = self.stream
-        if not hasattr(stream, "_last_branch_command"):
+        if not (
+            hasattr(stream, "_frames")
+            and hasattr(stream, "_last_branch_command")
+        ):
             return None
+        pending_cancelled = False
+        pending = getattr(stream, "_pending", None)
+        if pending is not None:
+            # Root-anchor and terrain refreshes can start a pending branch even
+            # when the keyboard command itself is unchanged.  Cancel it before
+            # the upstream deterministic barrier can repeat one stale LowCmd
+            # for too long; the active buffer continues from the current
+            # physical root/terrain.
+            pending.cancel_event.set()
+            pending.future.cancel()
+            stream._pending = None
+            pending_cancelled = True
+            if hasattr(stream, "_discard_count"):
+                stream._discard_count += 1
+            if hasattr(stream, "_deferred_reason"):
+                stream._deferred_reason = None
         previous = getattr(stream, "_last_branch_command", None)
         if previous is None:
-            return None
+            return "pending_cancel" if pending_cancelled else None
         change_reason = getattr(stream, "_change_reason", None)
         if callable(change_reason):
             reason = change_reason(command, previous)
@@ -1060,16 +1078,7 @@ class BfmTeacherCore:
         else:
             reason = None
         if reason is None:
-            return None
-        pending = getattr(stream, "_pending", None)
-        if pending is not None:
-            pending.cancel_event.set()
-            pending.future.cancel()
-            stream._pending = None
-            if hasattr(stream, "_discard_count"):
-                stream._discard_count += 1
-        if hasattr(stream, "_deferred_reason"):
-            stream._deferred_reason = None
+            return "pending_cancel" if pending_cancelled else None
         stream._last_branch_command = command
         return str(reason)
 

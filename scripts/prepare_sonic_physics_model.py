@@ -27,7 +27,7 @@ from inject_creative_inventory import (  # noqa: E402
 )
 
 
-PIPELINE_VERSION = 13
+PIPELINE_VERSION = 14
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
@@ -71,6 +71,11 @@ MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M = (
     -6.101562023162842,
     -6.101562023162842,
 )
+# The historical Leo spawn places the robot root about 0.85 m above the
+# locked flat pad.  Keep that root-to-pad-top relationship for alternate
+# MoonWorld spawn points so the startup clearance audit is local to the
+# selected route instead of the old hard-coded footprint.
+MOON_SPAWN_PAD_ROOT_CLEARANCE_M = 0.85
 MOON_COLLISION_FRICTION = "1 0.005 0.0001"
 MOON_COLLISION_SOLREF = "0.02 1"
 MOON_COLLISION_SOLIMP = "0.9 0.95 0.001 0.5 2"
@@ -349,6 +354,48 @@ def _mjcf_vector(values: tuple[float, ...]) -> str:
     return " ".join(str(value).removesuffix(".0") for value in values)
 
 
+def _moon_spawn_pad_center_m(
+    spawn_xyz: tuple[float, float, float] | None,
+) -> tuple[float, float, float]:
+    if spawn_xyz is None:
+        return MOON_SPAWN_PAD_CENTER_M
+    top_z = float(spawn_xyz[2]) - MOON_SPAWN_PAD_ROOT_CLEARANCE_M
+    return (
+        float(spawn_xyz[0]),
+        float(spawn_xyz[1]),
+        top_z - MOON_SPAWN_PAD_HALF_SIZE_M[2],
+    )
+
+
+def _moon_spawn_pad_contract(
+    spawn_xyz: tuple[float, float, float] | None,
+) -> dict[str, object]:
+    center_m = _moon_spawn_pad_center_m(spawn_xyz)
+    top_z_m = center_m[2] + MOON_SPAWN_PAD_HALF_SIZE_M[2]
+    locked_footprint = None
+    if _vectors_equal(center_m, MOON_SPAWN_PAD_CENTER_M):
+        locked_footprint = {
+            "map_sha256": MOON_DYNAMIC_MAP_SHA256,
+            "pixel_x_range": list(MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE),
+            "pixel_y_range": list(MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE),
+            "native_height_range_m": list(MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M),
+        }
+    return {
+        "mode": "finite-collision-only-box-v1",
+        "geom_name": MOON_SPAWN_PAD_GEOM_NAME,
+        "collision_enabled_initial": True,
+        "collision_enabled_after_handoff": False,
+        "center_m": list(center_m),
+        "half_size_m": list(MOON_SPAWN_PAD_HALF_SIZE_M),
+        "top_z_m": top_z_m,
+        "top_offset_above_native_floor_m": 0.0,
+        "root_clearance_m": MOON_SPAWN_PAD_ROOT_CLEARANCE_M,
+        "center_source": "spawn_xyz" if spawn_xyz is not None else "default",
+        "locked_footprint": locked_footprint,
+        "rgba": [0.0, 0.0, 0.0, 0.0],
+    }
+
+
 def _scene_transform_removals(
     native_scene: Path, scene_transform: str | None
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
@@ -463,6 +510,7 @@ def _scene_transform_contract(
     scene_transform: str,
     *,
     moon_dynamic_ground_collision_mode: str | None = None,
+    spawn_xyz: tuple[float, float, float] | None = None,
 ) -> dict[str, object] | None:
     if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         return None
@@ -526,32 +574,7 @@ def _scene_transform_contract(
                 "friction": MOON_COLLISION_FRICTION,
                 "solref": MOON_COLLISION_SOLREF,
                 "solimp": MOON_COLLISION_SOLIMP,
-                "spawn_pad": {
-                    "mode": "finite-collision-only-box-v1",
-                    "geom_name": MOON_SPAWN_PAD_GEOM_NAME,
-                    "collision_enabled_initial": True,
-                    "collision_enabled_after_handoff": False,
-                    "center_m": list(MOON_SPAWN_PAD_CENTER_M),
-                    "half_size_m": list(MOON_SPAWN_PAD_HALF_SIZE_M),
-                    "top_z_m": (
-                        MOON_SPAWN_PAD_CENTER_M[2]
-                        + MOON_SPAWN_PAD_HALF_SIZE_M[2]
-                    ),
-                    "top_offset_above_native_floor_m": 0.0,
-                    "locked_footprint": {
-                        "map_sha256": MOON_DYNAMIC_MAP_SHA256,
-                        "pixel_x_range": list(
-                            MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE
-                        ),
-                        "pixel_y_range": list(
-                            MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE
-                        ),
-                        "native_height_range_m": list(
-                            MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M
-                        ),
-                    },
-                    "rgba": [0.0, 0.0, 0.0, 0.0],
-                },
+                "spawn_pad": _moon_spawn_pad_contract(spawn_xyz),
             },
         }
     }
@@ -562,6 +585,7 @@ def _apply_scene_transform_additions(
     scene_transform: str,
     *,
     moon_dynamic_ground_collision_mode: str | None = None,
+    spawn_xyz: tuple[float, float, float] | None = None,
 ) -> None:
     if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         return
@@ -574,6 +598,7 @@ def _apply_scene_transform_additions(
     tile_compiled_collision = (
         collision_mode == MOON_DYNAMIC_GROUND_COLLISION_TILES
     )
+    spawn_pad_center_m = _moon_spawn_pad_center_m(spawn_xyz)
     try:
         tree = ET.parse(scene_path)
     except ET.ParseError as exc:
@@ -707,7 +732,7 @@ def _apply_scene_transform_additions(
             {
                 "name": MOON_SPAWN_PAD_GEOM_NAME,
                 "type": "box",
-                "pos": _mjcf_vector(MOON_SPAWN_PAD_CENTER_M),
+                "pos": _mjcf_vector(spawn_pad_center_m),
                 "size": _mjcf_vector(MOON_SPAWN_PAD_HALF_SIZE_M),
                 "contype": "1",
                 "conaffinity": "1",
@@ -816,6 +841,7 @@ def _source_contract(
     scene_transform_contract = _scene_transform_contract(
         scene_transform,
         moon_dynamic_ground_collision_mode=moon_dynamic_ground_collision_mode,
+        spawn_xyz=spawn_xyz,
     )
     if scene_transform_contract is not None:
         contract["scene_transform_contract"] = scene_transform_contract
@@ -1229,6 +1255,7 @@ def prepare_sonic_physics_model(
             temporary_dir / native_scene.name,
             normalized_scene_transform,
             moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
+            spawn_xyz=normalized_spawn_xyz,
         )
         contract["body_joint_names"] = list(body_joint_names)
         contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")

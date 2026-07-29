@@ -59,6 +59,7 @@ G1_SKIN="${MATRIX_G1_SKIN:-}"
 CONTROL_SOURCE="${MATRIX_SONIC_CONTROL_SOURCE:-planner}"
 GAME_INPUT_SOURCE="${MATRIX_GAME_INPUT_SOURCE:-auto}"
 GAME_CAMERA_YAW_SOURCE="${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}"
+GAME_CAMERA_YAW_SOURCE_ARGUMENT_SET=0
 GAME_LOOK_BUTTON="${MATRIX_GAME_LOOK_BUTTON:-left}"
 GAME_INITIAL_CAMERA_YAW_DEG="${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
 GAME_MOUSE_SENSITIVITY_DEG="${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
@@ -233,7 +234,7 @@ while [[ $# -gt 0 ]]; do
         --skin) G1_SKIN="$2"; shift 2 ;;
         --control-source) CONTROL_SOURCE="$2"; shift 2 ;;
         --game-input-source) GAME_INPUT_SOURCE="$2"; shift 2 ;;
-        --game-camera-yaw-source) GAME_CAMERA_YAW_SOURCE="$2"; shift 2 ;;
+        --game-camera-yaw-source) GAME_CAMERA_YAW_SOURCE="$2"; GAME_CAMERA_YAW_SOURCE_ARGUMENT_SET=1; shift 2 ;;
         --game-look-button) GAME_LOOK_BUTTON="$2"; shift 2 ;;
         --game-initial-yaw) GAME_INITIAL_CAMERA_YAW_DEG="$2"; shift 2 ;;
         --game-mouse-sensitivity) GAME_MOUSE_SENSITIVITY_DEG="$2"; shift 2 ;;
@@ -339,9 +340,43 @@ if [[ "$SCENE_ID" == "15" \
     if [[ "$GAME_MAX_TURN_RATE_ARGUMENT_SET" != "1" ]]; then
         GAME_MAX_TURN_RATE=2.40
     fi
-    MATRIX_MOON_BFM_SPEED_CAP="${MATRIX_MOON_BFM_SPEED_CAP:-${MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP:-0.50}}"
+    MATRIX_MOON_BFM_SPEED_CAP="${MATRIX_MOON_BFM_SPEED_CAP:-${MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP:-0.40}}"
     export MATRIX_MOON_BFM_SPEED_CAP
-    export MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER="${MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-flat-anchor}"
+    MATRIX_BFM_DIRECT="${MATRIX_BFM_DIRECT:-${MATRIX_MOON_BFM_DIRECT:-1}}"
+    case "${MATRIX_BFM_DIRECT,,}" in
+        1|true|yes|on)
+            export MATRIX_BFM_DIRECT=1
+            GAME_FALL_RECOVERY=off
+            PHYSICAL_RECOVERY_RESIDENT_POLICIES=0
+            export MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES=0
+            ;;
+        0|false|no|off|"")
+            export MATRIX_BFM_DIRECT=0
+            ;;
+        *)
+            echo "[ERROR] MATRIX_BFM_DIRECT must be a boolean" >&2
+            exit 2
+            ;;
+    esac
+    if [[ "$GAME_CAMERA_YAW_SOURCE_ARGUMENT_SET" != "1" ]]; then
+        GAME_CAMERA_YAW_SOURCE="${MATRIX_MOON_BFM_CAMERA_YAW_SOURCE:-fixed}"
+    fi
+    export MATRIX_GAME_CAMERA_YAW_SOURCE="$GAME_CAMERA_YAW_SOURCE"
+    export MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER="${MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-raw}"
+    MOON_SPAWN_OVERRIDE_COUNT=0
+    for value in "${MATRIX_MOON_SPAWN_X:-}" "${MATRIX_MOON_SPAWN_Y:-}" "${MATRIX_MOON_SPAWN_Z:-}" "${MATRIX_MOON_SPAWN_YAW:-}"; do
+        [[ -n "$value" ]] && ((MOON_SPAWN_OVERRIDE_COUNT += 1))
+    done
+    if [[ "$MOON_SPAWN_OVERRIDE_COUNT" == "0" ]]; then
+        # Default to the verified long-run MoonWorld route.  The historical
+        # Leo spawn at -94.7,-65.6 begins on a locked flat footprint and then
+        # runs into a steep descent; this route keeps BFM on raw rolling
+        # terrain for the desktop acceptance path.
+        export MATRIX_MOON_SPAWN_X=24.43
+        export MATRIX_MOON_SPAWN_Y=110.77
+        export MATRIX_MOON_SPAWN_Z=-5.251562023162842
+        export MATRIX_MOON_SPAWN_YAW="${MATRIX_MOON_BFM_SPAWN_YAW_RAD:-3.141592653589793}"
+    fi
     export MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP="$MATRIX_MOON_BFM_SPEED_CAP"
     export MATRIX_GAME_KEYBOARD_WALK_SPEED="${MATRIX_GAME_KEYBOARD_WALK_SPEED:-$MATRIX_MOON_BFM_SPEED_CAP}"
     export MATRIX_GAME_KEYBOARD_WALK_BOOST_SPEED="${MATRIX_GAME_KEYBOARD_WALK_BOOST_SPEED:-$MATRIX_MOON_BFM_SPEED_CAP}"
@@ -350,7 +385,7 @@ if [[ "$SCENE_ID" == "15" \
     export MATRIX_BFM_REALSCAN_WALK_SPEED_MPS="${MATRIX_BFM_REALSCAN_WALK_SPEED_MPS:-$MATRIX_MOON_BFM_SPEED_CAP}"
     export MATRIX_BFM_REALSCAN_JOG_SPEED_MPS="${MATRIX_BFM_REALSCAN_JOG_SPEED_MPS:-$MATRIX_MOON_BFM_SPEED_CAP}"
     export MATRIX_GAME_MOVEMENT_MODE="${MATRIX_GAME_MOVEMENT_MODE:-body_relative}"
-    echo "[INFO] moon-v1 BFM controls: bfm walk=${MATRIX_BFM_REALSCAN_WALK_SPEED_MPS}m/s jog=${MATRIX_BFM_REALSCAN_JOG_SPEED_MPS}m/s turn=2.40rad/s movement=${MATRIX_GAME_MOVEMENT_MODE}"
+    echo "[INFO] moon-v1 BFM controls: bfm walk=${MATRIX_BFM_REALSCAN_WALK_SPEED_MPS}m/s jog=${MATRIX_BFM_REALSCAN_JOG_SPEED_MPS}m/s turn=2.40rad/s movement=${MATRIX_GAME_MOVEMENT_MODE} camera_yaw=${GAME_CAMERA_YAW_SOURCE} direct=${MATRIX_BFM_DIRECT}"
 fi
 if [[ -n "$CELESTIAL_SPK" || -n "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
     if [[ -z "$CELESTIAL_SPK" || -z "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
@@ -557,6 +592,52 @@ IFS=$'\t' read -r MATRIX_VIDEO_APPLIED_WIDTH \
     MATRIX_VIDEO_APPLIED_FPS_LIMIT MATRIX_VIDEO_APPLIED_QUALITY \
     MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING MATRIX_VIDEO_APPLIED_REVISION \
     <<<"$VIDEO_LAUNCH_FIELDS"
+if [[ "$SCENE_ID" == "15" \
+    && "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
+    MATRIX_MOON_BFM_STABLE_RENDER="${MATRIX_MOON_BFM_STABLE_RENDER:-1}"
+    case "${MATRIX_MOON_BFM_STABLE_RENDER,,}" in
+        1|true|yes|on)
+            MATRIX_VIDEO_APPLIED_WIDTH=1280
+            MATRIX_VIDEO_APPLIED_HEIGHT=720
+            MATRIX_VIDEO_APPLIED_WINDOW_MODE=borderless
+            MATRIX_VIDEO_APPLIED_FPS_LIMIT=30
+            MATRIX_VIDEO_APPLIED_QUALITY=low
+            MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING=medium
+            MATRIX_VIDEO_APPLIED_REVISION=0
+            MATRIX_VIDEO_APPLIED_JSON="$(
+                printf '{"camera_smoothing":"medium","fps_limit":30,'
+                printf '"quality":"low","resolution":"1280x720",'
+                printf '"resolution_height":720,"resolution_width":1280,'
+                printf '"revision":0,"window_mode":"borderless"}'
+            )"
+            MATRIX_MOON_BFM_SCREEN_PERCENTAGE="${MATRIX_MOON_BFM_SCREEN_PERCENTAGE:-50}"
+            case "$MATRIX_MOON_BFM_SCREEN_PERCENTAGE" in
+                25|30|40|50|60|70|80|90|100) ;;
+                *)
+                    echo "[ERROR] MATRIX_MOON_BFM_SCREEN_PERCENTAGE must be one of 25/30/40/50/60/70/80/90/100" \
+                        >&2
+                    exit 2
+                    ;;
+            esac
+            moon_bfm_screen_cmd="r.ScreenPercentage ${MATRIX_MOON_BFM_SCREEN_PERCENTAGE}"
+            if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+                MATRIX_UE_EXTRA_EXEC_CMDS="${MATRIX_UE_EXTRA_EXEC_CMDS},${moon_bfm_screen_cmd}"
+            else
+                MATRIX_UE_EXTRA_EXEC_CMDS="$moon_bfm_screen_cmd"
+            fi
+            export MATRIX_UE_EXTRA_EXEC_CMDS
+            echo "[INFO] MoonWorld BFM stable render profile:" \
+                "1280x720 low 30fps" \
+                "screen_percentage=${MATRIX_MOON_BFM_SCREEN_PERCENTAGE}"
+            ;;
+        0|false|no|off)
+            ;;
+        *)
+            echo "[ERROR] MATRIX_MOON_BFM_STABLE_RENDER must be a boolean" >&2
+            exit 2
+            ;;
+    esac
+fi
 export MATRIX_VIDEO_SETTINGS_FILE MATRIX_VIDEO_APPLIED_JSON
 export MATRIX_VIDEO_APPLIED_WIDTH MATRIX_VIDEO_APPLIED_HEIGHT
 export MATRIX_VIDEO_APPLIED_WINDOW_MODE MATRIX_VIDEO_APPLIED_FPS_LIMIT

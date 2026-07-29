@@ -452,6 +452,7 @@ class ControlConfig:
     keyboard_run_boost_speed_mps: float = KEYBOARD_GAIT_BOOST_TARGETS_MPS[
         SONIC_RUN_MODE
     ]
+    keyboard_speed_cap_mps: float | None = None
     min_gait_speed_mps: float = 0.10
     gait_start_speed_mps: float = 0.10
     gait_stop_speed_mps: float = 0.08
@@ -506,6 +507,23 @@ class ControlConfig:
         )
         if deadzone >= 1.0:
             raise ValueError("stick_deadzone must be less than 1")
+        if self.keyboard_speed_cap_mps is not None:
+            keyboard_speed_cap = _finite_number(
+                self.keyboard_speed_cap_mps,
+                name="keyboard_speed_cap_mps",
+            )
+            if (
+                keyboard_speed_cap <= 0.0
+                or keyboard_speed_cap
+                > SONIC_GAIT_SPEED_RANGES_MPS[SONIC_RUN_MODE][1]
+            ):
+                raise ValueError(
+                    "keyboard_speed_cap_mps must be positive and no greater "
+                    "than native RUN maximum"
+                )
+            object.__setattr__(
+                self, "keyboard_speed_cap_mps", keyboard_speed_cap
+            )
         slow_walk_max = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][1]
         if self.max_speed_mps > slow_walk_max:
             raise ValueError(
@@ -1151,6 +1169,14 @@ class GameControlCore:
             requested_speed, requested_locomotion_mode = (
                 self._requested_locomotion(input_magnitude)
             )
+            if (
+                digital_movement
+                and self.config.keyboard_speed_cap_mps is not None
+            ):
+                requested_speed = min(
+                    requested_speed,
+                    self.config.keyboard_speed_cap_mps,
+                )
             target_speed = requested_speed * alignment
             pure_forward_alignment_crawl_eligible = (
                 movement_mode == CAMERA_FACE
