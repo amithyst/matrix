@@ -1389,8 +1389,25 @@ def creative_inventory_model(state: dict[str, object]) -> CreativeInventoryModel
     )
 
 
+def _strategy_loadout_candidate(state: dict[str, object]) -> object:
+    direct = state.get("strategy_loadout")
+    if direct is not None:
+        return direct
+    game_commands = state.get("game_commands")
+    if (
+        isinstance(game_commands, dict)
+        and game_commands.get("strategy_loadout") is not None
+    ):
+        return game_commands.get("strategy_loadout")
+    console = state.get("command_console")
+    console = console if isinstance(console, dict) else {}
+    data = console.get("data")
+    data = data if isinstance(data, dict) else {}
+    return data.get("strategy_loadout")
+
+
 def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
-    raw = state.get("strategy_loadout")
+    raw = _strategy_loadout_candidate(state)
     if not isinstance(raw, dict) or raw.get("version") != 1:
         return StrategyLoadoutModel(
             False,
@@ -2820,10 +2837,52 @@ class CommandConsoleStatus:
         )
 
 
+def _command_console_candidate(state: dict[str, object]) -> dict[str, object]:
+    raw = state.get("command_console")
+    if isinstance(raw, dict):
+        return raw
+    game_commands = state.get("game_commands")
+    if not isinstance(game_commands, dict):
+        return {}
+    last_response = game_commands.get("last_response")
+    last_response = last_response if isinstance(last_response, dict) else {}
+    pending = any(
+        game_commands.get(key) is True
+        for key in (
+            "policy_change_pending",
+            "runtime_pause_pending",
+            "restart_requested",
+        )
+    )
+    ok = last_response.get("ok")
+    status = "pending" if pending else "idle"
+    if type(ok) is bool and not pending:
+        status = "success" if ok else "error"
+    adapted: dict[str, object] = {
+        "available": game_commands.get("enabled") is True,
+        "editing": False,
+        "in_flight": pending,
+        "status": status,
+        "sequence": game_commands.get("last_sequence"),
+        "result_revision": game_commands.get("last_sequence"),
+        "ok": ok,
+        "code": last_response.get("code"),
+        "message": last_response.get("message"),
+        "warning": None,
+        "restart_required": last_response.get("restart_required") is True
+        or game_commands.get("restart_requested") is True,
+        "outcome_unknown": False,
+    }
+    response_data = last_response.get("data")
+    if isinstance(response_data, dict):
+        adapted["data"] = response_data
+    return adapted
+
+
 def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
     """Validate the provider's command result before rendering or gating input."""
 
-    raw = state.get("command_console")
+    raw = _command_console_candidate(state)
     raw = raw if isinstance(raw, dict) else {}
     status_value = raw.get("status")
     status = (
@@ -2916,12 +2975,48 @@ class RuntimePausePanelModel:
         return "暂停不可用"
 
 
+def _runtime_pause_candidate(state: dict[str, object]) -> object:
+    console = _command_console_candidate(state)
+    raw = console.get("runtime_pause")
+    if raw is not None:
+        return raw
+    game_commands = state.get("game_commands")
+    if not isinstance(game_commands, dict):
+        return None
+    telemetry = game_commands.get("runtime_pause")
+    if not isinstance(telemetry, dict):
+        return None
+    phase = telemetry.get("phase")
+    epoch = telemetry.get("epoch")
+    available = telemetry.get("available") is True
+    last_error = telemetry.get("last_error")
+    if not available:
+        state_name = "unavailable"
+    elif isinstance(last_error, str) and last_error:
+        state_name = "fault"
+    elif phase == "running":
+        state_name = "running"
+    elif phase == "paused":
+        state_name = "paused"
+    elif phase == "pause_requested":
+        state_name = "pausing"
+    elif phase == "continue_requested":
+        state_name = "resuming"
+    else:
+        state_name = "busy"
+    return {
+        "state": state_name,
+        "epoch": epoch,
+        "can_pause": state_name == "running",
+        "can_resume": state_name == "paused",
+        "last_error": last_error if isinstance(last_error, str) else None,
+    }
+
+
 def runtime_pause_panel_model(state: dict[str, object]) -> RuntimePausePanelModel:
     """Validate runtime-owned pause telemetry and fail closed on disagreement."""
 
-    console = state.get("command_console")
-    console = console if isinstance(console, dict) else {}
-    raw = console.get("runtime_pause")
+    raw = _runtime_pause_candidate(state)
     unavailable = RuntimePausePanelModel(
         state="unavailable",
         epoch=0,
@@ -3660,6 +3755,8 @@ class X11CalibrationOverlay:
         self._last_raise_s: float | None = None
         self._pressed_action: str | None = None
         self._pressed_window: int | None = None
+        self._pressed_runtime_pause_target: str | None = None
+        self._pressed_runtime_pause_epoch: int | None = None
         self._polled_pointer_valid = False
         self._polled_left_pressed = False
         self._polled_left_initialized = False
@@ -6883,6 +6980,18 @@ class X11CalibrationOverlay:
             if event_type == _BUTTON_PRESS:
                 self._pressed_action = action
                 self._pressed_window = int(button.window)
+                self._pressed_runtime_pause_target = None
+                self._pressed_runtime_pause_epoch = None
+                if action == "runtime_pause":
+                    pause_model = getattr(self, "_last_runtime_pause_model", None)
+                    pause_target = (
+                        pause_model.pause_target
+                        if isinstance(pause_model, RuntimePausePanelModel)
+                        else None
+                    )
+                    if pause_target is not None:
+                        self._pressed_runtime_pause_target = pause_target
+                        self._pressed_runtime_pause_epoch = pause_model.epoch
                 if action == "font_size_slider":
                     self._font_slider_dragging = bool(
                         self._xft is not None
@@ -6893,8 +7002,12 @@ class X11CalibrationOverlay:
             elif event_type == _BUTTON_RELEASE:
                 pressed = self._pressed_action
                 pressed_window = self._pressed_window
+                pressed_pause_target = self._pressed_runtime_pause_target
+                pressed_pause_epoch = self._pressed_runtime_pause_epoch
                 self._pressed_action = None
                 self._pressed_window = None
+                self._pressed_runtime_pause_target = None
+                self._pressed_runtime_pause_epoch = None
                 if pressed == "font_size_slider":
                     if self._font_slider_dragging and self._visible:
                         self._set_font_size_from_root_x(button.x_root)
@@ -6947,15 +7060,10 @@ class X11CalibrationOverlay:
                         self._last_page = None
                     continue
                 if action == "runtime_pause":
-                    pause_model = getattr(self, "_last_runtime_pause_model", None)
                     panel_model = self._last_panel_model
-                    pause_target = (
-                        pause_model.pause_target
-                        if isinstance(pause_model, RuntimePausePanelModel)
-                        else None
-                    )
                     if (
-                        pause_target is not None
+                        pressed_pause_target is not None
+                        and type(pressed_pause_epoch) is int
                         and panel_model is not None
                         and not panel_model.restart_requested
                         and panel_model.status != "restarting"
@@ -6969,8 +7077,8 @@ class X11CalibrationOverlay:
                         not in {"pending", "restarting", "unavailable"}
                     ):
                         publisher.publish_runtime_pause(
-                            pause_target,
-                            expected_epoch=pause_model.epoch,
+                            pressed_pause_target,
+                            expected_epoch=pressed_pause_epoch,
                         )
                         emitted += 1
                 elif action == "quit_game":
@@ -7384,6 +7492,8 @@ class X11CalibrationOverlay:
         self._last_raise_s = None
         self._pressed_action = None
         self._pressed_window = None
+        self._pressed_runtime_pause_target = None
+        self._pressed_runtime_pause_epoch = None
         self._font_slider_dragging = False
         self._pending_font_slider_action = None
         self._pending_font_slider_size = None

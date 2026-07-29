@@ -474,6 +474,21 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(tuple(data.qpos), qpos_after)
         self.assertEqual(tuple(data.qvel), qvel_after)
 
+        next_reference_qpos = tuple(2.0 + 0.01 * index for index in range(36))
+        next_reference_qvel = tuple(0.03 * index for index in range(35))
+        coordinator.bfm_control.direct_initial_qpos = next_reference_qpos
+        coordinator.bfm_control.direct_initial_qvel = next_reference_qvel
+        coordinator._align_initial_bfm_reference(force=True)
+
+        self.assertEqual(mujoco.forward_calls, forward_calls + 1)
+        self.assertEqual(tuple(data.qpos[:2]), (12.25, -7.5))
+        self.assertEqual(tuple(data.qpos[2:36]), next_reference_qpos[2:36])
+        self.assertEqual(tuple(data.qvel[:35]), next_reference_qvel)
+        self.assertEqual(
+            coordinator.initial_bfm_reference_alignment["mode"],
+            "online_pfnn_handoff_realign",
+        )
+
     def test_flat_v3_physics_profile_comes_from_locked_policy_config(self) -> None:
         mujoco, model, data, _joint_by_name = (
             self.fake_physics_profile_runtime()
@@ -6862,6 +6877,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.selected_locomotion_policy_id = "sonic"
         coordinator.bfm_switch_admission_ready = False
         coordinator.bfm_switch_admission_reason = "awaiting_runtime_observation"
+        coordinator.bfm_switch_admission_since_s = None
+        coordinator.bfm_switch_admission_elapsed_s = 0.0
         return coordinator
 
     def observe_locomotion_switch_admission(
@@ -6871,6 +6888,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         root_z_m: float,
         root_up_z: float = 1.0,
         qvel: list[float] | None = None,
+        now_s: float = 1.0,
     ) -> None:
         snapshot = self.snapshot(low_cmd_fresh=True, low_cmd_age_s=0.0)
         snapshot.qpos[2] = root_z_m
@@ -6886,7 +6904,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         coordinator.observe(
             snapshot,
-            now_s=1.0,
+            now_s=now_s,
             neutral_confirmed=True,
             locomotion_switch_neutral_confirmed=True,
             foot_contact=True,
@@ -6902,6 +6920,20 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.observe_locomotion_switch_admission(
             coordinator,
             root_z_m=0.494208,
+        )
+
+        self.assertFalse(coordinator.bfm_switch_admission_ready)
+        self.assertEqual(coordinator.bfm_switch_admission_reason, "stability_hold")
+        self.assertTrue(coordinator.bfm_switch_admission_telemetry["raw_ready"])
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry["stability_hold_seconds"],
+            MODULE._PhysicalRecoveryCoordinator.BFM_SWITCH_ADMISSION_HOLD_S,
+        )
+
+        self.observe_locomotion_switch_admission(
+            coordinator,
+            root_z_m=0.494208,
+            now_s=2.5,
         )
 
         self.assertTrue(coordinator.bfm_switch_admission_ready)
@@ -6987,6 +7019,27 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             result[2],
         )
 
+    def test_bfm_preparation_accepts_lowstate_anchor_without_reference_swap(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+
+        result = coordinator._bfm_hot_switch_preparation_rejection(
+            {"slot": "locomotion"},
+            {
+                "reference_aligned": True,
+                "reference_buffer_swapped": False,
+                "lowstate_anchor_handoff": True,
+                "preview_steps": 4,
+                "target_delta_max_rad": 0.0,
+                "desired_target_delta_max_rad": 10.0,
+            },
+        )
+
+        self.assertIsNone(result)
+
     def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
         self,
     ) -> None:
@@ -7048,8 +7101,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         popen.assert_not_called()
 
         # A provenance-verified resident adapter first refreshes its neutral
-        # shadow, then prepares four writer-free BFM preview ticks.  SONIC is
-        # fenced only after that target/reference admission passes.
+        # shadow, then fences SONIC and realigns to the current BFM reference
+        # before BFM preparation.  The SONIC stand pose is not assumed stable
+        # under the BFM physics/profile contract.
         coordinator.locomotion_policy_candidates = (
             MODULE.PolicyCandidateState(
                 policy_id="bfm-sonic-teacher50k",
@@ -7074,6 +7128,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             paused=True,
             current_first_write=False,
             reference_source="robo_pfnn_formal7168",
+            direct_initial_qpos=tuple(0.01 * index for index in range(36)),
+            direct_initial_qvel=tuple(-0.01 * index for index in range(35)),
+            direct_initial_status_sequence=12,
+            last_state_sequence=41,
             last_status={
                 "world_sample_sequence": 10,
                 "shadow_preview": True,
@@ -7092,6 +7150,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             authority_epoch=3,
         )
         coordinator.physics_profiles = mock.Mock()
+        coordinator.initial_bfm_reference_alignment = {
+            "mode": "online_pfnn_handoff_realign"
+        }
         coordinator.bfm_switch_timeout_s = 10.0
         coordinator._policy_selection_results = {}
         result = coordinator.request_policy_slot_assignment(
@@ -7102,15 +7163,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertIsNone(result)
         coordinator.sonic_writer.send.assert_not_called()
+        self.assertTrue(
+            coordinator._policy_selection_pending["initial_reference_alignment"]
+        )
+        self.assertFalse(
+            coordinator._policy_selection_pending["initial_locomotion_alignment"]
+        )
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
             "await_bfm_shadow",
         )
+        coordinator._align_initial_bfm_reference = mock.Mock()
 
         coordinator.bfm_control.last_status["world_sample_sequence"] = 11
         coordinator._reconcile_policy_slot_assignment()
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+        coordinator.bfm_control.prepare_activation.assert_not_called()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_pause_sonic",
+        )
+
+        coordinator.sonic_writer.paused = True
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator._align_initial_bfm_reference.assert_called_once_with(
+            force=True
+        )
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_alignment_wait",
+        )
+
+        coordinator.bfm_control.last_state_sequence = 42
+        coordinator._reconcile_policy_slot_assignment()
         coordinator.bfm_control.prepare_activation.assert_called_once_with(
-            allow_idle_neutral=False
+            aligned_initial=True
         )
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
@@ -7119,9 +7206,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         coordinator.bfm_control.activation_prepared = True
         coordinator.bfm_control.activation_preparation_status = {
+            "exact_initial_alignment": True,
             "reference_aligned": True,
-            "reference_buffer_swapped": True,
-            "preview_steps": 4,
+            "reference_buffer_swapped": False,
+            "preview_steps": 1,
             "target_delta_max_rad": 0.01,
             "desired_target_delta_max_rad": 0.33,
         }
@@ -7145,7 +7233,6 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.bfm_control.activate.side_effect = (
             lambda: events.append("activate_bfm")
         )
-        coordinator.sonic_writer.paused = True
         coordinator._reconcile_policy_slot_assignment()
         self.assertEqual(
             events,
@@ -8059,6 +8146,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertIsNone(coordinator.runtime_pause_writer_epoch)
         self.assertFalse(coordinator.runtime_pause_resume_sent)
 
+    def test_runtime_continue_retries_transient_bfm_freshness_rejection(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.selected_locomotion_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator.sonic_writer = mock.Mock()
+        writer = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        writer.ready = True
+        writer.warmed = True
+        writer.models_warmed = True
+        writer.paused = True
+        writer.first_write = True
+        writer.authority_epoch = 6
+        writer.activation_rejected_reason = "inputs_not_fresh"
+        writer.activation_preparation_status = {"reason": "inputs_not_fresh"}
+        writer.prepare_activation = mock.Mock()
+        coordinator.bfm_control = writer
+        coordinator.runtime_pause_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator.runtime_pause_writer_epoch = 6
+        coordinator.runtime_pause_resume_sent = False
+
+        coordinator.request_runtime_continue()
+
+        self.assertIsNone(writer.activation_rejected_reason)
+        self.assertIsNone(writer.activation_preparation_status)
+        writer.prepare_activation.assert_not_called()
+        self.assertFalse(coordinator.runtime_pause_resume_sent)
+
+        coordinator.request_runtime_continue()
+
+        writer.prepare_activation.assert_called_once_with(aligned_initial=True)
+        self.assertFalse(coordinator.runtime_pause_resume_sent)
+
     def test_resident_worker_ready_requires_gpu_policy_attestation(self) -> None:
         control = MODULE._RecoveryWorkerControl(
             Path("/unused/recovery.sock"),
@@ -8250,6 +8372,72 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             ).encode("utf-8")
         )
         self.assertTrue(control.activation_prepared)
+
+    def test_bfm_control_accepts_paused_status_as_pause_ack(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        control.ready = True
+        control.warmed = True
+        control.models_warmed = True
+        control.first_write = True
+        control.epoch_first_write = True
+        control.paused = False
+        control.pause_pending = True
+        control.authority_epoch = 3
+        control.requested_authority_epoch = 3
+
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "STATUS",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 3,
+                    "controller": "PAUSED_RESIDENT_WRITER",
+                    "writer_created": True,
+                    "write_authorized": False,
+                    "models_warmed": True,
+                }
+            ).encode("utf-8")
+        )
+
+        self.assertTrue(control.paused)
+        self.assertFalse(control.pause_pending)
+        self.assertFalse(control.current_first_write)
+        self.assertFalse(control.epoch_first_write)
+
+    def test_bfm_control_can_cancel_rejected_preparation(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        control.preparation_pending = True
+        control.activation_prepared = True
+        control.activation_pending = True
+        control.preparation_aligned_initial_requested = True
+        control.preparation_idle_neutral_requested = True
+        control.activation_preparation_status = {"reference_buffer_swapped": False}
+
+        control.cancel_preparation()
+
+        self.assertFalse(control.preparation_pending)
+        self.assertFalse(control.activation_prepared)
+        self.assertFalse(control.activation_pending)
+        self.assertFalse(control.preparation_aligned_initial_requested)
+        self.assertFalse(control.preparation_idle_neutral_requested)
+        self.assertIsNone(control.activation_preparation_status)
+
+    def test_bfm_control_retries_transient_freshness_rejection(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        control.activation_rejected_reason = "inputs_not_fresh"
+        control.activation_preparation_status = {"reason": "inputs_not_fresh"}
+
+        self.assertTrue(control.retry_transient_preparation())
+        self.assertIsNone(control.activation_rejected_reason)
+        self.assertIsNone(control.activation_preparation_status)
+
+        control.activation_rejected_reason = "target_delta_exceeded"
+        self.assertFalse(control.retry_transient_preparation())
+        self.assertEqual(
+            control.activation_rejected_reason,
+            "target_delta_exceeded",
+        )
 
     def test_bfm_control_accepts_unlimited_exact_initial_target(self) -> None:
         control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
