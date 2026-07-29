@@ -58,6 +58,7 @@ from matrix_mc_commands import (
     MAX_RUNTIME_PAUSE_EPOCH,
     MovementModeSet,
     PolicySlotAssignment,
+    PolicySlotQuery,
     RuntimePause,
     TeleportList,
     TeleportRoute,
@@ -5820,7 +5821,7 @@ class GameCommandRuntime:
                 continue
             if not command_allowed and not isinstance(
                 request.command,
-                (TeleportList, MovementModeSet, GameQuit),
+                (TeleportList, MovementModeSet, PolicySlotQuery, GameQuit),
             ):
                 self.rejected_commands += 1
                 self._send(
@@ -5902,7 +5903,7 @@ class GameCommandRuntime:
                 and self.runtime_pause.physics_frozen
                 and not isinstance(
                     request.command,
-                    (DataModifyNumber, MovementModeSet),
+                    (DataModifyNumber, MovementModeSet, PolicySlotQuery),
                 )
             ):
                 self.rejected_commands += 1
@@ -5913,6 +5914,31 @@ class GameCommandRuntime:
                         code="E_RUNTIME_PAUSED",
                         message="Continue the simulation before changing the world",
                         data={"runtime_pause": self.runtime_pause.telemetry()},
+                    )
+                )
+                continue
+            if isinstance(request.command, PolicySlotQuery):
+                if self.policy_slots is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_POLICY_UNAVAILABLE",
+                            message="Resident policy slots are unavailable for this run",
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code="OK_POLICY_SLOT_STATUS",
+                        message="Resident policy loadout refreshed",
+                        data=self._policy_response_data(
+                            self.policy_slots.strategy_loadout_mapping()
+                        ),
                     )
                 )
                 continue
@@ -8588,6 +8614,25 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             }:
                 raise RuntimeError("BFM Teacher STATUS epoch mismatch")
             self.last_status = dict(payload)
+            if (
+                payload.get("controller") == "PAUSED_RESIDENT_WRITER"
+                and self.pause_pending
+            ):
+                if (
+                    payload.get("writer_created") is not True
+                    or payload.get("write_authorized") is not False
+                ):
+                    raise RuntimeError(
+                        "BFM Teacher paused STATUS violated writer fence"
+                    )
+                self.paused = True
+                self.pause_pending = False
+                self.activation_pending = False
+                self.activation_prepared = False
+                self.activation_preparation_status = None
+                self.preparation_aligned_initial_requested = False
+                self.preparation_idle_neutral_requested = False
+                self.epoch_first_write = False
             status_qpos = payload.get("direct_initial_qpos")
             status_qvel = payload.get("direct_initial_qvel")
             if status_qpos is not None or status_qvel is not None:
@@ -8664,6 +8709,25 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         self.preparation_idle_neutral_requested = bool(allow_idle_neutral)
         self.activation_rejected_reason = None
         self.activation_preparation_status = None
+
+    def cancel_preparation(self) -> None:
+        """Drop a rejected local preparation without changing writer authority."""
+
+        self.preparation_pending = False
+        self.activation_prepared = False
+        self.activation_pending = False
+        self.preparation_aligned_initial_requested = False
+        self.preparation_idle_neutral_requested = False
+        self.activation_preparation_status = None
+
+    def retry_transient_preparation(self) -> bool:
+        """Clear a transient freshness rejection so the supervisor can retry."""
+
+        if self.activation_rejected_reason != "inputs_not_fresh":
+            return False
+        self.activation_rejected_reason = None
+        self.activation_preparation_status = None
+        return True
 
     def activate(self) -> None:
         if self.connection is None or not self.ready or not self.warmed:
@@ -9620,6 +9684,7 @@ class _PhysicalRecoveryCoordinator:
     FALLBACK_MAX_LINEAR_SPEED_M_S = 0.5
     FALLBACK_MAX_ANGULAR_SPEED_RAD_S = 1.5
     FALLBACK_MAX_JOINT_VELOCITY_RMS_RAD_S = 1.5
+    BFM_SWITCH_ADMISSION_HOLD_S = 1.5
     BFM_SWITCH_MAX_DESIRED_TARGET_DELTA_RAD = 0.75
     # Conservative first qualification after a replacement deploy.  At the
     # 50 Hz game command rate this is 1 rad/s and prevents a frame transform
@@ -9892,9 +9957,12 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_switch_timeout_s = 10.0
         self.bfm_switch_admission_ready = False
         self.bfm_switch_admission_reason = "awaiting_runtime_observation"
+        self.bfm_switch_admission_since_s: float | None = None
+        self.bfm_switch_admission_elapsed_s = 0.0
         self.bfm_switch_admission_telemetry: dict[str, object] = {
             "reason": self.bfm_switch_admission_reason,
             "ready": False,
+            "raw_ready": False,
             "root_z_m": None,
             "root_up_z": None,
             "root_linear_speed_m_s": None,
@@ -9902,6 +9970,8 @@ class _PhysicalRecoveryCoordinator:
             "joint_velocity_rms_rad_s": None,
             "height_threshold_m": self.LOCOMOTION_SWITCH_UPRIGHT_HEIGHT_M,
             "up_z_threshold": self.LOCOMOTION_SWITCH_UPRIGHT_UP_Z,
+            "stability_hold_seconds": self.BFM_SWITCH_ADMISSION_HOLD_S,
+            "stability_elapsed_seconds": 0.0,
         }
         self.last_locomotion_handoff: dict[str, object] | None = None
         self.initial_bfm_reference_aligned = False
@@ -9971,7 +10041,32 @@ class _PhysicalRecoveryCoordinator:
             raise RuntimeError("locomotion physics profiles are not bound")
         profiles.apply(profile_id)
 
-    def _align_initial_bfm_reference(self) -> None:
+    def _update_bfm_switch_admission_hold(
+        self,
+        raw_ready: bool,
+        *,
+        now_s: float,
+    ) -> bool:
+        """Require a short continuous neutral/upright window before BFM handoff."""
+
+        if not raw_ready:
+            self.bfm_switch_admission_since_s = None
+            self.bfm_switch_admission_elapsed_s = 0.0
+            return False
+        if self.bfm_switch_admission_since_s is None:
+            self.bfm_switch_admission_since_s = float(now_s)
+            self.bfm_switch_admission_elapsed_s = 0.0
+            return False
+        self.bfm_switch_admission_elapsed_s = max(
+            0.0,
+            float(now_s) - self.bfm_switch_admission_since_s,
+        )
+        return (
+            self.bfm_switch_admission_elapsed_s
+            >= self.BFM_SWITCH_ADMISSION_HOLD_S
+        )
+
+    def _align_initial_bfm_reference(self, *, force: bool = False) -> None:
         """Align the initial game G1 once to the online-PFNN reference.
 
         The validated BFM closed loop initializes the physical robot from the
@@ -9980,7 +10075,7 @@ class _PhysicalRecoveryCoordinator:
         policy, after SONIC is writer-fenced and before BFM gains authority.
         """
 
-        if self.initial_bfm_reference_aligned:
+        if self.initial_bfm_reference_aligned and not force:
             return
         profiles = getattr(self, "physics_profiles", None)
         qpos = self.bfm_control.direct_initial_qpos
@@ -10019,7 +10114,11 @@ class _PhysicalRecoveryCoordinator:
         )
         self.initial_bfm_reference_aligned = True
         self.initial_bfm_reference_alignment = {
-            "mode": "online_pfnn_first_frame_once",
+            "mode": (
+                "online_pfnn_handoff_realign"
+                if force
+                else "online_pfnn_first_frame_once"
+            ),
             "root_xy_preserved": True,
             "reference_root_shift_discarded_m": root_shift,
             "joint_delta_max_rad": joint_delta,
@@ -10406,13 +10505,15 @@ class _PhysicalRecoveryCoordinator:
                     )
                     else -1
                 )
+                initial_locomotion_alignment = transition_id.startswith(
+                    "initial-locomotion-"
+                )
                 self._policy_selection_pending = {
                     "slot": "locomotion",
                     "policy_id": BFM_TEACHER50K_POLICY_ID,
                     "transition_id": transition_id,
-                    "initial_reference_alignment": transition_id.startswith(
-                        "initial-locomotion-"
-                    ),
+                    "initial_reference_alignment": True,
+                    "initial_locomotion_alignment": initial_locomotion_alignment,
                     "phase": "await_bfm_shadow",
                     "requested_monotonic_s": time.monotonic(),
                     "shadow_baseline_sequence": baseline_sequence,
@@ -10676,7 +10777,14 @@ class _PhysicalRecoveryCoordinator:
                     ):
                         return
                     pending["prior_writer_fenced"] = True
-                    self._align_initial_bfm_reference()
+                    initial_locomotion_alignment = bool(
+                        pending.get("initial_locomotion_alignment") is True
+                        or transition_id.startswith("initial-locomotion-")
+                    )
+                    if initial_locomotion_alignment:
+                        self._align_initial_bfm_reference()
+                    else:
+                        self._align_initial_bfm_reference(force=True)
                     pending["initial_reference_alignment_result"] = dict(
                         self.initial_bfm_reference_alignment or {}
                     )
@@ -11067,13 +11175,15 @@ class _PhysicalRecoveryCoordinator:
             writer.send("RESUME")
         else:
             if writer.activation_rejected_reason is not None:
+                if writer.retry_transient_preparation():
+                    return
                 raise RuntimeError(
                     "BFM runtime-continue preparation rejected: "
                     f"{writer.activation_rejected_reason}"
                 )
             if not writer.activation_prepared:
                 if not writer.preparation_pending:
-                    writer.prepare_activation()
+                    writer.prepare_activation(aligned_initial=True)
                 return
             writer.activate()
         self.runtime_pause_resume_sent = True
@@ -11396,16 +11506,30 @@ class _PhysicalRecoveryCoordinator:
             ),
             None,
         )
-        self.bfm_switch_admission_ready = failed_admission is None
+        raw_admission_ready = failed_admission is None
+        held_admission_ready = self._update_bfm_switch_admission_hold(
+            raw_admission_ready,
+            now_s=now_s,
+        )
+        self.bfm_switch_admission_ready = held_admission_ready
         self.bfm_switch_admission_reason = (
-            "ready" if failed_admission is None else failed_admission
+            "ready"
+            if held_admission_ready
+            else (
+                "stability_hold"
+                if raw_admission_ready
+                else str(failed_admission)
+            )
         )
         if not initial_locomotion_handoff_allowed:
+            self._update_bfm_switch_admission_hold(False, now_s=now_s)
             self.bfm_switch_admission_ready = False
             self.bfm_switch_admission_reason = "resume_checkpoint_probation"
         self.bfm_switch_admission_telemetry = {
             "ready": bool(self.bfm_switch_admission_ready),
+            "raw_ready": bool(raw_admission_ready),
             "reason": self.bfm_switch_admission_reason,
+            "failed_reason": failed_admission,
             "root_z_m": round(root_z, 6),
             "root_up_z": round(root_up_z, 6),
             "root_linear_speed_m_s": round(root_linear_speed, 6),
@@ -11416,6 +11540,11 @@ class _PhysicalRecoveryCoordinator:
             "max_root_linear_speed_m_s": 0.15,
             "max_root_angular_speed_rad_s": 0.35,
             "max_joint_velocity_rms_rad_s": 0.75,
+            "stability_hold_seconds": self.BFM_SWITCH_ADMISSION_HOLD_S,
+            "stability_elapsed_seconds": round(
+                float(getattr(self, "bfm_switch_admission_elapsed_s", 0.0)),
+                6,
+            ),
         }
         self._request_initial_locomotion_policy_if_ready(
             handoff_allowed=initial_locomotion_handoff_allowed,
@@ -12166,6 +12295,8 @@ class _PhysicalRecoveryCoordinator:
                         and not self.bfm_control.activation_pending
                     ):
                         if self.bfm_control.activation_rejected_reason is not None:
+                            if self.bfm_control.retry_transient_preparation():
+                                return
                             raise RuntimeError(
                                 "BFM recovery-return preparation rejected: "
                                 f"{self.bfm_control.activation_rejected_reason}"
@@ -14075,11 +14206,6 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         )
                     if (
                         runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED
-                        and not physical_recovery.runtime_pause_resume_sent
-                    ):
-                        physical_recovery.request_runtime_continue()
-                    if (
-                        runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED
                         and physical_recovery.selected_locomotion_policy_id
                         == BFM_TEACHER50K_POLICY_ID
                         and runtime_pause_neutral_command is not None
@@ -14089,6 +14215,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             runtime_pause_neutral_command,
                             height_map_z=bfm_height_map(snapshot),
                         )
+                    if (
+                        runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED
+                        and not physical_recovery.runtime_pause_resume_sent
+                    ):
+                        physical_recovery.request_runtime_continue()
                     if runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED:
                         physical_recovery.poll_runtime_pause_controls()
                         if physical_recovery.runtime_continue_acknowledged():

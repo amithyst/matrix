@@ -1817,6 +1817,7 @@ class BfmTeacherCore:
             "reference_stop_pending_hold": canonical_stop_pending_hold,
             "reference_transition": self.reference_transition,
             "idle_anchor_hold": idle_anchor_hold,
+            "lowstate_anchor_handoff": False,
             "idle_anchor_enabled": bool(
                 getattr(self, "idle_anchor_enabled", True)
             ),
@@ -2349,26 +2350,50 @@ def run_worker(
                         now = monotonic()
                         state = state_store.get()
                         prior_command = command_store.get()
+                        world_age_s = (
+                            now - latest_world.received_monotonic
+                            if latest_world is not None
+                            else None
+                        )
+                        state_age_s = (
+                            now - state.received_monotonic
+                            if state is not None
+                            else None
+                        )
+                        lowcmd_age_s = (
+                            now - prior_command.received_monotonic
+                            if prior_command is not None
+                            else None
+                        )
                         if (
                             not warmed
-                            or latest_world is None
-                            or now - latest_world.received_monotonic
-                            > WORLD_SAMPLE_MAX_AGE_S
-                            or state is None
-                            or now - state.received_monotonic
-                            > LOWSTATE_MAX_AGE_S
+                            or world_age_s is None
+                            or world_age_s > WORLD_SAMPLE_MAX_AGE_S
+                            or state_age_s is None
+                            or state_age_s > LOWSTATE_MAX_AGE_S
                             or (
                                 not aligned_initial
                                 and (
-                                    prior_command is None
-                                    or now - prior_command.received_monotonic
-                                    > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                                    lowcmd_age_s is None
+                                    or lowcmd_age_s > HOT_SWITCH_LOW_CMD_MAX_AGE_S
                                 )
                             )
                         ):
-                            raise RuntimeError(
-                                "BFM Teacher PREPARE lacks fresh warmed inputs"
+                            send_event(
+                                "ACTIVATION_REJECTED",
+                                {
+                                    "authority_epoch": requested_epoch,
+                                    "writer_created": handoff.publisher is not None,
+                                    "writer_reused": handoff.publisher is not None,
+                                    "write_authorized": False,
+                                    "reason": "inputs_not_fresh",
+                                    "models_warmed": bool(warmed),
+                                    "world_age_s": world_age_s,
+                                    "lowstate_age_s": state_age_s,
+                                    "lowcmd_age_s": lowcmd_age_s,
+                                },
                             )
+                            continue
                         if not _handoff_input_is_neutral(
                             latest_world,
                             allow_idle_neutral=allow_idle_neutral,
@@ -2687,6 +2712,7 @@ def run_worker(
                                             "reference_buffer_swapped": (
                                                 prepare_reference_buffer_swapped
                                             ),
+                                            "lowstate_anchor_handoff": False,
                                             "preview_steps": prepare_ready_steps,
                                             "target_delta_max_rad": (
                                                 target_step_delta

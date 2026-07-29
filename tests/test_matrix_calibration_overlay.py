@@ -337,6 +337,54 @@ class OverlayLayoutTest(unittest.TestCase):
             self.assertGreaterEqual(panel[3], 760)
             self.assertLessEqual(panel[3], 800)
 
+    def test_startup_loading_model_accepts_media_metadata(self) -> None:
+        model = MODULE.startup_loading_model(
+            {
+                "startup_loading": {
+                    "active": True,
+                    "message": "加载月球视频背景",
+                    "progress": 0.45,
+                    "media_frames_dir": "/tmp/matrix-moon-frames",
+                    "media_frame_rate_hz": 3.5,
+                }
+            }
+        )
+
+        self.assertTrue(model.active)
+        self.assertEqual(model.message, "加载月球视频背景")
+        self.assertEqual(model.progress, 0.45)
+        self.assertEqual(model.media_frames_dir, "/tmp/matrix-moon-frames")
+        self.assertEqual(model.media_frame_rate_hz, 3.5)
+
+    def test_startup_loading_model_rejects_invalid_media_metadata(self) -> None:
+        model = MODULE.startup_loading_model(
+            {
+                "startup_loading": {
+                    "active": True,
+                    "media_frames_dir": True,
+                    "media_frame_rate_hz": True,
+                }
+            }
+        )
+
+        self.assertTrue(model.active)
+        self.assertIsNone(model.media_frames_dir)
+        self.assertEqual(model.media_frame_rate_hz, MODULE._STARTUP_MEDIA_FRAME_RATE_HZ)
+
+    def test_read_startup_media_ppm_accepts_binary_rgb_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "moon.ppm"
+            path.write_bytes(
+                b"P6\n# generated from Feishu startup video\n2 1\n255\n"
+                + bytes([1, 2, 3, 250, 251, 252])
+            )
+
+            frame = MODULE.read_startup_media_ppm(path)
+
+        self.assertEqual(frame.width, 2)
+        self.assertEqual(frame.height, 1)
+        self.assertEqual(frame.pixels, bytes([1, 2, 3, 250, 251, 252]))
+
     def test_compact_layout_is_bounded_and_too_small_client_hides_safely(self) -> None:
         geometry = MODULE.WindowGeometry(1, 20, 30, 640, 420)
         self.assertTrue(MODULE.overlay_supported(geometry))
@@ -844,6 +892,53 @@ class OverlayStateTest(unittest.TestCase):
         self.assertFalse(malformed.available)
         self.assertFalse(malformed.enabled)
 
+    def test_runtime_pause_model_accepts_game_commands_runtime_status(self) -> None:
+        running = MODULE.runtime_pause_panel_model(
+            {
+                "game_commands": {
+                    "runtime_pause": {
+                        "available": True,
+                        "phase": "running",
+                        "epoch": 4,
+                        "last_error": None,
+                    }
+                }
+            }
+        )
+        self.assertTrue(running.enabled)
+        self.assertEqual(running.pause_target, "paused")
+        self.assertEqual(running.epoch, 4)
+
+        paused = MODULE.runtime_pause_panel_model(
+            {
+                "game_commands": {
+                    "runtime_pause": {
+                        "available": True,
+                        "phase": "paused",
+                        "epoch": 5,
+                        "last_error": None,
+                    }
+                }
+            }
+        )
+        self.assertTrue(paused.enabled)
+        self.assertEqual(paused.pause_target, "running")
+
+        pausing = MODULE.runtime_pause_panel_model(
+            {
+                "game_commands": {
+                    "runtime_pause": {
+                        "available": True,
+                        "phase": "pause_requested",
+                        "epoch": 5,
+                        "last_error": None,
+                    }
+                }
+            }
+        )
+        self.assertFalse(pausing.enabled)
+        self.assertEqual(pausing.state, "pausing")
+
     def test_runtime_pause_button_draws_visible_state_semantics(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
         panel_model = MODULE.settings_panel_model(
@@ -1133,6 +1228,7 @@ class OverlayStateTest(unittest.TestCase):
                     "status": "success",
                     "sequence": 4,
                     "result_revision": 7,
+                    "result_age_s": 1.25,
                     "ok": True,
                     "warning": "已兼容执行；标准命令是 /summon",
                 }
@@ -1141,6 +1237,7 @@ class OverlayStateTest(unittest.TestCase):
         self.assertTrue(status.available)
         self.assertFalse(status.provider_editing)
         self.assertEqual(status.result_revision, 7)
+        self.assertEqual(status.result_age_s, 1.25)
         self.assertEqual(status.warning, "Accepted /summom alias; standard command is /summon")
         malformed = MODULE.command_console_status(
             {
@@ -1148,12 +1245,40 @@ class OverlayStateTest(unittest.TestCase):
                     "status": {},
                     "sequence": True,
                     "result_revision": True,
+                    "result_age_s": True,
                 }
             }
         )
         self.assertEqual(malformed.status, "unavailable")
         self.assertIsNone(malformed.sequence)
         self.assertEqual(malformed.result_revision, 0)
+        self.assertIsNone(malformed.result_age_s)
+
+    def test_command_state_accepts_game_commands_runtime_status(self) -> None:
+        status = MODULE.command_console_status(
+            {
+                "game_commands": {
+                    "enabled": True,
+                    "last_sequence": 4,
+                    "policy_change_pending": False,
+                    "runtime_pause_pending": False,
+                    "last_response": {
+                        "ok": True,
+                        "code": "OK_POLICY_SLOT_ASSIGNED",
+                        "message": "Assigned bfm-sonic-teacher50k to locomotion",
+                        "restart_required": False,
+                    },
+                }
+            }
+        )
+
+        self.assertTrue(status.available)
+        self.assertFalse(status.in_flight)
+        self.assertEqual(status.status, "success")
+        self.assertEqual(status.sequence, 4)
+        self.assertEqual(status.result_revision, 4)
+        self.assertTrue(status.ok)
+        self.assertEqual(status.code, "OK_POLICY_SLOT_ASSIGNED")
 
     def test_strategy_loadout_model_exposes_two_slots_and_pending_selection(self) -> None:
         model = MODULE.strategy_loadout_model(
@@ -1235,6 +1360,49 @@ class OverlayStateTest(unittest.TestCase):
             ["kungfu", "host", "amp", "amp-flat-v3"],
         )
         self.assertFalse(model.policy_enabled("host"))
+
+    def test_strategy_loadout_model_accepts_game_commands_status(self) -> None:
+        model = MODULE.strategy_loadout_model(
+            {
+                "game_commands": {
+                    "strategy_loadout": {
+                        "version": 1,
+                        "available": True,
+                        "status": "ready",
+                        "active_slot": "locomotion",
+                        "pending": None,
+                        "slots": [
+                            {
+                                "slot": "locomotion",
+                                "locked": False,
+                                "selected_policy_id": "bfm-sonic-teacher50k",
+                                "candidates": [
+                                    {
+                                        "policy_id": "sonic",
+                                        "name": "SONIC",
+                                        "resident": True,
+                                        "available": True,
+                                    },
+                                    {
+                                        "policy_id": "bfm-sonic-teacher50k",
+                                        "name": "BFM SONIC Teacher50k",
+                                        "resident": True,
+                                        "available": True,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+
+        self.assertTrue(model.available)
+        self.assertEqual(model.locomotion_policy_id, "bfm-sonic-teacher50k")
+        self.assertEqual(
+            [candidate.policy_id for candidate in model.locomotion_candidates],
+            ["sonic", "bfm-sonic-teacher50k"],
+        )
 
     def test_loading_loadout_allows_only_an_explicitly_unlocked_slot(self) -> None:
         model = MODULE.strategy_loadout_model(
@@ -1848,6 +2016,7 @@ class OverlayStateTest(unittest.TestCase):
             warning=None,
             restart_required=False,
             outcome_unknown=False,
+            result_age_s=1.0,
         )
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
         overlay._colours = {
@@ -1886,6 +2055,92 @@ class OverlayStateTest(unittest.TestCase):
             "策略切换失败",
             overlay._draw_progress_bar.call_args.kwargs["label"],
         )
+
+    def test_loadout_hides_stale_policy_rejection_status(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.strategy_loadout_model(
+            {
+                "strategy_loadout": {
+                    "version": 1,
+                    "available": True,
+                    "status": "ready",
+                    "active_slot": "locomotion",
+                    "pending": None,
+                    "slots": [
+                        {
+                            "slot": "locomotion",
+                            "selected_policy_id": "sonic",
+                            "locked": False,
+                            "candidates": [
+                                {
+                                    "policy_id": "sonic",
+                                    "name": "SONIC",
+                                    "available": True,
+                                    "resident": True,
+                                },
+                                {
+                                    "policy_id": "bfm-sonic-teacher50k",
+                                    "name": "BFM SONIC Teacher50k",
+                                    "available": True,
+                                    "resident": True,
+                                },
+                            ],
+                        },
+                        {
+                            "slot": "recovery",
+                            "selected_policy_id": "kungfu",
+                            "locked": False,
+                            "candidates": [],
+                        },
+                    ],
+                }
+            }
+        )
+        status = MODULE.CommandConsoleStatus(
+            available=True,
+            provider_editing=False,
+            in_flight=False,
+            status="error",
+            request_id="cmd-test",
+            sequence=1,
+            result_revision=1,
+            ok=False,
+            code="E_POLICY_SWITCH_REJECTED",
+            message="BFM hot switch reference buffer was not swapped",
+            warning=None,
+            restart_required=False,
+            outcome_unknown=False,
+            result_age_s=10.0,
+        )
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "button",
+                    "outline",
+                    "disabled",
+                    "selected",
+                    "pending",
+                    "apply",
+                    "cyan",
+                    "error",
+                ),
+                10,
+            )
+        }
+        overlay._fill_panel_band = mock.Mock(
+            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
+        )
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+        overlay._draw_progress_bar = mock.Mock()
+
+        overlay._draw_loadout_page(layout, model, status)
+
+        overlay._draw_progress_bar.assert_not_called()
 
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):
@@ -2326,6 +2581,7 @@ class RuntimePausePointerTest(unittest.TestCase):
         page: str = "settings",
         release_point: tuple[int, int] | None = None,
         release_window: int = 2,
+        release_state: str | None = None,
     ):
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
         pause_state = {
@@ -2363,6 +2619,8 @@ class RuntimePausePointerTest(unittest.TestCase):
         overlay._command_editor = MODULE.CommandLineEditor()
         overlay._pressed_action = None
         overlay._pressed_window = None
+        overlay._pressed_runtime_pause_target = None
+        overlay._pressed_runtime_pause_epoch = None
         overlay._recovered_pause_release_count = 0
         overlay._visible = True
         overlay._font_slider_dragging = False
@@ -2387,6 +2645,24 @@ class RuntimePausePointerTest(unittest.TestCase):
 
         def next_event(_display, destination):
             event = events.pop(0)
+            if (
+                event.type == MODULE._BUTTON_RELEASE
+                and release_state is not None
+            ):
+                release_pause_state = {
+                    "command_console": {
+                        "runtime_pause": {
+                            "state": release_state,
+                            "epoch": 4,
+                            "can_pause": release_state == "running",
+                            "can_resume": release_state == "paused",
+                            "last_error": None,
+                        }
+                    }
+                }
+                overlay._last_runtime_pause_model = (
+                    MODULE.runtime_pause_panel_model(release_pause_state)
+                )
             MODULE.ctypes.memmove(
                 destination,
                 MODULE.ctypes.byref(event),
@@ -2406,6 +2682,18 @@ class RuntimePausePointerTest(unittest.TestCase):
                     target, expected_epoch=3
                 )
                 publisher.publish.assert_not_called()
+
+    def test_pause_click_uses_press_time_target_when_release_model_flips(
+        self,
+    ) -> None:
+        overlay = self.overlay("running", release_state="paused")
+        publisher = mock.Mock()
+
+        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
+
+        publisher.publish_runtime_pause.assert_called_once_with(
+            "paused", expected_epoch=3
+        )
 
     def test_busy_and_fault_clicks_emit_nothing(self) -> None:
         for state in ("pausing", "resuming", "busy", "fault", "unavailable"):

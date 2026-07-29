@@ -1042,6 +1042,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
             np.zeros(MODULE.NUM_JOINTS),
         )
         self.assertTrue(status["idle_anchor_hold"])
+        self.assertFalse(status["lowstate_anchor_handoff"])
         self.assertTrue(status["handoff_preview"])
         self.assertTrue(status["activation_settle_active"])
         self.assertEqual(status["activation_blend_fraction"], 0.0)
