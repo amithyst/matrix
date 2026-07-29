@@ -1869,6 +1869,7 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_WORLD_ARGS=()
     SONIC_SCENE_TRANSFORM_ARGS=()
     SONIC_DYNAMIC_GROUND_ARGS=()
+    SONIC_DYNAMIC_GROUND_COLLISION_ARGS=()
     SONIC_INVENTORY_ARGS=()
     # The game-input provider always needs a stable world identity, even when
     # durable checkpoints are disabled.  Persistence adds revision/state
@@ -1898,14 +1899,35 @@ if $MATRIX_SONIC_ENABLED; then
         echo "[INFO] Town10 perimeter collision walls removed in derived physics scene"
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+        MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="$(
+            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1}" \
+                | tr '[:upper:]' '[:lower:]' \
+                | tr '_' '-'
+        )"
+        case "$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE" in
+            ""|stable|default|tiles|tile|mocap-tiles|rolling-tiles|rolling-mocap-tiles|rolling-mocap-tiles-v1|leo|official)
+                MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="rolling-mocap-tiles-v1"
+                ;;
+            hfield|heightfield|continuous|continuous-hfield|rolling-hfield|rolling-heightfield|rolling-heightfield-v2)
+                MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="rolling-heightfield-v2"
+                ;;
+            *)
+                echo "[ERROR] MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE must be rolling-heightfield-v2 or rolling-mocap-tiles-v1" >&2
+                exit 2
+                ;;
+        esac
+        export MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE="$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE"
         SONIC_SCENE_TRANSFORM_ARGS+=(
             --scene-transform moon-dynamic-ground-mocap-v3
+        )
+        SONIC_DYNAMIC_GROUND_COLLISION_ARGS=(
+            --moon-dynamic-ground-collision-mode "$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE"
         )
         SONIC_DYNAMIC_GROUND_ARGS=(
             --moon-dynamic-map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
             --moon-dynamic-map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
         )
-        echo "[INFO] MoonWorld rolling collision tiles enabled from locked dynamic height map"
+        echo "[INFO] MoonWorld dynamic ground enabled from locked height map: collision=$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE height_filter=${MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-flat-anchor}"
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
         && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
@@ -2100,7 +2122,8 @@ PY
         --output-dir "$SONIC_PHYSICS_DIR" \
         "${SONIC_SPAWN_ARGS[@]}" \
         "${SONIC_INVENTORY_ARGS[@]}" \
-        "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
+        "${SONIC_SCENE_TRANSFORM_ARGS[@]}" \
+        "${SONIC_DYNAMIC_GROUND_COLLISION_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
     GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"

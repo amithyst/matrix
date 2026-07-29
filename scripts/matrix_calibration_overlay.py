@@ -53,6 +53,10 @@ from matrix_motion_settings import (
     GEARS,
     KEYBOARD_LOOK_RATE_FIELD,
     KEYBOARD_LOOK_RATE_PATH,
+    KEYBOARD_TURN_BOOST_RATE_FIELD,
+    KEYBOARD_TURN_BOOST_RATE_PATH,
+    KEYBOARD_TURN_RATE_FIELD,
+    KEYBOARD_TURN_RATE_PATH,
     MAX_TURN_RATE_FIELD,
     MAX_TURN_RATE_PATH,
     MotionSettings,
@@ -100,6 +104,13 @@ _MAX_INTENT_PACKET_BYTES = 2048
 _MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 _MAX_LOCOMOTION_POLICY_BUTTONS = 3
 _MAX_RECOVERY_POLICY_BUTTONS = 4
+_POLICY_STATUS_DISPLAY_SECONDS = 4.0
+_STARTUP_MEDIA_FRAME_RATE_HZ = 2.0
+_STARTUP_MEDIA_MAX_FRAMES = 24
+_STARTUP_MEDIA_MAX_PIXELS = 640 * 360
+_STARTUP_MEDIA_GRID_COLUMNS = 72
+_STARTUP_MEDIA_GRID_ROWS = 42
+_STARTUP_MEDIA_COLOUR_STEP = 32
 _MIN_OVERLAY_FONT_SIZE = 1
 _DEFAULT_OVERLAY_FONT_SIZE = 13
 _MAX_OVERLAY_FONT_SIZE = 22
@@ -559,7 +570,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     motion_bottom = speed_y - motion_outer_gap
     motion_row_height = max(
         1,
-        (motion_bottom - motion_top - 3 * motion_row_gap) // 4,
+        (motion_bottom - motion_top - 4 * motion_row_gap) // 5,
     )
     motion_left_x = panel_x + margin
     motion_left_width = max(
@@ -854,48 +865,35 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
                 motion_row_height,
             )
     turn_y = motion_top + 3 * (motion_row_height + motion_row_gap)
-    turn_width = motion_left_width
-    turn_button_width = 24 if compact else max(32, min(52, turn_width // 4))
-    turn_value_width = max(1, turn_width - 2 * turn_button_width)
-    result["motion_turn_rate_down"] = (
-        motion_left_x,
-        turn_y,
-        turn_button_width,
-        motion_row_height,
+    look_y = motion_top + 4 * (motion_row_height + motion_row_gap)
+    turn_specs = (
+        ("motion_turn_rate", motion_left_x, motion_left_width),
+        ("motion_keyboard_turn_rate", motion_right_x, motion_right_width),
+        ("motion_keyboard_turn_boost_rate", motion_left_x, motion_left_width),
+        ("motion_camera_look_rate", motion_right_x, motion_right_width),
     )
-    result["motion_turn_rate_value"] = (
-        motion_left_x + turn_button_width,
-        turn_y,
-        turn_value_width,
-        motion_row_height,
-    )
-    result["motion_turn_rate_up"] = (
-        motion_left_x + turn_button_width + turn_value_width,
-        turn_y,
-        turn_button_width,
-        motion_row_height,
-    )
-    look_width = motion_right_width
-    look_button_width = 24 if compact else max(32, min(52, look_width // 4))
-    look_value_width = max(1, look_width - 2 * look_button_width)
-    result["motion_camera_look_rate_down"] = (
-        motion_right_x,
-        turn_y,
-        look_button_width,
-        motion_row_height,
-    )
-    result["motion_camera_look_rate_value"] = (
-        motion_right_x + look_button_width,
-        turn_y,
-        look_value_width,
-        motion_row_height,
-    )
-    result["motion_camera_look_rate_up"] = (
-        motion_right_x + look_button_width + look_value_width,
-        turn_y,
-        look_button_width,
-        motion_row_height,
-    )
+    for index, (stem, cell_x, cell_width) in enumerate(turn_specs):
+        row_y = turn_y if index < 2 else look_y
+        button_width = 24 if compact else max(32, min(52, cell_width // 4))
+        value_width = max(1, cell_width - 2 * button_width)
+        result[f"{stem}_down"] = (
+            cell_x,
+            row_y,
+            button_width,
+            motion_row_height,
+        )
+        result[f"{stem}_value"] = (
+            cell_x + button_width,
+            row_y,
+            value_width,
+            motion_row_height,
+        )
+        result[f"{stem}_up"] = (
+            cell_x + button_width + value_width,
+            row_y,
+            button_width,
+            motion_row_height,
+        )
     for index in range(3):
         result[f"navigation_destination_{index}"] = (
             panel_x
@@ -996,6 +994,26 @@ _MOTION_STEP_ACTION_DETAILS = {
 _MOTION_STEP_ACTION_DETAILS.update(
     {
         f"motion_turn_rate_{suffix}": (None, MAX_TURN_RATE_FIELD, direction)
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_keyboard_turn_rate_{suffix}": (
+            "turn",
+            KEYBOARD_TURN_RATE_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_keyboard_turn_boost_rate_{suffix}": (
+            "turn",
+            KEYBOARD_TURN_BOOST_RATE_FIELD,
+            direction,
+        )
         for suffix, direction in (("down", -1), ("up", 1))
     }
 )
@@ -1214,6 +1232,75 @@ class StartupLoadingModel:
     active: bool
     message: str
     progress: float
+    media_frames_dir: str | None = None
+    media_frame_rate_hz: float = _STARTUP_MEDIA_FRAME_RATE_HZ
+
+
+@dataclass(frozen=True)
+class StartupMediaFrame:
+    width: int
+    height: int
+    pixels: bytes
+
+
+_PPM_WHITESPACE = b" \t\r\n"
+
+
+def _skip_ppm_header_space(data: bytes, index: int) -> int:
+    while index < len(data):
+        value = data[index]
+        if value in _PPM_WHITESPACE:
+            index += 1
+            continue
+        if value == ord("#"):
+            while index < len(data) and data[index] not in b"\r\n":
+                index += 1
+            continue
+        break
+    return index
+
+
+def _read_ppm_token(data: bytes, index: int) -> tuple[bytes, int]:
+    index = _skip_ppm_header_space(data, index)
+    start = index
+    while index < len(data):
+        value = data[index]
+        if value in _PPM_WHITESPACE or value == ord("#"):
+            break
+        index += 1
+    if index == start:
+        raise ValueError("missing PPM header token")
+    return data[start:index], index
+
+
+def read_startup_media_ppm(path: Path) -> StartupMediaFrame:
+    data = path.read_bytes()
+    magic, index = _read_ppm_token(data, 0)
+    if magic != b"P6":
+        raise ValueError("startup media frame is not binary PPM/P6")
+    width_token, index = _read_ppm_token(data, index)
+    height_token, index = _read_ppm_token(data, index)
+    max_value_token, index = _read_ppm_token(data, index)
+    try:
+        width = int(width_token)
+        height = int(height_token)
+        max_value = int(max_value_token)
+    except ValueError as exc:
+        raise ValueError("startup media frame has a non-numeric PPM header") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("startup media frame has non-positive dimensions")
+    if width * height > _STARTUP_MEDIA_MAX_PIXELS:
+        raise ValueError("startup media frame is larger than the runtime overlay cap")
+    if max_value != 255:
+        raise ValueError("startup media frame must use 8-bit RGB samples")
+    if index >= len(data) or data[index] not in _PPM_WHITESPACE:
+        raise ValueError("startup media frame has no pixel-data separator")
+    index += 1
+    expected = width * height * 3
+    payload = data[index : index + expected]
+    if len(payload) != expected:
+        raise ValueError("startup media frame pixel payload is truncated")
+    return StartupMediaFrame(width=width, height=height, pixels=payload)
 
 
 def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
@@ -1228,7 +1315,26 @@ def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
         progress_value = 0.0
     else:
         progress_value = max(0.0, min(1.0, float(progress)))
-    return StartupLoadingModel(True, message[:80], progress_value)
+    media_frames_dir_raw = raw.get("media_frames_dir")
+    media_frames_dir = (
+        media_frames_dir_raw[:500]
+        if isinstance(media_frames_dir_raw, str)
+        and media_frames_dir_raw
+        and "\0" not in media_frames_dir_raw
+        else None
+    )
+    frame_rate_raw = raw.get("media_frame_rate_hz", raw.get("media_frame_rate"))
+    if isinstance(frame_rate_raw, bool) or not isinstance(frame_rate_raw, (int, float)):
+        media_frame_rate_hz = _STARTUP_MEDIA_FRAME_RATE_HZ
+    else:
+        media_frame_rate_hz = max(0.1, min(12.0, float(frame_rate_raw)))
+    return StartupLoadingModel(
+        True,
+        message[:80],
+        progress_value,
+        media_frames_dir,
+        media_frame_rate_hz,
+    )
 
 
 @dataclass(frozen=True)
@@ -1294,8 +1400,25 @@ def creative_inventory_model(state: dict[str, object]) -> CreativeInventoryModel
     )
 
 
+def _strategy_loadout_candidate(state: dict[str, object]) -> object:
+    direct = state.get("strategy_loadout")
+    if direct is not None:
+        return direct
+    game_commands = state.get("game_commands")
+    if (
+        isinstance(game_commands, dict)
+        and game_commands.get("strategy_loadout") is not None
+    ):
+        return game_commands.get("strategy_loadout")
+    console = state.get("command_console")
+    console = console if isinstance(console, dict) else {}
+    data = console.get("data")
+    data = data if isinstance(data, dict) else {}
+    return data.get("strategy_loadout")
+
+
 def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
-    raw = state.get("strategy_loadout")
+    raw = _strategy_loadout_candidate(state)
     if not isinstance(raw, dict) or raw.get("version") != 1:
         return StrategyLoadoutModel(
             False,
@@ -2422,6 +2545,10 @@ class MotionSettingsPanelModel:
     def value(self, gear: str, field: str) -> float:
         if gear == "turn" and field == MAX_TURN_RATE_FIELD:
             return self.settings.value_for_path(MAX_TURN_RATE_PATH)
+        if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+            return self.settings.value_for_path(KEYBOARD_TURN_RATE_PATH)
+        if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+            return self.settings.value_for_path(KEYBOARD_TURN_BOOST_RATE_PATH)
         if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
             return self.settings.value_for_path(KEYBOARD_LOOK_RATE_PATH)
         return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
@@ -2601,7 +2728,15 @@ def motion_step_target(
         else (
             KEYBOARD_LOOK_RATE_PATH
             if gear == "camera"
-            else f"control.motion.gears.{gear}.{field}"
+            else (
+                KEYBOARD_TURN_RATE_PATH
+                if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD
+                else (
+                    KEYBOARD_TURN_BOOST_RATE_PATH
+                    if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD
+                    else f"control.motion.gears.{gear}.{field}"
+                )
+            )
         )
     )
     current = model.settings.value_for_path(path)
@@ -2622,6 +2757,16 @@ def motion_step_command(
     if gear is None:
         return (
             f"/data modify entity @s {MAX_TURN_RATE_PATH} "
+            f"set value {target:.2f}"
+        )
+    if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+        return (
+            f"/data modify entity @s {KEYBOARD_TURN_RATE_PATH} "
+            f"set value {target:.2f}"
+        )
+    if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+        return (
+            f"/data modify entity @s {KEYBOARD_TURN_BOOST_RATE_PATH} "
             f"set value {target:.2f}"
         )
     if gear == "camera":
@@ -2646,7 +2791,13 @@ def motion_value_label(
 
     if gear == "turn" and field == MAX_TURN_RATE_FIELD:
         value = model.value(gear, field)
-        return f"转{value:.2f}" if compact else f"转向上限 {value:.2f} rad/s"
+        return f"上{value:.2f}" if compact else f"全局转向上限 {value:.2f} rad/s"
+    if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+        value = model.value(gear, field)
+        return f"单{value:.2f}" if compact else f"单按 Q/E {value:.2f} rad/s"
+    if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+        value = model.value(gear, field)
+        return f"双{value:.2f}" if compact else f"双击 Q/E {value:.2f} rad/s"
     if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
         if model.camera_control_available is False:
             return "相机不可用" if compact else "方向键相机不可用"
@@ -2704,6 +2855,7 @@ class CommandConsoleStatus:
     warning: str | None
     restart_required: bool
     outcome_unknown: bool
+    result_age_s: float | None = None
 
     @property
     def result_identity(self) -> tuple[object, ...]:
@@ -2724,10 +2876,52 @@ class CommandConsoleStatus:
         )
 
 
+def _command_console_candidate(state: dict[str, object]) -> dict[str, object]:
+    raw = state.get("command_console")
+    if isinstance(raw, dict):
+        return raw
+    game_commands = state.get("game_commands")
+    if not isinstance(game_commands, dict):
+        return {}
+    last_response = game_commands.get("last_response")
+    last_response = last_response if isinstance(last_response, dict) else {}
+    pending = any(
+        game_commands.get(key) is True
+        for key in (
+            "policy_change_pending",
+            "runtime_pause_pending",
+            "restart_requested",
+        )
+    )
+    ok = last_response.get("ok")
+    status = "pending" if pending else "idle"
+    if type(ok) is bool and not pending:
+        status = "success" if ok else "error"
+    adapted: dict[str, object] = {
+        "available": game_commands.get("enabled") is True,
+        "editing": False,
+        "in_flight": pending,
+        "status": status,
+        "sequence": game_commands.get("last_sequence"),
+        "result_revision": game_commands.get("last_sequence"),
+        "ok": ok,
+        "code": last_response.get("code"),
+        "message": last_response.get("message"),
+        "warning": None,
+        "restart_required": last_response.get("restart_required") is True
+        or game_commands.get("restart_requested") is True,
+        "outcome_unknown": False,
+    }
+    response_data = last_response.get("data")
+    if isinstance(response_data, dict):
+        adapted["data"] = response_data
+    return adapted
+
+
 def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
     """Validate the provider's command result before rendering or gating input."""
 
-    raw = state.get("command_console")
+    raw = _command_console_candidate(state)
     raw = raw if isinstance(raw, dict) else {}
     status_value = raw.get("status")
     status = (
@@ -2751,6 +2945,16 @@ def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
     ok = ok_value if type(ok_value) is bool else None
     warning = _bounded_status_text(raw.get("warning"), maximum=512)
     warning = _WARNING_DISPLAY_ALIASES.get(warning, warning)
+    result_age_value = raw.get("result_age_s")
+    result_age_s = (
+        max(0.0, float(result_age_value))
+        if (
+            not isinstance(result_age_value, bool)
+            and isinstance(result_age_value, (int, float))
+            and math.isfinite(float(result_age_value))
+        )
+        else None
+    )
     return CommandConsoleStatus(
         available=raw.get("available") is True,
         provider_editing=raw.get("editing") is True,
@@ -2765,6 +2969,7 @@ def command_console_status(state: dict[str, object]) -> CommandConsoleStatus:
         warning=warning,
         restart_required=raw.get("restart_required") is True,
         outcome_unknown=raw.get("outcome_unknown") is True,
+        result_age_s=result_age_s,
     )
 
 
@@ -2809,12 +3014,48 @@ class RuntimePausePanelModel:
         return "暂停不可用"
 
 
+def _runtime_pause_candidate(state: dict[str, object]) -> object:
+    console = _command_console_candidate(state)
+    raw = console.get("runtime_pause")
+    if raw is not None:
+        return raw
+    game_commands = state.get("game_commands")
+    if not isinstance(game_commands, dict):
+        return None
+    telemetry = game_commands.get("runtime_pause")
+    if not isinstance(telemetry, dict):
+        return None
+    phase = telemetry.get("phase")
+    epoch = telemetry.get("epoch")
+    available = telemetry.get("available") is True
+    last_error = telemetry.get("last_error")
+    if not available:
+        state_name = "unavailable"
+    elif isinstance(last_error, str) and last_error:
+        state_name = "fault"
+    elif phase == "running":
+        state_name = "running"
+    elif phase == "paused":
+        state_name = "paused"
+    elif phase == "pause_requested":
+        state_name = "pausing"
+    elif phase == "continue_requested":
+        state_name = "resuming"
+    else:
+        state_name = "busy"
+    return {
+        "state": state_name,
+        "epoch": epoch,
+        "can_pause": state_name == "running",
+        "can_resume": state_name == "paused",
+        "last_error": last_error if isinstance(last_error, str) else None,
+    }
+
+
 def runtime_pause_panel_model(state: dict[str, object]) -> RuntimePausePanelModel:
     """Validate runtime-owned pause telemetry and fail closed on disagreement."""
 
-    console = state.get("command_console")
-    console = console if isinstance(console, dict) else {}
-    raw = console.get("runtime_pause")
+    raw = _runtime_pause_candidate(state)
     unavailable = RuntimePausePanelModel(
         state="unavailable",
         epoch=0,
@@ -3530,6 +3771,9 @@ class X11CalibrationOverlay:
         self._pending_font_slider_action: str | None = None
         self._pending_font_slider_size: int | None = None
         self._colours: dict[str, int] = {}
+        self._startup_media_frame_dir: str | None = None
+        self._startup_media_frames: tuple[StartupMediaFrame, ...] = ()
+        self._startup_media_colour_cache: dict[tuple[int, int, int], int] = {}
         self._visible = False
         self._cursor_visible = False
         self._last_layout: dict[str, tuple[int, int, int, int]] | None = None
@@ -3550,6 +3794,8 @@ class X11CalibrationOverlay:
         self._last_raise_s: float | None = None
         self._pressed_action: str | None = None
         self._pressed_window: int | None = None
+        self._pressed_runtime_pause_target: str | None = None
+        self._pressed_runtime_pause_epoch: int | None = None
         self._polled_pointer_valid = False
         self._polled_left_pressed = False
         self._polled_left_initialized = False
@@ -5419,6 +5665,8 @@ class X11CalibrationOverlay:
             and command_status.status == "error"
             and isinstance(command_status.code, str)
             and command_status.code.startswith("E_POLICY")
+            and command_status.result_age_s is not None
+            and command_status.result_age_s <= _POLICY_STATUS_DISPLAY_SECONDS
         ):
             progress_state = (
                 1.0,
@@ -5641,6 +5889,12 @@ class X11CalibrationOverlay:
             )
         for stem, gear, field in (
             ("motion_turn_rate", "turn", MAX_TURN_RATE_FIELD),
+            ("motion_keyboard_turn_rate", "turn", KEYBOARD_TURN_RATE_FIELD),
+            (
+                "motion_keyboard_turn_boost_rate",
+                "turn",
+                KEYBOARD_TURN_BOOST_RATE_FIELD,
+            ),
             ("motion_camera_look_rate", "camera", KEYBOARD_LOOK_RATE_FIELD),
         ):
             for suffix in ("down", "up"):
@@ -6083,21 +6337,69 @@ class X11CalibrationOverlay:
             return "返回游戏并应用"
         return "返回游戏"
 
-    def _draw_startup_loading(
+    def _load_startup_media_frames(
         self,
-        layout: dict[str, tuple[int, int, int, int]],
-        model: StartupLoadingModel,
-    ) -> None:
-        _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
-        content = (
-            48,
-            max(92, panel_height // 3),
-            max(1, panel_width - 96),
-            max(110, panel_height // 3),
+        media_frames_dir: str | None,
+    ) -> tuple[StartupMediaFrame, ...]:
+        if not media_frames_dir:
+            self._startup_media_frame_dir = None
+            self._startup_media_frames = ()
+            return ()
+        try:
+            directory = Path(media_frames_dir).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            directory = Path(media_frames_dir).expanduser()
+        directory_key = os.fspath(directory)
+        if (
+            getattr(self, "_startup_media_frame_dir", None) == directory_key
+            and getattr(self, "_startup_media_frames", ())
+        ):
+            return self._startup_media_frames
+        frames: list[StartupMediaFrame] = []
+        try:
+            paths = sorted(directory.glob("*.ppm"))[:_STARTUP_MEDIA_MAX_FRAMES]
+        except OSError:
+            paths = []
+        for path in paths:
+            try:
+                frames.append(read_startup_media_ppm(path))
+            except (OSError, ValueError):
+                continue
+        self._startup_media_frame_dir = directory_key
+        self._startup_media_frames = tuple(frames)
+        return self._startup_media_frames
+
+    def _startup_media_pixel(self, red: int, green: int, blue: int) -> int:
+        luminance = max(
+            0,
+            min(255, (int(red) * 2126 + int(green) * 7152 + int(blue) * 722) // 10000),
         )
-        panel = self._windows["panel"]
-        gc = ctypes.c_void_p(self._panel_gc)
-        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        level = max(0, min(15, luminance // 16))
+        tinted = (
+            min(255, 4 + level * 7),
+            min(255, 16 + level * 10),
+            min(255, 32 + level * 13),
+        )
+        cache = getattr(self, "_startup_media_colour_cache", None)
+        if cache is None:
+            cache = {}
+            self._startup_media_colour_cache = cache
+        if tinted not in cache:
+            cache[tinted] = self._named_colour(
+                f"#{tinted[0]:02x}{tinted[1]:02x}{tinted[2]:02x}".encode("ascii"),
+                self._colours["button"],
+            )
+        return cache[tinted]
+
+    def _draw_startup_background(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        panel_width: int,
+        panel_height: int,
+        model: StartupLoadingModel,
+    ) -> bool:
+        self._x11.XSetForeground(self._display, gc, self._colours["disabled"])
         self._x11.XFillRectangle(
             self._display,
             panel,
@@ -6107,45 +6409,278 @@ class X11CalibrationOverlay:
             panel_width,
             panel_height,
         )
-        self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+        frames = self._load_startup_media_frames(model.media_frames_dir)
+        if frames:
+            frame_index = int(time.monotonic() * model.media_frame_rate_hz) % len(
+                frames
+            )
+            frame = frames[frame_index]
+            columns = min(_STARTUP_MEDIA_GRID_COLUMNS, max(24, panel_width // 14))
+            rows = min(_STARTUP_MEDIA_GRID_ROWS, max(18, panel_height // 14))
+            for row in range(rows):
+                sample_y = min(
+                    frame.height - 1,
+                    max(0, int((row + 0.5) * frame.height / rows)),
+                )
+                top = row * panel_height // rows
+                bottom = max(top + 1, (row + 1) * panel_height // rows)
+                for column in range(columns):
+                    sample_x = min(
+                        frame.width - 1,
+                        max(0, int((column + 0.5) * frame.width / columns)),
+                    )
+                    offset = (sample_y * frame.width + sample_x) * 3
+                    pixel = self._startup_media_pixel(
+                        frame.pixels[offset],
+                        frame.pixels[offset + 1],
+                        frame.pixels[offset + 2],
+                    )
+                    left = column * panel_width // columns
+                    right = max(left + 1, (column + 1) * panel_width // columns)
+                    self._x11.XSetForeground(self._display, gc, pixel)
+                    self._x11.XFillRectangle(
+                        self._display,
+                        panel,
+                        gc,
+                        left,
+                        top,
+                        right - left,
+                        bottom - top,
+                    )
+
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        for y in range(0, panel_height, 18):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                0,
+                y,
+                panel_width,
+                1,
+            )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        grid_step_x = max(72, panel_width // 10)
+        grid_step_y = max(54, panel_height // 8)
+        for x in range(grid_step_x, panel_width, grid_step_x):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                x,
+                0,
+                1,
+                panel_height,
+            )
+        for y in range(grid_step_y, panel_height, grid_step_y):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                0,
+                y,
+                panel_width,
+                1,
+            )
+        return bool(frames)
+
+    def _draw_startup_corner_brackets(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        colour_name: str = "cyan",
+    ) -> None:
+        length = max(24, min(72, width // 7))
+        thickness = 3
+        self._x11.XSetForeground(self._display, gc, self._colours[colour_name])
+        for left, top, vertical_sign in (
+            (x, y, 1),
+            (x + width - length, y, 1),
+            (x, y + height - thickness, -1),
+            (x + width - length, y + height - thickness, -1),
+        ):
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                left,
+                top,
+                length,
+                thickness,
+            )
+            vertical_x = left if left == x else x + width - thickness
+            vertical_y = y if vertical_sign > 0 else y + height - length
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                vertical_x,
+                vertical_y,
+                thickness,
+                length,
+            )
+
+    def _draw_startup_segmented_progress_bar(
+        self,
+        rectangle: tuple[int, int, int, int],
+        *,
+        progress: float,
+        label: str,
+        colour_name: str = "cyan",
+    ) -> None:
+        x, y, width, height = rectangle
+        progress = max(0.0, min(1.0, float(progress)))
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._draw_text(
+            label,
+            x=x,
+            y=max(12, y - 8),
+            colour=self._colours["muted"],
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["disabled"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            width,
+            height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
         self._x11.XDrawRectangle(
             self._display,
             panel,
             gc,
-            18,
-            18,
-            max(1, panel_width - 37),
-            max(1, panel_height - 37),
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
         )
+        segment_count = max(12, min(30, width // 28))
+        gap = 3
+        usable = max(1, width - 2 - gap * (segment_count - 1))
+        shimmer = int(time.monotonic() * 9) % segment_count
+        for index in range(segment_count):
+            left = x + 1 + index * (usable + gap) // segment_count + index * gap
+            right = x + 1 + (index + 1) * usable // segment_count + index * gap
+            right = max(left + 1, min(x + width - 1, right))
+            segment_progress = progress * segment_count - index
+            if segment_progress <= 0:
+                continue
+            fill_width = right - left
+            if segment_progress < 1.0:
+                fill_width = max(1, int(round(fill_width * segment_progress)))
+            self._x11.XSetForeground(
+                self._display,
+                gc,
+                self._colours["white" if index == shimmer else colour_name],
+            )
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                left,
+                y + 3,
+                fill_width,
+                max(1, height - 6),
+            )
         self._draw_text(
-            "MATRIX BOOT SEQUENCE",
-            x=content[0],
-            y=content[1],
+            f"{int(round(progress * 100)):02d}%",
+            x=x + max(1, width - 48),
+            y=y + height + 24,
+            colour=self._colours["cyan"],
+        )
+
+    def _draw_startup_loading(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: StartupLoadingModel,
+    ) -> None:
+        _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        media_online = self._draw_startup_background(
+            panel,
+            gc,
+            panel_width,
+            panel_height,
+            model,
+        )
+        content_width = max(1, min(860, panel_width - 80))
+        content_height = max(216, min(300, panel_height - 100))
+        content_x = max(24, (panel_width - content_width) // 2)
+        content_y = max(42, (panel_height - content_height) // 2)
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            content_x,
+            content_y,
+            content_width,
+            content_height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            content_x + 8,
+            content_y + 8,
+            max(1, content_width - 17),
+            max(1, content_height - 17),
+        )
+        self._draw_startup_corner_brackets(
+            panel,
+            gc,
+            content_x,
+            content_y,
+            content_width,
+            content_height,
+        )
+        text_x = content_x + 34
+        text_y = content_y + 58
+        self._draw_text(
+            "MATRIX // BFM-SONIC BOOT",
+            x=text_x,
+            y=text_y,
             colour=self._colours["white"],
             large=True,
         )
         self._draw_text(
             model.message,
-            x=content[0],
-            y=content[1] + 36,
+            x=text_x,
+            y=text_y + 36,
             colour=self._colours["muted"],
         )
-        bar = (
-            content[0],
-            content[1] + 72,
-            content[2],
-            18,
+        feed_status = (
+            "LUNAR VIDEO BUFFER ONLINE"
+            if media_online
+            else "LUNAR VIDEO BUFFER STANDBY"
         )
-        self._draw_progress_bar(
+        bar = (
+            text_x,
+            text_y + 86,
+            max(1, content_width - 68),
+            26,
+        )
+        self._draw_startup_segmented_progress_bar(
             bar,
             progress=model.progress,
-            label="正在挂载同屏 UI / 策略槽 / 输入桥",
+            label=f"{feed_status}  ·  UI BRIDGE HOT  ·  POLICY SLOT SYNC",
             colour_name="cyan",
         )
         self._draw_text(
-            f"{int(round(model.progress * 100)):02d}%  KEEP CONTROLS RELEASED",
-            x=content[0],
-            y=content[1] + 116,
+            "保持控制释放 · 启动完成后自动进入 MATRIX 操作界面",
+            x=text_x,
+            y=text_y + 154,
             colour=self._colours["cyan"],
         )
 
@@ -6490,6 +7025,18 @@ class X11CalibrationOverlay:
             if event_type == _BUTTON_PRESS:
                 self._pressed_action = action
                 self._pressed_window = int(button.window)
+                self._pressed_runtime_pause_target = None
+                self._pressed_runtime_pause_epoch = None
+                if action == "runtime_pause":
+                    pause_model = getattr(self, "_last_runtime_pause_model", None)
+                    pause_target = (
+                        pause_model.pause_target
+                        if isinstance(pause_model, RuntimePausePanelModel)
+                        else None
+                    )
+                    if pause_target is not None:
+                        self._pressed_runtime_pause_target = pause_target
+                        self._pressed_runtime_pause_epoch = pause_model.epoch
                 if action == "font_size_slider":
                     self._font_slider_dragging = bool(
                         self._xft is not None
@@ -6500,8 +7047,12 @@ class X11CalibrationOverlay:
             elif event_type == _BUTTON_RELEASE:
                 pressed = self._pressed_action
                 pressed_window = self._pressed_window
+                pressed_pause_target = self._pressed_runtime_pause_target
+                pressed_pause_epoch = self._pressed_runtime_pause_epoch
                 self._pressed_action = None
                 self._pressed_window = None
+                self._pressed_runtime_pause_target = None
+                self._pressed_runtime_pause_epoch = None
                 if pressed == "font_size_slider":
                     if self._font_slider_dragging and self._visible:
                         self._set_font_size_from_root_x(button.x_root)
@@ -6554,15 +7105,10 @@ class X11CalibrationOverlay:
                         self._last_page = None
                     continue
                 if action == "runtime_pause":
-                    pause_model = getattr(self, "_last_runtime_pause_model", None)
                     panel_model = self._last_panel_model
-                    pause_target = (
-                        pause_model.pause_target
-                        if isinstance(pause_model, RuntimePausePanelModel)
-                        else None
-                    )
                     if (
-                        pause_target is not None
+                        pressed_pause_target is not None
+                        and type(pressed_pause_epoch) is int
                         and panel_model is not None
                         and not panel_model.restart_requested
                         and panel_model.status != "restarting"
@@ -6576,8 +7122,8 @@ class X11CalibrationOverlay:
                         not in {"pending", "restarting", "unavailable"}
                     ):
                         publisher.publish_runtime_pause(
-                            pause_target,
-                            expected_epoch=pause_model.epoch,
+                            pressed_pause_target,
+                            expected_epoch=pressed_pause_epoch,
                         )
                         emitted += 1
                 elif action == "quit_game":
@@ -6991,6 +7537,8 @@ class X11CalibrationOverlay:
         self._last_raise_s = None
         self._pressed_action = None
         self._pressed_window = None
+        self._pressed_runtime_pause_target = None
+        self._pressed_runtime_pause_epoch = None
         self._font_slider_dragging = False
         self._pending_font_slider_action = None
         self._pending_font_slider_size = None

@@ -197,6 +197,7 @@ start_session() {
     local message
     local run_script
     local runtime_args
+    local -a env_overrides
 
     if session_is_live; then
         report_running
@@ -237,17 +238,52 @@ start_session() {
             --initial-locomotion-policy "$INITIAL_LOCOMOTION_POLICY"
         )
     fi
+    if [[ "$SCENE_ID" == "15" \
+        && "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
+        runtime_args+=(
+            --game-world-persistence off
+        )
+    fi
     if [[ ! -f "$run_script" || ! -r "$run_script" ]]; then
         die "runtime launcher is missing: $run_script"
     fi
 
+    env_overrides=(
+        MATRIX_GAME_GRAB_ESCAPE=1
+        MATRIX_ESC_OVERLAY_MODAL_SHIELD=0
+        MATRIX_ESC_OVERLAY_RECENTER_POINTER=0
+        MATRIX_ESC_OVERLAY_KEEP_RAISED=0
+        MATRIX_ESC_OVERLAY_CLOSE_ON_FOCUS_LOSS=1
+    )
+    if [[ -n "${MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-}" ]]; then
+        case "$MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER" in
+            raw | flat-local | flat_anchor | flat-anchor | anchor)
+                ;;
+            *)
+                die "invalid MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER: $MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER"
+                ;;
+        esac
+        env_overrides+=(
+            "MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER=$MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER"
+        )
+    fi
+    if [[ -n "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-}" ]]; then
+        case "$MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE" in
+            stable | default | hfield | heightfield | continuous | continuous-hfield | rolling-hfield | rolling-heightfield | rolling-heightfield-v2 | tiles | tile | mocap-tiles | rolling-tiles | rolling-mocap-tiles | rolling-mocap-tiles-v1 | leo | official)
+                ;;
+            *)
+                die "invalid MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE: $MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE"
+                ;;
+        esac
+        env_overrides+=(
+            "MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE=$MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE"
+        )
+    fi
+
     if tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT" -- \
         /usr/bin/env -u LD_LIBRARY_PATH -u PYTHONPATH \
-        MATRIX_GAME_GRAB_ESCAPE=1 \
-        MATRIX_ESC_OVERLAY_MODAL_SHIELD=0 \
-        MATRIX_ESC_OVERLAY_RECENTER_POINTER=0 \
-        MATRIX_ESC_OVERLAY_KEEP_RAISED=0 \
-        MATRIX_ESC_OVERLAY_CLOSE_ON_FOCUS_LOSS=1 \
+        -u MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE \
+        "${env_overrides[@]}" \
         /usr/bin/bash "$run_script" \
         "${runtime_args[@]}"; then
         sleep 0.20

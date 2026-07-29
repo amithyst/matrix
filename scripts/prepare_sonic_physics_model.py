@@ -32,6 +32,9 @@ SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
 MOON_DYNAMIC_GROUND_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
+MOON_DYNAMIC_GROUND_COLLISION_TILES = "rolling-mocap-tiles-v1"
+MOON_DYNAMIC_GROUND_COLLISION_HFIELD = "rolling-heightfield-v2"
+MOON_DYNAMIC_GROUND_COLLISION_DEFAULT = MOON_DYNAMIC_GROUND_COLLISION_TILES
 MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256 = (
     "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
 )
@@ -141,6 +144,49 @@ G1_BODY_JOINT_NAMES = (
 
 class SonicPhysicsModelError(RuntimeError):
     """Raised when the canonical SONIC model contract is not satisfied."""
+
+
+def normalize_moon_dynamic_ground_collision_mode(
+    value: str | None = None,
+) -> str:
+    """Normalize the MoonWorld dynamic-ground collision backend."""
+
+    raw = (
+        os.environ.get("MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE")
+        if value is None
+        else value
+    )
+    text = str(raw or MOON_DYNAMIC_GROUND_COLLISION_DEFAULT)
+    text = text.strip().lower().replace("_", "-")
+    if text in {
+        "",
+        "stable",
+        "default",
+        "tiles",
+        "tile",
+        "mocap-tiles",
+        "rolling-tiles",
+        "rolling-mocap-tiles",
+        MOON_DYNAMIC_GROUND_COLLISION_TILES,
+        "leo",
+        "official",
+    }:
+        return MOON_DYNAMIC_GROUND_COLLISION_TILES
+    if text in {
+        "hfield",
+        "heightfield",
+        "continuous",
+        "continuous-hfield",
+        "rolling-hfield",
+        "rolling-heightfield",
+        MOON_DYNAMIC_GROUND_COLLISION_HFIELD,
+    }:
+        return MOON_DYNAMIC_GROUND_COLLISION_HFIELD
+    raise SonicPhysicsModelError(
+        "MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE must be "
+        f"{MOON_DYNAMIC_GROUND_COLLISION_HFIELD} or "
+        f"{MOON_DYNAMIC_GROUND_COLLISION_TILES}"
+    )
 
 
 def _strip_canonical_scene_sections(
@@ -413,12 +459,25 @@ def _scene_transform_removals(
     return transform, TOWN10_PERIMETER_WALL_NAMES, ()
 
 
-def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
+def _scene_transform_contract(
+    scene_transform: str,
+    *,
+    moon_dynamic_ground_collision_mode: str | None = None,
+) -> dict[str, object] | None:
     if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         return None
+    collision_mode = normalize_moon_dynamic_ground_collision_mode(
+        moon_dynamic_ground_collision_mode
+    )
+    support_collision_enabled_after_handoff = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_HFIELD
+    )
+    tile_collision_enabled_after_handoff = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_TILES
+    )
     return {
         "dynamic_ground": {
-            "schema": "matrix-moon-dynamic-ground/v4",
+            "schema": "matrix-moon-dynamic-ground/v3",
             "body_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
             "body_name_pattern": MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern,
             "body_mode": "mocap",
@@ -434,13 +493,16 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
             "update_timing": "before_each_mj_step",
             "fallback_support_plane": False,
             "collision": {
-                "mode": "rolling-heightfield-v2",
+                "mode": collision_mode,
                 "asset_name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
                 "geom_name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
-                "compiled_collision_mask": [1, 1],
                 "collision_enabled_initial": False,
-                "collision_enabled_after_handoff": True,
-                "observation_hfield_only": False,
+                "collision_enabled_after_handoff": (
+                    support_collision_enabled_after_handoff
+                ),
+                "observation_hfield_only": (
+                    not support_collision_enabled_after_handoff
+                ),
                 "handoff": {
                     "trigger": "initial_spawn_clearance_passed",
                     "contract": "exactly-one-active-ground-v1",
@@ -454,9 +516,13 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
                 "height_range_m": MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
                 "base_depth_m": MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
                 "source_tile_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
-                "source_tile_compiled_collision_mask": [0, 0],
+                "source_tile_compiled_collision_mask": (
+                    [1, 1] if tile_collision_enabled_after_handoff else [0, 0]
+                ),
                 "source_tile_collision_enabled_initial": False,
-                "source_tile_collision_enabled_after_handoff": False,
+                "source_tile_collision_enabled_after_handoff": (
+                    tile_collision_enabled_after_handoff
+                ),
                 "friction": MOON_COLLISION_FRICTION,
                 "solref": MOON_COLLISION_SOLREF,
                 "solimp": MOON_COLLISION_SOLIMP,
@@ -492,10 +558,22 @@ def _scene_transform_contract(scene_transform: str) -> dict[str, object] | None:
 
 
 def _apply_scene_transform_additions(
-    scene_path: Path, scene_transform: str
+    scene_path: Path,
+    scene_transform: str,
+    *,
+    moon_dynamic_ground_collision_mode: str | None = None,
 ) -> None:
     if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
         return
+    collision_mode = normalize_moon_dynamic_ground_collision_mode(
+        moon_dynamic_ground_collision_mode
+    )
+    support_compiled_collision = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_HFIELD
+    )
+    tile_compiled_collision = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_TILES
+    )
     try:
         tree = ET.parse(scene_path)
     except ET.ParseError as exc:
@@ -568,11 +646,16 @@ def _apply_scene_transform_additions(
             raise SonicPhysicsModelError(
                 f"MoonWorld tile {body_name} collision source contract drifted"
             )
-        # Keep the official rolling boxes for visuals only. Independent moving
-        # box contacts introduce seams beneath the feet; one continuous hfield
-        # owns MoonWorld collision after the startup handoff.
-        tile_geom.set("contype", "0")
-        tile_geom.set("conaffinity", "0")
+        if tile_compiled_collision:
+            # Preserve the official rolling-box collision mechanism. Runtime
+            # briefly disarms these compiled collision geoms while the finite
+            # spawn pad owns the initial clearance audit, then enables all 256
+            # in one handoff before the next MuJoCo step.
+            tile_geom.set("contype", "1")
+            tile_geom.set("conaffinity", "1")
+        else:
+            tile_geom.set("contype", "0")
+            tile_geom.set("conaffinity", "0")
 
     asset = root.find("asset")
     if asset is None:
@@ -606,10 +689,10 @@ def _apply_scene_transform_additions(
                 "type": "hfield",
                 "hfield": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
                 "pos": f"0 0 {MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M:.12g}",
-                # Runtime disarms this compiled collision geom until the
-                # finite startup pad passes its clearance audit.
-                "contype": "1",
-                "conaffinity": "1",
+                # The hfield is the stable default collision backend. In the
+                # explicit rolling-tile experiment it remains observation-only.
+                "contype": "1" if support_compiled_collision else "0",
+                "conaffinity": "1" if support_compiled_collision else "0",
                 "friction": MOON_COLLISION_FRICTION,
                 "solref": MOON_COLLISION_SOLREF,
                 "solimp": MOON_COLLISION_SOLIMP,
@@ -638,9 +721,9 @@ def _apply_scene_transform_additions(
     root.insert(
         0,
         ET.Comment(
-            " converted official MoonWorld rolling tiles to visual mocap geoms, "
-            "added a runtime-updated collision hfield, and retained a finite "
-            "startup pad for atomic runtime handoff "
+            f" converted MoonWorld dynamic ground for {collision_mode}, added "
+            "a runtime-updated hfield, and retained a finite startup pad for "
+            "atomic runtime handoff "
         ),
     )
     ET.indent(tree, space="  ")
@@ -704,6 +787,7 @@ def _source_contract(
     removed_environment_geoms: tuple[str, ...],
     staticized_freejoint_bodies: tuple[str, ...],
     creative_inventory_catalog: Path | None,
+    moon_dynamic_ground_collision_mode: str | None = None,
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
     contract = {
@@ -729,7 +813,10 @@ def _source_contract(
             creative_inventory_catalog
         ),
     }
-    scene_transform_contract = _scene_transform_contract(scene_transform)
+    scene_transform_contract = _scene_transform_contract(
+        scene_transform,
+        moon_dynamic_ground_collision_mode=moon_dynamic_ground_collision_mode,
+    )
     if scene_transform_contract is not None:
         contract["scene_transform_contract"] = scene_transform_contract
     return contract
@@ -771,6 +858,7 @@ def physics_revision_payload(
     body_joint_names: tuple[str, ...] = G1_BODY_JOINT_NAMES,
     scene_transform: str | None = None,
     creative_inventory_catalog: Path | None = None,
+    moon_dynamic_ground_collision_mode: str | None = None,
 ) -> dict[str, object]:
     """Return the location-independent source contract for save isolation.
 
@@ -800,6 +888,7 @@ def physics_revision_payload(
         removed_environment_geoms=removed_environment_geoms,
         staticized_freejoint_bodies=staticized_freejoint_bodies,
         creative_inventory_catalog=creative_inventory_catalog,
+        moon_dynamic_ground_collision_mode=moon_dynamic_ground_collision_mode,
     )
     native_scene_assets = []
     for asset in contract["native_scene_assets"]:
@@ -1005,6 +1094,7 @@ def prepare_sonic_physics_model(
     spawn_yaw: float | None = None,
     scene_transform: str | None = None,
     creative_inventory_catalog: Path | None = None,
+    moon_dynamic_ground_collision_mode: str | None = None,
 ) -> Path:
     canonical_model = canonical_model.resolve()
     canonical_meshes = canonical_meshes.resolve()
@@ -1047,6 +1137,13 @@ def prepare_sonic_physics_model(
     ) = (
         _scene_transform_removals(native_scene, scene_transform)
     )
+    normalized_moon_collision_mode = None
+    if normalized_scene_transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        normalized_moon_collision_mode = (
+            normalize_moon_dynamic_ground_collision_mode(
+                moon_dynamic_ground_collision_mode
+            )
+        )
 
     contract = _source_contract(
         canonical_model,
@@ -1059,6 +1156,7 @@ def prepare_sonic_physics_model(
         removed_environment_geoms=removed_environment_geoms,
         staticized_freejoint_bodies=staticized_freejoint_bodies,
         creative_inventory_catalog=creative_inventory_catalog,
+        moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
     )
     manifest_path = output_dir / "manifest.json"
     scene_path = output_dir / native_scene.name
@@ -1130,6 +1228,7 @@ def prepare_sonic_physics_model(
         _apply_scene_transform_additions(
             temporary_dir / native_scene.name,
             normalized_scene_transform,
+            moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
         )
         contract["body_joint_names"] = list(body_joint_names)
         contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")
@@ -1171,6 +1270,18 @@ def _parse_args() -> argparse.Namespace:
         ),
         default=SCENE_TRANSFORM_NONE,
     )
+    parser.add_argument(
+        "--moon-dynamic-ground-collision-mode",
+        choices=(
+            MOON_DYNAMIC_GROUND_COLLISION_HFIELD,
+            MOON_DYNAMIC_GROUND_COLLISION_TILES,
+        ),
+        default=None,
+        help=(
+            "MoonWorld collision backend for moon-dynamic-ground-mocap-v3; "
+            "defaults to the stable rolling mocap tile backend"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1196,6 +1307,9 @@ def main() -> int:
             spawn_yaw=args.spawn_yaw,
             scene_transform=args.scene_transform,
             creative_inventory_catalog=args.creative_inventory_catalog,
+            moon_dynamic_ground_collision_mode=(
+                args.moon_dynamic_ground_collision_mode
+            ),
         )
     except SonicPhysicsModelError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc

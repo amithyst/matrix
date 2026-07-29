@@ -196,10 +196,10 @@ class InputSnapshot:
         if not isinstance(self.move_stick, MoveStickSnapshot):
             raise InputProtocolError("move_stick must be a MoveStickSnapshot")
         if self.keyboard_boost and not any(
-            (self.keys.w, self.keys.a, self.keys.s, self.keys.d)
+            (self.keys.w, self.keys.a, self.keys.s, self.keys.d, self.keys.q, self.keys.e)
         ):
             raise InputProtocolError(
-                "keyboard_boost requires at least one pressed WASD key"
+                "keyboard_boost requires at least one pressed WASD or Q/E key"
             )
         object.__setattr__(self, "timestamp_monotonic_s", timestamp)
         object.__setattr__(self, "camera_yaw_rad", yaw)
@@ -376,6 +376,10 @@ DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
 # per-command cap even if a caller supplies a larger dt or tuning rate.
 MAX_MEASURED_FACING_LEAD_RAD = 0.05
+# Manual Q/E turns are intentionally faster than movement-alignment facing.
+# At the normal 50 Hz command cadence this preserves distinct single/double Q/E
+# rates up to the 4.0 rad/s panel maximum, while still bounding a delayed frame.
+MAX_MANUAL_TURN_MEASURED_FACING_LEAD_RAD = 0.08
 PURE_FORWARD_CRAWL_MAX_ERROR_RAD = math.pi / 2.0
 PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD = 0.005
 PURE_FORWARD_CRAWL_STALL_GRACE_S = 0.40
@@ -431,6 +435,8 @@ class ControlConfig:
     max_acceleration_mps2: float = 1.20
     max_deceleration_mps2: float = 2.40
     max_turn_rate_rad_s: float = 2.50
+    keyboard_turn_rate_rad_s: float = 2.50
+    keyboard_turn_boost_rate_rad_s: float = 3.00
     movement_mode: str = DEFAULT_MOVEMENT_MODE
     keyboard_slow_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[
         SONIC_SLOW_WALK_MODE
@@ -469,6 +475,8 @@ class ControlConfig:
             "max_acceleration_mps2",
             "max_deceleration_mps2",
             "max_turn_rate_rad_s",
+            "keyboard_turn_rate_rad_s",
+            "keyboard_turn_boost_rate_rad_s",
             "keyboard_slow_speed_mps",
             "keyboard_slow_boost_speed_mps",
             "keyboard_walk_speed_mps",
@@ -558,6 +566,10 @@ class ControlConfig:
             )
         object.__setattr__(self, "max_future_skew_s", future_skew)
         object.__setattr__(self, "stick_deadzone", deadzone)
+        if self.keyboard_turn_boost_rate_rad_s < self.keyboard_turn_rate_rad_s:
+            raise ValueError(
+                "keyboard turn boost rate must be greater than or equal to base turn rate"
+            )
 
 
 @dataclass(frozen=True)
@@ -1183,7 +1195,12 @@ class GameControlCore:
             self._stopped_heading_latched = False
             turn_sign = 1.0 if keys.q else -1.0
             self._turn_sign = turn_sign
-            maximum_delta = self.config.max_turn_rate_rad_s * dt
+            turn_rate = (
+                self.config.keyboard_turn_boost_rate_rad_s
+                if self._snapshot.keyboard_boost
+                else self.config.keyboard_turn_rate_rad_s
+            )
+            maximum_delta = turn_rate * dt
             if self._measured_heading_rad is None:
                 self._command_heading_rad = wrap_angle_rad(
                     self._command_heading_rad + turn_sign * maximum_delta
@@ -1195,7 +1212,10 @@ class GameControlCore:
                 requested_error = wrap_angle_rad(
                     requested_heading - self._measured_heading_rad
                 )
-                maximum_delta = min(maximum_delta, MAX_MEASURED_FACING_LEAD_RAD)
+                maximum_delta = min(
+                    maximum_delta,
+                    MAX_MANUAL_TURN_MEASURED_FACING_LEAD_RAD,
+                )
                 bounded_error = max(
                     -maximum_delta,
                     min(maximum_delta, requested_error),

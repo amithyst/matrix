@@ -929,6 +929,7 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertTrue(client.poll())
         self.assertEqual(client.status, "success")
         self.assertEqual(client.code, "OK_GAME_QUIT")
+        self.assertIsInstance(client.mapping()["result_age_s"], float)
 
     def test_quit_game_requires_panel_and_neutral_frame(self) -> None:
         for arguments, expected_code in (
@@ -1197,8 +1198,10 @@ class GameCommandClientTest(unittest.TestCase):
         runtime.send(MC_COMMANDS.encode_command_response(response))
         self.assertTrue(client.poll())
         self.assertFalse(client.in_flight)
+        mapping = client.mapping()
+        self.assertIsInstance(mapping.pop("result_age_s"), float)
         self.assertEqual(
-            client.mapping(),
+            mapping,
             {
                 "available": True,
                 "editing": True,
@@ -1680,10 +1683,7 @@ class GameCommandClientTest(unittest.TestCase):
             client.refresh_loading_strategy_loadout(now_s=10.0, **gates)
         )
         request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.PolicySlotAssignment("locomotion", "sonic"),
-        )
+        self.assertEqual(request.command, MC_COMMANDS.PolicySlotQuery())
         self.assertFalse(
             client.refresh_loading_strategy_loadout(now_s=11.0, **gates)
         )
@@ -1694,8 +1694,8 @@ class GameCommandClientTest(unittest.TestCase):
                     sequence=request.sequence,
                     request_id=request.request_id,
                     ok=True,
-                    code="OK_POLICY_SLOT_ASSIGNED",
-                    message="unchanged",
+                    code="OK_POLICY_SLOT_STATUS",
+                    message="loading",
                     data={"strategy_loadout": self.strategy_loadout(status="loading")},
                 )
             )
@@ -1724,7 +1724,7 @@ class GameCommandClientTest(unittest.TestCase):
                     sequence=retry.sequence,
                     request_id=retry.request_id,
                     ok=True,
-                    code="OK_POLICY_SLOT_ASSIGNED",
+                    code="OK_POLICY_SLOT_STATUS",
                     message="ready",
                     data={"strategy_loadout": ready},
                 )
@@ -4581,6 +4581,32 @@ class KeyboardDoubleTapDetectorTest(unittest.TestCase):
             detector.update(self.sample(d=True), now_s=1.30, enabled=True)
         )
 
+    def test_q_or_e_double_tap_activates_turn_boost_until_key_up(self) -> None:
+        for key in ("q", "e"):
+            with self.subTest(key=key):
+                detector = MODULE.KeyboardDoubleTapDetector(0.30)
+                self.assertFalse(
+                    detector.update(
+                        self.sample(**{key: True}), now_s=1.00, enabled=True
+                    )
+                )
+                self.assertFalse(
+                    detector.update(self.sample(), now_s=1.08, enabled=True)
+                )
+                self.assertTrue(
+                    detector.update(
+                        self.sample(**{key: True}), now_s=1.20, enabled=True
+                    )
+                )
+                self.assertTrue(
+                    detector.update(
+                        self.sample(**{key: True}), now_s=1.25, enabled=True
+                    )
+                )
+                self.assertFalse(
+                    detector.update(self.sample(), now_s=1.30, enabled=True)
+                )
+
     def test_hold_timeout_other_key_and_opposites_do_not_activate(self) -> None:
         detector = MODULE.KeyboardDoubleTapDetector(0.30)
         self.assertFalse(
@@ -4605,6 +4631,22 @@ class KeyboardDoubleTapDetectorTest(unittest.TestCase):
                 self.sample(w=True, s=True), now_s=2.15, enabled=True
             )
         )
+
+        detector = MODULE.KeyboardDoubleTapDetector(0.30)
+        detector.update(self.sample(q=True), now_s=3.00, enabled=True)
+        detector.update(self.sample(), now_s=3.05, enabled=True)
+        self.assertFalse(
+            detector.update(self.sample(q=True, e=True), now_s=3.10, enabled=True)
+        )
+        self.assertEqual(detector.last_reset_reason, "opposing_directions")
+
+    def test_turn_double_tap_candidate_does_not_cross_into_wasd_tier(self) -> None:
+        detector = MODULE.KeyboardDoubleTapDetector(0.30)
+        detector.update(self.sample(q=True), now_s=1.00, enabled=True)
+        detector.update(self.sample(), now_s=1.05, enabled=True)
+
+        self.assertFalse(detector.update(self.sample(w=True), now_s=1.10, enabled=True))
+        self.assertEqual(detector.last_reset_reason, "tier_changed")
 
     def test_interlock_and_source_change_clear_candidates(self) -> None:
         detector = MODULE.KeyboardDoubleTapDetector(0.30)

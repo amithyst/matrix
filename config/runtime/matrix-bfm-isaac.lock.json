@@ -51,7 +51,7 @@
       },
       {
         "path": "scripts/launch_matrix_sonic_desktop.sh",
-        "sha256": "01abb125958fde5e1415392aba37c913a62372c912e3d267e0b11b5e8d6085b3"
+        "sha256": "5db71f5198046276a6d06b075fcf33f81704103b9ed539825c299a0b4c0740ba"
       },
       {
         "path": "scripts/matrix_bfm_isaac_command.py",
@@ -135,7 +135,7 @@
       },
       {
         "path": "scripts/run_sim.sh",
-        "sha256": "3e1d40e16ef8035a4617b3ee6cdbd46307a5c3799afacb6905fdc941897959ef"
+        "sha256": "cfc2db8d9bd904d16d5a2f4b51fa3dc350c17828c68620bcb000239ac76a28e8"
       },
       {
         "path": "scripts/stop_matrix_bfm_isaac_instance.sh",

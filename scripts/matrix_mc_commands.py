@@ -53,6 +53,10 @@ _POLICY_RE = re.compile(
     r"(?P<policy>[a-z0-9][a-z0-9._-]{0,63})\s*\Z",
     re.IGNORECASE,
 )
+_POLICY_QUERY_RE = re.compile(
+    r"/?policy\s+(?:list|status)\s*\Z",
+    re.IGNORECASE,
+)
 _ITEM_RE = re.compile(
     r"/?item\s+spawn\s+(?P<item>[a-z0-9][a-z0-9_-]{0,47})\s*\Z",
     re.IGNORECASE,
@@ -347,6 +351,11 @@ class PolicySlotAssignment:
 
 
 @dataclass(frozen=True)
+class PolicySlotQuery:
+    """Read the authoritative resident-policy loadout without mutating it."""
+
+
+@dataclass(frozen=True)
 class CreativeSpawnItem:
     """Take one standalone physical prop from the creative inventory pool."""
 
@@ -490,6 +499,7 @@ McCommand: TypeAlias = (
     | TeleportLocalCoordinates
     | TeleportSelector
     | TeleportList
+    | PolicySlotQuery
     | PolicySlotAssignment
     | CreativeSpawnItem
     | RuntimePause
@@ -698,6 +708,9 @@ def parse_mc_command(text: object) -> ParsedCommand:
                 raw_value=data_modify.group("value"),
             )
         )
+    policy_query = _POLICY_QUERY_RE.fullmatch(command_text)
+    if policy_query is not None:
+        return ParsedCommand(PolicySlotQuery())
     policy = _POLICY_RE.fullmatch(command_text)
     if policy is not None:
         return ParsedCommand(
@@ -809,6 +822,8 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "slot": command.slot,
             "policy_id": command.policy_id,
         }
+    if isinstance(command, PolicySlotQuery):
+        return {"name": "policy_slot_query"}
     if isinstance(command, SummonTeleportPoint):
         return {
             "name": "summon_teleport_point",
@@ -913,6 +928,10 @@ def command_from_mapping(value: object) -> McCommand:
             )
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
+    if name == "policy_slot_query":
+        if set(value) != {"name"}:
+            raise CommandProtocolError("policy slot query has an invalid schema")
+        return PolicySlotQuery()
     if name in {"summon_teleport_point", "teleport_coordinates"}:
         required = {"name", "coordinates"}
         if name == "summon_teleport_point":
@@ -1391,6 +1410,7 @@ __all__ = [
     "MovementModeSet",
     "ParsedCommand",
     "PolicySlotAssignment",
+    "PolicySlotQuery",
     "RuntimePause",
     "SummonTeleportPoint",
     "TeleportCoordinates",

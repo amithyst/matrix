@@ -183,6 +183,8 @@ esac
                     "LD_LIBRARY_PATH",
                     "-u",
                     "PYTHONPATH",
+                    "-u",
+                    "MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE",
                     "MATRIX_GAME_GRAB_ESCAPE=1",
                     "MATRIX_ESC_OVERLAY_MODAL_SHIELD=0",
                     "MATRIX_ESC_OVERLAY_RECENTER_POINTER=0",
@@ -216,6 +218,31 @@ esac
         )
         self.assertIn(f"tmux attach-session -t ={session_name}", first.stdout)
         self.assertIn("already running", second.stdout)
+
+    def test_explicit_moon_height_filter_reaches_tmux_environment(self) -> None:
+        self.environment["MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER"] = "raw"
+
+        result = self.run_launcher("start", "--profile", "trna")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new_session = [
+            call for call in parse_call_log(self.tmux_log)
+            if call[0] == "new-session"
+        ][0]
+        self.assertIn("MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER=raw", new_session)
+        self.assertEqual(
+            parse_call_log(self.run_log),
+            [
+                [
+                    "--profile",
+                    "trna",
+                    "--control-source",
+                    "game",
+                    "--game-fall-recovery",
+                    "auto",
+                ]
+            ],
+        )
 
     def test_concurrent_start_is_serialized_to_one_runtime(self) -> None:
         processes = [

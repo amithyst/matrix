@@ -168,18 +168,7 @@ def _apply_variant(
     dof_addresses: np.ndarray,
     actuator_ids: np.ndarray,
 ) -> np.ndarray:
-    actuator_joint_ids = model.actuator_trnid[actuator_ids, 0].astype(np.int64)
-    joint_limits = np.max(
-        np.abs(model.jnt_actfrcrange[actuator_joint_ids]),
-        axis=1,
-    )
-    ctrl_limits = np.max(
-        np.abs(model.actuator_ctrlrange[actuator_ids]),
-        axis=1,
-    )
-    matrix_limits = np.where(joint_limits > 0.0, joint_limits, ctrl_limits)
-    if np.any(~np.isfinite(matrix_limits)) or np.any(matrix_limits <= 0.0):
-        raise RuntimeError("actuator effort limits must be finite and positive")
+    matrix_limits = np.max(np.abs(model.actuator_ctrlrange[actuator_ids]), axis=1)
     effort_limits = matrix_limits.copy()
     if variant in {
         "official-effort",
@@ -235,11 +224,7 @@ def _apply_controller_contract(
     core.kd = kd.astype(np.float32)
 
 
-def _core(
-    args: argparse.Namespace,
-    *,
-    trace_file: Path | None = None,
-) -> BfmTeacherCore:
+def _core(args: argparse.Namespace) -> BfmTeacherCore:
     return BfmTeacherCore(
         model_path=args.teacher_onnx,
         realscan_root=args.realscan_root,
@@ -249,8 +234,6 @@ def _core(
         formal_ik=args.formal_ik,
         execution_provider="cpu",
         activation_blend_seconds=args.activation_blend_seconds,
-        trace_file=trace_file,
-        trace_ticks=args.trace_ticks,
     )
 
 
@@ -338,93 +321,13 @@ def _capture_live_state(args: argparse.Namespace) -> dict[str, np.ndarray]:
     }
 
 
-def _load_snapshot_state(path: Path) -> dict[str, np.ndarray]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    fields = {
-        "root_position": 3,
-        "quaternion_wxyz": 4,
-        "body_gyro_rad_s": 3,
-        "joint_pos_rad": 29,
-        "joint_vel_rad_s": 29,
-    }
-    state: dict[str, np.ndarray] = {}
-    for name, size in fields.items():
-        value = np.asarray(payload.get(name), dtype=np.float64)
-        if value.shape != (size,) or not np.isfinite(value).all():
-            raise ValueError(f"snapshot {name} must be a finite {size}-vector")
-        state[name] = value
-    return state
-
-
-def _load_trace_history(
-    path: Path,
-    *,
-    end_tick: int,
-) -> tuple[list[dict[str, np.ndarray]], np.ndarray]:
-    first_tick = end_tick - 10
-    records: dict[int, dict[str, Any]] = {}
-    with path.open("r", encoding="utf-8") as stream:
-        for line in stream:
-            record = json.loads(line)
-            tick = int(record.get("tick_index", -1))
-            if first_tick <= tick <= end_tick:
-                records[tick] = record
-            if tick > end_tick:
-                break
-    expected = list(range(first_tick, end_tick + 1))
-    if sorted(records) != expected:
-        raise ValueError(
-            f"history trace must contain contiguous ticks {first_tick}..{end_tick}"
-        )
-    observations: list[dict[str, np.ndarray]] = []
-    for tick in range(end_tick - 9, end_tick + 1):
-        current = records[tick]
-        previous = records[tick - 1]
-        observations.append(
-            {
-                "base_quat_wxyz": np.asarray(
-                    current["lowstate"]["base_quat_wxyz_values"],
-                    dtype=np.float32,
-                ),
-                "base_ang_vel": np.asarray(
-                    current["lowstate"]["base_ang_vel_values"],
-                    dtype=np.float32,
-                ),
-                "joint_pos": np.asarray(
-                    current["lowstate"]["joint_pos_values"],
-                    dtype=np.float32,
-                ),
-                "joint_vel": np.asarray(
-                    current["lowstate"]["joint_vel_values"],
-                    dtype=np.float32,
-                ),
-                "previous_action": np.asarray(
-                    previous["action_isaac_values"],
-                    dtype=np.float32,
-                ),
-            }
-        )
-    previous_action = np.asarray(
-        records[end_tick]["action_isaac_values"],
-        dtype=np.float32,
-    )
-    return observations, previous_action
-
-
 def run_variant(args: argparse.Namespace, variant: str) -> dict[str, Any]:
     adapter.TURN_REFERENCE_FORWARD_MPS = args.turn_reference_forward_mps
     adapter.FORMAL_COMMAND_YAW_GAIN = args.command_yaw_gain
     adapter.FORMAL_COMMAND_YAW_LIMIT_RAD_S = args.command_yaw_limit_rad_s
     adapter.TURN_COMMAND_YAW_LIMIT_RAD_S = args.command_yaw_limit_rad_s
     adapter.TURN_COMMAND_YAW_DAMPING_SECONDS = args.yaw_damping_seconds
-    trace_file = (
-        args.trace_dir / f"{variant}.jsonl"
-        if args.trace_dir is not None and args.trace_ticks > 0
-        else None
-    )
-    core = _core(args, trace_file=trace_file)
-    if args.reference_command_contract == "oracle-double-buffer":
-        core._prepare_realtime_rolling_command = lambda _command: None
+    core = _core(args)
     try:
         model = mujoco.MjModel.from_xml_path(str(args.scene))
         model.opt.timestep = 1.0 / PHYSICS_HZ
@@ -472,7 +375,7 @@ def run_variant(args: argparse.Namespace, variant: str) -> dict[str, Any]:
                 @ root_velocity_world[3:6]
             )
             data.qvel[dof_addresses] = reference_joint_vel
-        elif args.initialization in {"live-blend", "snapshot-blend"}:
+        elif args.initialization == "live-blend":
             live_state = args.live_state
             data.qpos[:3] = live_state["root_position"]
             data.qpos[3:7] = live_state["quaternion_wxyz"]
@@ -482,11 +385,7 @@ def run_variant(args: argparse.Namespace, variant: str) -> dict[str, Any]:
             data.qvel[dof_addresses] = live_state["joint_vel_rad_s"]
         mujoco.mj_forward(model, data)
         core.reset()
-        if args.initialization in {
-            "qpos0-blend",
-            "live-blend",
-            "snapshot-blend",
-        }:
+        if args.initialization in {"qpos0-blend", "live-blend"}:
             core.prepare_activation(
                 _lowstate(
                     data,
@@ -495,36 +394,6 @@ def run_variant(args: argparse.Namespace, variant: str) -> dict[str, Any]:
                     received_monotonic=0.0,
                 )
             )
-        if args.reference_preroll_steps > 0:
-            height_field = core.reference_module.LocalTerrainHeightField(
-                data.qpos[:3].copy(),
-                _yaw_wxyz(data.qpos[3:7]),
-                height_map,
-            )
-            for _ in range(args.reference_preroll_steps):
-                core.stream.sample(
-                    _stand_command(core),
-                    data.qpos[:3],
-                    _yaw_wxyz(data.qpos[3:7]),
-                    height_field,
-                )
-        if args.history_observations is not None:
-            core.teacher.reset()
-            for item in args.history_observations:
-                core.teacher.history.push(
-                    core.teacher_module.RobotObservation(
-                        base_quat_wxyz=item["base_quat_wxyz"],
-                        base_ang_vel=item["base_ang_vel"],
-                        joint_pos=item["joint_pos"][
-                            core.teacher_module.MUJOCO_TO_ISAACLAB
-                        ],
-                        joint_vel=item["joint_vel"][
-                            core.teacher_module.MUJOCO_TO_ISAACLAB
-                        ],
-                        previous_action=item["previous_action"],
-                    )
-                )
-            core.previous_action = args.history_previous_action.copy()
 
         initial_root = data.qpos[:3].copy()
         command_heading = _yaw_wxyz(data.qpos[3:7]) + math.radians(
@@ -539,7 +408,6 @@ def run_variant(args: argparse.Namespace, variant: str) -> dict[str, Any]:
         saturation_total = 0
         samples: list[dict[str, Any]] = []
         minimum_up_z = 1.0
-        was_moving = False
 
         for step in range(args.steps):
             root_position = data.qpos[:3].copy()
@@ -606,14 +474,6 @@ def run_variant(args: argparse.Namespace, variant: str) -> dict[str, Any]:
                 <= step
                 < transition_to_move
             )
-            if (
-                moving
-                and not was_moving
-                and args.reset_actor_on_motion_start
-            ):
-                core.teacher.reset()
-                core.previous_action.fill(0.0)
-            was_moving = moving
             lowstate = _lowstate(
                 data,
                 qpos_addresses=qpos_addresses,
@@ -702,15 +562,6 @@ def run_variant(args: argparse.Namespace, variant: str) -> dict[str, Any]:
         )
         return {
             "variant": variant,
-            "reference_command_contract": args.reference_command_contract,
-            "reference_preroll_steps": args.reference_preroll_steps,
-            "history_trace": (
-                str(args.history_trace) if args.history_trace is not None else None
-            ),
-            "history_end_tick": args.history_end_tick,
-            "reset_actor_on_motion_start": args.reset_actor_on_motion_start,
-            "trace_file": str(trace_file) if trace_file is not None else None,
-            "trace_ticks_written": int(core.trace_written),
             "controller_contract": args.controller_contract,
             "initialization": args.initialization,
             "command_mode": args.command_mode,
@@ -762,22 +613,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--formal-ik", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--sample-every", type=int, default=50)
-    parser.add_argument(
-        "--trace-dir",
-        type=Path,
-        help="Directory for per-variant policy-tick JSONL traces",
-    )
-    parser.add_argument("--trace-ticks", type=int, default=0)
     parser.add_argument("--ground-z", type=float, default=0.0)
-    parser.add_argument(
-        "--reference-command-contract",
-        choices=("matrix-rolling", "oracle-double-buffer"),
-        default="matrix-rolling",
-    )
-    parser.add_argument("--reference-preroll-steps", type=int, default=0)
-    parser.add_argument("--history-trace", type=Path)
-    parser.add_argument("--history-end-tick", type=int)
-    parser.add_argument("--reset-actor-on-motion-start", action="store_true")
     parser.add_argument(
         "--command-mode",
         choices=("idle", "turn", "move", "turn-move", "idle-turn-move"),
@@ -826,13 +662,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--initialization",
-        choices=("aligned", "qpos0-blend", "live-blend", "snapshot-blend"),
+        choices=("aligned", "qpos0-blend", "live-blend"),
         default="aligned",
-    )
-    parser.add_argument(
-        "--initial-state-json",
-        type=Path,
-        help="Captured root and low-state vectors for snapshot-blend",
     )
     parser.add_argument(
         "--live-status",
@@ -852,12 +683,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--steps must be positive")
     if args.sample_every <= 0:
         parser.error("--sample-every must be positive")
-    if args.trace_ticks < 0:
-        parser.error("--trace-ticks must be nonnegative")
-    if args.reference_preroll_steps < 0:
-        parser.error("--reference-preroll-steps must be nonnegative")
-    if args.trace_ticks > 0 and args.trace_dir is None:
-        parser.error("--trace-dir is required when --trace-ticks is positive")
     if args.idle_steps_before_turn < 0:
         parser.error("--idle-steps-before-turn must be nonnegative")
     if args.turn_steps_before_move < 0:
@@ -911,14 +736,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--activation-blend-seconds must be positive and finite")
     if args.initialization == "live-blend" and args.live_status is None:
         parser.error("--live-status is required with --initialization live-blend")
-    if args.initialization == "snapshot-blend" and args.initial_state_json is None:
-        parser.error(
-            "--initial-state-json is required with --initialization snapshot-blend"
-        )
-    if (args.history_trace is None) != (args.history_end_tick is None):
-        parser.error("--history-trace and --history-end-tick must be used together")
-    if args.history_end_tick is not None and args.history_end_tick < 10:
-        parser.error("--history-end-tick must be at least 10")
     if (
         not math.isfinite(args.live_state_timeout_seconds)
         or args.live_state_timeout_seconds <= 0.0
@@ -931,23 +748,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.initialization == "live-blend":
-        args.live_state = _capture_live_state(args)
-    elif args.initialization == "snapshot-blend":
-        args.live_state = _load_snapshot_state(args.initial_state_json)
-    else:
-        args.live_state = None
-    if args.history_trace is not None:
-        (
-            args.history_observations,
-            args.history_previous_action,
-        ) = _load_trace_history(
-            args.history_trace,
-            end_tick=args.history_end_tick,
-        )
-    else:
-        args.history_observations = None
-        args.history_previous_action = None
+    args.live_state = (
+        _capture_live_state(args)
+        if args.initialization == "live-blend"
+        else None
+    )
     results = []
     for variant in args.variants:
         result = run_variant(args, variant)

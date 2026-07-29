@@ -2635,14 +2635,20 @@ def run_worker(
                             if prior_command is not None
                             else None
                         )
+                        lowcmd_anchor_required = not bool(aligned_initial)
                         if (
                             not warmed
                             or world_age_s is None
                             or world_age_s > WORLD_SAMPLE_MAX_AGE_S
                             or state_age_s is None
                             or state_age_s > LOWSTATE_MAX_AGE_S
-                            or lowcmd_age_s is None
-                            or lowcmd_age_s > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                            or (
+                                lowcmd_anchor_required
+                                and (
+                                    lowcmd_age_s is None
+                                    or lowcmd_age_s > HOT_SWITCH_LOW_CMD_MAX_AGE_S
+                                )
+                            )
                         ):
                             send_event(
                                 "ACTIVATION_REJECTED",
@@ -2656,6 +2662,10 @@ def run_worker(
                                     "world_age_s": world_age_s,
                                     "lowstate_age_s": state_age_s,
                                     "lowcmd_age_s": lowcmd_age_s,
+                                    "aligned_initial": bool(aligned_initial),
+                                    "lowcmd_anchor_required": (
+                                        lowcmd_anchor_required
+                                    ),
                                 },
                             )
                             continue
@@ -2763,8 +2773,11 @@ def run_worker(
                             if prior_command is not None
                             else None
                         )
+                        lowcmd_anchor_required = (
+                            not direct_start and not preparing_aligned_initial
+                        )
                         if (
-                            not direct_start
+                            lowcmd_anchor_required
                             and (
                                 lowcmd_age_s is None
                                 or lowcmd_age_s > HOT_SWITCH_LOW_CMD_MAX_AGE_S
@@ -2853,6 +2866,9 @@ def run_worker(
                                         if lowcmd_age_s is not None
                                         else None
                                     ),
+                                    "go_lowcmd_anchor_required": (
+                                        lowcmd_anchor_required
+                                    ),
                                     "go_anchor_source": (
                                         "aligned_pfnn_first_frame"
                                     ),
@@ -2902,6 +2918,9 @@ def run_worker(
                                         max(0.0, float(lowcmd_age_s)) * 1000.0
                                         if lowcmd_age_s is not None
                                         else None
+                                    ),
+                                    "go_lowcmd_anchor_required": (
+                                        lowcmd_anchor_required
                                     ),
                                     "go_anchor_source": (
                                         "torque_equivalent_observed_lowcmd"

@@ -1012,9 +1012,6 @@ class ResidentRecoveryInput:
     foot_contact: bool
     grounded_contact: bool
     neutral_confirmed: bool = False
-    policy_hold_first_write: bool = False
-    locomotion_writer_prepared: bool = True
-    locomotion_preparation_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -1034,9 +1031,6 @@ class ResidentRecoveryOutput:
     request_sonic_stop: bool = False
     request_policy_stop: bool = False
     request_policy_hold: bool = False
-    request_policy_joint_hold: bool = False
-    prepare_locomotion_writer: bool = False
-    cancel_locomotion_preparation: bool = False
     start_sonic: bool = False
     authorize_sonic_writer: bool = False
     authority_policy_id: Optional[str] = None
@@ -1057,15 +1051,6 @@ class ResidentPolicyRecoveryFSM:
         ResidentRecoveryState.SONIC_RESUME_REQUESTED: "sonic_restart_timeout_s",
         ResidentRecoveryState.SONIC_STABILIZING: "sonic_full_control_timeout_s",
         ResidentRecoveryState.WAIT_NEUTRAL: "neutral_timeout_s",
-    }
-    _POLICY_CAPTURE_PROFILES = {
-        "host": ((0.25, 0.50, 0.50), 20.0),
-        "kungfu": ((0.35, 0.60, 0.60), 15.0),
-        "amp": ((0.50, 0.75, 0.75), 12.0),
-        "amp-flat-v3": ((0.60, 0.80, 0.80), 10.0),
-    }
-    _POLICY_CAPTURE_ROOT_UP_Z_FLOORS = {
-        "amp-flat-v3": 0.85,
     }
 
     def __init__(
@@ -1090,15 +1075,12 @@ class ResidentPolicyRecoveryFSM:
         self._fall_latched = False
         self._policy_start_requested = False
         self._policy_authorize_requested = False
-        self._policy_hold_requested = False
-        self._policy_hold_first_write_seen = False
         self._sonic_fresh_seen = False
         self._sonic_stale_confirmed = False
         self._policy_fresh_seen = False
         self._policy_stale_confirmed = False
         self._stable_since_s: Optional[float] = None
         self._sonic_stable_since_s: Optional[float] = None
-        self.last_policy_handoff_gate: dict[str, object] = {}
 
     @staticmethod
     def _normalize_policy_id(policy_id: str) -> str:
@@ -1129,65 +1111,6 @@ class ResidentPolicyRecoveryFSM:
         previous = self.recovery_policy_id
         self.recovery_policy_id = selected
         return previous
-
-    def begin_stable_policy_handoff(
-        self, observation: ResidentRecoveryInput
-    ) -> ResidentRecoveryOutput:
-        """Enter the resident handoff pipeline without fabricating a fall.
-
-        Startup locomotion handoffs use the recovery policy as a stable,
-        authoritative bridge.  The same writer fences and stability gates used
-        after a fall then protect the recovery-policy -> locomotion-policy swap.
-        """
-
-        if self.state is not ResidentRecoveryState.GAME_SONIC:
-            raise RuntimeError("stable policy handoff requires GAME_SONIC")
-        invalid = self._validate(observation)
-        if invalid is not None:
-            raise ValueError(f"invalid stable policy handoff: {invalid}")
-        if observation.fall_detected:
-            raise ValueError("stable policy handoff cannot start from a fall")
-        if not (
-            observation.sonic_alive
-            and observation.sonic_resident_ready
-            and observation.sonic_writer_active
-            and observation.policy_alive
-            and observation.policy_resident_ready
-            and observation.policy_writer_paused
-        ):
-            raise RuntimeError("resident policies are not ready for stable handoff")
-        if self._baseline_reset_count is None:
-            self._baseline_reset_count = observation.reset_count
-        elif observation.reset_count != self._baseline_reset_count:
-            raise RuntimeError("reset count changed before stable handoff")
-        self._last_now_s = observation.now_s
-        self._fall_latched = False
-        self._episode_started_s = observation.now_s
-        self._sonic_generation = observation.sonic_generation
-        self._sonic_fresh_seen = bool(observation.lowcmd_fresh)
-        self._sonic_stale_confirmed = False
-        self._policy_fresh_seen = False
-        self._policy_stale_confirmed = False
-        self._policy_authorize_requested = False
-        self._policy_hold_requested = False
-        self._policy_hold_first_write_seen = False
-        self._stable_since_s = None
-        self._sonic_stable_since_s = None
-        previous = self._transition(
-            ResidentRecoveryState.SONIC_PAUSE_REQUESTED,
-            observation.now_s,
-        )
-        return self._result(previous, request_sonic_pause=True)
-
-    def mark_policy_hold_requested(self) -> None:
-        """Record a supervisor-selected resident hold in the active episode."""
-
-        if self.state not in {
-            ResidentRecoveryState.POLICY_RECOVERING,
-            ResidentRecoveryState.POLICY_STABLE,
-        }:
-            raise RuntimeError("policy hold requires an active recovery policy")
-        self._policy_hold_requested = True
 
     def _transition(
         self, state: ResidentRecoveryState, now_s: float
@@ -1288,68 +1211,6 @@ class ResidentPolicyRecoveryFSM:
             and observation.lowcmd_age_s <= self.config.max_lowcmd_age_s
         )
 
-    def _policy_handoff_ready(
-        self, observation: ResidentRecoveryInput
-    ) -> bool:
-        start, relaxation_s = self._POLICY_CAPTURE_PROFILES.get(
-            self.recovery_policy_id,
-            ((0.25, 0.50, 0.50), 20.0),
-        )
-        episode_elapsed_s = max(
-            0.0,
-            observation.now_s - (
-                self._episode_started_s
-                if self._episode_started_s is not None
-                else observation.now_s
-            ),
-        )
-        fraction = min(1.0, episode_elapsed_s / relaxation_s)
-        maximum = (
-            self.config.policy_handoff_root_linear_speed_m_s,
-            self.config.policy_handoff_root_angular_speed_rad_s,
-            self.config.policy_handoff_joint_velocity_rms_rad_s,
-        )
-        limits = tuple(
-            initial + (upper - initial) * fraction
-            for initial, upper in zip(start, maximum)
-        )
-        root_up_z_start = self.config.policy_handoff_root_up_z
-        root_up_z_floor = min(
-            root_up_z_start,
-            self._POLICY_CAPTURE_ROOT_UP_Z_FLOORS.get(
-                self.recovery_policy_id,
-                root_up_z_start,
-            ),
-        )
-        root_up_z_min = root_up_z_start + (
-            root_up_z_floor - root_up_z_start
-        ) * fraction
-        self.last_policy_handoff_gate = {
-            "policy_id": self.recovery_policy_id,
-            "episode_elapsed_s": episode_elapsed_s,
-            "linear_relaxation_fraction": fraction,
-            "root_linear_speed_limit_m_s": limits[0],
-            "root_angular_speed_limit_rad_s": limits[1],
-            "joint_velocity_rms_limit_rad_s": limits[2],
-            "root_z_min_m": self.config.policy_handoff_root_z_m,
-            "root_up_z_min": root_up_z_min,
-            "root_up_z_initial_min": root_up_z_start,
-            "root_up_z_relaxed_floor": root_up_z_floor,
-        }
-        return (
-            not observation.fall_detected
-            and observation.lowcmd_fresh
-            and observation.lowcmd_age_s is not None
-            and observation.lowcmd_age_s <= self.config.max_lowcmd_age_s
-            and observation.foot_contact
-            and observation.grounded_contact
-            and observation.root_z_m >= self.config.policy_handoff_root_z_m
-            and observation.root_up_z >= root_up_z_min
-            and observation.root_linear_speed_m_s <= limits[0]
-            and observation.root_angular_speed_rad_s <= limits[1]
-            and observation.joint_velocity_rms_rad_s <= limits[2]
-        )
-
     def _deadline_failure(
         self, observation: ResidentRecoveryInput
     ) -> Optional[str]:
@@ -1382,8 +1243,6 @@ class ResidentPolicyRecoveryFSM:
         self._policy_fresh_seen = False
         self._policy_stale_confirmed = False
         self._policy_authorize_requested = False
-        self._policy_hold_requested = False
-        self._policy_hold_first_write_seen = False
         self._stable_since_s = None
         self._sonic_stable_since_s = None
         previous = self._transition(
@@ -1532,23 +1391,11 @@ class ResidentPolicyRecoveryFSM:
             if not observation.policy_writer_active:
                 return self._fail(observation, "policy_writer_lost_during_recovery")
             stable = self._stable(observation)
-            use_policy_hold = bool(
-                self.config.use_amp_hold
-                and self.recovery_policy_id in {"amp", "amp-flat-v3"}
-            )
-            handoff_ready = (
-                self._policy_handoff_ready(observation)
-                if use_policy_hold
-                else stable
-            )
             if self.state is ResidentRecoveryState.POLICY_RECOVERING:
-                if not handoff_ready:
+                if not stable:
                     return self._result(ResidentRecoveryState.POLICY_RECOVERING)
                 self._stable_since_s = observation.now_s
-                if (
-                    not use_policy_hold
-                    and self.config.policy_exit_hold_s <= 0.0
-                ):
+                if self.config.policy_exit_hold_s <= 0.0:
                     self._policy_fresh_seen = bool(observation.lowcmd_fresh)
                     previous = self._transition(
                         ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
@@ -1559,61 +1406,18 @@ class ResidentPolicyRecoveryFSM:
                     ResidentRecoveryState.POLICY_STABLE, observation.now_s
                 )
                 return self._result(previous)
-            if use_policy_hold and not self._policy_hold_requested:
-                if not handoff_ready:
-                    self._stable_since_s = None
-                    previous = self._transition(
-                        ResidentRecoveryState.POLICY_RECOVERING,
-                        observation.now_s,
-                    )
-                    return self._result(previous)
-                assert self._stable_since_s is not None
-                if (
-                    observation.now_s - self._stable_since_s
-                    < self.config.policy_handoff_hold_s
-                ):
-                    return self._result(ResidentRecoveryState.POLICY_STABLE)
-                self._policy_hold_requested = True
-                return self._result(
-                    ResidentRecoveryState.POLICY_STABLE,
-                    request_policy_hold=True,
-                )
-            if use_policy_hold and not self._policy_hold_first_write_seen:
-                self._policy_hold_first_write_seen = bool(
-                    observation.policy_hold_first_write
-                )
-                if not self._policy_hold_first_write_seen:
-                    return self._result(ResidentRecoveryState.POLICY_STABLE)
-                self._stable_since_s = (
-                    observation.now_s if stable else None
-                )
-                return self._result(ResidentRecoveryState.POLICY_STABLE)
             if not stable:
                 self._stable_since_s = None
-                return self._result(
-                    ResidentRecoveryState.POLICY_STABLE,
-                    cancel_locomotion_preparation=bool(
-                        observation.locomotion_preparation_active
-                    ),
+                previous = self._transition(
+                    ResidentRecoveryState.POLICY_RECOVERING, observation.now_s
                 )
-            if self._stable_since_s is None:
-                self._stable_since_s = observation.now_s
-                return self._result(ResidentRecoveryState.POLICY_STABLE)
-            required_hold_s = (
-                self.config.stable_hold_s
-                if use_policy_hold
-                else self.config.policy_exit_hold_s
-            )
+                return self._result(previous)
+            assert self._stable_since_s is not None
             if (
                 observation.now_s - self._stable_since_s
-                < required_hold_s
+                < self.config.policy_exit_hold_s
             ):
                 return self._result(ResidentRecoveryState.POLICY_STABLE)
-            if not observation.locomotion_writer_prepared:
-                return self._result(
-                    ResidentRecoveryState.POLICY_STABLE,
-                    prepare_locomotion_writer=True,
-                )
             self._policy_fresh_seen = bool(observation.lowcmd_fresh)
             previous = self._transition(
                 ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
@@ -1623,19 +1427,6 @@ class ResidentPolicyRecoveryFSM:
 
         if self.state is ResidentRecoveryState.POLICY_PAUSE_REQUESTED:
             self._policy_fresh_seen |= bool(observation.lowcmd_fresh)
-            if (
-                not observation.policy_writer_paused
-                and (
-                    observation.fall_detected
-                    or not self._stable(observation)
-                )
-            ):
-                self._stable_since_s = None
-                previous = self._transition(
-                    ResidentRecoveryState.POLICY_RECOVERING,
-                    observation.now_s,
-                )
-                return self._result(previous)
             if not observation.policy_writer_paused:
                 return self._result(
                     ResidentRecoveryState.POLICY_PAUSE_REQUESTED
@@ -1664,13 +1455,6 @@ class ResidentPolicyRecoveryFSM:
         if self.state is ResidentRecoveryState.SONIC_RESUME_REQUESTED:
             if observation.policy_writer_active:
                 return self._fail(observation, "policy_active_during_sonic_resume")
-            if observation.fall_detected:
-                if not observation.policy_writer_paused:
-                    return self._fail(
-                        observation,
-                        "resident_recovery_policy_not_ready_for_sonic_refall",
-                    )
-                return self._begin_fall_episode(observation)
             if not (
                 observation.sonic_writer_active
                 and observation.sonic_resume_first_write

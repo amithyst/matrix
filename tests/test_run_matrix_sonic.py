@@ -425,7 +425,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         profiles.verify_active()
 
-    def test_initial_bfm_alignment_records_lowstate_anchor_without_mutation(
+    def test_initial_bfm_alignment_preserves_live_xy_and_writes_once(
         self,
     ) -> None:
         mujoco, model, data, _joint_by_name = (
@@ -446,28 +446,24 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         coordinator.initial_bfm_reference_aligned = False
         coordinator.initial_bfm_reference_alignment = None
-        qpos_before = tuple(data.qpos)
-        qvel_before = tuple(data.qvel)
 
         coordinator._align_initial_bfm_reference()
 
         self.assertTrue(coordinator.initial_bfm_reference_aligned)
-        self.assertEqual(tuple(data.qpos), qpos_before)
-        self.assertEqual(tuple(data.qvel), qvel_before)
+        self.assertEqual(tuple(data.qpos[:2]), (12.25, -7.5))
+        self.assertEqual(tuple(data.qpos[2:36]), reference_qpos[2:36])
+        self.assertEqual(tuple(data.qvel[:35]), reference_qvel)
         self.assertEqual(
             profiles.active_profile_id,
-            MODULE._LocomotionPhysicsProfiles.BASELINE_PROFILE_ID,
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID,
         )
         self.assertEqual(
             coordinator.initial_bfm_reference_alignment["mode"],
-            "stable_lowstate_idle_anchor",
+            "online_pfnn_first_frame_once",
         )
-        self.assertFalse(
-            coordinator.initial_bfm_reference_alignment[
-                "simulator_state_mutation"
-            ]
+        self.assertTrue(
+            coordinator.initial_bfm_reference_alignment["root_xy_preserved"]
         )
-        self.assertEqual(mujoco.forward_calls, 0)
         forward_calls = mujoco.forward_calls
         qpos_after = tuple(data.qpos)
         qvel_after = tuple(data.qvel)
@@ -478,46 +474,19 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(tuple(data.qpos), qpos_after)
         self.assertEqual(tuple(data.qvel), qvel_after)
 
-    def test_initial_bfm_oracle_alignment_replays_validated_first_frame(self) -> None:
-        mujoco, model, data, _joint_by_name = (
-            self.fake_physics_profile_runtime()
-        )
-        data.qpos[0] = 12.25
-        data.qpos[1] = -7.5
-        profiles = MODULE._LocomotionPhysicsProfiles(mujoco, model, data)
-        reference_qpos = tuple(1.0 + 0.01 * index for index in range(36))
-        reference_qvel = tuple(-0.02 * index for index in range(35))
-        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
-            MODULE._PhysicalRecoveryCoordinator
-        )
-        coordinator.physics_profiles = profiles
-        coordinator.bfm_control = SimpleNamespace(
-            direct_initial_qpos=reference_qpos,
-            direct_initial_qvel=reference_qvel,
-        )
-        coordinator.initial_bfm_reference_aligned = False
-        coordinator.initial_bfm_reference_alignment = None
+        next_reference_qpos = tuple(2.0 + 0.01 * index for index in range(36))
+        next_reference_qvel = tuple(0.03 * index for index in range(35))
+        coordinator.bfm_control.direct_initial_qpos = next_reference_qpos
+        coordinator.bfm_control.direct_initial_qvel = next_reference_qvel
+        coordinator._align_initial_bfm_reference(force=True)
 
-        coordinator._align_initial_bfm_reference_oracle()
-
-        expected_qpos = list(reference_qpos)
-        expected_qpos[0] = 12.25
-        expected_qpos[1] = -7.5
-        self.assertEqual(tuple(data.qpos[:36]), tuple(expected_qpos))
-        self.assertEqual(tuple(data.qvel[:35]), reference_qvel)
-        self.assertEqual(
-            profiles.active_profile_id,
-            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID,
-        )
-        self.assertEqual(mujoco.forward_calls, 2)
+        self.assertEqual(mujoco.forward_calls, forward_calls + 1)
+        self.assertEqual(tuple(data.qpos[:2]), (12.25, -7.5))
+        self.assertEqual(tuple(data.qpos[2:36]), next_reference_qpos[2:36])
+        self.assertEqual(tuple(data.qvel[:35]), next_reference_qvel)
         self.assertEqual(
             coordinator.initial_bfm_reference_alignment["mode"],
-            "online_pfnn_first_frame_once",
-        )
-        self.assertTrue(
-            coordinator.initial_bfm_reference_alignment[
-                "simulator_state_mutation"
-            ]
+            "online_pfnn_handoff_realign",
         )
 
     def test_flat_v3_physics_profile_comes_from_locked_policy_config(self) -> None:
@@ -698,7 +667,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             check_fall=lambda: None,
             fall=False,
             fall_detected=False,
-            mj_data=SimpleNamespace(qpos=[0.0, 0.0, -0.13]),
+            mj_data=SimpleNamespace(qpos=[0.0, 0.0, -0.13, 1.0, 0.0, 0.0, 0.0]),
             reset_on_fall=False,
             reset=mock.Mock(),
         )
@@ -712,6 +681,13 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertFalse(environment.fall_detected)
 
         environment.mj_data.qpos[2] = -0.75
+        environment.check_fall()
+        self.assertFalse(environment.fall)
+        self.assertFalse(environment.fall_detected)
+
+        root_up_z = 0.2
+        environment.mj_data.qpos[3] = math.sqrt((1.0 + root_up_z) * 0.5)
+        environment.mj_data.qpos[4] = math.sqrt((1.0 - root_up_z) * 0.5)
         environment.check_fall()
         self.assertTrue(environment.fall)
         self.assertTrue(environment.fall_detected)
@@ -6446,6 +6422,72 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_game_command_runtime_policy_query_is_read_only(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.setblocking(False)
+        loadout = {
+            "version": 1,
+            "available": True,
+            "status": "ready",
+            "active_slot": "locomotion",
+            "pending": None,
+            "slots": [
+                {
+                    "slot": "locomotion",
+                    "selected_policy_id": "bfm-sonic-teacher50k",
+                    "locked": False,
+                    "candidates": [],
+                }
+            ],
+            "resident_models": [],
+        }
+
+        class PolicySlots:
+            @staticmethod
+            def strategy_loadout_mapping():
+                return loadout
+
+            def request_policy_slot_assignment(self, *_args, **_kwargs):
+                raise AssertionError("a policy query must not assign a slot")
+
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            policy_slots=PolicySlots(),
+        )
+        request = self.game_command_request(
+            "/policy status",
+            sequence=1,
+            request_character="a",
+        )
+        pose = WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0)
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+
+            self.assertFalse(
+                runtime.poll(current_pose=pose, command_allowed=False)
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(4096)
+            )
+
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_POLICY_SLOT_STATUS")
+            self.assertEqual(
+                response.data["strategy_loadout"]["slots"][0][
+                    "selected_policy_id"
+                ],
+                "bfm-sonic-teacher50k",
+            )
+            self.assertEqual(runtime.commands_executed, 1)
+            self.assertEqual(runtime.policy_changes_executed, 0)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
     def test_policy_response_projects_large_provenance_to_packet_bound(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
             socket.AF_UNIX,
@@ -6603,7 +6645,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator._request_initial_locomotion_policy_if_ready()
         coordinator.request_policy_slot_assignment.assert_called_once()
 
-    def test_initial_bfm_handoff_anchors_lowstate_before_writer_go(self) -> None:
+    def test_initial_bfm_handoff_aligns_before_prepare_and_writer_go(self) -> None:
         coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
             MODULE._PhysicalRecoveryCoordinator
         )
@@ -6662,96 +6704,24 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator._reconcile_policy_slot_assignment()
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
-            "prepare_bfm",
-        )
-        coordinator._align_initial_bfm_reference.assert_called_once_with()
-        coordinator.bfm_control.prepare_activation.assert_called_once_with(
-            allow_lowstate_anchor=True
-        )
-        coordinator.sonic_writer.send.assert_not_called()
-
-        coordinator.bfm_control.activation_prepared = True
-        coordinator.bfm_control.activation_preparation_status = {
-            "reference_aligned": True,
-            "reference_buffer_swapped": False,
-            "preview_steps": 4,
-            "target_delta_max_rad": 0.01,
-            "desired_target_delta_max_rad": 0.02,
-            "lowstate_anchor_handoff": True,
-        }
-        coordinator._reconcile_policy_slot_assignment()
-        self.assertEqual(
-            coordinator._policy_selection_pending["phase"],
-            "pause_sonic",
+            "initial_pause_sonic",
         )
         coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+        coordinator.bfm_control.prepare_activation.assert_not_called()
 
         coordinator.sonic_writer.paused = True
         coordinator._reconcile_policy_slot_assignment()
-        coordinator.physics_profiles.apply.assert_called_once_with(
-            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID
-        )
-        coordinator.bfm_control.activate.assert_called_once_with()
+        coordinator._align_initial_bfm_reference.assert_called_once_with()
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
-            "activate_bfm",
+            "initial_alignment_wait",
         )
 
-    def test_initial_bfm_oracle_handoff_requests_exact_alignment(self) -> None:
-        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
-            MODULE._PhysicalRecoveryCoordinator
+        coordinator._policy_selection_pending["aligned_state_monotonic_s"] = (
+            time.monotonic() - 0.2
         )
-        coordinator._policy_selection_pending = {
-            "slot": "locomotion",
-            "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
-            "transition_id": "initial-locomotion-bfm-sonic-teacher50k",
-            "initial_reference_alignment": True,
-            "phase": "await_bfm_shadow",
-            "requested_monotonic_s": time.monotonic(),
-            "shadow_baseline_sequence": 10,
-            "reference_aligned": False,
-        }
-        coordinator._policy_selection_results = {}
-        coordinator.last_locomotion_handoff = None
-        coordinator.selected_locomotion_policy_id = "sonic"
-        coordinator.bfm_switch_timeout_s = 10.0
-        coordinator.initial_bfm_reference_alignment = None
-        coordinator.bfm_control = mock.Mock(
-            last_status={
-                "world_sample_sequence": 11,
-                "shadow_preview": True,
-                "world_input_safe_stop": True,
-                "reference_pending_rebuild": False,
-                "reference_transition_holding": False,
-                "reference_root_error_m": 0.0,
-            },
-            activation_rejected_reason=None,
-            activation_prepared=False,
-            activation_preparation_status=None,
-        )
-        coordinator.sonic_writer = mock.Mock(
-            paused=False,
-            pause_pending=False,
-        )
-
-        def align_oracle() -> None:
-            coordinator.initial_bfm_reference_alignment = {
-                "mode": "online_pfnn_first_frame_once"
-            }
-
-        coordinator._align_initial_bfm_reference_oracle = mock.Mock(
-            side_effect=align_oracle
-        )
-        coordinator._align_initial_bfm_reference = mock.Mock()
-
-        with mock.patch.dict(
-            os.environ,
-            {"MATRIX_BFM_INITIAL_HANDOFF_MODE": "oracle"},
-        ):
-            coordinator._reconcile_policy_slot_assignment()
-
-        coordinator._align_initial_bfm_reference_oracle.assert_called_once_with()
-        coordinator._align_initial_bfm_reference.assert_not_called()
+        coordinator.bfm_control.last_state_sequence = 42
+        coordinator._reconcile_policy_slot_assignment()
         coordinator.bfm_control.prepare_activation.assert_called_once_with(
             aligned_initial=True
         )
@@ -6760,146 +6730,29 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             "prepare_bfm",
         )
 
-    def test_bfm_switch_admission_requires_continuous_stability(self) -> None:
-        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
-            MODULE._PhysicalRecoveryCoordinator
-        )
-        coordinator.bfm_switch_admission_since_s = None
-        coordinator.bfm_switch_admission_elapsed_s = 0.0
-
-        self.assertFalse(
-            coordinator._update_bfm_switch_admission_hold(True, now_s=10.0)
-        )
-        self.assertFalse(
-            coordinator._update_bfm_switch_admission_hold(True, now_s=11.49)
-        )
-        self.assertTrue(
-            coordinator._update_bfm_switch_admission_hold(True, now_s=11.5)
-        )
-        self.assertFalse(
-            coordinator._update_bfm_switch_admission_hold(False, now_s=11.51)
-        )
-        self.assertIsNone(coordinator.bfm_switch_admission_since_s)
-        self.assertEqual(coordinator.bfm_switch_admission_elapsed_s, 0.0)
-        self.assertFalse(
-            coordinator._update_bfm_switch_admission_hold(True, now_s=20.0)
-        )
-
-    def make_locomotion_switch_admission_coordinator(self):
-        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
-            MODULE._PhysicalRecoveryCoordinator
-        )
-        coordinator.locomotion_slots_only = True
-        coordinator.physics_profiles = None
-        coordinator.fsm = SimpleNamespace(
-            state=MODULE.ResidentRecoveryState.GAME_SONIC
-        )
-        coordinator.worker = mock.Mock(error=None)
-        coordinator.worker.poll = mock.Mock()
-        coordinator.sonic_writer = mock.Mock(error=None, ready=False)
-        coordinator.sonic_writer.poll = mock.Mock()
-        coordinator.replacement_sonic_ready_s = None
-        coordinator._reconcile_policy_slot_assignment = mock.Mock()
-        coordinator._fall_level = mock.Mock(return_value=False)
-        coordinator._request_initial_locomotion_policy_if_ready = mock.Mock()
-        coordinator.selected_locomotion_policy_id = "sonic"
-        coordinator.bfm_switch_admission_ready = False
-        coordinator.bfm_switch_admission_reason = "awaiting_runtime_observation"
-        coordinator.bfm_switch_admission_since_s = None
-        coordinator.bfm_switch_admission_elapsed_s = 0.0
-        return coordinator
-
-    def observe_locomotion_switch_admission(
-        self,
-        coordinator,
-        *,
-        root_z_m: float,
-        now_s: float,
-        root_up_z: float = 1.0,
-        qvel: list[float] | None = None,
-    ) -> None:
-        snapshot = self.snapshot(low_cmd_fresh=True, low_cmd_age_s=0.0)
-        snapshot.qpos[2] = root_z_m
-        # Identity orientation keeps root_up_z at 1.0.  Use x-axis tilt when a
-        # lower diagnostic up vector is requested.
-        if root_up_z < 1.0:
-            snapshot.qpos[3] = math.sqrt(max(0.0, (1.0 + root_up_z) * 0.5))
-            snapshot.qpos[4] = math.sqrt(max(0.0, (1.0 - root_up_z) * 0.5))
-        else:
-            snapshot.qpos[3] = 1.0
-        if qvel is not None:
-            snapshot.qvel = qvel
-
-        coordinator.observe(
-            snapshot,
-            now_s=now_s,
-            neutral_confirmed=True,
-            locomotion_switch_neutral_confirmed=True,
-            foot_contact=True,
-            grounded_contact=True,
-            processes=mock.Mock(),
-        )
-
-    def test_locomotion_switch_admission_accepts_trna_upright_clearance_after_hold(
-        self,
-    ) -> None:
-        coordinator = self.make_locomotion_switch_admission_coordinator()
-
-        self.observe_locomotion_switch_admission(
-            coordinator,
-            root_z_m=0.494208,
-            now_s=1.0,
-        )
-
-        self.assertFalse(coordinator.bfm_switch_admission_ready)
-        self.assertEqual(coordinator.bfm_switch_admission_reason, "stability_hold")
-        self.assertTrue(coordinator.bfm_switch_admission_telemetry["raw_ready"])
+        coordinator.bfm_control.activation_prepared = True
+        coordinator.bfm_control.activation_preparation_status = {
+            "reference_aligned": True,
+            "reference_buffer_swapped": False,
+            "preview_steps": 4,
+            "target_delta_max_rad": 0.01,
+            "desired_target_delta_max_rad": 0.02,
+        }
+        coordinator._reconcile_policy_slot_assignment()
         self.assertEqual(
-            coordinator.bfm_switch_admission_telemetry["height_threshold_m"],
-            0.45,
+            coordinator._policy_selection_pending["phase"],
+            "pause_sonic",
         )
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
 
-        self.observe_locomotion_switch_admission(
-            coordinator,
-            root_z_m=0.494208,
-            now_s=2.5,
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator.physics_profiles.apply.assert_called_once_with(
+            MODULE._LocomotionPhysicsProfiles.BFM_PROFILE_ID
         )
-
-        self.assertTrue(coordinator.bfm_switch_admission_ready)
-        self.assertEqual(coordinator.bfm_switch_admission_reason, "ready")
+        coordinator.bfm_control.activate.assert_called_once_with()
         self.assertEqual(
-            coordinator.bfm_switch_admission_telemetry["root_z_m"],
-            0.494208,
-        )
-        self.assertEqual(
-            coordinator.bfm_switch_admission_telemetry[
-                "stability_elapsed_seconds"
-            ],
-            1.5,
-        )
-
-    def test_locomotion_switch_admission_rejects_low_pose(
-        self,
-    ) -> None:
-        coordinator = self.make_locomotion_switch_admission_coordinator()
-
-        self.observe_locomotion_switch_admission(
-            coordinator,
-            root_z_m=0.12,
-            now_s=1.0,
-        )
-
-        self.assertFalse(coordinator.bfm_switch_admission_ready)
-        self.assertEqual(
-            coordinator.bfm_switch_admission_reason,
-            "pose_not_upright",
-        )
-        self.assertFalse(coordinator.bfm_switch_admission_telemetry["raw_ready"])
-        self.assertEqual(
-            coordinator.bfm_switch_admission_telemetry[
-                "stability_elapsed_seconds"
-            ],
-            0.0,
+            coordinator._policy_selection_pending["phase"],
+            "activate_bfm",
         )
 
     def test_initial_bfm_game_run_uses_locomotion_slots_only_when_fall_recovery_off(
@@ -6920,7 +6773,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         args.bfm_direct = True
         self.assertFalse(MODULE._needs_resident_locomotion_policy_slots(args))
 
-    def test_bfm_game_command_preserves_live_motion_setting_speed(self) -> None:
+    def test_bfm_game_command_uses_only_realscan_walk_and_jog_tiers(self) -> None:
         base = GAME_CONTROL.RobotMotionCommand(
             sequence=17,
             movement=(1.0, 0.0, 0.0),
@@ -6933,6 +6786,13 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
 
         walk = MODULE._bfm_realscan_motion_command(base)
+        slow = MODULE._bfm_realscan_motion_command(
+            replace(
+                base,
+                speed_mps=0.10,
+                locomotion_mode=GAME_CONTROL.SONIC_SLOW_WALK_MODE,
+            )
+        )
         walk_boost = MODULE._bfm_realscan_motion_command(
             replace(base, speed_mps=1.00)
         )
@@ -6951,34 +6811,69 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             mode="idle",
         )
 
-        self.assertEqual(walk.speed_mps, 0.80)
+        self.assertEqual(slow.speed_mps, 0.90)
+        self.assertEqual(slow.locomotion_mode, GAME_CONTROL.SONIC_WALK_MODE)
+        self.assertEqual(walk.speed_mps, 0.90)
         self.assertEqual(walk.locomotion_mode, GAME_CONTROL.SONIC_WALK_MODE)
-        self.assertEqual(walk_boost.speed_mps, 1.00)
-        self.assertEqual(jog.speed_mps, 2.50)
+        self.assertEqual(walk_boost.speed_mps, 0.90)
+        self.assertEqual(jog.speed_mps, 1.40)
         self.assertEqual(jog.locomotion_mode, GAME_CONTROL.SONIC_RUN_MODE)
         self.assertIs(MODULE._bfm_realscan_motion_command(stopped), stopped)
 
-    def test_initial_bfm_with_amp_flat_v3_defers_direct_sonic_handoff(self) -> None:
+    def test_physical_recovery_ignores_upright_low_clearance_sticky_fall(
+        self,
+    ) -> None:
         coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
             MODULE._PhysicalRecoveryCoordinator
         )
-        coordinator.resident_policies = True
-        coordinator.locomotion_slots_only = False
-        coordinator.initial_locomotion_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
-        coordinator.initial_controller = "amp-flat-v3"
-        coordinator._initial_locomotion_policy_requested = False
-        coordinator.request_policy_slot_assignment = mock.Mock()
+        coordinator.pose_candidate_since_s = None
+        coordinator.current_fall_detected = False
 
-        self.assertTrue(coordinator._initial_bfm_amp_bootstrap_required())
-        with mock.patch.dict(
-            os.environ,
-            {"MATRIX_BFM_INITIAL_HANDOFF_MODE": "oracle"},
-        ):
-            self.assertFalse(coordinator._initial_bfm_amp_bootstrap_required())
-        coordinator._request_initial_locomotion_policy_if_ready()
+        snapshot = self.snapshot(fall_detected=True)
+        snapshot.qpos[2] = 0.14
+        snapshot.qpos[3] = 1.0
 
-        coordinator.request_policy_slot_assignment.assert_not_called()
-        self.assertFalse(coordinator._initial_locomotion_policy_requested)
+        self.assertFalse(coordinator._fall_level(snapshot, now_s=1.0))
+        self.assertFalse(coordinator.current_fall_detected)
+        self.assertIsNone(coordinator.pose_candidate_since_s)
+
+    def test_physical_recovery_ignores_medium_tilt_low_clearance_sticky_fall(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.pose_candidate_since_s = None
+        coordinator.current_fall_detected = False
+
+        snapshot = self.snapshot(fall_detected=True)
+        snapshot.qpos[2] = 0.14
+        root_up_z = 0.75
+        snapshot.qpos[3] = math.sqrt((1.0 + root_up_z) * 0.5)
+        snapshot.qpos[4] = math.sqrt((1.0 - root_up_z) * 0.5)
+
+        self.assertFalse(coordinator._fall_level(snapshot, now_s=1.0))
+        self.assertFalse(coordinator.current_fall_detected)
+
+    def test_physical_recovery_accepts_low_tilted_sticky_fall(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.pose_candidate_since_s = None
+        coordinator.current_fall_detected = False
+
+        snapshot = self.snapshot(fall_detected=True)
+        snapshot.qpos[2] = 0.14
+        root_up_z = 0.2
+        snapshot.qpos[3] = math.sqrt((1.0 + root_up_z) * 0.5)
+        snapshot.qpos[4] = math.sqrt((1.0 - root_up_z) * 0.5)
+
+        self.assertFalse(coordinator._fall_level(snapshot, now_s=1.0))
+        self.assertFalse(coordinator.current_fall_detected)
+        self.assertTrue(coordinator._fall_level(snapshot, now_s=1.36))
+        self.assertTrue(coordinator.current_fall_detected)
 
     def test_locomotion_slots_only_loadout_exposes_ready_bfm_without_standup(
         self,
@@ -7033,6 +6928,116 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(recovery["locked"])
         self.assertEqual(recovery["candidates"], [])
 
+    def make_locomotion_switch_admission_coordinator(self):
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.locomotion_slots_only = True
+        coordinator.physics_profiles = None
+        coordinator.fsm = SimpleNamespace(
+            state=MODULE.ResidentRecoveryState.GAME_SONIC
+        )
+        coordinator.worker = mock.Mock(error=None)
+        coordinator.worker.poll = mock.Mock()
+        coordinator.sonic_writer = mock.Mock(error=None, ready=False)
+        coordinator.sonic_writer.poll = mock.Mock()
+        coordinator.replacement_sonic_ready_s = None
+        coordinator._reconcile_policy_slot_assignment = mock.Mock()
+        coordinator._fall_level = mock.Mock(return_value=False)
+        coordinator._request_initial_locomotion_policy_if_ready = mock.Mock()
+        coordinator.selected_locomotion_policy_id = "sonic"
+        coordinator.bfm_switch_admission_ready = False
+        coordinator.bfm_switch_admission_reason = "awaiting_runtime_observation"
+        coordinator.bfm_switch_admission_since_s = None
+        coordinator.bfm_switch_admission_elapsed_s = 0.0
+        return coordinator
+
+    def observe_locomotion_switch_admission(
+        self,
+        coordinator,
+        *,
+        root_z_m: float,
+        root_up_z: float = 1.0,
+        qvel: list[float] | None = None,
+        now_s: float = 1.0,
+    ) -> None:
+        snapshot = self.snapshot(low_cmd_fresh=True, low_cmd_age_s=0.0)
+        snapshot.qpos[2] = root_z_m
+        # Identity orientation keeps root_up_z at 1.0.  Use x-axis tilt when a
+        # lower diagnostic up vector is requested.
+        if root_up_z < 1.0:
+            snapshot.qpos[3] = math.sqrt(max(0.0, (1.0 + root_up_z) * 0.5))
+            snapshot.qpos[4] = math.sqrt(max(0.0, (1.0 - root_up_z) * 0.5))
+        else:
+            snapshot.qpos[3] = 1.0
+        if qvel is not None:
+            snapshot.qvel = qvel
+
+        coordinator.observe(
+            snapshot,
+            now_s=now_s,
+            neutral_confirmed=True,
+            locomotion_switch_neutral_confirmed=True,
+            foot_contact=True,
+            grounded_contact=True,
+            processes=mock.Mock(),
+        )
+
+    def test_locomotion_switch_admission_accepts_trna_upright_clearance(
+        self,
+    ) -> None:
+        coordinator = self.make_locomotion_switch_admission_coordinator()
+
+        self.observe_locomotion_switch_admission(
+            coordinator,
+            root_z_m=0.494208,
+        )
+
+        self.assertFalse(coordinator.bfm_switch_admission_ready)
+        self.assertEqual(coordinator.bfm_switch_admission_reason, "stability_hold")
+        self.assertTrue(coordinator.bfm_switch_admission_telemetry["raw_ready"])
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry["stability_hold_seconds"],
+            MODULE._PhysicalRecoveryCoordinator.BFM_SWITCH_ADMISSION_HOLD_S,
+        )
+
+        self.observe_locomotion_switch_admission(
+            coordinator,
+            root_z_m=0.494208,
+            now_s=2.5,
+        )
+
+        self.assertTrue(coordinator.bfm_switch_admission_ready)
+        self.assertEqual(coordinator.bfm_switch_admission_reason, "ready")
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry["height_threshold_m"],
+            0.45,
+        )
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry["root_z_m"],
+            0.494208,
+        )
+
+    def test_locomotion_switch_admission_rejects_low_pose(
+        self,
+    ) -> None:
+        coordinator = self.make_locomotion_switch_admission_coordinator()
+
+        self.observe_locomotion_switch_admission(
+            coordinator,
+            root_z_m=0.12,
+        )
+
+        self.assertFalse(coordinator.bfm_switch_admission_ready)
+        self.assertEqual(
+            coordinator.bfm_switch_admission_reason,
+            "pose_not_upright",
+        )
+        self.assertEqual(
+            coordinator.bfm_switch_admission_telemetry["height_threshold_m"],
+            0.45,
+        )
+
     def test_bfm_hot_switch_rejects_unswapped_large_target_delta(
         self,
     ) -> None:
@@ -7084,6 +7089,27 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             coordinator.last_locomotion_handoff["bfm_prepare_rejection_reason"],
             result[2],
         )
+
+    def test_bfm_preparation_accepts_lowstate_anchor_without_reference_swap(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+
+        result = coordinator._bfm_hot_switch_preparation_rejection(
+            {"slot": "locomotion"},
+            {
+                "reference_aligned": True,
+                "reference_buffer_swapped": False,
+                "lowstate_anchor_handoff": True,
+                "preview_steps": 4,
+                "target_delta_max_rad": 0.0,
+                "desired_target_delta_max_rad": 10.0,
+            },
+        )
+
+        self.assertIsNone(result)
 
     def test_bfm_locomotion_slot_is_visible_and_rejected_without_writer_calls(
         self,
@@ -7146,8 +7172,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         popen.assert_not_called()
 
         # A provenance-verified resident adapter first refreshes its neutral
-        # shadow, then prepares four writer-free BFM preview ticks.  SONIC is
-        # fenced only after that target/reference admission passes.
+        # shadow, then fences SONIC and realigns to the current BFM reference
+        # before BFM preparation.  The SONIC stand pose is not assumed stable
+        # under the BFM physics/profile contract.
         coordinator.locomotion_policy_candidates = (
             MODULE.PolicyCandidateState(
                 policy_id="bfm-sonic-teacher50k",
@@ -7172,6 +7199,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             paused=True,
             current_first_write=False,
             reference_source="robo_pfnn_formal7168",
+            direct_initial_qpos=tuple(0.01 * index for index in range(36)),
+            direct_initial_qvel=tuple(-0.01 * index for index in range(35)),
+            direct_initial_status_sequence=12,
+            last_state_sequence=41,
             last_status={
                 "world_sample_sequence": 10,
                 "shadow_preview": True,
@@ -7190,6 +7221,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             authority_epoch=3,
         )
         coordinator.physics_profiles = mock.Mock()
+        coordinator.initial_bfm_reference_alignment = {
+            "mode": "online_pfnn_handoff_realign"
+        }
         coordinator.bfm_switch_timeout_s = 10.0
         coordinator._policy_selection_results = {}
         result = coordinator.request_policy_slot_assignment(
@@ -7200,15 +7234,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertIsNone(result)
         coordinator.sonic_writer.send.assert_not_called()
+        self.assertTrue(
+            coordinator._policy_selection_pending["initial_reference_alignment"]
+        )
+        self.assertFalse(
+            coordinator._policy_selection_pending["initial_locomotion_alignment"]
+        )
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
             "await_bfm_shadow",
         )
+        coordinator._align_initial_bfm_reference = mock.Mock()
 
         coordinator.bfm_control.last_status["world_sample_sequence"] = 11
         coordinator._reconcile_policy_slot_assignment()
+        coordinator.sonic_writer.send.assert_called_once_with("PAUSE")
+        coordinator.bfm_control.prepare_activation.assert_not_called()
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_pause_sonic",
+        )
+
+        coordinator.sonic_writer.paused = True
+        coordinator._reconcile_policy_slot_assignment()
+        coordinator._align_initial_bfm_reference.assert_called_once_with(
+            force=True
+        )
+        self.assertEqual(
+            coordinator._policy_selection_pending["phase"],
+            "initial_alignment_wait",
+        )
+
+        coordinator.bfm_control.last_state_sequence = 42
+        coordinator._reconcile_policy_slot_assignment()
         coordinator.bfm_control.prepare_activation.assert_called_once_with(
-            allow_idle_neutral=False
+            aligned_initial=True
         )
         self.assertEqual(
             coordinator._policy_selection_pending["phase"],
@@ -7217,9 +7277,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         coordinator.bfm_control.activation_prepared = True
         coordinator.bfm_control.activation_preparation_status = {
+            "exact_initial_alignment": True,
             "reference_aligned": True,
-            "reference_buffer_swapped": True,
-            "preview_steps": 4,
+            "reference_buffer_swapped": False,
+            "preview_steps": 1,
             "target_delta_max_rad": 0.01,
             "desired_target_delta_max_rad": 0.33,
         }
@@ -7243,7 +7304,6 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.bfm_control.activate.side_effect = (
             lambda: events.append("activate_bfm")
         )
-        coordinator.sonic_writer.paused = True
         coordinator._reconcile_policy_slot_assignment()
         self.assertEqual(
             events,
@@ -7852,9 +7912,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                             "episode_id": episode_id,
                             "transition_id": hold["transition_id"],
                             "writer_reused": True,
-                            "measured_joint_target": False,
-                            "prior_pd_target_reused": True,
-                            "prior_pd_joint_count": 29,
+                            "measured_joint_target": True,
+                            "measured_joint_count": 29,
                             "capture_once": True,
                             "lowstate_capture_age_s": 0.01,
                             "target_velocity_zero": True,
@@ -7883,32 +7942,6 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             finally:
                 peer.close()
                 control.close()
-
-    def test_joint_hold_may_follow_confirmed_amp_hold_first_write(self) -> None:
-        control = MODULE._RecoveryWorkerControl(Path("/unused/recovery.sock"))
-        packets: list[dict[str, object]] = []
-        connection = mock.Mock()
-        connection.send.side_effect = lambda packet: (
-            packets.append(json.loads(packet.decode("utf-8"))) or len(packet)
-        )
-        control.connection = connection
-        control.episode_id = 7
-        control.go_sent = True
-        control.first_write = True
-        control.paused = False
-        control.amp_hold_sent = True
-        control.amp_hold_first_write = False
-
-        with self.assertRaisesRegex(RuntimeError, "not valid"):
-            control.send("ENTER_JOINT_HOLD")
-
-        control.amp_hold_first_write = True
-        control.send("ENTER_JOINT_HOLD")
-
-        self.assertEqual(packets[-1]["command"], "ENTER_JOINT_HOLD")
-        self.assertEqual(packets[-1]["episode_id"], 7)
-        self.assertTrue(control.joint_hold_sent)
-        self.assertEqual(control.hold_kind, "joint_pose")
 
     @unittest.skipUnless(
         hasattr(socket, "SOCK_SEQPACKET") and hasattr(socket, "SO_PEERCRED"),
@@ -8184,6 +8217,41 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertIsNone(coordinator.runtime_pause_writer_epoch)
         self.assertFalse(coordinator.runtime_pause_resume_sent)
 
+    def test_runtime_continue_retries_transient_bfm_freshness_rejection(
+        self,
+    ) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.selected_locomotion_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator.sonic_writer = mock.Mock()
+        writer = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        writer.ready = True
+        writer.warmed = True
+        writer.models_warmed = True
+        writer.paused = True
+        writer.first_write = True
+        writer.authority_epoch = 6
+        writer.activation_rejected_reason = "inputs_not_fresh"
+        writer.activation_preparation_status = {"reason": "inputs_not_fresh"}
+        writer.prepare_activation = mock.Mock()
+        coordinator.bfm_control = writer
+        coordinator.runtime_pause_policy_id = MODULE.BFM_TEACHER50K_POLICY_ID
+        coordinator.runtime_pause_writer_epoch = 6
+        coordinator.runtime_pause_resume_sent = False
+
+        coordinator.request_runtime_continue()
+
+        self.assertIsNone(writer.activation_rejected_reason)
+        self.assertIsNone(writer.activation_preparation_status)
+        writer.prepare_activation.assert_not_called()
+        self.assertFalse(coordinator.runtime_pause_resume_sent)
+
+        coordinator.request_runtime_continue()
+
+        writer.prepare_activation.assert_called_once_with(aligned_initial=True)
+        self.assertFalse(coordinator.runtime_pause_resume_sent)
+
     def test_resident_worker_ready_requires_gpu_policy_attestation(self) -> None:
         control = MODULE._RecoveryWorkerControl(
             Path("/unused/recovery.sock"),
@@ -8273,7 +8341,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(telemetry["resident_writer_created"])
         self.assertFalse(telemetry["paused_no_writer"])
 
-    def test_bfm_control_accepts_fenced_prepared_writer_before_go(self) -> None:
+    def test_bfm_control_requires_writer_free_preparation_before_go(self) -> None:
         control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
         sent: list[dict[str, object]] = []
 
@@ -8302,8 +8370,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "event": "ACTIVATION_PREPARED",
                     "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
                     "authority_epoch": 1,
-                    "writer_created": True,
-                    "writer_reused": True,
+                    "writer_created": False,
                     "write_authorized": False,
                     "reference_aligned": True,
                     "reference_pending_rebuild": False,
@@ -8377,6 +8444,72 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertTrue(control.activation_prepared)
 
+    def test_bfm_control_accepts_paused_status_as_pause_ack(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        control.ready = True
+        control.warmed = True
+        control.models_warmed = True
+        control.first_write = True
+        control.epoch_first_write = True
+        control.paused = False
+        control.pause_pending = True
+        control.authority_epoch = 3
+        control.requested_authority_epoch = 3
+
+        control._handle_packet(
+            json.dumps(
+                {
+                    "schema": control.SCHEMA,
+                    "event": "STATUS",
+                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
+                    "authority_epoch": 3,
+                    "controller": "PAUSED_RESIDENT_WRITER",
+                    "writer_created": True,
+                    "write_authorized": False,
+                    "models_warmed": True,
+                }
+            ).encode("utf-8")
+        )
+
+        self.assertTrue(control.paused)
+        self.assertFalse(control.pause_pending)
+        self.assertFalse(control.current_first_write)
+        self.assertFalse(control.epoch_first_write)
+
+    def test_bfm_control_can_cancel_rejected_preparation(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        control.preparation_pending = True
+        control.activation_prepared = True
+        control.activation_pending = True
+        control.preparation_aligned_initial_requested = True
+        control.preparation_idle_neutral_requested = True
+        control.activation_preparation_status = {"reference_buffer_swapped": False}
+
+        control.cancel_preparation()
+
+        self.assertFalse(control.preparation_pending)
+        self.assertFalse(control.activation_prepared)
+        self.assertFalse(control.activation_pending)
+        self.assertFalse(control.preparation_aligned_initial_requested)
+        self.assertFalse(control.preparation_idle_neutral_requested)
+        self.assertIsNone(control.activation_preparation_status)
+
+    def test_bfm_control_retries_transient_freshness_rejection(self) -> None:
+        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
+        control.activation_rejected_reason = "inputs_not_fresh"
+        control.activation_preparation_status = {"reason": "inputs_not_fresh"}
+
+        self.assertTrue(control.retry_transient_preparation())
+        self.assertIsNone(control.activation_rejected_reason)
+        self.assertIsNone(control.activation_preparation_status)
+
+        control.activation_rejected_reason = "target_delta_exceeded"
+        self.assertFalse(control.retry_transient_preparation())
+        self.assertEqual(
+            control.activation_rejected_reason,
+            "target_delta_exceeded",
+        )
+
     def test_bfm_control_accepts_unlimited_exact_initial_target(self) -> None:
         control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
         sent: list[dict[str, object]] = []
@@ -8416,8 +8549,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "event": "ACTIVATION_PREPARED",
                     "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
                     "authority_epoch": 1,
-                    "writer_created": True,
-                    "writer_reused": True,
+                    "writer_created": False,
                     "write_authorized": False,
                     "exact_initial_alignment": True,
                     "reference_aligned": True,
@@ -8432,36 +8564,6 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         self.assertTrue(control.activation_prepared)
         self.assertFalse(control.preparation_pending)
-
-    def test_bfm_control_retries_transient_input_freshness_rejection(self) -> None:
-        control = MODULE._BfmTeacherControl(Path("/unused/bfm.sock"))
-        control.ready = True
-        control.warmed = True
-        control.paused = True
-        control.first_write = True
-        control.connection = SimpleNamespace(send=lambda packet: len(packet))
-
-        control.prepare_activation()
-        control._handle_packet(
-            json.dumps(
-                {
-                    "schema": control.SCHEMA,
-                    "event": "ACTIVATION_REJECTED",
-                    "policy_id": MODULE.BFM_TEACHER50K_POLICY_ID,
-                    "authority_epoch": 1,
-                    "writer_created": True,
-                    "writer_reused": True,
-                    "write_authorized": False,
-                    "reason": "inputs_not_fresh",
-                    "world_age_s": 0.16,
-                }
-            ).encode("utf-8")
-        )
-
-        self.assertTrue(control.retry_transient_preparation())
-        self.assertIsNone(control.activation_rejected_reason)
-        self.assertIsNone(control.activation_preparation_status)
-        self.assertFalse(control.retry_transient_preparation())
 
     def test_recovery_worker_tracks_first_write_authority_across_fallback(
         self,
@@ -9362,6 +9464,141 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertTrue(coordinator.policy_advance_requested)
         self.assertEqual(coordinator.policy_advances, 1)
 
+    def test_resident_kungfu_fallback_can_catch_unsettled_upright_pose(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.worker = mock.Mock()
+        coordinator.worker.fallback_due = True
+        coordinator.worker.connection = object()
+        coordinator.worker.go_sent = True
+        coordinator.worker.stop_sent = False
+        coordinator.worker.amp_hold_sent = False
+        coordinator.worker.joint_hold_sent = False
+        coordinator.policy_fallback_last_near_upright_s = None
+        coordinator.policy_fallback_quiet_since_s = None
+        coordinator.policy_advance_requested = False
+        coordinator.policy_advances = 0
+        arguments = {
+            "root_z_m": 0.75,
+            "root_up_z": 0.99,
+            "root_linear_speed_m_s": 0.05,
+            "root_angular_speed_rad_s": 1.1,
+            "joint_velocity_rms_rad_s": 0.8,
+            "grounded_contact": True,
+            "recovery_state": MODULE.ResidentRecoveryState.POLICY_RECOVERING,
+            "policy_alive": True,
+            "worker_controller": "KUNGFU_GETUP",
+        }
+
+        coordinator._maybe_authorize_policy_advance(now_s=45.0, **arguments)
+        coordinator.worker.send.assert_not_called()
+        coordinator._maybe_authorize_policy_advance(now_s=45.26, **arguments)
+
+        coordinator.worker.send.assert_called_once_with("ADVANCE_POLICY")
+        self.assertTrue(coordinator.policy_advance_requested)
+        self.assertEqual(coordinator.policy_advances, 1)
+
+    def test_bfm_recovery_joint_hold_requires_continuous_capture_window(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.selected_locomotion_policy_id = (
+            MODULE.BFM_TEACHER50K_POLICY_ID
+        )
+        coordinator.fsm = SimpleNamespace(config=MODULE.RecoveryConfig())
+        coordinator.bfm_recovery_joint_hold_candidate_since_s = None
+        coordinator.worker = mock.Mock()
+        coordinator.worker.connection = object()
+        coordinator.worker.go_sent = True
+        coordinator.worker.first_write = True
+        coordinator.worker.paused = False
+        coordinator.worker.pause_sent = False
+        coordinator.worker.stop_sent = False
+        coordinator.worker.amp_hold_sent = False
+        coordinator.worker.joint_hold_sent = False
+        coordinator.worker.advance_transition_id = None
+        coordinator.worker.policy_selection_transition_id = None
+        arguments = {
+            "recovery_state": MODULE.ResidentRecoveryState.POLICY_RECOVERING,
+            "policy_alive": True,
+            "worker_controller": "KUNGFU_GETUP",
+            "fall_detected": False,
+            "lowcmd_fresh": True,
+            "lowcmd_age_s": 0.02,
+            "root_z_m": 0.70,
+            "root_up_z": 0.99,
+            "root_linear_speed_m_s": 0.05,
+            "root_angular_speed_rad_s": 0.70,
+            "joint_velocity_rms_rad_s": 0.60,
+            "foot_contact": True,
+            "grounded_contact": True,
+        }
+
+        self.assertFalse(
+            coordinator._maybe_enter_bfm_recovery_joint_hold(
+                now_s=10.0,
+                **arguments,
+            )
+        )
+        coordinator.worker.send.assert_not_called()
+        self.assertFalse(
+            coordinator._maybe_enter_bfm_recovery_joint_hold(
+                now_s=10.2,
+                **arguments,
+            )
+        )
+        coordinator.worker.send.assert_not_called()
+        self.assertTrue(
+            coordinator._maybe_enter_bfm_recovery_joint_hold(
+                now_s=10.36,
+                **arguments,
+            )
+        )
+        coordinator.worker.send.assert_called_once_with("ENTER_JOINT_HOLD")
+
+    def test_bfm_recovery_joint_hold_capture_resets_on_fall(self) -> None:
+        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
+            MODULE._PhysicalRecoveryCoordinator
+        )
+        coordinator.selected_locomotion_policy_id = (
+            MODULE.BFM_TEACHER50K_POLICY_ID
+        )
+        coordinator.fsm = SimpleNamespace(config=MODULE.RecoveryConfig())
+        coordinator.bfm_recovery_joint_hold_candidate_since_s = 10.0
+        coordinator.worker = mock.Mock()
+        coordinator.worker.connection = object()
+        coordinator.worker.go_sent = True
+        coordinator.worker.first_write = True
+        coordinator.worker.paused = False
+        coordinator.worker.pause_sent = False
+        coordinator.worker.stop_sent = False
+        coordinator.worker.amp_hold_sent = False
+        coordinator.worker.joint_hold_sent = False
+        coordinator.worker.advance_transition_id = None
+        coordinator.worker.policy_selection_transition_id = None
+
+        entered = coordinator._maybe_enter_bfm_recovery_joint_hold(
+            now_s=10.5,
+            recovery_state=MODULE.ResidentRecoveryState.POLICY_RECOVERING,
+            policy_alive=True,
+            worker_controller="KUNGFU_GETUP",
+            fall_detected=True,
+            lowcmd_fresh=True,
+            lowcmd_age_s=0.02,
+            root_z_m=0.70,
+            root_up_z=0.99,
+            root_linear_speed_m_s=0.05,
+            root_angular_speed_rad_s=0.20,
+            joint_velocity_rms_rad_s=0.20,
+            foot_contact=True,
+            grounded_contact=True,
+        )
+
+        self.assertFalse(entered)
+        coordinator.worker.send.assert_not_called()
+        self.assertIsNone(coordinator.bfm_recovery_joint_hold_candidate_since_s)
+
     def test_low_supine_pose_is_not_mistaken_for_upright(self) -> None:
         coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
             MODULE._PhysicalRecoveryCoordinator
@@ -9411,6 +9648,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         coordinator.physics_profiles = mock.Mock()
         coordinator.worker = mock.Mock()
         coordinator.worker.begin_resident_episode.return_value = 17
+        coordinator.worker.paused = False
+        coordinator.worker.pause_sent = False
+        coordinator.worker.joint_hold_sent = False
+        coordinator.worker.joint_hold_first_write = False
         coordinator.sonic_writer = mock.Mock(
             paused=True,
             pause_pending=False,
@@ -9425,12 +9666,14 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             activation_prepared=False,
             activation_rejected_reason=None,
             activation_pending=False,
-            preparation_cancel_pending=False,
         )
         processes = mock.Mock()
         processes.recovery_policy_alive.return_value = True
         planner = mock.Mock()
         events: list[str] = []
+        coordinator._align_initial_bfm_reference = mock.Mock(
+            side_effect=lambda *, force=False: events.append(f"align:{force}")
+        )
         coordinator.physics_profiles.apply.side_effect = (
             lambda profile_id: events.append(f"physics:{profile_id}")
         )
@@ -9458,35 +9701,70 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         events.clear()
         coordinator.bfm_control.prepare_activation.side_effect = (
-            lambda **_kwargs: events.append("prepare_bfm")
+            lambda **kwargs: events.append(f"prepare_bfm:{kwargs}")
         )
         coordinator.bfm_control.activate.side_effect = (
             lambda: events.append("activate_bfm")
         )
         coordinator.execute(
             MODULE.ResidentRecoveryOutput(
-                previous_state=MODULE.ResidentRecoveryState.POLICY_QUIET,
-                state=MODULE.ResidentRecoveryState.SONIC_RESUME_REQUESTED,
-                resume_sonic_writer=True,
+                previous_state=MODULE.ResidentRecoveryState.POLICY_RECOVERING,
+                state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+                request_policy_pause=True,
             ),
             processes=processes,
             planner=planner,
         )
         self.assertEqual(
             events,
-            ["prepare_bfm"],
+            ["worker:ENTER_JOINT_HOLD"],
         )
-        coordinator.bfm_control.prepare_activation.assert_called_once_with(
-            allow_lowstate_anchor=True
+        coordinator._align_initial_bfm_reference.assert_not_called()
+
+        events.clear()
+        coordinator.worker.joint_hold_sent = True
+        coordinator.execute(
+            MODULE.ResidentRecoveryOutput(
+                previous_state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+                state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+            ),
+            processes=processes,
+            planner=planner,
+        )
+        self.assertEqual(events, [])
+
+        coordinator.worker.joint_hold_first_write = True
+        coordinator.execute(
+            MODULE.ResidentRecoveryOutput(
+                previous_state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+                state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+            ),
+            processes=processes,
+            planner=planner,
+        )
+        self.assertEqual(
+            events,
+            ["prepare_bfm:{'allow_idle_neutral': True}"],
         )
 
         events.clear()
         coordinator.bfm_control.activation_prepared = True
+        coordinator.bfm_control.preparation_pending = False
+        coordinator.execute(
+            MODULE.ResidentRecoveryOutput(
+                previous_state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+                state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
+            ),
+            processes=processes,
+            planner=planner,
+        )
+        self.assertEqual(events, ["worker:PAUSE"])
+
+        events.clear()
         coordinator.execute(
             MODULE.ResidentRecoveryOutput(
                 previous_state=MODULE.ResidentRecoveryState.POLICY_QUIET,
                 state=MODULE.ResidentRecoveryState.SONIC_RESUME_REQUESTED,
-                resume_sonic_writer=False,
             ),
             processes=processes,
             planner=planner,
@@ -9496,115 +9774,6 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             [
                 "physics:bfm-sonic-teacher50k",
                 "activate_bfm",
-            ],
-        )
-
-    def test_bfm_recovery_prepares_before_pausing_recovery_writer(self) -> None:
-        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
-            MODULE._PhysicalRecoveryCoordinator
-        )
-        coordinator.locomotion_policy_candidates = ()
-        coordinator.resident_policies = True
-        coordinator._resident_worker_attested = mock.Mock(return_value=True)
-        coordinator.initial_sonic_gate_pending = False
-        coordinator.selected_locomotion_policy_id = (
-            MODULE.BFM_TEACHER50K_POLICY_ID
-        )
-        coordinator.worker = mock.Mock(paused=False, pause_sent=False)
-        coordinator.sonic_writer = mock.Mock()
-        coordinator.bfm_control = mock.Mock(
-            paused=True,
-            pause_pending=False,
-            stop_sent=False,
-            preparation_pending=False,
-            activation_prepared=False,
-            activation_rejected_reason=None,
-            activation_pending=False,
-            preparation_cancel_pending=False,
-        )
-        processes = mock.Mock()
-        processes.recovery_policy_alive.return_value = True
-        output = MODULE.ResidentRecoveryOutput(
-            previous_state=MODULE.ResidentRecoveryState.POLICY_STABLE,
-            state=MODULE.ResidentRecoveryState.POLICY_STABLE,
-            prepare_locomotion_writer=True,
-        )
-
-        coordinator.execute(output, processes=processes, planner=mock.Mock())
-
-        coordinator.bfm_control.prepare_activation.assert_called_once_with(
-            allow_lowstate_anchor=True
-        )
-        coordinator.worker.send.assert_not_called()
-
-        coordinator.bfm_control.activation_prepared = True
-        coordinator.execute(
-            MODULE.ResidentRecoveryOutput(
-                previous_state=MODULE.ResidentRecoveryState.POLICY_STABLE,
-                state=MODULE.ResidentRecoveryState.POLICY_PAUSE_REQUESTED,
-                request_policy_pause=True,
-            ),
-            processes=processes,
-            planner=mock.Mock(),
-        )
-        coordinator.worker.send.assert_called_once_with("PAUSE")
-
-    def test_flat_v3_to_amp_hold_switches_to_hold_physics_before_command(self) -> None:
-        coordinator = MODULE._PhysicalRecoveryCoordinator.__new__(
-            MODULE._PhysicalRecoveryCoordinator
-        )
-        coordinator.locomotion_policy_candidates = ()
-        coordinator.resident_policies = True
-        coordinator._resident_worker_attested = mock.Mock(return_value=True)
-        coordinator.initial_sonic_gate_pending = False
-        coordinator.selected_locomotion_policy_id = "sonic"
-        coordinator.worker = mock.Mock(selected_policy_id="amp-flat-v3")
-        coordinator.sonic_writer = mock.Mock()
-        coordinator.bfm_control = mock.Mock()
-        events: list[str] = []
-        coordinator.physics_profiles = mock.Mock()
-        coordinator.physics_profiles.apply.side_effect = (
-            lambda profile_id: events.append(f"physics:{profile_id}")
-        )
-        coordinator.worker.send.side_effect = (
-            lambda command: events.append(f"worker:{command}")
-        )
-        processes = mock.Mock()
-        processes.recovery_policy_alive.return_value = True
-
-        coordinator.execute(
-            MODULE.ResidentRecoveryOutput(
-                previous_state=MODULE.ResidentRecoveryState.POLICY_RECOVERING,
-                state=MODULE.ResidentRecoveryState.POLICY_RECOVERING,
-                request_policy_hold=True,
-            ),
-            processes=processes,
-            planner=mock.Mock(),
-        )
-
-        self.assertEqual(
-            events,
-            [
-                "physics:sonic-recovery",
-                "worker:ENTER_AMP_HOLD",
-            ],
-        )
-
-        events.clear()
-        coordinator.execute(
-            MODULE.ResidentRecoveryOutput(
-                previous_state=MODULE.ResidentRecoveryState.POLICY_RECOVERING,
-                state=MODULE.ResidentRecoveryState.POLICY_RECOVERING,
-                request_policy_joint_hold=True,
-            ),
-            processes=processes,
-            planner=mock.Mock(),
-        )
-        self.assertEqual(
-            events,
-            [
-                "physics:sonic-recovery",
-                "worker:ENTER_JOINT_HOLD",
             ],
         )
 

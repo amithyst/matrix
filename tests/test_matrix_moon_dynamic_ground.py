@@ -37,7 +37,8 @@ class FakeModel:
         unmapped: tuple[int, int] | None = None,
         duplicate_mocap: tuple[tuple[int, int], tuple[int, int]] | None = None,
         continuous_support: bool = True,
-        tile_collision_enabled: bool = False,
+        support_collision_enabled: bool = False,
+        tile_collision_enabled: bool = True,
     ) -> None:
         names: list[str | None] = ["world", "pelvis"]
         keys: list[tuple[int, int] | None] = [None, None]
@@ -79,8 +80,8 @@ class FakeModel:
             geom_body_ids.append(0)
             geom_data_ids.append(0)
             geom_types.append(1)
-            geom_contype.append(1)
-            geom_conaffinity.append(1)
+            geom_contype.append(1 if support_collision_enabled else 0)
+            geom_conaffinity.append(1 if support_collision_enabled else 0)
             self._geom_names.append(MODULE.SPAWN_PAD_GEOM_NAME)
             geom_body_ids.append(0)
             geom_data_ids.append(-1)
@@ -284,11 +285,9 @@ class MoonDynamicGroundTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(
             MODULE.MoonDynamicGroundError,
-            "remains collidable",
+            "tile collision mask",
         ):
-            MODULE.resolve_continuous_support(
-                FakeModel(tile_collision_enabled=True)
-            )
+            MODULE.resolve_continuous_support(FakeModel(tile_collision_enabled=False))
 
     def test_rejects_drifted_continuous_support_binding_and_collision(self) -> None:
         cases = (
@@ -309,8 +308,8 @@ class MoonDynamicGroundTest(unittest.TestCase):
             ),
             (
                 "collision mask",
-                {"geom_contype": 0, "geom_conaffinity": 0},
-                "compiled with contype=1",
+                {"geom_contype": 1, "geom_conaffinity": 1},
+                "continuous support collision mask",
             ),
         )
         for label, replacements, message in cases:
@@ -393,28 +392,28 @@ class MoonDynamicGroundTest(unittest.TestCase):
                 self.assertTrue(ground.collision_handoff_active)
                 self.assertEqual(
                     forward_states,
-                    [((1, 1), (0, 0), (0, 0))],
+                    [((0, 0), (0, 0), (1, 1))],
                 )
                 self.assertEqual(
                     tuple(model.geom_contype[:2]),
-                    (1, 0),
+                    (0, 0),
                 )
                 self.assertEqual(
                     tuple(model.geom_conaffinity[:2]),
-                    (1, 0),
+                    (0, 0),
                 )
-                self.assertTrue(np.all(model.geom_contype[2:] == 0))
-                self.assertTrue(np.all(model.geom_conaffinity[2:] == 0))
+                self.assertTrue(np.all(model.geom_contype[2:] == 1))
+                self.assertTrue(np.all(model.geom_conaffinity[2:] == 1))
                 telemetry = ground.telemetry()
                 self.assertTrue(telemetry["collision_handoff"]["active"])
-                self.assertTrue(
+                self.assertFalse(
                     telemetry["continuous_support"]["collision_enabled"]
                 )
                 self.assertEqual(
                     telemetry["collision_handoff"][
                         "rolling_tile_collision_mask"
                     ],
-                    [0, 0],
+                    [1, 1],
                 )
                 with self.assertRaisesRegex(
                     MODULE.MoonDynamicGroundError,
@@ -452,6 +451,61 @@ class MoonDynamicGroundTest(unittest.TestCase):
                 self.assertEqual(tuple(model.geom_conaffinity[:2]), (0, 1))
                 self.assertTrue(np.all(model.geom_contype[2:] == 0))
                 self.assertTrue(np.all(model.geom_conaffinity[2:] == 0))
+
+    def test_heightfield_collision_mode_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            path = Path(temporary_dir) / "moonworld.bin"
+            write_sparse_map(path)
+            model = FakeModel(
+                support_collision_enabled=True,
+                tile_collision_enabled=False,
+            )
+            data = FakeData()
+            forward_states: list[
+                tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+            ] = []
+
+            def forward(_model: FakeModel, _data: FakeData) -> None:
+                forward_states.append(
+                    (
+                        (
+                            int(model.geom_contype[0]),
+                            int(model.geom_conaffinity[0]),
+                        ),
+                        (
+                            int(model.geom_contype[1]),
+                            int(model.geom_conaffinity[1]),
+                        ),
+                        (
+                            int(model.geom_contype[2]),
+                            int(model.geom_conaffinity[2]),
+                        ),
+                    )
+                )
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE": (
+                        "rolling-heightfield-v2"
+                    )
+                },
+            ):
+                with MODULE.MoonDynamicGround(path, model) as ground:
+                    self.assertEqual(
+                        ground.collision_mode,
+                        MODULE.COLLISION_MODE_ROLLING_HFIELD,
+                    )
+                    ground.update_mocap(data)
+                    handoff = ground.activate_collision_handoff(
+                        data,
+                        forward=forward,
+                    )
+
+            self.assertEqual(handoff["ground_mode"], "rolling-heightfield-v2")
+            self.assertEqual(forward_states, [((1, 1), (0, 0), (0, 0))])
+            self.assertEqual(tuple(model.geom_contype[:2]), (1, 0))
+            self.assertTrue(np.all(model.geom_contype[2:] == 0))
 
     def test_rejects_size_hash_and_non_finite_samples(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -591,6 +645,39 @@ class MoonDynamicGroundTest(unittest.TestCase):
             self.assertTrue(ground.closed)
             with self.assertRaises(MODULE.MoonDynamicGroundError):
                 ground.update_mocap(data)
+
+    def test_flat_anchor_filter_keeps_active_ground_at_start_height(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            path = Path(temporary_dir) / "moonworld.bin"
+            write_sparse_map(
+                path,
+                {
+                    (3000, 3000): 1.25,
+                    (3000, 3002): 5.0,
+                },
+            )
+            data = FakeData()
+            with mock.patch.dict(
+                "os.environ",
+                {"MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER": "flat-anchor"},
+            ):
+                with MODULE.MoonDynamicGround(path, FakeModel()) as ground:
+                    first = ground.update_mocap(data, base_xy=(0.0, 0.0))
+                    moved = ground.update_mocap(data, base_xy=(0.2, 0.0))
+
+                    self.assertEqual(first["height_filter"], "flat-anchor")
+                    self.assertEqual(first["local_ground_height_m"], 1.25)
+                    self.assertAlmostEqual(
+                        moved["raw_local_ground_height_m"],
+                        5.0,
+                    )
+                    self.assertEqual(moved["local_ground_height_m"], 1.25)
+                    self.assertEqual(moved["height_range_m"], [1.25, 1.25])
+                    self.assertEqual(
+                        ground.telemetry()["filtered_center_xy_m"],
+                        [0.0, 0.0],
+                    )
+                    self.assertEqual(ground.sample_height(0.2, 0.0), 1.25)
 
     def test_quantized_base_cache_skips_tile_calculation_and_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

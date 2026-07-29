@@ -109,7 +109,7 @@ class InputProtocolTest(unittest.TestCase):
         value = snapshot().to_mapping()
         value["keyboard_boost"] = True
         with self.assertRaisesRegex(
-            MODULE.InputProtocolError, "requires at least one pressed WASD"
+            MODULE.InputProtocolError, "requires at least one pressed WASD or Q/E"
         ):
             MODULE.InputSnapshot.from_mapping(value)
 
@@ -231,6 +231,8 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(config.max_acceleration_mps2, 1.20)
         self.assertEqual(config.max_deceleration_mps2, 2.40)
         self.assertEqual(config.max_turn_rate_rad_s, 2.50)
+        self.assertEqual(config.keyboard_turn_rate_rad_s, 2.50)
+        self.assertEqual(config.keyboard_turn_boost_rate_rad_s, 3.00)
         self.assertEqual(config.keyboard_slow_speed_mps, 0.20)
         self.assertEqual(config.keyboard_slow_boost_speed_mps, 0.30)
         self.assertEqual(config.keyboard_walk_speed_mps, 0.80)
@@ -263,6 +265,11 @@ class GameControlCoreTest(unittest.TestCase):
             MODULE.ControlConfig(keyboard_walk_speed_mps=0.79)
         with self.assertRaisesRegex(ValueError, "keyboard run speeds"):
             MODULE.ControlConfig(keyboard_run_boost_speed_mps=7.51)
+        with self.assertRaisesRegex(ValueError, "keyboard turn boost rate"):
+            MODULE.ControlConfig(
+                keyboard_turn_rate_rad_s=3.0,
+                keyboard_turn_boost_rate_rad_s=2.5,
+            )
 
     def test_w_follows_camera_and_orients_to_movement(self) -> None:
         core = armed_core(immediate_config())
@@ -576,6 +583,68 @@ class GameControlCoreTest(unittest.TestCase):
         both = armed_core(immediate_config())
         both.accept_snapshot(snapshot(pressed=("q", "e")), received_at_s=10.0)
         self.assertEqual(both.command(now_s=10.0, dt_s=0.1).mode, "idle")
+
+    def test_q_and_e_double_tap_use_keyboard_turn_boost_rate(self) -> None:
+        normal = armed_core(
+            immediate_config(
+                keyboard_turn_rate_rad_s=1.0,
+                keyboard_turn_boost_rate_rad_s=2.0,
+            )
+        )
+        normal.accept_snapshot(snapshot(pressed=("q",)), received_at_s=10.0)
+        normal_command = normal.command(now_s=10.0, dt_s=0.1)
+
+        boosted = armed_core(
+            immediate_config(
+                keyboard_turn_rate_rad_s=1.0,
+                keyboard_turn_boost_rate_rad_s=2.0,
+            )
+        )
+        boosted.accept_snapshot(
+            snapshot(pressed=("q",), boost=True), received_at_s=10.0
+        )
+        boosted_command = boosted.command(now_s=10.0, dt_s=0.1)
+
+        self.assertAlmostEqual(
+            math.atan2(normal_command.facing[1], normal_command.facing[0]),
+            0.1,
+        )
+        self.assertAlmostEqual(
+            math.atan2(boosted_command.facing[1], boosted_command.facing[0]),
+            0.2,
+        )
+
+    def test_q_turn_rates_remain_distinct_with_measured_heading_feedback(self) -> None:
+        normal = armed_core(
+            immediate_config(
+                keyboard_turn_rate_rad_s=2.75,
+                keyboard_turn_boost_rate_rad_s=3.50,
+            )
+        )
+        normal.synchronize_heading(0.0)
+        normal.accept_snapshot(snapshot(pressed=("q",)), received_at_s=10.0)
+        normal_command = normal.command(now_s=10.0, dt_s=0.02)
+
+        boosted = armed_core(
+            immediate_config(
+                keyboard_turn_rate_rad_s=2.75,
+                keyboard_turn_boost_rate_rad_s=3.50,
+            )
+        )
+        boosted.synchronize_heading(0.0)
+        boosted.accept_snapshot(
+            snapshot(pressed=("q",), boost=True), received_at_s=10.0
+        )
+        boosted_command = boosted.command(now_s=10.0, dt_s=0.02)
+
+        self.assertAlmostEqual(
+            math.atan2(normal_command.facing[1], normal_command.facing[0]),
+            0.055,
+        )
+        self.assertAlmostEqual(
+            math.atan2(boosted_command.facing[1], boosted_command.facing[0]),
+            0.07,
+        )
 
     def test_camera_strafe_moves_in_camera_frame_and_holds_body_heading(self) -> None:
         core = armed_core(
