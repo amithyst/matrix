@@ -6830,6 +6830,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
             )
         )
+        capped_jog = MODULE._bfm_realscan_motion_command(
+            replace(
+                base,
+                speed_mps=0.40,
+                locomotion_mode=GAME_CONTROL.SONIC_SLOW_WALK_MODE,
+                requested_locomotion_mode=GAME_CONTROL.SONIC_RUN_MODE,
+                requested_speed_mps=2.50,
+            )
+        )
         stopped = replace(
             base,
             movement=(0.0, 0.0, 0.0),
@@ -6845,6 +6854,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(walk_boost.speed_mps, 0.90)
         self.assertEqual(jog.speed_mps, 1.40)
         self.assertEqual(jog.locomotion_mode, GAME_CONTROL.SONIC_RUN_MODE)
+        self.assertEqual(capped_jog.speed_mps, 1.40)
+        self.assertEqual(capped_jog.locomotion_mode, GAME_CONTROL.SONIC_RUN_MODE)
         self.assertIs(MODULE._bfm_realscan_motion_command(stopped), stopped)
 
     def test_physical_recovery_ignores_upright_low_clearance_sticky_fall(

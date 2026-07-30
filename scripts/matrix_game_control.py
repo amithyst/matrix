@@ -622,6 +622,12 @@ class RobotMotionCommand:
     # SONIC serialization ignores this metadata.  Keeping it optional preserves
     # compatibility with external/test commands that only provide wire fields.
     desired_facing: tuple[float, float, float] | None = None
+    # Native locomotion can be downgraded by alignment gates or a moon-safe
+    # keyboard speed cap.  Keep the operator-requested tier as metadata so
+    # adapters such as BFM RealScan can still distinguish Shift/Jog from a
+    # capped walk without loosening the global safety cap.
+    requested_locomotion_mode: int | None = None
+    requested_speed_mps: float | None = None
 
 
 class GameControlCore:
@@ -1059,6 +1065,8 @@ class GameControlCore:
             safe_stop=True,
             reason=reason,
             desired_facing=facing,
+            requested_locomotion_mode=SONIC_IDLE_MODE,
+            requested_speed_mps=0.0,
         )
 
     def _safety_reason(self, now_s: float) -> tuple[str, bool] | None:
@@ -1191,6 +1199,8 @@ class GameControlCore:
         alignment = 0.0
         requested_speed = 0.0
         requested_locomotion_mode = SONIC_IDLE_MODE
+        user_requested_speed = 0.0
+        user_requested_locomotion_mode = SONIC_IDLE_MODE
         desired_heading = self._command_heading_rad
         movement_heading = self._command_heading_rad
         pure_forward_alignment_crawl = False
@@ -1312,6 +1322,8 @@ class GameControlCore:
             requested_speed, requested_locomotion_mode = (
                 self._requested_locomotion(input_magnitude)
             )
+            user_requested_speed = requested_speed
+            user_requested_locomotion_mode = requested_locomotion_mode
             if (
                 digital_movement
                 and self.config.keyboard_speed_cap_mps is not None
@@ -1590,6 +1602,8 @@ class GameControlCore:
                 else None
             ),
             desired_facing=desired_direction,
+            requested_locomotion_mode=user_requested_locomotion_mode,
+            requested_speed_mps=user_requested_speed,
         )
         if completing_neutral_rearm:
             self._complete_neutral_rearm_frame()

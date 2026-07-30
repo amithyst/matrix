@@ -458,6 +458,28 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(moving.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
         self.assertAlmostEqual(moving.speed_mps, 0.8)
 
+    def test_keyboard_speed_cap_preserves_requested_run_tier(self) -> None:
+        core = armed_core(
+            immediate_config(
+                keyboard_speed_cap_mps=0.4,
+                max_speed_mps=0.8,
+            )
+        )
+        core.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        moving = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(moving.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertAlmostEqual(moving.speed_mps, 0.4)
+        self.assertEqual(
+            moving.requested_locomotion_mode,
+            MODULE.SONIC_RUN_MODE,
+        )
+        self.assertAlmostEqual(moving.requested_speed_mps, 2.5)
+
     def test_keyboard_run_to_analog_clamps_to_configured_cap_immediately(self) -> None:
         core = armed_core(immediate_config(max_speed_mps=0.3))
         core.accept_snapshot(

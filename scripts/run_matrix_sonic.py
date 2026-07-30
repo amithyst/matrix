@@ -2496,7 +2496,13 @@ def _world_checkpoint_writes_allowed(
 
 
 def _world_checkpoint_command_idle(command: RobotMotionCommand | None) -> bool:
-    """Only persist root-pose resume points from a neutral command boundary."""
+    """Return whether a game command is safe to accompany a checkpoint attempt.
+
+    The world-state layer still validates upright pose and spawn clearance
+    before updating ``last_exit``.  This predicate only excludes safety-stop and
+    malformed commands; waiting for a deadman boundary loses distance when the
+    operator runs continuously until a fall/reload.
+    """
 
     if command is None:
         return True
@@ -2507,19 +2513,39 @@ def _world_checkpoint_command_idle(command: RobotMotionCommand | None) -> bool:
         speed_mps = float(command.speed_mps)
     except (TypeError, ValueError, OverflowError):
         return False
-    return bool(
-        command.mode == "deadman"
-        and command.safe_stop is True
-        and command.locomotion_mode == SONIC_IDLE_MODE
-        and len(movement) == 3
-        and all(
+    if len(movement) != 3:
+        return False
+    movement_zero = all(
             math.isfinite(component)
             and math.isclose(component, 0.0, rel_tol=0.0, abs_tol=1e-9)
             for component in movement
-        )
-        and math.isfinite(speed_mps)
-        and math.isclose(speed_mps, 0.0, rel_tol=0.0, abs_tol=1e-9)
     )
+    if not math.isfinite(speed_mps) or command.safe_stop:
+        return False
+    if command.mode == "idle":
+        return bool(
+            movement_zero
+            and command.locomotion_mode == SONIC_IDLE_MODE
+            and math.isclose(speed_mps, 0.0, rel_tol=0.0, abs_tol=1e-9)
+        )
+    if command.mode == "turn":
+        return bool(
+            movement_zero
+            and command.locomotion_mode == SONIC_IDLE_MODE
+            and math.isclose(speed_mps, 0.0, rel_tol=0.0, abs_tol=1e-9)
+            and command.reason in _GAME_TURN_COMMAND_REASONS
+        )
+    if command.mode == "move":
+        return bool(
+            not movement_zero
+            and speed_mps > 0.0
+            and command.locomotion_mode in {
+                SONIC_SLOW_WALK_MODE,
+                SONIC_WALK_MODE,
+                SONIC_RUN_MODE,
+            }
+        )
+    return False
 
 
 def _final_world_checkpoint_allowed(
@@ -5599,6 +5625,20 @@ class GameInputRuntime:
                 if command is not None
                 else SONIC_GAIT_NAMES[SONIC_IDLE_MODE]
             ),
+            "requested_locomotion_mode": (
+                command.requested_locomotion_mode
+                if command is not None
+                else SONIC_IDLE_MODE
+            ),
+            "requested_locomotion_mode_name": (
+                SONIC_GAIT_NAMES.get(
+                    command.requested_locomotion_mode,
+                    "UNKNOWN",
+                )
+                if command is not None
+                and command.requested_locomotion_mode is not None
+                else SONIC_GAIT_NAMES[SONIC_IDLE_MODE]
+            ),
             "moving_command_frames": self.moving_command_frames,
             "packets_applied": self.packets_applied,
             "packets_received": self.packets_received,
@@ -5614,6 +5654,11 @@ class GameInputRuntime:
             "command_facing": command_facing,
             "command_desired_facing": command_desired_facing,
             "speed_mps": round(command.speed_mps, 6) if command is not None else 0.0,
+            "requested_speed_mps": (
+                round(float(command.requested_speed_mps), 6)
+                if command is not None and command.requested_speed_mps is not None
+                else 0.0
+            ),
             "stop_reason": command.reason if command is not None else "no_input",
         }
 
@@ -9004,13 +9049,19 @@ def _bfm_realscan_motion_command(
         fallback=facing,
         label="desired_facing",
     )
-    jog = command.locomotion_mode == SONIC_RUN_MODE
+    requested_locomotion_mode = getattr(command, "requested_locomotion_mode", None)
+    jog = (
+        command.locomotion_mode == SONIC_RUN_MODE
+        or requested_locomotion_mode == SONIC_RUN_MODE
+    )
     return replace(
         command,
         movement=movement,
         facing=facing,
         desired_facing=desired_facing,
-        speed_mps=float(command.speed_mps),
+        speed_mps=(
+            _BFM_REALSCAN_JOG_SPEED_MPS if jog else _BFM_REALSCAN_WALK_SPEED_MPS
+        ),
         locomotion_mode=SONIC_RUN_MODE if jog else SONIC_WALK_MODE,
     )
 
@@ -15393,6 +15444,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         )
                         game_input.last_command = game_command
                         game_input.record_published_command(game_command)
+                        writes_newly_armed = (
+                            resume_probation.observe_published_user_command(
+                                game_command
+                            )
+                        )
+                        if writes_newly_armed:
+                            print(
+                                "matrix-sonic-runtime resume checkpoint "
+                                "writes armed by direct BFM published user "
+                                f"{game_command.mode} command "
+                                f"sequence={game_command.sequence}",
+                                flush=True,
+                            )
                         if game_commands is not None:
                             command_restart = game_commands.poll(
                                 current_pose=_snapshot_world_pose(snapshot),
