@@ -885,6 +885,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--vy", type=float, default=0.0)
     parser.add_argument("--yaw-rate", type=float, default=0.0)
     parser.add_argument("--status-file", type=Path)
+    parser.add_argument("--state-trace-file", type=Path)
+    parser.add_argument("--state-trace-every", type=float, default=0.2)
     parser.add_argument("--bfm-trace-file", type=Path)
     parser.add_argument("--bfm-trace-ticks", type=int, default=0)
     parser.add_argument("--qualified-runtime", action="store_true", help=argparse.SUPPRESS)
@@ -930,6 +932,416 @@ def _atomic_json(path: Path | None, payload: dict[str, object]) -> None:
         stream.write("\n")
         temporary_path = Path(stream.name)
     os.replace(temporary_path, path)
+
+
+def _append_jsonl(path: Path | None, payload: dict[str, object]) -> None:
+    """Append one compact runtime state sample without replacing prior samples."""
+
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
+        stream.write("\n")
+
+
+def _rounded_float(value: object, *, digits: int = 6) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, digits)
+
+
+def _rounded_vector(
+    values: object,
+    *,
+    digits: int = 6,
+    limit: int | None = None,
+) -> list[float] | None:
+    try:
+        sequence = list(values)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+    if limit is not None:
+        sequence = sequence[:limit]
+    rounded: list[float] = []
+    for value in sequence:
+        number = _rounded_float(value, digits=digits)
+        if number is None:
+            return None
+        rounded.append(number)
+    return rounded
+
+
+def _xy_heading_rad(vector: object) -> float | None:
+    rounded = _rounded_vector(vector, limit=2)
+    if rounded is None or len(rounded) < 2:
+        return None
+    x_value, y_value = rounded[:2]
+    if abs(x_value) < 1e-9 and abs(y_value) < 1e-9:
+        return None
+    return round(math.atan2(y_value, x_value), 6)
+
+
+def _compact_command_trace(
+    command: RobotMotionCommand | None,
+) -> dict[str, object] | None:
+    if command is None:
+        return None
+    movement = _rounded_vector(command.movement, limit=3)
+    facing = _rounded_vector(command.facing, limit=3)
+    desired_facing = (
+        _rounded_vector(command.desired_facing, limit=3)
+        if command.desired_facing is not None
+        else None
+    )
+    return {
+        "sequence": command.sequence,
+        "mode": command.mode,
+        "safe_stop": bool(command.safe_stop),
+        "reason": command.reason,
+        "locomotion_mode": command.locomotion_mode,
+        "locomotion_mode_name": SONIC_GAIT_NAMES.get(
+            command.locomotion_mode,
+            "UNKNOWN",
+        ),
+        "speed_mps": round(float(command.speed_mps), 6),
+        "movement": movement,
+        "movement_heading_rad": _xy_heading_rad(command.movement),
+        "facing": facing,
+        "facing_heading_rad": _xy_heading_rad(command.facing),
+        "desired_facing": desired_facing,
+        "desired_facing_heading_rad": (
+            _xy_heading_rad(command.desired_facing)
+            if command.desired_facing is not None
+            else None
+        ),
+    }
+
+
+def _compact_worker_status_trace(telemetry: object) -> dict[str, object] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    keys = (
+        "active_policy_id",
+        "selected_policy_id",
+        "controller",
+        "writer_created",
+        "write_authorized",
+        "policy_trace_file",
+        "policy_trace_ticks_requested",
+        "policy_trace_ticks_written",
+        "command_gait",
+        "command_vx_mps",
+        "command_vy_mps",
+        "command_yaw_rate_rad_s",
+        "command_heading_error_rad",
+        "command_raw_heading_error_rad",
+        "command_final_heading_error_rad",
+        "command_heading_source",
+        "command_yaw_gain",
+        "command_yaw_limit_rad_s",
+        "command_yaw_damping_seconds",
+        "command_speed_mps",
+        "turn_reference_seeded",
+        "turn_reference_forward_mps",
+        "world_input_mode",
+        "world_input_safe_stop",
+        "world_input_speed_mps",
+        "world_input_locomotion_mode",
+        "observed_lowcmd_target",
+        "observed_lowcmd_target_age_ms",
+    )
+    return {key: telemetry.get(key) for key in keys if key in telemetry}
+
+
+def _compact_gate_trace(telemetry: object) -> dict[str, object] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    keys = (
+        "expected_peer_pid",
+        "active_policy_id",
+        "current_first_write",
+        "last_first_write_wall_s",
+        "stopped",
+        "connections",
+        "messages_received",
+        "messages_sent",
+        "last_error",
+    )
+    compact = {key: telemetry.get(key) for key in keys if key in telemetry}
+    status = _compact_worker_status_trace(telemetry.get("status"))
+    if status is not None:
+        compact["status"] = status
+    return compact
+
+
+def _compact_worker_trace(telemetry: object) -> dict[str, object] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    keys = (
+        "connected",
+        "ready_no_writer",
+        "first_write",
+        "paused_no_writer",
+        "resident_paused",
+        "resident_writer_created",
+        "last_event",
+        "events_received",
+        "expected_peer_pid",
+        "peer_pid",
+        "last_packet_age_s",
+        "fallback_due",
+        "go_sent",
+        "stop_sent",
+        "pause_sent",
+        "error",
+        "execution_provider",
+        "initial_policy_id",
+        "selected_policy_id",
+        "active_policy_id",
+        "models_loaded_once",
+        "models_warmed",
+    )
+    compact = {key: telemetry.get(key) for key in keys if key in telemetry}
+    status = _compact_worker_status_trace(telemetry.get("status"))
+    if status is not None:
+        compact["status"] = status
+    return compact
+
+
+def _compact_physics_profile_trace(
+    telemetry: object,
+) -> dict[str, object] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    keys = (
+        "available",
+        "active_profile_id",
+        "profile_matches_live_model",
+        "switch_count",
+        "last_transition",
+        "last_error",
+    )
+    return {key: telemetry.get(key) for key in keys if key in telemetry}
+
+
+def _compact_direct_bfm_trace(
+    telemetry: object,
+) -> dict[str, object] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    compact = {
+        "enabled": telemetry.get("enabled"),
+        "sole_lowcmd_writer": telemetry.get("sole_lowcmd_writer"),
+        "sonic_deploy_started": telemetry.get("sonic_deploy_started"),
+        "recovery_worker_started": telemetry.get("recovery_worker_started"),
+        "reference_aligned": telemetry.get("reference_aligned"),
+        "reference_alignment_step_index": telemetry.get(
+            "reference_alignment_step_index"
+        ),
+        "activation_requested": telemetry.get("activation_requested"),
+        "first_write": telemetry.get("first_write"),
+        "writer_gate": _compact_gate_trace(telemetry.get("writer_gate")),
+        "physics_profile": _compact_physics_profile_trace(
+            telemetry.get("physics_profile")
+        ),
+    }
+    return {key: value for key, value in compact.items() if value is not None}
+
+
+def _compact_physical_recovery_trace(
+    telemetry: object,
+) -> dict[str, object] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    keys = (
+        "mode",
+        "policy_lifecycle",
+        "resident_policies_enabled",
+        "state",
+        "selected_locomotion_policy_id",
+        "authority_policy_id",
+        "recovery_policy_id",
+        "recovery_active_policy_id",
+        "failure_reason",
+        "fail_closed",
+        "current_fall_detected",
+        "episodes",
+        "recoveries",
+        "deploy_alive",
+        "deploy_generation",
+        "locomotion_switch_admission_ready",
+        "locomotion_switch_admission_reason",
+        "command_frame_rotation_rad",
+        "command_frame_epoch",
+        "last_wire_facing_heading_rad",
+        "reframe_limited_frames",
+        "last_reframe_limited",
+        "last_reframe_heading_error_rad",
+        "inhibit_game_input",
+        "handoff_mode",
+        "bfm_activation_prepared",
+        "bfm_activation_pending",
+        "bfm_activation_rejected_reason",
+    )
+    compact = {key: telemetry.get(key) for key in keys if key in telemetry}
+    compact["worker"] = _compact_worker_trace(telemetry.get("worker"))
+    compact["sonic_writer_gate"] = _compact_gate_trace(
+        telemetry.get("sonic_writer_gate")
+    )
+    compact["bfm_teacher_writer_gate"] = _compact_gate_trace(
+        telemetry.get("bfm_teacher_writer_gate")
+    )
+    compact["locomotion_physics_profiles"] = _compact_physics_profile_trace(
+        telemetry.get("locomotion_physics_profiles")
+    )
+    handoff = telemetry.get("locomotion_policy_handoff")
+    if isinstance(handoff, dict):
+        compact["locomotion_policy_handoff"] = {
+            key: handoff.get(key)
+            for key in (
+                "slot",
+                "policy_id",
+                "state",
+                "requested_policy_id",
+                "accepted",
+                "reason",
+                "error",
+            )
+            if key in handoff
+        }
+    return {key: value for key, value in compact.items() if value is not None}
+
+
+def _compact_trace_status(
+    status: dict[str, object],
+    *,
+    event: str,
+) -> dict[str, object]:
+    """Keep per-run state traces dense enough for input/heading debugging."""
+
+    trace_keys = (
+        "active_elapsed_s",
+        "active_lowcmd",
+        "active_lowcmd_longest_s",
+        "backend",
+        "control_frames",
+        "control_hz",
+        "control_source",
+        "elapsed_wall_s",
+        "fall_detected",
+        "game_auto_respawn",
+        "heading_error_extreme_rad",
+        "heading_error_lag_s",
+        "heading_error_rad",
+        "heading_error_samples",
+        "heading_error_sign_changes",
+        "heading_error_total_variation_rad",
+        "initial_root_yaw_rad",
+        "instability_resets",
+        "last_reset_reason",
+        "local_ground_z_m",
+        "low_cmd_age_s",
+        "low_cmd_received",
+        "matrix_commit",
+        "min_root_clearance_m",
+        "model",
+        "mujoco_gravity",
+        "physics_hz_target",
+        "physics_step_hz",
+        "physics_steps",
+        "render_hz",
+        "root_clearance_m",
+        "root_displacement_xy_m",
+        "root_displacement_x_m",
+        "root_final_x",
+        "root_up_z",
+        "root_xyz",
+        "root_yaw_relative_rad",
+        "root_yaw_world_rad",
+        "rtf",
+        "run_id",
+        "sim_time_s",
+        "sonic_commit",
+        "sonic_step_index",
+        "state_trace_file",
+        "startup_band_scale",
+        "termination_reason",
+        "walking_commanded",
+    )
+    compact = {
+        key: status[key]
+        for key in trace_keys
+        if key in status and status[key] is not None
+    }
+    compact["event"] = event
+    game_input = status.get("game_input")
+    if isinstance(game_input, dict):
+        compact["game_input"] = game_input
+    game_control_configuration = status.get("game_control_configuration")
+    if isinstance(game_control_configuration, dict):
+        compact["game_control_configuration"] = game_control_configuration
+    command_trace = status.get("published_command")
+    if isinstance(command_trace, dict):
+        compact["published_command"] = command_trace
+    game_world_state = status.get("game_world_state")
+    if isinstance(game_world_state, dict):
+        compact["game_world_state"] = {
+            key: game_world_state.get(key)
+            for key in (
+                "available",
+                "world_id",
+                "revision",
+                "checkpoint_id",
+                "checkpoint_generation",
+                "current_scene_id",
+                "current_fall_detected",
+                "checkpoint_writes",
+                "last_error",
+            )
+            if key in game_world_state
+        }
+    moon_dynamic_ground = status.get("moon_dynamic_ground")
+    if isinstance(moon_dynamic_ground, dict):
+        compact["moon_dynamic_ground"] = {
+            key: moon_dynamic_ground.get(key)
+            for key in (
+                "enabled",
+                "map_path",
+                "map_sha256",
+                "tile_count",
+                "active_tile",
+                "last_error",
+            )
+            if key in moon_dynamic_ground
+        }
+    direct_bfm = _compact_direct_bfm_trace(status.get("direct_bfm"))
+    if direct_bfm is not None:
+        compact["direct_bfm"] = direct_bfm
+    physical_recovery = _compact_physical_recovery_trace(
+        status.get("game_fall_recovery")
+    )
+    if physical_recovery is not None:
+        compact["game_fall_recovery"] = physical_recovery
+    game_commands = status.get("game_commands")
+    if isinstance(game_commands, dict):
+        compact["game_commands"] = {
+            key: game_commands.get(key)
+            for key in (
+                "available",
+                "connected",
+                "packets_received",
+                "packets_sent",
+                "last_error",
+                "runtime_pause",
+            )
+            if key in game_commands
+        }
+    return compact
 
 
 def _creative_inventory_disabled_mapping(
@@ -12790,12 +13202,23 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ("game_applied_video_settings_json", None),
         ("moon_dynamic_map", None),
         ("moon_dynamic_map_sha256", None),
+        ("state_trace_file", None),
+        ("state_trace_every", 0.2),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
     args.verification_receipt_sha256 = None
     _arm_supervisor_parent_death(args.expected_parent_pid)
     run_id = uuid.uuid4().hex
+    if args.state_trace_file is None and args.control_source == "game":
+        args.state_trace_file = (
+            _SCRIPT_DIR.parent
+            / "outputs"
+            / "state-traces"
+            / f"matrix_sonic_state_trace_"
+            f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}_"
+            f"{run_id[:8]}.jsonl"
+        )
     model_path = args.model.resolve()
     if not model_path.is_file():
         raise SystemExit(f"composed Matrix model is missing: {model_path}")
@@ -13195,6 +13618,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         and not args.bfm_trace_file.is_absolute()
     ):
         raise SystemExit("--bfm-trace-file must be absolute")
+    if (
+        getattr(args, "state_trace_file", None) is not None
+        and not args.state_trace_file.is_absolute()
+    ):
+        raise SystemExit("--state-trace-file must be absolute")
+    if not math.isfinite(args.state_trace_every) or args.state_trace_every <= 0.0:
+        raise SystemExit("--state-trace-every must be positive and finite")
     if args.dds_interface != "lo":
         raise SystemExit("native Matrix SONIC requires --dds-interface lo")
     try:
@@ -14113,6 +14543,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         physics_period_s = 1.0 / physics_hz
         next_physics_wall = started_wall + physics_period_s
         next_print = started_wall
+        next_state_trace = started_wall
         last_print_wall = started_wall
         last_render_count = 0
         last_physics_steps = 0
@@ -14133,6 +14564,165 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         active_started_wall = None
         longest_active_elapsed_s = 0.0
         walking = False
+        state_trace_error_reported = False
+
+        def write_state_trace(status: dict[str, object], *, event: str) -> None:
+            nonlocal state_trace_error_reported
+            if args.state_trace_file is None:
+                return
+            try:
+                _append_jsonl(
+                    args.state_trace_file,
+                    _compact_trace_status(status, event=event),
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                if not state_trace_error_reported:
+                    print(
+                        "matrix-sonic-runtime ERROR state trace write failed: "
+                        f"{exc}",
+                        flush=True,
+                    )
+                    state_trace_error_reported = True
+
+        def sample_state_trace(
+            *,
+            event: str,
+            now_s: float,
+            active_lowcmd_value: bool,
+            low_cmd_age_value: float | None,
+            root_clearance_value_m: float,
+            root_up_value_z: float,
+        ) -> None:
+            if args.state_trace_file is None:
+                return
+            dx = float(snapshot.qpos[0]) - float(initial_root_xy[0])
+            dy = float(snapshot.qpos[1]) - float(initial_root_xy[1])
+            status: dict[str, object] = {
+                "active_elapsed_s": (
+                    round(now_s - active_started_wall, 3)
+                    if active_started_wall is not None
+                    else 0.0
+                ),
+                "active_lowcmd_longest_s": round(longest_active_elapsed_s, 3),
+                "active_lowcmd": active_lowcmd_value,
+                "backend": "gear_sonic_native",
+                "control_frames": control_frames,
+                "control_hz": args.control_hz,
+                "control_source": args.control_source,
+                "elapsed_wall_s": round(now_s - started_wall, 3),
+                "fall_detected": fall_detected,
+                "instability_resets": instability_resets,
+                "last_reset_reason": snapshot.last_reset_reason,
+                "local_ground_z_m": round(snapshot_ground_height_m, 6),
+                "low_cmd_age_s": (
+                    round(float(low_cmd_age_value), 6)
+                    if low_cmd_age_value is not None
+                    else None
+                ),
+                "low_cmd_received": bool(snapshot.low_cmd_received),
+                "matrix_commit": args.matrix_commit,
+                "min_root_clearance_m": round(min_root_clearance_m, 5),
+                "model": str(model_path),
+                "physics_hz_target": physics_hz,
+                "physics_steps": physics_steps,
+                "root_clearance_m": round(root_clearance_value_m, 6),
+                "root_displacement_xy_m": round(math.hypot(dx, dy), 5),
+                "root_displacement_x_m": round(dx, 5),
+                "root_final_x": round(float(snapshot.qpos[0]), 5),
+                "root_up_z": round(root_up_value_z, 5),
+                "root_xyz": [
+                    round(float(value), 5) for value in snapshot.qpos[:3]
+                ],
+                "run_id": run_id,
+                "sim_time_s": round(float(snapshot.sim_time), 4),
+                "sonic_commit": sonic_commit,
+                "sonic_step_index": int(snapshot.step_index),
+                "state_trace_file": str(args.state_trace_file),
+                "startup_band_scale": round(
+                    float(snapshot.elastic_band_scale),
+                    5,
+                ),
+                "walking_commanded": walking,
+                "published_command": _compact_command_trace(game_command),
+            }
+            status.update(live_mujoco_gravity_status())
+            if game_input is not None:
+                status["game_input"] = game_input.telemetry(now_s=now_s)
+                status["game_control_configuration"] = (
+                    _game_control_status_fields(
+                        args,
+                        applied_camera_yaw_offset_deg=(
+                            applied_game_camera_yaw_offset_deg
+                        ),
+                        initial_root_yaw_rad=initial_root_yaw_rad,
+                        motion_settings=(
+                            motion_settings_store.settings
+                            if motion_settings_store is not None
+                            else None
+                        ),
+                    )
+                )
+                try:
+                    current_root_yaw = _root_yaw_rad(snapshot.qpos)
+                except ValueError:
+                    status["root_yaw_world_rad"] = None
+                    status["root_yaw_relative_rad"] = None
+                else:
+                    assert initial_root_yaw_rad is not None
+                    status["root_yaw_world_rad"] = round(current_root_yaw, 6)
+                    status["root_yaw_relative_rad"] = round(
+                        wrap_angle_rad(current_root_yaw - initial_root_yaw_rad),
+                        6,
+                    )
+                if heading_anchor_telemetry is not None:
+                    heading_anchor_fields = (
+                        heading_anchor_telemetry.status_fields()
+                    )
+                    status.update(heading_anchor_fields)
+            if game_world is not None:
+                status["game_world_state"] = game_world.telemetry()
+                status["game_auto_respawn"] = bool(args.game_auto_respawn)
+            if moon_dynamic_ground is not None:
+                status["moon_dynamic_ground"] = (
+                    moon_dynamic_ground.telemetry()
+                )
+            if direct_bfm is not None:
+                status["direct_bfm"] = direct_bfm.telemetry()
+            if resume_probation.enabled:
+                status["resume_probation"] = resume_probation.telemetry(
+                    now_s=now_s
+                )
+            if game_commands is not None:
+                status["game_commands"] = game_commands.telemetry()
+            if game_fall_recovery is not None:
+                status["game_fall_recovery"] = game_fall_recovery.status(
+                    now_s=now_s
+                )
+            elif physical_recovery is not None and processes is not None:
+                status["game_fall_recovery"] = physical_recovery.telemetry(
+                    now_s=now_s,
+                    processes=processes,
+                )
+            write_state_trace(status, event=event)
+
+        try:
+            sample_state_trace(
+                event="start",
+                now_s=started_wall,
+                active_lowcmd_value=bool(snapshot.low_cmd_fresh),
+                low_cmd_age_value=snapshot.low_cmd_age_s,
+                root_clearance_value_m=min_root_clearance_m,
+                root_up_value_z=_root_up_z(snapshot.qpos),
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            if not state_trace_error_reported:
+                print(
+                    "matrix-sonic-runtime ERROR state trace sample failed: "
+                    f"{exc}",
+                    flush=True,
+                )
+                state_trace_error_reported = True
+        next_state_trace = started_wall + max(args.state_trace_every, 0.02)
         while running:
             runtime_pause_transition_frame = False
             # Poll on both sides of the duration gate so a child exit at the
@@ -14242,6 +14832,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 active_started_wall += paused_wall_s
                             next_physics_wall = completed_wall + physics_period_s
                             next_print = completed_wall
+                            next_state_trace = completed_wall
                             last_print_wall = completed_wall
                             last_render_count = (
                                 renderer.packet_count if renderer is not None else 0
@@ -14971,6 +15562,25 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             control_frames += 1
 
             now = time.perf_counter()
+            if now >= next_state_trace:
+                try:
+                    sample_state_trace(
+                        event="sample",
+                        now_s=now,
+                        active_lowcmd_value=active_lowcmd,
+                        low_cmd_age_value=low_cmd_age_s,
+                        root_clearance_value_m=root_clearance_m,
+                        root_up_value_z=root_up_z,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    if not state_trace_error_reported:
+                        print(
+                            "matrix-sonic-runtime ERROR state trace sample failed: "
+                            f"{exc}",
+                            flush=True,
+                        )
+                        state_trace_error_reported = True
+                next_state_trace = now + max(args.state_trace_every, 0.02)
             if now >= next_print:
                 window_wall = max(now - last_print_wall, 1e-9)
                 render_count = renderer.packet_count if renderer is not None else 0
@@ -15054,6 +15664,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "sim_time_s": round(float(snapshot.sim_time), 4),
                     "sonic_commit": sonic_commit,
                     "sonic_step_index": int(snapshot.step_index),
+                    "state_trace_file": (
+                        str(args.state_trace_file)
+                        if args.state_trace_file is not None
+                        else None
+                    ),
                     "instability_resets": instability_resets,
                     "last_reset_reason": snapshot.last_reset_reason,
                     "max_resets": args.max_resets,
@@ -15062,6 +15677,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "startup_band_fade_s": args.startup_band_fade,
                     "startup_band_scale": round(float(snapshot.elastic_band_scale), 5),
                     "walking_commanded": walking,
+                    "published_command": _compact_command_trace(game_command),
                 }
                 if game_input is not None:
                     status["game_input"] = game_input.telemetry(now_s=now)
@@ -15528,6 +16144,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "sonic_commit": sonic_commit,
             "sonic_step_index": int(snapshot.step_index),
             "spawn_clearance": spawn_clearance_audit,
+            "state_trace_file": (
+                str(args.state_trace_file)
+                if args.state_trace_file is not None
+                else None
+            ),
             "startup_band_enabled": bool(args.startup_band),
             "startup_band_fade_s": args.startup_band_fade,
             "startup_band_hold_s": args.startup_band_hold,
@@ -15537,6 +16158,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "ue_state_sync_hz": round(render_hz_aggregate, 3),
             "ue_pid": args.ue_pid,
             "walking_commanded": walking,
+            "published_command": _compact_command_trace(game_command),
         }
         if game_input is not None:
             final_status["game_input"] = game_input.telemetry(now_s=finished_wall)
@@ -15630,6 +16252,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 final_status["current_fall_detected"] = recovery_status[
                     "current_fall_detected"
                 ]
+        write_state_trace(final_status, event="final")
         _atomic_json(args.status_file, final_status)
         print(
             "matrix-sonic-runtime stopped "

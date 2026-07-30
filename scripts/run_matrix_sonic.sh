@@ -579,6 +579,14 @@ export MATRIX_ITEM_PACK_ROOT
 MATRIX_SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
 export MATRIX_SONIC_STATUS_FILE
 rm -f -- "$MATRIX_SONIC_STATUS_FILE"
+MATRIX_SONIC_STATE_TRACE_FILE="${MATRIX_SONIC_STATE_TRACE_FILE:-$PROJECT_ROOT/outputs/state-traces/matrix_sonic_state_trace_$(date -u +%Y%m%d-%H%M%S)_$$.jsonl}"
+if [[ "$MATRIX_SONIC_STATE_TRACE_FILE" != /* ]]; then
+    echo "[ERROR] MATRIX_SONIC_STATE_TRACE_FILE must be absolute" >&2
+    exit 2
+fi
+mkdir -p "$(dirname "$MATRIX_SONIC_STATE_TRACE_FILE")"
+rm -f -- "$MATRIX_SONIC_STATE_TRACE_FILE"
+export MATRIX_SONIC_STATE_TRACE_FILE
 if ! QUALIFICATION_REQUESTED="$(/usr/bin/python3 -I - "$MAX_SECONDS" <<'PY'
 import math
 import sys
