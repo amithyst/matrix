@@ -594,7 +594,7 @@ IFS=$'\t' read -r MATRIX_VIDEO_APPLIED_WIDTH \
     <<<"$VIDEO_LAUNCH_FIELDS"
 if [[ "$SCENE_ID" == "15" \
     && "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
-    MATRIX_MOON_BFM_STABLE_RENDER="${MATRIX_MOON_BFM_STABLE_RENDER:-1}"
+    MATRIX_MOON_BFM_STABLE_RENDER="${MATRIX_MOON_BFM_STABLE_RENDER:-0}"
     case "${MATRIX_MOON_BFM_STABLE_RENDER,,}" in
         1|true|yes|on)
             MATRIX_VIDEO_APPLIED_WIDTH=1280
@@ -631,6 +631,8 @@ if [[ "$SCENE_ID" == "15" \
                 "screen_percentage=${MATRIX_MOON_BFM_SCREEN_PERCENTAGE}"
             ;;
         0|false|no|off)
+            echo "[INFO] MoonWorld BFM high-quality render profile:" \
+                "using host video settings"
             ;;
         *)
             echo "[ERROR] MATRIX_MOON_BFM_STABLE_RENDER must be a boolean" >&2
