@@ -63,20 +63,26 @@ ACTION_CLIP = 20.0
 # rate before choosing a direction from target velocity.  A yaw-only command
 # with exactly zero velocity therefore leaves the trajectory in stand and
 # silently ignores ``yaw_rate``.  Seed a physically negligible *forward*
-# reference just above the strict post-division 1e-5 threshold (0.0005 m/s in
-# command units).  Forward is important: a lateral seed sets PFNN's
+# reference above the strict post-division 1e-5 threshold while
+# staying below the operator-visible walk speed.  Forward is important: a lateral seed sets PFNN's
 # ``gait_side`` input to one and turns an in-place rotation into a full strafe.
 # Matrix's authoritative world command remains zero-translation; this value
 # exists only inside the reference generator so a turn-only request can
 # produce a rotating pose.
-TURN_REFERENCE_FORWARD_MPS = 0.00051
-# The formal7168 collection path turns a requested heading into the canonical
-# body-yaw command with a bounded P controller.  Matrix already provides a
-# rate-limited wire-facing vector.  Consume that safety boundary directly,
-# then predict body heading slightly forward from measured yaw velocity to
-# damp the PFNN/Teacher closed-loop lag.  The final camera facing remains in
-# the packet for observability, but bypassing wire-facing caused full-rate
-# command reversals and live turn oscillation.
+TURN_REFERENCE_FORWARD_MPS = 0.10
+# The formal7168 collection path turns turn-only Matrix commands into BFM's
+# canonical body-yaw command with a bounded P controller.  Moving samples
+# project Matrix's world velocity into the measured root-yaw frame: BFM's
+# command surface is body-local, and using a future/requested facing as the
+# velocity frame makes real displacement drift when the body yaw lags or slides.
+# Moving samples do not add a second yaw controller.  Matrix has already
+# admitted translation at the camera-facing boundary; additional BFM yaw-hold
+# corrections were observed to excite MoonWorld yaw oscillations and falls.
+# Manual Q/E turn-only samples consume Matrix's final desired facing so the
+# operator gets the configured turn response.  Camera-face auto-alignment uses
+# Matrix's rate-limited wire-facing target to avoid full-rate overshoot.
+MOVE_YAW_HOLD_LIMIT_RAD_S = 0.0
+MOVE_YAW_HOLD_GAIN = 0.0
 FORMAL_COMMAND_YAW_GAIN = 4.0
 FORMAL_COMMAND_YAW_LIMIT_RAD_S = 1.5
 TURN_COMMAND_YAW_LIMIT_RAD_S = 0.6
@@ -533,6 +539,8 @@ class WorldSample:
     locomotion_mode: int
     mode: str
     safe_stop: bool
+    reason: str | None = None
+    turn_command_yaw_limit_rad_s: float | None = None
 
     @classmethod
     def from_packet(
@@ -565,6 +573,19 @@ class WorldSample:
         speed = float(packet.get("speed_mps"))
         if not math.isfinite(root_yaw) or not math.isfinite(speed):
             raise ValueError("STATE yaw and speed must be finite")
+        reason = packet.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("STATE reason must be a string or null")
+        turn_command_yaw_limit = packet.get("turn_command_yaw_limit_rad_s")
+        if turn_command_yaw_limit is not None:
+            turn_command_yaw_limit = float(turn_command_yaw_limit)
+            if (
+                not math.isfinite(turn_command_yaw_limit)
+                or turn_command_yaw_limit <= 0.0
+            ):
+                raise ValueError(
+                    "STATE turn_command_yaw_limit_rad_s must be finite and positive"
+                )
         return cls(
             sequence=int(packet.get("sequence")),
             received_monotonic=float(received_monotonic),
@@ -579,6 +600,8 @@ class WorldSample:
             locomotion_mode=int(packet.get("locomotion_mode")),
             mode=str(packet.get("mode")),
             safe_stop=bool(packet.get("safe_stop")),
+            reason=reason,
+            turn_command_yaw_limit_rad_s=turn_command_yaw_limit,
         )
 
 
@@ -649,12 +672,30 @@ class BfmTeacherCore:
         direct_start: bool = False,
         trace_file: Path | None = None,
         trace_ticks: int = 0,
+        command_yaw_gain: float = FORMAL_COMMAND_YAW_GAIN,
+        formal_command_yaw_limit_rad_s: float = FORMAL_COMMAND_YAW_LIMIT_RAD_S,
+        turn_command_yaw_limit_rad_s: float = TURN_COMMAND_YAW_LIMIT_RAD_S,
+        turn_command_yaw_damping_seconds: float = TURN_COMMAND_YAW_DAMPING_SECONDS,
     ) -> None:
         if (
             not math.isfinite(activation_blend_seconds)
             or activation_blend_seconds <= 0.0
         ):
             raise ValueError("activation_blend_seconds must be finite and positive")
+        for name, value in (
+            ("command_yaw_gain", command_yaw_gain),
+            ("formal_command_yaw_limit_rad_s", formal_command_yaw_limit_rad_s),
+            ("turn_command_yaw_limit_rad_s", turn_command_yaw_limit_rad_s),
+        ):
+            if not math.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        if (
+            not math.isfinite(float(turn_command_yaw_damping_seconds))
+            or float(turn_command_yaw_damping_seconds) < 0.0
+        ):
+            raise ValueError(
+                "turn_command_yaw_damping_seconds must be finite and non-negative"
+            )
         source = realscan_root / "src"
         if str(source) not in sys.path:
             sys.path.insert(0, str(source))
@@ -720,6 +761,16 @@ class BfmTeacherCore:
                 f"formal7168_clip:{self.stream.motion_key}"
             )
         self.direct_start = bool(direct_start)
+        self.command_yaw_gain = float(command_yaw_gain)
+        self.formal_command_yaw_limit_rad_s = float(
+            formal_command_yaw_limit_rad_s
+        )
+        self.turn_command_yaw_limit_rad_s = float(
+            turn_command_yaw_limit_rad_s
+        )
+        self.turn_command_yaw_damping_seconds = float(
+            turn_command_yaw_damping_seconds
+        )
         self.direct_reference_start: dict[str, list[float]] | None = None
         self.previous_action = np.zeros(NUM_JOINTS, dtype=np.float32)
         self.last_reset_count: int | None = None
@@ -1103,24 +1154,22 @@ class BfmTeacherCore:
         else:
             world_velocity = np.zeros(2, dtype=np.float64)
         requested_facing = sample.facing
-        facing_norm = float(np.linalg.norm(requested_facing[:2]))
-        # Matrix supplies two headings: a rate-limited wire-facing vector and
-        # the final desired facing.  Moving samples use wire-facing as the
-        # local movement frame.  Turn-only samples must also consume the
-        # wire-facing safety boundary: chasing the final camera target directly
-        # makes BFM hold a saturated yaw-rate command until it overshoots and
-        # then flips direction, which shows up in-game as left/right turn
-        # oscillation while holding W.
-        movement_frame_yaw = (
-            math.atan2(requested_facing[1], requested_facing[0])
-            if sample.mode == "move" and facing_norm > 1.0e-8
-            else sample.root_yaw
-        )
+        # BFM receives body-local velocity.  The correct inverse transform is
+        # therefore the measured physical root yaw, not the rate-limited
+        # requested facing.  The latter is a planner target and can lead the
+        # body during camera-face alignment or MoonWorld yaw drift.
+        movement_frame_yaw = sample.root_yaw
         cosine = math.cos(movement_frame_yaw)
         sine = math.sin(movement_frame_yaw)
         local_vx = cosine * world_velocity[0] + sine * world_velocity[1]
         local_vy = -sine * world_velocity[0] + cosine * world_velocity[1]
         heading_facing = requested_facing
+        desired_facing_norm = float(np.linalg.norm(sample.desired_facing[:2]))
+        if (
+            sample.mode == "move"
+            or (sample.mode == "turn" and sample.reason == "manual_yaw")
+        ) and desired_facing_norm > 1.0e-8:
+            heading_facing = sample.desired_facing
         heading_facing_norm = float(np.linalg.norm(heading_facing[:2]))
         if (
             sample.safe_stop
@@ -1142,22 +1191,31 @@ class BfmTeacherCore:
                 if lowstate is not None
                 else 0.0
             )
-            heading_error = math.atan2(
-                math.sin(
-                    heading_error
-                    - TURN_COMMAND_YAW_DAMPING_SECONDS
-                    * measured_yaw_rate
-                ),
-                math.cos(
-                    heading_error
-                    - TURN_COMMAND_YAW_DAMPING_SECONDS
-                    * measured_yaw_rate
-                ),
-            )
-            yaw_limit = TURN_COMMAND_YAW_LIMIT_RAD_S
+            if sample.mode == "turn":
+                heading_error = math.atan2(
+                    math.sin(
+                        heading_error
+                        - self.turn_command_yaw_damping_seconds
+                        * measured_yaw_rate
+                    ),
+                    math.cos(
+                        heading_error
+                        - self.turn_command_yaw_damping_seconds
+                        * measured_yaw_rate
+                    ),
+                )
+                yaw_gain = self.command_yaw_gain
+                yaw_limit = (
+                    float(sample.turn_command_yaw_limit_rad_s)
+                    if sample.turn_command_yaw_limit_rad_s is not None
+                    else self.turn_command_yaw_limit_rad_s
+                )
+            else:
+                yaw_gain = MOVE_YAW_HOLD_GAIN
+                yaw_limit = MOVE_YAW_HOLD_LIMIT_RAD_S
             yaw_rate = float(
                 np.clip(
-                    heading_error * FORMAL_COMMAND_YAW_GAIN,
+                    heading_error * yaw_gain,
                     -yaw_limit,
                     yaw_limit,
                 )
@@ -1610,9 +1668,20 @@ class BfmTeacherCore:
             self.reference_stop_resets += 1
         self.reference_motion_active = command_motion_active
         requested_facing = world.facing
+        final_facing = getattr(world, "desired_facing", world.facing)
+        heading_facing = requested_facing
+        command_heading_source = "matrix_wire_facing"
+        final_facing_norm = float(np.linalg.norm(final_facing[:2]))
+        if (
+            world.mode == "move"
+            or (world.mode == "turn" and world.reason == "manual_yaw")
+        ) and final_facing_norm > 1.0e-8:
+            heading_facing = final_facing
+            command_heading_source = "matrix_desired_facing"
+        heading_facing_norm = float(np.linalg.norm(heading_facing[:2]))
         requested_facing_yaw = math.atan2(
-            requested_facing[1],
-            requested_facing[0],
+            heading_facing[1],
+            heading_facing[0],
         )
         command_raw_heading_error = (
             math.atan2(
@@ -1622,7 +1691,7 @@ class BfmTeacherCore:
             if (
                 not world.safe_stop
                 and world.mode in {"move", "turn"}
-                and float(np.linalg.norm(requested_facing[:2])) > 1.0e-8
+                and heading_facing_norm > 1.0e-8
             )
             else 0.0
         )
@@ -1631,17 +1700,15 @@ class BfmTeacherCore:
             command_heading_error = math.atan2(
                 math.sin(
                     command_raw_heading_error
-                    - TURN_COMMAND_YAW_DAMPING_SECONDS
+                    - self.turn_command_yaw_damping_seconds
                     * float(lowstate.body_gyro_rad_s[2])
                 ),
                 math.cos(
                     command_raw_heading_error
-                    - TURN_COMMAND_YAW_DAMPING_SECONDS
+                    - self.turn_command_yaw_damping_seconds
                     * float(lowstate.body_gyro_rad_s[2])
                 ),
             )
-        final_facing = getattr(world, "desired_facing", world.facing)
-        final_facing_norm = float(np.linalg.norm(final_facing[:2]))
         command_final_heading_error = (
             math.atan2(
                 math.sin(
@@ -2042,19 +2109,23 @@ class BfmTeacherCore:
             "command_final_heading_error_rad": float(
                 command_final_heading_error
             ),
-            "command_heading_source": (
-                "matrix_desired_facing"
+            "command_heading_source": command_heading_source,
+            "command_yaw_gain": (
+                self.command_yaw_gain
                 if world.mode == "turn"
-                else "matrix_wire_facing"
+                else MOVE_YAW_HOLD_GAIN if world.mode == "move" else 0.0
             ),
-            "command_yaw_gain": FORMAL_COMMAND_YAW_GAIN,
             "command_yaw_limit_rad_s": (
-                TURN_COMMAND_YAW_LIMIT_RAD_S
+                (
+                    float(world.turn_command_yaw_limit_rad_s)
+                    if world.turn_command_yaw_limit_rad_s is not None
+                    else self.turn_command_yaw_limit_rad_s
+                )
                 if world.mode == "turn"
-                else FORMAL_COMMAND_YAW_LIMIT_RAD_S
+                else MOVE_YAW_HOLD_LIMIT_RAD_S if world.mode == "move" else 0.0
             ),
             "command_yaw_damping_seconds": (
-                TURN_COMMAND_YAW_DAMPING_SECONDS
+                self.turn_command_yaw_damping_seconds
                 if world.mode == "turn"
                 else 0.0
             ),
@@ -2064,6 +2135,7 @@ class BfmTeacherCore:
                 float(command.vx) if turn_reference_seeded else 0.0
             ),
             "world_input_mode": world.mode,
+            "world_input_reason": world.reason,
             "world_input_safe_stop": bool(world.safe_stop),
             "world_input_speed_mps": float(world.speed_mps),
             "world_input_locomotion_mode": int(world.locomotion_mode),
@@ -3598,6 +3670,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-file", type=Path)
     parser.add_argument("--trace-ticks", type=int, default=0)
     parser.add_argument(
+        "--command-yaw-gain",
+        type=float,
+        default=FORMAL_COMMAND_YAW_GAIN,
+        help="P gain from heading error to BFM formal yaw-rate command",
+    )
+    parser.add_argument(
+        "--formal-command-yaw-limit-rad-s",
+        type=float,
+        default=FORMAL_COMMAND_YAW_LIMIT_RAD_S,
+        help="Yaw-rate limit for moving BFM commands",
+    )
+    parser.add_argument(
+        "--turn-command-yaw-limit-rad-s",
+        type=float,
+        default=TURN_COMMAND_YAW_LIMIT_RAD_S,
+        help="Default yaw-rate limit for turn-only BFM commands",
+    )
+    parser.add_argument(
+        "--turn-command-yaw-damping-seconds",
+        type=float,
+        default=TURN_COMMAND_YAW_DAMPING_SECONDS,
+        help="Measured yaw-rate damping horizon for turn-only BFM commands",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Validate hashes, load both models, then exit without DDS",
@@ -3625,6 +3721,10 @@ def main(argv: list[str] | None = None) -> int:
         direct_start=args.direct_start,
         trace_file=args.trace_file,
         trace_ticks=args.trace_ticks,
+        command_yaw_gain=args.command_yaw_gain,
+        formal_command_yaw_limit_rad_s=args.formal_command_yaw_limit_rad_s,
+        turn_command_yaw_limit_rad_s=args.turn_command_yaw_limit_rad_s,
+        turn_command_yaw_damping_seconds=args.turn_command_yaw_damping_seconds,
     )
     if args.validate_only:
         core.close()

@@ -45,7 +45,7 @@
     {
       "name": "runtime_adapter",
       "path_env": "MATRIX_BFM_SONIC_RUNTIME_ADAPTER",
-      "sha256": "4638292b039818c66cf88b9aed1c9b28e242e498ebc178db7e6110ee788cc992",
+      "sha256": "cac7f8ab5f7a2db05ed6b9d4312f9fe1d64a0f67ad34092f0f10bfccb925e2c4",
       "executable": true
     },
     {
@@ -85,8 +85,8 @@
     "activation_contract": "observed-lowcmd-target-step-limited-v2",
     "standby_history_contract": "repeat-last-applied-target-zero-unapplied-actions",
     "turn_reference_contract": "yaw-only-pfnn-forward-seed-v1",
-    "turn_reference_forward_mps": 0.00051,
-    "command_heading_contract": "matrix-wire-facing-formal7168-pd-v2",
+    "turn_reference_forward_mps": 0.1,
+    "command_heading_contract": "matrix-root-yaw-velocity-frame-turn-move-yaw-hold-formal7168-pd-v8",
     "command_yaw_gain": 4.0,
     "command_yaw_limit_rad_s": 1.5,
     "turn_command_yaw_limit_rad_s": 0.6,

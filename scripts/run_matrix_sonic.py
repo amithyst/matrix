@@ -82,7 +82,9 @@ from inject_creative_inventory import (
     load_catalog as load_inventory_catalog,
 )
 from matrix_motion_settings import (
+    DEFAULT_BFM_TURN_COMMAND_YAW_LIMIT_RAD_S,
     DEFAULT_KEYBOARD_SPEED_CAP_MPS,
+    BFM_TURN_COMMAND_YAW_LIMIT_RANGE_RAD_S,
     KEYBOARD_SPEED_CAP_RANGE_MPS,
     MotionSettings,
     MotionSettingsError,
@@ -138,6 +140,7 @@ _GAME_TURN_COMMAND_REASONS = frozenset(
         "recovery_heading_slew_limited",
     }
 )
+_BFM_CAMERA_FACE_ALIGN_TURN_YAW_LIMIT_RAD_S = 0.35
 
 
 def _boundary_locomotion_policy_name(policy_id: str) -> str:
@@ -146,6 +149,23 @@ def _boundary_locomotion_policy_name(policy_id: str) -> str:
     if policy_id == "sonic":
         return "SONIC"
     return policy_id
+
+
+def _bfm_turn_command_yaw_limit_for_game_command(
+    command: RobotMotionCommand | None,
+    *,
+    configured_limit_rad_s: float,
+) -> float:
+    """Use a calmer BFM yaw cap for camera-face auto-alignment turns."""
+
+    limit = float(configured_limit_rad_s)
+    if (
+        command is not None
+        and command.mode == "turn"
+        and command.reason == "aligning_heading"
+    ):
+        return min(limit, _BFM_CAMERA_FACE_ALIGN_TURN_YAW_LIMIT_RAD_S)
+    return limit
 
 
 def _boundary_locomotion_strategy_loadout(
@@ -671,6 +691,39 @@ def _parse_args() -> argparse.Namespace:
         help="No-teleport BFM hot-switch blend duration",
     )
     parser.add_argument(
+        "--bfm-command-yaw-gain",
+        type=float,
+        default=float(os.environ.get("MATRIX_BFM_COMMAND_YAW_GAIN", "4.0")),
+        help="BFM heading-error to yaw-rate P gain",
+    )
+    parser.add_argument(
+        "--bfm-formal-command-yaw-limit-rad-s",
+        type=float,
+        default=float(
+            os.environ.get("MATRIX_BFM_FORMAL_COMMAND_YAW_LIMIT_RAD_S", "1.5")
+        ),
+        help="BFM moving-command yaw-rate limit",
+    )
+    parser.add_argument(
+        "--bfm-turn-command-yaw-limit-rad-s",
+        type=float,
+        default=float(
+            os.environ.get(
+                "MATRIX_BFM_TURN_COMMAND_YAW_LIMIT_RAD_S",
+                str(DEFAULT_BFM_TURN_COMMAND_YAW_LIMIT_RAD_S),
+            )
+        ),
+        help="Default BFM turn-only yaw-rate limit; motion settings can override it live",
+    )
+    parser.add_argument(
+        "--bfm-turn-command-yaw-damping-seconds",
+        type=float,
+        default=float(
+            os.environ.get("MATRIX_BFM_TURN_COMMAND_YAW_DAMPING_SECONDS", "0.1")
+        ),
+        help="Measured yaw-rate damping horizon for BFM turn-only commands",
+    )
+    parser.add_argument(
         "--physical-recovery-execution-provider",
         choices=("cuda", "cpu"),
         default=os.environ.get(
@@ -1051,6 +1104,8 @@ def _parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--ue-pid", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--state-trace-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--state-trace-every", type=float, default=0.2, help=argparse.SUPPRESS)
     parser.add_argument("--print-every", type=float, default=2.0)
     parser.add_argument(
         "--startup-band",
@@ -1073,6 +1128,84 @@ def _atomic_json(path: Path | None, payload: dict[str, object]) -> None:
         stream.write("\n")
         temporary_path = Path(stream.name)
     os.replace(temporary_path, path)
+
+
+def _append_jsonl(path: Path | None, payload: dict[str, object]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+
+
+def _compact_direct_bfm_trace_fields(
+    telemetry: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    writer_gate = telemetry.get("writer_gate")
+    if not isinstance(writer_gate, dict):
+        return {
+            "enabled": telemetry.get("enabled"),
+            "first_write": telemetry.get("first_write"),
+            "sole_lowcmd_writer": telemetry.get("sole_lowcmd_writer"),
+        }
+    status = writer_gate.get("status")
+    if not isinstance(status, dict):
+        status = {}
+    return {
+        "enabled": telemetry.get("enabled"),
+        "first_write": telemetry.get("first_write"),
+        "sole_lowcmd_writer": telemetry.get("sole_lowcmd_writer"),
+        "world_input_mode": status.get("world_input_mode"),
+        "world_input_reason": status.get("world_input_reason"),
+        "world_input_speed_mps": status.get("world_input_speed_mps"),
+        "command_yaw_rate_rad_s": status.get("command_yaw_rate_rad_s"),
+        "command_heading_source": status.get("command_heading_source"),
+        "command_heading_error_rad": status.get("command_heading_error_rad"),
+        "command_raw_heading_error_rad": status.get("command_raw_heading_error_rad"),
+        "command_final_heading_error_rad": status.get(
+            "command_final_heading_error_rad"
+        ),
+        "command_vx_mps": status.get("command_vx_mps"),
+        "command_vy_mps": status.get("command_vy_mps"),
+        "reference_realtime_rolling_reason": status.get(
+            "reference_realtime_rolling_reason"
+        ),
+        "reference_root_error_m": status.get("reference_root_error_m"),
+        "root_angular_speed_rad_s": status.get("root_angular_speed_rad_s"),
+        "joint_velocity_rms_rad_s": status.get("joint_velocity_rms_rad_s"),
+    }
+
+
+def _compact_game_state_trace(
+    status: dict[str, object],
+    *,
+    direct_bfm_telemetry: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Return a compact state record suitable for frequent JSONL writes."""
+
+    record = {
+        "schema": "matrix-sonic-state-trace/v1",
+        "run_id": status.get("run_id"),
+        "elapsed_wall_s": status.get("elapsed_wall_s"),
+        "sim_time_s": status.get("sim_time_s"),
+        "control_frames": status.get("control_frames"),
+        "sonic_step_index": status.get("sonic_step_index"),
+        "root_xyz": status.get("root_xyz"),
+        "root_yaw_world_rad": status.get("root_yaw_world_rad"),
+        "root_yaw_relative_rad": status.get("root_yaw_relative_rad"),
+        "root_up_z": status.get("root_up_z"),
+        "local_ground_z_m": status.get("local_ground_z_m"),
+        "root_clearance_m": status.get("root_clearance_m"),
+        "fall_detected": status.get("fall_detected"),
+        "walking_commanded": status.get("walking_commanded"),
+        "active_lowcmd": status.get("active_lowcmd"),
+        "game_input": status.get("game_input"),
+        "bfm": _compact_direct_bfm_trace_fields(direct_bfm_telemetry),
+    }
+    return {key: value for key, value in record.items() if value is not None}
 
 
 def _creative_inventory_disabled_mapping(
@@ -5395,6 +5528,12 @@ class GameInputRuntime:
                 if self.core.measured_heading_rad is not None
                 else None
             ),
+            "measured_root_angular_speed_rad_s": (
+                round(self.core.measured_root_angular_speed_rad_s, 6)
+                if self.core.measured_root_angular_speed_rad_s is not None
+                else None
+            ),
+            "camera_face_move_gate": self.core.camera_face_move_gate_telemetry(),
             "movement_control": self.core.movement_mode_mapping(),
             "camera_yaw_rad": (
                 round(snapshot.camera_yaw_rad, 6) if snapshot is not None else None
@@ -7274,6 +7413,10 @@ class NativeProcessGroup:
         formal_ik: Path,
         execution_provider: str,
         activation_blend_seconds: float,
+        command_yaw_gain: float,
+        formal_command_yaw_limit_rad_s: float,
+        turn_command_yaw_limit_rad_s: float,
+        turn_command_yaw_damping_seconds: float,
         direct_start: bool = False,
         reference_clip: Path | None = None,
         reference_clip_sha256: str | None = None,
@@ -7311,6 +7454,14 @@ class NativeProcessGroup:
             execution_provider,
             "--activation-blend-seconds",
             str(activation_blend_seconds),
+            "--command-yaw-gain",
+            str(command_yaw_gain),
+            "--formal-command-yaw-limit-rad-s",
+            str(formal_command_yaw_limit_rad_s),
+            "--turn-command-yaw-limit-rad-s",
+            str(turn_command_yaw_limit_rad_s),
+            "--turn-command-yaw-damping-seconds",
+            str(turn_command_yaw_damping_seconds),
         ]
         if direct_start:
             command.append("--direct-start")
@@ -9151,6 +9302,7 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
         *,
         root_yaw: float,
         height_map_z: Any,
+        turn_command_yaw_limit_rad_s: float | None = None,
     ) -> bool:
         """Send one newest-wins 50 Hz world sample without blocking physics."""
 
@@ -9186,8 +9338,13 @@ class _BfmTeacherControl(_RecoveryWorkerControl):
             "speed_mps": float(command.speed_mps),
             "locomotion_mode": int(command.locomotion_mode),
             "mode": command.mode,
+            "reason": command.reason,
             "safe_stop": bool(command.safe_stop),
         }
+        if turn_command_yaw_limit_rad_s is not None:
+            payload["turn_command_yaw_limit_rad_s"] = float(
+                turn_command_yaw_limit_rad_s
+            )
         packet = json.dumps(
             payload,
             separators=(",", ":"),
@@ -9881,6 +10038,16 @@ class _DirectBfmRuntime:
             formal_ik=self.formal_ik,
             execution_provider=self.execution_provider,
             activation_blend_seconds=self.activation_blend_seconds,
+            command_yaw_gain=float(self.args.bfm_command_yaw_gain),
+            formal_command_yaw_limit_rad_s=float(
+                self.args.bfm_formal_command_yaw_limit_rad_s
+            ),
+            turn_command_yaw_limit_rad_s=float(
+                self.args.bfm_turn_command_yaw_limit_rad_s
+            ),
+            turn_command_yaw_damping_seconds=float(
+                self.args.bfm_turn_command_yaw_damping_seconds
+            ),
             direct_start=True,
             reference_clip=self.reference_clip,
             reference_clip_sha256=self.reference_clip_sha256,
@@ -9991,12 +10158,18 @@ class _DirectBfmRuntime:
         height_map_z: Any,
         walking: bool = True,
         game_command: RobotMotionCommand | None = None,
+        turn_command_yaw_limit_rad_s: float | None = None,
     ) -> bool:
         return self.control.send_state(
             snapshot,
             self.command(snapshot, walking=walking, game_command=game_command),
             root_yaw=_root_yaw_rad(snapshot.qpos),
             height_map_z=height_map_z,
+            turn_command_yaw_limit_rad_s=(
+                turn_command_yaw_limit_rad_s
+                if turn_command_yaw_limit_rad_s is not None
+                else float(self.args.bfm_turn_command_yaw_limit_rad_s)
+            ),
         )
 
     def align_reference(self, *, snapshot: Any) -> None:
@@ -10360,6 +10533,16 @@ class _PhysicalRecoveryCoordinator:
         self.bfm_formal_ik = optional_path("bfm_formal_ik")
         self.bfm_activation_blend_seconds = float(
             args.bfm_teacher_activation_blend_seconds
+        )
+        self.bfm_command_yaw_gain = float(args.bfm_command_yaw_gain)
+        self.bfm_formal_command_yaw_limit_rad_s = float(
+            args.bfm_formal_command_yaw_limit_rad_s
+        )
+        self.bfm_turn_command_yaw_limit_rad_s = float(
+            args.bfm_turn_command_yaw_limit_rad_s
+        )
+        self.bfm_turn_command_yaw_damping_seconds = float(
+            args.bfm_turn_command_yaw_damping_seconds
         )
         self.bfm_trace_file = optional_path("bfm_trace_file")
         self.bfm_trace_ticks = max(0, int(args.bfm_trace_ticks))
@@ -11772,6 +11955,7 @@ class _PhysicalRecoveryCoordinator:
         command: RobotMotionCommand,
         *,
         height_map_z: Any,
+        turn_command_yaw_limit_rad_s: float | None = None,
     ) -> bool:
         """Keep the resident terrain policy warm in the physical world frame."""
 
@@ -11811,6 +11995,11 @@ class _PhysicalRecoveryCoordinator:
             world_command,
             root_yaw=root_yaw,
             height_map_z=height_map_z,
+            turn_command_yaw_limit_rad_s=(
+                turn_command_yaw_limit_rad_s
+                if turn_command_yaw_limit_rad_s is not None
+                else self.bfm_turn_command_yaw_limit_rad_s
+            ),
         )
 
     def _fall_level(
@@ -13047,6 +13236,16 @@ class _PhysicalRecoveryCoordinator:
             formal_ik=self.bfm_formal_ik,
             execution_provider=self.execution_provider,
             activation_blend_seconds=self.bfm_activation_blend_seconds,
+            command_yaw_gain=self.bfm_command_yaw_gain,
+            formal_command_yaw_limit_rad_s=(
+                self.bfm_formal_command_yaw_limit_rad_s
+            ),
+            turn_command_yaw_limit_rad_s=(
+                self.bfm_turn_command_yaw_limit_rad_s
+            ),
+            turn_command_yaw_damping_seconds=(
+                self.bfm_turn_command_yaw_damping_seconds
+            ),
             trace_file=self.bfm_trace_file,
             trace_ticks=self.bfm_trace_ticks,
         )
@@ -13433,6 +13632,35 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         raise SystemExit("--max-resets must be non-negative")
     if args.ue_pid is not None and args.ue_pid <= 1:
         raise SystemExit("--ue-pid must identify a live UE process")
+    for name in (
+        "bfm_command_yaw_gain",
+        "bfm_formal_command_yaw_limit_rad_s",
+        "bfm_turn_command_yaw_damping_seconds",
+    ):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or (
+            value <= 0.0 and name != "bfm_turn_command_yaw_damping_seconds"
+        ):
+            raise SystemExit(f"--{name.replace('_', '-')} must be finite and positive")
+        if name == "bfm_turn_command_yaw_damping_seconds" and value < 0.0:
+            raise SystemExit(
+                "--bfm-turn-command-yaw-damping-seconds must be finite and non-negative"
+            )
+        setattr(args, name, value)
+    bfm_turn_min, bfm_turn_max = BFM_TURN_COMMAND_YAW_LIMIT_RANGE_RAD_S
+    args.bfm_turn_command_yaw_limit_rad_s = float(
+        args.bfm_turn_command_yaw_limit_rad_s
+    )
+    if (
+        not math.isfinite(args.bfm_turn_command_yaw_limit_rad_s)
+        or not bfm_turn_min
+        <= args.bfm_turn_command_yaw_limit_rad_s
+        <= bfm_turn_max
+    ):
+        raise SystemExit(
+            "--bfm-turn-command-yaw-limit-rad-s must be finite and in "
+            f"[{bfm_turn_min:.2f}, {bfm_turn_max:.2f}]"
+        )
     game_config = None
     motion_settings_store: MotionSettingsStore | None = None
     if args.control_source == "game":
@@ -13475,6 +13703,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         DEFAULT_MOVEMENT_MODE,
                     ),
                     max_turn_rate_rad_s=args.game_max_turn_rate,
+                    bfm_turn_command_yaw_limit_rad_s=(
+                        args.bfm_turn_command_yaw_limit_rad_s
+                    ),
                     keyboard_speed_cap_mps=configured_keyboard_speed_cap_mps,
                     slow_speed_mps=args.game_keyboard_slow_speed,
                     slow_double_tap_speed_mps=(
@@ -13852,6 +14083,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         and not args.bfm_trace_file.is_absolute()
     ):
         raise SystemExit("--bfm-trace-file must be absolute")
+    if (
+        getattr(args, "state_trace_file", None) is not None
+        and not args.state_trace_file.is_absolute()
+    ):
+        raise SystemExit("--state-trace-file must be absolute")
+    if (
+        not math.isfinite(float(getattr(args, "state_trace_every", 0.2)))
+        or float(getattr(args, "state_trace_every", 0.2)) < 0.1
+    ):
+        raise SystemExit("--state-trace-every must be finite and >= 0.1")
     if args.dds_interface != "lo":
         raise SystemExit("native Matrix SONIC requires --dds-interface lo")
     try:
@@ -14242,6 +14483,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         direct_bfm.publish_state(
                             snapshot,
                             height_map_z=bfm_height_map(snapshot),
+                            turn_command_yaw_limit_rad_s=(
+                                motion_settings_store.settings.bfm_turn_command_yaw_limit_rad_s
+                                if motion_settings_store is not None
+                                else args.bfm_turn_command_yaw_limit_rad_s
+                            ),
                         )
                         startup_state_sent = True
                     except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -14268,6 +14514,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     direct_bfm.publish_state(
                         snapshot,
                         height_map_z=bfm_height_map(snapshot),
+                        turn_command_yaw_limit_rad_s=(
+                            motion_settings_store.settings.bfm_turn_command_yaw_limit_rad_s
+                            if motion_settings_store is not None
+                            else args.bfm_turn_command_yaw_limit_rad_s
+                        ),
                     )
                     direct_bfm.activate()
                     print(
@@ -14785,6 +15036,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         next_physics_wall = started_wall + physics_period_s
         next_print = started_wall
         last_print_wall = started_wall
+        next_state_trace = started_wall
         last_render_count = 0
         last_physics_steps = 0
         control_frames = 0
@@ -14885,6 +15137,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             snapshot,
                             runtime_pause_neutral_command,
                             height_map_z=bfm_height_map(snapshot),
+                            turn_command_yaw_limit_rad_s=(
+                                motion_settings_store.settings.bfm_turn_command_yaw_limit_rad_s
+                                if motion_settings_store is not None
+                                else args.bfm_turn_command_yaw_limit_rad_s
+                            ),
                         )
                     if (
                         runtime_pause.phase == runtime_pause.CONTINUE_REQUESTED
@@ -14975,7 +15232,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         assert initial_root_yaw_rad is not None
                         assert game_readiness is not None
                         measured_heading = _root_yaw_rad(snapshot.qpos)
-                        game_input.core.synchronize_heading(measured_heading)
+                        root_angular_speed = math.sqrt(
+                            sum(float(value) * float(value) for value in snapshot.qvel[3:6])
+                        )
+                        game_input.core.synchronize_heading(
+                            measured_heading,
+                            root_angular_speed_rad_s=root_angular_speed,
+                        )
                         game_readiness.begin_frame(snapshot, game_input.core)
                         candidate_game_command = game_input.poll(
                             now_s=frame_wall,
@@ -15044,6 +15307,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             else args.control_source == "planner"
                         ),
                         game_command=direct_game_command,
+                        turn_command_yaw_limit_rad_s=(
+                            _bfm_turn_command_yaw_limit_for_game_command(
+                                direct_game_command,
+                                configured_limit_rad_s=(
+                                    motion_settings_store.settings.bfm_turn_command_yaw_limit_rad_s
+                                    if motion_settings_store is not None
+                                    else args.bfm_turn_command_yaw_limit_rad_s
+                                ),
+                            )
+                        ),
                     )
                 except (
                     EOFError,
@@ -15121,7 +15394,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             flush=True,
                         )
                         break
-                    game_input.core.synchronize_heading(measured_heading)
+                    root_angular_speed = math.sqrt(
+                        sum(float(value) * float(value) for value in snapshot.qvel[3:6])
+                    )
+                    game_input.core.synchronize_heading(
+                        measured_heading,
+                        root_angular_speed_rad_s=root_angular_speed,
+                    )
                     game_readiness.begin_frame(snapshot, game_input.core)
                     candidate_game_command = game_input.poll(
                         now_s=frame_wall,
@@ -15271,6 +15550,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                     snapshot,
                                     game_command,
                                     height_map_z=bfm_height_map(snapshot),
+                                    turn_command_yaw_limit_rad_s=(
+                                        _bfm_turn_command_yaw_limit_for_game_command(
+                                            game_command,
+                                            configured_limit_rad_s=(
+                                                motion_settings_store.settings.bfm_turn_command_yaw_limit_rad_s
+                                                if motion_settings_store is not None
+                                                else args.bfm_turn_command_yaw_limit_rad_s
+                                            ),
+                                        )
+                                    ),
                                 )
                                 bfm_shadow_published = True
                             except (
@@ -15373,6 +15662,16 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 snapshot,
                                 game_command,
                                 height_map_z=bfm_height_map(snapshot),
+                                turn_command_yaw_limit_rad_s=(
+                                    _bfm_turn_command_yaw_limit_for_game_command(
+                                        game_command,
+                                        configured_limit_rad_s=(
+                                            motion_settings_store.settings.bfm_turn_command_yaw_limit_rad_s
+                                            if motion_settings_store is not None
+                                            else args.bfm_turn_command_yaw_limit_rad_s
+                                        ),
+                                    )
+                                ),
                             )
                         except (
                             MoonDynamicGroundError,
@@ -15870,10 +16169,30 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     flush=True,
                 )
                 _atomic_json(args.status_file, status)
+                if (
+                    args.state_trace_file is not None
+                    and now + 1.0e-12 >= next_state_trace
+                ):
+                    _append_jsonl(
+                        args.state_trace_file,
+                        _compact_game_state_trace(
+                            status,
+                            direct_bfm_telemetry=(
+                                direct_bfm.telemetry()
+                                if direct_bfm is not None
+                                else None
+                            ),
+                        ),
+                    )
+                    next_state_trace = now + max(args.state_trace_every, 0.1)
                 last_print_wall = now
                 last_render_count = render_count
                 last_physics_steps = physics_steps
-                next_print = now + max(args.print_every, 0.1)
+                next_print = now + (
+                    min(max(args.print_every, 0.1), max(args.state_trace_every, 0.1))
+                    if args.state_trace_file is not None
+                    else max(args.print_every, 0.1)
+                )
 
         resume_probation_stop_wall = time.perf_counter()
         resume_probation_elapsed_s = max(
@@ -15902,7 +16221,13 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 # The duration gate runs before the next regular control frame.
                 # Refresh measured yaw from the latest physics snapshot so the
                 # boundary/emergency stop cannot retain a one-frame-old facing.
-                game_input.core.synchronize_heading(boundary_measured_heading)
+                boundary_root_angular_speed = math.sqrt(
+                    sum(float(value) * float(value) for value in snapshot.qvel[3:6])
+                )
+                game_input.core.synchronize_heading(
+                    boundary_measured_heading,
+                    root_angular_speed_rad_s=boundary_root_angular_speed,
+                )
             boundary_now = time.perf_counter()
             game_readiness.begin_frame(snapshot, game_input.core)
             boundary_candidate = game_input.poll(now_s=boundary_now, dt_s=0.0)

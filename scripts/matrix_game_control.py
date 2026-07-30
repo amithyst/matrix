@@ -383,6 +383,12 @@ MAX_MANUAL_TURN_MEASURED_FACING_LEAD_RAD = 0.08
 PURE_FORWARD_CRAWL_MAX_ERROR_RAD = math.pi / 2.0
 PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD = 0.005
 PURE_FORWARD_CRAWL_STALL_GRACE_S = 0.40
+CAMERA_FACE_MOVE_ENTRY_HOLD_S = 0.06
+CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S = 0.35
+# BFM Teacher50k can develop large yaw-rate spikes while walking on MoonWorld.
+# Camera-face movement uses this only as an entry gate before gait starts;
+# hard braking an already-walking BFM policy can destabilize the plant.
+CAMERA_FACE_STABILITY_BRAKE_MAX_ROOT_ANGULAR_SPEED_RAD_S = 0.85
 
 
 def native_locomotion_mode_for_speed(
@@ -624,6 +630,7 @@ class GameControlCore:
         self.config = config or ControlConfig()
         self._command_heading_rad = wrap_angle_rad(initial_heading_rad)
         self._measured_heading_rad: float | None = None
+        self._measured_root_angular_speed_rad_s: float | None = None
         self._speed_mps = 0.0
         self._gait_active = False
         self._snapshot: InputSnapshot | None = None
@@ -650,6 +657,9 @@ class GameControlCore:
         self._locked_movement_heading_rad: float | None = None
         self._pure_forward_crawl_error_rad: float | None = None
         self._pure_forward_crawl_stall_s = 0.0
+        self._camera_face_move_entry_hold_s = 0.0
+        self._camera_face_move_entry_ready = False
+        self._camera_face_move_entry_reason = "not_requested"
 
     @property
     def free_camera(self) -> bool:
@@ -666,6 +676,26 @@ class GameControlCore:
         """Latest physical base heading, or ``None`` before runtime feedback."""
 
         return self._measured_heading_rad
+
+    @property
+    def measured_root_angular_speed_rad_s(self) -> float | None:
+        """Latest physical root angular speed, or ``None`` before feedback."""
+
+        return self._measured_root_angular_speed_rad_s
+
+    def camera_face_move_gate_telemetry(self) -> dict[str, object]:
+        return {
+            "ready": self._camera_face_move_entry_ready,
+            "reason": self._camera_face_move_entry_reason,
+            "hold_s": round(self._camera_face_move_entry_hold_s, 6),
+            "required_hold_s": CAMERA_FACE_MOVE_ENTRY_HOLD_S,
+            "max_root_angular_speed_rad_s": (
+                CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S
+            ),
+            "stability_brake_max_root_angular_speed_rad_s": (
+                CAMERA_FACE_STABILITY_BRAKE_MAX_ROOT_ANGULAR_SPEED_RAD_S
+            ),
+        }
 
     @property
     def movement_mode(self) -> str:
@@ -708,10 +738,23 @@ class GameControlCore:
         self.invalidate_input("movement_mode_changed")
         return True
 
-    def synchronize_heading(self, heading_rad: float) -> None:
+    def synchronize_heading(
+        self,
+        heading_rad: float,
+        *,
+        root_angular_speed_rad_s: float | None = None,
+    ) -> None:
         """Update physical yaw feedback without overwriting the facing target."""
 
         self._measured_heading_rad = wrap_angle_rad(heading_rad)
+        if root_angular_speed_rad_s is None:
+            self._measured_root_angular_speed_rad_s = None
+            return
+        self._measured_root_angular_speed_rad_s = _finite_number(
+            root_angular_speed_rad_s,
+            name="root_angular_speed_rad_s",
+            nonnegative=True,
+        )
 
     def reanchor_heading(self, heading_rad: float) -> None:
         """One-shot reset into a newly created SONIC deploy yaw frame.
@@ -730,6 +773,7 @@ class GameControlCore:
         self._gait_active = False
         self._stopped_heading_latched = True
         self._reset_pure_forward_crawl_tracker()
+        self._reset_camera_face_move_entry_gate()
 
     def invalidate_input(self, reason: str = "input_invalidated") -> None:
         """Stop immediately and require neutral input before re-arming."""
@@ -743,6 +787,7 @@ class GameControlCore:
         self._require_neutral_rearm()
         self._invalid_reason = reason
         self._clear_movement_chord_lock()
+        self._reset_camera_face_move_entry_gate()
 
     def _require_neutral_rearm(self) -> None:
         self._requires_neutral_rearm = True
@@ -786,10 +831,63 @@ class GameControlCore:
         self._locked_movement_chord = None
         self._locked_movement_heading_rad = None
         self._reset_pure_forward_crawl_tracker()
+        self._reset_camera_face_move_entry_gate()
 
     def _reset_pure_forward_crawl_tracker(self) -> None:
         self._pure_forward_crawl_error_rad = None
         self._pure_forward_crawl_stall_s = 0.0
+
+    def _reset_camera_face_move_entry_gate(
+        self, reason: str = "not_requested"
+    ) -> None:
+        self._camera_face_move_entry_hold_s = 0.0
+        self._camera_face_move_entry_ready = False
+        self._camera_face_move_entry_reason = reason
+
+    def _update_camera_face_move_entry_gate(
+        self,
+        *,
+        requested_speed: float,
+        alignment: float,
+        hidden_speed_mps: float,
+        dt_s: float,
+    ) -> bool:
+        """Return whether camera-face movement may enter gait this frame."""
+
+        if (
+            requested_speed + self.config.speed_epsilon_mps
+            < self.config.gait_start_speed_mps
+        ):
+            self._reset_camera_face_move_entry_gate("speed_below_start")
+            return False
+        if alignment + self.config.speed_epsilon_mps < math.cos(
+            self.config.gait_start_heading_error_rad
+        ):
+            self._reset_camera_face_move_entry_gate("heading_error")
+            return False
+        if hidden_speed_mps + self.config.speed_epsilon_mps < (
+            self.config.min_gait_speed_mps
+            * math.cos(self.config.gait_start_heading_error_rad)
+        ):
+            self._reset_camera_face_move_entry_gate("speed_ramp")
+            return False
+        root_angular_speed = self._measured_root_angular_speed_rad_s
+        if (
+            root_angular_speed is not None
+            and root_angular_speed
+            > CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S
+        ):
+            self._reset_camera_face_move_entry_gate("root_angular_speed")
+            return False
+        self._camera_face_move_entry_hold_s += dt_s
+        self._camera_face_move_entry_ready = (
+            self._camera_face_move_entry_hold_s + self.config.speed_epsilon_mps
+            >= CAMERA_FACE_MOVE_ENTRY_HOLD_S
+        )
+        self._camera_face_move_entry_reason = (
+            "ready" if self._camera_face_move_entry_ready else "stability_hold"
+        )
+        return self._camera_face_move_entry_ready
 
     def _pure_forward_crawl_progress_allows(
         self, measured_error_abs_rad: float, *, dt_s: float
@@ -1080,6 +1178,9 @@ class GameControlCore:
         desired_heading = self._command_heading_rad
         movement_heading = self._command_heading_rad
         pure_forward_alignment_crawl = False
+        camera_face_move_entry_allowed = True
+        camera_face_alignment_brake = False
+        camera_face_measured_error_rad: float | None = None
         manual_turn = bool(
             not digital_movement
             and input_magnitude <= 1e-12
@@ -1159,8 +1260,18 @@ class GameControlCore:
                     measured_error = wrap_angle_rad(
                         desired_heading - self._measured_heading_rad
                     )
+                    camera_face_measured_error_rad = measured_error
                     measured_alignment = max(0.0, math.cos(measured_error))
                     alignment = min(command_alignment, measured_alignment)
+                    root_angular_speed = self._measured_root_angular_speed_rad_s
+                    camera_face_alignment_brake = bool(
+                        not self._gait_active
+                        and root_angular_speed is not None
+                        and root_angular_speed
+                        > CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S
+                        and abs(measured_error)
+                        <= self.config.gait_stop_heading_error_rad
+                    )
             else:
                 # These modes deliberately decouple translation and facing.
                 # Keep the facing command anchored to the physical body so a
@@ -1224,6 +1335,9 @@ class GameControlCore:
                 # The translation gate already supplies turn-before-move, so
                 # preserve the exact tier target once the body is inside it.
                 target_speed = requested_speed
+            if camera_face_alignment_brake:
+                target_speed = 0.0
+                requested_locomotion_mode = SONIC_IDLE_MODE
         elif manual_turn:
             self._clear_movement_chord_lock()
             self._stopped_heading_latched = False
@@ -1309,6 +1423,33 @@ class GameControlCore:
         if self._speed_mps < self.config.speed_epsilon_mps:
             self._speed_mps = 0.0
 
+        if (
+            input_magnitude > 1e-12
+            and not camera_face_alignment_brake
+            and movement_mode == CAMERA_FACE
+            and not self._gait_active
+            and not pure_forward_alignment_crawl
+        ):
+            camera_face_move_entry_allowed = (
+                self._update_camera_face_move_entry_gate(
+                    requested_speed=requested_speed,
+                    alignment=alignment,
+                    hidden_speed_mps=self._speed_mps,
+                    dt_s=dt,
+                )
+            )
+        elif camera_face_alignment_brake:
+            camera_face_move_entry_allowed = False
+            self._reset_camera_face_move_entry_gate("root_angular_brake")
+        elif movement_mode != CAMERA_FACE:
+            self._reset_camera_face_move_entry_gate("not_camera_face")
+        elif self._gait_active:
+            self._reset_camera_face_move_entry_gate("already_moving")
+        elif input_magnitude <= 1e-12:
+            self._reset_camera_face_move_entry_gate("not_requested")
+        elif pure_forward_alignment_crawl:
+            self._reset_camera_face_move_entry_gate("alignment_crawl")
+
         # Native locomotion starts at SLOW_WALK's 0.10 m/s floor. Keep distinct
         # start/stop thresholds so measured-heading noise cannot chatter between
         # IDLE and locomotion. A deliberate direction release is IDLE above.
@@ -1331,6 +1472,7 @@ class GameControlCore:
             and not self._gait_active
             and requested_speed + self.config.speed_epsilon_mps
             >= self.config.gait_start_speed_mps
+            and camera_face_move_entry_allowed
             and alignment + self.config.speed_epsilon_mps
             >= math.cos(self.config.gait_start_heading_error_rad)
             and self._speed_mps + self.config.speed_epsilon_mps
@@ -1396,6 +1538,7 @@ class GameControlCore:
                 movement_mode == CAMERA_FACE
                 and input_magnitude > 1e-12
                 and not moving
+                and not camera_face_alignment_brake
             )
         )
         # SONIC's own controller sends IDLE whenever translational stick input
@@ -1414,7 +1557,11 @@ class GameControlCore:
             reason=(
                 "manual_yaw"
                 if manual_turn
-                else "aligning_heading" if turning_to_heading else None
+                else "aligning_heading"
+                if turning_to_heading
+                else "root_angular_brake"
+                if camera_face_alignment_brake
+                else None
             ),
             desired_facing=desired_direction,
         )
