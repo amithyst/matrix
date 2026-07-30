@@ -389,6 +389,12 @@ CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S = 0.35
 # Camera-face movement uses this only as an entry gate before gait starts;
 # hard braking an already-walking BFM policy can destabilize the plant.
 CAMERA_FACE_STABILITY_BRAKE_MAX_ROOT_ANGULAR_SPEED_RAD_S = 0.85
+# A fresh camera-facing W can legitimately request an approximately 180 degree
+# turn before any translation.  On MoonWorld, continuously feeding that turn can
+# spin the BFM root faster than the policy can stabilize.  Pulse the automatic
+# alignment turn and let the root settle before issuing the next turn command.
+CAMERA_FACE_TURN_BRAKE_ENTER_ROOT_ANGULAR_SPEED_RAD_S = 0.60
+CAMERA_FACE_TURN_BRAKE_EXIT_ROOT_ANGULAR_SPEED_RAD_S = 0.25
 
 
 def native_locomotion_mode_for_speed(
@@ -660,6 +666,7 @@ class GameControlCore:
         self._camera_face_move_entry_hold_s = 0.0
         self._camera_face_move_entry_ready = False
         self._camera_face_move_entry_reason = "not_requested"
+        self._camera_face_turn_brake_active = False
 
     @property
     def free_camera(self) -> bool:
@@ -694,6 +701,13 @@ class GameControlCore:
             ),
             "stability_brake_max_root_angular_speed_rad_s": (
                 CAMERA_FACE_STABILITY_BRAKE_MAX_ROOT_ANGULAR_SPEED_RAD_S
+            ),
+            "turn_brake_active": bool(self._camera_face_turn_brake_active),
+            "turn_brake_enter_root_angular_speed_rad_s": (
+                CAMERA_FACE_TURN_BRAKE_ENTER_ROOT_ANGULAR_SPEED_RAD_S
+            ),
+            "turn_brake_exit_root_angular_speed_rad_s": (
+                CAMERA_FACE_TURN_BRAKE_EXIT_ROOT_ANGULAR_SPEED_RAD_S
             ),
         }
 
@@ -832,6 +846,7 @@ class GameControlCore:
         self._locked_movement_heading_rad = None
         self._reset_pure_forward_crawl_tracker()
         self._reset_camera_face_move_entry_gate()
+        self._camera_face_turn_brake_active = False
 
     def _reset_pure_forward_crawl_tracker(self) -> None:
         self._pure_forward_crawl_error_rad = None
@@ -1022,6 +1037,7 @@ class GameControlCore:
         # focus loss, and free-camera mode can never leave residual velocity.
         self._speed_mps = 0.0
         self._gait_active = False
+        self._camera_face_turn_brake_active = False
         # ``facing`` remains an active orientation target even in SONIC IDLE.
         # If the rate-limited command is ahead of the physical body, preserving
         # it here would let the robot keep turning after focus loss, EOF, or a
@@ -1264,14 +1280,22 @@ class GameControlCore:
                     measured_alignment = max(0.0, math.cos(measured_error))
                     alignment = min(command_alignment, measured_alignment)
                     root_angular_speed = self._measured_root_angular_speed_rad_s
-                    camera_face_alignment_brake = bool(
-                        not self._gait_active
-                        and root_angular_speed is not None
-                        and root_angular_speed
-                        > CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S
-                        and abs(measured_error)
-                        <= self.config.gait_stop_heading_error_rad
-                    )
+                    if not self._gait_active and root_angular_speed is not None:
+                        if self._camera_face_turn_brake_active:
+                            camera_face_alignment_brake = (
+                                root_angular_speed
+                                > CAMERA_FACE_TURN_BRAKE_EXIT_ROOT_ANGULAR_SPEED_RAD_S
+                            )
+                        else:
+                            camera_face_alignment_brake = (
+                                root_angular_speed
+                                > CAMERA_FACE_TURN_BRAKE_ENTER_ROOT_ANGULAR_SPEED_RAD_S
+                            )
+                        self._camera_face_turn_brake_active = (
+                            camera_face_alignment_brake
+                        )
+                    else:
+                        self._camera_face_turn_brake_active = False
             else:
                 # These modes deliberately decouple translation and facing.
                 # Keep the facing command anchored to the physical body so a
@@ -1283,6 +1307,7 @@ class GameControlCore:
                     self._command_heading_rad = self._measured_heading_rad
                 desired_heading = self._command_heading_rad
                 self._reset_pure_forward_crawl_tracker()
+                self._camera_face_turn_brake_active = False
 
             requested_speed, requested_locomotion_mode = (
                 self._requested_locomotion(input_magnitude)
@@ -1340,6 +1365,7 @@ class GameControlCore:
                 requested_locomotion_mode = SONIC_IDLE_MODE
         elif manual_turn:
             self._clear_movement_chord_lock()
+            self._camera_face_turn_brake_active = False
             self._stopped_heading_latched = False
             turn_sign = 1.0 if keys.q else -1.0
             self._turn_sign = turn_sign

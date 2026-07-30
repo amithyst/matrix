@@ -4438,16 +4438,24 @@ def _effective_game_camera_yaw_offset_deg(
     configured_offset_deg: float,
     initial_root_yaw_rad: float | None,
 ) -> float:
-    """Map absolute provider yaw into SONIC's initial-root-relative frame."""
+    """Return the yaw offset applied to the game camera provider.
+
+    UE final POV is already an absolute world-facing observation. Re-centering
+    it by the initial robot root yaw makes a front-facing startup camera look
+    aligned with the robot body, so camera-face W walks toward the camera
+    instead of first turning the robot to put its back toward the camera.
+    """
 
     configured = float(configured_offset_deg)
     if not math.isfinite(configured):
         raise ValueError("configured camera yaw offset must be finite")
-    if source != "ue-final-pov":
-        return configured
-    if initial_root_yaw_rad is None or not math.isfinite(initial_root_yaw_rad):
-        raise ValueError("UE final-POV yaw requires a finite initial root yaw")
-    return configured - math.degrees(initial_root_yaw_rad)
+    if (
+        source == "ue-final-pov"
+        and initial_root_yaw_rad is not None
+        and not math.isfinite(initial_root_yaw_rad)
+    ):
+        raise ValueError("UE final-POV initial root yaw must be finite when present")
+    return configured
 
 
 def _game_control_status_fields(
