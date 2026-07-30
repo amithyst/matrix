@@ -8598,15 +8598,14 @@ def _bfm_realscan_motion_command(
     *,
     root_yaw_rad: float | None = None,
 ) -> RobotMotionCommand:
-    """Project a Matrix game command onto BFM RealScan's forward/yaw surface.
+    """Preserve Matrix movement/facing semantics for BFM RealScan.
 
-    Matrix's native SONIC keyboard surface has slow/walk/run plus per-tier
-    double-tap boosts.  The BFM Teacher was validated as a RealScan
-    forward-speed/yaw policy: Matrix computes the operator-facing movement
-    frame, speed tier, and keyboard cap; the BFM adapter only removes lateral
-    velocity that the teacher was not trained to handle.  Preserving
-    ``command.speed_mps`` keeps the ESC control panel authoritative instead of
-    silently replacing live settings with import-time environment constants.
+    Matrix computes the operator-facing movement frame, speed tier, keyboard
+    cap, and desired body heading.  The BFM worker converts that world-frame
+    command into its Robo-PFNN local command surface.  Do not replace these
+    vectors with the current root forward direction: doing so makes every
+    Matrix control mode degrade into "walk straight ahead" and hides
+    camera-face auto-turn or Q/E heading intent from the policy.
     """
 
     if (
@@ -8615,38 +8614,50 @@ def _bfm_realscan_motion_command(
         or command.speed_mps <= 1.0e-6
     ):
         return command
-    jog = command.locomotion_mode == SONIC_RUN_MODE
     if root_yaw_rad is not None:
         root_yaw = float(root_yaw_rad)
         if not math.isfinite(root_yaw):
             raise ValueError("BFM RealScan root_yaw_rad must be finite")
-        forward = (math.cos(root_yaw), math.sin(root_yaw), 0.0)
+        fallback_forward = (math.cos(root_yaw), math.sin(root_yaw), 0.0)
     else:
-        facing_xy = command.facing[:2]
-        facing_norm = math.hypot(facing_xy[0], facing_xy[1])
-        if facing_norm <= 1.0e-8:
-            movement_xy = command.movement[:2]
-            facing_norm = math.hypot(movement_xy[0], movement_xy[1])
-            if facing_norm <= 1.0e-8:
-                raise ValueError(
-                    "BFM RealScan moving command has no horizontal heading"
-                )
-            forward = (
-                movement_xy[0] / facing_norm,
-                movement_xy[1] / facing_norm,
-                0.0,
-            )
-        else:
-            forward = (
-                facing_xy[0] / facing_norm,
-                facing_xy[1] / facing_norm,
-                0.0,
-            )
+        fallback_forward = None
+
+    def normalise_heading(
+        vector: tuple[float, float, float] | None,
+        *,
+        fallback: tuple[float, float, float] | None = None,
+        label: str,
+    ) -> tuple[float, float, float]:
+        if vector is not None:
+            x, y, _z = (float(value) for value in vector)
+            norm = math.hypot(x, y)
+            if math.isfinite(norm) and norm > 1.0e-8:
+                return (x / norm, y / norm, 0.0)
+        if fallback is not None:
+            return fallback
+        raise ValueError(f"BFM RealScan moving command has no {label} heading")
+
+    movement = normalise_heading(
+        command.movement,
+        fallback=fallback_forward,
+        label="movement",
+    )
+    facing = normalise_heading(
+        command.facing,
+        fallback=movement,
+        label="facing",
+    )
+    desired_facing = normalise_heading(
+        command.desired_facing,
+        fallback=facing,
+        label="desired_facing",
+    )
+    jog = command.locomotion_mode == SONIC_RUN_MODE
     return replace(
         command,
-        movement=forward,
-        facing=forward,
-        desired_facing=forward,
+        movement=movement,
+        facing=facing,
+        desired_facing=desired_facing,
         speed_mps=float(command.speed_mps),
         locomotion_mode=SONIC_RUN_MODE if jog else SONIC_WALK_MODE,
     )

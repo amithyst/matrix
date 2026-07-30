@@ -1104,11 +1104,11 @@ class BfmTeacherCore:
             world_velocity = np.zeros(2, dtype=np.float64)
         requested_facing = sample.facing
         facing_norm = float(np.linalg.norm(requested_facing[:2]))
-        # Match the accepted BFM-3DGS keyboard contract: W/Shift-W are PFNN
-        # local forward walk/jog commands and carry no implicit yaw feedback.
-        # Matrix has already expressed movement in the camera-facing world
-        # frame, so rotate it back by that same facing.  A/D arrives as the
-        # explicit ``turn`` mode and remains the sole yaw command surface.
+        # Matrix supplies two headings: a rate-limited wire-facing vector and
+        # the final desired facing.  Moving samples use wire-facing as the
+        # local movement frame; turn-only samples use final desired facing for
+        # yaw feedback so camera-face auto-turn and Q/E do not look stationary
+        # just because the wire-facing lead is intentionally small.
         movement_frame_yaw = (
             math.atan2(requested_facing[1], requested_facing[0])
             if sample.mode == "move" and facing_norm > 1.0e-8
@@ -1118,16 +1118,22 @@ class BfmTeacherCore:
         sine = math.sin(movement_frame_yaw)
         local_vx = cosine * world_velocity[0] + sine * world_velocity[1]
         local_vy = -sine * world_velocity[0] + cosine * world_velocity[1]
+        turn_facing = (
+            sample.desired_facing
+            if sample.mode == "turn"
+            else requested_facing
+        )
+        turn_facing_norm = float(np.linalg.norm(turn_facing[:2]))
         if (
             sample.safe_stop
             or sample.mode != "turn"
-            or facing_norm <= 1.0e-8
+            or turn_facing_norm <= 1.0e-8
         ):
             yaw_rate = 0.0
         else:
             facing_yaw = math.atan2(
-                requested_facing[1],
-                requested_facing[0],
+                turn_facing[1],
+                turn_facing[0],
             )
             heading_error = math.atan2(
                 math.sin(facing_yaw - sample.root_yaw),
@@ -2040,7 +2046,11 @@ class BfmTeacherCore:
             "command_final_heading_error_rad": float(
                 command_final_heading_error
             ),
-            "command_heading_source": "matrix_wire_facing",
+            "command_heading_source": (
+                "matrix_desired_facing"
+                if world.mode == "turn"
+                else "matrix_wire_facing"
+            ),
             "command_yaw_gain": FORMAL_COMMAND_YAW_GAIN,
             "command_yaw_limit_rad_s": (
                 TURN_COMMAND_YAW_LIMIT_RAD_S
