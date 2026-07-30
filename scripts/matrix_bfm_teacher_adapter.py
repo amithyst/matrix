@@ -2556,6 +2556,7 @@ def run_worker(
     ] = deque()
     last_queued_world_sequence: int | None = None
     policy_input_queue_max_depth = 0
+    policy_input_queue_drop_count = 0
     active_policy_tick_count = 0
     active_policy_sequence_delta_last: int | None = None
     active_policy_sequence_delta_max = 0
@@ -2619,10 +2620,12 @@ def run_worker(
                         ):
                             if len(policy_inputs) >= MAX_POLICY_INPUT_QUEUE:
                                 if handoff.state == HandoffStateMachine.ACTIVE:
-                                    raise RuntimeError(
-                                        "BFM Teacher policy input queue exceeded "
-                                        f"{MAX_POLICY_INPUT_QUEUE} samples"
-                                    )
+                                    # A transient scheduler/GPU stall should not
+                                    # tear down the interactive desktop run. Keep
+                                    # the freshest host state and report the skip;
+                                    # the supervisor already tracks sequence gaps
+                                    # as policy skip telemetry.
+                                    policy_input_queue_drop_count += 1
                                 policy_inputs.popleft()
                             # Preserve the LowState observed with each host
                             # 50 Hz STATE.  If one inference overruns 20 ms,
@@ -3482,6 +3485,9 @@ def run_worker(
                     "policy_input_queue_depth": len(policy_inputs),
                     "policy_input_queue_max_depth": (
                         policy_input_queue_max_depth
+                    ),
+                    "policy_input_queue_drop_count": (
+                        policy_input_queue_drop_count
                     ),
                     "active_policy_tick_count": active_policy_tick_count,
                     "active_policy_sequence_delta_last": (

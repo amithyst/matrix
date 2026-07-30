@@ -157,6 +157,21 @@ _STARTUP_MEDIA_FRAMES_DIR = Path(
         os.fspath(_DEFAULT_STARTUP_MEDIA_FRAMES_DIR),
     )
 ).expanduser()
+
+
+def env_float(name: str, *, default: float, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number") from exc
+    if not math.isfinite(value):
+        raise SystemExit(f"{name} must be finite")
+    return max(minimum, min(maximum, value))
+
+
 _JS_EVENT = struct.Struct("IhBB")
 _JS_EVENT_BUTTON = 0x01
 _JS_EVENT_AXIS = 0x02
@@ -187,8 +202,18 @@ _X11_ESCAPE_GRAB_MODIFIERS = (
 )
 _X11_UI_GRAB_KEY_NAMES = ("escape", "q", "e")
 _MAX_X11_GRABBED_ESCAPE_EVENTS_PER_POLL = 128
-_STARTUP_LOADING_OVERLAY_SECONDS = 8.0
-_STARTUP_MEDIA_FRAME_RATE_HZ = 2.0
+_STARTUP_LOADING_OVERLAY_SECONDS = env_float(
+    "MATRIX_STARTUP_LOADING_OVERLAY_SECONDS",
+    default=74.0,
+    minimum=1.0,
+    maximum=300.0,
+)
+_STARTUP_MEDIA_FRAME_RATE_HZ = env_float(
+    "MATRIX_STARTUP_MEDIA_FRAME_RATE_HZ",
+    default=10.0,
+    minimum=0.1,
+    maximum=30.0,
+)
 
 
 def startup_loading_overlay_state(
@@ -6767,16 +6792,21 @@ class GameCommandClient:
             and isinstance(pending.command, TeleportList)
             and self._celestial_catalog is not None
         ):
-            try:
-                teleport_probes = probes_from_response(
-                    response_data,
-                    catalog=self._celestial_catalog,
-                )
-            except CelestialNavigationError as exc:
-                self._protocol_failure(
-                    f"Invalid celestial navigation response: {exc}"
-                )
-                return True
+            catalog_tags = tuple(
+                destination.teleport_tag
+                for destination in self._celestial_catalog.destinations
+            )
+            if pending.command.tags == catalog_tags:
+                try:
+                    teleport_probes = probes_from_response(
+                        response_data,
+                        catalog=self._celestial_catalog,
+                    )
+                except CelestialNavigationError as exc:
+                    self._protocol_failure(
+                        f"Invalid celestial navigation response: {exc}"
+                    )
+                    return True
         self._pending = None
         self._pending_runtime_pause = None
         warning = self._pending_warning

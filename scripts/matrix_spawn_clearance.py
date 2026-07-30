@@ -1728,22 +1728,59 @@ def audit_spawn_safety(
         if isinstance(contacts, list)
         else []
     )
-    if allowed_foot_contacts and not moon_spawn_gate:
+    if allowed_foot_contacts:
         supported_feet = {
             str(contact.get("robot_body", {}).get("name"))
             for contact in allowed_foot_contacts
             if isinstance(contact.get("robot_body"), dict)
             and contact["robot_body"].get("name") in _FOOT_BODY_NAMES
         }
-        if supported_feet:
+        required_hits = (
+            REQUIRED_MOON_GROUND_SUPPORT_HITS
+            if moon_spawn_gate
+            else REQUIRED_GROUND_SUPPORT_HITS
+        )
+        contact_heights: list[float] = []
+        for contact in allowed_foot_contacts:
+            position = contact.get("position_m")
+            if isinstance(position, list) and len(position) >= 3:
+                try:
+                    height = float(position[2])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(height):
+                    contact_heights.append(height)
+        height_delta_m = (
+            max(contact_heights) - min(contact_heights)
+            if len(contact_heights) >= 2
+            else None
+        )
+        height_delta_safe = bool(
+            not moon_spawn_gate
+            or (
+                height_delta_m is not None
+                and height_delta_m <= maximum_foot_support_height_delta_m
+            )
+        )
+        if len(supported_feet) >= required_hits and height_delta_safe:
             result["support"] = {
                 "schema": GROUND_SUPPORT_SCHEMA,
                 "supported": True,
                 "method": "allowed_foot_contacts",
-                "required_hits": REQUIRED_GROUND_SUPPORT_HITS,
+                "required_hits": required_hits,
                 "accepted_hits": len(supported_feet),
+                "required_distinct_feet": required_hits,
+                "supported_foot_names": sorted(supported_feet),
                 "maximum_drop_m": MAXIMUM_GROUND_SUPPORT_DROP_M,
                 "minimum_normal_z": MINIMUM_GROUND_SUPPORT_NORMAL_Z,
+                "height_delta_m": height_delta_m,
+                "maximum_height_delta_m": (
+                    maximum_foot_support_height_delta_m
+                    if moon_spawn_gate
+                    else None
+                ),
+                "height_delta_safe": height_delta_safe,
+                "moon_spawn_gate": moon_spawn_gate,
                 "ray_direction": [0.0, 0.0, -1.0],
                 "probes": [],
                 "contact_indices": [

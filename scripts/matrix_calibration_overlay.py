@@ -49,6 +49,8 @@ from matrix_ui_settings import (
     canonical_font_size,
 )
 from matrix_motion_settings import (
+    BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+    BFM_TURN_COMMAND_YAW_LIMIT_PATH,
     DOUBLE_TAP_SPEED_FIELD,
     GEARS,
     KEYBOARD_LOOK_RATE_FIELD,
@@ -107,12 +109,13 @@ _MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 _MAX_LOCOMOTION_POLICY_BUTTONS = 3
 _MAX_RECOVERY_POLICY_BUTTONS = 4
 _POLICY_STATUS_DISPLAY_SECONDS = 4.0
-_STARTUP_MEDIA_FRAME_RATE_HZ = 2.0
-_STARTUP_MEDIA_MAX_FRAMES = 24
-_STARTUP_MEDIA_MAX_PIXELS = 640 * 360
+_STARTUP_MEDIA_FRAME_RATE_HZ = 10.0
+_STARTUP_MEDIA_MAX_FRAMES = 2_400
+_STARTUP_MEDIA_MAX_PIXELS = 1280 * 720
 _STARTUP_MEDIA_GRID_COLUMNS = 72
 _STARTUP_MEDIA_GRID_ROWS = 42
 _STARTUP_MEDIA_COLOUR_STEP = 32
+_X11_Z_PIXMAP_FORMAT = 2
 _MIN_OVERLAY_FONT_SIZE = 1
 _DEFAULT_OVERLAY_FONT_SIZE = 13
 _MAX_OVERLAY_FONT_SIZE = 22
@@ -579,7 +582,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     motion_bottom = speed_y - motion_outer_gap
     motion_row_height = max(
         1,
-        (motion_bottom - motion_top - 4 * motion_row_gap) // 5,
+        (motion_bottom - motion_top - 5 * motion_row_gap) // 6,
     )
     motion_left_x = panel_x + margin
     motion_left_width = max(
@@ -887,15 +890,17 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
                 motion_row_height,
             )
     turn_y = motion_top + 3 * (motion_row_height + motion_row_gap)
-    look_y = motion_top + 4 * (motion_row_height + motion_row_gap)
+    boost_y = motion_top + 4 * (motion_row_height + motion_row_gap)
+    look_y = motion_top + 5 * (motion_row_height + motion_row_gap)
     turn_specs = (
         ("motion_turn_rate", motion_left_x, motion_left_width),
         ("motion_keyboard_turn_rate", motion_right_x, motion_right_width),
         ("motion_keyboard_turn_boost_rate", motion_left_x, motion_left_width),
-        ("motion_camera_look_rate", motion_right_x, motion_right_width),
+        ("motion_bfm_turn_command_yaw_limit", motion_right_x, motion_right_width),
+        ("motion_camera_look_rate", motion_left_x, motion_left_width),
     )
     for index, (stem, cell_x, cell_width) in enumerate(turn_specs):
-        row_y = turn_y if index < 2 else look_y
+        row_y = turn_y if index < 2 else boost_y if index < 4 else look_y
         button_width = 24 if compact else max(32, min(52, cell_width // 4))
         value_width = max(1, cell_width - 2 * button_width)
         result[f"{stem}_down"] = (
@@ -1034,6 +1039,16 @@ _MOTION_STEP_ACTION_DETAILS.update(
         f"motion_keyboard_turn_boost_rate_{suffix}": (
             "turn",
             KEYBOARD_TURN_BOOST_RATE_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_bfm_turn_command_yaw_limit_{suffix}": (
+            "bfm",
+            BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
             direction,
         )
         for suffix, direction in (("down", -1), ("up", 1))
@@ -1365,7 +1380,7 @@ def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
     if isinstance(frame_rate_raw, bool) or not isinstance(frame_rate_raw, (int, float)):
         media_frame_rate_hz = _STARTUP_MEDIA_FRAME_RATE_HZ
     else:
-        media_frame_rate_hz = max(0.1, min(12.0, float(frame_rate_raw)))
+        media_frame_rate_hz = max(0.1, min(30.0, float(frame_rate_raw)))
     return StartupLoadingModel(
         True,
         message[:80],
@@ -2597,6 +2612,8 @@ class MotionSettingsPanelModel:
             return self.settings.value_for_path(KEYBOARD_TURN_RATE_PATH)
         if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
             return self.settings.value_for_path(KEYBOARD_TURN_BOOST_RATE_PATH)
+        if gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+            return self.settings.value_for_path(BFM_TURN_COMMAND_YAW_LIMIT_PATH)
         if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
             return self.settings.value_for_path(KEYBOARD_SPEED_CAP_PATH)
         if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
@@ -2782,6 +2799,8 @@ def motion_step_target(
         path = KEYBOARD_TURN_RATE_PATH
     elif gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
         path = KEYBOARD_TURN_BOOST_RATE_PATH
+    elif gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+        path = BFM_TURN_COMMAND_YAW_LIMIT_PATH
     else:
         path = f"control.motion.gears.{gear}.{field}"
     current = model.settings.value_for_path(path)
@@ -2812,6 +2831,11 @@ def motion_step_command(
     if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
         return (
             f"/data modify entity @s {KEYBOARD_TURN_BOOST_RATE_PATH} "
+            f"set value {target:.2f}"
+        )
+    if gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+        return (
+            f"/data modify entity @s {BFM_TURN_COMMAND_YAW_LIMIT_PATH} "
             f"set value {target:.2f}"
         )
     if gear == "camera":
@@ -2848,6 +2872,9 @@ def motion_value_label(
     if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
         value = model.value(gear, field)
         return f"双{value:.2f}" if compact else f"双击 Q/E {value:.2f} rad/s"
+    if gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+        value = model.value(gear, field)
+        return f"BFM{value:.2f}" if compact else f"BFM纯转限幅 {value:.2f} rad/s"
     if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
         if model.camera_control_available is False:
             return "相机不可用" if compact else "方向键相机不可用"
@@ -3776,10 +3803,11 @@ class X11CalibrationOverlay:
         self._install_x_error_handler()
         self._screen = int(self._x11.XDefaultScreen(self._display))
         self._root = int(self._x11.XRootWindow(self._display, self._screen))
-        self._visual = (
-            self._x11.XDefaultVisual(self._display, self._screen)
-            if self._xft is not None
-            else None
+        self._visual = self._x11.XDefaultVisual(self._display, self._screen)
+        self._depth = (
+            int(self._x11.XDefaultDepth(self._display, self._screen))
+            if hasattr(self._x11, "XDefaultDepth")
+            else 24
         )
         self._colormap = int(
             self._x11.XDefaultColormap(self._display, self._screen)
@@ -3825,7 +3853,9 @@ class X11CalibrationOverlay:
         self._pending_font_slider_size: int | None = None
         self._colours: dict[str, int] = {}
         self._startup_media_frame_dir: str | None = None
-        self._startup_media_frames: tuple[StartupMediaFrame, ...] = ()
+        self._startup_media_frame_paths: tuple[Path, ...] = ()
+        self._startup_media_cached_path: str | None = None
+        self._startup_media_cached_frame: StartupMediaFrame | None = None
         self._startup_media_colour_cache: dict[tuple[int, int, int], int] = {}
         self._visible = False
         self._cursor_visible = False
@@ -4141,6 +4171,46 @@ class X11CalibrationOverlay:
             "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
         }
         for name, (argtypes, restype) in signatures.items():
+            function = getattr(self._x11, name)
+            function.argtypes = argtypes
+            function.restype = restype
+        optional_signatures = {
+            "XDefaultDepth": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_int),
+            "XCreateImage": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                ],
+                ctypes.c_void_p,
+            ),
+            "XPutImage": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                ],
+                ctypes.c_int,
+            ),
+            "XDestroyImage": ([ctypes.c_void_p], ctypes.c_int),
+        }
+        for name, (argtypes, restype) in optional_signatures.items():
+            if not hasattr(self._x11, name):
+                continue
             function = getattr(self._x11, name)
             function.argtypes = argtypes
             function.restype = restype
@@ -6202,6 +6272,11 @@ class X11CalibrationOverlay:
                 "turn",
                 KEYBOARD_TURN_BOOST_RATE_FIELD,
             ),
+            (
+                "motion_bfm_turn_command_yaw_limit",
+                "bfm",
+                BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+            ),
             ("motion_camera_look_rate", "camera", KEYBOARD_LOOK_RATE_FIELD),
         ):
             for suffix in ("down", "up"):
@@ -6644,13 +6719,15 @@ class X11CalibrationOverlay:
             return "返回游戏并应用"
         return "返回游戏"
 
-    def _load_startup_media_frames(
+    def _load_startup_media_frame_paths(
         self,
         media_frames_dir: str | None,
-    ) -> tuple[StartupMediaFrame, ...]:
+    ) -> tuple[Path, ...]:
         if not media_frames_dir:
             self._startup_media_frame_dir = None
-            self._startup_media_frames = ()
+            self._startup_media_frame_paths = ()
+            self._startup_media_cached_path = None
+            self._startup_media_cached_frame = None
             return ()
         try:
             directory = Path(media_frames_dir).expanduser().resolve(strict=False)
@@ -6659,22 +6736,30 @@ class X11CalibrationOverlay:
         directory_key = os.fspath(directory)
         if (
             getattr(self, "_startup_media_frame_dir", None) == directory_key
-            and getattr(self, "_startup_media_frames", ())
+            and getattr(self, "_startup_media_frame_paths", ())
         ):
-            return self._startup_media_frames
-        frames: list[StartupMediaFrame] = []
+            return self._startup_media_frame_paths
         try:
             paths = sorted(directory.glob("*.ppm"))[:_STARTUP_MEDIA_MAX_FRAMES]
         except OSError:
             paths = []
-        for path in paths:
-            try:
-                frames.append(read_startup_media_ppm(path))
-            except (OSError, ValueError):
-                continue
         self._startup_media_frame_dir = directory_key
-        self._startup_media_frames = tuple(frames)
-        return self._startup_media_frames
+        self._startup_media_frame_paths = tuple(paths)
+        self._startup_media_cached_path = None
+        self._startup_media_cached_frame = None
+        return self._startup_media_frame_paths
+
+    def _load_startup_media_frame(self, path: Path) -> StartupMediaFrame | None:
+        path_key = os.fspath(path)
+        if getattr(self, "_startup_media_cached_path", None) == path_key:
+            return getattr(self, "_startup_media_cached_frame", None)
+        try:
+            frame = read_startup_media_ppm(path)
+        except (OSError, ValueError):
+            return None
+        self._startup_media_cached_path = path_key
+        self._startup_media_cached_frame = frame
+        return frame
 
     def _startup_media_pixel(self, red: int, green: int, blue: int) -> int:
         luminance = max(
@@ -6698,6 +6783,111 @@ class X11CalibrationOverlay:
             )
         return cache[tinted]
 
+    @staticmethod
+    def _startup_media_bgrx_bytes(frame: StartupMediaFrame) -> bytes:
+        source = frame.pixels
+        target = bytearray(frame.width * frame.height * 4)
+        target[0::4] = source[2::3]
+        target[1::4] = source[1::3]
+        target[2::4] = source[0::3]
+        return bytes(target)
+
+    def _draw_startup_media_image(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        panel_width: int,
+        panel_height: int,
+        frame: StartupMediaFrame,
+    ) -> bool:
+        if (
+            not getattr(self, "_visual", None)
+            or getattr(self, "_depth", 0) not in {24, 32}
+            or not hasattr(self._x11, "XCreateImage")
+            or not hasattr(self._x11, "XPutImage")
+        ):
+            return False
+        copy_width = max(1, min(panel_width, frame.width))
+        copy_height = max(1, min(panel_height, frame.height))
+        source_x = max(0, (frame.width - copy_width) // 2)
+        source_y = max(0, (frame.height - copy_height) // 2)
+        dest_x = max(0, (panel_width - copy_width) // 2)
+        dest_y = max(0, (panel_height - copy_height) // 2)
+        image_bytes = self._startup_media_bgrx_bytes(frame)
+        buffer = ctypes.create_string_buffer(image_bytes)
+        image = self._x11.XCreateImage(
+            self._display,
+            self._visual,
+            int(getattr(self, "_depth", 24)),
+            _X11_Z_PIXMAP_FORMAT,
+            0,
+            ctypes.cast(buffer, ctypes.c_void_p),
+            frame.width,
+            frame.height,
+            32,
+            frame.width * 4,
+        )
+        if not image:
+            return False
+        try:
+            self._x11.XPutImage(
+                self._display,
+                panel,
+                gc,
+                image,
+                source_x,
+                source_y,
+                dest_x,
+                dest_y,
+                copy_width,
+                copy_height,
+            )
+        finally:
+            # Avoid letting XDestroyImage free Python-owned pixel memory.
+            self._x11.XFree(image)
+        return True
+
+    def _draw_startup_media_grid(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        panel_width: int,
+        panel_height: int,
+        frame: StartupMediaFrame,
+    ) -> None:
+        columns = min(_STARTUP_MEDIA_GRID_COLUMNS, max(24, panel_width // 14))
+        rows = min(_STARTUP_MEDIA_GRID_ROWS, max(18, panel_height // 14))
+        for row in range(rows):
+            sample_y = min(
+                frame.height - 1,
+                max(0, int((row + 0.5) * frame.height / rows)),
+            )
+            top = row * panel_height // rows
+            bottom = max(top + 1, (row + 1) * panel_height // rows)
+            for column in range(columns):
+                sample_x = min(
+                    frame.width - 1,
+                    max(0, int((column + 0.5) * frame.width / columns)),
+                )
+                offset = (sample_y * frame.width + sample_x) * 3
+                pixel = self._startup_media_pixel(
+                    frame.pixels[offset],
+                    frame.pixels[offset + 1],
+                    frame.pixels[offset + 2],
+                )
+                left = column * panel_width // columns
+                right = max(left + 1, (column + 1) * panel_width // columns)
+                self._x11.XSetForeground(self._display, gc, pixel)
+                self._x11.XFillRectangle(
+                    self._display,
+                    panel,
+                    gc,
+                    left,
+                    top,
+                    right - left,
+                    bottom - top,
+                )
+
     def _draw_startup_background(
         self,
         panel: int,
@@ -6716,44 +6906,20 @@ class X11CalibrationOverlay:
             panel_width,
             panel_height,
         )
-        frames = self._load_startup_media_frames(model.media_frames_dir)
-        if frames:
+        frame_paths = self._load_startup_media_frame_paths(model.media_frames_dir)
+        if frame_paths:
             frame_index = int(time.monotonic() * model.media_frame_rate_hz) % len(
-                frames
+                frame_paths
             )
-            frame = frames[frame_index]
-            columns = min(_STARTUP_MEDIA_GRID_COLUMNS, max(24, panel_width // 14))
-            rows = min(_STARTUP_MEDIA_GRID_ROWS, max(18, panel_height // 14))
-            for row in range(rows):
-                sample_y = min(
-                    frame.height - 1,
-                    max(0, int((row + 0.5) * frame.height / rows)),
-                )
-                top = row * panel_height // rows
-                bottom = max(top + 1, (row + 1) * panel_height // rows)
-                for column in range(columns):
-                    sample_x = min(
-                        frame.width - 1,
-                        max(0, int((column + 0.5) * frame.width / columns)),
-                    )
-                    offset = (sample_y * frame.width + sample_x) * 3
-                    pixel = self._startup_media_pixel(
-                        frame.pixels[offset],
-                        frame.pixels[offset + 1],
-                        frame.pixels[offset + 2],
-                    )
-                    left = column * panel_width // columns
-                    right = max(left + 1, (column + 1) * panel_width // columns)
-                    self._x11.XSetForeground(self._display, gc, pixel)
-                    self._x11.XFillRectangle(
-                        self._display,
-                        panel,
-                        gc,
-                        left,
-                        top,
-                        right - left,
-                        bottom - top,
-                    )
+            frame = self._load_startup_media_frame(frame_paths[frame_index])
+            if frame is not None and not self._draw_startup_media_image(
+                panel,
+                gc,
+                panel_width,
+                panel_height,
+                frame,
+            ):
+                self._draw_startup_media_grid(panel, gc, panel_width, panel_height, frame)
 
         self._x11.XSetForeground(self._display, gc, self._colours["button"])
         for y in range(0, panel_height, 18):
@@ -6789,7 +6955,7 @@ class X11CalibrationOverlay:
                 panel_width,
                 1,
             )
-        return bool(frames)
+        return bool(frame_paths)
 
     def _draw_startup_corner_brackets(
         self,

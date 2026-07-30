@@ -41,6 +41,11 @@ KEYBOARD_TURN_BOOST_RATE_PATH = f"control.motion.{KEYBOARD_TURN_BOOST_RATE_FIELD
 DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S = 3.00
 KEYBOARD_TURN_RATE_RANGE_RAD_S = (0.25, 4.00)
 KEYBOARD_TURN_RATE_STEP_RAD_S = 0.25
+BFM_TURN_COMMAND_YAW_LIMIT_FIELD = "bfm_turn_command_yaw_limit_rad_s"
+BFM_TURN_COMMAND_YAW_LIMIT_PATH = f"control.motion.{BFM_TURN_COMMAND_YAW_LIMIT_FIELD}"
+DEFAULT_BFM_TURN_COMMAND_YAW_LIMIT_RAD_S = 0.60
+BFM_TURN_COMMAND_YAW_LIMIT_RANGE_RAD_S = (0.25, 2.50)
+BFM_TURN_COMMAND_YAW_LIMIT_STEP_RAD_S = 0.05
 KEYBOARD_SPEED_CAP_FIELD = "keyboard_speed_cap_mps"
 KEYBOARD_SPEED_CAP_PATH = f"control.motion.{KEYBOARD_SPEED_CAP_FIELD}"
 DEFAULT_KEYBOARD_SPEED_CAP_MPS = 0.40
@@ -86,6 +91,7 @@ MOTION_SETTING_PATHS = frozenset(
         MAX_TURN_RATE_PATH,
         KEYBOARD_TURN_RATE_PATH,
         KEYBOARD_TURN_BOOST_RATE_PATH,
+        BFM_TURN_COMMAND_YAW_LIMIT_PATH,
         KEYBOARD_SPEED_CAP_PATH,
         KEYBOARD_LOOK_RATE_PATH,
     ]
@@ -214,6 +220,14 @@ def _is_keyboard_turn_rate_path(path: object) -> bool:
     return path in {KEYBOARD_TURN_RATE_PATH, KEYBOARD_TURN_BOOST_RATE_PATH}
 
 
+def _is_bfm_turn_limit_path(path: object) -> bool:
+    if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
+        raise MotionSettingsError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
+        )
+    return path == BFM_TURN_COMMAND_YAW_LIMIT_PATH
+
+
 def _is_keyboard_look_rate_path(path: object) -> bool:
     if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
         raise MotionSettingsError(
@@ -239,6 +253,9 @@ class MotionSettings:
     max_turn_rate_rad_s: float = DEFAULT_MAX_TURN_RATE_RAD_S
     keyboard_turn_rate_rad_s: float = DEFAULT_KEYBOARD_TURN_RATE_RAD_S
     keyboard_turn_boost_rate_rad_s: float = DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S
+    bfm_turn_command_yaw_limit_rad_s: float = (
+        DEFAULT_BFM_TURN_COMMAND_YAW_LIMIT_RAD_S
+    )
     keyboard_speed_cap_mps: float = DEFAULT_KEYBOARD_SPEED_CAP_MPS
     keyboard_look_rate_deg_s: float = DEFAULT_KEYBOARD_LOOK_RATE_DEG_S
     slow_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][0]
@@ -293,6 +310,24 @@ class MotionSettings:
             )
         object.__setattr__(self, KEYBOARD_TURN_RATE_FIELD, keyboard_turn)
         object.__setattr__(self, KEYBOARD_TURN_BOOST_RATE_FIELD, keyboard_turn_boost)
+        bfm_turn_limit = _finite_speed(
+            self.bfm_turn_command_yaw_limit_rad_s,
+            name=BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+        )
+        bfm_turn_minimum, bfm_turn_maximum = (
+            BFM_TURN_COMMAND_YAW_LIMIT_RANGE_RAD_S
+        )
+        if not bfm_turn_minimum <= bfm_turn_limit <= bfm_turn_maximum:
+            raise MotionSettingsError(
+                "E_DATA_RANGE",
+                f"{BFM_TURN_COMMAND_YAW_LIMIT_FIELD} must be in "
+                f"[{bfm_turn_minimum:.2f}, {bfm_turn_maximum:.2f}]",
+            )
+        object.__setattr__(
+            self,
+            BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+            bfm_turn_limit,
+        )
         keyboard_speed_cap = _finite_speed(
             self.keyboard_speed_cap_mps,
             name=KEYBOARD_SPEED_CAP_FIELD,
@@ -350,6 +385,8 @@ class MotionSettings:
             return self.keyboard_turn_rate_rad_s
         if path == KEYBOARD_TURN_BOOST_RATE_PATH:
             return self.keyboard_turn_boost_rate_rad_s
+        if path == BFM_TURN_COMMAND_YAW_LIMIT_PATH:
+            return self.bfm_turn_command_yaw_limit_rad_s
         if path == KEYBOARD_SPEED_CAP_PATH:
             return self.keyboard_speed_cap_mps
         if _is_keyboard_look_rate_path(path):
@@ -370,6 +407,8 @@ class MotionSettings:
             field_name = KEYBOARD_TURN_RATE_FIELD
         elif path == KEYBOARD_TURN_BOOST_RATE_PATH:
             field_name = KEYBOARD_TURN_BOOST_RATE_FIELD
+        elif path == BFM_TURN_COMMAND_YAW_LIMIT_PATH:
+            field_name = BFM_TURN_COMMAND_YAW_LIMIT_FIELD
         elif path == KEYBOARD_SPEED_CAP_PATH:
             field_name = KEYBOARD_SPEED_CAP_FIELD
         elif _is_keyboard_look_rate_path(path):
@@ -401,6 +440,9 @@ class MotionSettings:
             MAX_TURN_RATE_FIELD: self.max_turn_rate_rad_s,
             KEYBOARD_TURN_RATE_FIELD: self.keyboard_turn_rate_rad_s,
             KEYBOARD_TURN_BOOST_RATE_FIELD: self.keyboard_turn_boost_rate_rad_s,
+            BFM_TURN_COMMAND_YAW_LIMIT_FIELD: (
+                self.bfm_turn_command_yaw_limit_rad_s
+            ),
             KEYBOARD_SPEED_CAP_FIELD: self.keyboard_speed_cap_mps,
             "movement": movement_mode_metadata(self.movement_mode),
             "camera": {
@@ -424,6 +466,7 @@ class MotionSettings:
             MAX_TURN_RATE_FIELD,
             KEYBOARD_TURN_RATE_FIELD,
             KEYBOARD_TURN_BOOST_RATE_FIELD,
+            BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
             KEYBOARD_SPEED_CAP_FIELD,
             "camera",
             "movement",
@@ -463,6 +506,10 @@ class MotionSettings:
             KEYBOARD_TURN_BOOST_RATE_FIELD: value.get(
                 KEYBOARD_TURN_BOOST_RATE_FIELD,
                 keyboard_turn_boost_default,
+            ),
+            BFM_TURN_COMMAND_YAW_LIMIT_FIELD: value.get(
+                BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+                DEFAULT_BFM_TURN_COMMAND_YAW_LIMIT_RAD_S,
             ),
             KEYBOARD_SPEED_CAP_FIELD: value.get(
                 KEYBOARD_SPEED_CAP_FIELD,
@@ -667,6 +714,25 @@ _KEYBOARD_TURN_RATE_STEP_PRESETS = tuple(
         + 1
     )
 )
+_BFM_TURN_COMMAND_YAW_LIMIT_STEP_PRESETS = tuple(
+    round(
+        BFM_TURN_COMMAND_YAW_LIMIT_RANGE_RAD_S[0]
+        + index * BFM_TURN_COMMAND_YAW_LIMIT_STEP_RAD_S,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (
+                    BFM_TURN_COMMAND_YAW_LIMIT_RANGE_RAD_S[1]
+                    - BFM_TURN_COMMAND_YAW_LIMIT_RANGE_RAD_S[0]
+                )
+                / BFM_TURN_COMMAND_YAW_LIMIT_STEP_RAD_S
+            )
+        )
+        + 1
+    )
+)
 _KEYBOARD_SPEED_CAP_STEP_PRESETS = tuple(
     round(
         KEYBOARD_SPEED_CAP_RANGE_MPS[0] + index * KEYBOARD_SPEED_CAP_STEP_MPS,
@@ -725,6 +791,14 @@ def step_motion_speed(
         if not allowed:
             return current
         return max(result, allowed[0])
+    if _is_bfm_turn_limit_path(path):
+        current = settings.value_for_path(path)
+        presets = _BFM_TURN_COMMAND_YAW_LIMIT_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(value for value in presets if value > current + 1e-12)
+            return candidates[0] if candidates else presets[-1]
+        candidates = tuple(value for value in presets if value < current - 1e-12)
+        return candidates[-1] if candidates else presets[0]
     if _is_keyboard_look_rate_path(path):
         current = settings.value_for_path(path)
         presets = _KEYBOARD_LOOK_RATE_STEP_PRESETS

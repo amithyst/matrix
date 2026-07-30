@@ -241,7 +241,8 @@ start_session() {
     if [[ "$SCENE_ID" == "15" \
         && "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
         runtime_args+=(
-            --game-world-persistence off
+            --game-world-persistence on
+            --game-auto-respawn on
         )
     fi
     if [[ ! -f "$run_script" || ! -r "$run_script" ]]; then

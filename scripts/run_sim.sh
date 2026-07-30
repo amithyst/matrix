@@ -2126,6 +2126,22 @@ PY
         "${SONIC_DYNAMIC_GROUND_COLLISION_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
+    SONIC_STATE_TRACE_EVERY="${MATRIX_SONIC_STATE_TRACE_EVERY:-0.5}"
+    SONIC_STATE_TRACE_FILE="${MATRIX_SONIC_STATE_TRACE_FILE:-$PROJECT_ROOT/outputs/state-traces/matrix_sonic_state_$(date -u +%Y%m%dT%H%M%SZ).jsonl}"
+    SONIC_STATE_TRACE_ARGS=()
+    if [[ -n "$SONIC_STATE_TRACE_FILE" ]]; then
+        if [[ "$SONIC_STATE_TRACE_FILE" != /* ]]; then
+            echo "[ERROR] MATRIX_SONIC_STATE_TRACE_FILE must be absolute" >&2
+            exit 1
+        fi
+        mkdir -p "$(dirname "$SONIC_STATE_TRACE_FILE")"
+        rm -f -- "$SONIC_STATE_TRACE_FILE"
+        SONIC_STATE_TRACE_ARGS=(
+            --state-trace-file "$SONIC_STATE_TRACE_FILE"
+            --state-trace-every "$SONIC_STATE_TRACE_EVERY"
+        )
+        echo "[INFO] Matrix state trace: $SONIC_STATE_TRACE_FILE every=${SONIC_STATE_TRACE_EVERY}s"
+    fi
     GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
     if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         rm -f -- "$GAME_INPUT_STATUS_FILE"
@@ -2659,6 +2675,7 @@ PY
         --startup-band-fade "${MATRIX_SONIC_STARTUP_BAND_FADE:-3}" \
         "${GAME_INPUT_ARGS[@]}" \
         "${SONIC_WORLD_ARGS[@]}" \
+        "${SONIC_STATE_TRACE_ARGS[@]}" \
         --status-file "$SONIC_STATUS_FILE" \
         > "$PROJECT_ROOT/outputs/logs/matrix_sonic_runtime.log" 2>&1 &
     SONIC_PID=$!

@@ -2359,6 +2359,7 @@ if (
     raise SystemExit(1)
 numerical_error = status.get("numerical_error")
 dynamic_resume_clearance = False
+preflight_resume_clearance = False
 if termination_reason == "numerical_instability":
     if float(elapsed_wall_s) > 5.0:
         raise SystemExit(1)
@@ -2407,7 +2408,28 @@ else:
         and not isinstance(probation.get("audit_count"), bool)
         and probation.get("audit_count") > 0
     )
-    if not dynamic_resume_clearance and float(elapsed_wall_s) > 5.0:
+    preflight_resume_clearance = bool(
+        isinstance(probation, dict)
+        and probation.get("enabled") is True
+        and probation.get("active") is True
+        and probation.get("completed") is False
+        and probation.get("failed") is False
+        and probation.get("phase") in {"waiting_lowcmd", "startup_band"}
+        and probation.get("checkpoint_writes_blocked") is True
+        and probation.get("failure_reason") is None
+        and probation.get("last_clearance_audit") is None
+        and probation.get("stable_idle_required_s") == 1.5
+        and probation.get("stable_idle_clock") == "sim_time"
+        and probation.get("audit_interval_s") == 0.1
+        and isinstance(probation.get("audit_count"), int)
+        and not isinstance(probation.get("audit_count"), bool)
+        and probation.get("audit_count") == 0
+    )
+    if (
+        not dynamic_resume_clearance
+        and not preflight_resume_clearance
+        and float(elapsed_wall_s) > 5.0
+    ):
         raise SystemExit(1)
 for field in ("completed", "interrupted", "passed"):
     if status.get(field) is not False:
@@ -2445,6 +2467,21 @@ if dynamic_resume_clearance:
     if (
         status.get("low_cmd_received") is True
         and probation.get("first_fresh_lowcmd_observed") is not True
+    ):
+        raise SystemExit(1)
+elif preflight_resume_clearance:
+    if status.get("fall_detected") is not False:
+        raise SystemExit(1)
+    if (
+        status.get("active_lowcmd") is True
+        and status.get("low_cmd_received") is not True
+    ):
+        raise SystemExit(1)
+    if active_frames != 0:
+        raise SystemExit(1)
+    if any(
+        float(status[field]) != 0.0
+        for field in ("active_elapsed_s", "active_lowcmd_longest_s")
     ):
         raise SystemExit(1)
 else:

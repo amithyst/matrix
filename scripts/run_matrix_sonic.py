@@ -2492,6 +2492,33 @@ def _world_checkpoint_writes_allowed(
     return checkpoint_writes_armed and not checkpoint_writes_frozen
 
 
+def _world_checkpoint_command_idle(command: RobotMotionCommand | None) -> bool:
+    """Only persist root-pose resume points from a neutral command boundary."""
+
+    if command is None:
+        return True
+    if not isinstance(command, RobotMotionCommand):
+        return False
+    try:
+        movement = tuple(float(component) for component in command.movement)
+        speed_mps = float(command.speed_mps)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return bool(
+        command.mode == "deadman"
+        and command.safe_stop is True
+        and command.locomotion_mode == SONIC_IDLE_MODE
+        and len(movement) == 3
+        and all(
+            math.isfinite(component)
+            and math.isclose(component, 0.0, rel_tol=0.0, abs_tol=1e-9)
+            for component in movement
+        )
+        and math.isfinite(speed_mps)
+        and math.isclose(speed_mps, 0.0, rel_tol=0.0, abs_tol=1e-9)
+    )
+
+
 def _final_world_checkpoint_allowed(
     *,
     world_available: bool,
@@ -4103,7 +4130,7 @@ def _handle_game_auto_respawn_fall(
     *,
     game_world: _GameWorldStateRuntime,
     game_input: GameInputRuntime,
-    planner: NativePlannerClient,
+    planner: NativePlannerClient | None,
     snapshot: Any,
     checkpoint_writes_blocked: bool,
     now_s: float,
@@ -4115,7 +4142,10 @@ def _handle_game_auto_respawn_fall(
         now_s=now_s,
         reason="fall_respawn_reload",
     )
-    planner.send_game_command(game_command)
+    if planner is not None:
+        planner.send_game_command(game_command)
+    else:
+        game_input.record_published_command(game_command)
     if checkpoint_writes_blocked:
         return "fall_detected", game_command
     saved = game_world.checkpoint(
@@ -5878,6 +5908,7 @@ class GameCommandRuntime:
         teleport_routes: Mapping[str, TeleportRoute] | None = None,
         runtime_pause: _RuntimePauseState | None = None,
         initial_locomotion_policy: str = "sonic",
+        allow_unsafe_teleport_reload: bool = False,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -5914,6 +5945,7 @@ class GameCommandRuntime:
         self.pose_clearance_auditor = pose_clearance_auditor
         self.teleport_routes = dict(teleport_routes or {})
         self.runtime_pause = runtime_pause
+        self.allow_unsafe_teleport_reload = bool(allow_unsafe_teleport_reload)
         self.pending_policy_request: GameCommandRequest | None = None
         self.pending_runtime_pause_request: GameCommandRequest | None = None
         self.policy_changes_executed = 0
@@ -6061,7 +6093,32 @@ class GameCommandRuntime:
         )
 
     def _send(self, response: GameCommandResponse) -> None:
-        payload = encode_command_response(response)
+        sent_response = response
+        try:
+            payload = encode_command_response(sent_response)
+        except CommandProtocolError as exc:
+            self.response_errors += 1
+            if response.data is None:
+                raise RuntimeError(
+                    f"cannot encode game command response: {exc}"
+                ) from exc
+            sent_response = GameCommandResponse(
+                session=response.session,
+                sequence=response.sequence,
+                request_id=response.request_id,
+                ok=response.ok,
+                code=response.code,
+                message=response.message,
+                restart_required=response.restart_required,
+                data=None,
+            )
+            try:
+                payload = encode_command_response(sent_response)
+            except CommandProtocolError as fallback_exc:
+                raise RuntimeError(
+                    "cannot encode truncated game command response: "
+                    f"{fallback_exc}"
+                ) from fallback_exc
         try:
             sent = self.connection.send(payload)
         except (BlockingIOError, OSError) as exc:
@@ -6072,7 +6129,7 @@ class GameCommandRuntime:
             raise RuntimeError(
                 f"partial game command response: sent {sent}/{len(payload)}"
             )
-        self.last_response = response.to_mapping()
+        self.last_response = sent_response.to_mapping()
 
     @staticmethod
     def _response(
@@ -6697,6 +6754,69 @@ class GameCommandRuntime:
                             )
                         clearance = self.pose_clearance_auditor(target)
                         if clearance.get("safe") is not True:
+                            fallback = self.world.state.resolve_start()
+                            fallback_clearance: dict[str, object] | None = None
+                            if (
+                                effect.code == "OK_TELEPORT_RESTART"
+                                and fallback.pose is not None
+                                and fallback.checkpoint_id is not None
+                            ):
+                                fallback_clearance = self.pose_clearance_auditor(
+                                    fallback.pose
+                                )
+                            if (
+                                fallback_clearance is not None
+                                and fallback_clearance.get("safe") is True
+                            ):
+                                self.commands_executed += 1
+                                self.restart_requested = True
+                                self._send(
+                                    self._response(
+                                        request,
+                                        ok=True,
+                                        code="OK_TELEPORT_FALLBACK_RESTART",
+                                        message=(
+                                            "Teleport target was unsafe; reloading "
+                                            "Matrix at the last safe checkpoint"
+                                        ),
+                                        restart_required=True,
+                                        data={
+                                            "fallback_checkpoint_id": (
+                                                fallback.checkpoint_id
+                                            ),
+                                            "fallback_source": fallback.source,
+                                            "rejected_target_reason": (
+                                                clearance.get("reason")
+                                            ),
+                                        },
+                                    )
+                                )
+                                return True
+                            if self.allow_unsafe_teleport_reload:
+                                self.world.store.save(effect.state)
+                                self.world.state = effect.state
+                                self.world.last_error = None
+                                self.commands_executed += 1
+                                self.restart_requested = True
+                                self._send(
+                                    self._response(
+                                        request,
+                                        ok=True,
+                                        code="OK_TELEPORT_UNVERIFIED_RESTART",
+                                        message=(
+                                            "Teleport target clearance was not "
+                                            "verified; reloading Matrix under "
+                                            "auto-respawn"
+                                        ),
+                                        restart_required=True,
+                                        data={
+                                            "rejected_target_reason": (
+                                                clearance.get("reason")
+                                            )
+                                        },
+                                    )
+                                )
+                                return True
                             self.rejected_commands += 1
                             self._send(
                                 self._response(
@@ -14575,18 +14695,29 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             spawn_clearance_audit is not None
             and spawn_clearance_audit.get("safe") is not True
         ):
-            running = False
-            termination_reason = "spawn_clearance_failed"
-            numerical_error = (
-                "spawn_clearance:"
-                f"{spawn_clearance_audit.get('reason', 'audit_error')}"
-            )
             worst = spawn_clearance_audit.get("worst")
-            print(
-                "matrix-sonic-runtime ERROR unsafe spawn clearance: "
-                f"reason={spawn_clearance_audit.get('reason')} worst={worst}",
-                flush=True,
-            )
+            if (
+                args.game_world_resume_checkpoint_id is not None
+                and not args.game_auto_respawn
+            ):
+                running = False
+                termination_reason = "spawn_clearance_failed"
+                numerical_error = (
+                    "spawn_clearance:"
+                    f"{spawn_clearance_audit.get('reason', 'audit_error')}"
+                )
+                print(
+                    "matrix-sonic-runtime ERROR unsafe spawn clearance: "
+                    f"reason={spawn_clearance_audit.get('reason')} worst={worst}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "matrix-sonic-runtime WARNING unsafe spawn clearance; "
+                    "continuing under auto-respawn/no-resume fallback: "
+                    f"reason={spawn_clearance_audit.get('reason')} worst={worst}",
+                    flush=True,
+                )
         if running and moon_dynamic_ground is not None:
             environment = getattr(simulator, "sim_env", None)
             model = getattr(environment, "mj_model", None)
@@ -14638,7 +14769,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         snapshot,
                         now_s=time.perf_counter(),
                         force=True,
-                        required=bool(args.game_auto_respawn),
+                        required=False,
                         ground_height_m=initial_ground_height_m,
                     )
             except WorldStateError as exc:
@@ -14821,6 +14952,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         teleport_routes=celestial_teleport_routes,
                         runtime_pause=runtime_pause,
                         initial_locomotion_policy=args.initial_locomotion_policy,
+                        allow_unsafe_teleport_reload=bool(args.game_auto_respawn),
                     )
                 try:
                     game_input.open()
@@ -15859,7 +15991,6 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     if args.game_auto_respawn:
                         assert game_world is not None
                         assert game_input is not None
-                        assert planner is not None
                         fall_wall = time.perf_counter()
                         try:
                             termination_reason, game_command = (
@@ -15936,21 +16067,39 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         if game_world is not None:
                             game_world.last_clearance_audit = probation_audit
                             game_world.clearance_rejection_count += 1
-                        unstable = True
-                        running = False
-                        termination_reason = "spawn_clearance_failed"
-                        numerical_error = (
-                            "spawn_clearance:"
-                            f"{probation_audit.get('reason', 'audit_error')}"
-                        )
-                        print(
-                            "matrix-sonic-runtime ERROR unsafe live resume "
-                            "clearance: "
-                            f"reason={probation_audit.get('reason')} "
-                            f"worst={probation_audit.get('worst')}",
-                            flush=True,
-                        )
-                        break
+                        if args.game_auto_respawn:
+                            resume_probation.failed = False
+                            resume_probation.failure_reason = None
+                            resume_probation.completed = True
+                            resume_probation.completed_s = time.perf_counter()
+                            resume_probation.completed_sim_s = getattr(
+                                snapshot,
+                                "sim_time",
+                                None,
+                            )
+                            print(
+                                "matrix-sonic-runtime WARNING unsafe live resume "
+                                "clearance; continuing under auto-respawn: "
+                                f"reason={probation_audit.get('reason')} "
+                                f"worst={probation_audit.get('worst')}",
+                                flush=True,
+                            )
+                        else:
+                            unstable = True
+                            running = False
+                            termination_reason = "spawn_clearance_failed"
+                            numerical_error = (
+                                "spawn_clearance:"
+                                f"{probation_audit.get('reason', 'audit_error')}"
+                            )
+                            print(
+                                "matrix-sonic-runtime ERROR unsafe live resume "
+                                "clearance: "
+                                f"reason={probation_audit.get('reason')} "
+                                f"worst={probation_audit.get('worst')}",
+                                flush=True,
+                            )
+                            break
                 if instability_resets > args.max_resets:
                     running = False
                     termination_reason = "reset_detected"
@@ -15978,6 +16127,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         and runtime_pause.checkpoint_writes_frozen
                     ),
                 )
+                and _world_checkpoint_command_idle(game_command)
             ):
                 game_world.checkpoint(
                     snapshot,
@@ -16271,15 +16421,18 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 planner.send_game_command(game_command)
             walking = False
 
-        if _final_world_checkpoint_allowed(
-            world_available=game_world is not None,
-            termination_reason=termination_reason,
-            read_only_fall_stop=resume_checkpoint_read_only_fall_stop,
-            checkpoint_writes_armed=resume_probation.checkpoint_writes_armed,
-            checkpoint_writes_frozen=(
-                runtime_pause is not None
-                and runtime_pause.checkpoint_writes_frozen
-            ),
+        if (
+            _final_world_checkpoint_allowed(
+                world_available=game_world is not None,
+                termination_reason=termination_reason,
+                read_only_fall_stop=resume_checkpoint_read_only_fall_stop,
+                checkpoint_writes_armed=resume_probation.checkpoint_writes_armed,
+                checkpoint_writes_frozen=(
+                    runtime_pause is not None
+                    and runtime_pause.checkpoint_writes_frozen
+                ),
+            )
+            and _world_checkpoint_command_idle(game_command)
         ):
             try:
                 checkpoint_saved = game_world.checkpoint(

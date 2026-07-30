@@ -446,8 +446,8 @@ def load_policy_candidate_manifest(path: Path) -> PolicyCandidateManifest:
             "repeat-last-applied-target-zero-unapplied-actions"
         ),
         "turn_reference_contract": "yaw-only-pfnn-forward-seed-v1",
-        "turn_reference_forward_mps": 0.00051,
-        "command_heading_contract": "matrix-wire-facing-formal7168-pd-v2",
+        "turn_reference_forward_mps": 0.1,
+        "command_heading_contract": "matrix-root-yaw-velocity-frame-turn-move-yaw-hold-formal7168-pd-v8",
         "command_yaw_gain": 4.0,
         "command_yaw_limit_rad_s": 1.5,
         "turn_command_yaw_limit_rad_s": 0.6,
