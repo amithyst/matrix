@@ -30,6 +30,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from matrix_game_control import (
     ControlConfig,
     GameControlCore,
+    InputSnapshot,
     InputProtocolError,
     InputRejectedError,
     KEYBOARD_GAIT_TARGETS_MPS,
@@ -317,6 +318,26 @@ def _remote_speed_scale_argument(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _on_off_argument(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return "on"
+    if normalized in {"0", "false", "no", "off"}:
+        return "off"
+    raise argparse.ArgumentTypeError("expected on/off boolean value")
+
+
+def _on_off_enabled(value: object) -> bool:
+    if type(value) is bool:
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("expected on/off boolean value")
+
+
 def _validate_game_external_control(
     *,
     input_socket: Path,
@@ -431,6 +452,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-input-timeout", type=float, default=0.15)
     parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
     parser.add_argument("--game-max-future-skew", type=float, default=0.05)
+    parser.add_argument(
+        "--game-pure-forward-alignment-crawl",
+        type=_on_off_argument,
+        default="on",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--game-fall-recovery",
         choices=("off", "sonic", "physical"),
@@ -4435,6 +4462,9 @@ def _game_control_status_fields(
         ),
         "maximum_snapshot_age_s": args.game_max_snapshot_age,
         "maximum_future_skew_s": args.game_max_future_skew,
+        "pure_forward_alignment_crawl_enabled": _on_off_enabled(
+            getattr(args, "game_pure_forward_alignment_crawl", "on")
+        ),
         "camera_yaw_source": source,
         "camera_look_button": args.game_look_button,
         "focus_title_pattern": args.game_focus_title,
@@ -5195,6 +5225,7 @@ class GameInputRuntime:
         self.expected_peer_pid: int | None = None
         self.last_packet_at_s: float | None = None
         self.last_error: str | None = None
+        self.last_snapshot: InputSnapshot | None = None
         self.last_command: RobotMotionCommand | None = None
         if expected_peer_pid is not None:
             self.bind_expected_peer_pid(expected_peer_pid)
@@ -5224,6 +5255,7 @@ class GameInputRuntime:
             self.disconnects += 1
         self.peer_pid = None
         self.last_error = reason
+        self.last_snapshot = None
         # Invalidating the core is intentionally last and unconditional: even
         # a broken peer fd that fails close must zero the command this frame.
         self.core.invalidate_input(reason)
@@ -5289,6 +5321,7 @@ class GameInputRuntime:
                     batch_fault_reason = "input_rejected"
                 continue
             self.packets_applied += 1
+            self.last_snapshot = snapshot
             self.last_packet_at_s = now_s
             self.last_error = None
         if batch_fault_reason is not None:
@@ -5323,6 +5356,14 @@ class GameInputRuntime:
 
     def telemetry(self, *, now_s: float) -> dict[str, object]:
         command = self.last_command
+        snapshot = self.last_snapshot
+        command_movement = list(command.movement) if command is not None else None
+        command_facing = list(command.facing) if command is not None else None
+        command_desired_facing = (
+            list(command.desired_facing)
+            if command is not None and command.desired_facing is not None
+            else None
+        )
         return {
             "accepted_connections": self.accepted_connections,
             "connected": self.connection is not None,
@@ -5337,6 +5378,14 @@ class GameInputRuntime:
                 else None
             ),
             "movement_control": self.core.movement_mode_mapping(),
+            "camera_yaw_rad": (
+                round(snapshot.camera_yaw_rad, 6) if snapshot is not None else None
+            ),
+            "focused": snapshot.focused if snapshot is not None else None,
+            "keys": snapshot.keys.to_mapping() if snapshot is not None else None,
+            "move_stick": (
+                snapshot.move_stick.to_mapping() if snapshot is not None else None
+            ),
             "input_age_s": (
                 round(max(0.0, now_s - self.last_packet_at_s), 6)
                 if self.last_packet_at_s is not None
@@ -5363,6 +5412,9 @@ class GameInputRuntime:
             "safe_stop": command.safe_stop if command is not None else True,
             "sequence": command.sequence if command is not None else None,
             "socket": str(self.path),
+            "command_movement": command_movement,
+            "command_facing": command_facing,
+            "command_desired_facing": command_desired_facing,
             "speed_mps": round(command.speed_mps, 6) if command is not None else 0.0,
             "stop_reason": command.reason if command is not None else "no_input",
         }
@@ -13328,6 +13380,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ("game_applied_video_settings_json", None),
         ("moon_dynamic_map", None),
         ("moon_dynamic_map_sha256", None),
+        ("game_pure_forward_alignment_crawl", "on"),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -13484,6 +13537,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 input_timeout_s=args.game_input_timeout,
                 max_snapshot_age_s=args.game_max_snapshot_age,
                 max_future_skew_s=args.game_max_future_skew,
+                pure_forward_alignment_crawl_enabled=_on_off_enabled(
+                    args.game_pure_forward_alignment_crawl
+                ),
             )
         except (InputProtocolError, ValueError) as exc:
             raise SystemExit(f"invalid game control configuration: {exc}") from exc

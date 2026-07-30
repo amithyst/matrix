@@ -464,6 +464,7 @@ class ControlConfig:
     max_future_skew_s: float = 0.05
     max_step_s: float = 0.10
     speed_epsilon_mps: float = 1e-4
+    pure_forward_alignment_crawl_enabled: bool = True
 
     def __post_init__(self) -> None:
         try:
@@ -471,6 +472,8 @@ class ControlConfig:
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
         object.__setattr__(self, "movement_mode", movement_mode)
+        if type(self.pure_forward_alignment_crawl_enabled) is not bool:
+            raise ValueError("pure_forward_alignment_crawl_enabled must be boolean")
         positive = (
             "max_speed_mps",
             "max_acceleration_mps2",
@@ -1160,9 +1163,13 @@ class GameControlCore:
                     alignment = min(command_alignment, measured_alignment)
             else:
                 # These modes deliberately decouple translation and facing.
-                # Their facing target stays fixed while the movement vector is
-                # expressed in the camera or body frame.
+                # Keep the facing command anchored to the physical body so a
+                # stale target from a previous camera-facing/manual turn does
+                # not become an unintended auto-turn while strafing or moving
+                # in the body frame.
                 alignment = 1.0
+                if self._measured_heading_rad is not None:
+                    self._command_heading_rad = self._measured_heading_rad
                 desired_heading = self._command_heading_rad
                 self._reset_pure_forward_crawl_tracker()
 
@@ -1179,7 +1186,8 @@ class GameControlCore:
                 )
             target_speed = requested_speed * alignment
             pure_forward_alignment_crawl_eligible = (
-                movement_mode == CAMERA_FACE
+                self.config.pure_forward_alignment_crawl_enabled
+                and movement_mode == CAMERA_FACE
                 and
                 digital_movement
                 and keys.w

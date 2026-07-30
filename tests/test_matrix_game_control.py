@@ -681,6 +681,42 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(command.movement[1], 0.0, places=7)
         self.assertEqual(command.movement, command.facing)
 
+    def test_camera_strafe_anchors_facing_to_current_body_heading(self) -> None:
+        core = armed_core(
+            immediate_config(movement_mode=MODULE.CAMERA_STRAFE)
+        )
+        core.reanchor_heading(1.0)
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(yaw=math.pi / 2.0, pressed=("w",)),
+            received_at_s=10.0,
+        )
+        core.command(now_s=10.0, dt_s=0.1)
+        command = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(command.mode, "move")
+        self.assertAlmostEqual(command.movement[0], 0.0, places=7)
+        self.assertAlmostEqual(command.movement[1], 1.0, places=7)
+        self.assertAlmostEqual(command.facing[0], 1.0, places=7)
+        self.assertAlmostEqual(command.facing[1], 0.0, places=7)
+        self.assertEqual(command.facing, command.desired_facing)
+
+    def test_body_relative_anchors_facing_to_current_body_heading(self) -> None:
+        core = armed_core(
+            immediate_config(movement_mode=MODULE.BODY_RELATIVE)
+        )
+        core.reanchor_heading(1.0)
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
+        core.command(now_s=10.0, dt_s=0.1)
+        command = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(command.mode, "move")
+        self.assertAlmostEqual(command.movement[0], 1.0, places=7)
+        self.assertAlmostEqual(command.movement[1], 0.0, places=7)
+        self.assertEqual(command.movement, command.facing)
+        self.assertEqual(command.facing, command.desired_facing)
+
     def test_movement_mode_change_requires_neutral_and_fresh_input(self) -> None:
         core = armed_core(immediate_config())
         self.assertTrue(core.set_movement_mode(MODULE.CAMERA_STRAFE))
@@ -934,6 +970,36 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(command.mode, "turn")
         self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(command.speed_mps, 0.0)
+
+    def test_disabled_pure_w_alignment_crawl_stays_turn_only(self) -> None:
+        core = armed_core(
+            immediate_config(
+                input_timeout_s=10.0,
+                pure_forward_alignment_crawl_enabled=False,
+            )
+        )
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(yaw=math.radians(53.0), pressed=("w",)),
+            received_at_s=10.0,
+        )
+
+        for index in range(6):
+            command = core.command(now_s=10.0 + index * 0.1, dt_s=0.1)
+            self.assertEqual(command.mode, "turn")
+            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+            self.assertEqual(command.speed_mps, 0.0)
+            self.assertEqual(command.movement, (0.0, 0.0, 0.0))
+            self.assertIsNotNone(command.desired_facing)
+            self.assertAlmostEqual(
+                math.atan2(command.desired_facing[1], command.desired_facing[0]),
+                math.radians(53.0),
+            )
+
+        core.synchronize_heading(math.radians(48.0))
+        aligned = core.command(now_s=10.6, dt_s=0.1)
+        self.assertEqual(aligned.mode, "move")
+        self.assertGreater(aligned.speed_mps, 0.0)
 
     def test_pure_w_alignment_crawl_clamps_existing_speed(self) -> None:
         core = armed_core(immediate_config())

@@ -5352,6 +5352,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertTrue(telemetry["connected"])
                 self.assertEqual(telemetry["packets_applied"], 2)
                 self.assertEqual(telemetry["sequence"], 8)
+                self.assertAlmostEqual(telemetry["camera_yaw_rad"], math.pi / 2.0, places=6)
+                self.assertTrue(telemetry["focused"])
+                self.assertTrue(telemetry["keys"]["w"])
+                self.assertAlmostEqual(telemetry["command_movement"][0], 0.0, places=7)
+                self.assertAlmostEqual(telemetry["command_movement"][1], 1.0, places=7)
+                self.assertEqual(telemetry["command_movement"], telemetry["command_facing"])
 
                 # The final duration check may end the main loop with a packet
                 # already queued.  A zero-dt boundary poll must still observe
@@ -5376,6 +5382,27 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 client.close()
                 runtime.close()
             self.assertFalse(path.exists())
+
+    def test_game_input_runtime_telemetry_allows_missing_desired_facing(self) -> None:
+        config = GAME_CONTROL.ControlConfig()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "game.sock"
+            runtime = MODULE.GameInputRuntime(
+                path,
+                GAME_CONTROL.GameControlCore(config),
+            )
+            runtime.last_command = GAME_CONTROL.RobotMotionCommand(
+                sequence=1,
+                movement=(0.0, 0.0, 0.0),
+                facing=(1.0, 0.0, 0.0),
+                speed_mps=0.0,
+                locomotion_mode=GAME_CONTROL.SONIC_IDLE_MODE,
+                mode="idle",
+                safe_stop=False,
+                reason=None,
+            )
+            telemetry = runtime.telemetry(now_s=10.0)
+            self.assertIsNone(telemetry["command_desired_facing"])
 
     def test_game_command_runtime_routes_input_mutation_to_external_api_first(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
