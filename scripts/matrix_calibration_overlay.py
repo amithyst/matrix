@@ -53,6 +53,8 @@ from matrix_motion_settings import (
     GEARS,
     KEYBOARD_LOOK_RATE_FIELD,
     KEYBOARD_LOOK_RATE_PATH,
+    KEYBOARD_SPEED_CAP_FIELD,
+    KEYBOARD_SPEED_CAP_PATH,
     KEYBOARD_TURN_BOOST_RATE_FIELD,
     KEYBOARD_TURN_BOOST_RATE_PATH,
     KEYBOARD_TURN_RATE_FIELD,
@@ -465,8 +467,8 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     centre_x, centre_y = geometry.centre
     compact = geometry.width < 900 or geometry.height < 650
     outer_margin = 16 if compact else 32
-    panel_width = min(1180, geometry.width - 2 * outer_margin)
-    panel_height = min(790, geometry.height - 2 * outer_margin)
+    panel_width = min(1500, geometry.width - 2 * outer_margin)
+    panel_height = min(900, geometry.height - 2 * outer_margin)
     panel_x = centre_x - panel_width // 2
     panel_y = centre_y - panel_height // 2
     margin = max(18, min(64, panel_width // 18))
@@ -489,7 +491,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         (panel_width - 2 * margin - 4 * profile_gap) // 5,
     )
     settings_content_width = panel_width - 2 * margin
-    settings_group_width = max(1, (settings_content_width - gap) // 2)
+    settings_group_width = max(1, (settings_content_width - 2 * gap) // 3)
     speed_width = max(42, min(112, settings_group_width // 4))
     apply_height = max(42, min(80, button_height + 6))
     footer_space = 8 if compact else 42
@@ -515,7 +517,14 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         settings_group_width - 2 * speed_width,
         button_height,
     )
-    font_left = panel_x + margin + settings_group_width + gap
+    cap_left = panel_x + margin + settings_group_width + gap
+    font_left = panel_x + margin + 2 * (settings_group_width + gap)
+    cap_value = (
+        cap_left + speed_width,
+        speed_y,
+        settings_group_width - 2 * speed_width,
+        button_height,
+    )
     font_value = (
         font_left + speed_width,
         speed_y,
@@ -705,6 +714,19 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         "speed_value": speed_value,
         "speed_up": (
             panel_x + margin + settings_group_width - speed_width,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "motion_keyboard_speed_cap_down": (
+            cap_left,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "motion_keyboard_speed_cap_value": cap_value,
+        "motion_keyboard_speed_cap_up": (
+            cap_left + settings_group_width - speed_width,
             speed_y,
             speed_width,
             button_height,
@@ -1012,6 +1034,16 @@ _MOTION_STEP_ACTION_DETAILS.update(
         f"motion_keyboard_turn_boost_rate_{suffix}": (
             "turn",
             KEYBOARD_TURN_BOOST_RATE_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_keyboard_speed_cap_{suffix}": (
+            "keyboard",
+            KEYBOARD_SPEED_CAP_FIELD,
             direction,
         )
         for suffix, direction in (("down", -1), ("up", 1))
@@ -2565,6 +2597,8 @@ class MotionSettingsPanelModel:
             return self.settings.value_for_path(KEYBOARD_TURN_RATE_PATH)
         if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
             return self.settings.value_for_path(KEYBOARD_TURN_BOOST_RATE_PATH)
+        if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+            return self.settings.value_for_path(KEYBOARD_SPEED_CAP_PATH)
         if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
             return self.settings.value_for_path(KEYBOARD_LOOK_RATE_PATH)
         return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
@@ -2738,23 +2772,18 @@ def motion_step_target(
     gear, field, direction = details
     if gear == "camera" and model.camera_control_available is False:
         return None
-    path = (
-        MAX_TURN_RATE_PATH
-        if gear is None
-        else (
-            KEYBOARD_LOOK_RATE_PATH
-            if gear == "camera"
-            else (
-                KEYBOARD_TURN_RATE_PATH
-                if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD
-                else (
-                    KEYBOARD_TURN_BOOST_RATE_PATH
-                    if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD
-                    else f"control.motion.gears.{gear}.{field}"
-                )
-            )
-        )
-    )
+    if gear is None:
+        path = MAX_TURN_RATE_PATH
+    elif gear == "camera":
+        path = KEYBOARD_LOOK_RATE_PATH
+    elif gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+        path = KEYBOARD_SPEED_CAP_PATH
+    elif gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+        path = KEYBOARD_TURN_RATE_PATH
+    elif gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+        path = KEYBOARD_TURN_BOOST_RATE_PATH
+    else:
+        path = f"control.motion.gears.{gear}.{field}"
     current = model.settings.value_for_path(path)
     target = step_motion_speed(model.settings, path, direction)
     return None if math.isclose(target, current, rel_tol=0.0, abs_tol=1e-12) else target
@@ -2790,6 +2819,11 @@ def motion_step_command(
             f"/data modify entity @s {KEYBOARD_LOOK_RATE_PATH} "
             f"set value {target:.2f}"
         )
+    if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+        return (
+            f"/data modify entity @s {KEYBOARD_SPEED_CAP_PATH} "
+            f"set value {target:.2f}"
+        )
     return (
         f"/data modify entity @s control.motion.gears.{gear}.{field} "
         f"set value {target:.2f}"
@@ -2819,6 +2853,9 @@ def motion_value_label(
             return "相机不可用" if compact else "方向键相机不可用"
         value = model.value(gear, field)
         return f"相{value:.0f}" if compact else f"相机标称转速 {value:.0f}"
+    if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+        value = model.value(gear, field)
+        return f"限{value:.2f}" if compact else f"键盘速度上限 {value:.2f} m/s"
     if (gear, field) not in _MOTION_CONTROL_SPECS:
         raise ValueError("unsupported motion value label")
     value = model.value(gear, field)
@@ -5163,6 +5200,53 @@ class X11CalibrationOverlay:
                     )
                     emitted += 1
             return emitted
+        if action in _MOVEMENT_MODE_ACTIONS:
+            movement_mode = action.removeprefix("movement_mode_")
+            motion_model = getattr(self, "_last_motion_model", None)
+            panel_model = self._last_panel_model
+            if (
+                motion_model is not None
+                and motion_model.available
+                and panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish_movement_mode_select(movement_mode)
+                emitted += 1
+            return emitted
+        if action in _MOTION_STEP_ACTIONS:
+            motion_model = getattr(self, "_last_motion_model", None)
+            panel_model = self._last_panel_model
+            command = (
+                motion_step_command(motion_model, action)
+                if motion_model is not None
+                else None
+            )
+            if (
+                command is not None
+                and panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting"}
+            ):
+                publisher.publish_command_submit(command)
+                emitted += 1
+            return emitted
         if (
             self._last_panel_model is not None
             and self._last_panel_model.action_enabled(action)
@@ -5983,6 +6067,20 @@ class X11CalibrationOverlay:
             fill=self._colours["disabled" if font_up_disabled else "button"],
             disabled=font_up_disabled,
         )
+        for suffix in ("down", "up"):
+            action = f"motion_keyboard_speed_cap_{suffix}"
+            disabled = bool(
+                controls_disabled
+                or command_blocked
+                or not motion_model.action_enabled(action)
+            )
+            self._draw_button(
+                layout,
+                action,
+                "-" if suffix == "down" else "+",
+                fill=self._colours["disabled" if disabled else "button"],
+                disabled=disabled,
+            )
         speed_value = self._panel_rectangle(layout, "speed_value")
         self._draw_text(
             "远程鼠标速度",
@@ -6007,6 +6105,34 @@ class X11CalibrationOverlay:
                 speed_value[1] + 10,
                 speed_value[2],
                 speed_value[3],
+            ),
+        )
+        cap_value = self._panel_rectangle(layout, "motion_keyboard_speed_cap_value")
+        self._draw_text(
+            "键盘速度上限",
+            x=0,
+            y=0,
+            colour=self._colours["muted"],
+            centred_in=(
+                cap_value[0],
+                cap_value[1] - 18,
+                cap_value[2],
+                cap_value[3],
+            ),
+        )
+        self._draw_text(
+            f"{motion_model.value('keyboard', KEYBOARD_SPEED_CAP_FIELD):.2f} m/s"
+            if motion_model.available
+            else "--",
+            x=0,
+            y=0,
+            colour=self._colours["white" if motion_model.available else "muted"],
+            large=True,
+            centred_in=(
+                cap_value[0],
+                cap_value[1] + 16,
+                cap_value[2],
+                cap_value[3],
             ),
         )
         font_value = self._panel_rectangle(layout, "font_value")
@@ -7584,13 +7710,7 @@ class X11CalibrationOverlay:
         raise_due = bool(
             first_show
             or geometry_changed
-            or (
-                keep_raised
-                and (
-                    self._last_raise_s is None
-                    or now - self._last_raise_s >= self._RAISE_INTERVAL_S
-                )
-            )
+            or keep_raised
         )
         if first_show:
             for name in static_order:

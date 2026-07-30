@@ -41,6 +41,11 @@ KEYBOARD_TURN_BOOST_RATE_PATH = f"control.motion.{KEYBOARD_TURN_BOOST_RATE_FIELD
 DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S = 3.00
 KEYBOARD_TURN_RATE_RANGE_RAD_S = (0.25, 4.00)
 KEYBOARD_TURN_RATE_STEP_RAD_S = 0.25
+KEYBOARD_SPEED_CAP_FIELD = "keyboard_speed_cap_mps"
+KEYBOARD_SPEED_CAP_PATH = f"control.motion.{KEYBOARD_SPEED_CAP_FIELD}"
+DEFAULT_KEYBOARD_SPEED_CAP_MPS = 0.40
+KEYBOARD_SPEED_CAP_RANGE_MPS = (0.10, 2.75)
+KEYBOARD_SPEED_CAP_STEP_MPS = 0.05
 KEYBOARD_LOOK_RATE_FIELD = "keyboard_look_rate_deg_s"
 KEYBOARD_LOOK_RATE_PATH = f"control.camera.{KEYBOARD_LOOK_RATE_FIELD}"
 DEFAULT_KEYBOARD_LOOK_RATE_DEG_S = 120.0
@@ -81,6 +86,7 @@ MOTION_SETTING_PATHS = frozenset(
         MAX_TURN_RATE_PATH,
         KEYBOARD_TURN_RATE_PATH,
         KEYBOARD_TURN_BOOST_RATE_PATH,
+        KEYBOARD_SPEED_CAP_PATH,
         KEYBOARD_LOOK_RATE_PATH,
     ]
     + [
@@ -216,6 +222,14 @@ def _is_keyboard_look_rate_path(path: object) -> bool:
     return path == KEYBOARD_LOOK_RATE_PATH
 
 
+def _is_keyboard_speed_cap_path(path: object) -> bool:
+    if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
+        raise MotionSettingsError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
+        )
+    return path == KEYBOARD_SPEED_CAP_PATH
+
+
 @dataclass(frozen=True)
 class MotionSettings:
     """One validated, revisioned snapshot of motion and keyboard camera rates."""
@@ -225,6 +239,7 @@ class MotionSettings:
     max_turn_rate_rad_s: float = DEFAULT_MAX_TURN_RATE_RAD_S
     keyboard_turn_rate_rad_s: float = DEFAULT_KEYBOARD_TURN_RATE_RAD_S
     keyboard_turn_boost_rate_rad_s: float = DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S
+    keyboard_speed_cap_mps: float = DEFAULT_KEYBOARD_SPEED_CAP_MPS
     keyboard_look_rate_deg_s: float = DEFAULT_KEYBOARD_LOOK_RATE_DEG_S
     slow_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][0]
     slow_double_tap_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][1]
@@ -278,6 +293,20 @@ class MotionSettings:
             )
         object.__setattr__(self, KEYBOARD_TURN_RATE_FIELD, keyboard_turn)
         object.__setattr__(self, KEYBOARD_TURN_BOOST_RATE_FIELD, keyboard_turn_boost)
+        keyboard_speed_cap = _finite_speed(
+            self.keyboard_speed_cap_mps,
+            name=KEYBOARD_SPEED_CAP_FIELD,
+        )
+        keyboard_speed_cap_minimum, keyboard_speed_cap_maximum = (
+            KEYBOARD_SPEED_CAP_RANGE_MPS
+        )
+        if not keyboard_speed_cap_minimum <= keyboard_speed_cap <= keyboard_speed_cap_maximum:
+            raise MotionSettingsError(
+                "E_DATA_RANGE",
+                f"{KEYBOARD_SPEED_CAP_FIELD} must be in "
+                f"[{keyboard_speed_cap_minimum:.2f}, {keyboard_speed_cap_maximum:.2f}]",
+            )
+        object.__setattr__(self, KEYBOARD_SPEED_CAP_FIELD, keyboard_speed_cap)
         look_rate = _finite_speed(
             self.keyboard_look_rate_deg_s,
             name=KEYBOARD_LOOK_RATE_FIELD,
@@ -321,6 +350,8 @@ class MotionSettings:
             return self.keyboard_turn_rate_rad_s
         if path == KEYBOARD_TURN_BOOST_RATE_PATH:
             return self.keyboard_turn_boost_rate_rad_s
+        if path == KEYBOARD_SPEED_CAP_PATH:
+            return self.keyboard_speed_cap_mps
         if _is_keyboard_look_rate_path(path):
             return self.keyboard_look_rate_deg_s
         gear, field = _path_parts(path)
@@ -339,6 +370,8 @@ class MotionSettings:
             field_name = KEYBOARD_TURN_RATE_FIELD
         elif path == KEYBOARD_TURN_BOOST_RATE_PATH:
             field_name = KEYBOARD_TURN_BOOST_RATE_FIELD
+        elif path == KEYBOARD_SPEED_CAP_PATH:
+            field_name = KEYBOARD_SPEED_CAP_FIELD
         elif _is_keyboard_look_rate_path(path):
             field_name = KEYBOARD_LOOK_RATE_FIELD
         else:
@@ -368,6 +401,7 @@ class MotionSettings:
             MAX_TURN_RATE_FIELD: self.max_turn_rate_rad_s,
             KEYBOARD_TURN_RATE_FIELD: self.keyboard_turn_rate_rad_s,
             KEYBOARD_TURN_BOOST_RATE_FIELD: self.keyboard_turn_boost_rate_rad_s,
+            KEYBOARD_SPEED_CAP_FIELD: self.keyboard_speed_cap_mps,
             "movement": movement_mode_metadata(self.movement_mode),
             "camera": {
                 KEYBOARD_LOOK_RATE_FIELD: self.keyboard_look_rate_deg_s,
@@ -390,6 +424,7 @@ class MotionSettings:
             MAX_TURN_RATE_FIELD,
             KEYBOARD_TURN_RATE_FIELD,
             KEYBOARD_TURN_BOOST_RATE_FIELD,
+            KEYBOARD_SPEED_CAP_FIELD,
             "camera",
             "movement",
         }
@@ -428,6 +463,10 @@ class MotionSettings:
             KEYBOARD_TURN_BOOST_RATE_FIELD: value.get(
                 KEYBOARD_TURN_BOOST_RATE_FIELD,
                 keyboard_turn_boost_default,
+            ),
+            KEYBOARD_SPEED_CAP_FIELD: value.get(
+                KEYBOARD_SPEED_CAP_FIELD,
+                DEFAULT_KEYBOARD_SPEED_CAP_MPS,
             ),
             KEYBOARD_LOOK_RATE_FIELD: DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
             "movement_mode": DEFAULT_MOVEMENT_MODE,
@@ -628,6 +667,21 @@ _KEYBOARD_TURN_RATE_STEP_PRESETS = tuple(
         + 1
     )
 )
+_KEYBOARD_SPEED_CAP_STEP_PRESETS = tuple(
+    round(
+        KEYBOARD_SPEED_CAP_RANGE_MPS[0] + index * KEYBOARD_SPEED_CAP_STEP_MPS,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (KEYBOARD_SPEED_CAP_RANGE_MPS[1] - KEYBOARD_SPEED_CAP_RANGE_MPS[0])
+                / KEYBOARD_SPEED_CAP_STEP_MPS
+            )
+        )
+        + 1
+    )
+)
 
 
 def step_motion_speed(
@@ -674,6 +728,14 @@ def step_motion_speed(
     if _is_keyboard_look_rate_path(path):
         current = settings.value_for_path(path)
         presets = _KEYBOARD_LOOK_RATE_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(value for value in presets if value > current + 1e-12)
+            return candidates[0] if candidates else presets[-1]
+        candidates = tuple(value for value in presets if value < current - 1e-12)
+        return candidates[-1] if candidates else presets[0]
+    if _is_keyboard_speed_cap_path(path):
+        current = settings.value_for_path(path)
+        presets = _KEYBOARD_SPEED_CAP_STEP_PRESETS
         if direction > 0:
             candidates = tuple(value for value in presets if value > current + 1e-12)
             return candidates[0] if candidates else presets[-1]
@@ -905,6 +967,11 @@ __all__ = [
     "KEYBOARD_LOOK_RATE_PATH",
     "KEYBOARD_LOOK_RATE_RANGE_DEG_S",
     "KEYBOARD_LOOK_RATE_STEP_DEG_S",
+    "DEFAULT_KEYBOARD_SPEED_CAP_MPS",
+    "KEYBOARD_SPEED_CAP_FIELD",
+    "KEYBOARD_SPEED_CAP_PATH",
+    "KEYBOARD_SPEED_CAP_RANGE_MPS",
+    "KEYBOARD_SPEED_CAP_STEP_MPS",
     "KEYBOARD_TURN_BOOST_RATE_FIELD",
     "KEYBOARD_TURN_BOOST_RATE_PATH",
     "KEYBOARD_TURN_RATE_FIELD",

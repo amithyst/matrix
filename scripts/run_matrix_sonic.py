@@ -81,6 +81,8 @@ from inject_creative_inventory import (
     load_catalog as load_inventory_catalog,
 )
 from matrix_motion_settings import (
+    DEFAULT_KEYBOARD_SPEED_CAP_MPS,
+    KEYBOARD_SPEED_CAP_RANGE_MPS,
     MotionSettings,
     MotionSettingsError,
     MotionSettingsPersistenceError,
@@ -4356,26 +4358,40 @@ def _game_control_status_fields(
         "native_gait_modes": {
             SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
         },
-        "keyboard_slow_speed_mps": getattr(
-            args, "game_keyboard_slow_speed", 0.20
+        "keyboard_slow_speed_mps": (
+            motion_settings.slow_speed_mps
+            if motion_settings is not None
+            else getattr(args, "game_keyboard_slow_speed", 0.20)
         ),
         "keyboard_slow_boost_speed_mps": (
-            getattr(args, "game_keyboard_slow_boost_speed", 0.30)
+            motion_settings.slow_double_tap_speed_mps
+            if motion_settings is not None
+            else getattr(args, "game_keyboard_slow_boost_speed", 0.30)
         ),
-        "keyboard_walk_speed_mps": getattr(
-            args, "game_keyboard_walk_speed", 0.80
+        "keyboard_walk_speed_mps": (
+            motion_settings.walk_speed_mps
+            if motion_settings is not None
+            else getattr(args, "game_keyboard_walk_speed", 0.80)
         ),
         "keyboard_walk_boost_speed_mps": (
-            getattr(args, "game_keyboard_walk_boost_speed", 1.00)
+            motion_settings.walk_double_tap_speed_mps
+            if motion_settings is not None
+            else getattr(args, "game_keyboard_walk_boost_speed", 1.00)
         ),
-        "keyboard_run_speed_mps": getattr(
-            args, "game_keyboard_run_speed", 2.50
+        "keyboard_run_speed_mps": (
+            motion_settings.run_speed_mps
+            if motion_settings is not None
+            else getattr(args, "game_keyboard_run_speed", 2.50)
         ),
-        "keyboard_run_boost_speed_mps": getattr(
-            args, "game_keyboard_run_boost_speed", 2.75
+        "keyboard_run_boost_speed_mps": (
+            motion_settings.run_double_tap_speed_mps
+            if motion_settings is not None
+            else getattr(args, "game_keyboard_run_boost_speed", 2.75)
         ),
-        "keyboard_speed_cap_mps": getattr(
-            args, "game_keyboard_speed_cap_mps", None
+        "keyboard_speed_cap_mps": (
+            motion_settings.keyboard_speed_cap_mps
+            if motion_settings is not None
+            else getattr(args, "game_keyboard_speed_cap_mps", None)
         ),
         "keyboard_double_tap_window_s": getattr(
             args, "game_keyboard_double_tap_window", 0.30
@@ -4493,6 +4509,7 @@ def _control_config_with_motion_settings(
         keyboard_walk_boost_speed_mps=settings.walk_double_tap_speed_mps,
         keyboard_run_speed_mps=settings.run_speed_mps,
         keyboard_run_boost_speed_mps=settings.run_double_tap_speed_mps,
+        keyboard_speed_cap_mps=settings.keyboard_speed_cap_mps,
     )
 
 
@@ -8581,17 +8598,15 @@ def _bfm_realscan_motion_command(
     *,
     root_yaw_rad: float | None = None,
 ) -> RobotMotionCommand:
-    """Quantize a Matrix game command to BFM RealScan walk/jog tiers.
+    """Project a Matrix game command onto BFM RealScan's forward/yaw surface.
 
     Matrix's native SONIC keyboard surface has slow/walk/run plus per-tier
     double-tap boosts.  The BFM Teacher was validated as a RealScan
-    forward-walk/jog policy: W/Shift-W are scalar local-forward commands and
-    Q/E are the explicit yaw surface.  Project translating Matrix commands onto
-    their requested facing before the BFM adapter rotates them into its local
-    command frame, otherwise body-relative/camera-relative desktop input can
-    leak a lateral ``vy`` component that the teacher was not trained to handle.
-    RUN remains the stable Shift marker; every other translating native tier is
-    BFM walk, so double-tap never creates a third speed.
+    forward-speed/yaw policy: Matrix computes the operator-facing movement
+    frame, speed tier, and keyboard cap; the BFM adapter only removes lateral
+    velocity that the teacher was not trained to handle.  Preserving
+    ``command.speed_mps`` keeps the ESC control panel authoritative instead of
+    silently replacing live settings with import-time environment constants.
     """
 
     if (
@@ -8632,11 +8647,7 @@ def _bfm_realscan_motion_command(
         movement=forward,
         facing=forward,
         desired_facing=forward,
-        speed_mps=(
-            _BFM_REALSCAN_JOG_SPEED_MPS
-            if jog
-            else _BFM_REALSCAN_WALK_SPEED_MPS
-        ),
+        speed_mps=float(command.speed_mps),
         locomotion_mode=SONIC_RUN_MODE if jog else SONIC_WALK_MODE,
     )
 
@@ -9812,13 +9823,38 @@ class _DirectBfmRuntime:
     ) -> RobotMotionCommand:
         root_yaw = _root_yaw_rad(snapshot.qpos)
         if game_command is not None:
+            forward = (math.cos(root_yaw), math.sin(root_yaw), 0.0)
+            if game_command.safe_stop:
+                return replace(
+                    game_command,
+                    sequence=int(snapshot.step_index),
+                    movement=(0.0, 0.0, 0.0),
+                    facing=forward,
+                    desired_facing=forward,
+                    speed_mps=0.0,
+                    locomotion_mode=SONIC_IDLE_MODE,
+                    reason=game_command.reason or "direct_bfm_game_safe_stop",
+                )
+            if game_command.mode == "turn":
+                # BFM Teacher's adapter has an explicit yaw branch for
+                # zero-speed turn samples.  Do not collapse Matrix's
+                # turn-before-move or Q/E manual-yaw command into idle, or the
+                # requested facing is lost before the policy can rotate.
+                return replace(
+                    game_command,
+                    sequence=int(snapshot.step_index),
+                    movement=(0.0, 0.0, 0.0),
+                    speed_mps=0.0,
+                    locomotion_mode=SONIC_IDLE_MODE,
+                    mode="turn",
+                    safe_stop=False,
+                    reason=game_command.reason or "direct_bfm_game_turn",
+                )
             if (
-                game_command.safe_stop
-                or game_command.mode != "move"
+                game_command.mode != "move"
                 or not math.isfinite(float(game_command.speed_mps))
                 or float(game_command.speed_mps) <= 1.0e-8
             ):
-                forward = (math.cos(root_yaw), math.sin(root_yaw), 0.0)
                 return replace(
                     game_command,
                     sequence=int(snapshot.step_index),
@@ -13317,6 +13353,32 @@ def main(*, completion_event: threading.Event | None = None) -> int:
     motion_settings_store: MotionSettingsStore | None = None
     if args.control_source == "game":
         args.game_keyboard_speed_cap_mps = None
+        configured_keyboard_speed_cap_mps = DEFAULT_KEYBOARD_SPEED_CAP_MPS
+        if (
+            args.moon_dynamic_map is not None
+            and str(getattr(args, "initial_locomotion_policy", "sonic"))
+            == BFM_TEACHER50K_POLICY_ID
+        ):
+            raw_keyboard_cap = (
+                os.environ.get("MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP")
+                or os.environ.get("MATRIX_MOON_BFM_SPEED_CAP")
+            )
+            if raw_keyboard_cap:
+                try:
+                    configured_keyboard_speed_cap_mps = float(raw_keyboard_cap)
+                except ValueError as exc:
+                    raise SystemExit(
+                        "MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP must be numeric"
+                    ) from exc
+                cap_min, cap_max = KEYBOARD_SPEED_CAP_RANGE_MPS
+                if (
+                    not math.isfinite(configured_keyboard_speed_cap_mps)
+                    or not cap_min <= configured_keyboard_speed_cap_mps <= cap_max
+                ):
+                    raise SystemExit(
+                        "MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP must be finite "
+                        f"and in [{cap_min:.2f}, {cap_max:.2f}]"
+                    )
         motion_settings_path = getattr(args, "game_motion_settings_file", None)
         if motion_settings_path is not None:
             if not motion_settings_path.is_absolute():
@@ -13329,6 +13391,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         DEFAULT_MOVEMENT_MODE,
                     ),
                     max_turn_rate_rad_s=args.game_max_turn_rate,
+                    keyboard_speed_cap_mps=configured_keyboard_speed_cap_mps,
                     slow_speed_mps=args.game_keyboard_slow_speed,
                     slow_double_tap_speed_mps=(
                         args.game_keyboard_slow_boost_speed
@@ -13364,6 +13427,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             args.game_keyboard_run_boost_speed = (
                 motion.run_double_tap_speed_mps
             )
+            args.game_keyboard_speed_cap_mps = motion.keyboard_speed_cap_mps
             args.game_motion_settings_load_status = (
                 motion_settings_store.load_status
             )
@@ -13373,33 +13437,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             args.game_motion_settings_load_status = "disabled"
             args.game_motion_settings_revision = None
             args.game_movement_mode = DEFAULT_MOVEMENT_MODE
-        if (
-            args.moon_dynamic_map is not None
-            and str(getattr(args, "initial_locomotion_policy", "sonic"))
-            == BFM_TEACHER50K_POLICY_ID
-        ):
-            raw_keyboard_cap = (
-                os.environ.get("MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP")
-                or os.environ.get("MATRIX_MOON_BFM_SPEED_CAP")
-            )
-            if raw_keyboard_cap:
-                try:
-                    keyboard_cap = float(raw_keyboard_cap)
-                except ValueError as exc:
-                    raise SystemExit(
-                        "MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP must be numeric"
-                    ) from exc
-                if (
-                    not math.isfinite(keyboard_cap)
-                    or keyboard_cap <= 0.0
-                    or keyboard_cap
-                    > SONIC_GAIT_SPEED_RANGES_MPS[SONIC_RUN_MODE][1]
-                ):
-                    raise SystemExit(
-                        "MATRIX_MOON_BFM_KEYBOARD_SPEED_CAP must be finite, "
-                        "positive, and no greater than native RUN maximum"
-                    )
-                args.game_keyboard_speed_cap_mps = keyboard_cap
+            args.game_keyboard_speed_cap_mps = configured_keyboard_speed_cap_mps
         if args.game_max_speed > 0.8:
             raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
         if (
