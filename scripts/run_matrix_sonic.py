@@ -453,6 +453,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
     parser.add_argument("--game-max-future-skew", type=float, default=0.05)
     parser.add_argument(
+        "--game-gait-start-heading-error-deg",
+        type=float,
+        default=15.0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--game-gait-stop-heading-error-deg",
+        type=float,
+        default=30.0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--game-pure-forward-alignment-crawl",
         type=_on_off_argument,
         default="on",
@@ -4459,6 +4471,12 @@ def _game_control_status_fields(
         "fall_recovery_mode": getattr(args, "game_fall_recovery", "off"),
         "fall_recovery_timeout_s": getattr(
             args, "game_fall_recovery_timeout", 15.0
+        ),
+        "gait_start_heading_error_deg": getattr(
+            args, "game_gait_start_heading_error_deg", 15.0
+        ),
+        "gait_stop_heading_error_deg": getattr(
+            args, "game_gait_stop_heading_error_deg", 30.0
         ),
         "maximum_snapshot_age_s": args.game_max_snapshot_age,
         "maximum_future_skew_s": args.game_max_future_skew,
@@ -13381,6 +13399,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
         ("moon_dynamic_map", None),
         ("moon_dynamic_map_sha256", None),
         ("game_pure_forward_alignment_crawl", "on"),
+        ("game_gait_start_heading_error_deg", 15.0),
+        ("game_gait_stop_heading_error_deg", 30.0),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -13537,6 +13557,12 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 input_timeout_s=args.game_input_timeout,
                 max_snapshot_age_s=args.game_max_snapshot_age,
                 max_future_skew_s=args.game_max_future_skew,
+                gait_start_heading_error_rad=math.radians(
+                    args.game_gait_start_heading_error_deg
+                ),
+                gait_stop_heading_error_rad=math.radians(
+                    args.game_gait_stop_heading_error_deg
+                ),
                 pure_forward_alignment_crawl_enabled=_on_off_enabled(
                     args.game_pure_forward_alignment_crawl
                 ),

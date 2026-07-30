@@ -2574,6 +2574,8 @@ PY
         --game-input-timeout "${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
         --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
+        --game-gait-start-heading-error-deg "${MATRIX_GAME_GAIT_START_HEADING_ERROR_DEG:-15.0}"
+        --game-gait-stop-heading-error-deg "${MATRIX_GAME_GAIT_STOP_HEADING_ERROR_DEG:-30.0}"
         --game-pure-forward-alignment-crawl "${MATRIX_GAME_PURE_FORWARD_ALIGNMENT_CRAWL:-on}"
     )
     GAME_INPUT_ARGS+=("${GAME_EXTERNAL_CONTROL_ARGS[@]}")

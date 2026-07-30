@@ -1106,9 +1106,11 @@ class BfmTeacherCore:
         facing_norm = float(np.linalg.norm(requested_facing[:2]))
         # Matrix supplies two headings: a rate-limited wire-facing vector and
         # the final desired facing.  Moving samples use wire-facing as the
-        # local movement frame; turn-only samples use final desired facing for
-        # yaw feedback so camera-face auto-turn and Q/E do not look stationary
-        # just because the wire-facing lead is intentionally small.
+        # local movement frame.  Turn-only samples must also consume the
+        # wire-facing safety boundary: chasing the final camera target directly
+        # makes BFM hold a saturated yaw-rate command until it overshoots and
+        # then flips direction, which shows up in-game as left/right turn
+        # oscillation while holding W.
         movement_frame_yaw = (
             math.atan2(requested_facing[1], requested_facing[0])
             if sample.mode == "move" and facing_norm > 1.0e-8
@@ -1118,47 +1120,41 @@ class BfmTeacherCore:
         sine = math.sin(movement_frame_yaw)
         local_vx = cosine * world_velocity[0] + sine * world_velocity[1]
         local_vy = -sine * world_velocity[0] + cosine * world_velocity[1]
-        turn_facing = (
-            sample.desired_facing
-            if sample.mode == "turn"
-            else requested_facing
-        )
-        turn_facing_norm = float(np.linalg.norm(turn_facing[:2]))
+        heading_facing = requested_facing
+        heading_facing_norm = float(np.linalg.norm(heading_facing[:2]))
         if (
             sample.safe_stop
-            or sample.mode != "turn"
-            or turn_facing_norm <= 1.0e-8
+            or sample.mode not in {"move", "turn"}
+            or heading_facing_norm <= 1.0e-8
         ):
             yaw_rate = 0.0
         else:
             facing_yaw = math.atan2(
-                turn_facing[1],
-                turn_facing[0],
+                heading_facing[1],
+                heading_facing[0],
             )
             heading_error = math.atan2(
                 math.sin(facing_yaw - sample.root_yaw),
                 math.cos(facing_yaw - sample.root_yaw),
             )
-            yaw_limit = FORMAL_COMMAND_YAW_LIMIT_RAD_S
-            if sample.mode == "turn":
-                measured_yaw_rate = (
-                    float(lowstate.body_gyro_rad_s[2])
-                    if lowstate is not None
-                    else 0.0
-                )
-                heading_error = math.atan2(
-                    math.sin(
-                        heading_error
-                        - TURN_COMMAND_YAW_DAMPING_SECONDS
-                        * measured_yaw_rate
-                    ),
-                    math.cos(
-                        heading_error
-                        - TURN_COMMAND_YAW_DAMPING_SECONDS
-                        * measured_yaw_rate
-                    ),
-                )
-                yaw_limit = TURN_COMMAND_YAW_LIMIT_RAD_S
+            measured_yaw_rate = (
+                float(lowstate.body_gyro_rad_s[2])
+                if lowstate is not None
+                else 0.0
+            )
+            heading_error = math.atan2(
+                math.sin(
+                    heading_error
+                    - TURN_COMMAND_YAW_DAMPING_SECONDS
+                    * measured_yaw_rate
+                ),
+                math.cos(
+                    heading_error
+                    - TURN_COMMAND_YAW_DAMPING_SECONDS
+                    * measured_yaw_rate
+                ),
+            )
+            yaw_limit = TURN_COMMAND_YAW_LIMIT_RAD_S
             yaw_rate = float(
                 np.clip(
                     heading_error * FORMAL_COMMAND_YAW_GAIN,

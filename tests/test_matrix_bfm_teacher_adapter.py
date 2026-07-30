@@ -146,11 +146,29 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertEqual(command.gait, "walk")
         self.assertFalse(command.stop_latched)
 
-    def test_move_uses_camera_local_velocity_without_yaw_feedback(self) -> None:
+    def test_move_uses_camera_local_velocity_with_wire_facing_yaw_feedback(self) -> None:
         sample = self.sample(safe_stop=False, mode="move")
         sample.movement = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
         sample.facing = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
         sample.root_yaw = 0.35
+        sample.speed_mps = 0.9
+
+        command = self.core()._command(sample)
+
+        self.assertAlmostEqual(command.vx, 0.9)
+        self.assertAlmostEqual(command.vy, 0.0)
+        self.assertEqual(command.yaw_rate, MODULE.TURN_COMMAND_YAW_LIMIT_RAD_S)
+        self.assertEqual(command.gait, "walk")
+
+    def test_move_aligned_facing_has_zero_yaw_feedback(self) -> None:
+        sample = self.sample(safe_stop=False, mode="move")
+        sample.root_yaw = 0.35
+        sample.movement = np.asarray(
+            (math.cos(sample.root_yaw), math.sin(sample.root_yaw), 0.0),
+            dtype=np.float64,
+        )
+        sample.facing = sample.movement.copy()
+        sample.desired_facing = sample.facing.copy()
         sample.speed_mps = 0.9
 
         command = self.core()._command(sample)
@@ -184,7 +202,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         sample = self.sample(safe_stop=False, mode="turn")
         sample.movement = np.zeros(3, dtype=np.float64)
         sample.facing = np.asarray(
-            (math.cos(0.15), math.sin(0.15), 0.0),
+            (math.cos(0.04), math.sin(0.04), 0.0),
             dtype=np.float64,
         )
         # The final camera facing is intentionally farther away; the adapter
@@ -192,7 +210,7 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         sample.desired_facing = np.asarray((0.0, 1.0, 0.0), dtype=np.float64)
         sample.speed_mps = 0.0
         lowstate = SimpleNamespace(
-            body_gyro_rad_s=np.asarray((0.0, 0.0, 0.5), dtype=np.float64)
+            body_gyro_rad_s=np.asarray((0.0, 0.0, 0.1), dtype=np.float64)
         )
 
         command = self.core()._command(sample, lowstate)
@@ -200,8 +218,8 @@ class MatrixBfmTeacherAdapterTest(unittest.TestCase):
         self.assertAlmostEqual(
             command.yaw_rate,
             (
-                0.15
-                - MODULE.TURN_COMMAND_YAW_DAMPING_SECONDS * 0.5
+                0.04
+                - MODULE.TURN_COMMAND_YAW_DAMPING_SECONDS * 0.1
             )
             * MODULE.FORMAL_COMMAND_YAW_GAIN,
         )
