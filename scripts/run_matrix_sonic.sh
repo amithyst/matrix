@@ -1840,6 +1840,7 @@ RESTART_EXPECTED_EXIT_CODE=143
 NEXT_SCENE_ID="$SCENE_ID"
 NEXT_WORLD_ID=""
 NEXT_ROUTE_JSON=""
+NEXT_INITIAL_LOCOMOTION_POLICY=""
 GAME_RESUME_ROLLBACK_COUNT="${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
 # Keep this equal to matrix_world_state.MAX_RESUME_CHECKPOINTS: each failed
 # generation may quarantine exactly one member of the bounded resume ring.
@@ -2628,8 +2629,7 @@ PY
 fi
 if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
     && "$FORCED_STOP" == "0" \
-    && "$exit_code" == "75" \
-    && "$GAME_WORLD_PERSISTENCE" == "1" ]]; then
+    && "$exit_code" == "75" ]]; then
     if VERIFIED_INTERNAL_RESTART_REASON="$(
         /usr/bin/python3 -I - \
             "$MATRIX_SONIC_STATUS_FILE" \
@@ -2657,7 +2657,7 @@ world = status.get("game_world_state")
 if not isinstance(internal, dict) or internal.get("requested") is not True:
     raise SystemExit(1)
 reason = internal.get("reason")
-if reason not in {"game_fall_respawn", "game_teleport"}:
+if reason not in {"game_fall_respawn", "game_teleport", "policy_boundary_switch"}:
     raise SystemExit(1)
 if status.get("termination_reason") != reason:
     raise SystemExit(1)
@@ -2666,6 +2666,12 @@ if "termination_signal" not in status or status["termination_signal"] is not Non
 for field in ("failed_child_name", "failed_child_exit_code"):
     if field not in status or status[field] is not None:
         raise SystemExit(1)
+if reason == "policy_boundary_switch":
+    target_policy = internal.get("target_locomotion_policy")
+    if target_policy not in {"sonic", "bfm-sonic-teacher50k"}:
+        raise SystemExit(1)
+    print(f"{reason}\x1f\x1f\x1f\x1f{target_policy}")
+    raise SystemExit(0)
 if not isinstance(world, dict):
     raise SystemExit(1)
 if world.get("last_error") is not None:
@@ -2677,7 +2683,7 @@ if reason == "game_fall_respawn" and status.get("game_auto_respawn") is not True
 target_scene_id = internal.get("target_scene_id")
 launch_route = internal.get("launch_route")
 if target_scene_id is None and launch_route is None:
-    print(reason)
+    print(f"{reason}\x1f\x1f\x1f\x1f")
     raise SystemExit(0)
 if reason != "game_teleport" or not isinstance(launch_route, dict):
     raise SystemExit(1)
@@ -2724,17 +2730,19 @@ route_json = json.dumps(
     separators=(",", ":"),
     sort_keys=True,
 )
-print(f"{reason}\t{target_scene_id}\t{launch_route['target_world_id']}\t{route_json}")
+print(f"{reason}\x1f{target_scene_id}\x1f{launch_route['target_world_id']}\x1f{route_json}\x1f")
 PY
     )"; then
         VERIFIED_INTERNAL_RESTART_TARGET_SCENE=""
         VERIFIED_INTERNAL_RESTART_TARGET_WORLD=""
         VERIFIED_INTERNAL_RESTART_ROUTE_JSON=""
-        IFS=$'\t' read -r \
+        VERIFIED_INTERNAL_RESTART_TARGET_POLICY=""
+        IFS=$'\x1f' read -r \
             VERIFIED_INTERNAL_RESTART_REASON \
             VERIFIED_INTERNAL_RESTART_TARGET_SCENE \
             VERIFIED_INTERNAL_RESTART_TARGET_WORLD \
             VERIFIED_INTERNAL_RESTART_ROUTE_JSON \
+            VERIFIED_INTERNAL_RESTART_TARGET_POLICY \
             <<<"$VERIFIED_INTERNAL_RESTART_REASON"
         INTERNAL_RESTART_NOW="$(date +%s)"
         if [[ "$INTERNAL_RESTART_WINDOW" == "0" ]] \
@@ -2751,10 +2759,14 @@ PY
                 NEXT_WORLD_ID="$VERIFIED_INTERNAL_RESTART_TARGET_WORLD"
                 NEXT_ROUTE_JSON="$VERIFIED_INTERNAL_RESTART_ROUTE_JSON"
             fi
-            echo "[INFO] Validated Matrix world reload " \
+            if [[ -n "$VERIFIED_INTERNAL_RESTART_TARGET_POLICY" ]]; then
+                NEXT_INITIAL_LOCOMOTION_POLICY="$VERIFIED_INTERNAL_RESTART_TARGET_POLICY"
+            fi
+            echo "[INFO] Validated Matrix internal reload " \
                 "reason=$VERIFIED_INTERNAL_RESTART_REASON " \
                 "next_scene=$NEXT_SCENE_ID " \
                 "next_world=${NEXT_WORLD_ID:-current} " \
+                "next_policy=${NEXT_INITIAL_LOCOMOTION_POLICY:-current} " \
                 "count=${INTERNAL_RESTART_COUNT}/${INTERNAL_RESTART_MAX}"
         else
             echo "[ERROR] Matrix world reload rate limit exceeded; " \
@@ -2961,6 +2973,7 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
             echo "[INFO] External stop cancelled the pending Matrix restart" >&2
         else
             RESTART_ROUTE_ENV=()
+            RESTART_ARGS=("${ORIGINAL_ARGS[@]}")
             if [[ -n "$NEXT_WORLD_ID" ]]; then
                 RESTART_ROUTE_ENV+=(
                     "MATRIX_SONIC_RESTART_WORLD_ID=$NEXT_WORLD_ID"
@@ -2969,6 +2982,29 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
             if [[ -n "${NEXT_ROUTE_JSON:-}" ]]; then
                 RESTART_ROUTE_ENV+=(
                     "MATRIX_SONIC_RESTART_ROUTE_JSON=$NEXT_ROUTE_JSON"
+                )
+            fi
+            if [[ -n "$NEXT_INITIAL_LOCOMOTION_POLICY" ]]; then
+                RESTART_ARGS=()
+                SKIP_NEXT_INITIAL_POLICY_ARG=0
+                for arg in "${ORIGINAL_ARGS[@]}"; do
+                    if [[ "$SKIP_NEXT_INITIAL_POLICY_ARG" == "1" ]]; then
+                        SKIP_NEXT_INITIAL_POLICY_ARG=0
+                        continue
+                    fi
+                    case "$arg" in
+                        --initial-locomotion-policy)
+                            SKIP_NEXT_INITIAL_POLICY_ARG=1
+                            ;;
+                        --initial-locomotion-policy=*)
+                            ;;
+                        *)
+                            RESTART_ARGS+=("$arg")
+                            ;;
+                    esac
+                done
+                RESTART_ARGS+=(
+                    --initial-locomotion-policy "$NEXT_INITIAL_LOCOMOTION_POLICY"
                 )
             fi
             exec /usr/bin/env -i \
@@ -2981,7 +3017,7 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
                 MATRIX_GAME_RESUME_ROLLBACK_RATE_COUNT="$GAME_RESUME_ROLLBACK_RATE_COUNT" \
                 MATRIX_SONIC_RESTART_SCENE_ID="$NEXT_SCENE_ID" \
                 "${RESTART_ROUTE_ENV[@]}" \
-                "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${ORIGINAL_ARGS[@]}"
+                "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${RESTART_ARGS[@]}"
             echo "[ERROR] Failed to exec restarted Matrix launcher" >&2
             exit 1
         fi

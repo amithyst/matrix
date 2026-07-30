@@ -1184,6 +1184,7 @@ class StrategyPolicyModel:
     available: bool
     display_name: str | None = None
     unavailable_reason: str | None = None
+    switch_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1219,12 +1220,17 @@ class StrategyLoadoutModel:
         )
         if policy_id == selected:
             return False
-        return any(
-            candidate.policy_id == policy_id
-            and candidate.available
-            and candidate.resident
-            for candidate in candidates
-        )
+        for candidate in candidates:
+            if candidate.policy_id != policy_id or not candidate.available:
+                continue
+            if candidate.resident:
+                return True
+            if (
+                slot == "locomotion"
+                and candidate.switch_mode == "paused_boundary_restart"
+            ):
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -1479,6 +1485,11 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                                     )
                                     else None
                                 ),
+                                switch_mode=(
+                                    candidate.get("switch_mode")
+                                    if isinstance(candidate.get("switch_mode"), str)
+                                    else None
+                                ),
                             )
                         )
             elif slot_id == "recovery" and isinstance(selected, str):
@@ -1509,6 +1520,11 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                                     if isinstance(
                                         candidate.get("unavailable_reason"), str
                                     )
+                                    else None
+                                ),
+                                switch_mode=(
+                                    candidate.get("switch_mode")
+                                    if isinstance(candidate.get("switch_mode"), str)
                                     else None
                                 ),
                             )
@@ -3798,10 +3814,18 @@ class X11CalibrationOverlay:
         self._pressed_runtime_pause_epoch: int | None = None
         self._polled_pointer_valid = False
         self._polled_left_pressed = False
+        self._polled_left_mask = 0
         self._polled_left_initialized = False
         self._polled_left_was_down = False
+        self._polled_pressed_action: str | None = None
+        self._polled_pressed_runtime_pause_target: str | None = None
+        self._polled_pressed_runtime_pause_epoch: int | None = None
         self._polled_left_transition_count = 0
         self._polled_left_fallback_events = 0
+        self._polled_left_emitted_intents = 0
+        self._last_polled_action: str | None = None
+        self._cooked_left_button_events = 0
+        self._last_cooked_action: str | None = None
         self._recovered_pause_release_count = 0
         self._pointer_recenter_count = 0
         self._target_window: int | None = None
@@ -4326,6 +4350,25 @@ class X11CalibrationOverlay:
             "polled_left_fallback_events": getattr(
                 self, "_polled_left_fallback_events", 0
             ),
+            "polled_left_emitted_intents": getattr(
+                self, "_polled_left_emitted_intents", 0
+            ),
+            "polled_pointer_valid": getattr(self, "_polled_pointer_valid", False),
+            "polled_left_pressed": getattr(self, "_polled_left_pressed", False),
+            "polled_left_mask": getattr(self, "_polled_left_mask", 0),
+            "polled_left_initialized": getattr(
+                self, "_polled_left_initialized", False
+            ),
+            "polled_left_was_down": getattr(self, "_polled_left_was_down", False),
+            "polled_pressed_action": getattr(
+                self, "_polled_pressed_action", None
+            ),
+            "last_polled_action": getattr(self, "_last_polled_action", None),
+            "last_pointer": getattr(self, "_last_pointer", None),
+            "cooked_left_button_events": getattr(
+                self, "_cooked_left_button_events", 0
+            ),
+            "last_cooked_action": getattr(self, "_last_cooked_action", None),
             "recovered_pause_release_count": getattr(
                 self, "_recovered_pause_release_count", 0
             ),
@@ -4549,8 +4592,10 @@ class X11CalibrationOverlay:
                     self._make_click_through(window)
                 if name == "cursor-shadow":
                     self._set_bounding_shape(window, _CURSOR_SHADOW_RECTANGLES)
+                    self._make_click_through(window)
                 elif name == "cursor":
                     self._set_bounding_shape(window, _CURSOR_FOREGROUND_RECTANGLES)
+                    self._make_click_through(window)
             panel = self._windows["panel"]
             gc = self._x11.XCreateGC(self._display, panel, 0, None)
             if not gc:
@@ -4918,23 +4963,31 @@ class X11CalibrationOverlay:
         ):
             self._polled_pointer_valid = False
             self._polled_left_pressed = False
+            self._polled_left_mask = 0
             self._polled_left_initialized = False
             return None
         self._polled_pointer_valid = True
+        self._polled_left_mask = int(mask.value)
         self._polled_left_pressed = bool(mask.value & _BUTTON_1_MASK)
         return (root_x.value, root_y.value)
 
-    def _queue_polled_left_transition(self, *, cooked_button_seen: bool) -> None:
+    def _queue_polled_left_transition(
+        self,
+        publisher: PointerActionPublisher,
+        *,
+        cooked_button_seen: bool,
+    ) -> int:
         """Recover clicks whose cooked X11 events are held by another client.
 
         Remote desktop/browser stacks can leave the Matrix override-redirect
         panel visible while an older client still owns the cooked pointer
         grab.  XQueryPointer nevertheless exposes the authoritative core
-        Button1 level.  Convert only observed level edges into this client's
-        own event queue; ordinary cooked events remain authoritative and
+        Button1 level.  Convert only observed level edges directly into the
+        same panel intents; ordinary cooked events remain authoritative and
         suppress the fallback for that frame.
         """
 
+        emitted = 0
         valid = bool(getattr(self, "_polled_pointer_valid", False))
         current = bool(getattr(self, "_polled_left_pressed", False))
         initialized = bool(getattr(self, "_polled_left_initialized", False))
@@ -4945,59 +4998,184 @@ class X11CalibrationOverlay:
             or getattr(self, "_last_pointer", None) is None
         ):
             self._polled_left_initialized = False
-            return
+            self._polled_pressed_action = None
+            self._polled_pressed_runtime_pause_target = None
+            self._polled_pressed_runtime_pause_epoch = None
+            return emitted
         if cooked_button_seen:
             self._polled_left_initialized = True
             self._polled_left_was_down = current
-            return
+            if not current:
+                self._polled_pressed_action = None
+                self._polled_pressed_runtime_pause_target = None
+                self._polled_pressed_runtime_pause_epoch = None
+            return emitted
+
+        root_x, root_y = self._last_pointer
+        layout = self._last_layout
+        action = panel_action_at(
+            layout,
+            root_x,
+            root_y,
+            page=getattr(self, "_active_page", "loadout"),
+        )
+        self._last_polled_action = action
+        if getattr(
+            self,
+            "_last_startup_loading_model",
+            startup_loading_model({}),
+        ).active:
+            action = None
+
         if not initialized:
-            # A button already held when the panel appears cannot prove that
-            # its press began on a visible Matrix control.
             self._polled_left_initialized = True
             self._polled_left_was_down = current
-            return
+            if current:
+                self._polled_pressed_action = action
+                self._polled_pressed_runtime_pause_target = None
+                self._polled_pressed_runtime_pause_epoch = None
+                if action == "runtime_pause":
+                    pause_model = getattr(self, "_last_runtime_pause_model", None)
+                    pause_target = (
+                        pause_model.pause_target
+                        if isinstance(pause_model, RuntimePausePanelModel)
+                        else None
+                    )
+                    if pause_target is not None:
+                        self._polled_pressed_runtime_pause_target = pause_target
+                        self._polled_pressed_runtime_pause_epoch = pause_model.epoch
+            return emitted
+
         previous = bool(getattr(self, "_polled_left_was_down", current))
         self._polled_left_was_down = current
         if current == previous:
-            return
+            return emitted
 
-        root_x, root_y = self._last_pointer
-        panel_x, panel_y, _panel_width, _panel_height = self._last_layout["panel"]
-        event = XEvent()
-        event.type = _BUTTON_PRESS if current else _BUTTON_RELEASE
-        event.xbutton.type = event.type
-        event.xbutton.send_event = 1
-        event.xbutton.display = self._display
-        event.xbutton.window = self._windows["panel"]
-        event.xbutton.root = self._root
-        event.xbutton.x = root_x - panel_x
-        event.xbutton.y = root_y - panel_y
-        event.xbutton.x_root = root_x
-        event.xbutton.y_root = root_y
-        event.xbutton.state = 0 if current else _BUTTON_1_MASK
-        event.xbutton.button = 1
-        event.xbutton.same_screen = 1
-        event_mask = (
-            _BUTTON_PRESS_MASK if current else _BUTTON_RELEASE_MASK
-        )
-        if (
-            self._x11.XSendEvent(
-                self._display,
-                self._windows["panel"],
-                0,
-                event_mask,
-                ctypes.byref(event),
-            )
-            == 0
-        ):
-            raise RuntimeError("XSendEvent rejected pointer-level fallback")
-        self._x11.XFlush(self._display)
         self._polled_left_transition_count = (
             getattr(self, "_polled_left_transition_count", 0) + 1
         )
         self._polled_left_fallback_events = (
             getattr(self, "_polled_left_fallback_events", 0) + 1
         )
+        if current:
+            self._polled_pressed_action = action
+            self._polled_pressed_runtime_pause_target = None
+            self._polled_pressed_runtime_pause_epoch = None
+            if action == "runtime_pause":
+                pause_model = getattr(self, "_last_runtime_pause_model", None)
+                pause_target = (
+                    pause_model.pause_target
+                    if isinstance(pause_model, RuntimePausePanelModel)
+                    else None
+                )
+                if pause_target is not None:
+                    self._polled_pressed_runtime_pause_target = pause_target
+                    self._polled_pressed_runtime_pause_epoch = pause_model.epoch
+            return emitted
+
+        pressed = self._polled_pressed_action
+        pressed_pause_target = self._polled_pressed_runtime_pause_target
+        pressed_pause_epoch = self._polled_pressed_runtime_pause_epoch
+        self._polled_pressed_action = None
+        self._polled_pressed_runtime_pause_target = None
+        self._polled_pressed_runtime_pause_epoch = None
+        if pressed is None or action != pressed or not self._visible:
+            return emitted
+
+        if action in _PANEL_TABS:
+            next_page = action.removeprefix("tab_")
+            if next_page != getattr(self, "_active_page", "loadout"):
+                if self._force_end_command_editing(publisher):
+                    emitted += 1
+                self._active_page = next_page
+                self._last_page = None
+            return emitted
+        if action == "runtime_pause":
+            panel_model = self._last_panel_model
+            if (
+                pressed_pause_target is not None
+                and type(pressed_pause_epoch) is int
+                and panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish_runtime_pause(
+                    pressed_pause_target,
+                    expected_epoch=pressed_pause_epoch,
+                )
+                emitted += 1
+            return emitted
+        if action == "quit_game":
+            panel_model = self._last_panel_model
+            if (
+                panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish_game_quit()
+                emitted += 1
+            return emitted
+        if action.startswith("recovery_policy_"):
+            strategy = getattr(self, "_last_strategy_model", None)
+            try:
+                policy_index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return emitted
+            if strategy is not None and policy_index < len(strategy.recovery_candidates):
+                candidate = strategy.recovery_candidates[policy_index]
+                if strategy.policy_enabled(candidate.policy_id):
+                    publisher.publish_strategy_select(
+                        "recovery",
+                        candidate.policy_id,
+                    )
+                    emitted += 1
+            return emitted
+        if action.startswith("locomotion_policy_"):
+            strategy = getattr(self, "_last_strategy_model", None)
+            try:
+                policy_index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return emitted
+            if strategy is not None and policy_index < len(
+                strategy.locomotion_candidates
+            ):
+                candidate = strategy.locomotion_candidates[policy_index]
+                if strategy.policy_enabled(candidate.policy_id, slot="locomotion"):
+                    publisher.publish_strategy_select(
+                        "locomotion",
+                        candidate.policy_id,
+                    )
+                    emitted += 1
+            return emitted
+        if (
+            self._last_panel_model is not None
+            and self._last_panel_model.action_enabled(action)
+            and not self._command_editor.editing
+            and not self._command_editor.pending
+            and not self._last_command_status.in_flight
+            and not self._last_command_status.restart_required
+            and not self._last_command_status.outcome_unknown
+            and self._last_command_status.status not in {"pending", "restarting"}
+        ):
+            publisher.publish(action)
+            emitted += 1
+        return emitted
 
     def _panel_rectangle(
         self,
@@ -5628,7 +5806,10 @@ class X11CalibrationOverlay:
             )
             if pending:
                 label = f"{label} · 切换中"
-            elif not candidate.available or not candidate.resident:
+            elif not candidate.available or (
+                not candidate.resident
+                and candidate.switch_mode != "paused_boundary_restart"
+            ):
                 label = f"{label} · 未就绪"
             self._draw_button(
                 layout,
@@ -7005,6 +7186,9 @@ class X11CalibrationOverlay:
             if button.button != 1:
                 continue
             cooked_button_seen = True
+            self._cooked_left_button_events = (
+                getattr(self, "_cooked_left_button_events", 0) + 1
+            )
             layout = self._last_layout
             action = (
                 panel_action_at(
@@ -7016,6 +7200,7 @@ class X11CalibrationOverlay:
                 if layout is not None
                 else None
             )
+            self._last_cooked_action = action
             if getattr(
                 self,
                 "_last_startup_loading_model",
@@ -7074,7 +7259,7 @@ class X11CalibrationOverlay:
                         emitted += 1
                     continue
                 release_matches_press = bool(
-                    action == pressed and pressed_window == int(button.window)
+                    action == pressed
                 )
                 recovered_pause_release = bool(
                     pressed == "runtime_pause"
@@ -7323,9 +7508,15 @@ class X11CalibrationOverlay:
                 ):
                     publisher.publish(action)
                     emitted += 1
-        self._queue_polled_left_transition(
+        polled_emitted = self._queue_polled_left_transition(
+            publisher,
             cooked_button_seen=cooked_button_seen
         )
+        if polled_emitted:
+            self._polled_left_emitted_intents = (
+                getattr(self, "_polled_left_emitted_intents", 0) + polled_emitted
+            )
+        emitted += polled_emitted
         return emitted
 
     def show(
@@ -7539,6 +7730,9 @@ class X11CalibrationOverlay:
         self._pressed_window = None
         self._pressed_runtime_pause_target = None
         self._pressed_runtime_pause_epoch = None
+        self._polled_pressed_action = None
+        self._polled_pressed_runtime_pause_target = None
+        self._polled_pressed_runtime_pause_epoch = None
         self._font_slider_dragging = False
         self._pending_font_slider_action = None
         self._pending_font_slider_size = None
@@ -7703,6 +7897,7 @@ def main() -> int:
             },
         )
         interval = 1.0 / args.poll_hz
+        last_status_update_s = time.monotonic()
         while running:
             if os.getppid() != args.expected_parent_pid:
                 exit_reason = "parent_exit"
@@ -7725,6 +7920,21 @@ def main() -> int:
                 overlay.hide(action_publisher)
                 assert action_publisher is not None
                 overlay.drain_pointer_actions(action_publisher)
+            now_s = time.monotonic()
+            if now_s - last_status_update_s >= 0.5:
+                font_diagnostics = overlay.font_diagnostics
+                x11_diagnostics = overlay.x11_diagnostics
+                atomic_json(
+                    args.status_file,
+                    {
+                        "ready": True,
+                        "pid": os.getpid(),
+                        "expected_ue_pid": args.expected_ue_pid,
+                        "fonts": font_diagnostics,
+                        "x11": x11_diagnostics,
+                    },
+                )
+                last_status_update_s = now_s
             time.sleep(interval)
     except Exception as exc:
         return_code = 1

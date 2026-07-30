@@ -97,6 +97,7 @@ from matrix_moon_dynamic_ground import (
     MoonDynamicGroundError,
 )
 from matrix_policy_slots import (
+    BFM_TEACHER50K_DISPLAY_NAME,
     BFM_TEACHER50K_POLICY_ID,
     PolicyCandidateState,
     evaluate_policy_candidate,
@@ -124,8 +125,9 @@ from matrix_world_state import (
 _GAME_INTERNAL_RESTART_EXIT_CODE = 75
 _GAME_RESUME_ROLLBACK_EXIT_CODE = 76
 _GAME_INTERNAL_RESTART_REASONS = frozenset(
-    {"game_fall_respawn", "game_teleport"}
+    {"game_fall_respawn", "game_teleport", "policy_boundary_switch"}
 )
+_BOUNDARY_LOCOMOTION_POLICY_IDS = ("sonic", BFM_TEACHER50K_POLICY_ID)
 _GAME_TURN_COMMAND_REASONS = frozenset(
     {
         "aligning_heading",
@@ -133,6 +135,90 @@ _GAME_TURN_COMMAND_REASONS = frozenset(
         "recovery_heading_slew_limited",
     }
 )
+
+
+def _boundary_locomotion_policy_name(policy_id: str) -> str:
+    if policy_id == BFM_TEACHER50K_POLICY_ID:
+        return BFM_TEACHER50K_DISPLAY_NAME
+    if policy_id == "sonic":
+        return "SONIC"
+    return policy_id
+
+
+def _boundary_locomotion_strategy_loadout(
+    current_policy_id: str,
+    *,
+    pending: dict[str, object] | None = None,
+    base_loadout: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Expose locomotion policy switching as a paused-boundary restart slot.
+
+    Direct BFM deliberately disables resident policy slots so the stable
+    MoonWorld path has exactly one LowCmd writer.  The UI still needs a
+    locomotion slot, but assigning it must request a whole-runtime restart
+    rather than hot-swapping writer authority inside the process.
+    """
+
+    candidates = [
+        {
+            "policy_id": policy_id,
+            "name": _boundary_locomotion_policy_name(policy_id),
+            "resident": False,
+            "available": True,
+            "provenance_verified": True,
+            "unavailable_reason": None,
+            "switch_mode": "paused_boundary_restart",
+        }
+        for policy_id in _BOUNDARY_LOCOMOTION_POLICY_IDS
+    ]
+    recovery_slot = {
+        "slot": "recovery",
+        "selected_policy_id": "off",
+        "locked": True,
+        "candidates": [],
+    }
+    resident_models: list[dict[str, object]] = [
+        {
+            "policy_id": item["policy_id"],
+            "name": item["name"],
+            "resident": item["resident"],
+            "available": item["available"],
+            "unavailable_reason": item["unavailable_reason"],
+        }
+        for item in candidates
+    ]
+    if isinstance(base_loadout, dict):
+        for slot in base_loadout.get("slots", []):
+            if isinstance(slot, dict) and slot.get("slot") == "recovery":
+                recovery_slot = dict(slot)
+                break
+        for model in base_loadout.get("resident_models", []):
+            if not isinstance(model, dict):
+                continue
+            policy_id = model.get("policy_id")
+            if policy_id in _BOUNDARY_LOCOMOTION_POLICY_IDS:
+                continue
+            resident_models.append(dict(model))
+    return {
+        "version": 1,
+        "available": True,
+        "status": "switching" if pending is not None else "ready",
+        "active_slot": "locomotion",
+        "pending": pending,
+        "slots": [
+            {
+                "slot": "locomotion",
+                "selected_policy_id": current_policy_id,
+                "locked": False,
+                "candidates": candidates,
+                "switch_mode": "paused_boundary_restart",
+            },
+            recovery_slot,
+        ],
+        "resident_models": resident_models,
+    }
+
+
 _GAME_SIGNAL_BOUNDARY_EXIT_CODES = frozenset(
     {_GAME_INTERNAL_RESTART_EXIT_CODE, _GAME_RESUME_ROLLBACK_EXIT_CODE}
 )
@@ -5557,6 +5643,7 @@ class GameCommandRuntime:
         pose_clearance_auditor: Callable[[WorldPose], dict[str, object]] | None = None,
         teleport_routes: Mapping[str, TeleportRoute] | None = None,
         runtime_pause: _RuntimePauseState | None = None,
+        initial_locomotion_policy: str = "sonic",
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -5571,8 +5658,16 @@ class GameCommandRuntime:
         self.response_errors = 0
         self.restart_requested = False
         self.quit_requested = False
+        self.policy_boundary_switch_requested = False
+        self.policy_boundary_switch_target: str | None = None
+        self.policy_boundary_switch_transition_id: str | None = None
         self.last_response: dict[str, object] | None = None
         self.policy_slots = policy_slots
+        self.current_locomotion_policy_id = str(
+            initial_locomotion_policy or "sonic"
+        ).strip().lower()
+        if self.current_locomotion_policy_id not in _BOUNDARY_LOCOMOTION_POLICY_IDS:
+            self.current_locomotion_policy_id = "sonic"
         self.creative_inventory = creative_inventory
         self.creative_inventory_status = (
             dict(creative_inventory_status)
@@ -5643,6 +5738,7 @@ class GameCommandRuntime:
                         "slot",
                         "selected_policy_id",
                         "locked",
+                        "switch_mode",
                     )
                     if key in raw_slot
                 }
@@ -5661,6 +5757,7 @@ class GameCommandRuntime:
                                     "resident",
                                     "available",
                                     "unavailable_reason",
+                                    "switch_mode",
                                 )
                                 if key in raw_candidate
                             }
@@ -5697,6 +5794,37 @@ class GameCommandRuntime:
         loadout: dict[str, object],
     ) -> dict[str, object]:
         return {"strategy_loadout": cls._command_strategy_loadout(loadout)}
+
+    def _policy_slots_loadout(self) -> dict[str, object] | None:
+        if self.policy_slots is None:
+            return None
+        return self.policy_slots.strategy_loadout_mapping()
+
+    def _boundary_locomotion_pending(self) -> dict[str, object] | None:
+        if not self.policy_boundary_switch_requested:
+            return None
+        return {
+            "slot": "locomotion",
+            "policy_id": self.policy_boundary_switch_target,
+            "transition_id": self.policy_boundary_switch_transition_id,
+            "phase": "policy_boundary_switch",
+        }
+
+    def _boundary_locomotion_loadout(self) -> dict[str, object]:
+        return _boundary_locomotion_strategy_loadout(
+            self.current_locomotion_policy_id,
+            pending=self._boundary_locomotion_pending(),
+            base_loadout=self._policy_slots_loadout(),
+        )
+
+    @staticmethod
+    def _is_boundary_locomotion_assignment(
+        command: PolicySlotAssignment,
+    ) -> bool:
+        return (
+            command.slot == "locomotion"
+            and command.policy_id in _BOUNDARY_LOCOMOTION_POLICY_IDS
+        )
 
     def _send(self, response: GameCommandResponse) -> None:
         payload = encode_command_response(response)
@@ -5951,38 +6079,37 @@ class GameCommandRuntime:
                     (DataModifyNumber, MovementModeSet, PolicySlotQuery),
                 )
             ):
-                self.rejected_commands += 1
-                self._send(
-                    self._response(
-                        request,
-                        ok=False,
-                        code="E_RUNTIME_PAUSED",
-                        message="Continue the simulation before changing the world",
-                        data={"runtime_pause": self.runtime_pause.telemetry()},
-                    )
-                )
-                continue
-            if isinstance(request.command, PolicySlotQuery):
-                if self.policy_slots is None:
+                if (
+                    isinstance(request.command, PolicySlotAssignment)
+                    and self._is_boundary_locomotion_assignment(request.command)
+                ):
+                    pass
+                else:
                     self.rejected_commands += 1
                     self._send(
                         self._response(
                             request,
                             ok=False,
-                            code="E_POLICY_UNAVAILABLE",
-                            message="Resident policy slots are unavailable for this run",
+                            code="E_RUNTIME_PAUSED",
+                            message="Continue the simulation before changing the world",
+                            data={"runtime_pause": self.runtime_pause.telemetry()},
                         )
                     )
                     continue
+            if isinstance(request.command, PolicySlotQuery):
                 self.commands_executed += 1
                 self._send(
                     self._response(
                         request,
                         ok=True,
                         code="OK_POLICY_SLOT_STATUS",
-                        message="Resident policy loadout refreshed",
+                        message=(
+                            "Paused-boundary locomotion policy loadout refreshed"
+                            if self.policy_slots is None
+                            else "Resident policy loadout refreshed"
+                        ),
                         data=self._policy_response_data(
-                            self.policy_slots.strategy_loadout_mapping()
+                            self._boundary_locomotion_loadout()
                         ),
                     )
                 )
@@ -6078,6 +6205,60 @@ class GameCommandRuntime:
                 )
                 continue
             if isinstance(request.command, PolicySlotAssignment):
+                if self._is_boundary_locomotion_assignment(request.command):
+                    target_policy = request.command.policy_id
+                    self.commands_executed += 1
+                    if target_policy == self.current_locomotion_policy_id:
+                        self._send(
+                            self._response(
+                                request,
+                                ok=True,
+                                code="OK_POLICY_SLOT_ASSIGNED",
+                                message=f"{target_policy} is already active",
+                                data=self._policy_response_data(
+                                    self._boundary_locomotion_loadout()
+                                ),
+                            )
+                        )
+                        continue
+                    self.policy_changes_executed += 1
+                    self.policy_boundary_switch_requested = True
+                    self.policy_boundary_switch_target = target_policy
+                    self.policy_boundary_switch_transition_id = request.request_id
+                    self.restart_requested = True
+                    self._send(
+                        self._response(
+                            request,
+                            ok=True,
+                            code="OK_POLICY_SLOT_ASSIGNED",
+                            message=(
+                                f"Switching locomotion to {target_policy} at "
+                                "the paused boundary; restarting Matrix runtime"
+                            ),
+                            restart_required=True,
+                            data=self._policy_response_data(
+                                self._boundary_locomotion_loadout()
+                            ),
+                        )
+                    )
+                    return True
+                if request.command.slot == "locomotion":
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_POLICY_NOT_REGISTERED",
+                            message=(
+                                "Locomotion boundary switch supports only sonic "
+                                f"or {BFM_TEACHER50K_POLICY_ID}"
+                            ),
+                            data=self._policy_response_data(
+                                self._boundary_locomotion_loadout()
+                            ),
+                        )
+                    )
+                    continue
                 if self.policy_slots is None:
                     self.rejected_commands += 1
                     self._send(
@@ -6377,26 +6558,24 @@ class GameCommandRuntime:
                 if self.motion_settings is not None
                 else None
             ),
-            "policy_change_pending": self.pending_policy_request is not None,
+            "policy_change_pending": (
+                self.pending_policy_request is not None
+                or self.policy_boundary_switch_requested
+            ),
             "strategy_loadout": (
                 self._command_strategy_loadout(
-                    self.policy_slots.strategy_loadout_mapping()
+                    self._boundary_locomotion_loadout()
                 )
-                if self.policy_slots is not None
-                else {
-                    "version": 1,
-                    "available": False,
-                    "status": "unavailable",
-                    "active_slot": "locomotion",
-                    "pending": None,
-                    "slots": [],
-                    "resident_models": [],
-                }
             ),
             "protocol_errors": self.protocol_errors,
             "rejected_commands": self.rejected_commands,
             "response_errors": self.response_errors,
             "restart_requested": self.restart_requested,
+            "policy_boundary_switch_requested": (
+                self.policy_boundary_switch_requested
+            ),
+            "policy_boundary_switch_target": self.policy_boundary_switch_target,
+            "current_locomotion_policy_id": self.current_locomotion_policy_id,
             "last_response": self.last_response,
         }
 
@@ -10373,10 +10552,12 @@ class _PhysicalRecoveryCoordinator:
                 "available": True,
                 "provenance_verified": True,
                 "unavailable_reason": None,
+                "switch_mode": "paused_boundary_restart",
             },
             *[
                 {
                     **candidate.to_mapping(),
+                    "switch_mode": "paused_boundary_restart",
                     "resident": bool(
                         candidate.provenance_verified
                         and bfm_control is not None
@@ -10432,6 +10613,7 @@ class _PhysicalRecoveryCoordinator:
                         and candidate.get("policy_id") != "sonic"
                         for candidate in locomotion_candidates
                     ),
+                    "switch_mode": "paused_boundary_restart",
                     "candidates": locomotion_candidates,
                 },
                 {
@@ -14248,6 +14430,7 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         pose_clearance_auditor=pose_clearance_audit,
                         teleport_routes=celestial_teleport_routes,
                         runtime_pause=runtime_pause,
+                        initial_locomotion_policy=args.initial_locomotion_policy,
                     )
                 try:
                     game_input.open()
@@ -14325,11 +14508,20 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         game_world_id=args.game_world_id,
                         strategy_loadout_json=(
                             json.dumps(
-                                physical_recovery.strategy_loadout_mapping(),
+                                (
+                                    physical_recovery.strategy_loadout_mapping()
+                                    if physical_recovery is not None
+                                    else _boundary_locomotion_strategy_loadout(
+                                        str(args.initial_locomotion_policy)
+                                    )
+                                ),
                                 separators=(",", ":"),
                                 sort_keys=True,
                             )
-                            if physical_recovery is not None
+                            if (
+                                physical_recovery is not None
+                                or game_command_child_socket is not None
+                            )
                             else None
                         ),
                         creative_inventory_json=(
@@ -14674,12 +14866,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 runtime_pause_busy_reason=None,
                             )
                             if command_restart:
+                                policy_boundary_switch = bool(
+                                    game_commands.policy_boundary_switch_requested
+                                )
                                 game_command = game_input.emergency_stop(
                                     now_s=time.perf_counter(),
                                     reason=(
                                         "game_quit"
                                         if game_commands.quit_requested
-                                        else "teleport_reload"
+                                        else (
+                                            "policy_boundary_switch"
+                                            if policy_boundary_switch
+                                            else "teleport_reload"
+                                        )
                                     ),
                                 )
                                 game_input.record_published_command(game_command)
@@ -14687,7 +14886,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 termination_reason = (
                                     "game_quit"
                                     if game_commands.quit_requested
-                                    else "game_teleport"
+                                    else (
+                                        "policy_boundary_switch"
+                                        if policy_boundary_switch
+                                        else "game_teleport"
+                                    )
                                 )
                         direct_game_command = game_command
                         walking = (
@@ -15099,12 +15302,19 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             )
                         else:
                             if command_restart:
+                                policy_boundary_switch = bool(
+                                    game_commands.policy_boundary_switch_requested
+                                )
                                 game_command = game_input.emergency_stop(
                                     now_s=time.perf_counter(),
                                     reason=(
                                         "game_quit"
                                         if game_commands.quit_requested
-                                        else "teleport_reload"
+                                        else (
+                                            "policy_boundary_switch"
+                                            if policy_boundary_switch
+                                            else "teleport_reload"
+                                        )
                                     ),
                                 )
                                 planner.send_game_command(game_command)
@@ -15113,7 +15323,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 termination_reason = (
                                     "game_quit"
                                     if game_commands.quit_requested
-                                    else "game_teleport"
+                                    else (
+                                        "policy_boundary_switch"
+                                        if policy_boundary_switch
+                                        else "game_teleport"
+                                    )
                                 )
                 else:
                     planner.send_velocity(
@@ -16002,6 +16216,17 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 if type(target_scene_id) is int:
                     internal_restart_status["target_scene_id"] = target_scene_id
                     internal_restart_status["launch_route"] = dict(launch_route)
+        if (
+            internal_restart_requested
+            and termination_reason == "policy_boundary_switch"
+        ):
+            target_policy = (
+                game_commands.policy_boundary_switch_target
+                if game_commands is not None
+                else None
+            )
+            if target_policy in _BOUNDARY_LOCOMOTION_POLICY_IDS:
+                internal_restart_status["target_locomotion_policy"] = target_policy
         final_status["internal_restart"] = internal_restart_status
         final_status["game_auto_respawn"] = bool(args.game_auto_respawn)
         if game_world is not None:
