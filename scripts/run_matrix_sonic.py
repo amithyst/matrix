@@ -1020,7 +1020,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--game-auto-respawn",
         action="store_true",
-        help="On fall, save an upright resume pose and request a cold full-runtime reload",
+        help=(
+            "On fall, request a cold full-runtime reload; save a resume pose "
+            "only after checkpoint writes are armed"
+        ),
     )
     parser.add_argument(
         "--pico-python",
@@ -4136,7 +4139,7 @@ def _handle_game_auto_respawn_fall(
     now_s: float,
     ground_height_m: float = 0.0,
 ) -> tuple[str, RobotMotionCommand]:
-    """Stop every fall, but persist/reload only after writes are armed."""
+    """Stop every fall, but do not persist a fall pose while writes are blocked."""
 
     game_command = game_input.emergency_stop(
         now_s=now_s,
@@ -4147,7 +4150,7 @@ def _handle_game_auto_respawn_fall(
     else:
         game_input.record_published_command(game_command)
     if checkpoint_writes_blocked:
-        return "fall_detected", game_command
+        return "game_fall_respawn", game_command
     saved = game_world.checkpoint(
         snapshot,
         now_s=now_s,
@@ -16036,8 +16039,8 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                             )
                         else:
                             print(
-                                "matrix-sonic-runtime fall detected; saved an "
-                                "upright cold-respawn checkpoint",
+                                "matrix-sonic-runtime fall detected; requesting "
+                                "auto-respawn reload",
                                 flush=True,
                             )
                         break
