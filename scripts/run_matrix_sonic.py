@@ -10139,6 +10139,8 @@ class _DirectBfmRuntime:
         self.reference_alignment_wall_s: float | None = None
         self.activation_requested = False
         self.first_write_wall_s: float | None = None
+        self.fall_tp_respawn_count = 0
+        self.last_fall_tp_respawn: dict[str, object] | None = None
 
     def validate(self) -> None:
         if (
@@ -10394,6 +10396,105 @@ class _DirectBfmRuntime:
             self.first_write_wall_s = time.perf_counter()
         return self.control.current_first_write
 
+    def _wait_for_control_state(
+        self,
+        predicate: Callable[[], bool],
+        *,
+        timeout_s: float,
+        label: str,
+    ) -> None:
+        deadline = time.perf_counter() + float(timeout_s)
+        while True:
+            self.poll()
+            if predicate():
+                return
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(f"direct BFM timed out waiting for {label}")
+            time.sleep(0.005)
+
+    def pause_for_fall_tp_respawn(self, *, timeout_s: float = 1.0) -> None:
+        """Fence the resident direct-start writer before a same-process TP reset."""
+
+        if self.control.current_first_write:
+            self.control.pause()
+        self._wait_for_control_state(
+            lambda: (
+                self.control.ready
+                and self.control.warmed
+                and self.control.paused
+                and not self.control.pause_pending
+                and not self.control.activation_pending
+            ),
+            timeout_s=timeout_s,
+            label="writer-fenced fall TP respawn standby",
+        )
+
+    def write_reference_pose_for_fall_tp_respawn(
+        self,
+        pose: WorldPose,
+        *,
+        snapshot: Any,
+    ) -> None:
+        """Teleport MuJoCo to the BFM canonical upright state at ``pose``.
+
+        This preserves BFM's known-good joint/reference state while replacing
+        only the semantic world root pose.  It deliberately avoids mixing the
+        fallen frame's root height or orientation into the next policy epoch.
+        """
+
+        if not isinstance(pose, WorldPose):
+            raise RuntimeError("fall TP respawn requires a resolved WorldPose")
+        qpos = self.control.direct_initial_qpos
+        qvel = self.control.direct_initial_qvel
+        profiles = self.physics_profiles
+        if qpos is None or qvel is None or profiles is None:
+            raise RuntimeError("direct BFM reference is not ready for fall TP respawn")
+        profiles.apply(_LocomotionPhysicsProfiles.BFM_PROFILE_ID)
+        data = profiles.data
+        if len(data.qpos) < len(qpos) or len(data.qvel) < len(qvel):
+            raise RuntimeError("live MuJoCo state is smaller than direct BFM reference")
+        respawn_qpos = list(qpos)
+        respawn_qvel = list(qvel)
+        half_yaw = 0.5 * float(pose.yaw_rad)
+        respawn_qpos[0] = float(pose.x)
+        respawn_qpos[1] = float(pose.y)
+        respawn_qpos[2] = float(pose.z)
+        respawn_qpos[3] = math.cos(half_yaw)
+        respawn_qpos[4] = 0.0
+        respawn_qpos[5] = 0.0
+        respawn_qpos[6] = math.sin(half_yaw)
+        for index, value in enumerate(respawn_qpos):
+            data.qpos[index] = value
+        for index, value in enumerate(respawn_qvel):
+            data.qvel[index] = value
+        profiles.mujoco.mj_forward(profiles.model, data)
+        profiles.verify_active()
+        if not all(math.isfinite(float(value)) for value in data.qpos[: len(qpos)]):
+            raise RuntimeError("fall TP respawn wrote a non-finite qpos")
+        if not all(math.isfinite(float(value)) for value in data.qvel[: len(qvel)]):
+            raise RuntimeError("fall TP respawn wrote a non-finite qvel")
+        self.reference_aligned = True
+        self.reference_alignment_step_index = int(snapshot.step_index)
+        self.reference_alignment_wall_s = time.perf_counter()
+        self.activation_requested = False
+
+    def activate_after_fall_tp_respawn(
+        self,
+        *,
+        timeout_s: float = 1.0,
+    ) -> None:
+        """Re-authorize direct BFM and wait until the first post-TP write lands."""
+
+        self.first_write_wall_s = None
+        self.activate()
+        self._wait_for_control_state(
+            lambda: self.control.current_first_write,
+            timeout_s=timeout_s,
+            label="post-fall TP respawn first write",
+        )
+        self.first_write_wall_s = time.perf_counter()
+        self.fall_tp_respawn_count += 1
+
     def telemetry(self) -> dict[str, object]:
         return {
             "enabled": True,
@@ -10408,6 +10509,8 @@ class _DirectBfmRuntime:
             "reference_alignment_step_index": self.reference_alignment_step_index,
             "activation_requested": self.activation_requested,
             "first_write": self.control.current_first_write,
+            "fall_tp_respawn_count": self.fall_tp_respawn_count,
+            "last_fall_tp_respawn": self.last_fall_tp_respawn,
             "writer_gate": self.control.telemetry(),
             "physics_profile": (
                 self.physics_profiles.telemetry()
@@ -16091,6 +16194,92 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                                 flush=True,
                             )
                             break
+                        if direct_bfm is not None:
+                            try:
+                                resolved_respawn = game_world.state.resolve_start()
+                                if resolved_respawn.pose is None:
+                                    raise WorldStateError(
+                                        "fall TP respawn has no resolved world pose"
+                                    )
+                                direct_bfm.pause_for_fall_tp_respawn()
+                                direct_bfm.write_reference_pose_for_fall_tp_respawn(
+                                    resolved_respawn.pose,
+                                    snapshot=snapshot,
+                                )
+                                environment = getattr(simulator, "sim_env", None)
+                                for fall_attr in ("fall", "fall_detected"):
+                                    if hasattr(environment, fall_attr):
+                                        setattr(environment, fall_attr, False)
+                                if moon_dynamic_ground is not None:
+                                    moon_dynamic_ground.update_mocap(
+                                        simulator.sim_env.mj_data
+                                    )
+                                snapshot = simulator.get_state_snapshot()
+                                respawn_step_error = _snapshot_validation_error(
+                                    snapshot,
+                                    expected_dims=expected_snapshot_dims,
+                                )
+                                if respawn_step_error is not None:
+                                    raise RuntimeError(
+                                        "invalid fall TP respawn snapshot: "
+                                        f"{respawn_step_error}"
+                                    )
+                                snapshot_ground_height_m = local_ground_height(snapshot)
+                                if bool(snapshot.fall_detected):
+                                    raise RuntimeError(
+                                        "fall TP respawn snapshot is still fallen"
+                                    )
+                                direct_bfm.publish_state(
+                                    snapshot,
+                                    height_map_z=bfm_height_map(snapshot),
+                                    walking=False,
+                                    game_command=game_command,
+                                    turn_command_yaw_limit_rad_s=(
+                                        _bfm_turn_command_yaw_limit_for_game_command(
+                                            game_command,
+                                            configured_limit_rad_s=(
+                                                motion_settings_store.settings.bfm_turn_command_yaw_limit_rad_s
+                                                if motion_settings_store is not None
+                                                else args.bfm_turn_command_yaw_limit_rad_s
+                                            ),
+                                        )
+                                    ),
+                                )
+                                direct_bfm.activate_after_fall_tp_respawn()
+                                game_input.core.invalidate_input(
+                                    "fall_tp_respawn_awaiting_neutral"
+                                )
+                                direct_bfm.last_fall_tp_respawn = {
+                                    "wall_s": fall_wall,
+                                    "source": resolved_respawn.source,
+                                    "checkpoint_id": resolved_respawn.checkpoint_id,
+                                    "generation": resolved_respawn.generation,
+                                    "pose": resolved_respawn.pose.to_mapping(),
+                                }
+                                termination_reason = None
+                                walking = False
+                                next_physics_wall = time.perf_counter() + physics_period_s
+                                print(
+                                    "matrix-sonic-runtime fall detected; "
+                                    "same-process TP respawn complete "
+                                    f"source={resolved_respawn.source} "
+                                    f"checkpoint_id={resolved_respawn.checkpoint_id}",
+                                    flush=True,
+                                )
+                                break
+                            except (
+                                MoonDynamicGroundError,
+                                OSError,
+                                RuntimeError,
+                                TypeError,
+                                ValueError,
+                                WorldStateError,
+                            ) as exc:
+                                print(
+                                    "matrix-sonic-runtime WARNING fall TP respawn "
+                                    f"failed; falling back to auto-respawn reload: {exc}",
+                                    flush=True,
+                                )
                         walking = False
                         running = False
                         if termination_reason == "fall_detected":
@@ -16248,6 +16437,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                 render_count = renderer.packet_count if renderer is not None else 0
                 window_render = render_count - last_render_count
                 window_physics_steps = physics_steps - last_physics_steps
+                current_status_fall_detected = _game_world_current_fall_detected(
+                    snapshot,
+                    game_fall_recovery=game_fall_recovery,
+                    physical_recovery=physical_recovery,
+                )
                 status = {
                     "active_elapsed_s": round(
                         now - active_started_wall, 3
@@ -16277,6 +16471,12 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                     "low_cmd_fresh_timeout_s": args.low_cmd_fresh_timeout_seconds,
                     "low_cmd_received": bool(snapshot.low_cmd_received),
                     "fall_detected": fall_detected,
+                    "current_fall_detected": current_status_fall_detected,
+                    "fall_tp_respawn_count": (
+                        direct_bfm.fall_tp_respawn_count
+                        if direct_bfm is not None
+                        else 0
+                    ),
                     "min_displacement_m": args.min_displacement_m,
                     "min_final_x": args.min_final_x,
                     "min_forward_x_m": args.min_forward_x_m,
@@ -16742,6 +16942,11 @@ def main(*, completion_event: threading.Event | None = None) -> int:
 
         failed_child_name = child_failure[0] if child_failure is not None else None
         failed_child_code = child_failure[1] if child_failure is not None else None
+        current_final_fall_detected = _game_world_current_fall_detected(
+            snapshot,
+            game_fall_recovery=game_fall_recovery,
+            physical_recovery=physical_recovery,
+        )
         final_status = {
             "acceptance_failures": acceptance_failures,
             "active_elapsed_s": round(active_elapsed_s, 3),
@@ -16763,6 +16968,10 @@ def main(*, completion_event: threading.Event | None = None) -> int:
             "failed_child_exit_code": failed_child_code,
             "failed_child_name": failed_child_name,
             "fall_detected": fall_detected,
+            "current_fall_detected": current_final_fall_detected,
+            "fall_tp_respawn_count": (
+                direct_bfm.fall_tp_respawn_count if direct_bfm is not None else 0
+            ),
             "final_checkpoint": final_checkpoint_identity,
             "reused_resume_checkpoint": reused_resume_checkpoint_identity,
             "instability_resets": instability_resets,

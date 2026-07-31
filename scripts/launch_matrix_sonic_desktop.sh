@@ -448,6 +448,8 @@ validate_profile "$PROFILE"
 validate_scene "$SCENE_ID"
 if [[ -n "$INITIAL_LOCOMOTION_POLICY" ]]; then
     validate_initial_locomotion_policy "$INITIAL_LOCOMOTION_POLICY"
+elif [[ "$PROFILE" == "trna" && "$SCENE_ID" == "15" ]]; then
+    INITIAL_LOCOMOTION_POLICY="bfm-sonic-teacher50k"
 fi
 command -v tmux >/dev/null 2>&1 || die "tmux is required"
 
