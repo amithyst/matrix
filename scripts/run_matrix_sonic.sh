@@ -370,6 +370,7 @@ if [[ "$SCENE_ID" == "15" \
     fi
     export MATRIX_GAME_CAMERA_YAW_SOURCE="$GAME_CAMERA_YAW_SOURCE"
     export MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER="${MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-raw}"
+    export MATRIX_MOON_DYNAMIC_GROUND_EDGE_MODE="${MATRIX_MOON_DYNAMIC_GROUND_EDGE_MODE:-clamp}"
     MOON_SPAWN_OVERRIDE_COUNT=0
     for value in "${MATRIX_MOON_SPAWN_X:-}" "${MATRIX_MOON_SPAWN_Y:-}" "${MATRIX_MOON_SPAWN_Z:-}" "${MATRIX_MOON_SPAWN_YAW:-}"; do
         [[ -n "$value" ]] && ((MOON_SPAWN_OVERRIDE_COUNT += 1))
@@ -396,7 +397,7 @@ if [[ "$SCENE_ID" == "15" \
     export MATRIX_BFM_REALSCAN_WALK_SPEED_MPS="${MATRIX_BFM_REALSCAN_WALK_SPEED_MPS:-$MATRIX_MOON_BFM_SPEED_CAP}"
     export MATRIX_BFM_REALSCAN_JOG_SPEED_MPS="${MATRIX_BFM_REALSCAN_JOG_SPEED_MPS:-${MATRIX_MOON_BFM_JOG_SPEED:-0.80}}"
     export MATRIX_GAME_MOVEMENT_MODE="${MATRIX_GAME_MOVEMENT_MODE:-body_relative}"
-    echo "[INFO] moon-v1 BFM controls: bfm walk=${MATRIX_BFM_REALSCAN_WALK_SPEED_MPS}m/s jog=${MATRIX_BFM_REALSCAN_JOG_SPEED_MPS}m/s turn=2.40rad/s movement=${MATRIX_GAME_MOVEMENT_MODE} camera_yaw=${GAME_CAMERA_YAW_SOURCE} direct=${MATRIX_BFM_DIRECT}"
+    echo "[INFO] moon-v1 BFM controls: bfm walk=${MATRIX_BFM_REALSCAN_WALK_SPEED_MPS}m/s jog=${MATRIX_BFM_REALSCAN_JOG_SPEED_MPS}m/s turn=2.40rad/s movement=${MATRIX_GAME_MOVEMENT_MODE} camera_yaw=${GAME_CAMERA_YAW_SOURCE} direct=${MATRIX_BFM_DIRECT} moon_edge=${MATRIX_MOON_DYNAMIC_GROUND_EDGE_MODE}"
 fi
 if [[ -n "$CELESTIAL_SPK" || -n "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
     if [[ -z "$CELESTIAL_SPK" || -z "$CELESTIAL_JPLEPHEM_WHEEL" ]]; then
@@ -582,6 +583,8 @@ expected = {
     "quality",
     "camera_smoothing",
     "camera_distance_cm",
+    "camera_distance_min_cm",
+    "camera_distance_max_cm",
 }
 if not isinstance(value, dict) or set(value) != expected:
     raise SystemExit("invalid video-settings helper output")
@@ -593,6 +596,8 @@ fields = (
     value["quality"],
     value["camera_smoothing"],
     value["camera_distance_cm"],
+    value["camera_distance_min_cm"],
+    value["camera_distance_max_cm"],
     value["revision"],
 )
 if any(isinstance(item, bool) for item in fields):
@@ -604,6 +609,8 @@ IFS=$'\t' read -r MATRIX_VIDEO_APPLIED_WIDTH \
     MATRIX_VIDEO_APPLIED_HEIGHT MATRIX_VIDEO_APPLIED_WINDOW_MODE \
     MATRIX_VIDEO_APPLIED_FPS_LIMIT MATRIX_VIDEO_APPLIED_QUALITY \
     MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM \
+    MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_MIN_CM \
+    MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_MAX_CM \
     MATRIX_VIDEO_APPLIED_REVISION \
     <<<"$VIDEO_LAUNCH_FIELDS"
 if [[ "$SCENE_ID" == "15" \
@@ -618,9 +625,13 @@ if [[ "$SCENE_ID" == "15" \
             MATRIX_VIDEO_APPLIED_QUALITY=low
             MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING=medium
             MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM=150
+            MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_MIN_CM=80
+            MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_MAX_CM=500
             MATRIX_VIDEO_APPLIED_REVISION=0
             MATRIX_VIDEO_APPLIED_JSON="$(
                 printf '{"camera_distance_cm":150,'
+                printf '"camera_distance_max_cm":500,'
+                printf '"camera_distance_min_cm":80,'
                 printf '"camera_smoothing":"medium","fps_limit":30,'
                 printf '"quality":"low","resolution":"1280x720",'
                 printf '"resolution_height":720,"resolution_width":1280,'

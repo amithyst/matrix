@@ -933,7 +933,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     video_top = tab_y + tab_height + gap
     video_bottom = apply_y - gap
     video_row_gap = 4 if compact else 8
-    video_rows = max(1, len(_VIDEO_SETTING_PRESETS))
+    video_rows = max(1, len(_VIDEO_SETTING_PRESETS) + 3)
     video_row_height = max(
         24,
         (video_bottom - video_top - (video_rows - 1) * video_row_gap) // video_rows,
@@ -960,6 +960,33 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             video_button_width,
             video_row_height,
         )
+    camera_start = len(_VIDEO_SETTING_PRESETS)
+    for offset, field in enumerate(_VIDEO_CAMERA_DISTANCE_FIELDS):
+        row_y = video_top + (camera_start + offset) * (
+            video_row_height + video_row_gap
+        )
+        stem = f"video_{field}"
+        result[f"{stem}_down"] = (
+            panel_x + margin,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
+        result[f"{stem}_value"] = (
+            panel_x + margin + video_button_width,
+            row_y,
+            max(1, panel_width - 2 * margin - 2 * video_button_width),
+            video_row_height,
+        )
+        result[f"{stem}_up"] = (
+            panel_x + panel_width - margin - video_button_width,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
+    result["video_camera_distance_cm_slider"] = result[
+        "video_camera_distance_cm_value"
+    ]
     return result
 
 
@@ -988,6 +1015,21 @@ def font_size_from_slider(
     span = _MAX_OVERLAY_FONT_SIZE - _MIN_OVERLAY_FONT_SIZE
     step = int(math.floor((offset / usable_width) * span + 0.5))
     return _MIN_OVERLAY_FONT_SIZE + step
+
+
+def camera_distance_from_slider(
+    rectangle: tuple[int, int, int, int],
+    root_x: int,
+    minimum_cm: int,
+    maximum_cm: int,
+) -> int:
+    track_x, _track_y, track_width, _track_height = font_slider_track(rectangle)
+    if maximum_cm <= minimum_cm:
+        return minimum_cm
+    usable_width = max(1, track_width - 1)
+    offset = max(0, min(usable_width, root_x - track_x))
+    span = maximum_cm - minimum_cm
+    return minimum_cm + int(math.floor((offset / usable_width) * span + 0.5))
 
 
 _PANEL_ACTIONS = (
@@ -1091,8 +1133,13 @@ _VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
     "fps_limit": (30, 60, 90, 120),
     "quality": ("low", "medium", "high", "epic"),
     "camera_smoothing": ("off", "low", "medium", "high"),
-    "camera_distance_cm": (100, 150, 200, 250, 300, 400, 500),
 }
+_VIDEO_CAMERA_DISTANCE_FIELDS = (
+    "camera_distance_cm",
+    "camera_distance_min_cm",
+    "camera_distance_max_cm",
+)
+_VIDEO_CAMERA_DISTANCE_RANGE = (80, 500)
 _VIDEO_SETTING_LABELS = {
     "resolution": "分辨率",
     "window_mode": "窗口模式",
@@ -1100,6 +1147,8 @@ _VIDEO_SETTING_LABELS = {
     "quality": "画质档位",
     "camera_smoothing": "相机平滑",
     "camera_distance_cm": "相机距离",
+    "camera_distance_min_cm": "距离下限",
+    "camera_distance_max_cm": "距离上限",
 }
 _VIDEO_VALUE_LABELS = {
     "windowed": "窗口",
@@ -1116,6 +1165,13 @@ _VIDEO_STEP_ACTION_DETAILS = {
     for field in _VIDEO_SETTING_PRESETS
     for suffix, direction in (("down", -1), ("up", 1))
 }
+_VIDEO_STEP_ACTION_DETAILS.update(
+    {
+        f"video_{field}_{suffix}": (field, direction)
+        for field in ("camera_distance_min_cm", "camera_distance_max_cm")
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
 _VIDEO_STEP_ACTIONS = tuple(_VIDEO_STEP_ACTION_DETAILS)
 
 _PANEL_TABS = (
@@ -1127,7 +1183,7 @@ _PANEL_TABS = (
     "tab_video",
     "tab_system",
 )
-_OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
+_OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider", "video_camera_distance_cm_slider")
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
     f"locomotion_policy_{index}"
     for index in range(_MAX_LOCOMOTION_POLICY_BUTTONS)
@@ -1216,6 +1272,7 @@ def panel_action_at(
         targets = (
             _PANEL_TABS
             + ("runtime_pause", "quit_game", "apply_return")
+            + ("video_camera_distance_cm_slider",)
             + _VIDEO_STEP_ACTIONS
         )
     elif page == "system":
@@ -2652,8 +2709,26 @@ class VideoSettingsPanelModel:
         if detail is None or not self.available or self.error is not None:
             return None
         field, direction = detail
-        presets = _VIDEO_SETTING_PRESETS[field]
         current = self.value(field)
+        if field in {"camera_distance_min_cm", "camera_distance_max_cm"}:
+            if not isinstance(current, int):
+                return None
+            lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
+            target = max(lower, min(upper, current + 10 * direction))
+            values = dict(self.next_launch)
+            values[field] = target
+            distance = values["camera_distance_cm"]
+            minimum = values["camera_distance_min_cm"]
+            maximum = values["camera_distance_max_cm"]
+            if not (
+                isinstance(distance, int)
+                and isinstance(minimum, int)
+                and isinstance(maximum, int)
+                and minimum <= distance <= maximum
+            ):
+                return None
+            return target if target != current else None
+        presets = _VIDEO_SETTING_PRESETS[field]
         try:
             index = presets.index(current)
         except ValueError:
@@ -2661,9 +2736,23 @@ class VideoSettingsPanelModel:
         target = index + direction
         return presets[target] if 0 <= target < len(presets) else None
 
+    def camera_distance_value_from_slider(
+        self,
+        rectangle: tuple[int, int, int, int],
+        root_x: int,
+    ) -> int | None:
+        if not self.available or self.error is not None:
+            return None
+        minimum = self.value("camera_distance_min_cm")
+        maximum = self.value("camera_distance_max_cm")
+        if not isinstance(minimum, int) or not isinstance(maximum, int):
+            return None
+        return camera_distance_from_slider(rectangle, root_x, minimum, maximum)
+
 
 def _canonical_video_settings_mapping(value: object) -> dict[str, object] | None:
-    if not isinstance(value, dict) or set(value) != set(_VIDEO_SETTING_PRESETS):
+    expected_fields = set(_VIDEO_SETTING_PRESETS) | set(_VIDEO_CAMERA_DISTANCE_FIELDS)
+    if not isinstance(value, dict) or set(value) != expected_fields:
         return None
     result: dict[str, object] = {}
     for field, presets in _VIDEO_SETTING_PRESETS.items():
@@ -2671,6 +2760,22 @@ def _canonical_video_settings_mapping(value: object) -> dict[str, object] | None
         if candidate not in presets or type(candidate) is not type(presets[0]):
             return None
         result[field] = candidate
+    lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
+    for field in _VIDEO_CAMERA_DISTANCE_FIELDS:
+        candidate = value.get(field)
+        if isinstance(candidate, bool) or not isinstance(candidate, int):
+            return None
+        if not lower <= candidate <= upper:
+            return None
+        result[field] = candidate
+    if result["camera_distance_min_cm"] > result["camera_distance_max_cm"]:
+        return None
+    if not (
+        result["camera_distance_min_cm"]
+        <= result["camera_distance_cm"]
+        <= result["camera_distance_max_cm"]
+    ):
+        return None
     return result
 
 
@@ -2697,6 +2802,13 @@ def video_settings_panel_model(state: dict[str, object]) -> VideoSettingsPanelMo
         current = {
             field: presets[0] for field, presets in _VIDEO_SETTING_PRESETS.items()
         }
+        current.update(
+            {
+                "camera_distance_cm": 150,
+                "camera_distance_min_cm": 80,
+                "camera_distance_max_cm": 500,
+            }
+        )
     if next_launch is None:
         next_launch = dict(current)
     return VideoSettingsPanelModel(
@@ -3672,10 +3784,22 @@ class PointerActionPublisher:
         expected_revision: int,
     ) -> None:
         presets = _VIDEO_SETTING_PRESETS.get(field)
+        camera_distance_field = field in _VIDEO_CAMERA_DISTANCE_FIELDS
+        lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
         if (
-            presets is None
-            or value not in presets
-            or type(value) is not type(presets[0])
+            (
+                presets is None
+                and not (
+                    camera_distance_field
+                    and not isinstance(value, bool)
+                    and isinstance(value, int)
+                    and lower <= value <= upper
+                )
+            )
+            or (
+                presets is not None
+                and (value not in presets or type(value) is not type(presets[0]))
+            )
             or type(expected_revision) is not int
             or not 0 <= expected_revision < 2**63
         ):
@@ -3854,6 +3978,8 @@ class X11CalibrationOverlay:
         self._font_slider_dragging = False
         self._pending_font_slider_action: str | None = None
         self._pending_font_slider_size: int | None = None
+        self._camera_distance_slider_dragging = False
+        self._pending_camera_distance_cm: int | None = None
         self._colours: dict[str, int] = {}
         self._startup_media_frame_dir: str | None = None
         self._startup_media_frame_paths: tuple[Path, ...] = ()
@@ -6429,6 +6555,27 @@ class X11CalibrationOverlay:
                 colour=self._colours["white" if model.available else "muted"],
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
+        for field in ("camera_distance_min_cm", "camera_distance_max_cm"):
+            stem = f"video_{field}"
+            current = model.value(field)
+            for suffix, direction in (("down", -1), ("up", 1)):
+                target = model.stepped_value(f"{stem}_{suffix}")
+                enabled = bool(model.available and model.error is None and target is not None)
+                self._draw_button(
+                    layout,
+                    f"{stem}_{suffix}",
+                    "‹" if direction < 0 else "›",
+                    fill=self._colours["button" if enabled else "disabled"],
+                    disabled=not enabled,
+                )
+            self._draw_text(
+                f"{_VIDEO_SETTING_LABELS[field]}  ·  {current} cm",
+                x=0,
+                y=0,
+                colour=self._colours["white" if model.available else "muted"],
+                centred_in=self._panel_rectangle(layout, f"{stem}_value"),
+            )
+        self._draw_camera_distance_slider(layout, model)
         first_row = self._panel_rectangle(layout, "video_resolution_value")
         status = (
             f"保存失败：{model.error}"
@@ -6448,6 +6595,94 @@ class X11CalibrationOverlay:
                 if model.error is not None
                 else ("pending" if model.pending_restart else "muted")
             ],
+        )
+
+    def _draw_camera_distance_slider(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: VideoSettingsPanelModel,
+    ) -> None:
+        rectangle = self._panel_rectangle(layout, "video_camera_distance_cm_slider")
+        x, y, width, height = rectangle
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        enabled = bool(model.available and model.error is None)
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["button" if enabled else "disabled"],
+        )
+        self._x11.XFillRectangle(self._display, panel, gc, x, y, width, height)
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
+        )
+        distance = model.value("camera_distance_cm")
+        minimum = model.value("camera_distance_min_cm")
+        maximum = model.value("camera_distance_max_cm")
+        panel_x, panel_y, _panel_width, _panel_height = layout["panel"]
+        track_root = font_slider_track(rectangle)
+        track_x = track_root[0] - panel_x
+        track_y = track_root[1] - panel_y
+        track_width = track_root[2]
+        track_height = track_root[3]
+        self._x11.XSetForeground(self._display, gc, self._colours["muted"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            track_x,
+            track_y,
+            track_width,
+            track_height,
+        )
+        fraction = 0.0
+        if (
+            isinstance(distance, int)
+            and isinstance(minimum, int)
+            and isinstance(maximum, int)
+            and maximum > minimum
+        ):
+            fraction = (distance - minimum) / (maximum - minimum)
+        knob_x = track_x + int(round(max(0, track_width - 1) * fraction))
+        if enabled:
+            self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                track_x,
+                track_y,
+                max(1, knob_x - track_x + 1),
+                track_height,
+            )
+        knob_width = 9
+        knob_height = max(10, height - 10)
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["white" if enabled else "disabled"],
+        )
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            knob_x - knob_width // 2,
+            y + (height - knob_height) // 2,
+            knob_width,
+            knob_height,
+        )
+        self._draw_text(
+            f"相机距离 {distance} cm",
+            x=x + 8,
+            y=y + height // 2 + 6,
+            colour=self._colours["white" if enabled else "muted"],
         )
 
     @staticmethod
@@ -7458,6 +7693,27 @@ class X11CalibrationOverlay:
         self._pending_font_slider_size = target_size
         return True
 
+    def _set_camera_distance_from_root_x(self, root_x: int) -> bool:
+        layout = self._last_layout
+        video_model = getattr(self, "_last_video_model", None)
+        if (
+            layout is None
+            or getattr(self, "_active_page", "loadout") != "video"
+            or video_model is None
+        ):
+            return False
+        target = video_model.camera_distance_value_from_slider(
+            layout["video_camera_distance_cm_slider"],
+            root_x,
+        )
+        if target is None or target == video_model.value("camera_distance_cm"):
+            self._pending_camera_distance_cm = None
+            return False
+        if target == getattr(self, "_pending_camera_distance_cm", None):
+            return False
+        self._pending_camera_distance_cm = target
+        return True
+
     def drain_pointer_actions(self, publisher: PointerActionPublisher) -> int:
         """Drain bounded keyboard intents and completed left-button clicks."""
 
@@ -7476,6 +7732,8 @@ class X11CalibrationOverlay:
             if event_type == _MOTION_NOTIFY:
                 if self._font_slider_dragging and self._visible:
                     self._set_font_size_from_root_x(event.xmotion.x_root)
+                if self._camera_distance_slider_dragging and self._visible:
+                    self._set_camera_distance_from_root_x(event.xmotion.x_root)
                 continue
             if event_type not in {_BUTTON_PRESS, _BUTTON_RELEASE}:
                 continue
@@ -7526,6 +7784,9 @@ class X11CalibrationOverlay:
                     )
                     if self._font_slider_dragging:
                         self._set_font_size_from_root_x(button.x_root)
+                if action == "video_camera_distance_cm_slider":
+                    self._camera_distance_slider_dragging = True
+                    self._set_camera_distance_from_root_x(button.x_root)
             elif event_type == _BUTTON_RELEASE:
                 pressed = self._pressed_action
                 pressed_window = self._pressed_window
@@ -7553,6 +7814,21 @@ class X11CalibrationOverlay:
                         and self._last_panel_model.action_enabled(action)
                     ):
                         publisher.publish(action)
+                        emitted += 1
+                    continue
+                if pressed == "video_camera_distance_cm_slider":
+                    if self._camera_distance_slider_dragging and self._visible:
+                        self._set_camera_distance_from_root_x(button.x_root)
+                    self._camera_distance_slider_dragging = False
+                    distance_cm = getattr(self, "_pending_camera_distance_cm", None)
+                    self._pending_camera_distance_cm = None
+                    video_model = getattr(self, "_last_video_model", None)
+                    if type(distance_cm) is int and video_model is not None:
+                        publisher.publish_video_setting(
+                            "camera_distance_cm",
+                            distance_cm,
+                            expected_revision=video_model.revision,
+                        )
                         emitted += 1
                     continue
                 release_matches_press = bool(
@@ -8027,6 +8303,8 @@ class X11CalibrationOverlay:
         self._font_slider_dragging = False
         self._pending_font_slider_action = None
         self._pending_font_slider_size = None
+        self._camera_distance_slider_dragging = False
+        self._pending_camera_distance_cm = None
         self._last_rendered_font_size = None
         self._active_page = "loadout"
 

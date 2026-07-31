@@ -271,7 +271,7 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 receiver.close()
                 supervisor._action_socket = None
 
-    def test_video_setting_intent_is_strict_cas_and_next_launch_only(self) -> None:
+    def test_video_setting_intent_is_strict_cas_and_live_camera_distance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "matrix_calibration_overlay.py"
@@ -342,6 +342,32 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 self.assertEqual(reconciled["next_launch"]["fps_limit"], 90)
                 self.assertEqual(reconciled["next_launch"]["quality"], "high")
                 self.assertTrue(reconciled["pending_restart"])
+                camera_packet = {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 2,
+                    "kind": "video_setting",
+                    "field": "camera_distance_cm",
+                    "value": 175,
+                    "expected_revision": 1,
+                }
+                sender.send(json.dumps(camera_packet).encode("ascii"))
+                camera_intents = supervisor.drain_intents()
+                self.assertEqual(camera_intents[0].video_field, "camera_distance_cm")
+                self.assertEqual(camera_intents[0].video_value, 175)
+                self.assertTrue(
+                    controller.apply_intent(
+                        "camera_distance_cm",
+                        175,
+                        expected_revision=1,
+                        active=True,
+                    )
+                )
+                camera_mapping = controller.live_mapping()
+                self.assertEqual(
+                    camera_mapping["next_launch"]["camera_distance_cm"], 175
+                )
+                self.assertTrue(camera_mapping["pending_restart"])
             finally:
                 sender.close()
                 receiver.close()

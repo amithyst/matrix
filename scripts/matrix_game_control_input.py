@@ -67,6 +67,10 @@ from matrix_motion_settings import (
 from matrix_movement_modes import next_movement_mode
 from matrixctl import MatrixEngineInputClient
 from matrix_video_settings import (
+    CAMERA_DISTANCE_CM_RANGE,
+    CAMERA_DISTANCE_CM_FIELD,
+    CAMERA_DISTANCE_MIN_CM_FIELD,
+    CAMERA_DISTANCE_MAX_CM_FIELD,
     VideoSettings,
     VideoSettingsError,
     VideoSettingsPersistenceError,
@@ -115,6 +119,7 @@ from matrix_celestial_visuals import (
     load_visual_catalog,
 )
 from matrix_mc_commands import (
+    CameraDistanceSet,
     CommandParseError,
     CommandProtocolError,
     CreativeSpawnItem,
@@ -1331,6 +1336,19 @@ class VideoSettingsController:
             if key not in {"version", "revision"}
         }
 
+    @staticmethod
+    def _restart_values(settings: VideoSettings) -> dict[str, object]:
+        return {
+            key: value
+            for key, value in VideoSettingsController._values(settings).items()
+            if key
+            not in {
+                "camera_distance_cm",
+                "camera_distance_min_cm",
+                "camera_distance_max_cm",
+            }
+        }
+
     def apply_intent(
         self,
         field: str,
@@ -1372,7 +1390,9 @@ class VideoSettingsController:
         return modification.changed
 
     def pending_restart(self) -> bool:
-        return self._values(self.store.settings) != self._values(self.applied)
+        return self._restart_values(self.store.settings) != self._restart_values(
+            self.applied
+        )
 
     def live_mapping(self) -> dict[str, object]:
         desired = self.store.settings
@@ -1386,7 +1406,7 @@ class VideoSettingsController:
             "load_status": self.store.load_status,
             "persistence_error": self.persistence_error,
             "change_count": self.change_count,
-            "apply_mode": "whole_runtime_restart",
+            "apply_mode": "hybrid_runtime_camera_distance",
         }
 
 
@@ -5231,6 +5251,8 @@ def decode_applied_video_settings(value: str) -> VideoSettings:
             "quality",
             "camera_smoothing",
             "camera_distance_cm",
+            "camera_distance_min_cm",
+            "camera_distance_max_cm",
         }
         if set(raw) != expected:
             raise ValueError("applied video settings have an invalid schema")
@@ -5242,6 +5264,8 @@ def decode_applied_video_settings(value: str) -> VideoSettings:
             quality=raw.get("quality"),
             camera_smoothing=raw.get("camera_smoothing"),
             camera_distance_cm=raw.get("camera_distance_cm"),
+            camera_distance_min_cm=raw.get("camera_distance_min_cm"),
+            camera_distance_max_cm=raw.get("camera_distance_max_cm"),
         )
         if settings.runtime_mapping() != raw:
             raise ValueError("applied video settings runtime fields disagree")
@@ -6433,6 +6457,43 @@ class GameCommandClient:
             pending_message="Ending Matrix game; waiting for runtime shutdown ACK",
         )
 
+    def set_camera_distance(
+        self,
+        distance_cm: object,
+        *,
+        calibration_active: bool,
+        neutral_frame_ready: bool,
+        restart_requested: bool,
+    ) -> bool:
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        if not calibration_active:
+            self._local_error(
+                "E_NOT_PAUSED", "Open the ESC panel before changing camera distance"
+            )
+            return False
+        if not neutral_frame_ready:
+            self._local_error(
+                "E_NEUTRAL_REQUIRED",
+                "Wait for the ESC panel to deliver a neutral frame",
+            )
+            return False
+        if restart_requested:
+            self._local_error(
+                "E_RESTART_PENDING", "A whole-runtime restart is already pending"
+            )
+            return False
+        try:
+            command = CameraDistanceSet(distance_cm=distance_cm)
+        except CommandParseError as exc:
+            self._local_error(exc.code, exc.message)
+            return False
+        return self._send_typed_command(
+            command,
+            warning=None,
+            pending_message="Applying live camera distance",
+        )
+
     def spawn_creative_item(
         self,
         item_id: object,
@@ -7386,14 +7447,31 @@ class CalibrationOverlaySupervisor:
                 ):
                     raise RuntimeError("invalid video-setting intent revision")
                 field = value.get("field")
-                try:
-                    VideoSettings().with_patch({field: value.get("value")})
-                except (TypeError, ValueError, VideoSettingsError) as exc:
-                    raise RuntimeError("invalid video-setting intent value") from exc
+                intent_value = value.get("value")
+                camera_distance_fields = {
+                    CAMERA_DISTANCE_CM_FIELD,
+                    CAMERA_DISTANCE_MIN_CM_FIELD,
+                    CAMERA_DISTANCE_MAX_CM_FIELD,
+                }
+                if field in camera_distance_fields:
+                    lower, upper = CAMERA_DISTANCE_CM_RANGE
+                    if (
+                        isinstance(intent_value, bool)
+                        or not isinstance(intent_value, int)
+                        or not lower <= intent_value <= upper
+                    ):
+                        raise RuntimeError("invalid video-setting intent value")
+                else:
+                    try:
+                        VideoSettings().with_patch({field: intent_value})
+                    except (TypeError, ValueError, VideoSettingsError) as exc:
+                        raise RuntimeError(
+                            "invalid video-setting intent value"
+                        ) from exc
                 intent = OverlayIntent(
                     kind="video_setting",
                     video_field=field,
-                    video_value=value.get("value"),
+                    video_value=intent_value,
                     expected_revision=expected_revision,
                 )
             else:
@@ -8592,22 +8670,31 @@ def main() -> int:
                 if intent.kind == "video_setting":
                     assert intent.video_field is not None
                     assert intent.expected_revision is not None
-                    video_settings_changed = bool(
-                        video_settings.apply_intent(
-                            intent.video_field,
-                            intent.video_value,
-                            expected_revision=intent.expected_revision,
-                            active=(
-                                calibration.active
-                                and not restart_requester.requested
-                                and not game_command_client.editing
-                                and not game_command_client.in_flight
-                                and not game_command_client.restart_required
-                                and not game_command_client.outcome_unknown
-                            ),
-                        )
-                        or video_settings_changed
+                    video_intent_active = bool(
+                        calibration.active
+                        and not restart_requester.requested
+                        and not game_command_client.editing
+                        and not game_command_client.in_flight
+                        and not game_command_client.restart_required
+                        and not game_command_client.outcome_unknown
                     )
+                    changed = video_settings.apply_intent(
+                        intent.video_field,
+                        intent.video_value,
+                        expected_revision=intent.expected_revision,
+                        active=video_intent_active,
+                    )
+                    video_settings_changed = bool(changed or video_settings_changed)
+                    if changed and intent.video_field == "camera_distance_cm":
+                        command_state_changed = bool(
+                            game_command_client.set_camera_distance(
+                                intent.video_value,
+                                calibration_active=calibration.active,
+                                neutral_frame_ready=neutral_frame_ready,
+                                restart_requested=restart_requester.requested,
+                            )
+                            or command_state_changed
+                        )
                     apply_return.cancel_pending()
                     continue
                 assert intent.kind == "command_submit"

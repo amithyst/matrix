@@ -105,6 +105,7 @@ _NONFINITE_NUMBER_TOKENS = frozenset(
         "-infinity",
     }
 )
+CAMERA_DISTANCE_CM_RANGE = (80, 500)
 
 
 class CommandParseError(ValueError):
@@ -430,6 +431,26 @@ class MovementModeSet:
 
 
 @dataclass(frozen=True)
+class CameraDistanceSet:
+    """Set the live native UE spring-arm distance in centimetres."""
+
+    distance_cm: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.distance_cm, bool) or not isinstance(self.distance_cm, int):
+            raise CommandParseError(
+                "E_CAMERA_DISTANCE",
+                "camera distance must be an integer centimetre value",
+            )
+        lower, upper = CAMERA_DISTANCE_CM_RANGE
+        if not lower <= self.distance_cm <= upper:
+            raise CommandParseError(
+                "E_CAMERA_DISTANCE",
+                f"camera distance must be in [{lower}, {upper}] cm",
+            )
+
+
+@dataclass(frozen=True)
 class DataModifyNumber:
     """Set one whitelisted numeric Matrix entity-data path."""
 
@@ -505,6 +526,7 @@ McCommand: TypeAlias = (
     | RuntimePause
     | GameQuit
     | MovementModeSet
+    | CameraDistanceSet
     | DataModifyNumber
     | DataModifyInput
 )
@@ -788,6 +810,11 @@ def parse_mc_command(text: object) -> ParsedCommand:
 
 
 def command_to_mapping(command: McCommand) -> dict[str, object]:
+    if isinstance(command, CameraDistanceSet):
+        return {
+            "name": "camera_distance_set",
+            "distance_cm": command.distance_cm,
+        }
     if isinstance(command, MovementModeSet):
         return {
             "name": "movement_mode_set",
@@ -862,6 +889,13 @@ def command_from_mapping(value: object) -> McCommand:
     if not isinstance(value, dict) or not isinstance(value.get("name"), str):
         raise CommandProtocolError("command AST has an invalid schema")
     name = value["name"]
+    if name == "camera_distance_set":
+        if set(value) != {"name", "distance_cm"}:
+            raise CommandProtocolError("camera distance set has an invalid schema")
+        try:
+            return CameraDistanceSet(distance_cm=value.get("distance_cm"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
     if name == "movement_mode_set":
         if set(value) != {"name", "movement_mode", "expected_revision"}:
             raise CommandProtocolError("movement mode set has an invalid schema")
@@ -1394,6 +1428,8 @@ def execute_command(
 
 
 __all__ = [
+    "CAMERA_DISTANCE_CM_RANGE",
+    "CameraDistanceSet",
     "COMMAND_PROTOCOL",
     "CommandEffect",
     "CommandExecutionError",

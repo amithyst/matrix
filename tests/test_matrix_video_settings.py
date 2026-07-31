@@ -30,7 +30,7 @@ class VideoSettingsValueTest(unittest.TestCase):
         self.assertEqual(
             settings.to_mapping(),
             {
-                "version": 2,
+                "version": 3,
                 "revision": 0,
                 "resolution": "1920x1080",
                 "window_mode": "borderless",
@@ -38,6 +38,8 @@ class VideoSettingsValueTest(unittest.TestCase):
                 "quality": "high",
                 "camera_smoothing": "medium",
                 "camera_distance_cm": 150,
+                "camera_distance_min_cm": 80,
+                "camera_distance_max_cm": 500,
             },
         )
         self.assertEqual(settings.runtime_mapping()["resolution_width"], 1920)
@@ -53,9 +55,18 @@ class VideoSettingsValueTest(unittest.TestCase):
         legacy = dict(valid)
         legacy["version"] = 1
         del legacy["camera_distance_cm"]
+        del legacy["camera_distance_min_cm"]
+        del legacy["camera_distance_max_cm"]
         migrated = MODULE.VideoSettings.from_mapping(legacy)
         self.assertEqual(migrated.revision, 3)
         self.assertEqual(migrated.camera_distance_cm, 150)
+        distance_only = dict(valid)
+        distance_only["version"] = 2
+        del distance_only["camera_distance_min_cm"]
+        del distance_only["camera_distance_max_cm"]
+        migrated_v2 = MODULE.VideoSettings.from_mapping(distance_only)
+        self.assertEqual(migrated_v2.camera_distance_min_cm, 80)
+        self.assertEqual(migrated_v2.camera_distance_max_cm, 500)
         mutations = []
         for key in valid:
             changed = dict(valid)
@@ -64,7 +75,7 @@ class VideoSettingsValueTest(unittest.TestCase):
         mutations.extend(
             (
                 {**valid, "extra": "value"},
-                {**valid, "version": 3},
+                {**valid, "version": 4},
                 {**valid, "version": True},
                 {**valid, "revision": -1},
                 {**valid, "revision": True},
@@ -77,7 +88,7 @@ class VideoSettingsValueTest(unittest.TestCase):
             ):
                 MODULE.VideoSettings.from_mapping(value)
 
-    def test_every_runtime_value_is_a_fixed_preset(self) -> None:
+    def test_runtime_values_are_strict_and_camera_distance_is_bounded(self) -> None:
         cases = (
             {"resolution": "1920x1080;quit"},
             {"resolution": "1x1"},
@@ -87,16 +98,23 @@ class VideoSettingsValueTest(unittest.TestCase):
             {"fps_limit": "60"},
             {"quality": "ultra;open /tmp"},
             {"camera_smoothing": "0;quit"},
-            {"camera_distance_cm": 175},
             {"camera_distance_cm": True},
             {"camera_distance_cm": "150"},
+            {"camera_distance_cm": 79},
+            {"camera_distance_cm": 501},
+            {"camera_distance_min_cm": 151},
+            {"camera_distance_max_cm": 149},
         )
         for values in cases:
             with self.subTest(values=values), self.assertRaises(
                 MODULE.VideoSettingsError
             ) as caught:
                 MODULE.VideoSettings(**values)
-            self.assertEqual(caught.exception.code, "E_VIDEO_PRESET")
+            self.assertIn(
+                caught.exception.code,
+                {"E_VIDEO_PRESET", "E_VIDEO_CAMERA_DISTANCE"},
+            )
+        self.assertEqual(MODULE.VideoSettings(camera_distance_cm=175).camera_distance_cm, 175)
 
     def test_patch_is_strict_and_does_not_mutate_source(self) -> None:
         settings = MODULE.VideoSettings()
@@ -118,7 +136,7 @@ class VideoSettingsValueTest(unittest.TestCase):
         for patch in (
             {"unknown": "value"},
             {"camera_smoothing": "on;quit"},
-            {"camera_distance_cm": 175},
+            {"camera_distance_cm": 79},
         ):
             with self.subTest(patch=patch), self.assertRaises(
                 MODULE.VideoSettingsError

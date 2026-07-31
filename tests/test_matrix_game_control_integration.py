@@ -2134,6 +2134,8 @@ printf '%s\n%s\n%s\n' \
                 {
                     "camera_smoothing": "off",
                     "camera_distance_cm": 150,
+                    "camera_distance_min_cm": 80,
+                    "camera_distance_max_cm": 500,
                     "fps_limit": 90,
                     "quality": "epic",
                     "resolution": "1600x900",

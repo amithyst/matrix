@@ -5436,6 +5436,43 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_game_command_runtime_applies_live_camera_distance(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        applied: list[int] = []
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            camera_distance_setter=applied.append,
+        )
+        request = MC_COMMANDS.GameCommandRequest(
+            session="a" * 32,
+            sequence=1,
+            request_id="cmd-" + "d" * 32,
+            command=MC_COMMANDS.CameraDistanceSet(175),
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(0.0, 0.0, 0.8, 0.0),
+                    command_allowed=True,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_CAMERA_DISTANCE_SET")
+            self.assertEqual(applied, [175])
+            self.assertEqual(runtime.camera_distance_changes_executed, 1)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
     def test_game_command_runtime_accepts_operator_quit_as_normal_stop(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
             socket.AF_UNIX,

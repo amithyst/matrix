@@ -360,6 +360,29 @@ class McCommandProtocolTest(unittest.TestCase):
             ):
                 MODULE.command_from_mapping(mapping)
 
+    def test_camera_distance_round_trip_is_typed_and_strict(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=4,
+            request_id=REQUEST_ID,
+            command=MODULE.CameraDistanceSet(175),
+        )
+        payload = MODULE.encode_command_request(request)
+
+        self.assertNotIn(b"TargetArmLength", payload)
+        self.assertEqual(MODULE.decode_command_request(payload), request)
+        for mapping in (
+            {"name": "camera_distance_set"},
+            {"name": "camera_distance_set", "distance_cm": True},
+            {"name": "camera_distance_set", "distance_cm": 79},
+            {"name": "camera_distance_set", "distance_cm": 501},
+            {"name": "camera_distance_set", "distance_cm": 175, "extra": 1},
+        ):
+            with self.subTest(mapping=mapping), self.assertRaises(
+                MODULE.CommandProtocolError
+            ):
+                MODULE.command_from_mapping(mapping)
+
     def test_creative_spawn_round_trip_is_typed(self) -> None:
         request = MODULE.GameCommandRequest(
             session=SESSION,

@@ -2785,6 +2785,8 @@ class PointerActionPublisherTest(unittest.TestCase):
                         "quality": "high",
                         "camera_smoothing": "medium",
                         "camera_distance_cm": 150,
+                        "camera_distance_min_cm": 80,
+                        "camera_distance_max_cm": 500,
                     },
                     "next_launch": {
                         "resolution": "1920x1080",
@@ -2793,6 +2795,8 @@ class PointerActionPublisherTest(unittest.TestCase):
                         "quality": "high",
                         "camera_smoothing": "medium",
                         "camera_distance_cm": 150,
+                        "camera_distance_min_cm": 80,
+                        "camera_distance_max_cm": 500,
                     },
                     "pending_restart": False,
                     "persistence_error": None,
@@ -2801,7 +2805,7 @@ class PointerActionPublisherTest(unittest.TestCase):
         )
         self.assertTrue(model.available)
         self.assertEqual(model.stepped_value("video_fps_limit_up"), 90)
-        self.assertEqual(model.stepped_value("video_camera_distance_cm_up"), 200)
+        self.assertEqual(model.stepped_value("video_camera_distance_min_cm_up"), 90)
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 720)
         layout = MODULE.overlay_layout(geometry)
         self.assertIn("tab_video", layout)
@@ -2815,7 +2819,7 @@ class PointerActionPublisherTest(unittest.TestCase):
             ),
             "video_fps_limit_up",
         )
-        x, y, width, height = layout["video_camera_distance_cm_up"]
+        x, y, width, height = layout["video_camera_distance_cm_slider"]
         self.assertEqual(
             MODULE.panel_action_at(
                 layout,
@@ -2823,7 +2827,7 @@ class PointerActionPublisherTest(unittest.TestCase):
                 y + height // 2,
                 page="video",
             ),
-            "video_camera_distance_cm_up",
+            "video_camera_distance_cm_slider",
         )
 
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -2868,7 +2872,7 @@ class PointerActionPublisherTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid"):
                 publisher.publish_video_setting(
                     "camera_distance_cm",
-                    175,
+                    501,
                     expected_revision=4,
                 )
         finally:

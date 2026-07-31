@@ -47,6 +47,7 @@ from matrix_game_control import (
     wrap_angle_rad,
 )
 from matrix_mc_commands import (
+    CameraDistanceSet,
     CommandExecutionError,
     CommandProtocolError,
     CreativeSpawnItem,
@@ -97,7 +98,9 @@ from matrix_movement_modes import (
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_moon_dynamic_ground import (
+    CONTINUOUS_SUPPORT_HALF_EXTENT_M,
     LOCKED_MOONWORLD_SHA256,
+    MAP_HALF_EXTENT_M,
     MoonDynamicGround,
     MoonDynamicGroundError,
 )
@@ -1107,6 +1110,7 @@ def _parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--ue-pid", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--ue-control-fd", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--state-trace-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--state-trace-every", type=float, default=0.2, help=argparse.SUPPRESS)
     parser.add_argument("--print-every", type=float, default=2.0)
@@ -5955,6 +5959,7 @@ class GameCommandRuntime:
         pose_clearance_auditor: Callable[[WorldPose], dict[str, object]] | None = None,
         teleport_routes: Mapping[str, TeleportRoute] | None = None,
         runtime_pause: _RuntimePauseState | None = None,
+        camera_distance_setter: Callable[[int], None] | None = None,
         initial_locomotion_policy: str = "sonic",
         allow_unsafe_teleport_reload: bool = False,
     ) -> None:
@@ -5993,6 +5998,7 @@ class GameCommandRuntime:
         self.pose_clearance_auditor = pose_clearance_auditor
         self.teleport_routes = dict(teleport_routes or {})
         self.runtime_pause = runtime_pause
+        self.camera_distance_setter = camera_distance_setter
         self.allow_unsafe_teleport_reload = bool(allow_unsafe_teleport_reload)
         self.pending_policy_request: GameCommandRequest | None = None
         self.pending_runtime_pause_request: GameCommandRequest | None = None
@@ -6001,6 +6007,7 @@ class GameCommandRuntime:
         self.movement_mode_changes_executed = 0
         self.runtime_pause_changes_executed = 0
         self.quit_requests_executed = 0
+        self.camera_distance_changes_executed = 0
 
     @staticmethod
     def _command_strategy_loadout(
@@ -6342,6 +6349,44 @@ class GameCommandRuntime:
                         ok=False,
                         code="E_NOT_PAUSED",
                         message="Open ESC and wait for a neutral frame before commands",
+                    )
+                )
+                continue
+            if isinstance(request.command, CameraDistanceSet):
+                if self.camera_distance_setter is None:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_CAMERA_DISTANCE_UNAVAILABLE",
+                            message="Live UE camera distance control is unavailable",
+                        )
+                    )
+                    continue
+                try:
+                    self.camera_distance_setter(request.command.distance_cm)
+                except OSError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_CAMERA_DISTANCE_CONTROL",
+                            message=f"Could not send live camera distance: {exc}",
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self.camera_distance_changes_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code="OK_CAMERA_DISTANCE_SET",
+                        message=(
+                            f"Camera distance set to {request.command.distance_cm} cm"
+                        ),
                     )
                 )
                 continue
@@ -6939,6 +6984,9 @@ class GameCommandRuntime:
             "runtime_pause_changes_executed": (
                 self.runtime_pause_changes_executed
             ),
+            "camera_distance_changes_executed": (
+                self.camera_distance_changes_executed
+            ),
             "quit_requests_executed": self.quit_requests_executed,
             "quit_requested": self.quit_requested,
             "runtime_pause_pending": (
@@ -6983,6 +7031,18 @@ class GameCommandRuntime:
 
     def close(self) -> None:
         self.connection.close()
+
+
+def _ue_camera_distance_setter(control_fd: int | None) -> Callable[[int], None] | None:
+    if control_fd is None:
+        return None
+    if control_fd < 0:
+        raise ValueError("UE control fd must be non-negative")
+
+    def write_distance(distance_cm: int) -> None:
+        os.write(control_fd, f"camera_distance_cm {distance_cm}\n".encode("ascii"))
+
+    return write_distance
 
 
 def _peek_child_returncode(process: subprocess.Popen[bytes]) -> int | None:
@@ -14557,10 +14617,50 @@ def main(*, completion_event: threading.Event | None = None) -> int:
 
     def live_checkpoint_audit() -> dict[str, object]:
         environment = getattr(simulator, "sim_env", None)
+        data = getattr(environment, "mj_data", None)
+        if moon_dynamic_ground is not None:
+            try:
+                qpos = data.qpos
+                root_x = float(qpos[0])
+                root_y = float(qpos[1])
+            except (AttributeError, IndexError, TypeError, ValueError) as exc:
+                return {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": "moon_heightmap_audit_error",
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc) or type(exc).__name__,
+                    },
+                    "moon_heightmap_extent": {
+                        "edge_mode": getattr(moon_dynamic_ground, "edge_mode", None),
+                        "half_extent_m": MAP_HALF_EXTENT_M,
+                        "support_half_extent_m": CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                    },
+                }
+            edge_mode = getattr(moon_dynamic_ground, "edge_mode", "clamp")
+            limit_m = MAP_HALF_EXTENT_M - CONTINUOUS_SUPPORT_HALF_EXTENT_M
+            if (
+                edge_mode == "clamp"
+                and (abs(root_x) > limit_m or abs(root_y) > limit_m)
+            ):
+                return {
+                    "schema": "matrix-spawn-clearance-audit/v1",
+                    "safe": False,
+                    "reason": "moon_heightmap_oob",
+                    "error": None,
+                    "moon_heightmap_extent": {
+                        "edge_mode": edge_mode,
+                        "root_xy_m": [root_x, root_y],
+                        "half_extent_m": MAP_HALF_EXTENT_M,
+                        "support_half_extent_m": CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                        "safe_root_limit_m": limit_m,
+                    },
+                }
         return audit_spawn_safety(
             mujoco_module,
             getattr(environment, "mj_model", None),
-            getattr(environment, "mj_data", None),
+            data,
         )
 
     resume_probation = _GameWorldResumeProbation(
@@ -15108,6 +15208,9 @@ def main(*, completion_event: threading.Event | None = None) -> int:
                         pose_clearance_auditor=pose_clearance_audit,
                         teleport_routes=celestial_teleport_routes,
                         runtime_pause=runtime_pause,
+                        camera_distance_setter=_ue_camera_distance_setter(
+                            args.ue_control_fd
+                        ),
                         initial_locomotion_policy=args.initial_locomotion_policy,
                         allow_unsafe_teleport_reload=bool(args.game_auto_respawn),
                     )

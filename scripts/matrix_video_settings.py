@@ -24,8 +24,9 @@ import threading
 from typing import Callable, Mapping, Sequence
 
 
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 LEGACY_SETTINGS_VERSION = 1
+CAMERA_DISTANCE_ONLY_SETTINGS_VERSION = 2
 MAX_REVISION = (2**63) - 1
 MAX_SETTINGS_BYTES = 64 * 1024
 
@@ -35,6 +36,8 @@ FPS_LIMIT_FIELD = "fps_limit"
 QUALITY_FIELD = "quality"
 CAMERA_SMOOTHING_FIELD = "camera_smoothing"
 CAMERA_DISTANCE_CM_FIELD = "camera_distance_cm"
+CAMERA_DISTANCE_MIN_CM_FIELD = "camera_distance_min_cm"
+CAMERA_DISTANCE_MAX_CM_FIELD = "camera_distance_max_cm"
 VIDEO_SETTING_FIELDS = frozenset(
     {
         RESOLUTION_FIELD,
@@ -43,6 +46,8 @@ VIDEO_SETTING_FIELDS = frozenset(
         QUALITY_FIELD,
         CAMERA_SMOOTHING_FIELD,
         CAMERA_DISTANCE_CM_FIELD,
+        CAMERA_DISTANCE_MIN_CM_FIELD,
+        CAMERA_DISTANCE_MAX_CM_FIELD,
     }
 )
 
@@ -59,6 +64,7 @@ FPS_LIMIT_PRESETS = (30, 60, 90, 120)
 QUALITY_PRESETS = ("low", "medium", "high", "epic")
 CAMERA_SMOOTHING_PRESETS = ("off", "low", "medium", "high")
 CAMERA_DISTANCE_CM_PRESETS = (100, 150, 200, 250, 300, 400, 500)
+CAMERA_DISTANCE_CM_RANGE = (80, 500)
 
 DEFAULT_RESOLUTION = "1920x1080"
 DEFAULT_WINDOW_MODE = "borderless"
@@ -66,6 +72,8 @@ DEFAULT_FPS_LIMIT = 60
 DEFAULT_QUALITY = "high"
 DEFAULT_CAMERA_SMOOTHING = "medium"
 DEFAULT_CAMERA_DISTANCE_CM = 150
+DEFAULT_CAMERA_DISTANCE_MIN_CM = 80
+DEFAULT_CAMERA_DISTANCE_MAX_CM = 500
 
 _PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _DIRECTORY_OPEN_FLAGS = (
@@ -173,6 +181,21 @@ def _field(value: object) -> str:
     return value
 
 
+def _camera_distance_cm(value: object, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise VideoSettingsError(
+            "E_VIDEO_CAMERA_DISTANCE",
+            f"{name} must be an integer centimetre value",
+        )
+    lower, upper = CAMERA_DISTANCE_CM_RANGE
+    if not lower <= value <= upper:
+        raise VideoSettingsError(
+            "E_VIDEO_CAMERA_DISTANCE",
+            f"{name} must be in [{lower}, {upper}] cm",
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class VideoSettings:
     """One validated, revisioned snapshot of all host video settings."""
@@ -184,6 +207,8 @@ class VideoSettings:
     quality: str = DEFAULT_QUALITY
     camera_smoothing: str = DEFAULT_CAMERA_SMOOTHING
     camera_distance_cm: int = DEFAULT_CAMERA_DISTANCE_CM
+    camera_distance_min_cm: int = DEFAULT_CAMERA_DISTANCE_MIN_CM
+    camera_distance_max_cm: int = DEFAULT_CAMERA_DISTANCE_MAX_CM
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "revision", _revision(self.revision))
@@ -235,12 +260,41 @@ class VideoSettings:
         object.__setattr__(
             self,
             CAMERA_DISTANCE_CM_FIELD,
-            _preset(
+            _camera_distance_cm(
                 self.camera_distance_cm,
                 name=CAMERA_DISTANCE_CM_FIELD,
-                choices=CAMERA_DISTANCE_CM_PRESETS,
             ),
         )
+        object.__setattr__(
+            self,
+            CAMERA_DISTANCE_MIN_CM_FIELD,
+            _camera_distance_cm(
+                self.camera_distance_min_cm,
+                name=CAMERA_DISTANCE_MIN_CM_FIELD,
+            ),
+        )
+        object.__setattr__(
+            self,
+            CAMERA_DISTANCE_MAX_CM_FIELD,
+            _camera_distance_cm(
+                self.camera_distance_max_cm,
+                name=CAMERA_DISTANCE_MAX_CM_FIELD,
+            ),
+        )
+        if self.camera_distance_min_cm > self.camera_distance_max_cm:
+            raise VideoSettingsError(
+                "E_VIDEO_CAMERA_DISTANCE",
+                "camera distance minimum must be less than or equal to maximum",
+            )
+        if not (
+            self.camera_distance_min_cm
+            <= self.camera_distance_cm
+            <= self.camera_distance_max_cm
+        ):
+            raise VideoSettingsError(
+                "E_VIDEO_CAMERA_DISTANCE",
+                "camera distance must be inside its slider bounds",
+            )
 
     def value_for_field(self, field: object) -> str | int:
         return getattr(self, _field(field))
@@ -273,6 +327,8 @@ class VideoSettings:
             QUALITY_FIELD: self.quality,
             CAMERA_SMOOTHING_FIELD: self.camera_smoothing,
             CAMERA_DISTANCE_CM_FIELD: self.camera_distance_cm,
+            CAMERA_DISTANCE_MIN_CM_FIELD: self.camera_distance_min_cm,
+            CAMERA_DISTANCE_MAX_CM_FIELD: self.camera_distance_max_cm,
         }
 
     def runtime_mapping(self) -> dict[str, object]:
@@ -295,12 +351,22 @@ class VideoSettings:
             QUALITY_FIELD: self.quality,
             CAMERA_SMOOTHING_FIELD: self.camera_smoothing,
             CAMERA_DISTANCE_CM_FIELD: self.camera_distance_cm,
+            CAMERA_DISTANCE_MIN_CM_FIELD: self.camera_distance_min_cm,
+            CAMERA_DISTANCE_MAX_CM_FIELD: self.camera_distance_max_cm,
         }
 
     @classmethod
     def from_mapping(cls, value: object) -> "VideoSettings":
         expected = {"version", "revision", *VIDEO_SETTING_FIELDS}
-        legacy_expected = expected - {CAMERA_DISTANCE_CM_FIELD}
+        legacy_expected = expected - {
+            CAMERA_DISTANCE_CM_FIELD,
+            CAMERA_DISTANCE_MIN_CM_FIELD,
+            CAMERA_DISTANCE_MAX_CM_FIELD,
+        }
+        distance_only_expected = expected - {
+            CAMERA_DISTANCE_MIN_CM_FIELD,
+            CAMERA_DISTANCE_MAX_CM_FIELD,
+        }
         if not isinstance(value, dict):
             raise VideoSettingsError(
                 "E_VIDEO_SCHEMA",
@@ -309,6 +375,7 @@ class VideoSettings:
         version = value.get("version")
         if type(version) is not int or version not in {
             LEGACY_SETTINGS_VERSION,
+            CAMERA_DISTANCE_ONLY_SETTINGS_VERSION,
             SETTINGS_VERSION,
         }:
             raise VideoSettingsError(
@@ -316,13 +383,28 @@ class VideoSettings:
                 f"video settings version must be {SETTINGS_VERSION}",
             )
         if version == LEGACY_SETTINGS_VERSION and set(value) == legacy_expected:
-            value = {**value, CAMERA_DISTANCE_CM_FIELD: DEFAULT_CAMERA_DISTANCE_CM}
+            value = {
+                **value,
+                CAMERA_DISTANCE_CM_FIELD: DEFAULT_CAMERA_DISTANCE_CM,
+                CAMERA_DISTANCE_MIN_CM_FIELD: DEFAULT_CAMERA_DISTANCE_MIN_CM,
+                CAMERA_DISTANCE_MAX_CM_FIELD: DEFAULT_CAMERA_DISTANCE_MAX_CM,
+            }
+        elif (
+            version == CAMERA_DISTANCE_ONLY_SETTINGS_VERSION
+            and set(value) == distance_only_expected
+        ):
+            value = {
+                **value,
+                CAMERA_DISTANCE_MIN_CM_FIELD: DEFAULT_CAMERA_DISTANCE_MIN_CM,
+                CAMERA_DISTANCE_MAX_CM_FIELD: DEFAULT_CAMERA_DISTANCE_MAX_CM,
+            }
         elif set(value) != expected:
             raise VideoSettingsError(
                 "E_VIDEO_SCHEMA",
                 "video settings must contain exactly "
                 "version/revision/resolution/window_mode/fps_limit/quality/"
-                "camera_smoothing/camera_distance_cm",
+                "camera_smoothing/camera_distance_cm/"
+                "camera_distance_min_cm/camera_distance_max_cm",
             )
         return cls(
             revision=value.get("revision"),
@@ -332,6 +414,8 @@ class VideoSettings:
             quality=value.get(QUALITY_FIELD),
             camera_smoothing=value.get(CAMERA_SMOOTHING_FIELD),
             camera_distance_cm=value.get(CAMERA_DISTANCE_CM_FIELD),
+            camera_distance_min_cm=value.get(CAMERA_DISTANCE_MIN_CM_FIELD),
+            camera_distance_max_cm=value.get(CAMERA_DISTANCE_MAX_CM_FIELD),
         )
 
 
@@ -607,8 +691,18 @@ def step_setting(
         presets = QUALITY_PRESETS
     elif canonical_field == CAMERA_SMOOTHING_FIELD:
         presets = CAMERA_SMOOTHING_PRESETS
-    else:
+    elif canonical_field == CAMERA_DISTANCE_CM_FIELD:
         presets = CAMERA_DISTANCE_CM_PRESETS
+    else:
+        current = settings.value_for_field(canonical_field)
+        if not isinstance(current, int):
+            raise VideoSettingsError(
+                "E_VIDEO_STEP", "camera distance bound must be numeric"
+            )
+        return max(
+            CAMERA_DISTANCE_CM_RANGE[0],
+            min(CAMERA_DISTANCE_CM_RANGE[1], current + 10 * direction),
+        )
     current = settings.value_for_field(canonical_field)
     index = presets.index(current)
     next_index = max(0, min(len(presets) - 1, index + direction))
@@ -811,8 +905,9 @@ def _argument_parser() -> argparse.ArgumentParser:
     patch.add_argument(
         "--camera-distance-cm",
         type=int,
-        choices=CAMERA_DISTANCE_CM_PRESETS,
     )
+    patch.add_argument("--camera-distance-min-cm", type=int)
+    patch.add_argument("--camera-distance-max-cm", type=int)
     return parser
 
 
@@ -878,8 +973,13 @@ __all__ = [
     "CAMERA_SMOOTHING_PRESETS",
     "CAMERA_DISTANCE_CM_FIELD",
     "CAMERA_DISTANCE_CM_PRESETS",
+    "CAMERA_DISTANCE_CM_RANGE",
+    "CAMERA_DISTANCE_MIN_CM_FIELD",
+    "CAMERA_DISTANCE_MAX_CM_FIELD",
     "DEFAULT_CAMERA_SMOOTHING",
     "DEFAULT_CAMERA_DISTANCE_CM",
+    "DEFAULT_CAMERA_DISTANCE_MIN_CM",
+    "DEFAULT_CAMERA_DISTANCE_MAX_CM",
     "DEFAULT_FPS_LIMIT",
     "DEFAULT_QUALITY",
     "DEFAULT_RESOLUTION",

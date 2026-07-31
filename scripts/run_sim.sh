@@ -1075,26 +1075,37 @@ if [[ ! "$VIDEO_REVISION" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 VIDEO_CAMERA_DISTANCE_CM="${MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM:-150}"
-case "$VIDEO_CAMERA_DISTANCE_CM" in
-    100|150|200|250|300|400|500) ;;
-    *)
-        echo "[ERROR] Matrix video camera distance must be one of" \
-            "100/150/200/250/300/400/500 cm: $VIDEO_CAMERA_DISTANCE_CM" >&2
+VIDEO_CAMERA_DISTANCE_MIN_CM="${MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_MIN_CM:-80}"
+VIDEO_CAMERA_DISTANCE_MAX_CM="${MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_MAX_CM:-500}"
+if ! /usr/bin/python3 -I - "$VIDEO_CAMERA_DISTANCE_CM" \
+    "$VIDEO_CAMERA_DISTANCE_MIN_CM" "$VIDEO_CAMERA_DISTANCE_MAX_CM" <<'PY'
+import sys
+
+try:
+    value, lower, upper = (int(item) for item in sys.argv[1:4])
+except ValueError:
+    raise SystemExit(1)
+if not (80 <= lower <= upper <= 500 and lower <= value <= upper):
+    raise SystemExit(1)
+PY
+then
+        echo "[ERROR] Matrix video camera distance must be an integer in" \
+            "its [min,max] bounds inside 80..500 cm:" \
+            "$VIDEO_CAMERA_DISTANCE_CM [$VIDEO_CAMERA_DISTANCE_MIN_CM,$VIDEO_CAMERA_DISTANCE_MAX_CM]" >&2
         exit 1
-        ;;
-esac
+fi
 if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
     VIDEO_APPLIED_JSON="$(
-        printf '{"camera_distance_cm":%s,"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
-            "$VIDEO_CAMERA_DISTANCE_CM" "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+        printf '{"camera_distance_cm":%s,"camera_distance_max_cm":%s,"camera_distance_min_cm":%s,"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+            "$VIDEO_CAMERA_DISTANCE_CM" "$VIDEO_CAMERA_DISTANCE_MAX_CM" "$VIDEO_CAMERA_DISTANCE_MIN_CM" "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
             "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
             "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
     )"
 else
     if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
         MATRIX_VIDEO_APPLIED_JSON="$(
-            printf '{"camera_distance_cm":%s,"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
-                "$VIDEO_CAMERA_DISTANCE_CM" "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+            printf '{"camera_distance_cm":%s,"camera_distance_max_cm":%s,"camera_distance_min_cm":%s,"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+                "$VIDEO_CAMERA_DISTANCE_CM" "$VIDEO_CAMERA_DISTANCE_MAX_CM" "$VIDEO_CAMERA_DISTANCE_MIN_CM" "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
                 "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
                 "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
         )"
@@ -2663,6 +2674,7 @@ PY
         --expected-parent-pid "$$" \
         --external-failure-file "$UE_FAILURE_FILE" \
         --ue-pid "$UE_PID" \
+        --ue-control-fd "$UE_CONTROL_FD" \
         --physics-hz "${MATRIX_SONIC_PHYSICS_HZ:-200}" \
         --walk-after "${MATRIX_SONIC_WALK_AFTER:--1}" \
         --vx "${MATRIX_SONIC_VX:-0.30}" \
