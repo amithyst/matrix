@@ -1139,6 +1139,13 @@ _VIDEO_CAMERA_DISTANCE_FIELDS = (
     "camera_distance_min_cm",
     "camera_distance_max_cm",
 )
+_VIDEO_CAMERA_DISTANCE_BOUND_FIELDS = (
+    "camera_distance_min_cm",
+    "camera_distance_max_cm",
+)
+_VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS = tuple(
+    f"video_{field}_value" for field in _VIDEO_CAMERA_DISTANCE_BOUND_FIELDS
+)
 _VIDEO_CAMERA_DISTANCE_RANGE = (80, 500)
 _VIDEO_SETTING_LABELS = {
     "resolution": "分辨率",
@@ -1212,6 +1219,7 @@ _PANEL_HIT_TARGETS = (
     + _INVENTORY_HIT_TARGETS
     + _NAVIGATION_HIT_TARGETS
     + _VIDEO_STEP_ACTIONS
+    + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
 )
 
 
@@ -1274,6 +1282,7 @@ def panel_action_at(
             + ("runtime_pause", "quit_game", "apply_return")
             + ("video_camera_distance_cm_slider",)
             + _VIDEO_STEP_ACTIONS
+            + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
         )
     elif page == "system":
         targets = _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
@@ -3310,6 +3319,125 @@ class CommandEditOutcome:
     command: str | None = None
 
 
+@dataclass(frozen=True)
+class CameraDistanceBoundEditOutcome:
+    action: str | None = None
+    field: str | None = None
+    value: int | None = None
+
+
+class CameraDistanceBoundEditor:
+    """Integer editor for live camera distance slider bounds."""
+
+    def __init__(self) -> None:
+        self.field: str | None = None
+        self.text = ""
+        self.revision = 0
+
+    @property
+    def editing(self) -> bool:
+        return self.field is not None
+
+    def _changed(self) -> None:
+        self.revision += 1
+
+    def begin(self, field: str, value: object) -> bool:
+        if field not in _VIDEO_CAMERA_DISTANCE_BOUND_FIELDS:
+            return False
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+        self.field = field
+        self.text = str(value)
+        self._changed()
+        return True
+
+    def end(self) -> bool:
+        if not self.editing:
+            return False
+        self.field = None
+        self.text = ""
+        self._changed()
+        return True
+
+    def _submit(
+        self,
+        model: VideoSettingsPanelModel | None,
+    ) -> CameraDistanceBoundEditOutcome:
+        field = self.field
+        if (
+            field is None
+            or model is None
+            or not model.available
+            or model.error is not None
+        ):
+            return CameraDistanceBoundEditOutcome()
+        if not self.text or not self.text.isascii() or not self.text.isdecimal():
+            return CameraDistanceBoundEditOutcome()
+        value = int(self.text, 10)
+        lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
+        if not lower <= value <= upper:
+            return CameraDistanceBoundEditOutcome()
+        values = dict(model.next_launch)
+        values[field] = value
+        distance = values.get("camera_distance_cm")
+        minimum = values.get("camera_distance_min_cm")
+        maximum = values.get("camera_distance_max_cm")
+        if not (
+            isinstance(distance, int)
+            and isinstance(minimum, int)
+            and isinstance(maximum, int)
+            and minimum <= distance <= maximum
+        ):
+            return CameraDistanceBoundEditOutcome()
+        self.end()
+        return CameraDistanceBoundEditOutcome(
+            action="submit",
+            field=field,
+            value=value,
+        )
+
+    def handle_key(
+        self,
+        *,
+        keysym: int,
+        printable: str,
+        model: VideoSettingsPanelModel | None,
+    ) -> CameraDistanceBoundEditOutcome:
+        if not self.editing:
+            return CameraDistanceBoundEditOutcome()
+        if keysym == _XK_ESCAPE:
+            self.end()
+            return CameraDistanceBoundEditOutcome(action="end")
+        if keysym in {_XK_RETURN, _XK_KP_ENTER}:
+            return self._submit(model)
+        if keysym == _XK_BACK_SPACE:
+            if self.text:
+                self.text = self.text[:-1]
+                self._changed()
+            return CameraDistanceBoundEditOutcome()
+        if keysym == _XK_DELETE:
+            if self.text:
+                self.text = ""
+                self._changed()
+            return CameraDistanceBoundEditOutcome()
+        if printable and printable.isascii():
+            digits = "".join(
+                character for character in printable if character.isdigit()
+            )
+            available = 3 - len(self.text)
+            addition = digits[:available]
+            if addition:
+                self.text += addition
+                self._changed()
+        return CameraDistanceBoundEditOutcome()
+
+    def display_text(self, field: str, fallback: object) -> str:
+        if self.field == field:
+            text = self.text if self.text else ""
+            return f"{text}|"
+        return str(fallback)
+
+
 class CommandLineEditor:
     """Small bounded ASCII editor; execution remains provider/runtime authority."""
 
@@ -4002,6 +4130,7 @@ class X11CalibrationOverlay:
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = -1
+        self._last_video_distance_bound_revision = -1
         self._last_pointer: tuple[int, int] | None = None
         self._last_raise_s: float | None = None
         self._pressed_action: str | None = None
@@ -4026,6 +4155,7 @@ class X11CalibrationOverlay:
         self._pointer_recenter_count = 0
         self._target_window: int | None = None
         self._command_editor = CommandLineEditor()
+        self._video_distance_bound_editor = CameraDistanceBoundEditor()
         self._keyboard_grabbed = False
         self._deferred_ungrab_keycode: int | None = None
         self._active_page = "loadout"
@@ -5317,12 +5447,17 @@ class X11CalibrationOverlay:
         self._polled_pressed_runtime_pause_epoch = None
         if pressed is None or action != pressed or not self._visible:
             return emitted
+        if self._video_distance_bound_editing() and action not in (
+            _PANEL_TABS + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
+        ):
+            return emitted
 
         if action in _PANEL_TABS:
             next_page = action.removeprefix("tab_")
             if next_page != getattr(self, "_active_page", "loadout"):
                 if self._force_end_command_editing(publisher):
                     emitted += 1
+                self._force_end_video_distance_bound_editing()
                 self._active_page = next_page
                 self._last_page = None
             return emitted
@@ -5366,6 +5501,9 @@ class X11CalibrationOverlay:
             ):
                 publisher.publish_game_quit()
                 emitted += 1
+            return emitted
+        if action in _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS:
+            self._begin_video_distance_bound_editing(action)
             return emitted
         if action.startswith("recovery_policy_"):
             strategy = getattr(self, "_last_strategy_model", None)
@@ -6524,6 +6662,7 @@ class X11CalibrationOverlay:
         layout: dict[str, tuple[int, int, int, int]],
         model: VideoSettingsPanelModel,
     ) -> None:
+        bound_editor = getattr(self, "_video_distance_bound_editor", None)
         for field, presets in _VIDEO_SETTING_PRESETS.items():
             stem = f"video_{field}"
             current = model.value(field)
@@ -6569,10 +6708,18 @@ class X11CalibrationOverlay:
                     disabled=not enabled,
                 )
             self._draw_text(
-                f"{_VIDEO_SETTING_LABELS[field]}  ·  {current} cm",
+                (
+                    f"{_VIDEO_SETTING_LABELS[field]}  ·  "
+                    f"{bound_editor.display_text(field, current) if bound_editor is not None else current}"
+                    " cm"
+                ),
                 x=0,
                 y=0,
-                colour=self._colours["white" if model.available else "muted"],
+                colour=self._colours[
+                    "cyan"
+                    if bound_editor is not None and bound_editor.field == field
+                    else ("white" if model.available else "muted")
+                ],
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
         self._draw_camera_distance_slider(layout, model)
@@ -7483,6 +7630,7 @@ class X11CalibrationOverlay:
             or visible_command_status.status in {"pending", "restarting", "unavailable"}
             or self._command_editor.editing
             or self._command_editor.pending
+            or self._video_distance_bound_editing()
             or model.restart_requested
         )
         strategy_switch_busy = bool(
@@ -7544,6 +7692,7 @@ class X11CalibrationOverlay:
             or visible_command_status.status in {"pending", "restarting", "unavailable"}
             or self._command_editor.editing
             or self._command_editor.pending
+            or self._video_distance_bound_editing()
             or model.restart_requested
         )
         self._draw_button(
@@ -7566,6 +7715,10 @@ class X11CalibrationOverlay:
             disabled=apply_disabled,
         )
 
+    def _video_distance_bound_editing(self) -> bool:
+        editor = getattr(self, "_video_distance_bound_editor", None)
+        return bool(editor is not None and editor.editing)
+
     def _begin_command_editing(self, publisher: PointerActionPublisher) -> bool:
         status = self._last_command_status
         if (
@@ -7578,6 +7731,7 @@ class X11CalibrationOverlay:
             or status.status in {"pending", "restarting", "unavailable"}
             or self._deferred_ungrab_keycode is not None
             or self._keyboard_grabbed
+            or self._video_distance_bound_editing()
             or not self._command_editor.begin()
         ):
             return False
@@ -7590,11 +7744,46 @@ class X11CalibrationOverlay:
             raise
         return True
 
+    def _begin_video_distance_bound_editing(self, action: str) -> bool:
+        if (
+            not self._visible
+            or self._deferred_ungrab_keycode is not None
+            or self._keyboard_grabbed
+            or self._command_editor.editing
+            or self._command_editor.pending
+            or getattr(self, "_active_page", "loadout") != "video"
+        ):
+            return False
+        if not hasattr(self, "_video_distance_bound_editor"):
+            self._video_distance_bound_editor = CameraDistanceBoundEditor()
+        field = action.removeprefix("video_").removesuffix("_value")
+        video_model = getattr(self, "_last_video_model", None)
+        if (
+            field not in _VIDEO_CAMERA_DISTANCE_BOUND_FIELDS
+            or video_model is None
+            or not video_model.available
+            or video_model.error is not None
+            or not self._video_distance_bound_editor.begin(
+                field,
+                video_model.value(field),
+            )
+        ):
+            return False
+        try:
+            self._grab_keyboard()
+        except Exception:
+            self._video_distance_bound_editor.end()
+            self._ungrab_keyboard()
+            raise
+        return True
+
     def _force_end_command_editing(
         self,
         publisher: PointerActionPublisher | None,
     ) -> bool:
         was_editing = self._command_editor.editing
+        if not was_editing and self._video_distance_bound_editing():
+            return False
         if not was_editing and not self._keyboard_grabbed:
             return False
         self._command_editor.end(force=True)
@@ -7602,6 +7791,17 @@ class X11CalibrationOverlay:
             if was_editing and publisher is not None:
                 publisher.publish_command_edit(False)
         finally:
+            self._ungrab_keyboard()
+        return True
+
+    def _force_end_video_distance_bound_editing(self) -> bool:
+        editor = getattr(self, "_video_distance_bound_editor", None)
+        was_editing = bool(editor is not None and editor.editing)
+        if not was_editing:
+            return False
+        assert editor is not None
+        editor.end()
+        if not self._command_editor.editing:
             self._ungrab_keyboard()
         return True
 
@@ -7634,6 +7834,32 @@ class X11CalibrationOverlay:
         if not self._visible or not self._keyboard_grabbed:
             return 0
         keysym, printable = self._lookup_key(event)
+        video_bound_editor = getattr(self, "_video_distance_bound_editor", None)
+        if video_bound_editor is not None and video_bound_editor.editing:
+            outcome = video_bound_editor.handle_key(
+                keysym=keysym,
+                printable=printable,
+                model=getattr(self, "_last_video_model", None),
+            )
+            if outcome.action == "submit":
+                assert outcome.field is not None
+                assert outcome.value is not None
+                video_model = getattr(self, "_last_video_model", None)
+                if video_model is not None:
+                    publisher.publish_video_setting(
+                        outcome.field,
+                        outcome.value,
+                        expected_revision=video_model.revision,
+                    )
+                self._ungrab_keyboard()
+                return 1
+            if outcome.action == "end":
+                keycode = int(event.keycode)
+                if not 8 <= keycode <= 255:
+                    raise RuntimeError(f"invalid Escape keycode from X11: {keycode}")
+                self._deferred_ungrab_keycode = keycode
+                return 1
+            return 0
         outcome = self._command_editor.handle_key(
             keysym=keysym,
             printable=printable,
@@ -7845,6 +8071,10 @@ class X11CalibrationOverlay:
                     or not self._visible
                 ):
                     continue
+                if self._video_distance_bound_editing() and action not in (
+                    _PANEL_TABS + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
+                ):
+                    continue
                 if recovered_pause_release:
                     # SDL/remote-desktop pointer lock can warp the core pointer
                     # after a valid Pause press but before its release.  Pause
@@ -7859,6 +8089,7 @@ class X11CalibrationOverlay:
                     if next_page != getattr(self, "_active_page", "loadout"):
                         if self._force_end_command_editing(publisher):
                             emitted += 1
+                        self._force_end_video_distance_bound_editing()
                         self._active_page = next_page
                         self._last_page = None
                     continue
@@ -7904,6 +8135,8 @@ class X11CalibrationOverlay:
                 elif action == "command_input":
                     if self._begin_command_editing(publisher):
                         emitted += 1
+                elif action in _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS:
+                    self._begin_video_distance_bound_editing(action)
                 elif action == "navigation_refresh":
                     navigation = getattr(self, "_last_navigation_model", None)
                     if (
@@ -8136,6 +8369,12 @@ class X11CalibrationOverlay:
             != getattr(self, "_last_page", None)
             or command_status != self._last_command_status
             or self._command_editor.revision != self._last_command_revision
+            or getattr(
+                self,
+                "_video_distance_bound_editor",
+                CameraDistanceBoundEditor(),
+            ).revision
+            != self._last_video_distance_bound_revision
         )
         if geometry_changed or self._last_layout is None:
             layout = overlay_layout(geometry)
@@ -8263,6 +8502,11 @@ class X11CalibrationOverlay:
         self._last_page = getattr(self, "_active_page", "loadout")
         self._last_command_status = command_status
         self._last_command_revision = self._command_editor.revision
+        self._last_video_distance_bound_revision = getattr(
+            self,
+            "_video_distance_bound_editor",
+            CameraDistanceBoundEditor(),
+        ).revision
         self._last_pointer = pointer
         if raise_due:
             self._last_raise_s = now
@@ -8271,6 +8515,7 @@ class X11CalibrationOverlay:
 
     def hide(self, publisher: PointerActionPublisher | None = None) -> None:
         self._force_end_command_editing(publisher)
+        self._force_end_video_distance_bound_editing()
         if not self._visible and not self._cursor_visible:
             return
         for window in self._windows.values():
@@ -8291,6 +8536,11 @@ class X11CalibrationOverlay:
         self._last_page = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision
+        self._last_video_distance_bound_revision = getattr(
+            self,
+            "_video_distance_bound_editor",
+            CameraDistanceBoundEditor(),
+        ).revision
         self._last_pointer = None
         self._last_raise_s = None
         self._pressed_action = None
@@ -8315,6 +8565,9 @@ class X11CalibrationOverlay:
         editor = getattr(self, "_command_editor", None)
         if editor is not None:
             editor.end(force=True)
+        video_editor = getattr(self, "_video_distance_bound_editor", None)
+        if video_editor is not None:
+            video_editor.end()
         self._ungrab_keyboard()
         xft = getattr(self, "_xft", None)
         visual = getattr(self, "_visual", None)

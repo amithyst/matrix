@@ -3269,6 +3269,74 @@ class CommandLineEditorTest(unittest.TestCase):
         self.assertFalse(editor.pending)
 
 
+class CameraDistanceBoundEditorTest(unittest.TestCase):
+    @staticmethod
+    def model(**overrides):
+        next_launch = {
+            "resolution": "1920x1080",
+            "window_mode": "borderless",
+            "fps_limit": 60,
+            "quality": "high",
+            "camera_smoothing": "medium",
+            "camera_distance_cm": 150,
+            "camera_distance_min_cm": 80,
+            "camera_distance_max_cm": 500,
+        }
+        next_launch.update(overrides)
+        return MODULE.video_settings_panel_model(
+            {
+                "video_settings": {
+                    "available": True,
+                    "revision": 7,
+                    "current": dict(next_launch),
+                    "next_launch": next_launch,
+                    "pending_restart": False,
+                    "persistence_error": None,
+                }
+            }
+        )
+
+    @staticmethod
+    def key(editor, keysym=0, printable="", model=None):
+        return editor.handle_key(
+            keysym=keysym,
+            printable=printable,
+            model=model or CameraDistanceBoundEditorTest.model(),
+        )
+
+    def test_digits_submit_and_escape_are_bounded(self) -> None:
+        editor = MODULE.CameraDistanceBoundEditor()
+        self.assertTrue(editor.begin("camera_distance_max_cm", 500))
+        self.assertEqual(editor.display_text("camera_distance_max_cm", 500), "500|")
+        self.key(editor, MODULE._XK_BACK_SPACE)
+        self.key(editor, MODULE._XK_BACK_SPACE)
+        self.key(editor, MODULE._XK_BACK_SPACE)
+        self.key(editor, printable="4509")
+        self.assertEqual(editor.text, "450")
+        outcome = self.key(editor, MODULE._XK_RETURN)
+        self.assertEqual(outcome.action, "submit")
+        self.assertEqual(outcome.field, "camera_distance_max_cm")
+        self.assertEqual(outcome.value, 450)
+        self.assertFalse(editor.editing)
+
+        self.assertTrue(editor.begin("camera_distance_min_cm", 80))
+        self.assertEqual(self.key(editor, MODULE._XK_ESCAPE).action, "end")
+        self.assertFalse(editor.editing)
+
+    def test_rejects_values_outside_hard_or_slider_bounds(self) -> None:
+        editor = MODULE.CameraDistanceBoundEditor()
+        self.assertTrue(editor.begin("camera_distance_max_cm", 500))
+        editor.text = "149"
+        self.assertIsNone(self.key(editor, MODULE._XK_RETURN).action)
+        self.assertTrue(editor.editing)
+        editor.text = "501"
+        self.assertIsNone(self.key(editor, MODULE._XK_RETURN).action)
+        self.assertTrue(editor.editing)
+
+        self.assertFalse(editor.begin("resolution", 80))
+        self.assertFalse(editor.begin("camera_distance_min_cm", "80"))
+
+
 class KeyboardGrabLifecycleTest(unittest.TestCase):
     @staticmethod
     def overlay(*, visible=True, grab_result=MODULE._GRAB_SUCCESS):
@@ -3282,6 +3350,7 @@ class KeyboardGrabLifecycleTest(unittest.TestCase):
         overlay._keyboard_grabbed = False
         overlay._deferred_ungrab_keycode = None
         overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._video_distance_bound_editor = MODULE.CameraDistanceBoundEditor()
         overlay._last_command_status = CommandLineEditorTest.status()
         overlay._last_layout = None
         overlay._last_geometry = None
@@ -3403,6 +3472,41 @@ class KeyboardGrabLifecycleTest(unittest.TestCase):
             publisher.publish_command_edit.call_args_list,
             [mock.call(True), mock.call(False), mock.call(True)],
         )
+
+    def test_video_distance_bound_edit_grabs_keyboard_and_publishes_setting(self) -> None:
+        overlay = self.overlay()
+        overlay._active_page = "video"
+        overlay._last_video_model = CameraDistanceBoundEditorTest.model()
+        self.assertTrue(
+            overlay._begin_video_distance_bound_editing(
+                "video_camera_distance_max_cm_value"
+            )
+        )
+        self.assertTrue(overlay._keyboard_grabbed)
+        overlay._lookup_key = mock.Mock(
+            side_effect=[
+                (MODULE._XK_BACK_SPACE, ""),
+                (MODULE._XK_BACK_SPACE, ""),
+                (MODULE._XK_BACK_SPACE, ""),
+                (0, "450"),
+                (MODULE._XK_RETURN, ""),
+            ]
+        )
+        publisher = mock.Mock()
+        event = MODULE.XKeyEvent()
+        event.keycode = 42
+        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
+        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
+        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
+        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
+        self.assertEqual(overlay._handle_key_press(event, publisher), 1)
+        publisher.publish_video_setting.assert_called_once_with(
+            "camera_distance_max_cm",
+            450,
+            expected_revision=7,
+        )
+        self.assertFalse(overlay._keyboard_grabbed)
+        self.assertFalse(overlay._video_distance_bound_editor.editing)
 
     def test_pending_or_restart_provider_state_blocks_click_reentry(self) -> None:
         publisher = mock.Mock()
