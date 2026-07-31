@@ -933,9 +933,10 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     video_top = tab_y + tab_height + gap
     video_bottom = apply_y - gap
     video_row_gap = 4 if compact else 8
+    video_rows = max(1, len(_VIDEO_SETTING_PRESETS))
     video_row_height = max(
         24,
-        (video_bottom - video_top - 4 * video_row_gap) // 5,
+        (video_bottom - video_top - (video_rows - 1) * video_row_gap) // video_rows,
     )
     video_button_width = max(34, min(64, panel_width // 14))
     for index, field in enumerate(_VIDEO_SETTING_PRESETS):
@@ -1090,6 +1091,7 @@ _VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
     "fps_limit": (30, 60, 90, 120),
     "quality": ("low", "medium", "high", "epic"),
     "camera_smoothing": ("off", "low", "medium", "high"),
+    "camera_distance_cm": (100, 150, 200, 250, 300, 400, 500),
 }
 _VIDEO_SETTING_LABELS = {
     "resolution": "分辨率",
@@ -1097,6 +1099,7 @@ _VIDEO_SETTING_LABELS = {
     "fps_limit": "帧率上限",
     "quality": "画质档位",
     "camera_smoothing": "相机平滑",
+    "camera_distance_cm": "相机距离",
 }
 _VIDEO_VALUE_LABELS = {
     "windowed": "窗口",
@@ -6417,6 +6420,8 @@ class X11CalibrationOverlay:
             label_value = _VIDEO_VALUE_LABELS.get(str(current), str(current))
             if field == "fps_limit":
                 label_value = f"{current} FPS"
+            elif field == "camera_distance_cm":
+                label_value = f"{current} cm"
             self._draw_text(
                 f"{_VIDEO_SETTING_LABELS[field]}  ·  {label_value}",
                 x=0,

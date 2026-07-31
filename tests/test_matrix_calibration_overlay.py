@@ -2784,6 +2784,7 @@ class PointerActionPublisherTest(unittest.TestCase):
                         "fps_limit": 60,
                         "quality": "high",
                         "camera_smoothing": "medium",
+                        "camera_distance_cm": 150,
                     },
                     "next_launch": {
                         "resolution": "1920x1080",
@@ -2791,6 +2792,7 @@ class PointerActionPublisherTest(unittest.TestCase):
                         "fps_limit": 60,
                         "quality": "high",
                         "camera_smoothing": "medium",
+                        "camera_distance_cm": 150,
                     },
                     "pending_restart": False,
                     "persistence_error": None,
@@ -2799,6 +2801,7 @@ class PointerActionPublisherTest(unittest.TestCase):
         )
         self.assertTrue(model.available)
         self.assertEqual(model.stepped_value("video_fps_limit_up"), 90)
+        self.assertEqual(model.stepped_value("video_camera_distance_cm_up"), 200)
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 720)
         layout = MODULE.overlay_layout(geometry)
         self.assertIn("tab_video", layout)
@@ -2811,6 +2814,16 @@ class PointerActionPublisherTest(unittest.TestCase):
                 page="video",
             ),
             "video_fps_limit_up",
+        )
+        x, y, width, height = layout["video_camera_distance_cm_up"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="video",
+            ),
+            "video_camera_distance_cm_up",
         )
 
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -2837,10 +2850,25 @@ class PointerActionPublisherTest(unittest.TestCase):
                     "expected_revision": 4,
                 },
             )
+            publisher.publish_video_setting(
+                "camera_distance_cm",
+                200,
+                expected_revision=model.revision,
+            )
+            packet = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(packet["field"], "camera_distance_cm")
+            self.assertEqual(packet["value"], 200)
+            self.assertEqual(packet["expected_revision"], 4)
             with self.assertRaisesRegex(ValueError, "invalid"):
                 publisher.publish_video_setting(
                     "fps_limit",
                     "90;quit",
+                    expected_revision=4,
+                )
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                publisher.publish_video_setting(
+                    "camera_distance_cm",
+                    175,
                     expected_revision=4,
                 )
         finally:

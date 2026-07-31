@@ -5230,6 +5230,7 @@ def decode_applied_video_settings(value: str) -> VideoSettings:
             "fps_limit",
             "quality",
             "camera_smoothing",
+            "camera_distance_cm",
         }
         if set(raw) != expected:
             raise ValueError("applied video settings have an invalid schema")
@@ -5240,6 +5241,7 @@ def decode_applied_video_settings(value: str) -> VideoSettings:
             fps_limit=raw.get("fps_limit"),
             quality=raw.get("quality"),
             camera_smoothing=raw.get("camera_smoothing"),
+            camera_distance_cm=raw.get("camera_distance_cm"),
         )
         if settings.runtime_mapping() != raw:
             raise ValueError("applied video settings runtime fields disagree")

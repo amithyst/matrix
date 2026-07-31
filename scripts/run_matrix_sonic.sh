@@ -581,6 +581,7 @@ expected = {
     "fps_limit",
     "quality",
     "camera_smoothing",
+    "camera_distance_cm",
 }
 if not isinstance(value, dict) or set(value) != expected:
     raise SystemExit("invalid video-settings helper output")
@@ -591,6 +592,7 @@ fields = (
     value["fps_limit"],
     value["quality"],
     value["camera_smoothing"],
+    value["camera_distance_cm"],
     value["revision"],
 )
 if any(isinstance(item, bool) for item in fields):
@@ -601,7 +603,8 @@ PY
 IFS=$'\t' read -r MATRIX_VIDEO_APPLIED_WIDTH \
     MATRIX_VIDEO_APPLIED_HEIGHT MATRIX_VIDEO_APPLIED_WINDOW_MODE \
     MATRIX_VIDEO_APPLIED_FPS_LIMIT MATRIX_VIDEO_APPLIED_QUALITY \
-    MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING MATRIX_VIDEO_APPLIED_REVISION \
+    MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM \
+    MATRIX_VIDEO_APPLIED_REVISION \
     <<<"$VIDEO_LAUNCH_FIELDS"
 if [[ "$SCENE_ID" == "15" \
     && "$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k" ]]; then
@@ -614,9 +617,11 @@ if [[ "$SCENE_ID" == "15" \
             MATRIX_VIDEO_APPLIED_FPS_LIMIT=30
             MATRIX_VIDEO_APPLIED_QUALITY=low
             MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING=medium
+            MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM=150
             MATRIX_VIDEO_APPLIED_REVISION=0
             MATRIX_VIDEO_APPLIED_JSON="$(
-                printf '{"camera_smoothing":"medium","fps_limit":30,'
+                printf '{"camera_distance_cm":150,'
+                printf '"camera_smoothing":"medium","fps_limit":30,'
                 printf '"quality":"low","resolution":"1280x720",'
                 printf '"resolution_height":720,"resolution_width":1280,'
                 printf '"revision":0,"window_mode":"borderless"}'
@@ -655,11 +660,13 @@ export MATRIX_VIDEO_SETTINGS_FILE MATRIX_VIDEO_APPLIED_JSON
 export MATRIX_VIDEO_APPLIED_WIDTH MATRIX_VIDEO_APPLIED_HEIGHT
 export MATRIX_VIDEO_APPLIED_WINDOW_MODE MATRIX_VIDEO_APPLIED_FPS_LIMIT
 export MATRIX_VIDEO_APPLIED_QUALITY MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING
-export MATRIX_VIDEO_APPLIED_REVISION
+export MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM MATRIX_VIDEO_APPLIED_REVISION
+MATRIX_GAME_CAMERA_DISTANCE_CM="$MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM"
+export MATRIX_GAME_CAMERA_DISTANCE_CM
 echo "[INFO] Video launch settings: ${MATRIX_VIDEO_APPLIED_WIDTH}x${MATRIX_VIDEO_APPLIED_HEIGHT}" \
     "mode=$MATRIX_VIDEO_APPLIED_WINDOW_MODE fps=$MATRIX_VIDEO_APPLIED_FPS_LIMIT" \
     "quality=$MATRIX_VIDEO_APPLIED_QUALITY smoothing=$MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING" \
-    "revision=$MATRIX_VIDEO_APPLIED_REVISION"
+    "camera_distance=${MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM}cm revision=$MATRIX_VIDEO_APPLIED_REVISION"
 MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
 MATRIX_CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
 if [[ -n "$MATRIX_ITEM_INVENTORY_CATALOG" \

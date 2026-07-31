@@ -10078,7 +10078,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             '{"revision":3,"resolution":"1600x900",'
             '"resolution_width":1600,"resolution_height":900,'
             '"window_mode":"fullscreen","fps_limit":90,"quality":"epic",'
-            '"camera_smoothing":"high"}'
+            '"camera_smoothing":"high","camera_distance_cm":250}'
         )
         try:
             provider_pid = group.start_game_input(

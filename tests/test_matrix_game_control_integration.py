@@ -2133,6 +2133,7 @@ printf '%s\n%s\n%s\n' \
                 json.loads(parsed.game_applied_video_settings_json),
                 {
                     "camera_smoothing": "off",
+                    "camera_distance_cm": 150,
                     "fps_limit": 90,
                     "quality": "epic",
                     "resolution": "1600x900",

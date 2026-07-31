@@ -364,6 +364,7 @@ class MatrixBfmIsaacRuntimeVerifierTest(unittest.TestCase):
             "MATRIX_VIDEO_APPLIED_FPS_LIMIT",
             "MATRIX_VIDEO_APPLIED_QUALITY",
             "MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING",
+            "MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM",
             "MATRIX_VIDEO_APPLIED_REVISION",
             "MATRIX_VIDEO_APPLIED_JSON",
         ):

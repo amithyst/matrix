@@ -969,6 +969,7 @@ case "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" in
             MATRIX_VIDEO_APPLIED_FPS_LIMIT \
             MATRIX_VIDEO_APPLIED_QUALITY \
             MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING \
+            MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM \
             MATRIX_VIDEO_APPLIED_REVISION \
             MATRIX_VIDEO_APPLIED_JSON \
             MATRIX_UE_EXTRA_EXEC_CMDS; do
@@ -1073,18 +1074,27 @@ if [[ ! "$VIDEO_REVISION" =~ ^[0-9]+$ ]]; then
     echo "[ERROR] Invalid Matrix video settings revision: $VIDEO_REVISION" >&2
     exit 1
 fi
+VIDEO_CAMERA_DISTANCE_CM="${MATRIX_VIDEO_APPLIED_CAMERA_DISTANCE_CM:-150}"
+case "$VIDEO_CAMERA_DISTANCE_CM" in
+    100|150|200|250|300|400|500) ;;
+    *)
+        echo "[ERROR] Matrix video camera distance must be one of" \
+            "100/150/200/250/300/400/500 cm: $VIDEO_CAMERA_DISTANCE_CM" >&2
+        exit 1
+        ;;
+esac
 if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
     VIDEO_APPLIED_JSON="$(
-        printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
-            "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+        printf '{"camera_distance_cm":%s,"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+            "$VIDEO_CAMERA_DISTANCE_CM" "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
             "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
             "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
     )"
 else
     if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
         MATRIX_VIDEO_APPLIED_JSON="$(
-            printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
-                "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
+            printf '{"camera_distance_cm":%s,"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
+                "$VIDEO_CAMERA_DISTANCE_CM" "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
                 "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
                 "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
         )"
