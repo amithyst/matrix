@@ -589,9 +589,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(turning.speed_mps, 0.0)
         self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
-        self.assertAlmostEqual(
-            abs(core.heading_rad), MODULE.MAX_MEASURED_FACING_LEAD_RAD
-        )
+        self.assertAlmostEqual(abs(core.heading_rad), math.pi)
         self.assertEqual(core.measured_heading_rad, 0.0)
 
         core.synchronize_heading(math.pi)

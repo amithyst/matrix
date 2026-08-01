@@ -912,26 +912,40 @@ class GameControlCore:
                     self._command_heading_rad = self._measured_heading_rad
                 desired_heading = self._command_heading_rad
             else:
-                # Keep the planner-facing setpoint close to the physical body.
-                # During a post-recovery handoff SONIC can remain in a writer-
-                # confirmed hold for longer than it takes an open-loop setpoint
-                # to traverse a large camera/body yaw error. Advancing from the
-                # prior command in that interval lets the planner accumulate the
-                # entire turn before the robot has moved at all. Once live
-                # control starts, blending toward that far-ahead trajectory can
-                # create an unsafe angular-velocity spike.
-                #
-                # With runtime feedback available, command at most one
-                # rate-limited step ahead of measured yaw. The setpoint
-                # therefore pauses while the body is held, then advances only as
-                # physical yaw follows it. Keep the original command-relative
-                # fallback for startup/tests that legitimately have no measured
-                # heading yet.
-                heading_origin = (
-                    self._measured_heading_rad
+                measured_error = (
+                    wrap_angle_rad(desired_heading - self._measured_heading_rad)
                     if self._measured_heading_rad is not None
-                    else self._command_heading_rad
+                    else None
                 )
+                turn_before_translation = bool(
+                    measured_error is not None
+                    and abs(measured_error) > self.config.gait_start_heading_error_rad
+                )
+                if turn_before_translation:
+                    # A large camera-face request is the same physical yaw
+                    # intent as Pico's right stick while the left stick is
+                    # already held forward: accumulate a real facing target in
+                    # native IDLE, then release translation only after measured
+                    # yaw enters the gait gate.  Keeping the target only one
+                    # feedback tick ahead of measured yaw can stall the native
+                    # planner far outside that gate.
+                    heading_origin = self._command_heading_rad
+                    max_heading_delta = self.config.max_turn_rate_rad_s * dt
+                else:
+                    # Once feedback says the body is near the requested
+                    # heading, keep the planner-facing setpoint close to the
+                    # physical body so a small residual error cannot create an
+                    # angular spike right as translation starts.
+                    heading_origin = (
+                        self._measured_heading_rad
+                        if self._measured_heading_rad is not None
+                        else self._command_heading_rad
+                    )
+                    max_heading_delta = self.config.max_turn_rate_rad_s * dt
+                    if self._measured_heading_rad is not None:
+                        max_heading_delta = min(
+                            max_heading_delta, MAX_MEASURED_FACING_LEAD_RAD
+                        )
                 heading_error = wrap_angle_rad(desired_heading - heading_origin)
                 # At the antipode, tiny camera-yaw noise can represent the same
                 # direction as either +pi or -pi.  Latch the prior turn side so an
@@ -940,11 +954,6 @@ class GameControlCore:
                     heading_error = self._turn_sign * abs(heading_error)
                 elif abs(heading_error) > 1e-6:
                     self._turn_sign = math.copysign(1.0, heading_error)
-                max_heading_delta = self.config.max_turn_rate_rad_s * dt
-                if self._measured_heading_rad is not None:
-                    max_heading_delta = min(
-                        max_heading_delta, MAX_MEASURED_FACING_LEAD_RAD
-                    )
                 heading_delta = max(
                     -max_heading_delta, min(max_heading_delta, heading_error)
                 )
@@ -966,9 +975,7 @@ class GameControlCore:
                 if self._measured_heading_rad is None:
                     alignment = command_alignment
                 else:
-                    measured_error = wrap_angle_rad(
-                        desired_heading - self._measured_heading_rad
-                    )
+                    assert measured_error is not None
                     measured_alignment = max(0.0, math.cos(measured_error))
                     # A mid-turn retarget can make the body already face the new
                     # request while the rate-limited planner target still points in
