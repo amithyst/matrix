@@ -39,6 +39,31 @@ from matrix_mouse_settings import (
     canonical_remote_speed_scale,
 )
 from matrix_mc_commands import MAX_COMMAND_CHARS
+from matrix_movement_modes import MOVEMENT_MODES, validate_movement_mode
+from matrix_motion_settings import (
+    GEAR_RUN,
+    GEAR_SLOW,
+    GEAR_WALK,
+    KEYBOARD_LOOK_RATE_PATH,
+    KEYBOARD_TURN_RATE_PATH,
+    MotionSettings,
+    MotionSettingsError,
+    SPEED_FIELD,
+    step_motion_speed,
+)
+from matrix_ui_settings import (
+    DEFAULT_FONT_SCALE,
+    MAX_FONT_SIZE,
+    MIN_FONT_SIZE,
+    canonical_font_scale,
+    canonical_font_size,
+)
+from matrix_video_settings import (
+    CAMERA_DISTANCE_CM_FIELD,
+    VideoSettings,
+    VideoSettingsError,
+    step_setting,
+)
 
 
 _IS_VIEWABLE = 2
@@ -67,6 +92,78 @@ _MAX_COMMAND_HISTORY = 24
 _MAX_INTENT_PACKET_BYTES = 2048
 _BODY_FONT_CANDIDATES = (b"10x20", b"9x15", b"fixed")
 _LARGE_FONT_CANDIDATES = (b"12x24", b"10x20", b"fixed")
+
+_MOVEMENT_MODE_LABELS = {
+    "camera_face": "面对相机方向",
+    "camera_strafe": "相机平移",
+    "body_relative": "身体坐标",
+}
+_MOTION_ACTIONS = (
+    "motion_slow_speed_down",
+    "motion_slow_speed_up",
+    "motion_walk_speed_down",
+    "motion_walk_speed_up",
+    "motion_run_speed_down",
+    "motion_run_speed_up",
+    "motion_turn_rate_down",
+    "motion_turn_rate_up",
+    "motion_look_rate_down",
+    "motion_look_rate_up",
+)
+_VIDEO_ACTIONS = (
+    "video_camera_distance_down",
+    "video_camera_distance_up",
+)
+_UI_ACTIONS = ("font_down", "font_up")
+_MOTION_ACTION_TO_STEP: dict[str, tuple[str, int]] = {
+    "motion_slow_speed_down": (
+        f"control.motion.gears.{GEAR_SLOW}.{SPEED_FIELD}",
+        -1,
+    ),
+    "motion_slow_speed_up": (
+        f"control.motion.gears.{GEAR_SLOW}.{SPEED_FIELD}",
+        1,
+    ),
+    "motion_walk_speed_down": (
+        f"control.motion.gears.{GEAR_WALK}.{SPEED_FIELD}",
+        -1,
+    ),
+    "motion_walk_speed_up": (
+        f"control.motion.gears.{GEAR_WALK}.{SPEED_FIELD}",
+        1,
+    ),
+    "motion_run_speed_down": (
+        f"control.motion.gears.{GEAR_RUN}.{SPEED_FIELD}",
+        -1,
+    ),
+    "motion_run_speed_up": (
+        f"control.motion.gears.{GEAR_RUN}.{SPEED_FIELD}",
+        1,
+    ),
+    "motion_turn_rate_down": (KEYBOARD_TURN_RATE_PATH, -1),
+    "motion_turn_rate_up": (KEYBOARD_TURN_RATE_PATH, 1),
+    "motion_look_rate_down": (KEYBOARD_LOOK_RATE_PATH, -1),
+    "motion_look_rate_up": (KEYBOARD_LOOK_RATE_PATH, 1),
+}
+_VIDEO_ACTION_TO_STEP: dict[str, tuple[str, int]] = {
+    "video_camera_distance_down": (CAMERA_DISTANCE_CM_FIELD, -1),
+    "video_camera_distance_up": (CAMERA_DISTANCE_CM_FIELD, 1),
+}
+
+
+def core_font_candidates(scale: object, *, large: bool) -> tuple[bytes, ...]:
+    canonical = canonical_font_scale(scale)
+    if large:
+        return (
+            (b"10x20", b"9x15", b"fixed")
+            if canonical < 1.0
+            else _LARGE_FONT_CANDIDATES
+        )
+    if canonical < 1.0:
+        return (b"9x15", b"fixed")
+    if canonical > 1.1:
+        return (b"12x24", b"10x20", b"fixed")
+    return _BODY_FONT_CANDIDATES
 
 _XK_BACK_SPACE = 0xFF08
 _XK_RETURN = 0xFF0D
@@ -280,22 +377,51 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     panel_y = centre_y - panel_height // 2
     margin = max(18, min(64, panel_width // 18))
     gap = max(10, min(28, panel_width // 36))
+    tuning_specs = (
+        "motion_slow_speed",
+        "motion_walk_speed",
+        "motion_run_speed",
+        "motion_turn_rate",
+        "motion_look_rate",
+        "video_camera_distance",
+        "font",
+    )
+    tuning_columns = 4
+    tuning_rows = (len(tuning_specs) + tuning_columns - 1) // tuning_columns
     button_height = max(
         36,
-        min(52 if compact else 76, panel_height // 8),
+        min(52 if compact else 60, panel_height // 8),
     )
     safe_half_size = 50
     speed_y = panel_y + panel_height // 2 - safe_half_size - button_height
     profile_y = speed_y - gap - button_height
+    mode_y = max(panel_y + 56, profile_y - gap - button_height)
+    tuning_y = max(panel_y + 56, mode_y) if compact else centre_y + safe_half_size + 4
     profile_width = max(1, (panel_width - 2 * margin - gap) // 2)
+    mode_width = max(1, (panel_width - 2 * margin - 2 * gap) // 3)
     speed_width = max(48, min(132, (panel_width - 2 * margin) // 4))
-    apply_height = max(42, min(80, button_height + 6))
-    footer_space = 8 if compact else 42
+    tuning_cell_width = max(
+        1,
+        (panel_width - 2 * margin - (tuning_columns - 1) * gap)
+        // tuning_columns,
+    )
+    tuning_button_width = (
+        100
+        if tuning_cell_width >= 240
+        else max(30, min(56, tuning_cell_width // 4))
+    )
+    tuning_value_width = max(1, tuning_cell_width - 2 * tuning_button_width)
+    apply_height = max(42, min(66, button_height + 6))
+    footer_space = 8
     apply_y = panel_y + panel_height - footer_space - apply_height
     console_left = panel_x + margin
     console_width = panel_width - 2 * margin
-    console_top = centre_y + safe_half_size + (4 if compact else gap // 2)
-    console_bottom = apply_y - (6 if compact else gap)
+    console_top = (
+        centre_y + safe_half_size + 4
+        if compact
+        else tuning_y + tuning_rows * (button_height + gap) - 2
+    )
+    console_bottom = apply_y - 6
     console_height = max(1, console_bottom - console_top)
     command_input_height = min(28 if compact else 42, max(22, console_height))
     command_input_y = max(console_top, console_bottom - command_input_height)
@@ -309,7 +435,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         panel_width - 2 * margin - 2 * speed_width,
         button_height,
     )
-    return {
+    result = {
         "shield": (geometry.x, geometry.y, geometry.width, geometry.height),
         "panel": (panel_x, panel_y, panel_width, panel_height),
         "title": (
@@ -332,6 +458,24 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             panel_x + margin + profile_width + gap,
             profile_y,
             profile_width,
+            button_height,
+        ),
+        "movement_mode_camera_face": (
+            panel_x + margin,
+            mode_y,
+            mode_width,
+            button_height,
+        ),
+        "movement_mode_camera_strafe": (
+            panel_x + margin + mode_width + gap,
+            mode_y,
+            mode_width,
+            button_height,
+        ),
+        "movement_mode_body_relative": (
+            panel_x + margin + 2 * (mode_width + gap),
+            mode_y,
+            mode_width,
             button_height,
         ),
         "speed_down": (panel_x + margin, speed_y, speed_width, button_height),
@@ -373,6 +517,25 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             safe_half_size * 2,
         ),
     }
+    for index, stem in enumerate(tuning_specs):
+        row = index // tuning_columns
+        column = index % tuning_columns
+        x = panel_x + margin + column * (tuning_cell_width + gap)
+        y = tuning_y + row * (button_height + gap)
+        result[f"{stem}_down"] = (x, y, tuning_button_width, button_height)
+        result[f"{stem}_value"] = (
+            x + tuning_button_width,
+            y,
+            tuning_value_width,
+            button_height,
+        )
+        result[f"{stem}_up"] = (
+            x + tuning_button_width + tuning_value_width,
+            y,
+            tuning_button_width,
+            button_height,
+        )
+    return result
 
 
 _PANEL_ACTIONS = (
@@ -380,6 +543,12 @@ _PANEL_ACTIONS = (
     "profile_remote",
     "speed_down",
     "speed_up",
+    "movement_mode_camera_face",
+    "movement_mode_camera_strafe",
+    "movement_mode_body_relative",
+    *_MOTION_ACTIONS,
+    *_VIDEO_ACTIONS,
+    *_UI_ACTIONS,
     "apply_return",
 )
 
@@ -445,6 +614,19 @@ class SettingsPanelModel:
     effective_mirror_gain: float
     status: str
     error: str | None
+    font_scale: float
+    font_size: int
+    movement_mode: str
+    motion_available: bool
+    motion_error: str | None
+    slow_speed_mps: float
+    walk_speed_mps: float
+    run_speed_mps: float
+    keyboard_turn_rate_rad_s: float
+    keyboard_look_rate_deg_s: float
+    video_available: bool
+    video_error: str | None
+    camera_distance_cm: int
 
     @property
     def apply_label(self) -> str:
@@ -472,6 +654,16 @@ class SettingsPanelModel:
                 and self.next_profile == "Remote"
                 and self.next_scale < MAX_REMOTE_SPEED_SCALE
             )
+        if action.startswith("movement_mode_"):
+            return bool(not controls_disabled and self.motion_available)
+        if action in _MOTION_ACTIONS:
+            return bool(not controls_disabled and self.motion_available)
+        if action in _VIDEO_ACTIONS:
+            return bool(not controls_disabled and self.video_available)
+        if action == "font_down":
+            return bool(not controls_disabled and self.font_size > MIN_FONT_SIZE)
+        if action == "font_up":
+            return bool(not controls_disabled and self.font_size < MAX_FONT_SIZE)
         if action == "apply_return":
             return bool(
                 not controls_disabled
@@ -807,6 +999,12 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
     mirror = mirror if isinstance(mirror, dict) else {}
     apply_return = state.get("apply_return")
     apply_return = apply_return if isinstance(apply_return, dict) else {}
+    ui_settings = state.get("ui_settings")
+    ui_settings = ui_settings if isinstance(ui_settings, dict) else {}
+    motion_payload = state.get("motion_settings")
+    motion_payload = motion_payload if isinstance(motion_payload, dict) else {}
+    video_payload = state.get("video_settings")
+    video_payload = video_payload if isinstance(video_payload, dict) else {}
 
     def profile(value: object) -> str:
         return "Remote" if value == "remote" else "Local"
@@ -825,16 +1023,50 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
 
     current_scale = preset(current.get("effective_scale"))
     next_scale = preset(next_launch.get("effective_scale"))
-    pending = settings.get("pending_restart") is True
+    pending = bool(
+        settings.get("pending_restart") is True
+        or motion_payload.get("pending_restart") is True
+        or video_payload.get("pending_restart") is True
+    )
     requested = restart.get("requested") is True
     restart_available = restart.get("available") is True
     persistence_error = settings.get("persistence_error")
+    ui_error = ui_settings.get("persistence_error")
+    motion_error_value = next(
+        (
+            value
+            for value in (
+                motion_payload.get("persistence_error"),
+                motion_payload.get("load_error"),
+            )
+            if isinstance(value, str) and value
+        ),
+        None,
+    )
+    video_error_value = next(
+        (
+            value
+            for value in (
+                video_payload.get("persistence_error"),
+                video_payload.get("load_error"),
+            )
+            if isinstance(value, str) and value
+        ),
+        None,
+    )
     restart_error = restart.get("error")
     action_error = apply_return.get("error")
     error_value = next(
         (
             value
-            for value in (persistence_error, restart_error, action_error)
+            for value in (
+                persistence_error,
+                ui_error,
+                motion_error_value,
+                video_error_value,
+                restart_error,
+                action_error,
+            )
             if isinstance(value, str) and value
         ),
         None,
@@ -849,6 +1081,59 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         status = "error"
     elif status not in {"waiting_neutral", "returning", "restarting", "error"}:
         status = "pending" if pending else "ready"
+    try:
+        font_scale = canonical_font_scale(
+            ui_settings.get("font_scale", DEFAULT_FONT_SCALE)
+        )
+    except ValueError:
+        font_scale = DEFAULT_FONT_SCALE
+    try:
+        font_size = canonical_font_size(ui_settings.get("font_size"))
+    except ValueError:
+        font_size = max(
+            MIN_FONT_SIZE,
+            min(MAX_FONT_SIZE, int(round(13 * font_scale))),
+        )
+
+    raw_movement_mode = state.get("movement_mode")
+    try:
+        movement_mode = validate_movement_mode(raw_movement_mode)
+    except ValueError:
+        movement_mode = MotionSettings().movement_mode
+    motion_snapshot: object = motion_payload.get("settings", motion_payload)
+    try:
+        motion_settings = MotionSettings.from_mapping(motion_snapshot)
+        motion_available = True
+        movement_mode = motion_settings.movement_mode
+        motion_error = motion_error_value
+    except (MotionSettingsError, TypeError, ValueError) as exc:
+        motion_settings = MotionSettings(movement_mode=movement_mode)
+        motion_available = False
+        motion_error = (
+            motion_error_value
+            or (
+                "motion settings unavailable"
+                if not motion_payload
+                else f"invalid motion settings telemetry: {exc}"
+            )
+        )
+    try:
+        video_settings = VideoSettings.from_mapping(
+            video_payload.get("settings", video_payload)
+        )
+        video_available = True
+        video_error = video_error_value
+    except (VideoSettingsError, TypeError, ValueError) as exc:
+        video_settings = VideoSettings()
+        video_available = False
+        video_error = (
+            video_error_value
+            or (
+                "video settings unavailable"
+                if not video_payload
+                else f"invalid video settings telemetry: {exc}"
+            )
+        )
     return SettingsPanelModel(
         current_profile=profile(current.get("profile")),
         current_scale=current_scale,
@@ -870,6 +1155,31 @@ def settings_panel_model(state: dict[str, object]) -> SettingsPanelModel:
         ),
         status=status,
         error=error_value,
+        font_scale=font_scale,
+        font_size=font_size,
+        movement_mode=movement_mode,
+        motion_available=motion_available,
+        motion_error=motion_error,
+        slow_speed_mps=motion_settings.value_for_path(
+            f"control.motion.gears.{GEAR_SLOW}.{SPEED_FIELD}"
+        ),
+        walk_speed_mps=motion_settings.value_for_path(
+            f"control.motion.gears.{GEAR_WALK}.{SPEED_FIELD}"
+        ),
+        run_speed_mps=motion_settings.value_for_path(
+            f"control.motion.gears.{GEAR_RUN}.{SPEED_FIELD}"
+        ),
+        keyboard_turn_rate_rad_s=motion_settings.value_for_path(
+            KEYBOARD_TURN_RATE_PATH
+        ),
+        keyboard_look_rate_deg_s=motion_settings.value_for_path(
+            KEYBOARD_LOOK_RATE_PATH
+        ),
+        video_available=video_available,
+        video_error=video_error,
+        camera_distance_cm=int(
+            video_settings.value_for_field(CAMERA_DISTANCE_CM_FIELD)
+        ),
     )
 
 
@@ -1973,6 +2283,35 @@ class X11CalibrationOverlay:
             fill=self._colours["selected" if not local_selected else "button"],
             disabled=controls_disabled,
         )
+        command_blocked = bool(
+            command_status is not None
+            and (
+                command_status.in_flight
+                or command_status.restart_required
+                or command_status.outcome_unknown
+                or command_status.status in {"pending", "restarting"}
+            )
+        )
+        mode_disabled = bool(
+            controls_disabled or command_blocked or not model.motion_available
+        )
+        for movement_mode in MOVEMENT_MODES:
+            selected = movement_mode == model.movement_mode
+            self._draw_button(
+                layout,
+                f"movement_mode_{movement_mode}",
+                {
+                    "camera_face": "CAM FACE",
+                    "camera_strafe": "STRAFE",
+                    "body_relative": "BODY",
+                }[movement_mode],
+                fill=self._colours[
+                    "selected"
+                    if selected
+                    else "disabled" if mode_disabled else "button"
+                ],
+                disabled=mode_disabled,
+            )
         speed_down_disabled = not model.action_enabled("speed_down")
         speed_up_disabled = not model.action_enabled("speed_up")
         self._draw_button(
@@ -2015,6 +2354,74 @@ class X11CalibrationOverlay:
                 speed_value[3],
             ),
         )
+        tuning_rows = (
+            (
+                "motion_slow_speed",
+                "SLOW",
+                f"{model.slow_speed_mps:.2f}m/s",
+                model.motion_available,
+            ),
+            (
+                "motion_walk_speed",
+                "WALK",
+                f"{model.walk_speed_mps:.2f}m/s",
+                model.motion_available,
+            ),
+            (
+                "motion_run_speed",
+                "RUN",
+                f"{model.run_speed_mps:.2f}m/s",
+                model.motion_available,
+            ),
+            (
+                "motion_turn_rate",
+                "Q/E",
+                f"{model.keyboard_turn_rate_rad_s:.2f}rad",
+                model.motion_available,
+            ),
+            (
+                "motion_look_rate",
+                "ARROWS",
+                f"{model.keyboard_look_rate_deg_s:.0f}deg/s",
+                model.motion_available,
+            ),
+            (
+                "video_camera_distance",
+                "CAM DIST",
+                f"{model.camera_distance_cm}cm",
+                model.video_available,
+            ),
+            ("font", "FONT", f"{model.font_size}px", True),
+        )
+        for stem, label, value, available in tuning_rows:
+            down_action = f"{stem}_down"
+            up_action = f"{stem}_up"
+            down_disabled = bool(
+                not available or not model.action_enabled(down_action)
+            )
+            up_disabled = bool(not available or not model.action_enabled(up_action))
+            self._draw_button(
+                layout,
+                down_action,
+                "-",
+                fill=self._colours["disabled" if down_disabled else "button"],
+                disabled=down_disabled,
+            )
+            self._draw_button(
+                layout,
+                up_action,
+                "+",
+                fill=self._colours["disabled" if up_disabled else "button"],
+                disabled=up_disabled,
+            )
+            value_rectangle = self._panel_rectangle(layout, f"{stem}_value")
+            self._draw_text(
+                f"{label} {value}",
+                x=0,
+                y=0,
+                colour=self._colours["white" if available else "muted"],
+                centred_in=value_rectangle,
+            )
         if model.status == "restarting":
             status_text = "Reloading the complete Matrix runtime - keep controls released"
             status_colour = self._colours["pending"]

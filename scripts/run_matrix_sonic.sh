@@ -245,12 +245,32 @@ fi
 export MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT
 export MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE
 
-MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+MATRIX_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${PROFILE:-local}}"
+if [[ ! "$MATRIX_SETTINGS_PROFILE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+    echo "[ERROR] Matrix settings profile is invalid: $MATRIX_SETTINGS_PROFILE" >&2
+    exit 2
+fi
+MATRIX_SETTINGS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/$MATRIX_SETTINGS_PROFILE"
+MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/mouse-control.json}"
+MATRIX_UI_SETTINGS_FILE="${MATRIX_UI_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/ui-settings.json}"
+MATRIX_MOTION_SETTINGS_FILE="${MATRIX_MOTION_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/motion-control.json}"
+MATRIX_VIDEO_SETTINGS_FILE="${MATRIX_VIDEO_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/video-settings.json}"
 if [[ "$MATRIX_MOUSE_SETTINGS_FILE" != /* ]]; then
     echo "[ERROR] MATRIX_MOUSE_SETTINGS_FILE must be absolute" >&2
     exit 2
 fi
 MATRIX_MOUSE_SETTINGS_FILE="$(realpath -m "$MATRIX_MOUSE_SETTINGS_FILE")"
+for settings_path_name in \
+    MATRIX_UI_SETTINGS_FILE \
+    MATRIX_MOTION_SETTINGS_FILE \
+    MATRIX_VIDEO_SETTINGS_FILE; do
+    settings_path="${!settings_path_name}"
+    if [[ "$settings_path" != /* ]]; then
+        echo "[ERROR] $settings_path_name must be absolute" >&2
+        exit 2
+    fi
+    printf -v "$settings_path_name" '%s' "$(realpath -m "$settings_path")"
+done
 MOUSE_LAUNCH_FIELDS="$(
     /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_mouse_settings.py" \
         launch-fields --file "$MATRIX_MOUSE_SETTINGS_FILE"
@@ -277,6 +297,40 @@ export MATRIX_MOUSE_SETTINGS_FILE MATRIX_MOUSE_APPLIED_PROFILE
 export MATRIX_MOUSE_APPLIED_SPEED_SCALE MATRIX_MOUSE_SETTINGS_LOAD_STATUS
 echo "[INFO] Mouse launch profile: $MATRIX_MOUSE_APPLIED_PROFILE " \
     "scale=$MATRIX_MOUSE_APPLIED_SPEED_SCALE status=$MATRIX_MOUSE_SETTINGS_LOAD_STATUS"
+if [[ -f "$PROJECT_ROOT/scripts/matrix_video_settings.py" ]]; then
+    if ! MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON="$(
+        /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_video_settings.py" \
+            --settings-file "$MATRIX_VIDEO_SETTINGS_FILE" \
+            launch-json
+    )"; then
+        echo "[ERROR] Invalid video settings file: $MATRIX_VIDEO_SETTINGS_FILE" >&2
+        exit 2
+    fi
+else
+    MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON='{"camera_distance_cm":150,"camera_distance_max_cm":500,"camera_distance_min_cm":80,"camera_smoothing":"medium","fps_limit":60,"quality":"high","resolution":"1920x1080","resolution_height":1080,"resolution_width":1920,"revision":0,"window_mode":"borderless"}'
+fi
+if [[ -z "${MATRIX_GAME_CAMERA_DISTANCE_CM+x}" ]]; then
+    if ! MATRIX_GAME_CAMERA_DISTANCE_CM="$(
+        /usr/bin/python3 -I - "$MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+distance = value.get("camera_distance_cm")
+if type(distance) is not int:
+    raise SystemExit("camera_distance_cm must be an integer")
+print(distance)
+PY
+    )"; then
+        echo "[ERROR] Invalid video camera distance from settings" >&2
+        exit 2
+    fi
+fi
+export MATRIX_HOST_PROFILE="${MATRIX_HOST_PROFILE:-$MATRIX_SETTINGS_PROFILE}"
+export MATRIX_SETTINGS_PROFILE MATRIX_UI_SETTINGS_FILE MATRIX_MOTION_SETTINGS_FILE
+export MATRIX_VIDEO_SETTINGS_FILE MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON
+export MATRIX_GAME_CAMERA_DISTANCE_CM
+echo "[INFO] Matrix settings profile: $MATRIX_SETTINGS_PROFILE " \
+    "video_camera_distance=${MATRIX_GAME_CAMERA_DISTANCE_CM}cm"
 MATRIX_SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
 export MATRIX_SONIC_STATUS_FILE
 rm -f -- "$MATRIX_SONIC_STATUS_FILE"

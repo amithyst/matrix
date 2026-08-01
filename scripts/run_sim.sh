@@ -27,7 +27,67 @@ MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRA
 MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
 MATRIX_UE_CAMERA_LAYOUT="${MATRIX_UE_CAMERA_LAYOUT:-$PROJECT_ROOT/config/runtime/matrix-ue-camera-layout-v1.json}"
 CENTERED_CAMERA_OVERLAY_STEM="pakchunk99-MatrixCentered-Linux_P"
+MATRIX_GAME_CAMERA_DISTANCE_EXPLICIT=0
+if [[ -n "${MATRIX_GAME_CAMERA_DISTANCE_CM+x}" ]]; then
+    MATRIX_GAME_CAMERA_DISTANCE_EXPLICIT=1
+fi
 MATRIX_GAME_CAMERA_DISTANCE_CM="${MATRIX_GAME_CAMERA_DISTANCE_CM:-150}"
+MATRIX_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}"
+if [[ ! "$MATRIX_SETTINGS_PROFILE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+    echo "[ERROR] Matrix settings profile is invalid: $MATRIX_SETTINGS_PROFILE" >&2
+    exit 1
+fi
+MATRIX_SETTINGS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/$MATRIX_SETTINGS_PROFILE"
+MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/mouse-control.json}"
+MATRIX_UI_SETTINGS_FILE="${MATRIX_UI_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/ui-settings.json}"
+MATRIX_MOTION_SETTINGS_FILE="${MATRIX_MOTION_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/motion-control.json}"
+MATRIX_VIDEO_SETTINGS_FILE="${MATRIX_VIDEO_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/video-settings.json}"
+for settings_path_name in \
+    MATRIX_MOUSE_SETTINGS_FILE \
+    MATRIX_UI_SETTINGS_FILE \
+    MATRIX_MOTION_SETTINGS_FILE \
+    MATRIX_VIDEO_SETTINGS_FILE; do
+    settings_path="${!settings_path_name}"
+    if [[ "$settings_path" != /* ]]; then
+        echo "[ERROR] $settings_path_name must be absolute" >&2
+        exit 1
+    fi
+    printf -v "$settings_path_name" '%s' "$(realpath -m "$settings_path")"
+done
+if [[ -z "${MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON:-}" ]]; then
+    if [[ -f "$PROJECT_ROOT/scripts/matrix_video_settings.py" ]]; then
+        if ! MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON="$(
+            /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_video_settings.py" \
+                --settings-file "$MATRIX_VIDEO_SETTINGS_FILE" \
+                launch-json
+        )"; then
+            echo "[ERROR] Invalid video settings file: $MATRIX_VIDEO_SETTINGS_FILE" >&2
+            exit 1
+        fi
+    else
+        MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON='{"camera_distance_cm":150,"camera_distance_max_cm":500,"camera_distance_min_cm":80,"camera_smoothing":"medium","fps_limit":60,"quality":"high","resolution":"1920x1080","resolution_height":1080,"resolution_width":1920,"revision":0,"window_mode":"borderless"}'
+    fi
+fi
+if [[ "$MATRIX_GAME_CAMERA_DISTANCE_EXPLICIT" == "0" ]]; then
+    if ! MATRIX_GAME_CAMERA_DISTANCE_CM="$(
+        /usr/bin/python3 -I - "$MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+distance = value.get("camera_distance_cm")
+if type(distance) is not int:
+    raise SystemExit("camera_distance_cm must be an integer")
+print(distance)
+PY
+    )"; then
+        echo "[ERROR] Invalid video camera distance from settings" >&2
+        exit 1
+    fi
+fi
+export MATRIX_HOST_PROFILE="${MATRIX_HOST_PROFILE:-$MATRIX_SETTINGS_PROFILE}"
+export MATRIX_SETTINGS_PROFILE MATRIX_MOUSE_SETTINGS_FILE MATRIX_UI_SETTINGS_FILE
+export MATRIX_MOTION_SETTINGS_FILE MATRIX_VIDEO_SETTINGS_FILE
+export MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON MATRIX_GAME_CAMERA_DISTANCE_CM
 
 case "${MATRIX_GAME_CENTERED_CAMERA,,}" in
     1|true|yes|on)
@@ -1502,8 +1562,13 @@ if $MATRIX_SONIC_ENABLED; then
         --game-initial-camera-yaw-deg "${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
         --game-mouse-sensitivity-deg "${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
         --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+        --game-ui-settings-file "${MATRIX_UI_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/ui-settings.json}"
+        --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/motion-control.json}"
+        --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/video-settings.json}"
+        --game-applied-video-settings-json "${MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON:-}"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
+        --game-keyboard-camera-look-rate-deg-s "${MATRIX_GAME_KEYBOARD_CAMERA_LOOK_RATE_DEG_S:-120.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
         --game-camera-yaw-offset-deg "${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
         --game-carla-host "${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"

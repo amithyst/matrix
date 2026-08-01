@@ -54,6 +54,7 @@ from matrix_mc_commands import (
     execute_command,
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
+from matrix_motion_settings import MotionSettings, MotionSettingsStore
 from matrix_world_state import (
     WorldPose,
     WorldStateError,
@@ -148,6 +149,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--game-mouse-sensitivity-deg", type=float, default=0.12)
     parser.add_argument("--game-mouse-settings-file", type=Path)
+    parser.add_argument("--game-ui-settings-file", type=Path)
+    parser.add_argument("--game-motion-settings-file", type=Path)
+    parser.add_argument("--game-video-settings-file", type=Path)
+    parser.add_argument("--game-applied-video-settings-json")
+    parser.add_argument(
+        "--game-keyboard-camera-look-rate-deg-s",
+        type=float,
+        default=120.0,
+    )
     parser.add_argument(
         "--game-applied-mouse-profile",
         choices=("local", "remote"),
@@ -1538,6 +1548,22 @@ def _game_control_status_fields(
         if applied_camera_yaw_offset_deg is None
         else applied_camera_yaw_offset_deg
     )
+    motion_settings = getattr(args, "game_motion_settings", None)
+    keyboard_slow_speed = (
+        motion_settings.slow_speed_mps
+        if isinstance(motion_settings, MotionSettings)
+        else KEYBOARD_GAIT_TARGETS_MPS[SONIC_SLOW_WALK_MODE]
+    )
+    keyboard_walk_speed = (
+        motion_settings.walk_speed_mps
+        if isinstance(motion_settings, MotionSettings)
+        else KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE]
+    )
+    keyboard_run_speed = (
+        motion_settings.run_speed_mps
+        if isinstance(motion_settings, MotionSettings)
+        else KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE]
+    )
     return {
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
@@ -1546,22 +1572,50 @@ def _game_control_status_fields(
         "native_gait_modes": {
             SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
         },
-        "keyboard_slow_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
-            SONIC_SLOW_WALK_MODE
-        ],
-        "keyboard_walk_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE],
-        "keyboard_run_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE],
+        "keyboard_slow_speed_mps": keyboard_slow_speed,
+        "keyboard_walk_speed_mps": keyboard_walk_speed,
+        "keyboard_run_speed_mps": keyboard_run_speed,
         # Preserve the historical status contract: maximum_speed_mps is the
         # configurable analog SLOW_WALK ceiling.  Keyboard tiers now have a
         # separate native RUN target and must not silently change that field.
         "maximum_speed_mps": args.game_max_speed,
         "analog_maximum_speed_mps": args.game_max_speed,
-        "keyboard_maximum_target_speed_mps": KEYBOARD_GAIT_TARGETS_MPS[
-            SONIC_RUN_MODE
-        ],
+        "keyboard_maximum_target_speed_mps": keyboard_run_speed,
         "maximum_acceleration_mps2": args.game_max_acceleration,
         "maximum_deceleration_mps2": args.game_max_deceleration,
-        "maximum_turn_rate_rad_s": args.game_max_turn_rate,
+        "maximum_turn_rate_rad_s": (
+            motion_settings.max_turn_rate_rad_s
+            if isinstance(motion_settings, MotionSettings)
+            else args.game_max_turn_rate
+        ),
+        "keyboard_turn_rate_rad_s": (
+            motion_settings.keyboard_turn_rate_rad_s
+            if isinstance(motion_settings, MotionSettings)
+            else 2.50
+        ),
+        "keyboard_turn_boost_rate_rad_s": (
+            motion_settings.keyboard_turn_boost_rate_rad_s
+            if isinstance(motion_settings, MotionSettings)
+            else 3.00
+        ),
+        "keyboard_camera_look_rate_deg_s": (
+            motion_settings.keyboard_look_rate_deg_s
+            if isinstance(motion_settings, MotionSettings)
+            else getattr(args, "game_keyboard_camera_look_rate_deg_s", 120.0)
+        ),
+        "motion_settings_file": (
+            os.fspath(args.game_motion_settings_file)
+            if getattr(args, "game_motion_settings_file", None) is not None
+            else None
+        ),
+        "motion_settings_load_status": getattr(
+            args, "game_motion_settings_load_status", "disabled"
+        ),
+        "motion_settings_revision": (
+            motion_settings.revision
+            if isinstance(motion_settings, MotionSettings)
+            else None
+        ),
         "stick_deadzone": args.game_stick_deadzone,
         "input_timeout_s": args.game_input_timeout,
         "maximum_snapshot_age_s": args.game_max_snapshot_age,
@@ -2592,8 +2646,13 @@ class NativeProcessGroup:
         status_file: Path | None,
         ue_camera_state_file: Path | None = None,
         mouse_settings_file: Path | None = None,
+        ui_settings_file: Path | None = None,
+        motion_settings_file: Path | None = None,
+        video_settings_file: Path | None = None,
+        applied_video_settings_json: str | None = None,
         applied_mouse_profile: str = "local",
         applied_mouse_speed_scale: float = 1.0,
+        keyboard_camera_look_rate_deg_s: float = 120.0,
         restart_request_file: Path | None = None,
         restart_capability_file: Path | None = None,
         restart_launcher_pid: int | None = None,
@@ -2619,6 +2678,8 @@ class NativeProcessGroup:
             applied_mouse_profile,
             "--applied-mouse-speed-scale",
             str(applied_mouse_speed_scale),
+            "--keyboard-camera-look-rate-deg-s",
+            str(keyboard_camera_look_rate_deg_s),
             "--camera-yaw-sign",
             str(camera_yaw_sign),
             "--camera-yaw-offset-deg",
@@ -2644,6 +2705,16 @@ class NativeProcessGroup:
         ]
         if mouse_settings_file is not None:
             command.extend(("--mouse-settings-file", str(mouse_settings_file)))
+        if ui_settings_file is not None:
+            command.extend(("--ui-settings-file", str(ui_settings_file)))
+        if motion_settings_file is not None:
+            command.extend(("--motion-settings-file", str(motion_settings_file)))
+        if video_settings_file is not None:
+            command.extend(("--video-settings-file", str(video_settings_file)))
+        if applied_video_settings_json is not None:
+            command.extend(
+                ("--applied-video-settings-json", applied_video_settings_json)
+            )
         if ue_camera_state_file is not None:
             command.extend(("--ue-camera-state-file", str(ue_camera_state_file)))
         restart_values = (
@@ -2840,6 +2911,13 @@ def main() -> int:
         ("game_world_state_file", None),
         ("game_world_checkpoint_seconds", 0.75),
         ("game_auto_respawn", False),
+        ("game_ui_settings_file", None),
+        ("game_motion_settings_file", None),
+        ("game_video_settings_file", None),
+        ("game_applied_video_settings_json", None),
+        ("game_keyboard_camera_look_rate_deg_s", 120.0),
+        ("game_motion_settings", None),
+        ("game_motion_settings_load_status", "disabled"),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -2871,12 +2949,69 @@ def main() -> int:
     if args.control_source == "game":
         if args.game_max_speed > 0.8:
             raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
+        motion_settings: MotionSettings | None = None
+        if args.game_motion_settings_file is not None:
+            if not args.game_motion_settings_file.is_absolute():
+                raise SystemExit("--game-motion-settings-file must be absolute")
+            try:
+                motion_settings_store = MotionSettingsStore(
+                    args.game_motion_settings_file
+                )
+                motion_settings = motion_settings_store.settings
+                args.game_motion_settings_load_status = (
+                    motion_settings_store.load_status
+                )
+                args.game_motion_settings = motion_settings
+                args.game_keyboard_camera_look_rate_deg_s = (
+                    motion_settings.keyboard_look_rate_deg_s
+                )
+            except (OSError, ValueError) as exc:
+                raise SystemExit(
+                    f"invalid game motion settings: {exc}"
+                ) from exc
+        else:
+            args.game_motion_settings_load_status = "disabled"
+            args.game_motion_settings = None
         try:
             game_config = ControlConfig(
                 max_speed_mps=args.game_max_speed,
                 max_acceleration_mps2=args.game_max_acceleration,
                 max_deceleration_mps2=args.game_max_deceleration,
-                max_turn_rate_rad_s=args.game_max_turn_rate,
+                max_turn_rate_rad_s=(
+                    motion_settings.max_turn_rate_rad_s
+                    if motion_settings is not None
+                    else args.game_max_turn_rate
+                ),
+                keyboard_turn_rate_rad_s=(
+                    motion_settings.keyboard_turn_rate_rad_s
+                    if motion_settings is not None
+                    else 2.50
+                ),
+                keyboard_turn_boost_rate_rad_s=(
+                    motion_settings.keyboard_turn_boost_rate_rad_s
+                    if motion_settings is not None
+                    else 3.00
+                ),
+                keyboard_slow_speed_mps=(
+                    motion_settings.slow_speed_mps
+                    if motion_settings is not None
+                    else KEYBOARD_GAIT_TARGETS_MPS[SONIC_SLOW_WALK_MODE]
+                ),
+                keyboard_walk_speed_mps=(
+                    motion_settings.walk_speed_mps
+                    if motion_settings is not None
+                    else KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE]
+                ),
+                keyboard_run_speed_mps=(
+                    motion_settings.run_speed_mps
+                    if motion_settings is not None
+                    else KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE]
+                ),
+                movement_mode=(
+                    motion_settings.movement_mode
+                    if motion_settings is not None
+                    else "camera_face"
+                ),
                 stick_deadzone=args.game_stick_deadzone,
                 input_timeout_s=args.game_input_timeout,
                 max_snapshot_age_s=args.game_max_snapshot_age,
@@ -2900,6 +3035,7 @@ def main() -> int:
             "gamepad_look_deadzone",
             "gamepad_look_min_pitch_deg",
             "gamepad_look_max_pitch_deg",
+            "game_keyboard_camera_look_rate_deg_s",
         ):
             if not math.isfinite(getattr(args, name)):
                 raise SystemExit(f"--{name.replace('_', '-')} must be finite")
@@ -2908,8 +3044,9 @@ def main() -> int:
         if (
             args.gamepad_look_yaw_rate_deg_s <= 0.0
             or args.gamepad_look_pitch_rate_deg_s <= 0.0
+            or args.game_keyboard_camera_look_rate_deg_s <= 0.0
         ):
-            raise SystemExit("gamepad look rates must be positive")
+            raise SystemExit("gamepad and keyboard look rates must be positive")
         if not 0.0 <= args.gamepad_look_deadzone < 1.0:
             raise SystemExit("--gamepad-look-deadzone must be in [0, 1)")
         if args.gamepad_look_min_pitch_deg >= args.gamepad_look_max_pitch_deg:
@@ -2932,6 +3069,25 @@ def main() -> int:
             and not args.game_mouse_settings_file.is_absolute()
         ):
             raise SystemExit("--game-mouse-settings-file must be absolute")
+        for name in (
+            "game_ui_settings_file",
+            "game_motion_settings_file",
+            "game_video_settings_file",
+        ):
+            path = getattr(args, name)
+            if path is not None and not path.is_absolute():
+                raise SystemExit(f"--{name.replace('_', '-')} must be absolute")
+        if args.game_applied_video_settings_json is not None:
+            try:
+                value = json.loads(args.game_applied_video_settings_json)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(
+                    "--game-applied-video-settings-json must be JSON"
+                ) from exc
+            if not isinstance(value, dict):
+                raise SystemExit(
+                    "--game-applied-video-settings-json must be a JSON object"
+                )
         if args.game_camera_yaw_source == "ue-final-pov":
             if args.game_ue_camera_state_file is None:
                 raise SystemExit(
@@ -3246,9 +3402,18 @@ def main() -> int:
                         initial_camera_yaw_deg=args.game_initial_camera_yaw_deg,
                         mouse_sensitivity_deg=args.game_mouse_sensitivity_deg,
                         mouse_settings_file=args.game_mouse_settings_file,
+                        ui_settings_file=args.game_ui_settings_file,
+                        motion_settings_file=args.game_motion_settings_file,
+                        video_settings_file=args.game_video_settings_file,
+                        applied_video_settings_json=(
+                            args.game_applied_video_settings_json
+                        ),
                         applied_mouse_profile=args.game_applied_mouse_profile,
                         applied_mouse_speed_scale=(
                             args.game_applied_mouse_speed_scale
+                        ),
+                        keyboard_camera_look_rate_deg_s=(
+                            args.game_keyboard_camera_look_rate_deg_s
                         ),
                         restart_request_file=args.game_restart_request_file,
                         restart_capability_file=(

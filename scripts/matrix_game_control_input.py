@@ -47,6 +47,30 @@ from matrix_mouse_settings import (
     load_settings,
     step_remote_speed_scale,
 )
+from matrix_motion_settings import (
+    GEAR_RUN,
+    GEAR_SLOW,
+    GEAR_WALK,
+    KEYBOARD_LOOK_RATE_PATH,
+    KEYBOARD_TURN_RATE_PATH,
+    MotionSettings,
+    MotionSettingsError,
+    MotionSettingsPersistenceError,
+    MotionSettingsStore,
+    SPEED_FIELD,
+)
+from matrix_ui_settings import (
+    UiSettings,
+    atomic_save_settings as atomic_save_ui_settings,
+    load_settings_with_legacy_fallback as load_ui_settings,
+    step_font_size,
+)
+from matrix_video_settings import (
+    CAMERA_DISTANCE_CM_FIELD,
+    VideoSettingsError,
+    VideoSettingsPersistenceError,
+    VideoSettingsStore,
+)
 from matrix_restart_request import (
     RestartRequest,
     atomic_write_request,
@@ -89,6 +113,46 @@ DEFAULT_SOCKET = Path(
         ),
     )
 )
+
+_MOTION_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
+    "motion_slow_speed_down": (
+        f"control.motion.gears.{GEAR_SLOW}.{SPEED_FIELD}",
+        -1,
+    ),
+    "motion_slow_speed_up": (
+        f"control.motion.gears.{GEAR_SLOW}.{SPEED_FIELD}",
+        1,
+    ),
+    "motion_walk_speed_down": (
+        f"control.motion.gears.{GEAR_WALK}.{SPEED_FIELD}",
+        -1,
+    ),
+    "motion_walk_speed_up": (
+        f"control.motion.gears.{GEAR_WALK}.{SPEED_FIELD}",
+        1,
+    ),
+    "motion_run_speed_down": (
+        f"control.motion.gears.{GEAR_RUN}.{SPEED_FIELD}",
+        -1,
+    ),
+    "motion_run_speed_up": (
+        f"control.motion.gears.{GEAR_RUN}.{SPEED_FIELD}",
+        1,
+    ),
+    "motion_turn_rate_down": (KEYBOARD_TURN_RATE_PATH, -1),
+    "motion_turn_rate_up": (KEYBOARD_TURN_RATE_PATH, 1),
+    "motion_look_rate_down": (KEYBOARD_LOOK_RATE_PATH, -1),
+    "motion_look_rate_up": (KEYBOARD_LOOK_RATE_PATH, 1),
+}
+_VIDEO_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
+    "video_camera_distance_down": (CAMERA_DISTANCE_CM_FIELD, -1),
+    "video_camera_distance_up": (CAMERA_DISTANCE_CM_FIELD, 1),
+}
+_MOVEMENT_MODE_ACTIONS = frozenset(
+    f"movement_mode_{movement_mode}"
+    for movement_mode in ("camera_face", "camera_strafe", "body_relative")
+)
+_UI_PANEL_ACTIONS = frozenset({"font_down", "font_up"})
 _JS_EVENT = struct.Struct("IhBB")
 _JS_EVENT_BUTTON = 0x01
 _JS_EVENT_AXIS = 0x02
@@ -365,6 +429,113 @@ class MouseSettingsController:
             "persistence_error": self.persistence_error,
             "change_count": self.change_count,
         }
+
+
+class UiSettingsController:
+    """Persist operator-facing UI settings from the ESC overlay."""
+
+    def __init__(
+        self,
+        *,
+        path: Path | None,
+        desired: UiSettings,
+        load_status: str,
+        load_error: str | None,
+    ) -> None:
+        self.path = path
+        self.desired = desired
+        self.load_status = load_status
+        self.persistence_error = load_error
+        self.change_count = 0
+
+    def apply_panel_action(self, action: str, *, active: bool) -> bool:
+        if not active or action not in _UI_PANEL_ACTIONS:
+            return False
+        direction = -1 if action == "font_down" else 1
+        replacement = UiSettings(
+            font_scale=self.desired.font_scale,
+            font_size=step_font_size(self.desired.font_size, direction),
+        )
+        if replacement == self.desired:
+            return False
+        self.desired = replacement
+        self.change_count += 1
+        if self.path is None:
+            self.persistence_error = "UI settings file is unavailable"
+            return True
+        try:
+            atomic_save_ui_settings(self.path, replacement)
+            self.persistence_error = None
+            self.load_status = "saved"
+        except (OSError, ValueError) as exc:
+            self.persistence_error = str(exc)
+        return True
+
+    def live_mapping(self) -> dict[str, object]:
+        return {
+            "settings_file": os.fspath(self.path) if self.path is not None else None,
+            "font_scale": self.desired.font_scale,
+            "font_size": self.desired.font_size,
+            "load_status": self.load_status,
+            "persistence_error": self.persistence_error,
+            "change_count": self.change_count,
+        }
+
+
+def motion_settings_live_mapping(
+    store: MotionSettingsStore | None,
+    *,
+    applied: MotionSettings | None,
+    change_count: int,
+    persistence_error: str | None,
+) -> dict[str, object]:
+    if store is None:
+        return {"available": False, "pending_restart": False}
+    mapping = store.mapping()
+    mapping.update(
+        {
+            "available": True,
+            "pending_restart": (
+                applied is not None and store.settings != applied
+            ),
+            "persistence_error": persistence_error,
+            "change_count": change_count,
+        }
+    )
+    return mapping
+
+
+def video_settings_live_mapping(
+    store: VideoSettingsStore | None,
+    *,
+    applied_runtime: dict[str, object] | None,
+    change_count: int,
+    persistence_error: str | None,
+) -> dict[str, object]:
+    if store is None:
+        return {"available": False, "pending_restart": False}
+    mapping = store.mapping()
+    pending_restart = False
+    if applied_runtime is not None:
+        pending_restart = store.settings.runtime_mapping() != applied_runtime
+    mapping.update(
+        {
+            "available": True,
+            "current": applied_runtime or store.settings.runtime_mapping(),
+            "next_launch": store.settings.runtime_mapping(),
+            "pending_restart": pending_restart,
+            "persistence_error": persistence_error,
+            "change_count": change_count,
+        }
+    )
+    return mapping
+
+
+def first_settings_error(*values: str | None) -> str | None:
+    for value in values:
+        if value:
+            return value
+    return None
 
 
 class RuntimeRestartRequester:
@@ -3888,6 +4059,10 @@ class CalibrationOverlaySupervisor:
             "speed_up",
             "apply_return",
         }
+        | _MOVEMENT_MODE_ACTIONS
+        | set(_MOTION_PANEL_ACTIONS)
+        | set(_VIDEO_PANEL_ACTIONS)
+        | _UI_PANEL_ACTIONS
     )
 
     def __init__(
@@ -4243,6 +4418,13 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=default_settings_file(),
     )
+    parser.add_argument("--ui-settings-file", type=Path)
+    parser.add_argument("--motion-settings-file", type=Path)
+    parser.add_argument("--video-settings-file", type=Path)
+    parser.add_argument(
+        "--applied-video-settings-json",
+        help="Launcher-applied video settings JSON for pending-restart display",
+    )
     parser.add_argument(
         "--applied-mouse-profile",
         choices=(PROFILE_LOCAL, PROFILE_REMOTE),
@@ -4344,6 +4526,21 @@ def _validate_args(args: argparse.Namespace) -> None:
             )
     if not args.mouse_settings_file.is_absolute():
         raise SystemExit("--mouse-settings-file must be absolute")
+    for name in (
+        "ui_settings_file",
+        "motion_settings_file",
+        "video_settings_file",
+    ):
+        path = getattr(args, name)
+        if path is not None and not path.is_absolute():
+            raise SystemExit(f"--{name.replace('_', '-')} must be absolute")
+    if args.applied_video_settings_json is not None:
+        try:
+            value = json.loads(args.applied_video_settings_json)
+        except json.JSONDecodeError as exc:
+            raise SystemExit("--applied-video-settings-json must be JSON") from exc
+        if not isinstance(value, dict):
+            raise SystemExit("--applied-video-settings-json must be a JSON object")
     try:
         AppliedMouseSettings(
             profile=args.applied_mouse_profile,
@@ -4402,6 +4599,57 @@ def main() -> int:
         load_status=loaded_mouse.status,
         load_error=loaded_mouse.error,
     )
+    if args.ui_settings_file is None:
+        ui_settings = UiSettingsController(
+            path=None,
+            desired=UiSettings(),
+            load_status="disabled",
+            load_error=None,
+        )
+    else:
+        loaded_ui = load_ui_settings(args.ui_settings_file)
+        ui_settings = UiSettingsController(
+            path=args.ui_settings_file,
+            desired=loaded_ui.settings,
+            load_status=loaded_ui.status,
+            load_error=loaded_ui.error,
+        )
+    motion_store: MotionSettingsStore | None = None
+    applied_motion: MotionSettings | None = None
+    motion_settings_change_count = 0
+    motion_settings_error: str | None = None
+    if args.motion_settings_file is not None:
+        try:
+            motion_store = MotionSettingsStore(args.motion_settings_file)
+            applied_motion = motion_store.settings
+        except (
+            MotionSettingsError,
+            MotionSettingsPersistenceError,
+            OSError,
+            ValueError,
+        ) as exc:
+            motion_settings_error = str(exc)
+    video_store: VideoSettingsStore | None = None
+    applied_video_runtime: dict[str, object] | None = None
+    video_settings_change_count = 0
+    video_settings_error: str | None = None
+    if args.video_settings_file is not None:
+        try:
+            video_store = VideoSettingsStore(args.video_settings_file)
+            if args.applied_video_settings_json is not None:
+                decoded_video = json.loads(args.applied_video_settings_json)
+                if isinstance(decoded_video, dict):
+                    applied_video_runtime = dict(decoded_video)
+            if applied_video_runtime is None:
+                applied_video_runtime = video_store.settings.runtime_mapping()
+        except (
+            VideoSettingsError,
+            VideoSettingsPersistenceError,
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            video_settings_error = str(exc)
     restart_requester = RuntimeRestartRequester(
         request_file=args.restart_request_file,
         capability_file=args.restart_capability_file,
@@ -4535,7 +4783,11 @@ def main() -> int:
     last_teleport_rejections = 0
     calibration_neutral_frames = 0
     final_pov_observation: UeFinalPovObservation | None = None
-    current_movement_mode = DEFAULT_MOVEMENT_MODE
+    current_movement_mode = (
+        motion_store.settings.movement_mode
+        if motion_store is not None
+        else DEFAULT_MOVEMENT_MODE
+    )
     provider_yaw = tracker.yaw
     camera_yaw = transform_camera_yaw(
         provider_yaw,
@@ -4557,6 +4809,19 @@ def main() -> int:
                 {
                     **source_claim,
                     "mouse_settings": mouse_settings.live_mapping(applied_mouse),
+                    "ui_settings": ui_settings.live_mapping(),
+                    "motion_settings": motion_settings_live_mapping(
+                        motion_store,
+                        applied=applied_motion,
+                        change_count=motion_settings_change_count,
+                        persistence_error=motion_settings_error,
+                    ),
+                    "video_settings": video_settings_live_mapping(
+                        video_store,
+                        applied_runtime=applied_video_runtime,
+                        change_count=video_settings_change_count,
+                        persistence_error=video_settings_error,
+                    ),
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "command_console": game_command_client.mapping(),
@@ -4696,24 +4961,110 @@ def main() -> int:
                 slower_pressed=raw_keyboard.mouse_speed_down,
                 faster_pressed=raw_keyboard.mouse_speed_up,
             )
+            ui_settings_changed = False
+            motion_settings_changed = False
+            video_settings_changed = False
+            settings_action_active = bool(
+                calibration.active
+                and not restart_requester.requested
+                and not command_controls_blocked
+            )
             for panel_action in panel_actions:
-                mouse_settings_changed = bool(
-                    mouse_settings.apply_panel_action(
-                        panel_action,
-                        active=(
-                            calibration.active
-                            and not restart_requester.requested
-                            and not command_controls_blocked
-                        ),
+                if panel_action in {
+                    "profile_local",
+                    "profile_remote",
+                    "speed_down",
+                    "speed_up",
+                }:
+                    mouse_settings_changed = bool(
+                        mouse_settings.apply_panel_action(
+                            panel_action,
+                            active=settings_action_active,
+                        )
+                        or mouse_settings_changed
                     )
-                    or mouse_settings_changed
-                )
+                elif panel_action in _UI_PANEL_ACTIONS:
+                    ui_settings_changed = bool(
+                        ui_settings.apply_panel_action(
+                            panel_action,
+                            active=settings_action_active,
+                        )
+                        or ui_settings_changed
+                    )
+                elif panel_action in _MOTION_PANEL_ACTIONS:
+                    if settings_action_active and motion_store is not None:
+                        path, direction = _MOTION_PANEL_ACTIONS[panel_action]
+                        try:
+                            modification = motion_store.step(path, direction)
+                            motion_settings_error = None
+                            if modification.changed:
+                                motion_settings_change_count += 1
+                            motion_settings_changed = True
+                        except (
+                            MotionSettingsError,
+                            MotionSettingsPersistenceError,
+                            OSError,
+                            ValueError,
+                        ) as exc:
+                            motion_settings_error = str(exc)
+                            motion_settings_changed = True
+                elif panel_action in _VIDEO_PANEL_ACTIONS:
+                    if settings_action_active and video_store is not None:
+                        field, direction = _VIDEO_PANEL_ACTIONS[panel_action]
+                        try:
+                            modification = video_store.step(field, direction)
+                            video_settings_error = None
+                            if modification.changed:
+                                video_settings_change_count += 1
+                            video_settings_changed = True
+                        except (
+                            VideoSettingsError,
+                            VideoSettingsPersistenceError,
+                            OSError,
+                            ValueError,
+                        ) as exc:
+                            video_settings_error = str(exc)
+                            video_settings_changed = True
+                elif panel_action in _MOVEMENT_MODE_ACTIONS:
+                    if settings_action_active:
+                        movement_mode = panel_action.removeprefix("movement_mode_")
+                        try:
+                            movement_mode = validate_movement_mode(movement_mode)
+                        except ValueError:
+                            continue
+                        command_state_changed = bool(
+                            game_command_client.set_movement_mode(movement_mode)
+                            or command_state_changed
+                        )
+                        if game_command_client.in_flight:
+                            current_movement_mode = movement_mode
+                        apply_return.cancel_pending()
+            motion_pending_restart = bool(
+                motion_store is not None
+                and applied_motion is not None
+                and motion_store.settings != applied_motion
+            )
+            video_pending_restart = bool(
+                video_store is not None
+                and applied_video_runtime is not None
+                and video_store.settings.runtime_mapping() != applied_video_runtime
+            )
+            settings_pending_restart = bool(
+                mouse_settings.pending_restart(applied_mouse)
+                or motion_pending_restart
+                or video_pending_restart
+            )
+            settings_persistence_error = first_settings_error(
+                mouse_settings.persistence_error,
+                motion_settings_error,
+                video_settings_error,
+            )
             restart_requested = apply_restart_key.update(
                 pressed=raw_keyboard.apply_restart,
                 calibration_active=keyboard_panel_active,
                 neutral_frame_ready=neutral_frame_ready,
-                pending_restart=mouse_settings.pending_restart(applied_mouse),
-                persistence_ok=mouse_settings.persistence_error is None,
+                pending_restart=settings_pending_restart,
+                persistence_ok=settings_persistence_error is None,
                 requester=restart_requester,
             )
             left_calibration, ui_restart_requested = apply_return.update(
@@ -4729,8 +5080,8 @@ def main() -> int:
                     neutral_frame_ready
                     and not command_controls_blocked
                 ),
-                pending_restart=mouse_settings.pending_restart(applied_mouse),
-                persistence_error=mouse_settings.persistence_error,
+                pending_restart=settings_pending_restart,
+                persistence_error=settings_persistence_error,
                 requester=restart_requester,
             )
             restart_requested = restart_requested or ui_restart_requested
@@ -4865,6 +5216,9 @@ def main() -> int:
                     or bool(panel_intents)
                     or command_state_changed
                     or mouse_settings_changed
+                    or ui_settings_changed
+                    or motion_settings_changed
+                    or video_settings_changed
                     or restart_requested
                     or teleport_rejections != last_teleport_rejections
                     or now >= next_overlay_heartbeat
@@ -4882,6 +5236,19 @@ def main() -> int:
                             "neutral_frames": calibration_neutral_frames,
                             "mouse_settings": mouse_settings.live_mapping(
                                 applied_mouse
+                            ),
+                            "ui_settings": ui_settings.live_mapping(),
+                            "motion_settings": motion_settings_live_mapping(
+                                motion_store,
+                                applied=applied_motion,
+                                change_count=motion_settings_change_count,
+                                persistence_error=motion_settings_error,
+                            ),
+                            "video_settings": video_settings_live_mapping(
+                                video_store,
+                                applied_runtime=applied_video_runtime,
+                                change_count=video_settings_change_count,
+                                persistence_error=video_settings_error,
                             ),
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
@@ -4987,6 +5354,19 @@ def main() -> int:
                 "requested_input_source": args.input_source,
                 "effective_input_source": input_source,
                 "mouse_settings": mouse_settings.live_mapping(applied_mouse),
+                "ui_settings": ui_settings.live_mapping(),
+                "motion_settings": motion_settings_live_mapping(
+                    motion_store,
+                    applied=applied_motion,
+                    change_count=motion_settings_change_count,
+                    persistence_error=motion_settings_error,
+                ),
+                "video_settings": video_settings_live_mapping(
+                    video_store,
+                    applied_runtime=applied_video_runtime,
+                    change_count=video_settings_change_count,
+                    persistence_error=video_settings_error,
+                ),
                 "mirror_sensitivity": sensitivity_telemetry,
                 "camera_yaw": camera_yaw_telemetry(
                     args.camera_yaw_source,

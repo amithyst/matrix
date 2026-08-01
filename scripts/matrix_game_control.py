@@ -405,14 +405,20 @@ def native_locomotion_mode_for_speed(
 class ControlConfig:
     """Tuning and safety limits for :class:`GameControlCore`."""
 
-    # This is the analog cap; keyboard targets are the fixed native gait
-    # boundaries in KEYBOARD_GAIT_TARGETS_MPS.
+    # This is the analog cap; keyboard targets default to the native gait
+    # boundaries in KEYBOARD_GAIT_TARGETS_MPS and may be overridden by
+    # host-scoped motion settings.
     max_speed_mps: float = DEFAULT_ANALOG_MAX_SPEED_MPS
     max_acceleration_mps2: float = 1.20
     max_deceleration_mps2: float = 2.40
     max_turn_rate_rad_s: float = 2.50
     keyboard_turn_rate_rad_s: float = 2.50
     keyboard_turn_boost_rate_rad_s: float = 3.00
+    keyboard_slow_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[
+        SONIC_SLOW_WALK_MODE
+    ]
+    keyboard_walk_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE]
+    keyboard_run_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE]
     movement_mode: str = DEFAULT_MOVEMENT_MODE
     min_gait_speed_mps: float = 0.10
     gait_start_speed_mps: float = 0.10
@@ -434,6 +440,9 @@ class ControlConfig:
             "max_turn_rate_rad_s",
             "keyboard_turn_rate_rad_s",
             "keyboard_turn_boost_rate_rad_s",
+            "keyboard_slow_speed_mps",
+            "keyboard_walk_speed_mps",
+            "keyboard_run_speed_mps",
             "min_gait_speed_mps",
             "gait_start_speed_mps",
             "gait_stop_speed_mps",
@@ -462,6 +471,23 @@ class ControlConfig:
             raise ValueError(
                 "max_speed_mps cannot exceed native SLOW_WALK maximum 0.80"
             )
+        keyboard_speed_specs = (
+            (
+                "keyboard_slow_speed_mps",
+                SONIC_SLOW_WALK_MODE,
+            ),
+            ("keyboard_walk_speed_mps", SONIC_WALK_MODE),
+            ("keyboard_run_speed_mps", SONIC_RUN_MODE),
+        )
+        for name, native_mode in keyboard_speed_specs:
+            value = getattr(self, name)
+            minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[native_mode]
+            if not minimum <= value <= maximum:
+                raise ValueError(
+                    f"{name} must be inside native "
+                    f"{SONIC_GAIT_NAMES[native_mode]} range "
+                    f"[{minimum:.2f}, {maximum:.2f}]"
+                )
         slow_walk_min = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][0]
         if not (
             self.gait_stop_speed_mps < self.min_gait_speed_mps
@@ -811,12 +837,12 @@ class GameControlCore:
         if digital_movement:
             if keys.ctrl or keys.alt:
                 requested_mode = SONIC_SLOW_WALK_MODE
-                return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
+                return (self.config.keyboard_slow_speed_mps, requested_mode)
             if keys.shift:
                 requested_mode = SONIC_RUN_MODE
-                return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
+                return (self.config.keyboard_run_speed_mps, requested_mode)
             requested_mode = SONIC_WALK_MODE
-            return (KEYBOARD_GAIT_TARGETS_MPS[requested_mode], requested_mode)
+            return (self.config.keyboard_walk_speed_mps, requested_mode)
         # Treat the deadzone-remapped stick magnitude like a native analog
         # gait command: the first non-zero intent starts at SONIC's minimum
         # feasible gait, then the rest of the stick travel spans the full
