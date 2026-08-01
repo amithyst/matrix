@@ -38,7 +38,7 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(settings.run_speed_mps, 2.50)
         self.assertEqual(settings.run_double_tap_speed_mps, 2.75)
         self.assertEqual(settings.max_turn_rate_rad_s, 2.50)
-        self.assertEqual(settings.keyboard_turn_rate_rad_s, 2.50)
+        self.assertEqual(settings.keyboard_turn_rate_rad_s, 1.50)
         self.assertEqual(settings.keyboard_turn_boost_rate_rad_s, 3.00)
         self.assertEqual(settings.keyboard_look_rate_deg_s, 120.0)
         self.assertEqual(settings.movement_mode, "camera_face")
@@ -400,7 +400,7 @@ class MotionSettingsStepTest(unittest.TestCase):
             (path("run", "speed_mps"), 1, 2.50),
             (path("run", "double_tap_speed_mps"), 1, 3.00),
             (MODULE.MAX_TURN_RATE_PATH, -1, 2.25),
-            (MODULE.KEYBOARD_TURN_RATE_PATH, 1, 2.75),
+            (MODULE.KEYBOARD_TURN_RATE_PATH, 1, 1.75),
             (MODULE.KEYBOARD_TURN_BOOST_RATE_PATH, -1, 2.75),
             (MODULE.KEYBOARD_LOOK_RATE_PATH, 1, 150.0),
         )

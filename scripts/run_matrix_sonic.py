@@ -1596,7 +1596,7 @@ def _game_control_status_fields(
         "keyboard_turn_rate_rad_s": (
             motion_settings.keyboard_turn_rate_rad_s
             if isinstance(motion_settings, MotionSettings)
-            else 2.50
+            else 1.50
         ),
         "keyboard_turn_boost_rate_rad_s": (
             motion_settings.keyboard_turn_boost_rate_rad_s
@@ -3019,7 +3019,7 @@ def main() -> int:
                 keyboard_turn_rate_rad_s=(
                     motion_settings.keyboard_turn_rate_rad_s
                     if motion_settings is not None
-                    else 2.50
+                    else 1.50
                 ),
                 keyboard_turn_boost_rate_rad_s=(
                     motion_settings.keyboard_turn_boost_rate_rad_s

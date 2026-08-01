@@ -211,6 +211,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(config.max_acceleration_mps2, 1.20)
         self.assertEqual(config.max_deceleration_mps2, 2.40)
         self.assertEqual(config.max_turn_rate_rad_s, 2.50)
+        self.assertEqual(config.keyboard_turn_rate_rad_s, 1.50)
 
     def test_gait_configuration_cannot_make_slow_tier_unreachable(self) -> None:
         with self.assertRaisesRegex(ValueError, "minimum == start"):
@@ -508,7 +509,34 @@ class GameControlCoreTest(unittest.TestCase):
             self.assertEqual(command.reason, "manual_yaw")
             self.assertEqual(command.movement, (0.0, 0.0, 0.0))
             self.assertEqual(command.speed_mps, 0.0)
-            self.assertEqual(command.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+            expected_heading = 0.15 if key == "q" else -0.15
+            self.assertAlmostEqual(
+                math.atan2(command.facing[1], command.facing[0]),
+                expected_heading,
+            )
+
+    def test_q_and_e_match_pico_right_stick_yaw_accumulator_with_feedback(self) -> None:
+        core = armed_core(immediate_config())
+        core.synchronize_heading(0.0)
+
+        headings = []
+        for sequence in range(1, 4):
+            now = 10.0 + sequence * 0.02
+            core.accept_snapshot(
+                snapshot(sequence=sequence, timestamp=now, pressed=("q",)),
+                received_at_s=now,
+            )
+            command = core.command(now_s=now, dt_s=0.02)
+            headings.append(math.atan2(command.facing[1], command.facing[0]))
+            self.assertEqual(command.mode, "turn")
+            self.assertEqual(command.reason, "manual_yaw")
+            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+
+        self.assertEqual(
+            [round(value, 6) for value in headings],
+            [0.03, 0.06, 0.09],
+        )
 
     def test_turn_and_acceleration_are_rate_limited(self) -> None:
         config = MODULE.ControlConfig(

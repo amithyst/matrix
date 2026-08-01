@@ -100,7 +100,8 @@ def _require_exact_keys(
 class KeySnapshot:
     """Current key state, including keyboard-only speed modifiers.
 
-    Q/E are carried for future actions but never contribute to locomotion.
+    Q/E are keyboard aliases for Pico's right-stick yaw.  They continuously
+    accumulate a facing target while leaving translation neutral.
     Ctrl/Shift select a digital-WASD speed tier; they do not quantize gamepad
     input, whose magnitude remains continuous.
     """
@@ -355,6 +356,7 @@ KEYBOARD_GAIT_TARGETS_MPS = {
     SONIC_RUN_MODE: 2.50,
 }
 DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
+PICO_RIGHT_STICK_YAW_GAIN_RAD_S = 1.50
 # A feedback-backed facing target may lead the measured body by at most one
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
 # per-command cap even if a caller supplies a larger dt or tuning rate.
@@ -412,7 +414,7 @@ class ControlConfig:
     max_acceleration_mps2: float = 1.20
     max_deceleration_mps2: float = 2.40
     max_turn_rate_rad_s: float = 2.50
-    keyboard_turn_rate_rad_s: float = 2.50
+    keyboard_turn_rate_rad_s: float = PICO_RIGHT_STICK_YAW_GAIN_RAD_S
     keyboard_turn_boost_rate_rad_s: float = 3.00
     keyboard_slow_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[
         SONIC_SLOW_WALK_MODE
@@ -1004,23 +1006,17 @@ class GameControlCore:
                 if keys.shift
                 else self.config.keyboard_turn_rate_rad_s
             )
-            maximum_delta = turn_rate * dt
-            if self._measured_heading_rad is None:
-                self._command_heading_rad = wrap_angle_rad(
-                    self._command_heading_rad + turn_sign * maximum_delta
-                )
-            else:
-                requested_heading = wrap_angle_rad(
-                    self._command_heading_rad + turn_sign * maximum_delta
-                )
-                requested_error = wrap_angle_rad(
-                    requested_heading - self._measured_heading_rad
-                )
-                maximum_delta = min(maximum_delta, MAX_MEASURED_FACING_LEAD_RAD)
-                bounded_error = max(-maximum_delta, min(maximum_delta, requested_error))
-                self._command_heading_rad = wrap_angle_rad(
-                    self._measured_heading_rad + bounded_error
-                )
+            # Match Pico's right-stick planner loop: accumulate yaw from the
+            # operator input itself (dyaw = yaw_gain * axis * dt) and publish the
+            # resulting facing even when there is no translational movement.
+            # Feedback-limiting this path makes an unresponsive body keep
+            # re-sending only a tiny measured-yaw lead, which feels like Q/E did
+            # not turn at all.  Releasing Q/E still latches back to measured yaw
+            # through the neutral/idle path below, so stale open-loop targets do
+            # not survive key-up.
+            self._command_heading_rad = wrap_angle_rad(
+                self._command_heading_rad + turn_sign * turn_rate * dt
+            )
             desired_heading = self._command_heading_rad
             target_speed = 0.0
         else:
@@ -1147,13 +1143,18 @@ class GameControlCore:
             or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
         if turning_to_heading:
-            # Keep turn-before-translation semantics while selecting SONIC's
-            # locomotion manifold immediately.  A stationary SLOW_WALK request
-            # lets the native planner rotate toward ``facing`` without first
-            # driving the post-recovery IDLE policy into a saturated waist
-            # pose.  Translation remains exactly zero until both command and
-            # measured heading pass the existing alignment gate.
-            locomotion_mode = SONIC_SLOW_WALK_MODE
+            if manual_turn:
+                # Pico sends a new facing target in native IDLE when only the
+                # right stick is deflected.  Q/E should hit that same deploy
+                # path instead of the Matrix-specific stationary SLOW_WALK
+                # alignment mode.
+                locomotion_mode = SONIC_IDLE_MODE
+            else:
+                # Keep turn-before-translation semantics while selecting
+                # SONIC's locomotion manifold immediately.  A stationary
+                # SLOW_WALK request lets the native planner rotate toward
+                # ``facing`` before translation starts.
+                locomotion_mode = SONIC_SLOW_WALK_MODE
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=movement_direction if moving else (0.0, 0.0, 0.0),
