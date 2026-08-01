@@ -554,7 +554,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(math.atan2(command.facing[1], command.facing[0]), 0.1)
         self.assertEqual(command.speed_mps, 0.0)
         self.assertEqual(command.mode, "turn")
-        self.assertEqual(command.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(command.movement, (0.0, 0.0, 0.0))
 
         core.accept_snapshot(
@@ -567,9 +567,7 @@ class GameControlCoreTest(unittest.TestCase):
             0.2,
         )
         self.assertEqual(still_turning.mode, "turn")
-        self.assertEqual(
-            still_turning.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
-        )
+        self.assertEqual(still_turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(still_turning.movement, (0.0, 0.0, 0.0))
 
         forward = armed_core(config)
@@ -588,7 +586,7 @@ class GameControlCoreTest(unittest.TestCase):
         turning = core.command(now_s=10.0, dt_s=0.1)
 
         self.assertEqual(turning.mode, "turn")
-        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(turning.speed_mps, 0.0)
         self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
         self.assertAlmostEqual(
@@ -695,7 +693,7 @@ class GameControlCoreTest(unittest.TestCase):
         )
         turning = core.command(now_s=10.01, dt_s=0.02)
         self.assertEqual(turning.mode, "turn")
-        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(turning.speed_mps, 0.0)
         self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
 
@@ -922,9 +920,7 @@ class GameControlCoreTest(unittest.TestCase):
         )
         turn_only = turning.command(now_s=10.0, dt_s=0.1)
         self.assertEqual(turn_only.mode, "turn")
-        self.assertEqual(
-            turn_only.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE
-        )
+        self.assertEqual(turn_only.locomotion_mode, MODULE.SONIC_IDLE_MODE)
         self.assertEqual(turn_only.speed_mps, 0.0)
         self.assertEqual(turn_only.movement, (0.0, 0.0, 0.0))
 

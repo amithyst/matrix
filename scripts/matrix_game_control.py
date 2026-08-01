@@ -1150,11 +1150,14 @@ class GameControlCore:
                 # alignment mode.
                 locomotion_mode = SONIC_IDLE_MODE
             else:
-                # Keep turn-before-translation semantics while selecting
-                # SONIC's locomotion manifold immediately.  A stationary
-                # SLOW_WALK request lets the native planner rotate toward
-                # ``facing`` before translation starts.
-                locomotion_mode = SONIC_SLOW_WALK_MODE
+                # Camera-face auto-alignment is the same operator intent as a
+                # Pico right-stick yaw while the left stick is already asking
+                # for forward motion: turn the body to the requested facing
+                # first, then allow translation once the measured heading enters
+                # the gait start gate.  Native IDLE is the proven yaw manifold
+                # for this policy; the stationary SLOW_WALK variant can stall
+                # far outside the 15-degree start gate on the packaged runtime.
+                locomotion_mode = SONIC_IDLE_MODE
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=movement_direction if moving else (0.0, 0.0, 0.0),
