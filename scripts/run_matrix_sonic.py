@@ -48,6 +48,7 @@ from matrix_mc_commands import (
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
+    MovementModeSet,
     decode_command_request,
     encode_command_response,
     execute_command,
@@ -2211,10 +2212,16 @@ class GameInputRuntime:
 class GameCommandRuntime:
     """Execute typed ESC-panel commands over one inherited private socketpair."""
 
-    def __init__(self, connection: socket.socket, world: _GameWorldStateRuntime) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        world: _GameWorldStateRuntime | None,
+        core: GameControlCore | None = None,
+    ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
         self.world = world
+        self.core = core or GameControlCore()
         self.session: str | None = None
         self.last_sequence = 0
         self.request_ids: set[str] = set()
@@ -2277,7 +2284,13 @@ class GameCommandRuntime:
             self.request_ids = {request.request_id}
         return None
 
-    def poll(self, *, current_pose: WorldPose, command_allowed: bool) -> bool:
+    def poll(
+        self,
+        *,
+        current_pose: WorldPose,
+        command_allowed: bool,
+        movement_mode_allowed: bool = False,
+    ) -> bool:
         if self.restart_requested:
             return True
         for _ in range(16):
@@ -2313,6 +2326,56 @@ class GameCommandRuntime:
                         ok=False,
                         code="E_PROTOCOL_IDENTITY",
                         message=identity_error,
+                    )
+                )
+                continue
+            if isinstance(request.command, MovementModeSet):
+                if not (command_allowed or movement_mode_allowed):
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_NEUTRAL_REQUIRED",
+                            message=(
+                                "Movement mode changes require neutral input "
+                                "or the ESC safety panel"
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    changed = self.core.set_movement_mode(
+                        request.command.movement_mode,
+                        neutral_authorized=command_allowed,
+                    )
+                except ValueError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_MOVEMENT_MODE_BOUNDARY",
+                            message=str(exc),
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                mode = self.core.movement_mode
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=(
+                            "OK_MOVEMENT_MODE_CHANGED"
+                            if changed
+                            else "OK_MOVEMENT_MODE_UNCHANGED"
+                        ),
+                        message=f"Movement mode is {mode}",
+                        data={
+                            "movement_mode": mode,
+                            "movement_mode_mapping": self.core.movement_mode_mapping(),
+                        },
                     )
                 )
                 continue
@@ -2387,6 +2450,9 @@ class GameCommandRuntime:
             "rejected_commands": self.rejected_commands,
             "response_errors": self.response_errors,
             "restart_requested": self.restart_requested,
+            "movement_mode": self.core.movement_mode,
+            "movement_mode_mapping": self.core.movement_mode_mapping(),
+            "world_available": self.world is not None,
             "last_response": self.last_response,
         }
 
@@ -3158,7 +3224,11 @@ def main() -> int:
                         socket.AF_UNIX,
                         socket.SOCK_SEQPACKET,
                     )
-                    game_commands = GameCommandRuntime(command_parent, game_world)
+                    game_commands = GameCommandRuntime(
+                        command_parent,
+                        game_world,
+                        game_input.core,
+                    )
                 try:
                     game_input.open()
                 except OSError as exc:
@@ -3335,6 +3405,9 @@ def main() -> int:
                             command_restart = game_commands.poll(
                                 current_pose=_snapshot_world_pose(snapshot),
                                 command_allowed=command_allowed,
+                                movement_mode_allowed=(
+                                    game_input.core.movement_mode_change_allowed()
+                                ),
                             )
                         except (EOFError, RuntimeError, WorldStateError) as exc:
                             game_input.core.invalidate_input(

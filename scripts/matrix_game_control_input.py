@@ -61,10 +61,17 @@ from matrix_game_control import (
     encode_input_packet,
     wrap_angle_rad,
 )
+from matrix_movement_modes import (
+    DEFAULT_MOVEMENT_MODE,
+    next_movement_mode,
+    validate_movement_mode,
+)
+from matrixctl import MatrixEngineInputClient
 from matrix_mc_commands import (
     CommandParseError,
     CommandProtocolError,
     GameCommandRequest,
+    MovementModeSet,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
     decode_command_response,
@@ -136,7 +143,12 @@ class KeyboardMouseSample:
     q: bool = False
     e: bool = False
     v: bool = False
+    arrow_left: bool = False
+    arrow_up: bool = False
+    arrow_right: bool = False
+    arrow_down: bool = False
     ctrl: bool = False
+    alt: bool = False
     shift: bool = False
     escape: bool = False
     mouse_mode: bool = False
@@ -144,6 +156,7 @@ class KeyboardMouseSample:
     mouse_speed_up: bool = False
     apply_restart: bool = False
     apply_return: bool = False
+    movement_mode_cycle: bool = False
     mouse_dx: float = 0.0
     mouse_dy: float = 0.0
     camera_dragging: bool = False
@@ -162,6 +175,7 @@ class KeyboardMouseSample:
             e=self.e,
             v=self.v,
             ctrl=self.ctrl and movement_enabled,
+            alt=self.alt and movement_enabled,
             shift=self.shift and movement_enabled,
         )
 
@@ -443,6 +457,23 @@ class ApplyRestartKey:
         ):
             return False
         return requester.request()
+
+
+class MovementModeCycleKey:
+    """Accept one F6 edge after the physical key has been released once."""
+
+    def __init__(self) -> None:
+        self._was_down = False
+        self._armed = False
+
+    def update(self, pressed: bool, *, enabled: bool) -> bool:
+        if type(pressed) is not bool or type(enabled) is not bool:
+            raise TypeError("movement-mode key state must be boolean")
+        edge = bool(pressed and not self._was_down and self._armed and enabled)
+        if not pressed:
+            self._armed = True
+        self._was_down = pressed
+        return edge
 
 
 class ApplyReturnController:
@@ -735,6 +766,407 @@ class CameraYawTracker:
             )
         self._yaw = wrap_angle_rad(self._yaw + delta)
         return self._yaw
+
+
+class KeyboardCameraLookIntegrator:
+    """Convert held arrow keys into bounded integer pointer deltas."""
+
+    _MAX_FRAME_SECONDS = 0.05
+
+    def __init__(self) -> None:
+        self._residual_x = 0.0
+        self._residual_y = 0.0
+        self.generated_batches = 0
+        self.last_dx = 0
+        self.last_dy = 0
+
+    def _reset(self) -> None:
+        self._residual_x = 0.0
+        self._residual_y = 0.0
+        self.last_dx = 0
+        self.last_dy = 0
+
+    def update(
+        self,
+        keyboard: KeyboardMouseSample,
+        *,
+        dt: float,
+        rate_deg_s: float,
+        degrees_per_pixel: float,
+        enabled: bool,
+    ) -> tuple[int, int]:
+        if not isinstance(keyboard, KeyboardMouseSample):
+            raise TypeError("keyboard sample is required")
+        if not math.isfinite(dt) or dt < 0.0:
+            raise ValueError("dt must be finite and non-negative")
+        for name, value in (
+            ("rate_deg_s", rate_deg_s),
+            ("degrees_per_pixel", degrees_per_pixel),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be boolean")
+        yaw_axis = int(keyboard.arrow_right) - int(keyboard.arrow_left)
+        pitch_axis = int(keyboard.arrow_down) - int(keyboard.arrow_up)
+        if not enabled or (yaw_axis == 0 and pitch_axis == 0):
+            self._reset()
+            return (0, 0)
+
+        frame_seconds = min(dt, self._MAX_FRAME_SECONDS)
+        pixels = rate_deg_s * frame_seconds / degrees_per_pixel
+        if yaw_axis:
+            self._residual_x += yaw_axis * pixels
+        else:
+            self._residual_x = 0.0
+        if pitch_axis:
+            self._residual_y += pitch_axis * pixels
+        else:
+            self._residual_y = 0.0
+        dx = math.trunc(self._residual_x)
+        dy = math.trunc(self._residual_y)
+        self._residual_x -= dx
+        self._residual_y -= dy
+        self.last_dx = dx
+        self.last_dy = dy
+        if dx or dy:
+            self.generated_batches += 1
+        return (dx, dy)
+
+    @property
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "source": "x11-arrow-keys",
+            "mapping": {
+                "left_right": "camera_yaw",
+                "up_down": "camera_pitch",
+            },
+            "maximum_frame_seconds": self._MAX_FRAME_SECONDS,
+            "generated_batches": self.generated_batches,
+            "last_dx": self.last_dx,
+            "last_dy": self.last_dy,
+        }
+
+
+def keyboard_camera_arrow_active(keyboard: KeyboardMouseSample) -> bool:
+    if not isinstance(keyboard, KeyboardMouseSample):
+        raise TypeError("keyboard sample is required")
+    return bool(
+        keyboard.arrow_left != keyboard.arrow_right
+        or keyboard.arrow_up != keyboard.arrow_down
+    )
+
+
+class EngineCameraLookWorker:
+    """Coalesce provider deltas and perform bridge I/O off the 50 Hz loop."""
+
+    _MAX_PENDING_DELTA = 4096
+    _RETRY_SECONDS = 0.5
+
+    def __init__(
+        self,
+        endpoint: Path,
+        capability_file: Path,
+        *,
+        button: str,
+        timeout_seconds: float = 0.2,
+        client_factory: Callable[..., Any] = MatrixEngineInputClient,
+    ) -> None:
+        if not endpoint.is_absolute() or not capability_file.is_absolute():
+            raise ValueError("engine camera endpoint paths must be absolute")
+        if button not in {"left", "middle", "right"}:
+            raise ValueError("engine camera look button is invalid")
+        if not math.isfinite(timeout_seconds) or not 0.05 <= timeout_seconds <= 1.0:
+            raise ValueError("engine camera timeout must be in [0.05, 1.0]")
+        if not callable(client_factory):
+            raise TypeError("engine camera client factory must be callable")
+        self._endpoint = endpoint
+        self._capability_file = capability_file
+        self._button = button
+        self._timeout_seconds = timeout_seconds
+        self._client_factory = client_factory
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._stop_requested = False
+        self._pending_dx = 0
+        self._pending_dy = 0
+        self._drag_requested = False
+        self._release_requested = False
+        self._retry_not_before = 0.0
+        self._status = "stopped"
+        self._available = False
+        self._capability_compatible: bool | None = None
+        self._last_error: str | None = None
+        self.submitted_batches = 0
+        self.coalesced_batches = 0
+        self.emitted_batches = 0
+        self.dropped_batches = 0
+        self.release_requests = 0
+        self.releases_emitted = 0
+
+    def start(self) -> None:
+        with self._condition:
+            if self._thread is not None:
+                return
+            self._status = "probing"
+            self._stop_requested = False
+            self._thread = threading.Thread(
+                target=self._run,
+                name="matrix-engine-camera-look",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _request(self, action: str, payload: dict[str, object]) -> dict[str, object]:
+        client = self._client_factory(
+            self._endpoint,
+            self._capability_file,
+            timeout_seconds=self._timeout_seconds,
+        )
+        try:
+            client.connect()
+            return client.request(action, payload)
+        finally:
+            client.close()
+
+    def _record_success(self) -> None:
+        with self._condition:
+            self._available = True
+            self._capability_compatible = True
+            self._status = "ready"
+            self._last_error = None
+            self._retry_not_before = 0.0
+
+    def _record_error(self, exc: Exception, *, retryable: bool = True) -> None:
+        with self._condition:
+            self._available = False
+            if not retryable:
+                self._capability_compatible = False
+            self._status = "unavailable" if retryable else "unsupported"
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._retry_not_before = (
+                time.monotonic() + self._RETRY_SECONDS if retryable else math.inf
+            )
+            self._pending_dx = 0
+            self._pending_dy = 0
+
+    def _run(self) -> None:
+        try:
+            response = self._request("status", {})
+            data = response.get("data")
+            supported_actions = (
+                data.get("supported_actions") if isinstance(data, dict) else None
+            )
+            if (
+                not isinstance(supported_actions, list)
+                or not all(isinstance(item, str) for item in supported_actions)
+                or not {"look_delta", "look_stop"}.issubset(supported_actions)
+            ):
+                self._record_error(
+                    RuntimeError(
+                        "engine input bridge does not advertise held look protocol"
+                    ),
+                    retryable=False,
+                )
+                return
+        except Exception as exc:
+            self._record_error(exc)
+        else:
+            self._record_success()
+        while True:
+            with self._condition:
+                while (
+                    not self._stop_requested
+                    and self._pending_dx == 0
+                    and self._pending_dy == 0
+                    and not self._release_requested
+                ):
+                    self._condition.wait()
+                stop_after_request = self._stop_requested
+                release = bool(
+                    self._release_requested
+                    or (stop_after_request and self._drag_requested)
+                )
+                if release:
+                    self._release_requested = False
+                    self._drag_requested = False
+                    self._pending_dx = 0
+                    self._pending_dy = 0
+                    dx = 0
+                    dy = 0
+                elif stop_after_request:
+                    return
+                else:
+                    dx = self._pending_dx
+                    dy = self._pending_dy
+                    self._pending_dx = 0
+                    self._pending_dy = 0
+            if release:
+                try:
+                    self._request("look_stop", {})
+                except Exception as exc:
+                    self._record_error(exc)
+                else:
+                    with self._condition:
+                        self.releases_emitted += 1
+                    self._record_success()
+                if stop_after_request:
+                    return
+                continue
+            try:
+                self._request(
+                    "look_delta",
+                    {"dx": dx, "dy": dy, "button": self._button},
+                )
+            except Exception as exc:
+                self._record_error(exc)
+            else:
+                with self._condition:
+                    self.emitted_batches += 1
+                self._record_success()
+
+    def submit(self, dx: int, dy: int) -> bool:
+        if (
+            isinstance(dx, bool)
+            or isinstance(dy, bool)
+            or type(dx) is not int
+            or type(dy) is not int
+        ):
+            raise TypeError("engine camera deltas must be integers")
+        if dx == 0 and dy == 0:
+            return False
+        with self._condition:
+            if self._thread is None or self._stop_requested:
+                self.dropped_batches += 1
+                return False
+            if self._capability_compatible is False:
+                self.dropped_batches += 1
+                return False
+            if time.monotonic() < self._retry_not_before:
+                self.dropped_batches += 1
+                return False
+            if self._pending_dx or self._pending_dy:
+                self.coalesced_batches += 1
+            self._drag_requested = True
+            self._release_requested = False
+            self._pending_dx = int(
+                _clamp(
+                    self._pending_dx + dx,
+                    -self._MAX_PENDING_DELTA,
+                    self._MAX_PENDING_DELTA,
+                )
+            )
+            self._pending_dy = int(
+                _clamp(
+                    self._pending_dy + dy,
+                    -self._MAX_PENDING_DELTA,
+                    self._MAX_PENDING_DELTA,
+                )
+            )
+            self.submitted_batches += 1
+            self._condition.notify()
+            return True
+
+    def cancel_pending(self) -> bool:
+        with self._condition:
+            had_pending = bool(self._pending_dx or self._pending_dy)
+            changed = bool(had_pending or self._drag_requested)
+            self._pending_dx = 0
+            self._pending_dy = 0
+            if self._drag_requested:
+                self._drag_requested = False
+                self._release_requested = True
+                self.release_requests += 1
+            if had_pending:
+                self.dropped_batches += 1
+            if changed:
+                self._condition.notify()
+            return changed
+
+    @property
+    def telemetry(self) -> dict[str, object]:
+        with self._condition:
+            return {
+                "configured": True,
+                "available": self._available,
+                "capability_compatible": self._capability_compatible,
+                "status": self._status,
+                "transport": "engine-held-relative-look-delta",
+                "button": self._button,
+                "endpoint": os.fspath(self._endpoint),
+                "submitted_batches": self.submitted_batches,
+                "coalesced_batches": self.coalesced_batches,
+                "emitted_batches": self.emitted_batches,
+                "dropped_batches": self.dropped_batches,
+                "pending_dx": self._pending_dx,
+                "pending_dy": self._pending_dy,
+                "drag_requested": self._drag_requested,
+                "release_pending": self._release_requested,
+                "release_requests": self.release_requests,
+                "releases_emitted": self.releases_emitted,
+                "last_error": self._last_error,
+            }
+
+    def close(self) -> None:
+        with self._condition:
+            thread = self._thread
+            if thread is None:
+                return
+            self._stop_requested = True
+            self._pending_dx = 0
+            self._pending_dy = 0
+            self._condition.notify_all()
+        thread.join(timeout=max(1.0, self._timeout_seconds * 4.0))
+        if thread.is_alive():
+            raise RuntimeError("engine camera look worker did not stop")
+        with self._condition:
+            self._thread = None
+            self._available = False
+            self._status = "stopped"
+
+
+def keyboard_camera_telemetry(
+    worker: EngineCameraLookWorker | None,
+    integrator: KeyboardCameraLookIntegrator,
+    *,
+    arrow_keys_available: bool = True,
+    rate_deg_s: float = 120.0,
+) -> dict[str, object]:
+    if type(arrow_keys_available) is not bool:
+        raise TypeError("arrow key availability must be boolean")
+    if worker is None:
+        bridge: dict[str, object] = {
+            "configured": False,
+            "available": False,
+            "capability_compatible": False,
+            "status": "disabled",
+            "transport": None,
+            "button": None,
+            "endpoint": None,
+            "submitted_batches": 0,
+            "coalesced_batches": 0,
+            "emitted_batches": 0,
+            "dropped_batches": 0,
+            "pending_dx": 0,
+            "pending_dy": 0,
+            "last_error": "Matrix engine input bridge is not configured",
+        }
+    else:
+        bridge = worker.telemetry
+    if not arrow_keys_available:
+        bridge = {
+            **bridge,
+            "available": False,
+            "status": "unavailable",
+            "last_error": "X11 keyboard map is missing one or more arrow keys",
+        }
+    return {
+        **bridge,
+        "arrow_keys_available": arrow_keys_available,
+        "rate_deg_s": rate_deg_s,
+        "rate_scope": "nominal_input_rate_not_final_pov_angular_velocity",
+        "integrator": integrator.telemetry,
+    }
 
 
 def transform_camera_yaw(
@@ -2240,6 +2672,9 @@ class X11KeyboardMouse:
     """Poll global keyboard/pointer state without grabbing it from Matrix UE."""
 
     _BUTTON_MASK = {"left": 1 << 8, "middle": 1 << 9, "right": 1 << 10}
+    _ARROW_KEY_NAMES = frozenset(
+        {"arrow_left", "arrow_up", "arrow_right", "arrow_down"}
+    )
     _KEYSYMS = {
         "w": 0x0077,
         "a": 0x0061,
@@ -2248,8 +2683,14 @@ class X11KeyboardMouse:
         "q": 0x0071,
         "e": 0x0065,
         "v": 0x0076,
+        "arrow_left": 0xFF51,
+        "arrow_up": 0xFF52,
+        "arrow_right": 0xFF53,
+        "arrow_down": 0xFF54,
         "ctrl_left": 0xFFE3,
         "ctrl_right": 0xFFE4,
+        "alt_left": 0xFFE9,
+        "alt_right": 0xFFEA,
         "shift_left": 0xFFE1,
         "shift_right": 0xFFE2,
         "escape": 0xFF1B,
@@ -2257,6 +2698,7 @@ class X11KeyboardMouse:
         "mouse_speed_down": 0x002D,
         "mouse_speed_up": 0x003D,
         "apply_restart": 0xFFC6,
+        "movement_mode_cycle": 0xFFC3,
         "apply_return": 0xFF0D,
     }
 
@@ -2293,7 +2735,11 @@ class X11KeyboardMouse:
             name: int(self._x11.XKeysymToKeycode(self._display, keysym))
             for name, keysym in self._KEYSYMS.items()
         }
-        if any(code <= 0 for code in self._keycodes.values()):
+        if any(
+            code <= 0
+            for name, code in self._keycodes.items()
+            if name not in self._ARROW_KEY_NAMES
+        ):
             self.close()
             raise RuntimeError("X11 keyboard map is missing a required key")
         self._focus_pattern = (
@@ -2344,8 +2790,15 @@ class X11KeyboardMouse:
                 raise
 
     @property
+    def arrow_keys_available(self) -> bool:
+        return all(
+            self._keycodes.get(name, 0) > 0 for name in self._ARROW_KEY_NAMES
+        )
+
+    @property
     def pointer_telemetry(self) -> dict[str, object]:
         telemetry = {
+            "arrow_keys_available": self.arrow_keys_available,
             "teleport_rejections": self._teleport_rejections,
             "last_teleport_delta": list(self._last_teleport_delta)
             if self._last_teleport_delta is not None
@@ -2713,11 +3166,25 @@ class X11KeyboardMouse:
         }
         return KeyboardMouseSample(
             **{
-                name: pressed[name]
-                for name in ("w", "a", "s", "d", "q", "e", "v")
+                name: pressed.get(name, False)
+                for name in (
+                    "w",
+                    "a",
+                    "s",
+                    "d",
+                    "q",
+                    "e",
+                    "v",
+                    "arrow_left",
+                    "arrow_up",
+                    "arrow_right",
+                    "arrow_down",
+                )
             },
             ctrl=pressed.get("ctrl_left", False)
             or pressed.get("ctrl_right", False),
+            alt=pressed.get("alt_left", False)
+            or pressed.get("alt_right", False),
             shift=pressed.get("shift_left", False)
             or pressed.get("shift_right", False),
             escape=pressed.get("escape", False),
@@ -2725,6 +3192,7 @@ class X11KeyboardMouse:
             mouse_speed_down=pressed.get("mouse_speed_down", False),
             mouse_speed_up=pressed.get("mouse_speed_up", False),
             apply_restart=pressed.get("apply_restart", False),
+            movement_mode_cycle=pressed.get("movement_mode_cycle", False),
             apply_return=pressed.get("apply_return", False),
             mouse_dx=mouse_dx,
             mouse_dy=mouse_dy,
@@ -2933,6 +3401,9 @@ def build_snapshot(
     keys, move_stick, _look_yaw = select_physical_inputs(
         keyboard, gamepad, source=input_source
     )
+    native_free_camera_drag = bool(
+        keyboard.camera_dragging and not keyboard_camera_arrow_active(keyboard)
+    )
     return InputSnapshot(
         sequence=sequence,
         timestamp_monotonic_s=timestamp_monotonic_s,
@@ -2940,9 +3411,10 @@ def build_snapshot(
         # keep walking using the last direction.
         # Native Matrix documents held mouse-drag as temporary free camera.
         # Treat it like a focus interlock so camera-WASD cannot also walk G1.
+        # Arrow camera deliberately synthesizes that drag and remains movement-safe.
         focused=(
             keyboard.focused
-            and not keyboard.camera_dragging
+            and not native_free_camera_drag
             and camera_available
             and input_available
         ),
@@ -3254,6 +3726,63 @@ class GameCommandClient:
         self.code = None
         self.message = "Command submitted; waiting for the runtime"
         self.warning = parsed.warning
+        self.restart_required = False
+        self.data = None
+        self.last_request_id = request.request_id
+        return True
+
+    def set_movement_mode(self, movement_mode: object) -> bool:
+        """Send one hot movement-mode request without entering text edit mode."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        connection = self._connection
+        if connection is None:
+            self._local_error(
+                "E_COMMAND_UNAVAILABLE", "Game commands are unavailable for this run"
+            )
+            return False
+        try:
+            command = MovementModeSet(movement_mode)
+        except CommandParseError as exc:
+            self._local_error(exc.code, exc.message)
+            return False
+        self._sequence += 1
+        request = GameCommandRequest(
+            session=self._session,
+            sequence=self._sequence,
+            request_id=f"cmd-{os.urandom(16).hex()}",
+            command=command,
+        )
+        payload = encode_command_request(request)
+        try:
+            sent = connection.send(payload)
+        except BlockingIOError as exc:
+            self._local_error(
+                "E_COMMAND_SEND", f"Could not send movement mode: {exc}"
+            )
+            return False
+        except OSError as exc:
+            self._close_channel()
+            self._local_error(
+                "E_COMMAND_SEND", f"Could not send movement mode: {exc}"
+            )
+            return False
+        if sent != len(payload):
+            self._close_channel()
+            self._local_error(
+                "E_COMMAND_SEND",
+                f"Partial movement-mode packet write: sent {sent}/{len(payload)}",
+            )
+            return False
+        self._pending = request
+        self._pending_warning = None
+        self._result_revision += 1
+        self.status = "pending"
+        self.ok = None
+        self.code = None
+        self.message = f"Switching movement mode to {command.movement_mode}"
+        self.warning = None
         self.restart_required = False
         self.data = None
         self.last_request_id = request.request_id
@@ -3699,6 +4228,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gamepad-look-deadzone", type=float, default=0.12)
     parser.add_argument("--gamepad-look-min-pitch-deg", type=float, default=-80.0)
     parser.add_argument("--gamepad-look-max-pitch-deg", type=float, default=60.0)
+    parser.add_argument("--keyboard-camera-look-rate-deg-s", type=float, default=120.0)
     parser.add_argument("--status-file", type=Path)
     parser.add_argument(
         "--calibration-state-file",
@@ -3726,6 +4256,20 @@ def _parse_args() -> argparse.Namespace:
         "--game-command-fd",
         type=int,
         help="Inherited private SOCK_SEQPACKET channel for typed ESC commands",
+    )
+    engine_input_socket = os.environ.get("MATRIX_ENGINE_INPUT_SOCKET")
+    engine_input_capability = os.environ.get("MATRIX_ENGINE_INPUT_CAPABILITY_FILE")
+    parser.add_argument(
+        "--engine-input-socket",
+        type=Path,
+        default=Path(engine_input_socket) if engine_input_socket else None,
+        help="Private Matrix engine-input socket used for arrow-key camera look",
+    )
+    parser.add_argument(
+        "--engine-input-capability-file",
+        type=Path,
+        default=Path(engine_input_capability) if engine_input_capability else None,
+        help="Private Matrix engine-input capability for arrow-key camera look",
     )
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument(
@@ -3757,12 +4301,14 @@ def _validate_args(args: argparse.Namespace) -> None:
         "gamepad_look_pitch_rate_deg_s",
         "gamepad_look_min_pitch_deg",
         "gamepad_look_max_pitch_deg",
+        "keyboard_camera_look_rate_deg_s",
     ):
         if not math.isfinite(getattr(args, name)):
             raise SystemExit(f"--{name.replace('_', '-')} must be finite")
     for name in (
         "gamepad_look_yaw_rate_deg_s",
         "gamepad_look_pitch_rate_deg_s",
+        "keyboard_camera_look_rate_deg_s",
     ):
         if getattr(args, name) <= 0.0:
             raise SystemExit(f"--{name.replace('_', '-')} must be positive")
@@ -3828,6 +4374,18 @@ def _validate_args(args: argparse.Namespace) -> None:
             os.fstat(game_command_fd)
         except OSError as exc:
             raise SystemExit(f"--game-command-fd is not open: {exc}") from exc
+    engine_values = (args.engine_input_socket, args.engine_input_capability_file)
+    if any(value is not None for value in engine_values):
+        if not all(value is not None for value in engine_values):
+            raise SystemExit(
+                "--engine-input-socket and --engine-input-capability-file are all-or-none"
+            )
+        assert args.engine_input_socket is not None
+        assert args.engine_input_capability_file is not None
+        if not args.engine_input_socket.is_absolute():
+            raise SystemExit("--engine-input-socket must be absolute")
+        if not args.engine_input_capability_file.is_absolute():
+            raise SystemExit("--engine-input-capability-file must be absolute")
 
 
 def main() -> int:
@@ -3936,8 +4494,19 @@ def main() -> int:
         raise SystemExit(
             f"Matrix game-control input cannot initialize command channel: {exc}"
         ) from exc
+    keyboard_camera_integrator = KeyboardCameraLookIntegrator()
+    engine_camera_worker: EngineCameraLookWorker | None = None
+    if args.engine_input_socket is not None:
+        assert args.engine_input_capability_file is not None
+        engine_camera_worker = EngineCameraLookWorker(
+            args.engine_input_socket,
+            args.engine_input_capability_file,
+            button=args.look_button,
+        )
+        engine_camera_worker.start()
     calibration = CalibrationModeController()
     shortcut_arming = StartupShortcutArming()
+    movement_mode_cycle_key = MovementModeCycleKey()
 
     running = True
 
@@ -3966,6 +4535,7 @@ def main() -> int:
     last_teleport_rejections = 0
     calibration_neutral_frames = 0
     final_pov_observation: UeFinalPovObservation | None = None
+    current_movement_mode = DEFAULT_MOVEMENT_MODE
     provider_yaw = tracker.yaw
     camera_yaw = transform_camera_yaw(
         provider_yaw,
@@ -3990,6 +4560,7 @@ def main() -> int:
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "command_console": game_command_client.mapping(),
+                    "movement_mode": current_movement_mode,
                     "mirror_sensitivity": sensitivity_telemetry,
                     "pointer": x11.pointer_telemetry,
                     "camera_yaw": camera_yaw_telemetry(
@@ -3998,6 +4569,12 @@ def main() -> int:
                         sonic_yaw_rad=camera_yaw,
                     ),
                     "ue_final_pov": ue_final_pov_telemetry(None),
+                    "keyboard_camera": keyboard_camera_telemetry(
+                        engine_camera_worker,
+                        keyboard_camera_integrator,
+                        arrow_keys_available=x11.arrow_keys_available,
+                        rate_deg_s=args.keyboard_camera_look_rate_deg_s,
+                    ),
                 }
             )
         while running:
@@ -4018,6 +4595,16 @@ def main() -> int:
             next_frame = max(next_frame + 1.0 / args.rate_hz, now)
 
             command_state_changed = game_command_client.poll()
+            if (
+                game_command_client.data is not None
+                and isinstance(game_command_client.data.get("movement_mode"), str)
+            ):
+                try:
+                    current_movement_mode = validate_movement_mode(
+                        game_command_client.data["movement_mode"]
+                    )
+                except ValueError:
+                    pass
             raw_keyboard = x11.poll()
             last_keyboard = raw_keyboard
             raw_pad = gamepad.poll(now)
@@ -4164,6 +4751,56 @@ def main() -> int:
                 # Keep that whole frame neutral; normal input resumes next frame.
                 active=calibration_interlock_active,
             )
+            movement_inputs_neutral = bool(
+                not any(
+                    (
+                        raw_keyboard.w,
+                        raw_keyboard.a,
+                        raw_keyboard.s,
+                        raw_keyboard.d,
+                        raw_keyboard.q,
+                        raw_keyboard.e,
+                    )
+                )
+                and math.hypot(raw_pad.right, raw_pad.forward) <= 0.15
+            )
+            movement_mode_cycle_edge = movement_mode_cycle_key.update(
+                raw_keyboard.movement_mode_cycle,
+                enabled=bool(
+                    raw_keyboard.focused
+                    and not calibration.active
+                    and not command_controls_blocked
+                    and movement_inputs_neutral
+                    and game_command_client.available
+                ),
+            )
+            if movement_mode_cycle_edge:
+                next_mode = next_movement_mode(current_movement_mode)
+                command_state_changed = bool(
+                    game_command_client.set_movement_mode(next_mode)
+                    or command_state_changed
+                )
+                if game_command_client.in_flight:
+                    current_movement_mode = next_mode
+            camera_arrows_active = keyboard_camera_arrow_active(keyboard)
+            camera_dx, camera_dy = keyboard_camera_integrator.update(
+                keyboard,
+                dt=dt,
+                rate_deg_s=args.keyboard_camera_look_rate_deg_s,
+                degrees_per_pixel=effective_mouse_sensitivity,
+                enabled=bool(
+                    engine_camera_worker is not None
+                    and keyboard.focused
+                    and x11.arrow_keys_available
+                    and not calibration.active
+                ),
+            )
+            if engine_camera_worker is not None and (camera_dx or camera_dy):
+                engine_camera_worker.submit(camera_dx, camera_dy)
+            elif engine_camera_worker is not None and (
+                not keyboard.focused or not camera_arrows_active
+            ):
+                engine_camera_worker.cancel_pending()
             pointer_telemetry = x11.pointer_telemetry
             teleport_rejections = int(pointer_telemetry["teleport_rejections"])
             input_available = gamepad_input_available(
@@ -4249,6 +4886,7 @@ def main() -> int:
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
                             "command_console": game_command_client.mapping(),
+                            "movement_mode": current_movement_mode,
                             "mirror_sensitivity": sensitivity_telemetry,
                             "camera_yaw": camera_yaw_telemetry(
                                 args.camera_yaw_source,
@@ -4257,6 +4895,12 @@ def main() -> int:
                             ),
                             "ue_final_pov": ue_final_pov_telemetry(
                                 final_pov_observation
+                            ),
+                            "keyboard_camera": keyboard_camera_telemetry(
+                                engine_camera_worker,
+                                keyboard_camera_integrator,
+                                arrow_keys_available=x11.arrow_keys_available,
+                                rate_deg_s=args.keyboard_camera_look_rate_deg_s,
                             ),
                             "pointer": pointer_telemetry,
                         }
@@ -4303,7 +4947,18 @@ def main() -> int:
                 timestamp_monotonic_s=time.monotonic(),
                 focused=False,
                 camera_yaw_rad=last_snapshot.camera_yaw_rad,
-                keys=KeySnapshot(False, False, False, False, False, False, False),
+                keys=KeySnapshot(
+                    w=False,
+                    a=False,
+                    s=False,
+                    d=False,
+                    q=False,
+                    e=False,
+                    v=False,
+                    ctrl=False,
+                    alt=False,
+                    shift=False,
+                ),
                 move_stick=MoveStickSnapshot(0.0, 0.0),
             )
             publisher.send(release, now=time.monotonic())
@@ -4311,6 +4966,15 @@ def main() -> int:
         # a successfully sent but unacknowledged command outcome-unknown.  This
         # must happen before the final status snapshot is serialized.
         game_command_client.close()
+        if engine_camera_worker is not None:
+            try:
+                engine_camera_worker.close()
+            except RuntimeError as exc:
+                print(
+                    f"matrix-game-control-input WARN {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         _atomic_json(
             args.status_file,
             {

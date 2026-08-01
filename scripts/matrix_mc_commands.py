@@ -14,6 +14,7 @@ import math
 import re
 from typing import Any, Mapping, TypeAlias
 
+from matrix_movement_modes import validate_movement_mode
 from matrix_world_state import (
     MatrixWorldState,
     TELEPORT_POINT_TYPE,
@@ -161,7 +162,21 @@ class TeleportSelector:
         object.__setattr__(self, "tag", tag)
 
 
-McCommand: TypeAlias = SummonTeleportPoint | TeleportCoordinates | TeleportSelector
+@dataclass(frozen=True)
+class MovementModeSet:
+    movement_mode: str
+
+    def __post_init__(self) -> None:
+        try:
+            mode = validate_movement_mode(self.movement_mode)
+        except ValueError as exc:
+            raise CommandParseError("E_MOVEMENT_MODE", str(exc)) from exc
+        object.__setattr__(self, "movement_mode", mode)
+
+
+McCommand: TypeAlias = (
+    SummonTeleportPoint | TeleportCoordinates | TeleportSelector | MovementModeSet
+)
 
 
 @dataclass(frozen=True)
@@ -336,6 +351,11 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "sort": command.sort,
             "type": TELEPORT_POINT_TYPE,
         }
+    if isinstance(command, MovementModeSet):
+        return {
+            "name": "movement_mode_set",
+            "movement_mode": command.movement_mode,
+        }
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
@@ -376,6 +396,13 @@ def command_from_mapping(value: object) -> McCommand:
                 limit=value.get("limit"),
                 sort=value.get("sort"),
             )
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "movement_mode_set":
+        if set(value) != {"name", "movement_mode"}:
+            raise CommandProtocolError("movement mode command has an invalid schema")
+        try:
+            return MovementModeSet(value.get("movement_mode"))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     raise CommandProtocolError(f"unsupported typed command {name!r}")
@@ -679,6 +706,7 @@ __all__ = [
     "Coordinate",
     "GameCommandRequest",
     "GameCommandResponse",
+    "MovementModeSet",
     "ParsedCommand",
     "SummonTeleportPoint",
     "TeleportCoordinates",

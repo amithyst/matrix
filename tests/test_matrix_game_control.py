@@ -13,6 +13,9 @@ import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = REPO_ROOT / "scripts"
+if os.fspath(SCRIPTS) not in sys.path:
+    sys.path.insert(0, os.fspath(SCRIPTS))
 SCRIPT_PATH = REPO_ROOT / "scripts" / "matrix_game_control.py"
 SPEC = importlib.util.spec_from_file_location("matrix_game_control", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -34,6 +37,7 @@ def snapshot(
     keys = {name: name in pressed for name in ("w", "a", "s", "d", "q", "e", "v")}
     keys.update(
         ctrl="ctrl" in speed_modifiers,
+        alt="alt" in speed_modifiers,
         shift="shift" in speed_modifiers,
     )
     return MODULE.InputSnapshot.from_mapping(
@@ -82,6 +86,11 @@ class InputProtocolTest(unittest.TestCase):
         self.assertEqual(value["protocol"], "matrix-game-input/v2")
         del value["keys"]["ctrl"]
         with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: ctrl"):
+            MODULE.InputSnapshot.from_mapping(value)
+
+        value = snapshot().to_mapping()
+        del value["keys"]["alt"]
+        with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: alt"):
             MODULE.InputSnapshot.from_mapping(value)
 
         value = snapshot().to_mapping()
@@ -490,12 +499,13 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(right_command.movement[0], 0.0, places=7)
         self.assertAlmostEqual(right_command.movement[1], -1.0, places=7)
 
-    def test_q_and_e_never_contribute_to_locomotion(self) -> None:
+    def test_q_and_e_turn_in_place_without_locomotion(self) -> None:
         for key in ("q", "e", "q", "e"):
             core = armed_core(immediate_config())
             core.accept_snapshot(snapshot(pressed=(key,)), received_at_s=10.0)
             command = core.command(now_s=10.0, dt_s=0.1)
-            self.assertEqual(command.mode, "idle")
+            self.assertEqual(command.mode, "turn")
+            self.assertEqual(command.reason, "manual_yaw")
             self.assertEqual(command.movement, (0.0, 0.0, 0.0))
             self.assertEqual(command.speed_mps, 0.0)
 
