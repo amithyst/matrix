@@ -2461,6 +2461,20 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if self.world is None:
+                self.rejected_commands += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=False,
+                        code="E_WORLD_UNAVAILABLE",
+                        message=(
+                            "World commands require game world persistence; "
+                            "movement-mode commands remain available"
+                        ),
+                    )
+                )
+                continue
             try:
                 effect = execute_command(
                     request.command,
@@ -3395,7 +3409,7 @@ def main() -> int:
                     GameControlCore(game_config),
                 )
                 game_readiness = _GameSonicReadinessGate(snapshot)
-                if game_world is not None and not args.no_game_input_provider:
+                if not args.no_game_input_provider:
                     command_parent, game_command_child_socket = socket.socketpair(
                         socket.AF_UNIX,
                         socket.SOCK_SEQPACKET,

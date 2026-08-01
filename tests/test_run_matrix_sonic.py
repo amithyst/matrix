@@ -2094,6 +2094,77 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_game_command_runtime_allows_movement_mode_without_world_state(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        core = GAME_CONTROL.GameControlCore()
+        core.accept_snapshot(
+            self.game_input_snapshot(1, 10.0),
+            received_at_s=10.0,
+        )
+        runtime = MODULE.GameCommandRuntime(runtime_socket, None, core)
+        request = MC_COMMANDS.GameCommandRequest(
+            session="a" * 32,
+            sequence=1,
+            request_id="cmd-" + "d" * 32,
+            command=MC_COMMANDS.MovementModeSet("camera_strafe"),
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                    command_allowed=False,
+                    movement_mode_allowed=True,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_MOVEMENT_MODE_CHANGED")
+            self.assertEqual(response.data["movement_mode"], "camera_strafe")
+            self.assertEqual(core.movement_mode, "camera_strafe")
+            self.assertEqual(runtime.commands_executed, 1)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
+    def test_game_command_runtime_rejects_world_commands_without_world_state(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        runtime = MODULE.GameCommandRuntime(runtime_socket, None)
+        request = self.game_command_request(
+            '/summon matrix:teleport_point ~ ~ ~ {Tags:["no_world"]}',
+            sequence=1,
+            request_character="e",
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                    command_allowed=True,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertFalse(response.ok)
+            self.assertEqual(response.code, "E_WORLD_UNAVAILABLE")
+            self.assertFalse(response.restart_required)
+            self.assertEqual(runtime.rejected_commands, 1)
+            self.assertEqual(runtime.commands_executed, 0)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
     def test_game_command_runtime_rejects_out_of_order_and_reused_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"
