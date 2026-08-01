@@ -89,6 +89,19 @@ export MATRIX_SETTINGS_PROFILE MATRIX_MOUSE_SETTINGS_FILE MATRIX_UI_SETTINGS_FIL
 export MATRIX_MOTION_SETTINGS_FILE MATRIX_VIDEO_SETTINGS_FILE
 export MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON MATRIX_GAME_CAMERA_DISTANCE_CM
 
+case "${MATRIX_DISABLE_MC,,}" in
+    1|true|yes|on)
+        MATRIX_MC_DISABLED=true
+        ;;
+    0|false|no|off|"")
+        MATRIX_MC_DISABLED=false
+        ;;
+    *)
+        echo "[ERROR] MATRIX_DISABLE_MC must be a boolean: $MATRIX_DISABLE_MC" >&2
+        exit 1
+        ;;
+esac
+
 case "${MATRIX_GAME_CENTERED_CAMERA,,}" in
     1|true|yes|on)
         GAME_CENTERED_CAMERA_ENABLED=true
@@ -822,6 +835,28 @@ ENABLE_MC=false
 ROBOTTYPE="xgb"
 RUNTIME_ROBOTTYPE="xgb"
 
+configure_mc_robot_type() {
+    local mc_robot_type="$1"
+    if $MATRIX_MC_DISABLED; then
+        return 0
+    fi
+    sed -i "s/export ROBOT_TYPE=.*/export ROBOT_TYPE=${mc_robot_type}/" "$TARGET_FILE"
+}
+
+set_mc_motor_platform() {
+    local config_name="$1"
+    local platform_type="$2"
+    local config_path="$PROJECT_ROOT/src/robot_mc/build/export/config/$config_name"
+    if $MATRIX_MC_DISABLED; then
+        return 0
+    fi
+    if [[ ! -f "$config_path" ]]; then
+        echo "[ERROR] Matrix motion-controller config is missing: $config_path" >&2
+        exit 1
+    fi
+    sed -i "s/motor_platform_type: .*/motor_platform_type: ${platform_type}/" "$config_path"
+}
+
 # MUJOCORUNNING is 1 config/config.json中"mujoco_running": true，否则为 false
 if [[ "$MUJOCORUNNING" == "1" ]]; then
     ENABLE_MUJOCO=true
@@ -849,39 +884,39 @@ case "$ROBOT_ARG" in
         ROBOTTYPE="xgb"
         RUNTIME_ROBOTTYPE="xgb"
         ENABLE_MC=true
-        sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
+        configure_mc_robot_type "XG"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+            set_mc_motor_platform "xg-user-parameters.yaml" "5"
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+            set_mc_motor_platform "xg-user-parameters.yaml" "8"
         fi
         ;;
     2|xgw)
         ROBOTTYPE="xgw"
         RUNTIME_ROBOTTYPE="xgw"
         ENABLE_MC=true
-        sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
+        configure_mc_robot_type "XGW"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+            set_mc_motor_platform "xg_wheel-user-parameters.yaml" "5"
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+            set_mc_motor_platform "xg_wheel-user-parameters.yaml" "8"
         fi
         ;;
     3|zgws)
         ROBOTTYPE="zgws"
         RUNTIME_ROBOTTYPE="zgws"
         ENABLE_MC=true
-        sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=ZGWS/' "$TARGET_FILE"
+        configure_mc_robot_type "ZGWS"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml
+            set_mc_motor_platform "zg_wheels-user-parameters.yaml" "5"
         else
             ENABLE_MUJOCO=false
-            sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml
+            set_mc_motor_platform "zg_wheels-user-parameters.yaml" "8"
         fi
         ;;
     6|xxg)
@@ -908,35 +943,35 @@ case "$ROBOT_ARG" in
         case "${_REF_PROFILE}" in
             xgw|zgw)
                 # 16-DOF wheel-leg (xgw/zgw) → XGW MC config
-                sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
+                configure_mc_robot_type "XGW"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+                    set_mc_motor_platform "xg_wheel-user-parameters.yaml" "5"
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml
+                    set_mc_motor_platform "xg_wheel-user-parameters.yaml" "8"
                 fi
                 ;;
             xxg)
                 # XXG family → XXG MC config
-                sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XXG/' "$TARGET_FILE"
+                configure_mc_robot_type "XXG"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xxg-user-parameters.yaml
+                    set_mc_motor_platform "xxg-user-parameters.yaml" "5"
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xxg-user-parameters.yaml
+                    set_mc_motor_platform "xxg-user-parameters.yaml" "8"
                 fi
                 ;;
             *)
                 # xgb / generic / unknown → XG MC config (default)
-                sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
+                configure_mc_robot_type "XG"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 5/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+                    set_mc_motor_platform "xg-user-parameters.yaml" "5"
                 else
                     ENABLE_MUJOCO=false
-                    sed -i 's/motor_platform_type: .*/motor_platform_type: 8/' src/robot_mc/build/export/config/xg-user-parameters.yaml
+                    set_mc_motor_platform "xg-user-parameters.yaml" "8"
                 fi
                 ;;
         esac
@@ -947,18 +982,10 @@ case "$ROBOT_ARG" in
         ;;
 esac
 
-case "${MATRIX_DISABLE_MC,,}" in
-    1|true|yes|on)
-        ENABLE_MC=false
-        echo "[INFO] Matrix motion controller disabled by MATRIX_DISABLE_MC=$MATRIX_DISABLE_MC"
-        ;;
-    0|false|no|off|"")
-        ;;
-    *)
-        echo "[ERROR] MATRIX_DISABLE_MC must be a boolean: $MATRIX_DISABLE_MC" >&2
-        exit 1
-        ;;
-esac
+if $MATRIX_MC_DISABLED; then
+    ENABLE_MC=false
+    echo "[INFO] Matrix motion controller disabled by MATRIX_DISABLE_MC=$MATRIX_DISABLE_MC"
+fi
 
 case "${MATRIX_SONIC,,}" in
     1|true|yes|on)
@@ -1228,6 +1255,7 @@ fi
 #######################################
 echo "[INFO] Starting processes..."
 
+mkdir -p src/robot_mujoco/simulate/build
 cd src/robot_mujoco/simulate/build
 if $ENABLE_MUJOCO && ! $MATRIX_SONIC_ENABLED; then
     echo "[INFO] Starting MuJoCo"
