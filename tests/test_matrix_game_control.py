@@ -508,6 +508,7 @@ class GameControlCoreTest(unittest.TestCase):
             self.assertEqual(command.reason, "manual_yaw")
             self.assertEqual(command.movement, (0.0, 0.0, 0.0))
             self.assertEqual(command.speed_mps, 0.0)
+            self.assertEqual(command.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
 
     def test_turn_and_acceleration_are_rate_limited(self) -> None:
         config = MODULE.ControlConfig(

@@ -1153,8 +1153,7 @@ class GameControlCore:
             # driving the post-recovery IDLE policy into a saturated waist
             # pose.  Translation remains exactly zero until both command and
             # measured heading pass the existing alignment gate.
-            if not manual_turn:
-                locomotion_mode = SONIC_SLOW_WALK_MODE
+            locomotion_mode = SONIC_SLOW_WALK_MODE
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=movement_direction if moving else (0.0, 0.0, 0.0),
