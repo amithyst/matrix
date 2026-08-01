@@ -1953,6 +1953,7 @@ class NativePlannerClient:
         speed: float,
         locomotion_mode: int = 2,
         start: bool = True,
+        allow_stationary_locomotion: bool = False,
     ) -> None:
         """Send an absolute planner direction in SONIC's normalized XY frame."""
 
@@ -1972,6 +1973,11 @@ class NativePlannerClient:
             raise ValueError("locomotion_mode must be a native SONIC motion in [0, 26]")
         if moving and locomotion_mode == SONIC_IDLE_MODE:
             raise ValueError("moving planner command cannot use native IDLE")
+        stationary_locomotion = bool(
+            allow_stationary_locomotion
+            and not moving
+            and locomotion_mode != SONIC_IDLE_MODE
+        )
         self._socket.send(
             self._build_command_message(
                 start=start,
@@ -1982,7 +1988,7 @@ class NativePlannerClient:
         )
         self._socket.send(
             self._build_planner_message(
-                mode=locomotion_mode if moving else 0,
+                mode=locomotion_mode if moving or stationary_locomotion else 0,
                 movement=movement_values if moving else [0.0, 0.0, 0.0],
                 facing=facing_values,
                 speed=speed_value if moving else -1.0,
@@ -2007,8 +2013,13 @@ class NativePlannerClient:
         if has_speed != has_direction:
             raise ValueError("game command speed and movement must become active together")
         moving = has_speed and has_direction
+        stationary_turn = bool(
+            not moving
+            and command.mode == "turn"
+            and command.locomotion_mode != SONIC_IDLE_MODE
+        )
         if not moving:
-            if command.locomotion_mode != SONIC_IDLE_MODE:
+            if command.locomotion_mode != SONIC_IDLE_MODE and not stationary_turn:
                 raise ValueError("stationary game command must use native IDLE")
         else:
             if command.locomotion_mode == SONIC_IDLE_MODE:
@@ -2027,6 +2038,7 @@ class NativePlannerClient:
             facing=command.facing,
             speed=command.speed_mps,
             locomotion_mode=command.locomotion_mode,
+            allow_stationary_locomotion=stationary_turn,
         )
 
     def close(self) -> None:
