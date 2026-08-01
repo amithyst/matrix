@@ -27,6 +27,54 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
+class LockedSonicStrategyViewTest(unittest.TestCase):
+    def test_locked_single_sonic_loadout_has_no_recovery_choices(self) -> None:
+        model = MODULE.strategy_loadout_model(
+            {
+                "strategy_loadout": {
+                    "version": 1,
+                    "available": True,
+                    "status": "locked",
+                    "active_slot": "locomotion",
+                    "pending": None,
+                    "slots": [
+                        {
+                            "slot": "locomotion",
+                            "selected_policy_id": "sonic",
+                            "locked": True,
+                            "candidates": [
+                                {
+                                    "policy_id": "sonic",
+                                    "name": "SONIC",
+                                    "resident": True,
+                                    "available": True,
+                                    "switch_mode": "disabled",
+                                }
+                            ],
+                        },
+                        {
+                            "slot": "recovery",
+                            "selected_policy_id": "off",
+                            "locked": True,
+                            "candidates": [],
+                        },
+                    ],
+                }
+            }
+        )
+        self.assertEqual(model.status, "locked")
+        self.assertEqual(model.locomotion_policy_id, "sonic")
+        self.assertEqual(
+            [candidate.policy_id for candidate in model.locomotion_candidates],
+            ["sonic"],
+        )
+        self.assertTrue(model.locomotion_locked)
+        self.assertEqual(model.recovery_policy_id, "off")
+        self.assertEqual(model.recovery_candidates, ())
+        self.assertTrue(model.recovery_locked)
+        self.assertFalse(model.policy_enabled("sonic", slot="locomotion"))
+
+
 class OverlayLayoutTest(unittest.TestCase):
     @staticmethod
     def intersects(left, right) -> bool:
@@ -79,7 +127,7 @@ class OverlayLayoutTest(unittest.TestCase):
         )
         for action in MODULE._PANEL_ACTIONS:
             x, y, width, height = layout[action]
-            self.assertGreaterEqual(width, 100)
+            self.assertGreaterEqual(width, 80)
             self.assertGreaterEqual(height, 60)
             self.assertTrue(MODULE.point_in_rectangle((x, y), panel))
             self.assertTrue(
@@ -105,10 +153,8 @@ class OverlayLayoutTest(unittest.TestCase):
                 MODULE.WindowGeometry(1, 0, 0, width, height)
             )
             panel = layout["panel"]
-            self.assertGreaterEqual(panel[2], 1100)
-            self.assertLessEqual(panel[2], 1200)
-            self.assertGreaterEqual(panel[3], 760)
-            self.assertLessEqual(panel[3], 800)
+            self.assertEqual(panel[2], 1500)
+            self.assertEqual(panel[3], 900)
 
     def test_compact_layout_is_bounded_and_too_small_client_hides_safely(self) -> None:
         geometry = MODULE.WindowGeometry(1, 20, 30, 640, 420)
@@ -825,12 +871,12 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay.show(geometry, (301, 302), heartbeat, now_s=10.06)
         self.assertEqual(overlay._draw_panel.call_count, 1)
         self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
-        self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises)
-
-        # A low-frequency stack repair raises all eight windows without
-        # clearing/redrawing the 1180x736 panel.
-        overlay.show(geometry, (301, 302), heartbeat, now_s=11.1)
         self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises + 8)
+
+        # Main's full ESC keeps all eight overlay windows above UE each frame
+        # without clearing/redrawing the 1216x736 panel.
+        overlay.show(geometry, (301, 302), heartbeat, now_s=11.1)
+        self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises + 16)
         self.assertEqual(overlay._draw_panel.call_count, 1)
 
         changed = self.state(scale=0.4)

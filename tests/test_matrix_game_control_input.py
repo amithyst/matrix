@@ -4014,5 +4014,26 @@ class CameraYawSourceCliTest(unittest.TestCase):
             MODULE._validate_args(args)
 
 
+class LockedSonicLoadoutTest(unittest.TestCase):
+    def test_fixed_runtime_exposes_only_sonic_and_no_recovery_candidates(self) -> None:
+        loadout = MODULE.locked_sonic_strategy_loadout()
+        self.assertEqual(loadout["status"], "locked")
+        self.assertIsNone(loadout["pending"])
+        slots = {slot["slot"]: slot for slot in loadout["slots"]}
+        self.assertEqual(set(slots), {"locomotion", "recovery"})
+        self.assertTrue(slots["locomotion"]["locked"])
+        self.assertEqual(slots["locomotion"]["selected_policy_id"], "sonic")
+        self.assertEqual(
+            [
+                candidate["policy_id"]
+                for candidate in slots["locomotion"]["candidates"]
+            ],
+            ["sonic"],
+        )
+        self.assertTrue(slots["recovery"]["locked"])
+        self.assertEqual(slots["recovery"]["selected_policy_id"], "off")
+        self.assertEqual(slots["recovery"]["candidates"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,11 @@ import threading
 import time
 from typing import Any, Callable, Iterator, Protocol
 
+from matrix_build_info import (
+    BuildInfoError,
+    parse_build_info_json,
+    unavailable_build_info,
+)
 from matrix_mouse_settings import (
     PROFILE_LOCAL,
     PROFILE_REMOTE,
@@ -539,6 +544,57 @@ def motion_settings_live_mapping(
         }
     )
     return mapping
+
+
+def locked_sonic_strategy_loadout() -> dict[str, object]:
+    """Describe the fixed stable runtime without exposing switch intents.
+
+    The accepted walking line has exactly one locomotion policy and deliberately
+    has no recovery worker.  This telemetry lets the main ESC presentation show
+    that truth while the input provider's action allowlist remains unchanged.
+    """
+
+    return {
+        "version": 1,
+        "available": True,
+        "status": "locked",
+        "active_slot": "locomotion",
+        "pending": None,
+        "slots": [
+            {
+                "slot": "locomotion",
+                "selected_policy_id": "sonic",
+                "locked": True,
+                "candidates": [
+                    {
+                        "policy_id": "sonic",
+                        "name": "SONIC",
+                        "resident": True,
+                        "available": True,
+                        "unavailable_reason": None,
+                        "switch_mode": "disabled",
+                    }
+                ],
+                "switch_mode": "disabled",
+            },
+            {
+                "slot": "recovery",
+                "selected_policy_id": "off",
+                "locked": True,
+                "candidates": [],
+                "switch_mode": "disabled",
+            },
+        ],
+        "resident_models": [
+            {
+                "policy_id": "sonic",
+                "name": "SONIC",
+                "resident": True,
+                "available": True,
+                "unavailable_reason": None,
+            }
+        ],
+    }
 
 
 def video_settings_live_mapping(
@@ -4788,6 +4844,17 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> int:
     args = _parse_args()
     _validate_args(args)
+    raw_build_info = os.environ.get("MATRIX_BUILD_INFO_JSON")
+    try:
+        build_info = parse_build_info_json(raw_build_info or "")
+    except BuildInfoError as exc:
+        build_info = unavailable_build_info(
+            profile="local",
+            scene_id=0,
+            control_source="game",
+            error=f"Launch provenance unavailable: {exc}",
+            launch_available=False,
+        )
     applied_mouse = AppliedMouseSettings(
         profile=args.applied_mouse_profile,
         effective_scale=args.applied_mouse_speed_scale,
@@ -5026,6 +5093,8 @@ def main() -> int:
                     "restart": restart_requester.mapping(),
                     "apply_return": apply_return.mapping(),
                     "command_console": game_command_client.mapping(),
+                    "build_info": build_info,
+                    "strategy_loadout": locked_sonic_strategy_loadout(),
                     "movement_mode": current_movement_mode,
                     "mirror_sensitivity": sensitivity_telemetry,
                     "pointer": x11.pointer_telemetry,
@@ -5454,6 +5523,8 @@ def main() -> int:
                             "restart": restart_requester.mapping(),
                             "apply_return": apply_return.mapping(),
                             "command_console": game_command_client.mapping(),
+                            "build_info": build_info,
+                            "strategy_loadout": locked_sonic_strategy_loadout(),
                             "movement_mode": current_movement_mode,
                             "mirror_sensitivity": sensitivity_telemetry,
                             "camera_yaw": camera_yaw_telemetry(
@@ -5580,6 +5651,8 @@ def main() -> int:
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),
                 "command_console": game_command_client.mapping(),
+                "build_info": build_info,
+                "strategy_loadout": locked_sonic_strategy_loadout(),
                 "gamepad_camera": {
                     "driver": "carla-spectator"
                     if args.camera_yaw_source == "carla"
