@@ -187,6 +187,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gamepad-look-min-pitch-deg", type=float, default=-80.0)
     parser.add_argument("--gamepad-look-max-pitch-deg", type=float, default=60.0)
     parser.add_argument("--game-focus-title", default=r"(zsibot|matrix|unreal)")
+    parser.add_argument(
+        "--game-grab-ui-keys",
+        action="store_true",
+        help="Ask the game input provider to consume ESC/Q/E before cooked UE",
+    )
     parser.add_argument("--game-input-status-file", type=Path)
     parser.add_argument("--no-game-input-provider", action="store_true")
     parser.add_argument("--game-world-id")
@@ -2654,6 +2659,7 @@ class NativeProcessGroup:
         gamepad_look_min_pitch_deg: float,
         gamepad_look_max_pitch_deg: float,
         focus_title: str,
+        grab_ui_keys: bool,
         expected_ue_pid: int,
         status_file: Path | None,
         ue_camera_state_file: Path | None = None,
@@ -2715,6 +2721,8 @@ class NativeProcessGroup:
             "--expected-ue-pid",
             str(expected_ue_pid),
         ]
+        if grab_ui_keys:
+            command.append("--grab-ui-keys")
         if mouse_settings_file is not None:
             command.extend(("--mouse-settings-file", str(mouse_settings_file)))
         if ui_settings_file is not None:
@@ -3452,6 +3460,7 @@ def main() -> int:
                             args.gamepad_look_max_pitch_deg
                         ),
                         focus_title=args.game_focus_title,
+                        grab_ui_keys=args.game_grab_ui_keys,
                         expected_ue_pid=args.ue_pid,
                         status_file=args.game_input_status_file,
                         ue_camera_state_file=args.game_ue_camera_state_file,

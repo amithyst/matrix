@@ -161,7 +161,20 @@ DEFAULT_CARLA_WRITE_READBACK_TOLERANCE_RAD = math.radians(0.5)
 
 
 _X11_BAD_WINDOW = 3
+_X11_KEY_PRESS = 2
+_X11_KEY_RELEASE = 3
+_X11_GRAB_MODE_ASYNC = 1
+_X11_LOCK_MASK = 1 << 1
+_X11_MOD2_MASK = 1 << 4
 _X11_ERROR_HANDLER_LOCK = threading.RLock()
+_X11_UI_GRAB_MODIFIERS = (
+    0,
+    _X11_LOCK_MASK,
+    _X11_MOD2_MASK,
+    _X11_LOCK_MASK | _X11_MOD2_MASK,
+)
+_X11_UI_GRAB_KEY_NAMES = ("escape", "q", "e")
+_MAX_X11_GRABBED_UI_EVENTS_PER_POLL = 128
 
 
 class _XErrorEvent(ctypes.Structure):
@@ -178,6 +191,28 @@ class _XErrorEvent(ctypes.Structure):
     )
 
 
+class _XKeyEvent(ctypes.Structure):
+    """Public ``XKeyEvent`` prefix from Xlib.h."""
+
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    )
+
+
 _X11_ERROR_HANDLER = ctypes.CFUNCTYPE(
     ctypes.c_int,
     ctypes.c_void_p,
@@ -190,6 +225,7 @@ class _X11FocusErrorScope:
     """Errors and window IDs owned by one synchronous focus-chain query."""
 
     windows: set[int]
+    label: str = "focus query"
     stale_window: int | None = None
     unexpected_error: tuple[int, int, int, int] | None = None
 
@@ -1816,7 +1852,11 @@ class _XGenericEventCookie(ctypes.Structure):
 
 class _XEvent(ctypes.Union):
     # Xlib guarantees that XEvent is 24 longs on every supported ABI.
-    _fields_ = (("type", ctypes.c_int), ("pad", ctypes.c_long * 24))
+    _fields_ = (
+        ("type", ctypes.c_int),
+        ("xkey", _XKeyEvent),
+        ("pad", ctypes.c_long * 24),
+    )
 
 
 class _XIEventMask(ctypes.Structure):
@@ -2884,6 +2924,7 @@ class X11KeyboardMouse:
         capture_absolute_motion: bool = False,
         raw_button_gate: str = "xi2-events",
         maximum_mouse_delta: float = 200.0,
+        grab_ui_keys: bool = False,
         library: Any | None = None,
         xi_library: Any | None = None,
     ) -> None:
@@ -2906,6 +2947,11 @@ class X11KeyboardMouse:
             name: int(self._x11.XKeysymToKeycode(self._display, keysym))
             for name, keysym in self._KEYSYMS.items()
         }
+        self._grab_ui_keys = bool(grab_ui_keys)
+        self._grabbed_key_modifiers: dict[str, tuple[int, ...]] = {}
+        self._grabbed_escape_down = False
+        self._grabbed_escape_press_pending = False
+        self._grabbed_ui_events = 0
         if any(
             code <= 0
             for name, code in self._keycodes.items()
@@ -2946,6 +2992,12 @@ class X11KeyboardMouse:
         self._x_error_handler_callback = _X11_ERROR_HANDLER(
             self._handle_x_error
         )
+        if self._grab_ui_keys:
+            try:
+                self._install_ui_key_grabs()
+            except Exception:
+                self.close()
+                raise
         self._raw_motion: XInput2RawMotion | None = None
         if capture_raw_motion:
             try:
@@ -2981,6 +3033,15 @@ class X11KeyboardMouse:
             "last_focus_badwindow_resource": getattr(
                 self, "_last_focus_badwindow_resource", None
             ),
+            "ui_keys_grabbed": all(
+                bool(getattr(self, "_grabbed_key_modifiers", {}).get(name))
+                for name in _X11_UI_GRAB_KEY_NAMES
+            ),
+            "turn_keys_grabbed": all(
+                bool(getattr(self, "_grabbed_key_modifiers", {}).get(name))
+                for name in ("q", "e")
+            ),
+            "grabbed_ui_events": getattr(self, "_grabbed_ui_events", 0),
         }
         raw_motion = getattr(self, "_raw_motion", None)
         if raw_motion is not None:
@@ -2996,6 +3057,27 @@ class X11KeyboardMouse:
             "XDefaultRootWindow": ([ctypes.c_void_p], ctypes.c_ulong),
             "XKeysymToKeycode": ([ctypes.c_void_p, ctypes.c_ulong], ctypes.c_uint),
             "XQueryKeymap": ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+            "XPending": ([ctypes.c_void_p], ctypes.c_int),
+            "XNextEvent": (
+                [ctypes.c_void_p, ctypes.POINTER(_XEvent)],
+                ctypes.c_int,
+            ),
+            "XGrabKey": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_ulong,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                ],
+                ctypes.c_int,
+            ),
+            "XUngrabKey": (
+                [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_ulong],
+                ctypes.c_int,
+            ),
             "XQueryPointer": (
                 [
                     ctypes.c_void_p,
@@ -3054,6 +3136,7 @@ class X11KeyboardMouse:
                 [ctypes.c_void_p, ctypes.c_int],
                 ctypes.c_int,
             ),
+            "XFlush": ([ctypes.c_void_p], ctypes.c_int),
             # The callback type itself remains process-global in Xlib.  Use a
             # void pointer at the ABI boundary so the previous handler can be
             # restored verbatim, including Xlib's null/default sentinel.
@@ -3061,8 +3144,14 @@ class X11KeyboardMouse:
             "XFree": ([ctypes.c_void_p], ctypes.c_int),
             "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
         }
+        optional = {"XPending", "XNextEvent", "XGrabKey", "XUngrabKey", "XFlush"}
         for name, (argtypes, restype) in signatures.items():
-            function = getattr(self._x11, name)
+            try:
+                function = getattr(self._x11, name)
+            except AttributeError:
+                if name in optional:
+                    continue
+                raise
             try:
                 function.argtypes = argtypes
                 function.restype = restype
@@ -3118,8 +3207,8 @@ class X11KeyboardMouse:
         return 0
 
     @contextmanager
-    def _focus_window_error_scope(self) -> Iterator[_X11FocusErrorScope]:
-        """Bound asynchronous BadWindow handling to one focus-chain read.
+    def _x11_error_scope(self, label: str) -> Iterator[_X11FocusErrorScope]:
+        """Bound asynchronous X errors to one synchronous Xlib operation.
 
         Xlib error handlers are process-global while protocol errors are
         asynchronous.  The leading XSync drains older requests under the
@@ -3129,9 +3218,9 @@ class X11KeyboardMouse:
 
         with _X11_ERROR_HANDLER_LOCK:
             if self._active_focus_error_scope is not None:
-                raise RuntimeError("nested X11 focus error scope")
+                raise RuntimeError("nested X11 error scope")
             self._x11.XSync(self._display, 0)
-            scope = _X11FocusErrorScope(windows=set())
+            scope = _X11FocusErrorScope(windows=set(), label=label)
             self._active_focus_error_scope = scope
             callback = ctypes.cast(
                 self._x_error_handler_callback, ctypes.c_void_p
@@ -3155,10 +3244,111 @@ class X11KeyboardMouse:
                     scope.unexpected_error
                 )
                 raise RuntimeError(
-                    "unexpected X11 error during focus query: "
+                    f"unexpected X11 error during {scope.label}: "
                     f"code={error_code} request={request_code} "
                     f"minor={minor_code} resource={resource}"
                 )
+
+    @contextmanager
+    def _focus_window_error_scope(self) -> Iterator[_X11FocusErrorScope]:
+        """Bound asynchronous BadWindow handling to one focus-chain read."""
+
+        with self._x11_error_scope("focus query") as scope:
+            yield scope
+
+    def _install_ui_key_grabs(self) -> None:
+        """Consume Matrix UI keys before packaged UE can treat them as global commands.
+
+        XQueryKeymap still exposes the physical key level to this provider, so
+        ESC/Q/E remain usable by Matrix while Q cannot reach the cooked UE quit
+        path.
+        """
+
+        missing = [
+            name
+            for name in ("XGrabKey", "XUngrabKey", "XPending", "XNextEvent", "XFlush")
+            if not hasattr(self._x11, name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "X11 UI key isolation is unavailable: missing "
+                + ", ".join(missing)
+            )
+        grabbed_by_name: dict[str, tuple[int, ...]] = {}
+        try:
+            with self._x11_error_scope("Matrix UI passive grab"):
+                for name in _X11_UI_GRAB_KEY_NAMES:
+                    keycode = int(self._keycodes.get(name, 0))
+                    if keycode <= 0:
+                        raise RuntimeError(f"X11 keyboard map is missing {name}")
+                    grabbed: list[int] = []
+                    for modifiers in _X11_UI_GRAB_MODIFIERS:
+                        self._x11.XGrabKey(
+                            self._display,
+                            keycode,
+                            modifiers,
+                            self._root,
+                            0,  # owner_events=False: consume before UE/SDL sees it.
+                            _X11_GRAB_MODE_ASYNC,
+                            _X11_GRAB_MODE_ASYNC,
+                        )
+                        grabbed.append(modifiers)
+                    grabbed_by_name[name] = tuple(grabbed)
+                self._x11.XSync(self._display, 0)
+        except RuntimeError as exc:
+            raise RuntimeError(f"cannot grab Matrix UI keys: {exc}") from exc
+        self._grabbed_key_modifiers = grabbed_by_name
+
+    def _ungrab_ui_key_grabs(self) -> None:
+        display = getattr(self, "_display", None)
+        if not display:
+            return
+        grabbed_by_name = dict(getattr(self, "_grabbed_key_modifiers", {}))
+        for name, modifiers in grabbed_by_name.items():
+            keycode = int(getattr(self, "_keycodes", {}).get(name, 0))
+            if keycode <= 0:
+                continue
+            for modifier in modifiers:
+                self._x11.XUngrabKey(display, keycode, modifier, self._root)
+        if grabbed_by_name:
+            self._x11.XFlush(display)
+        self._grabbed_key_modifiers = {}
+        self._grabbed_escape_down = False
+        self._grabbed_escape_press_pending = False
+
+    def _drain_grabbed_ui_events(self) -> bool:
+        """Drain passive-grab key events and return a one-frame Escape sample."""
+
+        if not getattr(self, "_grabbed_key_modifiers", {}):
+            return False
+        escape_keycode = int(self._keycodes.get("escape", 0))
+        processed = 0
+        while self._x11.XPending(self._display):
+            if processed >= _MAX_X11_GRABBED_UI_EVENTS_PER_POLL:
+                raise RuntimeError(
+                    "grabbed Matrix UI key event backlog exceeded the safe limit"
+                )
+            event = _XEvent()
+            self._x11.XNextEvent(self._display, ctypes.byref(event))
+            processed += 1
+            if event.type not in {_X11_KEY_PRESS, _X11_KEY_RELEASE}:
+                continue
+            if int(event.xkey.keycode) != escape_keycode:
+                continue
+            self._grabbed_ui_events = (
+                getattr(self, "_grabbed_ui_events", 0) + 1
+            )
+            if event.type == _X11_KEY_PRESS:
+                self._grabbed_escape_down = True
+                self._grabbed_escape_press_pending = True
+            else:
+                self._grabbed_escape_down = False
+        escape_pressed = bool(
+            getattr(self, "_grabbed_escape_down", False)
+            or getattr(self, "_grabbed_escape_press_pending", False)
+        )
+        self._grabbed_escape_press_pending = False
+        return escape_pressed
 
     def _fetch_name(self, window: int) -> str | None:
         name = ctypes.c_char_p()
@@ -3258,6 +3448,7 @@ class X11KeyboardMouse:
         return result
 
     def poll(self) -> KeyboardMouseSample:
+        grabbed_escape_pressed = self._drain_grabbed_ui_events()
         key_buffer = ctypes.create_string_buffer(32)
         if not self._x11.XQueryKeymap(self._display, key_buffer):
             raise RuntimeError("XQueryKeymap failed")
@@ -3358,7 +3549,7 @@ class X11KeyboardMouse:
             or pressed.get("alt_right", False),
             shift=pressed.get("shift_left", False)
             or pressed.get("shift_right", False),
-            escape=pressed.get("escape", False),
+            escape=grabbed_escape_pressed or pressed.get("escape", False),
             mouse_mode=pressed.get("mouse_mode", False),
             mouse_speed_down=pressed.get("mouse_speed_down", False),
             mouse_speed_up=pressed.get("mouse_speed_up", False),
@@ -3375,6 +3566,7 @@ class X11KeyboardMouse:
         )
 
     def close(self) -> None:
+        self._ungrab_ui_key_grabs()
         raw_motion = getattr(self, "_raw_motion", None)
         if raw_motion is not None:
             raw_motion.close()
@@ -4332,6 +4524,14 @@ def _parse_args() -> argparse.Namespace:
         help="Disable only the title regex; exact UE PID binding remains active",
     )
     parser.add_argument(
+        "--grab-ui-keys",
+        action="store_true",
+        help=(
+            "Passively grab ESC/Q/E on X11 so Matrix consumes them before "
+            "the cooked UE window can treat Q as an application quit key"
+        ),
+    )
+    parser.add_argument(
         "--look-button",
         choices=("left", "middle", "right"),
         default="left",
@@ -4679,6 +4879,7 @@ def main() -> int:
                 if args.camera_yaw_source == "x11-core-gated"
                 else "xi2-events"
             ),
+            grab_ui_keys=args.grab_ui_keys,
         )
     except (OSError, RuntimeError, re.error) as exc:
         raise SystemExit(f"Matrix game-control input cannot initialize X11: {exc}") from exc

@@ -2222,6 +2222,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 gamepad_look_min_pitch_deg=-70.0,
                 gamepad_look_max_pitch_deg=50.0,
                 focus_title="matrix",
+                grab_ui_keys=True,
                 expected_ue_pid=4242,
                 status_file=Path("/matrix/outputs/game-input.json"),
                 command_fd=command_fd,
@@ -2251,6 +2252,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             command[command.index("--camera-yaw-offset-deg") + 1], "90.0"
         )
         self.assertEqual(command[command.index("--expected-ue-pid") + 1], "4242")
+        self.assertIn("--grab-ui-keys", command)
         self.assertEqual(
             command[command.index("--game-command-fd") + 1],
             str(command_fd),
@@ -2319,6 +2321,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             gamepad_look_min_pitch_deg=-80.0,
             gamepad_look_max_pitch_deg=60.0,
             focus_title="matrix",
+            grab_ui_keys=False,
             expected_ue_pid=4242,
             status_file=None,
         )

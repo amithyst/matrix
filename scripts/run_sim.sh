@@ -1617,6 +1617,9 @@ if $MATRIX_SONIC_ENABLED; then
         --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
+    if [[ "${MATRIX_GAME_GRAB_UI_KEYS:-1}" == "1" ]]; then
+        GAME_INPUT_ARGS+=(--game-grab-ui-keys)
+    fi
     if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
         if [[ -z "$UE_CAMERA_STATE_FILE" ]]; then
             echo "[ERROR] UE final-POV state file was not initialized" >&2
