@@ -344,8 +344,11 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(core.heading_rad, heading_before_telemetry)
         command = core.command(now_s=10.01, dt_s=0.1)
         self.assertEqual(command.mode, "move")
-        self.assertAlmostEqual(command.movement[0], math.cos(0.4))
-        self.assertAlmostEqual(command.movement[1], math.sin(0.4))
+        expected_heading = GAME_CONTROL.wrap_angle_rad(
+            measured_heading + GAME_CONTROL.MAX_MEASURED_FACING_LEAD_RAD
+        )
+        self.assertAlmostEqual(command.movement[0], math.cos(expected_heading))
+        self.assertAlmostEqual(command.movement[1], math.sin(expected_heading))
 
         source_lines = [
             line.strip()
