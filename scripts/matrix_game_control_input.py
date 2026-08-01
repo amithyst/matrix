@@ -35,6 +35,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from typing import Any, Callable, Iterator, Protocol
 
 from matrix_build_info import (
@@ -5056,6 +5057,9 @@ def main() -> int:
         if motion_store is not None
         else DEFAULT_MOVEMENT_MODE
     )
+    exception_detail: dict[str, object] | None = None
+    overlay_error: str | None = None
+    overlay_failures = 0
     provider_yaw = tracker.yaw
     camera_yaw = transform_camera_yaw(
         provider_yaw,
@@ -5071,47 +5075,88 @@ def main() -> int:
         effective_deg_per_unit=effective_mouse_sensitivity,
     )
     source_claim = camera_source_claim(args.camera_yaw_source)
+
+    def overlay_runtime_mapping() -> dict[str, object]:
+        return {
+            "configured": args.expected_ue_pid is not None,
+            "available": overlay is not None,
+            "failures": overlay_failures,
+            "last_error": overlay_error,
+        }
+
+    def disable_overlay(context: str, exc: Exception) -> bool:
+        """Disable the ESC overlay without killing the movement input provider."""
+
+        nonlocal overlay, overlay_error, overlay_failures, calibration_neutral_frames
+        overlay_failures += 1
+        overlay_error = f"{context}: {type(exc).__name__}: {exc}"
+        print(
+            "matrix-game-control-input WARN disabling calibration overlay: "
+            f"{overlay_error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if overlay is not None:
+            try:
+                overlay.close()
+            except Exception as close_exc:
+                print(
+                    "matrix-game-control-input WARN calibration overlay close "
+                    f"failed: {type(close_exc).__name__}: {close_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            overlay = None
+        left_calibration = calibration.exit()
+        if left_calibration:
+            calibration_neutral_frames = 0
+        return bool(game_command_client.panel_closed() or left_calibration)
+
     try:
         if overlay is not None:
-            overlay.start(
-                {
-                    **source_claim,
-                    "mouse_settings": mouse_settings.live_mapping(applied_mouse),
-                    "ui_settings": ui_settings.live_mapping(),
-                    "motion_settings": motion_settings_live_mapping(
-                        motion_store,
-                        applied=applied_motion,
-                        change_count=motion_settings_change_count,
-                        persistence_error=motion_settings_error,
-                    ),
-                    "video_settings": video_settings_live_mapping(
-                        video_store,
-                        applied_runtime=applied_video_runtime,
-                        change_count=video_settings_change_count,
-                        persistence_error=video_settings_error,
-                    ),
-                    "restart": restart_requester.mapping(),
-                    "apply_return": apply_return.mapping(),
-                    "command_console": game_command_client.mapping(),
-                    "build_info": build_info,
-                    "strategy_loadout": locked_sonic_strategy_loadout(),
-                    "movement_mode": current_movement_mode,
-                    "mirror_sensitivity": sensitivity_telemetry,
-                    "pointer": x11.pointer_telemetry,
-                    "camera_yaw": camera_yaw_telemetry(
-                        args.camera_yaw_source,
-                        provider_yaw_rad=provider_yaw,
-                        sonic_yaw_rad=camera_yaw,
-                    ),
-                    "ue_final_pov": ue_final_pov_telemetry(None),
-                    "keyboard_camera": keyboard_camera_telemetry(
-                        engine_camera_worker,
-                        keyboard_camera_integrator,
-                        arrow_keys_available=x11.arrow_keys_available,
-                        rate_deg_s=args.keyboard_camera_look_rate_deg_s,
-                    ),
-                }
-            )
+            try:
+                overlay.start(
+                    {
+                        **source_claim,
+                        "mouse_settings": mouse_settings.live_mapping(applied_mouse),
+                        "ui_settings": ui_settings.live_mapping(),
+                        "motion_settings": motion_settings_live_mapping(
+                            motion_store,
+                            applied=applied_motion,
+                            change_count=motion_settings_change_count,
+                            persistence_error=motion_settings_error,
+                        ),
+                        "video_settings": video_settings_live_mapping(
+                            video_store,
+                            applied_runtime=applied_video_runtime,
+                            change_count=video_settings_change_count,
+                            persistence_error=video_settings_error,
+                        ),
+                        "restart": restart_requester.mapping(),
+                        "apply_return": apply_return.mapping(),
+                        "command_console": game_command_client.mapping(),
+                        "build_info": build_info,
+                        "strategy_loadout": locked_sonic_strategy_loadout(),
+                        "movement_mode": current_movement_mode,
+                        "mirror_sensitivity": sensitivity_telemetry,
+                        "pointer": x11.pointer_telemetry,
+                        "camera_yaw": camera_yaw_telemetry(
+                            args.camera_yaw_source,
+                            provider_yaw_rad=provider_yaw,
+                            sonic_yaw_rad=camera_yaw,
+                        ),
+                        "ue_final_pov": ue_final_pov_telemetry(None),
+                        "keyboard_camera": keyboard_camera_telemetry(
+                            engine_camera_worker,
+                            keyboard_camera_integrator,
+                            arrow_keys_available=x11.arrow_keys_available,
+                            rate_deg_s=args.keyboard_camera_look_rate_deg_s,
+                        ),
+                        "calibration_overlay": overlay_runtime_mapping(),
+                    }
+                )
+            except (OSError, RuntimeError) as exc:
+                disable_overlay("startup", exc)
         while running:
             now = time.monotonic()
             if args.max_seconds > 0.0 and now - started >= args.max_seconds:
@@ -5143,12 +5188,21 @@ def main() -> int:
             raw_keyboard = x11.poll()
             last_keyboard = raw_keyboard
             raw_pad = gamepad.poll(now)
-            panel_intents = overlay.drain_intents() if overlay is not None else ()
+            panel_was_active = calibration.active
+            overlay_state_changed = False
+            if overlay is not None:
+                try:
+                    panel_intents = overlay.drain_intents()
+                except RuntimeError as exc:
+                    overlay_state_changed = disable_overlay("drain_intents", exc)
+                    panel_intents = ()
+            else:
+                panel_intents = ()
             shortcuts_armed = shortcut_arming.update(
                 escape_pressed=raw_keyboard.escape,
                 restart_pressed=raw_keyboard.apply_restart,
             )
-            panel_was_active = calibration.active
+            command_state_changed = bool(command_state_changed or overlay_state_changed)
             panel_escape = game_command_client.panel_escape_pressed(
                 raw_keyboard.escape if shortcuts_armed else False,
                 # A begin/end pair can both arrive inside one 20 ms provider
@@ -5479,72 +5533,76 @@ def main() -> int:
             # poll.  Telemetry stays downstream of every safety decision and
             # never feeds the tracker or snapshot interlocks.
             if overlay is not None:
-                overlay.ensure_running()
-                if (
-                    calibration_toggled
-                    or left_calibration
-                    or bool(panel_intents)
-                    or command_state_changed
-                    or mouse_settings_changed
-                    or ui_settings_changed
-                    or motion_settings_changed
-                    or video_settings_changed
-                    or restart_requested
-                    or teleport_rejections != last_teleport_rejections
-                    or now >= next_overlay_heartbeat
-                ):
-                    overlay.publish(
-                        {
-                            **source_claim,
-                            "active": calibration.active,
-                            "toggle_count": calibration.toggle_count,
-                            "updated_monotonic_s": now,
-                            "expected_ue_pid": args.expected_ue_pid,
-                            "raw_ue_focused": raw_keyboard.focused,
-                            "snapshot_forced_unfocused": calibration_interlock_active,
-                            "shortcuts_armed": shortcuts_armed,
-                            "neutral_frames": calibration_neutral_frames,
-                            "mouse_settings": mouse_settings.live_mapping(
-                                applied_mouse
-                            ),
-                            "ui_settings": ui_settings.live_mapping(),
-                            "motion_settings": motion_settings_live_mapping(
-                                motion_store,
-                                applied=applied_motion,
-                                change_count=motion_settings_change_count,
-                                persistence_error=motion_settings_error,
-                            ),
-                            "video_settings": video_settings_live_mapping(
-                                video_store,
-                                applied_runtime=applied_video_runtime,
-                                change_count=video_settings_change_count,
-                                persistence_error=video_settings_error,
-                            ),
-                            "restart": restart_requester.mapping(),
-                            "apply_return": apply_return.mapping(),
-                            "command_console": game_command_client.mapping(),
-                            "build_info": build_info,
-                            "strategy_loadout": locked_sonic_strategy_loadout(),
-                            "movement_mode": current_movement_mode,
-                            "mirror_sensitivity": sensitivity_telemetry,
-                            "camera_yaw": camera_yaw_telemetry(
-                                args.camera_yaw_source,
-                                provider_yaw_rad=provider_yaw,
-                                sonic_yaw_rad=camera_yaw,
-                            ),
-                            "ue_final_pov": ue_final_pov_telemetry(
-                                final_pov_observation
-                            ),
-                            "keyboard_camera": keyboard_camera_telemetry(
-                                engine_camera_worker,
-                                keyboard_camera_integrator,
-                                arrow_keys_available=x11.arrow_keys_available,
-                                rate_deg_s=args.keyboard_camera_look_rate_deg_s,
-                            ),
-                            "pointer": pointer_telemetry,
-                        }
-                    )
-                    next_overlay_heartbeat = now + 1.0
+                try:
+                    overlay.ensure_running()
+                    if (
+                        calibration_toggled
+                        or left_calibration
+                        or bool(panel_intents)
+                        or command_state_changed
+                        or mouse_settings_changed
+                        or ui_settings_changed
+                        or motion_settings_changed
+                        or video_settings_changed
+                        or restart_requested
+                        or teleport_rejections != last_teleport_rejections
+                        or now >= next_overlay_heartbeat
+                    ):
+                        overlay.publish(
+                            {
+                                **source_claim,
+                                "active": calibration.active,
+                                "toggle_count": calibration.toggle_count,
+                                "updated_monotonic_s": now,
+                                "expected_ue_pid": args.expected_ue_pid,
+                                "raw_ue_focused": raw_keyboard.focused,
+                                "snapshot_forced_unfocused": calibration_interlock_active,
+                                "shortcuts_armed": shortcuts_armed,
+                                "neutral_frames": calibration_neutral_frames,
+                                "mouse_settings": mouse_settings.live_mapping(
+                                    applied_mouse
+                                ),
+                                "ui_settings": ui_settings.live_mapping(),
+                                "motion_settings": motion_settings_live_mapping(
+                                    motion_store,
+                                    applied=applied_motion,
+                                    change_count=motion_settings_change_count,
+                                    persistence_error=motion_settings_error,
+                                ),
+                                "video_settings": video_settings_live_mapping(
+                                    video_store,
+                                    applied_runtime=applied_video_runtime,
+                                    change_count=video_settings_change_count,
+                                    persistence_error=video_settings_error,
+                                ),
+                                "restart": restart_requester.mapping(),
+                                "apply_return": apply_return.mapping(),
+                                "command_console": game_command_client.mapping(),
+                                "build_info": build_info,
+                                "strategy_loadout": locked_sonic_strategy_loadout(),
+                                "movement_mode": current_movement_mode,
+                                "mirror_sensitivity": sensitivity_telemetry,
+                                "camera_yaw": camera_yaw_telemetry(
+                                    args.camera_yaw_source,
+                                    provider_yaw_rad=provider_yaw,
+                                    sonic_yaw_rad=camera_yaw,
+                                ),
+                                "ue_final_pov": ue_final_pov_telemetry(
+                                    final_pov_observation
+                                ),
+                                "keyboard_camera": keyboard_camera_telemetry(
+                                    engine_camera_worker,
+                                    keyboard_camera_integrator,
+                                    arrow_keys_available=x11.arrow_keys_available,
+                                    rate_deg_s=args.keyboard_camera_look_rate_deg_s,
+                                ),
+                                "calibration_overlay": overlay_runtime_mapping(),
+                                "pointer": pointer_telemetry,
+                            }
+                        )
+                        next_overlay_heartbeat = now + 1.0
+                except RuntimeError as exc:
+                    disable_overlay("publish", exc)
             last_teleport_rejections = teleport_rejections
             snapshot = build_snapshot(
                 sequence=sequence,
@@ -5574,8 +5632,14 @@ def main() -> int:
         if exit_reason == "unknown":
             exit_reason = "signal"
     except Exception as exc:
-        exit_reason = f"error:{type(exc).__name__}"
+        exception_detail = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        exit_reason = f"error:{type(exc).__name__}:{exc}"
         print(f"matrix-game-control-input ERROR {exc}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         return_code = 1
     finally:
         # A focused=false release is immediate; the core's independent 0.15 s
@@ -5648,6 +5712,14 @@ def main() -> int:
                 "ue_final_pov": ue_final_pov_telemetry(
                     final_pov_observation
                 ),
+                "keyboard_camera": keyboard_camera_telemetry(
+                    engine_camera_worker,
+                    keyboard_camera_integrator,
+                    arrow_keys_available=x11.arrow_keys_available,
+                    rate_deg_s=args.keyboard_camera_look_rate_deg_s,
+                ),
+                "calibration_overlay": overlay_runtime_mapping(),
+                "exception": exception_detail,
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),
                 "command_console": game_command_client.mapping(),
