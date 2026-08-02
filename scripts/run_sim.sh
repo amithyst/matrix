@@ -1479,7 +1479,7 @@ if $MATRIX_SONIC_ENABLED; then
             --map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
             --map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
             --source "$source"
-            --root-clearance "${MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.78696775}"
+            --root-clearance "${MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.85}"
             --min-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MIN_RESUME_CLEARANCE:-0.45}"
             --max-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MAX_RESUME_CLEARANCE:-1.30}"
         )
@@ -1519,17 +1519,18 @@ if $MATRIX_SONIC_ENABLED; then
             [[ -n "$value" ]] && ((moon_spawn_override_count += 1))
         done
         if [[ "$moon_spawn_override_count" == "0" ]]; then
-            # Verified playable MoonWorld route from the stable desktop branch.
-            # The historical map default at 23,13 can idle-drift into a slope
-            # after the startup band releases.
+            # Verified MoonWorld plain from the pre-regression mainline.  This
+            # point is a locally flat, locked-height patch with real collision;
+            # it avoids spawning into the steeper 23,13 test slope or the later
+            # 24.43,110.77 route that can destabilize native SONIC.
             resolve_moon_spawn_args \
-                "verified_route" \
-                24.43 \
-                110.77 \
-                -5.3145942731628422 \
-                3.141592653589793 \
+                "mainline_plain" \
+                -94.7 \
+                -65.6 \
+                -5.251562023162842 \
+                0 \
                 || return 1
-            echo "[INFO] MoonWorld verified playable spawn route selected"
+            echo "[INFO] MoonWorld verified mainline plain spawn selected"
             return 0
         fi
         if [[ "$moon_spawn_override_count" == "4" ]]; then

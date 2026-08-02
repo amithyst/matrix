@@ -63,19 +63,18 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
             run_sim,
         )
         self.assertIn(
-            'MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.78696775',
+            'MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.85',
             run_sim,
         )
 
-    def test_run_sim_moon_default_uses_verified_playable_route(self) -> None:
+    def test_run_sim_moon_default_uses_verified_mainline_plain(self) -> None:
         run_sim = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(encoding="utf-8")
 
         self.assertIn("resolve_default_moon_spawn_args", run_sim)
-        self.assertIn("MoonWorld verified playable spawn route selected", run_sim)
-        self.assertIn("24.43", run_sim)
-        self.assertIn("110.77", run_sim)
-        self.assertIn("-5.3145942731628422", run_sim)
-        self.assertIn("3.141592653589793", run_sim)
+        self.assertIn("MoonWorld verified mainline plain spawn selected", run_sim)
+        self.assertIn("-94.7", run_sim)
+        self.assertIn("-65.6", run_sim)
+        self.assertIn("-5.251562023162842", run_sim)
         self.assertIn("MATRIX_MOON_SPAWN_X/Y/Z/YAW are all-or-none", run_sim)
 
     def test_moon_default_spawn_samples_raw_ground_height(self) -> None:
