@@ -259,7 +259,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
-      "sha256": "155f6f52b4f5ee4a99997754e48839ae85b7c39a9407ef2167870325b7ce901f"
+      "sha256": "655ea74da69cde3d0fc3243d5783e0e7aa55d02bce618f9a5216e191bc4f5967"
     },
     {
       "root": "sonic",
