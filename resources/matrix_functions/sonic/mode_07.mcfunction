@@ -1,2 +1,2 @@
-# SONIC 7：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 7：俯卧待机档。
 /sonic mode 7

@@ -245,6 +245,11 @@ class OverlayLayoutTest(unittest.TestCase):
             MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_7"),
             "/sonic mode 7",
         )
+        self.assertIn("俯卧", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[7])
+        self.assertIn("受伤", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[19])
+        self.assertTrue(
+            any("19 受伤行走" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
+        )
 
     def test_keybindings_page_exposes_hot_movement_mode_switches(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))

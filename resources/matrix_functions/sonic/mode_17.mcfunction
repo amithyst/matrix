@@ -1,2 +1,2 @@
-# SONIC 17：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 17：向前跳跃档。
 /sonic mode 17

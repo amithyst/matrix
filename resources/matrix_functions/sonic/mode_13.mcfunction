@@ -1,2 +1,2 @@
-# SONIC 13：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 13：随机出拳档。
 /sonic mode 13

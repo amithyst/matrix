@@ -1,2 +1,2 @@
-# SONIC 4：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 4：蹲姿待机档。
 /sonic mode 4

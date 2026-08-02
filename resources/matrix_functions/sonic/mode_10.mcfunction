@@ -1,2 +1,2 @@
-# SONIC 10：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 10：拳击行走档。
 /sonic mode 10

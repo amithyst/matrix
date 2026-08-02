@@ -1,2 +1,2 @@
-# SONIC 19：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 19：受伤行走档。
 /sonic mode 19

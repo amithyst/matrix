@@ -1267,11 +1267,14 @@ _NATIVE_MODE_HIT_TARGETS = ("native_mode_auto",) + tuple(
 )
 _NATIVE_MODE_BUTTON_LABELS_ZH = {
     None: native_mode_label_zh(None),
-    0: native_mode_label_zh(0),
-    1: native_mode_label_zh(1),
-    2: native_mode_label_zh(2),
-    3: native_mode_label_zh(3),
+    **{index: native_mode_label_zh(index) for index in range(20)},
 }
+_NATIVE_MODE_LEGEND_LINES_ZH = (
+    "0 空闲/原地；1 慢走；2 行走；3 跑步；4 蹲姿待机；5 双膝跪姿",
+    "6 单膝跪姿；7 俯卧待机；8 爬行；9 拳击待机；10 拳击行走",
+    "11 左直拳；12 右直拳；13 随机出拳；14 肘部爬行；15 左勾拳",
+    "16 右勾拳；17 向前跳跃；18 隐蔽行走；19 受伤行走",
+)
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider", "video_camera_distance_cm_slider")
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
     f"locomotion_policy_{index}"
@@ -6556,7 +6559,7 @@ class X11CalibrationOverlay:
         for offset, line in enumerate(
             (
                 "WASD 模式：相机朝向=按镜头前方行走并自动面向；相机侧移=按镜头平移；机身相对=按机器人自身坐标。",
-                "SONIC：" + native_mode_description_zh(None) + " 4-19 是原生单档，语义待确认。",
+                "SONIC：" + native_mode_description_zh(None) + " 4-19 含蹲/跪/爬行/拳击/跳跃/风格走路。",
             )
         ):
             self._draw_text(
@@ -6845,7 +6848,7 @@ class X11CalibrationOverlay:
             )
         auto_rect = self._panel_rectangle(layout, "native_mode_auto")
         self._draw_text(
-            "SONIC 模式：AUTO 自动稳定；0-3 是已知步态；4-19 为原生单档/语义待确认",
+            "SONIC 模式：AUTO 自动稳定；0-19 为原生 LocomotionMode，按钮含中文说明",
             x=content[0],
             y=max(auto_rect[1] - 12, content[1] + 72),
             colour=self._colours["muted"],
@@ -6878,8 +6881,8 @@ class X11CalibrationOverlay:
                 self._clip_console_line(path_line, content[2]),
                 self._clip_console_line(files_line, content[2]),
                 "AUTO：" + native_mode_description_zh(None),
-                "4-19：SONIC 原生单档，Matrix 只透传编号，具体语义待确认",
                 "示例：/function recover_here，/function sonic/mode_07，/function sonic/auto",
+                *_NATIVE_MODE_LEGEND_LINES_ZH,
             )
         ):
             self._draw_text(

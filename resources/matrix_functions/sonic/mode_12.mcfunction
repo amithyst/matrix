@@ -1,2 +1,2 @@
-# SONIC 12：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 12：右直拳档。
 /sonic mode 12

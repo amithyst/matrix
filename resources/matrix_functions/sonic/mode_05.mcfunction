@@ -1,2 +1,2 @@
-# SONIC 5：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 5：双膝跪姿档。
 /sonic mode 5

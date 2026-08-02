@@ -1594,12 +1594,22 @@ def _game_control_status_fields(
         "input_source_effective": effective_input_source,
         "native_gait": "IDLE/SLOW_WALK/WALK/RUN selected by movement tier",
         "native_gait_modes": {
-            SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
+            SONIC_GAIT_NAMES[mode]: mode
+            for mode in (
+                SONIC_IDLE_MODE,
+                SONIC_SLOW_WALK_MODE,
+                SONIC_WALK_MODE,
+                SONIC_RUN_MODE,
+            )
         },
         "native_mode_override": "auto unless changed by /sonic mode or ESC native-mode buttons",
         "native_mode_override_range": [SONIC_NATIVE_MODE_MIN, SONIC_NATIVE_MODE_MAX],
         "native_mode_override_auto_label_zh": native_mode_label_zh(None),
         "native_mode_override_auto_description_zh": native_mode_description_zh(None),
+        "native_mode_catalog_zh": {
+            str(mode): native_mode_label_zh(mode)
+            for mode in range(SONIC_NATIVE_MODE_MIN, SONIC_NATIVE_MODE_MAX + 1)
+        },
         "game_function_directory": (
             str(args.game_function_directory)
             if getattr(args, "game_function_directory", None) is not None

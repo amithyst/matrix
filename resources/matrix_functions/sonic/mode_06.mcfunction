@@ -1,2 +1,2 @@
-# SONIC 6：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 6：单膝跪姿档。
 /sonic mode 6

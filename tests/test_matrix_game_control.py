@@ -74,10 +74,16 @@ def armed_core(config=None):
 
 
 class InputProtocolTest(unittest.TestCase):
-    def test_native_mode_chinese_labels_cover_auto_known_and_unknown_modes(self) -> None:
+    def test_native_mode_chinese_labels_cover_auto_and_native_modes(self) -> None:
         self.assertIn("自动", MODULE.native_mode_label_zh(None))
         self.assertIn("慢走", MODULE.native_mode_description_zh(1))
-        self.assertIn("原生模式 19", MODULE.native_mode_description_zh(19))
+        self.assertIn("受伤", MODULE.native_mode_description_zh(19))
+        self.assertIn("拳击", MODULE.native_mode_label_zh(10))
+        self.assertNotIn("待确认", MODULE.native_mode_description_zh(18))
+        for mode in range(20):
+            with self.subTest(mode=mode):
+                self.assertIn(str(mode), MODULE.native_mode_label_zh(mode))
+                self.assertGreater(len(MODULE.native_mode_description_zh(mode)), 8)
 
     def test_snapshot_packet_round_trip(self) -> None:
         original = snapshot(pressed=("w", "q"), stick=(0.25, -0.5), yaw=1.25)

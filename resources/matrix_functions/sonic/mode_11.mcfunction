@@ -1,2 +1,2 @@
-# SONIC 11：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 11：左直拳档。
 /sonic mode 11

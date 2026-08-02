@@ -1,2 +1,2 @@
-# SONIC 16：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 16：右勾拳档。
 /sonic mode 16

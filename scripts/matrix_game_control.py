@@ -346,6 +346,22 @@ SONIC_GAIT_NAMES = {
     SONIC_SLOW_WALK_MODE: "SLOW_WALK",
     SONIC_WALK_MODE: "WALK",
     SONIC_RUN_MODE: "RUN",
+    4: "IDEL_SQUAT",
+    5: "IDEL_KNEEL_TWO_LEGS",
+    6: "IDEL_KNEEL",
+    7: "IDEL_LYING_FACE_DOWN",
+    8: "CRAWLING",
+    9: "IDEL_BOXING",
+    10: "WALK_BOXING",
+    11: "LEFT_PUNCH",
+    12: "RIGHT_PUNCH",
+    13: "RANDOM_PUNCH",
+    14: "ELBOW_CRAWLING",
+    15: "LEFT_HOOK",
+    16: "RIGHT_HOOK",
+    17: "FORWARD_JUMP",
+    18: "STEALTH_WALK",
+    19: "INJURED_WALK",
 }
 SONIC_NATIVE_MODE_DESCRIPTIONS_ZH: dict[int | None, tuple[str, str]] = {
     None: (
@@ -367,6 +383,70 @@ SONIC_NATIVE_MODE_DESCRIPTIONS_ZH: dict[int | None, tuple[str, str]] = {
     SONIC_RUN_MODE: (
         "3 跑步",
         "SONIC 跑步档；适合 Shift/高速输入，速度上限更高。",
+    ),
+    4: (
+        "4 蹲姿待机",
+        "SONIC 蹲姿静态档；用于低姿态原地保持，不是行走档。",
+    ),
+    5: (
+        "5 双膝跪姿",
+        "SONIC 双膝跪姿静态档；用于原地双膝跪姿保持。",
+    ),
+    6: (
+        "6 单膝跪姿",
+        "SONIC 单膝跪姿静态档；用于原地单膝跪姿保持。",
+    ),
+    7: (
+        "7 俯卧待机",
+        "SONIC 俯卧静态档；原生侧注释提示该动作仍需谨慎使用。",
+    ),
+    8: (
+        "8 爬行",
+        "SONIC 爬行动作档；用于低姿态爬行，不是站立行走。",
+    ),
+    9: (
+        "9 拳击待机",
+        "SONIC 拳击姿态静态档；用于原地拳击准备姿态。",
+    ),
+    10: (
+        "10 拳击行走",
+        "SONIC 拳击行走档；边移动边保持拳击风格。",
+    ),
+    11: (
+        "11 左直拳",
+        "SONIC 左手直拳动作档；偏动作/风格控制，不是常规移动档。",
+    ),
+    12: (
+        "12 右直拳",
+        "SONIC 右手直拳动作档；偏动作/风格控制，不是常规移动档。",
+    ),
+    13: (
+        "13 随机出拳",
+        "SONIC 随机出拳动作档；由原生策略选择拳击动作组合。",
+    ),
+    14: (
+        "14 肘部爬行",
+        "SONIC 肘部爬行动作档；用于更低姿态爬行。",
+    ),
+    15: (
+        "15 左勾拳",
+        "SONIC 左勾拳动作档；偏动作/风格控制。",
+    ),
+    16: (
+        "16 右勾拳",
+        "SONIC 右勾拳动作档；偏动作/风格控制。",
+    ),
+    17: (
+        "17 向前跳跃",
+        "SONIC 向前跳跃动作档；动态幅度较大，测试时应留安全空间。",
+    ),
+    18: (
+        "18 隐蔽行走",
+        "SONIC 隐蔽/潜行风格行走档；仍属于站立移动风格。",
+    ),
+    19: (
+        "19 受伤行走",
+        "SONIC 受伤风格行走档；步态会刻意表现为不对称/跛行。",
     ),
 }
 SONIC_GAIT_SPEED_RANGES_MPS = {

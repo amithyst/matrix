@@ -1,2 +1,2 @@
-# SONIC 14：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 14：肘部爬行档。
 /sonic mode 14

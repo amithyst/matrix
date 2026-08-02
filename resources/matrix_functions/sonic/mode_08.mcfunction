@@ -1,2 +1,2 @@
-# SONIC 8：原生单档，具体语义待 SONIC 侧确认。
+# SONIC 8：爬行档。
 /sonic mode 8
