@@ -2008,6 +2008,26 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         client.send_game_command(
             MODULE.RobotMotionCommand(
+                sequence=141,
+                movement=(0.0, 0.0, 0.0),
+                facing=(0.0, 1.0, 0.0),
+                speed_mps=0.0,
+                locomotion_mode=MODULE.SONIC_IDLE_MODE,
+                mode="turn",
+                safe_stop=False,
+                reason="manual_yaw",
+                delta_heading_rad=math.pi / 2.0,
+            )
+        )
+        self.assertAlmostEqual(commands[-1]["delta_heading"], math.pi / 2.0)
+        self.assertEqual(planners[-1]["mode"], MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(planners[-1]["movement"], [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(planners[-1]["facing"][0], 1.0)
+        self.assertAlmostEqual(planners[-1]["facing"][1], 0.0)
+        self.assertEqual(planners[-1]["speed"], -1.0)
+
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
                 sequence=15,
                 movement=(1.0, 0.0, 0.0),
                 facing=(1.0, 0.0, 0.0),
@@ -2020,6 +2040,27 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(planners[-1]["mode"], MODULE.SONIC_SLOW_WALK_MODE)
         self.assertAlmostEqual(planners[-1]["speed"], 0.8)
+
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=151,
+                movement=(0.0, 1.0, 0.0),
+                facing=(0.0, 1.0, 0.0),
+                speed_mps=0.8,
+                locomotion_mode=MODULE.SONIC_WALK_MODE,
+                mode="move",
+                safe_stop=False,
+                reason=None,
+                delta_heading_rad=math.pi / 2.0,
+            )
+        )
+        self.assertAlmostEqual(commands[-1]["delta_heading"], math.pi / 2.0)
+        self.assertEqual(planners[-1]["mode"], MODULE.SONIC_WALK_MODE)
+        self.assertAlmostEqual(planners[-1]["movement"][0], 1.0)
+        self.assertAlmostEqual(planners[-1]["movement"][1], 0.0)
+        self.assertAlmostEqual(planners[-1]["facing"][0], 1.0)
+        self.assertAlmostEqual(planners[-1]["facing"][1], 0.0)
+        self.assertEqual(planners[-1]["speed"], 0.8)
 
         for sequence, native_mode, speed, clamped in (
             (16, MODULE.SONIC_WALK_MODE, 0.79995, 0.8),

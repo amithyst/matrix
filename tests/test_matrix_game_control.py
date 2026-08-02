@@ -573,6 +573,7 @@ class GameControlCoreTest(unittest.TestCase):
                 math.atan2(command.facing[1], command.facing[0]),
                 expected_heading,
             )
+            self.assertAlmostEqual(command.delta_heading_rad, expected_heading)
 
     def test_q_and_e_match_pico_right_stick_yaw_accumulator_with_feedback(self) -> None:
         core = armed_core(immediate_config())
@@ -592,6 +593,7 @@ class GameControlCoreTest(unittest.TestCase):
             self.assertEqual(
                 command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
             )
+            self.assertAlmostEqual(command.delta_heading_rad, headings[-1])
 
         self.assertEqual(
             [round(value, 6) for value in headings],
@@ -612,6 +614,7 @@ class GameControlCoreTest(unittest.TestCase):
         )
         command = core.command(now_s=10.0, dt_s=1.0)
         self.assertAlmostEqual(math.atan2(command.facing[1], command.facing[0]), 0.1)
+        self.assertAlmostEqual(command.delta_heading_rad, 0.1)
         self.assertEqual(command.speed_mps, 0.0)
         self.assertEqual(command.mode, "turn")
         self.assertEqual(command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE)

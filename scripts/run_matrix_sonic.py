@@ -2262,10 +2262,21 @@ class NativePlannerClient:
             self._socket.close(linger=0)
             raise
         self._heading: float | None = None
+        self._delta_heading_rad: float = 0.0
 
     @staticmethod
     def _wrap_angle(value: float) -> float:
         return math.atan2(math.sin(value), math.cos(value))
+
+    @staticmethod
+    def _rotate_xy(values: list[float], angle_rad: float) -> list[float]:
+        cosine = math.cos(angle_rad)
+        sine = math.sin(angle_rad)
+        return [
+            cosine * values[0] - sine * values[1],
+            sine * values[0] + cosine * values[1],
+            values[2],
+        ]
 
     def send_velocity(
         self,
@@ -2312,6 +2323,7 @@ class NativePlannerClient:
         locomotion_mode: int = 2,
         start: bool = True,
         allow_stationary_locomotion: bool = False,
+        delta_heading: float | None = None,
     ) -> None:
         """Send an absolute planner direction in SONIC's normalized XY frame."""
 
@@ -2331,6 +2343,13 @@ class NativePlannerClient:
             raise ValueError("locomotion_mode must be a native SONIC motion in [0, 26]")
         if moving and locomotion_mode == SONIC_IDLE_MODE:
             raise ValueError("moving planner command cannot use native IDLE")
+        if delta_heading is not None:
+            delta_heading_value = float(delta_heading)
+            if not math.isfinite(delta_heading_value):
+                raise ValueError("delta_heading must be finite")
+            self._delta_heading_rad = self._wrap_angle(delta_heading_value)
+            movement_values = self._rotate_xy(movement_values, -self._delta_heading_rad)
+            facing_values = self._rotate_xy(facing_values, -self._delta_heading_rad)
         stationary_locomotion = bool(
             allow_stationary_locomotion
             and not moving
@@ -2341,7 +2360,7 @@ class NativePlannerClient:
                 start=start,
                 stop=False,
                 planner=True,
-                delta_heading=None,
+                delta_heading=self._delta_heading_rad if delta_heading is not None else None,
             )
         )
         self._socket.send(
@@ -2396,6 +2415,7 @@ class NativePlannerClient:
             speed=speed_mps,
             locomotion_mode=command.locomotion_mode,
             allow_stationary_locomotion=stationary_turn,
+            delta_heading=command.delta_heading_rad,
         )
 
     def close(self) -> None:

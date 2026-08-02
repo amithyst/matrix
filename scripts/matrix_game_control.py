@@ -339,7 +339,7 @@ SONIC_IDLE_MODE = 0
 SONIC_SLOW_WALK_MODE = 1
 SONIC_WALK_MODE = 2
 SONIC_RUN_MODE = 3
-SONIC_STATIONARY_TURN_MODE = SONIC_SLOW_WALK_MODE
+SONIC_STATIONARY_TURN_MODE = SONIC_IDLE_MODE
 SONIC_NATIVE_MODE_MIN = 0
 SONIC_NATIVE_MODE_MAX = 19
 SONIC_NATIVE_MANUAL_MODE_MIN = 4
@@ -727,6 +727,10 @@ class RobotMotionCommand:
     # SONIC serialization ignores this metadata.  Keeping it optional preserves
     # compatibility with external/test commands that only provide wire fields.
     desired_facing: tuple[float, float, float] | None = None
+    # Absolute native heading-state override in the normalized SONIC frame.
+    # Matrix uses this to mirror Pico/native Q/E heading control while planner
+    # movement/facing are serialized in the matching local frame.
+    delta_heading_rad: float | None = None
 
 
 class GameControlCore:
@@ -974,6 +978,7 @@ class GameControlCore:
             safe_stop=True,
             reason=reason,
             desired_facing=facing,
+            delta_heading_rad=self._command_heading_rad,
         )
 
     def _safety_reason(self, now_s: float) -> tuple[str, bool] | None:
@@ -1358,12 +1363,11 @@ class GameControlCore:
             or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
         if turning_to_heading:
-            # Pure facing changes must still enter a native motion manifold.
-            # Mode 0 can update the Matrix-facing target while the packaged
-            # SONIC body remains nearly inert on MoonWorld, which feels like
-            # Q/E or camera-face auto-turn did not work.  Publishing zero
-            # translation with the SLOW_WALK gait keeps the command stationary
-            # at Matrix level while giving SONIC an executable in-place turn.
+            # Pure facing changes use native HeadingState.delta_heading, the
+            # same physical orientation layer used by native Q/E-style heading
+            # controls.  Keeping the planner in IDLE avoids the invalid
+            # zero-translation SLOW_WALK combination that can stall or drift on
+            # MoonWorld.
             locomotion_mode = SONIC_STATIONARY_TURN_MODE
         native_override = self._native_mode_override
         if native_override is not None:
@@ -1390,6 +1394,7 @@ class GameControlCore:
                 else None
             ),
             desired_facing=desired_direction,
+            delta_heading_rad=self._command_heading_rad,
         )
 
 
