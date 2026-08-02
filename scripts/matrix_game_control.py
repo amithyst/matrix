@@ -339,7 +339,7 @@ SONIC_IDLE_MODE = 0
 SONIC_SLOW_WALK_MODE = 1
 SONIC_WALK_MODE = 2
 SONIC_RUN_MODE = 3
-SONIC_STATIONARY_TURN_MODE = SONIC_IDLE_MODE
+SONIC_STATIONARY_TURN_MODE = SONIC_SLOW_WALK_MODE
 SONIC_NATIVE_MODE_MIN = 0
 SONIC_NATIVE_MODE_MAX = 19
 SONIC_NATIVE_MANUAL_MODE_MIN = 4
@@ -978,7 +978,7 @@ class GameControlCore:
             safe_stop=True,
             reason=reason,
             desired_facing=facing,
-            delta_heading_rad=self._command_heading_rad,
+            delta_heading_rad=None,
         )
 
     def _safety_reason(self, now_s: float) -> tuple[str, bool] | None:
@@ -1363,11 +1363,10 @@ class GameControlCore:
             or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
         if turning_to_heading:
-            # Pure facing changes use native HeadingState.delta_heading, the
-            # same physical orientation layer used by native Q/E-style heading
-            # controls.  Keeping the planner in IDLE avoids the invalid
-            # zero-translation SLOW_WALK combination that can stall or drift on
-            # MoonWorld.
+            # Pure facing changes must enter a native turn-capable motion
+            # manifold.  Updating only HeadingState.delta_heading leaves the
+            # packaged MoonWorld body nearly inert because the native planner
+            # does not see a locomotion/facing transition to execute.
             locomotion_mode = SONIC_STATIONARY_TURN_MODE
         native_override = self._native_mode_override
         if native_override is not None:
@@ -1394,7 +1393,7 @@ class GameControlCore:
                 else None
             ),
             desired_facing=desired_direction,
-            delta_heading_rad=self._command_heading_rad,
+            delta_heading_rad=self._command_heading_rad if moving else None,
         )
 
 
