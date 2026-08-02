@@ -339,6 +339,7 @@ SONIC_IDLE_MODE = 0
 SONIC_SLOW_WALK_MODE = 1
 SONIC_WALK_MODE = 2
 SONIC_RUN_MODE = 3
+SONIC_STATIONARY_TURN_MODE = SONIC_SLOW_WALK_MODE
 SONIC_NATIVE_MODE_MIN = 0
 SONIC_NATIVE_MODE_MAX = 19
 SONIC_NATIVE_MANUAL_MODE_MIN = 4
@@ -1357,21 +1358,13 @@ class GameControlCore:
             or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
         if turning_to_heading:
-            if manual_turn:
-                # Pico sends a new facing target in native IDLE when only the
-                # right stick is deflected.  Q/E should hit that same deploy
-                # path instead of the Matrix-specific stationary SLOW_WALK
-                # alignment mode.
-                locomotion_mode = SONIC_IDLE_MODE
-            else:
-                # Camera-face auto-alignment is the same operator intent as a
-                # Pico right-stick yaw while the left stick is already asking
-                # for forward motion: turn the body to the requested facing
-                # first, then allow translation once the measured heading enters
-                # the gait start gate.  Native IDLE is the proven yaw manifold
-                # for this policy; the stationary SLOW_WALK variant can stall
-                # far outside the 15-degree start gate on the packaged runtime.
-                locomotion_mode = SONIC_IDLE_MODE
+            # Pure facing changes must still enter a native motion manifold.
+            # Mode 0 can update the Matrix-facing target while the packaged
+            # SONIC body remains nearly inert on MoonWorld, which feels like
+            # Q/E or camera-face auto-turn did not work.  Publishing zero
+            # translation with the SLOW_WALK gait keeps the command stationary
+            # at Matrix level while giving SONIC an executable in-place turn.
+            locomotion_mode = SONIC_STATIONARY_TURN_MODE
         native_override = self._native_mode_override
         if native_override is not None:
             if native_override == SONIC_IDLE_MODE:

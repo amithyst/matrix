@@ -556,7 +556,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(right_command.movement[0], 0.0, places=7)
         self.assertAlmostEqual(right_command.movement[1], -1.0, places=7)
 
-    def test_q_and_e_turn_in_place_without_locomotion(self) -> None:
+    def test_q_and_e_turn_in_place_without_translation(self) -> None:
         for key in ("q", "e", "q", "e"):
             core = armed_core(immediate_config())
             core.accept_snapshot(snapshot(pressed=(key,)), received_at_s=10.0)
@@ -565,7 +565,9 @@ class GameControlCoreTest(unittest.TestCase):
             self.assertEqual(command.reason, "manual_yaw")
             self.assertEqual(command.movement, (0.0, 0.0, 0.0))
             self.assertEqual(command.speed_mps, 0.0)
-            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+            self.assertEqual(
+                command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
+            )
             expected_heading = 0.15 if key == "q" else -0.15
             self.assertAlmostEqual(
                 math.atan2(command.facing[1], command.facing[0]),
@@ -587,7 +589,9 @@ class GameControlCoreTest(unittest.TestCase):
             headings.append(math.atan2(command.facing[1], command.facing[0]))
             self.assertEqual(command.mode, "turn")
             self.assertEqual(command.reason, "manual_yaw")
-            self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+            self.assertEqual(
+                command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
+            )
 
         self.assertEqual(
             [round(value, 6) for value in headings],
@@ -610,7 +614,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(math.atan2(command.facing[1], command.facing[0]), 0.1)
         self.assertEqual(command.speed_mps, 0.0)
         self.assertEqual(command.mode, "turn")
-        self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE)
         self.assertEqual(command.movement, (0.0, 0.0, 0.0))
 
         core.accept_snapshot(
@@ -623,7 +627,9 @@ class GameControlCoreTest(unittest.TestCase):
             0.2,
         )
         self.assertEqual(still_turning.mode, "turn")
-        self.assertEqual(still_turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(
+            still_turning.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
+        )
         self.assertEqual(still_turning.movement, (0.0, 0.0, 0.0))
 
         forward = armed_core(config)
@@ -642,7 +648,7 @@ class GameControlCoreTest(unittest.TestCase):
         turning = core.command(now_s=10.0, dt_s=0.1)
 
         self.assertEqual(turning.mode, "turn")
-        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE)
         self.assertEqual(turning.speed_mps, 0.0)
         self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
         self.assertAlmostEqual(abs(core.heading_rad), math.pi)
@@ -747,7 +753,7 @@ class GameControlCoreTest(unittest.TestCase):
         )
         turning = core.command(now_s=10.01, dt_s=0.02)
         self.assertEqual(turning.mode, "turn")
-        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(turning.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE)
         self.assertEqual(turning.speed_mps, 0.0)
         self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
 
@@ -1039,7 +1045,9 @@ class GameControlCoreTest(unittest.TestCase):
         )
         turn_only = turning.command(now_s=10.0, dt_s=0.1)
         self.assertEqual(turn_only.mode, "turn")
-        self.assertEqual(turn_only.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+        self.assertEqual(
+            turn_only.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
+        )
         self.assertEqual(turn_only.speed_mps, 0.0)
         self.assertEqual(turn_only.movement, (0.0, 0.0, 0.0))
 
