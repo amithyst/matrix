@@ -32,6 +32,31 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(MODULE.normalize_height_filter(), "raw")
 
+    def test_height_filter_accepts_playable_local_limited_relief(self) -> None:
+        self.assertEqual(
+            MODULE.normalize_height_filter("playable-local"),
+            "playable-local",
+        )
+        self.assertEqual(MODULE.normalize_height_filter("limited"), "playable-local")
+
+    def test_playable_local_filter_preserves_small_relief_and_clamps_steps(self) -> None:
+        filtered = MODULE.apply_playable_local_height_filter(
+            np.asarray([-0.35, -0.05, 0.0, 0.08, 0.4], dtype=np.float32),
+            0.0,
+            max_delta_m=0.18,
+        )
+
+        np.testing.assert_allclose(filtered, [-0.18, -0.05, 0.0, 0.08, 0.18])
+        self.assertGreater(float(np.max(filtered) - np.min(filtered)), 0.0)
+
+    def test_playable_local_height_delta_validates_positive_finite_values(self) -> None:
+        self.assertAlmostEqual(
+            MODULE.normalize_playable_local_height_delta("0.12"),
+            0.12,
+        )
+        with self.assertRaisesRegex(MODULE.MoonDynamicGroundError, "must be positive"):
+            MODULE.normalize_playable_local_height_delta("0")
+
     def test_collision_default_uses_mainline_rolling_tiles(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(

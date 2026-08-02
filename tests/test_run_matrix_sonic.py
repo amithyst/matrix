@@ -708,6 +708,74 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(moving.mode, "move")
         self.assertGreater(moving.speed_mps, 0.0)
 
+    def test_game_control_brief_lowcmd_stale_does_not_latch_held_w(
+        self,
+    ) -> None:
+        core = GAME_CONTROL.GameControlCore(
+            GAME_CONTROL.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+        gate = MODULE._GameSonicReadinessGate(
+            self.snapshot(
+                low_cmd_fresh=True,
+                low_cmd_age_s=0.0,
+                elastic_band_scale=0.0,
+                sim_time=20.0,
+            )
+        )
+
+        def command_for(
+            sonic_snapshot: SimpleNamespace,
+            input_sequence: int,
+            now_s: float,
+            *,
+            w: bool,
+        ):
+            gate.begin_frame(sonic_snapshot, core)
+            core.accept_snapshot(
+                self.game_input_snapshot(input_sequence, now_s, w=w),
+                received_at_s=now_s,
+            )
+            return gate.apply(core.command(now_s=now_s, dt_s=0.02), core)
+
+        ready = self.snapshot(
+            low_cmd_fresh=True,
+            low_cmd_age_s=0.0,
+            elastic_band_scale=0.0,
+            sim_time=20.0,
+        )
+        self.assertEqual(command_for(ready, 1, 20.0, w=False).mode, "idle")
+        self.assertEqual(command_for(ready, 2, 20.01, w=True).mode, "move")
+
+        brief_stale = self.snapshot(
+            low_cmd_fresh=False,
+            low_cmd_age_s=0.16,
+            elastic_band_scale=0.0,
+            sim_time=20.02,
+        )
+        with mock.patch.object(
+            core, "invalidate_input", wraps=core.invalidate_input
+        ) as invalidate_input:
+            stale_motion = command_for(brief_stale, 3, 20.02, w=True)
+        self.assertEqual(invalidate_input.call_args_list, [])
+        self.assertEqual(stale_motion.mode, "move")
+        self.assertGreater(stale_motion.speed_mps, 0.0)
+
+        recovered = self.snapshot(
+            low_cmd_fresh=True,
+            low_cmd_age_s=0.0,
+            elastic_band_scale=0.0,
+            sim_time=20.04,
+        )
+        held_after_recovery = command_for(recovered, 4, 20.04, w=True)
+        self.assertEqual(held_after_recovery.mode, "move")
+        self.assertGreater(held_after_recovery.speed_mps, 0.0)
+
     def test_game_control_lowcmd_dropout_requires_neutral_after_recovery(
         self,
     ) -> None:
@@ -720,7 +788,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 max_step_s=1.0,
             )
         )
-        ready = self.snapshot(low_cmd_fresh=True, elastic_band_scale=0.0)
+        ready = self.snapshot(
+            low_cmd_fresh=True,
+            low_cmd_age_s=0.0,
+            elastic_band_scale=0.0,
+            sim_time=20.0,
+        )
         gate = MODULE._GameSonicReadinessGate(ready)
 
         def command_for(
@@ -740,7 +813,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(command_for(ready, 1, 20.0, w=False).mode, "idle")
         self.assertEqual(command_for(ready, 2, 20.01, w=True).mode, "move")
 
-        stale = self.snapshot(low_cmd_fresh=False, elastic_band_scale=0.0)
+        stale = self.snapshot(
+            low_cmd_fresh=False,
+            low_cmd_age_s=0.5,
+            elastic_band_scale=0.0,
+            sim_time=20.02,
+        )
         with mock.patch.object(
             core, "invalidate_input", wraps=core.invalidate_input
         ) as invalidate_input:

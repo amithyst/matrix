@@ -1556,6 +1556,9 @@ class _GameSonicReadinessGate:
     """
 
     ELASTIC_BAND_ZERO_ABS_TOL = 1e-6
+    LOW_CMD_STALE_GRACE_S = 0.30
+    LOW_CMD_STALE_GRACE_FRAMES = 15
+    LOW_CMD_STALE_GRACE_MAX_AGE_S = 0.40
 
     def __init__(
         self,
@@ -1569,6 +1572,9 @@ class _GameSonicReadinessGate:
         )
         self._allow_active_elastic_band = bool(allow_active_elastic_band)
         self._ready = False
+        self._has_been_ready = False
+        self._low_cmd_stale_since_s: float | None = None
+        self._low_cmd_stale_frames = 0
         self._stop_facing = (1.0, 0.0, 0.0)
 
     @classmethod
@@ -1599,15 +1605,95 @@ class _GameSonicReadinessGate:
             abs_tol=cls.ELASTIC_BAND_ZERO_ABS_TOL,
         )
 
+    @classmethod
+    def _snapshot_time_s(cls, snapshot: Any) -> float | None:
+        raw = getattr(snapshot, "sim_time", None)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    @classmethod
+    def _snapshot_lowcmd_grace_candidate(
+        cls,
+        snapshot: Any,
+        *,
+        allow_active_elastic_band: bool = False,
+    ) -> bool:
+        if type(getattr(snapshot, "low_cmd_fresh", None)) is not bool:
+            return False
+        if bool(getattr(snapshot, "low_cmd_fresh")):
+            return False
+        elastic_band_enabled = getattr(snapshot, "elastic_band_enabled", True)
+        if type(elastic_band_enabled) is not bool:
+            return False
+        elastic_band_scale = getattr(snapshot, "elastic_band_scale", None)
+        if type(elastic_band_scale) is not float:
+            return False
+        if not math.isfinite(elastic_band_scale):
+            return False
+        if allow_active_elastic_band and elastic_band_enabled:
+            return True
+        if not elastic_band_enabled:
+            return True
+        return math.isclose(
+            elastic_band_scale,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=cls.ELASTIC_BAND_ZERO_ABS_TOL,
+        )
+
+    def _within_low_cmd_stale_grace(self, snapshot: Any) -> bool:
+        if not self._has_been_ready:
+            return False
+        if not self._snapshot_lowcmd_grace_candidate(
+            snapshot,
+            allow_active_elastic_band=self._allow_active_elastic_band,
+        ):
+            return False
+        low_cmd_age_s = getattr(snapshot, "low_cmd_age_s", None)
+        if low_cmd_age_s is not None:
+            try:
+                age_s = float(low_cmd_age_s)
+            except (TypeError, ValueError):
+                return False
+            if not math.isfinite(age_s) or age_s > self.LOW_CMD_STALE_GRACE_MAX_AGE_S:
+                return False
+
+        now_s = self._snapshot_time_s(snapshot)
+        if self._low_cmd_stale_since_s is None:
+            self._low_cmd_stale_since_s = now_s
+            self._low_cmd_stale_frames = 0
+        self._low_cmd_stale_frames += 1
+        if (
+            self._low_cmd_stale_frames > self.LOW_CMD_STALE_GRACE_FRAMES
+        ):
+            return False
+        if now_s is None or self._low_cmd_stale_since_s is None:
+            return True
+        return (now_s - self._low_cmd_stale_since_s) <= self.LOW_CMD_STALE_GRACE_S
+
     def begin_frame(self, snapshot: Any, core: GameControlCore) -> bool:
         """Invalidate unsafe input before polling and return readiness."""
 
         fresh_value = getattr(snapshot, "low_cmd_fresh", False)
         fresh = fresh_value if type(fresh_value) is bool else False
-        self._ready = self.snapshot_ready(
+        ready_now = self.snapshot_ready(
             snapshot,
             allow_active_elastic_band=self._allow_active_elastic_band,
         )
+        if ready_now:
+            self._ready = True
+            self._has_been_ready = True
+            self._low_cmd_stale_since_s = None
+            self._low_cmd_stale_frames = 0
+        elif self._within_low_cmd_stale_grace(snapshot):
+            self._ready = True
+        else:
+            self._ready = False
         if not self._ready:
             reason = (
                 "low_cmd_stale"

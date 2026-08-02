@@ -61,6 +61,7 @@ DEFAULT_SPAWN_Z_M = DEFAULT_SPAWN_PAD_TOP_Z_M + DEFAULT_ROOT_CLEARANCE_M
 DEFAULT_SPAWN_YAW_RAD = 0.0
 DEFAULT_MIN_RESUME_CLEARANCE_M = 0.45
 DEFAULT_MAX_RESUME_CLEARANCE_M = 1.30
+DEFAULT_PLAYABLE_LOCAL_HEIGHT_DELTA_M = 0.18
 _EXPECTED_TILE_KEYS = tuple(
     (i, j)
     for i in range(TILE_SIDE_COUNT)
@@ -110,10 +111,46 @@ def normalize_height_filter(value: object | None = None) -> str:
         return "flat-anchor"
     if text in {"flat-local", "local"}:
         return "flat-local"
+    if text in {"playable", "playable-local", "limited", "limited-local"}:
+        return "playable-local"
     raise MoonDynamicGroundError(
         "MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER must be raw, "
-        "flat-local, or flat-anchor"
+        "playable-local, flat-local, or flat-anchor"
     )
+
+
+def normalize_playable_local_height_delta(value: object | None = None) -> float:
+    raw = (
+        os.environ.get("MATRIX_MOON_DYNAMIC_GROUND_PLAYABLE_MAX_DELTA_M")
+        if value is None
+        else value
+    )
+    if raw in (None, ""):
+        return DEFAULT_PLAYABLE_LOCAL_HEIGHT_DELTA_M
+    delta_m = _finite_float(raw, label="playable local height delta")
+    if delta_m <= 0.0:
+        raise MoonDynamicGroundError(
+            "MATRIX_MOON_DYNAMIC_GROUND_PLAYABLE_MAX_DELTA_M must be positive"
+        )
+    return delta_m
+
+
+def apply_playable_local_height_filter(
+    raw_heights: object,
+    anchor_height_m: object,
+    *,
+    max_delta_m: object | None = None,
+) -> np.ndarray:
+    """Keep real MoonWorld relief while limiting steps that destabilize MuJoCo."""
+
+    anchor = _finite_float(anchor_height_m, label="playable local anchor height")
+    limit = normalize_playable_local_height_delta(max_delta_m)
+    values = np.asarray(raw_heights, dtype=np.float64)
+    if not bool(np.all(np.isfinite(values))):
+        raise MoonDynamicGroundError(
+            "MoonWorld playable-local filter received a non-finite height"
+        )
+    return np.clip(values, anchor - limit, anchor + limit)
 
 
 def normalize_collision_mode(value: object | None = None) -> str:
@@ -495,10 +532,12 @@ class MoonDynamicGround:
         self._last_update: dict[str, object] | None = None
         self._cached_data: Any | None = None
         self._cached_quantized_base_xy: tuple[float, float] | None = None
+        self._cached_filter_key: tuple[str, float | None] | None = None
         self._filtered_height_m: float | None = None
         self._filtered_center_xy_m: tuple[float, float] | None = None
         self._collision_handoff_active = False
         self._model = model
+        self._playable_local_height_delta_m = normalize_playable_local_height_delta()
 
         tile_i = np.repeat(np.arange(TILE_SIDE_COUNT, dtype=np.float64), TILE_SIDE_COUNT)
         tile_j = np.tile(np.arange(TILE_SIDE_COUNT, dtype=np.float64), TILE_SIDE_COUNT)
@@ -670,15 +709,26 @@ class MoonDynamicGround:
             self._filtered_height_m = float(raw_local_ground_height_m)
             self._filtered_center_xy_m = (base_x, base_y)
             local_ground_height_m = float(self._filtered_height_m)
+        elif self.height_filter == "playable-local":
+            self._filtered_height_m = float(raw_local_ground_height_m)
+            self._filtered_center_xy_m = (base_x, base_y)
+            local_ground_height_m = float(self._filtered_height_m)
         elif self.height_filter == "flat-anchor":
             if self._filtered_height_m is None:
                 self._filtered_height_m = float(raw_local_ground_height_m)
                 self._filtered_center_xy_m = (base_x, base_y)
             local_ground_height_m = float(self._filtered_height_m)
+        cache_filter_key = (
+            self.height_filter,
+            round(local_ground_height_m, 2)
+            if self.height_filter in {"flat-local", "playable-local"}
+            else None,
+        )
 
         if (
             data is self._cached_data
             and quantized_base_xy == self._cached_quantized_base_xy
+            and cache_filter_key == self._cached_filter_key
         ):
             self._update_count += 1
             self._cache_hit_count += 1
@@ -711,6 +761,12 @@ class MoonDynamicGround:
         raw_tile_z = np.asarray(tile_z, dtype=np.float64)
         if self.height_filter in {"flat-local", "flat-anchor"}:
             tile_z = np.full_like(tile_z, local_ground_height_m)
+        elif self.height_filter == "playable-local":
+            tile_z = apply_playable_local_height_filter(
+                raw_tile_z,
+                local_ground_height_m,
+                max_delta_m=self._playable_local_height_delta_m,
+            )
 
         support_center_x = quantized_x + MAP_HALF_CELL_M
         support_center_y = quantized_y + MAP_HALF_CELL_M
@@ -727,6 +783,12 @@ class MoonDynamicGround:
         support_z = heights[np.ix_(support_pixel_y, support_pixel_x)]
         if self.height_filter in {"flat-local", "flat-anchor"}:
             support_z = np.full_like(support_z, local_ground_height_m)
+        elif self.height_filter == "playable-local":
+            support_z = apply_playable_local_height_filter(
+                support_z,
+                local_ground_height_m,
+                max_delta_m=self._playable_local_height_delta_m,
+            )
         assert self.minimum_height_m is not None
         normalized_support = (
             np.asarray(support_z, dtype=np.float64) - self.minimum_height_m
@@ -761,6 +823,7 @@ class MoonDynamicGround:
 
         self._cached_data = data
         self._cached_quantized_base_xy = quantized_base_xy
+        self._cached_filter_key = cache_filter_key
         self._update_count += 1
         self._tile_update_count += 1
         self._last_update = {
@@ -769,6 +832,11 @@ class MoonDynamicGround:
             "local_ground_height_m": local_ground_height_m,
             "raw_local_ground_height_m": raw_local_ground_height_m,
             "height_filter": self.height_filter,
+            "height_filter_limit_m": (
+                self._playable_local_height_delta_m
+                if self.height_filter == "playable-local"
+                else None
+            ),
             "filtered_center_xy_m": (
                 list(self._filtered_center_xy_m)
                 if self._filtered_center_xy_m is not None
@@ -852,6 +920,11 @@ class MoonDynamicGround:
             "schema": TELEMETRY_SCHEMA,
             "closed": self._closed,
             "height_filter": self.height_filter,
+            "height_filter_limit_m": (
+                self._playable_local_height_delta_m
+                if self.height_filter == "playable-local"
+                else None
+            ),
             "collision_mode": self.collision_mode,
             "filtered_height_m": self._filtered_height_m,
             "filtered_center_xy_m": (
@@ -1041,10 +1114,14 @@ def main() -> int:
 __all__ = (
     "CONTINUOUS_SUPPORT_HALF_EXTENT_M",
     "DEFAULT_COLLISION_MODE",
+    "DEFAULT_PLAYABLE_LOCAL_HEIGHT_DELTA_M",
     "LOCKED_MOONWORLD_SHA256",
     "MAP_HALF_EXTENT_M",
     "MoonDynamicGround",
     "MoonDynamicGroundError",
+    "apply_playable_local_height_filter",
+    "normalize_height_filter",
+    "normalize_playable_local_height_delta",
     "resolve_spawn_pose_for_moon_dynamic_ground",
     "sample_raw_height_from_map",
 )
