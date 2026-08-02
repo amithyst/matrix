@@ -1714,9 +1714,18 @@ def panel_hover_action_at(
 _BASIC_TOOLTIP_LINES = {
     "profile_local": ("本机控制：鼠标和键盘按本机输入比例运行。",),
     "profile_remote": ("远程控制：给远程桌面鼠标输入使用的缩放配置。",),
-    "speed_down": ("降低远程鼠标速度缩放；只影响远程鼠标灵敏度。",),
-    "speed_up": ("提高远程鼠标速度缩放；只影响远程鼠标灵敏度。",),
-    "speed_value": ("远程鼠标速度缩放当前值；本机控制时通常不用调。",),
+    "speed_down": (
+        "降低远程鼠标速度缩放；只影响远程鼠标灵敏度。",
+        "低档精细步进 0.01-0.10，高档粗调 0.20-1.00。",
+    ),
+    "speed_up": (
+        "提高远程鼠标速度缩放；只影响远程鼠标灵敏度。",
+        "低档精细步进 0.01-0.10，高档粗调 0.20-1.00。",
+    ),
+    "speed_value": (
+        "远程鼠标速度缩放当前值；本机控制时通常不用调。",
+        "低档精细步进 0.01-0.10，高档粗调 0.20-1.00。",
+    ),
     "font_down": ("减小 ESC 面板字号。",),
     "font_up": ("增大 ESC 面板字号。",),
     "font_value": ("当前 ESC 面板字号。",),
@@ -6915,7 +6924,7 @@ class X11CalibrationOverlay:
     ) -> None:
         back_rect = self._panel_rectangle(layout, _BACK_TO_DIRECTORY_ACTION)
         self._draw_text(
-            "ESC 目录页：点击入口进入独立页面；悬停按钮查看说明。",
+            "ESC 目录",
             x=back_rect[0],
             y=back_rect[1] + back_rect[3] - 8,
             colour=self._colours["muted"],
@@ -7462,13 +7471,6 @@ class X11CalibrationOverlay:
                     else ("pending" if model.pending_restart else "muted")
                 ],
             )
-            self._draw_text(
-                "精细 0.01-0.10 / 粗调 0.20-1.00",
-                x=self._panel_rectangle(layout, "profile_local")[0],
-                y=max(112, self._panel_rectangle(layout, "profile_local")[1] - 40),
-                colour=self._colours["muted"],
-                )
-
     def _draw_functions_page(
         self,
         layout: dict[str, tuple[int, int, int, int]],
@@ -7485,7 +7487,7 @@ class X11CalibrationOverlay:
         if selected_function not in function_model.files:
             selected_function = None
         self._draw_text(
-            "函数命令：MC 风格层级菜单；悬停按钮查看说明。",
+            "函数命令",
             x=content[0],
             y=content[1] + (18 if compact else 26),
             colour=self._colours["muted"],
@@ -7540,7 +7542,7 @@ class X11CalibrationOverlay:
                 46 if compact else 64
             )
             self._draw_text(
-                f"函数文件：{len(function_model.files)} 个；说明已移到按钮悬停框。",
+                f"函数文件：{len(function_model.files)} 个",
                 x=content[0],
                 y=summary_y,
                 colour=self._colours["muted"],
@@ -7567,7 +7569,7 @@ class X11CalibrationOverlay:
             files = function_model.files[:_MAX_FUNCTION_FILE_BUTTONS]
             if not files:
                 self._draw_text(
-                    "未发现 .mcfunction；点击“打开目录编辑”新建文件。",
+                    "未发现 .mcfunction 文件。",
                     x=content[0],
                     y=self._panel_rectangle(layout, "function_file_0")[1] + 18,
                     colour=self._colours["muted"],
@@ -7583,9 +7585,9 @@ class X11CalibrationOverlay:
                 )
             more_count = max(0, len(function_model.files) - _MAX_FUNCTION_FILE_BUTTONS)
             note = (
-                f"只显示前 {_MAX_FUNCTION_FILE_BUTTONS} 个；还有 {more_count} 个请从目录编辑。"
+                f"只显示前 {_MAX_FUNCTION_FILE_BUTTONS} 个；还有 {more_count} 个文件。"
                 if more_count
-                else "点击文件进入详情页；文件保存后状态会自动刷新。"
+                else "函数文件状态会自动刷新。"
             )
             self._draw_text(
                 self._clip_console_line(note, content[2]),
@@ -7621,7 +7623,7 @@ class X11CalibrationOverlay:
                 lines = (
                     f"文件：{selected_function}.mcfunction",
                     f"执行：/function {selected_function}",
-                    "内容预览：打开目录后直接编辑文本，一行一条命令。",
+                    "内容预览：",
                     *self._function_file_preview_lines(
                         function_model,
                         selected_function,
@@ -7649,23 +7651,13 @@ class X11CalibrationOverlay:
                     fill=self._colours["disabled" if quick_disabled else "button"],
                     disabled=quick_disabled,
                 )
-            key_y = self._panel_rectangle(layout, "function_file_2")[1] + (
-                46 if compact else 64
-            )
-            for offset, (_label, command) in enumerate(_FUNCTION_PRESETS):
-                self._draw_text(
-                    self._clip_console_line(command, content[2]),
-                    x=content[0],
-                    y=key_y + offset * (18 if compact else 24),
-                    colour=self._colours["muted"],
-                )
             draw_command_message()
             return
 
         if subpage == "sonic":
             auto_rect = self._panel_rectangle(layout, "native_mode_auto")
             self._draw_text(
-                "SONIC 原生模式：悬停 AUTO / 0-19 查看中文说明。",
+                "SONIC 原生模式",
                 x=content[0],
                 y=max(auto_rect[1] - 12, content[1] + 72),
                 colour=self._colours["muted"],
@@ -7684,22 +7676,6 @@ class X11CalibrationOverlay:
                     _NATIVE_MODE_BUTTON_LABELS_ZH.get(index, f"{index} 单档"),
                     fill=self._colours["disabled" if quick_disabled else "button"],
                     disabled=quick_disabled,
-                )
-            key_y = self._panel_rectangle(layout, "native_mode_10")[1] + (
-                46 if compact else 64
-            )
-            for offset, line in enumerate(
-                (
-                    "按钮会提交 /sonic mode auto 或 /sonic mode <0-19>。",
-                )
-            ):
-                self._draw_text(
-                    self._clip_console_line(line, content[2]),
-                    x=content[0],
-                    y=key_y + offset * (18 if compact else 24),
-                    colour=self._colours[
-                        "pending" if quick_disabled and offset == 0 else "muted"
-                    ],
                 )
             draw_command_message()
             return
@@ -7753,7 +7729,7 @@ class X11CalibrationOverlay:
             controls_disabled or not motion_model.available
         )
         self._draw_text(
-            "按键绑定 / 热切换：悬停三种 WASD 模式查看区别。",
+            "按键绑定 / 热切换",
             x=content[0],
             y=content[1] + (18 if compact else 26),
             colour=self._colours["muted"],
@@ -7780,10 +7756,9 @@ class X11CalibrationOverlay:
         )
         lines = (
             f"当前 WASD 坐标模式：{current_mode}",
-            "W / A / S / D：前后左右移动；Shift/Ctrl/Alt：速度档位。",
-            "Q / E：按 SONIC/PICO 原生右摇杆语义做左右转向",
-            "方向键：调整相机；鼠标拖拽：相机视角；V：循环三种 WASD 模式",
-            "ESC：打开/关闭战术终端；Enter：命令台提交；F6：应用重启",
+            "WASD 移动 | Shift/Ctrl/Alt 速度档",
+            "Q/E 左右转向 | 方向键/鼠标 调相机",
+            "V 切 WASD 模式 | ESC 面板 | F6 重启",
         )
         for offset, line in enumerate(lines):
             self._draw_text(
@@ -7818,7 +7793,7 @@ class X11CalibrationOverlay:
             "render_sync_disabled": "UE 画面同步未启用",
         }
         heading = (
-            "点击物品会在机器人前方放置独立刚体"
+            "创造物品"
             if model.available
             else unavailable_labels.get(
                 model.unavailable_reason,

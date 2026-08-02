@@ -818,7 +818,7 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn(f"set value {math.radians(89.0):.10f}", stop_command)
         self.assertIn(f"set value {math.radians(3.0):.10f}", snap_command)
 
-    def test_low_remote_scale_is_rendered_with_discrete_step_hint(self) -> None:
+    def test_low_remote_scale_step_hint_is_hover_only(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
         layout = MODULE.overlay_layout(geometry)
         model = MODULE.settings_panel_model(
@@ -869,8 +869,11 @@ class OverlayStateTest(unittest.TestCase):
         labels = [call.args[0] for call in overlay._draw_text.call_args_list]
         self.assertIn("0.01x", labels)
         combined = " | ".join(labels)
-        self.assertIn("0.01-0.10", combined)
-        self.assertIn("0.20-1.00", combined)
+        self.assertNotIn("0.01-0.10", combined)
+        self.assertNotIn("0.20-1.00", combined)
+        tooltip = " | ".join(MODULE.tooltip_lines_for_action("speed_value"))
+        self.assertIn("0.01-0.10", tooltip)
+        self.assertIn("0.20-1.00", tooltip)
 
         overlay._draw_text.reset_mock()
         compact_layout = MODULE.overlay_layout(
