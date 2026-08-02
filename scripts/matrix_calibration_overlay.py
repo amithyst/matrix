@@ -495,6 +495,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_gap = 4 if compact else 8
     tab_count = 9
     tab_width = max(1, (panel_width - 2 * margin - (tab_count - 1) * tab_gap) // tab_count)
+    back_width = max(128, min(260, panel_width // 5))
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
     profile_gap = max(4, min(10, gap // 2))
@@ -645,6 +646,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             panel_y + (2 if compact else 24),
             font_slider_width,
             24 if compact else 32,
+        ),
+        "back_to_directory": (
+            panel_x + margin,
+            tab_y,
+            back_width,
+            tab_height,
         ),
         "tab_loadout": (
             panel_x + margin,
@@ -848,6 +855,40 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             navigation_destinations_height,
         ),
     }
+    directory_names = (
+        "tab_loadout",
+        "tab_settings",
+        "tab_console",
+        "tab_functions",
+        "tab_keybindings",
+        "tab_inventory",
+        "tab_navigation",
+        "tab_video",
+        "tab_system",
+    )
+    directory_top = console_top
+    directory_bottom = apply_y - gap
+    directory_gap = 8 if compact else 16
+    directory_columns = 3
+    directory_rows = 3
+    directory_width = max(
+        1,
+        (console_width - (directory_columns - 1) * directory_gap)
+        // directory_columns,
+    )
+    directory_height = max(
+        1,
+        (directory_bottom - directory_top - (directory_rows - 1) * directory_gap)
+        // directory_rows,
+    )
+    for index, name in enumerate(directory_names):
+        row, column = divmod(index, directory_columns)
+        result[name] = (
+            console_left + column * (directory_width + directory_gap),
+            directory_top + row * (directory_height + directory_gap),
+            directory_width,
+            directory_height,
+        )
     for index in range(_MAX_RECOVERY_POLICY_BUTTONS):
         result[f"recovery_policy_{index}"] = (
             panel_x + margin + index * (candidate_width + candidate_gap),
@@ -1321,17 +1362,68 @@ _VIDEO_STEP_ACTION_DETAILS.update(
 )
 _VIDEO_STEP_ACTIONS = tuple(_VIDEO_STEP_ACTION_DETAILS)
 
-_PANEL_TABS = (
-    "tab_loadout",
-    "tab_settings",
-    "tab_console",
-    "tab_functions",
-    "tab_keybindings",
-    "tab_inventory",
-    "tab_navigation",
-    "tab_video",
-    "tab_system",
+_PANEL_DIRECTORY_PAGE = "directory"
+_BACK_TO_DIRECTORY_ACTION = "back_to_directory"
+_PANEL_DIRECTORY_ENTRIES = (
+    (
+        "tab_loadout",
+        "策略装配",
+        "查看 SONIC 策略槽与运行策略状态",
+        "loadout",
+    ),
+    (
+        "tab_settings",
+        "控制设置",
+        "调 WASD、转向、相机与行走阈值",
+        "settings",
+    ),
+    (
+        "tab_console",
+        "命令台",
+        "输入局内命令并查看执行反馈",
+        "console",
+    ),
+    (
+        "tab_functions",
+        "函数命令",
+        "MC 风格 .mcfunction 组合命令",
+        "functions",
+    ),
+    (
+        "tab_keybindings",
+        "按键绑定",
+        "查看热键与运控模式说明",
+        "keybindings",
+    ),
+    (
+        "tab_inventory",
+        "创造物品",
+        "生成可交互物品与场景调试件",
+        "inventory",
+    ),
+    (
+        "tab_navigation",
+        "星体导航",
+        "查看目标点并执行导航刷新",
+        "navigation",
+    ),
+    (
+        "tab_video",
+        "视频设置",
+        "调画面质量、窗口与相机距离",
+        "video",
+    ),
+    (
+        "tab_system",
+        "运行信息",
+        "查看构建、进程和运行诊断",
+        "system",
+    ),
 )
+_PANEL_TABS = tuple(entry[0] for entry in _PANEL_DIRECTORY_ENTRIES)
+_PANEL_PAGE_NAMES = {_PANEL_DIRECTORY_PAGE} | {
+    entry[3] for entry in _PANEL_DIRECTORY_ENTRIES
+}
 _FUNCTION_PRESETS = (
     ("原地站立恢复", "/function recover_here"),
     ("当前位置面向北", "/function pose/north"),
@@ -1389,7 +1481,7 @@ _NAVIGATION_HIT_TARGETS = (
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
-    + ("runtime_pause", "quit_game")
+    + (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game")
     + _MOVEMENT_MODE_ACTIONS
     + _MOTION_STEP_ACTIONS
     + ("command_input",)
@@ -1428,31 +1520,33 @@ def panel_action_at(
 ) -> str | None:
     """Hit-test X11 root coordinates, including remote-desktop absolute input."""
 
-    targets = _PANEL_HIT_TARGETS
-    if page == "loadout":
+    effective_page = _PANEL_DIRECTORY_PAGE if page is None else page
+    if effective_page == _PANEL_DIRECTORY_PAGE:
+        targets = _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
+    elif effective_page == "loadout":
         targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _LOCOMOTION_POLICY_HIT_TARGETS
             + _POLICY_HIT_TARGETS
         )
-    elif page == "settings":
+    elif effective_page == "settings":
         targets = (
-            _PANEL_TABS
+            (_BACK_TO_DIRECTORY_ACTION,)
             + _PANEL_ACTIONS
             + ("runtime_pause", "quit_game")
             + _MOVEMENT_MODE_ACTIONS
             + _MOTION_STEP_ACTIONS
             + _OVERLAY_LOCAL_HIT_TARGETS
         )
-    elif page == "console":
-        targets = _PANEL_TABS + (
+    elif effective_page == "console":
+        targets = (
+            _BACK_TO_DIRECTORY_ACTION,
             "runtime_pause",
             "quit_game",
             "apply_return",
             "command_input",
         )
-    elif page == "functions":
+    elif effective_page == "functions":
         subpage = function_subpage or "home"
         if subpage == "files":
             function_targets = (
@@ -1473,37 +1567,39 @@ def panel_action_at(
         else:
             function_targets = _FUNCTION_HOME_HIT_TARGETS
         targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + function_targets
         )
-    elif page == "keybindings":
+    elif effective_page == "keybindings":
         targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _MOVEMENT_MODE_ACTIONS
         )
-    elif page == "inventory":
+    elif effective_page == "inventory":
         targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _INVENTORY_HIT_TARGETS
         )
-    elif page == "navigation":
+    elif effective_page == "navigation":
         targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _NAVIGATION_HIT_TARGETS
         )
-    elif page == "video":
+    elif effective_page == "video":
         targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + ("video_camera_distance_cm_slider",)
             + _VIDEO_STEP_ACTIONS
             + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
         )
-    elif page == "system":
+    elif effective_page == "system":
+        targets = (
+            _BACK_TO_DIRECTORY_ACTION,
+            "runtime_pause",
+            "quit_game",
+            "apply_return",
+        )
+    else:
         targets = _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
     for action in targets:
         rectangle = layout.get(action)
@@ -4457,7 +4553,7 @@ class X11CalibrationOverlay:
         self._video_distance_bound_editor = CameraDistanceBoundEditor()
         self._keyboard_grabbed = False
         self._deferred_ungrab_keycode: int | None = None
-        self._active_page = "loadout"
+        self._active_page = _PANEL_DIRECTORY_PAGE
         self._functions_subpage = "home"
         self._selected_function_name: str | None = None
         self._last_functions_subpage: str | None = None
@@ -5641,7 +5737,7 @@ class X11CalibrationOverlay:
         return (root_x.value, root_y.value)
 
     def _handle_function_navigation_action(self, action: str | None) -> bool:
-        if getattr(self, "_active_page", "loadout") != "functions":
+        if getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "functions":
             return False
         if action == "function_nav_files":
             self._functions_subpage = "files"
@@ -5724,7 +5820,7 @@ class X11CalibrationOverlay:
             layout,
             root_x,
             root_y,
-            page=getattr(self, "_active_page", "loadout"),
+            page=getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE),
             function_subpage=getattr(self, "_functions_subpage", "home"),
         )
         self._last_polled_action = action
@@ -5790,18 +5886,38 @@ class X11CalibrationOverlay:
         if pressed is None or action != pressed or not self._visible:
             return emitted
         if self._video_distance_bound_editing() and action not in (
-            _PANEL_TABS + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
+            (_BACK_TO_DIRECTORY_ACTION,) + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
         ):
             return emitted
 
+        if action == _BACK_TO_DIRECTORY_ACTION:
+            if (
+                getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
+                != _PANEL_DIRECTORY_PAGE
+            ):
+                if self._force_end_command_editing(publisher):
+                    emitted += 1
+                self._force_end_video_distance_bound_editing()
+                self._active_page = _PANEL_DIRECTORY_PAGE
+                self._functions_subpage = "home"
+                self._last_page = None
+                self._last_functions_subpage = None
+            return emitted
         if action in _PANEL_TABS:
             next_page = action.removeprefix("tab_")
-            if next_page != getattr(self, "_active_page", "loadout"):
+            if next_page != getattr(
+                self,
+                "_active_page",
+                _PANEL_DIRECTORY_PAGE,
+            ):
                 if self._force_end_command_editing(publisher):
                     emitted += 1
                 self._force_end_video_distance_bound_editing()
                 self._active_page = next_page
+                if next_page == "functions":
+                    self._functions_subpage = "home"
                 self._last_page = None
+                self._last_functions_subpage = None
             return emitted
         if self._handle_function_navigation_action(action):
             return emitted
@@ -6441,6 +6557,61 @@ class X11CalibrationOverlay:
                     "selected" if page == target_page else "button"
                 ],
             )
+
+    def _draw_directory_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+    ) -> None:
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        back_rect = self._panel_rectangle(layout, _BACK_TO_DIRECTORY_ACTION)
+        self._draw_text(
+            "ESC 目录页：点击一个入口进入独立页面；进入后其它一级栏目隐藏，用“返回目录”回到这里。",
+            x=back_rect[0],
+            y=back_rect[1] + back_rect[3] - 8,
+            colour=self._colours["muted"],
+        )
+        for action, label, description, _target_page in _PANEL_DIRECTORY_ENTRIES:
+            self._draw_button(
+                layout,
+                action,
+                label,
+                fill=self._colours["button"],
+            )
+            x, y, width, height = self._panel_rectangle(layout, action)
+            if height >= 52:
+                self._draw_text(
+                    self._clip_console_line(description, width - 24),
+                    x=x + 12,
+                    y=y + height - (10 if compact else 16),
+                    colour=self._colours["muted"],
+                )
+
+    def _draw_back_to_directory(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        page: str,
+    ) -> None:
+        self._draw_button(
+            layout,
+            _BACK_TO_DIRECTORY_ACTION,
+            "返回目录",
+            fill=self._colours["button"],
+        )
+        page_label = next(
+            (
+                label
+                for _action, label, _description, target_page in _PANEL_DIRECTORY_ENTRIES
+                if target_page == page
+            ),
+            page,
+        )
+        x, y, width, height = self._panel_rectangle(layout, _BACK_TO_DIRECTORY_ACTION)
+        self._draw_text(
+            f"当前页面：{page_label}",
+            x=x + width + 16,
+            y=y + height - 10,
+            colour=self._colours["muted"],
+        )
 
     def _draw_font_size_slider(
         self,
@@ -8312,7 +8483,10 @@ class X11CalibrationOverlay:
         if startup_loading is not None and startup_loading.active:
             self._draw_startup_loading(layout, startup_loading)
             return
-        page = getattr(self, "_active_page", "settings")
+        page = getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
+        if page not in _PANEL_PAGE_NAMES:
+            page = _PANEL_DIRECTORY_PAGE
+            self._active_page = page
         title_x, title_y, _title_width, title_height = self._panel_rectangle(
             layout, "title"
         )
@@ -8325,7 +8499,11 @@ class X11CalibrationOverlay:
         )
         if page == "settings":
             self._draw_font_size_slider(layout)
-        self._draw_tabs(layout, page)
+        if page == _PANEL_DIRECTORY_PAGE:
+            self._draw_directory_page(layout)
+        else:
+            self._draw_back_to_directory(layout, page)
+
         if page == "loadout":
             self._draw_loadout_page(
                 layout,
@@ -8573,7 +8751,7 @@ class X11CalibrationOverlay:
             or self._keyboard_grabbed
             or self._command_editor.editing
             or self._command_editor.pending
-            or getattr(self, "_active_page", "loadout") != "video"
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "video"
         ):
             return False
         if not hasattr(self, "_video_distance_bound_editor"):
@@ -8721,7 +8899,7 @@ class X11CalibrationOverlay:
         layout = self._last_layout
         if (
             layout is None
-            or getattr(self, "_active_page", "loadout") != "settings"
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "settings"
             or getattr(self, "_xft", None) is None
             or getattr(self, "_xft_draw", None) is None
         ):
@@ -8746,7 +8924,7 @@ class X11CalibrationOverlay:
         video_model = getattr(self, "_last_video_model", None)
         if (
             layout is None
-            or getattr(self, "_active_page", "loadout") != "video"
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "video"
             or video_model is None
         ):
             return False
@@ -8798,7 +8976,7 @@ class X11CalibrationOverlay:
                     layout,
                     button.x_root,
                     button.y_root,
-                    page=getattr(self, "_active_page", "loadout"),
+                    page=getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE),
                     function_subpage=getattr(self, "_functions_subpage", "home"),
                 )
                 if layout is not None
@@ -8895,8 +9073,22 @@ class X11CalibrationOverlay:
                 ):
                     continue
                 if self._video_distance_bound_editing() and action not in (
-                    _PANEL_TABS + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
+                    (_BACK_TO_DIRECTORY_ACTION,)
+                    + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
                 ):
+                    continue
+                if action == _BACK_TO_DIRECTORY_ACTION:
+                    if (
+                        getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
+                        != _PANEL_DIRECTORY_PAGE
+                    ):
+                        if self._force_end_command_editing(publisher):
+                            emitted += 1
+                        self._force_end_video_distance_bound_editing()
+                        self._active_page = _PANEL_DIRECTORY_PAGE
+                        self._functions_subpage = "home"
+                        self._last_page = None
+                        self._last_functions_subpage = None
                     continue
                 if recovered_pause_release:
                     # SDL/remote-desktop pointer lock can warp the core pointer
@@ -8906,15 +9098,22 @@ class X11CalibrationOverlay:
                     action = pressed
                     self._recovered_pause_release_count = (
                         getattr(self, "_recovered_pause_release_count", 0) + 1
-                    )
+                )
                 if action in _PANEL_TABS:
                     next_page = action.removeprefix("tab_")
-                    if next_page != getattr(self, "_active_page", "loadout"):
+                    if next_page != getattr(
+                        self,
+                        "_active_page",
+                        _PANEL_DIRECTORY_PAGE,
+                    ):
                         if self._force_end_command_editing(publisher):
                             emitted += 1
                         self._force_end_video_distance_bound_editing()
                         self._active_page = next_page
+                        if next_page == "functions":
+                            self._functions_subpage = "home"
                         self._last_page = None
+                        self._last_functions_subpage = None
                     continue
                 if self._handle_function_navigation_action(action):
                     continue
@@ -9217,7 +9416,7 @@ class X11CalibrationOverlay:
             != getattr(self, "_last_runtime_pause_model", runtime_pause_panel_model({}))
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
             != getattr(self, "_last_rendered_font_size", None)
-            or getattr(self, "_active_page", "loadout")
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
             != getattr(self, "_last_page", None)
             or getattr(self, "_functions_subpage", "home")
             != getattr(self, "_last_functions_subpage", None)
@@ -9357,7 +9556,7 @@ class X11CalibrationOverlay:
             "_font_size",
             _DEFAULT_OVERLAY_FONT_SIZE,
         )
-        self._last_page = getattr(self, "_active_page", "loadout")
+        self._last_page = getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
         self._last_functions_subpage = getattr(self, "_functions_subpage", "home")
         self._last_selected_function_name = getattr(
             self,
@@ -9423,7 +9622,7 @@ class X11CalibrationOverlay:
         self._camera_distance_slider_dragging = False
         self._pending_camera_distance_cm = None
         self._last_rendered_font_size = None
-        self._active_page = "loadout"
+        self._active_page = _PANEL_DIRECTORY_PAGE
 
     def close(self) -> None:
         display = getattr(self, "_display", None)

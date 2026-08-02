@@ -199,7 +199,10 @@ class OverlayLayoutTest(unittest.TestCase):
             command_input[0] + command_input[2] // 2,
             command_input[1] + command_input[3] // 2,
         )
-        self.assertEqual(MODULE.panel_action_at(layout, *point), "command_input")
+        self.assertEqual(
+            MODULE.panel_action_at(layout, *point, page="console"),
+            "command_input",
+        )
         self.assertFalse(self.intersects(command_input, layout["crosshair_safe"]))
         self.assertGreaterEqual(layout["command_result"][3], 14)
         self.assertFalse(self.intersects(layout["title"], layout["profile_local"]))
@@ -211,10 +214,62 @@ class OverlayLayoutTest(unittest.TestCase):
         for action in MODULE._PANEL_ACTIONS:
             x, y, width, height = layout[action]
             self.assertEqual(
-                MODULE.panel_action_at(layout, x + width // 2, y + height // 2),
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="settings",
+                ),
                 action,
             )
         self.assertIsNone(MODULE.panel_action_at(layout, geometry.x + 3, geometry.y + 3))
+
+    def test_directory_page_is_the_only_top_level_navigation_surface(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+
+        x, y, width, height = layout["tab_settings"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="directory",
+            ),
+            "tab_settings",
+        )
+        self.assertEqual(
+            MODULE.panel_action_at(layout, x + width // 2, y + height // 2),
+            "tab_settings",
+        )
+        x, y, width, height = layout["back_to_directory"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="settings",
+            ),
+            "back_to_directory",
+        )
+        self.assertIsNone(
+            MODULE.panel_action_at(
+                layout,
+                x + width + 24,
+                y + height // 2,
+                page="settings",
+            )
+        )
+
+        x, y, width, height = layout["movement_mode_body_relative"]
+        self.assertNotEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="directory",
+            ),
+            "movement_mode_body_relative",
+        )
 
     def test_functions_page_hit_test_exposes_nested_menu_presets_and_native_modes(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
@@ -300,7 +355,12 @@ class OverlayLayoutTest(unittest.TestCase):
         )
         x, y, width, height = layout["tab_keybindings"]
         self.assertEqual(
-            MODULE.panel_action_at(layout, x + width // 2, y + height // 2),
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="directory",
+            ),
             "tab_keybindings",
         )
 
@@ -344,6 +404,39 @@ class CursorShapeTest(unittest.TestCase):
 
 
 class OverlayStateTest(unittest.TestCase):
+    @staticmethod
+    def bare_overlay(page: str):
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._windows = {"panel": 2}
+        overlay._panel_gc = 3
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "selected",
+                    "button",
+                    "disabled",
+                    "pending",
+                    "error",
+                    "apply",
+                    "outline",
+                ),
+                10,
+            )
+        }
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._last_command_status = MODULE.command_console_status({})
+        overlay._active_page = page
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+        overlay._draw_font_size_slider = mock.Mock()
+        overlay._draw_tabs = mock.Mock()
+        return overlay
+
     def test_state_is_visible_only_for_exact_versioned_true(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.json"
@@ -356,6 +449,31 @@ class OverlayStateTest(unittest.TestCase):
             self.assertFalse(MODULE.read_active_state(path))
             path.write_text(json.dumps({"version": 1, "active": True}))
             self.assertTrue(MODULE.read_active_state(path))
+
+    def test_panel_draws_directory_page_then_isolated_child_page(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+
+        directory_overlay = self.bare_overlay("directory")
+        directory_overlay._draw_panel(layout, model)
+        directory_labels = [
+            call.args[2] for call in directory_overlay._draw_button.call_args_list
+        ]
+        self.assertIn("策略装配", directory_labels)
+        self.assertIn("运行信息", directory_labels)
+        self.assertNotIn("返回目录", directory_labels)
+        directory_overlay._draw_tabs.assert_not_called()
+
+        settings_overlay = self.bare_overlay("settings")
+        settings_overlay._draw_panel(layout, model)
+        settings_labels = [
+            call.args[2] for call in settings_overlay._draw_button.call_args_list
+        ]
+        self.assertIn("返回目录", settings_labels)
+        self.assertNotIn("策略装配", settings_labels)
+        settings_overlay._draw_tabs.assert_not_called()
 
     def test_settings_panel_distinguishes_current_next_and_pending(self) -> None:
         lines = MODULE.settings_hint_lines(
@@ -585,6 +703,7 @@ class OverlayStateTest(unittest.TestCase):
         }
         overlay._command_editor = MODULE.CommandLineEditor()
         overlay._last_command_status = MODULE.command_console_status({})
+        overlay._active_page = "settings"
         overlay._draw_text = mock.Mock()
         overlay._draw_button = mock.Mock()
 
