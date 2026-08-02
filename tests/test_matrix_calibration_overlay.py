@@ -597,6 +597,59 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn("unavailable", unavailable.error)
         self.assertFalse(unavailable.action_enabled("apply_return"))
 
+    def test_control_motion_buttons_ignore_command_console_pending(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+        motion_model = MODULE.MotionSettingsPanelModel(
+            settings=MODULE.MotionSettings(),
+            available=True,
+            load_status="loaded",
+            error=None,
+            camera_control_available=True,
+            camera_control_error=None,
+        )
+        command_status = MODULE.CommandConsoleStatus(
+            available=True,
+            provider_editing=True,
+            in_flight=True,
+            status="pending",
+            request_id="request-1",
+            sequence=1,
+            result_revision=0,
+            ok=None,
+            code=None,
+            message=None,
+            warning=None,
+            restart_required=True,
+            outcome_unknown=True,
+        )
+        overlay = self.bare_overlay("settings")
+        overlay._command_editor.begin()
+
+        overlay._draw_control_settings_page(
+            layout,
+            model,
+            motion_model,
+            command_status,
+        )
+
+        disabled_by_action = {
+            call.args[1]: call.kwargs.get("disabled")
+            for call in overlay._draw_button.call_args_list
+        }
+        for action in (
+            "movement_mode_camera_face",
+            "movement_mode_camera_strafe",
+            "movement_mode_body_relative",
+            "motion_gait_start_heading_error_down",
+            "motion_gait_start_heading_error_up",
+            "motion_gait_stop_heading_error_down",
+            "motion_gait_stop_heading_error_up",
+        ):
+            self.assertIs(disabled_by_action[action], False)
+
     def test_command_state_is_strict_and_alias_warning_is_ascii_readable(self) -> None:
         status = MODULE.command_console_status(
             {
@@ -687,7 +740,7 @@ class OverlayStateTest(unittest.TestCase):
                 MODULE.GAIT_START_HEADING_ERROR_FIELD,
                 compact=False,
             ),
-            "边走阈值 45°",
+            "边走≤45°",
         )
         self.assertEqual(
             MODULE.motion_value_label(
@@ -696,7 +749,7 @@ class OverlayStateTest(unittest.TestCase):
                 MODULE.GAIT_STOP_HEADING_ERROR_FIELD,
                 compact=False,
             ),
-            "原地阈值 65°",
+            "原地≥65°",
         )
 
         start_command = MODULE.motion_step_command(

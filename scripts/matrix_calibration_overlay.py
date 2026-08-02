@@ -3360,10 +3360,10 @@ def motion_value_label(
         return f"限{value:.2f}" if compact else f"键盘速度上限 {value:.2f} m/s"
     if gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
         value_deg = math.degrees(model.value(gear, field))
-        return f"走{value_deg:.0f}°" if compact else f"边走阈值 {value_deg:.0f}°"
+        return f"走≤{value_deg:.0f}°" if compact else f"边走≤{value_deg:.0f}°"
     if gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
         value_deg = math.degrees(model.value(gear, field))
-        return f"停{value_deg:.0f}°" if compact else f"原地阈值 {value_deg:.0f}°"
+        return f"停≥{value_deg:.0f}°" if compact else f"原地≥{value_deg:.0f}°"
     if (gear, field) not in _MOTION_CONTROL_SPECS:
         raise ValueError("unsupported motion value label")
     value = model.value(gear, field)
@@ -6917,14 +6917,6 @@ class X11CalibrationOverlay:
     ) -> None:
         local_selected = model.next_profile == "Local"
         controls_disabled = model.restart_requested or model.status == "restarting"
-        command_blocked = bool(
-            command_status.in_flight
-            or command_status.restart_required
-            or command_status.outcome_unknown
-            or command_status.status in {"pending", "restarting"}
-            or self._command_editor.editing
-            or self._command_editor.pending
-        )
         self._draw_button(
             layout,
             "profile_local",
@@ -6940,7 +6932,7 @@ class X11CalibrationOverlay:
             disabled=controls_disabled,
         )
         movement_controls_disabled = bool(
-            controls_disabled or command_blocked or not motion_model.available
+            controls_disabled or not motion_model.available
         )
         for movement_mode in MOVEMENT_MODES:
             selected = movement_mode == motion_model.settings.movement_mode
@@ -7014,9 +7006,7 @@ class X11CalibrationOverlay:
         for suffix in ("down", "up"):
             action = f"motion_keyboard_speed_cap_{suffix}"
             disabled = bool(
-                controls_disabled
-                or command_blocked
-                or not motion_model.action_enabled(action)
+                controls_disabled or not motion_model.action_enabled(action)
             )
             self._draw_button(
                 layout,
@@ -7058,9 +7048,7 @@ class X11CalibrationOverlay:
             for suffix in ("down", "up"):
                 action = f"{stem}_{suffix}"
                 disabled = bool(
-                    controls_disabled
-                    or command_blocked
-                    or not motion_model.action_enabled(action)
+                    controls_disabled or not motion_model.action_enabled(action)
                 )
                 self._draw_button(
                     layout,
@@ -7111,9 +7099,7 @@ class X11CalibrationOverlay:
             for suffix in ("down", "up"):
                 action = f"{stem}_{suffix}"
                 disabled = bool(
-                    controls_disabled
-                    or command_blocked
-                    or not motion_model.action_enabled(action)
+                    controls_disabled or not motion_model.action_enabled(action)
                 )
                 self._draw_button(
                     layout,
@@ -7460,16 +7446,8 @@ class X11CalibrationOverlay:
             or panel_model.restart_requested
             or panel_model.status == "restarting"
         )
-        command_blocked = bool(
-            command_status.in_flight
-            or command_status.restart_required
-            or command_status.outcome_unknown
-            or command_status.status in {"pending", "restarting", "unavailable"}
-            or self._command_editor.editing
-            or self._command_editor.pending
-        )
         movement_controls_disabled = bool(
-            controls_disabled or command_blocked or not motion_model.available
+            controls_disabled or not motion_model.available
         )
         self._draw_text(
             "按键绑定 / 热切换：当前先支持三种 WASD 坐标模式的局内切换",
