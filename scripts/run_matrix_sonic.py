@@ -1184,22 +1184,37 @@ def _install_moon_relative_fall_check(
     environment.check_fall = check_relative_fall
 
 
-def _disable_elastic_band_for_moon_dynamic_ground(environment: Any) -> bool:
-    """Disable SONIC's origin-anchored startup band for non-origin Moon spawns."""
+def _anchor_elastic_band_for_moon_dynamic_ground(environment: Any) -> bool:
+    """Move SONIC's startup band anchor to the current non-origin Moon spawn."""
 
     elastic_band = getattr(environment, "elastic_band", None)
     if elastic_band is None:
         return False
     if not bool(getattr(elastic_band, "enable", False)):
         return False
-    elastic_band.enable = False
     data = getattr(environment, "mj_data", None)
     attached_link = getattr(environment, "band_attached_link", None)
-    if data is not None and attached_link is not None:
-        try:
-            data.xfrc_applied[int(attached_link)] = 0.0
-        except (IndexError, TypeError, ValueError):
-            pass
+    if data is None or attached_link is None:
+        return False
+    try:
+        link_index = int(attached_link)
+        anchor_xyz = [float(value) for value in data.xpos[link_index]]
+    except (IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("cannot anchor MoonWorld startup band") from exc
+    if len(anchor_xyz) != 3 or not all(math.isfinite(value) for value in anchor_xyz):
+        raise RuntimeError("MoonWorld startup band anchor is non-finite")
+    try:
+        import numpy as np
+
+        elastic_band.point = np.asarray(anchor_xyz, dtype=float)
+    except ImportError:
+        elastic_band.point = anchor_xyz
+    if callable(getattr(elastic_band, "reset_release", None)):
+        elastic_band.reset_release()
+    try:
+        data.xfrc_applied[link_index] = 0.0
+    except (IndexError, TypeError, ValueError):
+        pass
     return True
 
 
@@ -4186,6 +4201,7 @@ def main() -> int:
     game_command_child_socket = None
     moon_dynamic_ground = None
     moon_dynamic_ground_disabled_startup_band = False
+    moon_dynamic_ground_anchored_startup_band = False
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -4240,8 +4256,8 @@ def main() -> int:
                     model,
                     expected_sha256=args.moon_dynamic_map_sha256,
                 )
-                moon_dynamic_ground_disabled_startup_band = (
-                    _disable_elastic_band_for_moon_dynamic_ground(environment)
+                moon_dynamic_ground_anchored_startup_band = (
+                    _anchor_elastic_band_for_moon_dynamic_ground(environment)
                 )
                 moon_dynamic_ground.update_mocap(data)
                 moon_dynamic_ground.activate_collision_handoff(
@@ -4820,6 +4836,9 @@ def main() -> int:
                     "moon_dynamic_ground_disabled_startup_band": (
                         moon_dynamic_ground_disabled_startup_band
                     ),
+                    "moon_dynamic_ground_anchored_startup_band": (
+                        moon_dynamic_ground_anchored_startup_band
+                    ),
                     "startup_band_hold_s": args.startup_band_hold,
                     "startup_band_fade_s": args.startup_band_fade,
                     "startup_band_scale": round(float(snapshot.elastic_band_scale), 5),
@@ -5098,6 +5117,9 @@ def main() -> int:
             ),
             "moon_dynamic_ground_disabled_startup_band": (
                 moon_dynamic_ground_disabled_startup_band
+            ),
+            "moon_dynamic_ground_anchored_startup_band": (
+                moon_dynamic_ground_anchored_startup_band
             ),
             "startup_band_fade_s": args.startup_band_fade,
             "startup_band_hold_s": args.startup_band_hold,
