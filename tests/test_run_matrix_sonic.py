@@ -145,6 +145,36 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
 
+    def test_moon_collision_handoff_waits_for_startup_band_release(self) -> None:
+        self.assertTrue(
+            MODULE._moon_dynamic_ground_collision_handoff_ready(
+                self.snapshot(elastic_band_scale=1.0),
+                wait_for_startup_band=False,
+            )
+        )
+        for scale in (1.0, 0.1, MODULE._MOON_COLLISION_HANDOFF_ELASTIC_BAND_SCALE_EPS * 2):
+            with self.subTest(scale=scale):
+                self.assertFalse(
+                    MODULE._moon_dynamic_ground_collision_handoff_ready(
+                        self.snapshot(elastic_band_scale=scale),
+                        wait_for_startup_band=True,
+                    )
+                )
+        self.assertTrue(
+            MODULE._moon_dynamic_ground_collision_handoff_ready(
+                self.snapshot(elastic_band_scale=0.0),
+                wait_for_startup_band=True,
+            )
+        )
+        for bad_scale in (True, None, "bad"):
+            with self.subTest(bad_scale=bad_scale):
+                self.assertFalse(
+                    MODULE._moon_dynamic_ground_collision_handoff_ready(
+                        self.snapshot(elastic_band_scale=bad_scale),
+                        wait_for_startup_band=True,
+                    )
+                )
+
     def test_moon_dynamic_ground_installs_following_elastic_band(self) -> None:
         class FakeForce:
             def __init__(self) -> None:

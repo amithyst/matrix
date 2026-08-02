@@ -91,6 +91,7 @@ _GAME_INTERNAL_RESTART_REASONS = frozenset(
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _MOON_RELATIVE_FALL_ROOT_UP_Z = 0.5
+_MOON_COLLISION_HANDOFF_ELASTIC_BAND_SCALE_EPS = 1.0e-6
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
 _MAX_FUNCTION_FILE_BYTES = 16 * 1024
@@ -1252,6 +1253,28 @@ def _install_moon_following_elastic_band(
     except (IndexError, TypeError, ValueError):
         pass
     return True
+
+
+def _moon_dynamic_ground_collision_handoff_ready(
+    snapshot: Any,
+    *,
+    wait_for_startup_band: bool,
+) -> bool:
+    """Return whether MoonWorld can leave the finite startup pad."""
+
+    if not wait_for_startup_band:
+        return True
+    scale = getattr(snapshot, "elastic_band_scale", None)
+    if isinstance(scale, bool):
+        return False
+    try:
+        value = float(scale)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        math.isfinite(value)
+        and value <= _MOON_COLLISION_HANDOFF_ELASTIC_BAND_SCALE_EPS
+    )
 
 
 def _root_yaw_rad(qpos) -> float:
@@ -4338,10 +4361,6 @@ def main() -> int:
                     moon_dynamic_ground_following_startup_band
                 )
                 moon_dynamic_ground.update_mocap(data)
-                moon_dynamic_ground.activate_collision_handoff(
-                    data,
-                    forward=mujoco_module.mj_forward,
-                )
                 _install_moon_relative_fall_check(
                     environment,
                     moon_dynamic_ground,
@@ -4706,6 +4725,20 @@ def main() -> int:
                         moon_dynamic_ground.update_mocap(
                             simulator.sim_env.mj_data
                         )
+                        if (
+                            not moon_dynamic_ground.collision_handoff_active
+                            and _moon_dynamic_ground_collision_handoff_ready(
+                                snapshot,
+                                wait_for_startup_band=(
+                                    args.startup_band
+                                    and moon_dynamic_ground_following_startup_band
+                                ),
+                            )
+                        ):
+                            moon_dynamic_ground.activate_collision_handoff(
+                                simulator.sim_env.mj_data,
+                                forward=mujoco_module.mj_forward,
+                            )
                     except MoonDynamicGroundError as exc:
                         unstable = True
                         running = False

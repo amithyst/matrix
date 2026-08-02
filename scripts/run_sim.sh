@@ -183,6 +183,18 @@ mc_ld_library_path() {
 
 setup_runtime_environment
 
+cleanup_runtime_generated_integrity_files() {
+    # UE/MuJoCo writes this diagnostic beside binaries on some crashes.  The
+    # launcher verifies Binaries/Linux as a locked runtime tree, so leaving the
+    # generated log there makes the next launch fail before Matrix can even
+    # start.  The file is runtime output, not an installed artifact.
+    rm -f -- \
+        "$PROJECT_ROOT/src/UeSim/Linux/MUJOCO_LOG.TXT" \
+        "$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/MUJOCO_LOG.TXT"
+}
+
+cleanup_runtime_generated_integrity_files
+
 if [[ "${SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER:-0}" != "1" ]] && [[ "$ROBOT_ARG" == "custom" || "$ROBOT_ARG" == "7" ]] && [[ -n "$CUSTOM_URDF" ]]; then
     if [[ -f "$CUSTOM_WRAPPER" ]]; then
         echo "[INFO] Delegating custom URDF setup to $CUSTOM_WRAPPER"
@@ -1542,7 +1554,7 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
         MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="$(
-            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1}" \
+            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-heightfield-v2}" \
                 | tr '[:upper:]' '[:lower:]' \
                 | tr '_' '-'
         )"

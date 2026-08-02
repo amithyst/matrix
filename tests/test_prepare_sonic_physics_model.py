@@ -312,6 +312,66 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
                 )
             )
 
+    def test_moon_dynamic_ground_transform_defaults_to_continuous_hfield(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            canonical = root / "canonical.xml"
+            meshes = root / "canonical_meshes"
+            native = root / "xgb"
+            output = root / "output"
+            meshes.mkdir()
+            native.mkdir()
+            canonical.write_text(
+                """<mujoco><worldbody><body name="pelvis">
+<freejoint name="floating" /><joint name="joint_a" />
+</body></worldbody><actuator><motor name="a" joint="joint_a" />
+</actuator></mujoco>""",
+                encoding="utf-8",
+            )
+            scene = native / MODULE.MOON_DYNAMIC_GROUND_SCENE_NAME
+            bodies = []
+            for i in range(16):
+                for j in range(16):
+                    bodies.append(
+                        f"""<body name="gb_{i}_{j}" pos="{i * 0.1:.1f} {j * 0.1:.1f} 0" gravcomp="1">
+  <joint type="free" name="gb_joint_{i}_{j}" />
+  <geom name="soil_{i}_{j}" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>"""
+                    )
+            scene.write_text(
+                "<mujoco><include file=\"xgb.xml\" /><worldbody>\n"
+                + "\n".join(bodies)
+                + "\n</worldbody></mujoco>",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                MODULE,
+                "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
+                MODULE._file_sha256(scene),
+            ):
+                MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    output,
+                    body_joint_names=("joint_a",),
+                    scene_transform=MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+                )
+
+            manifest = json.loads((output / "manifest.json").read_text())
+            contract = manifest["scene_transform_contract"]["dynamic_ground"]
+            self.assertEqual(
+                contract["collision"]["mode"],
+                MODULE.MOON_DYNAMIC_GROUND_COLLISION_HFIELD,
+            )
+            self.assertEqual(
+                contract["collision"]["source_tile_compiled_collision_mask"],
+                [0, 0],
+            )
+            self.assertTrue(
+                contract["collision"]["collision_enabled_after_handoff"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
