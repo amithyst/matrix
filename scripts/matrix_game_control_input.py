@@ -71,6 +71,7 @@ from matrix_motion_settings import (
 from matrix_ui_settings import (
     UiSettings,
     atomic_save_settings as atomic_save_ui_settings,
+    canonical_font_size,
     load_settings_with_legacy_fallback as load_ui_settings,
     step_font_size,
 )
@@ -497,14 +498,7 @@ class UiSettingsController:
         self.persistence_error = load_error
         self.change_count = 0
 
-    def apply_panel_action(self, action: str, *, active: bool) -> bool:
-        if not active or action not in _UI_PANEL_ACTIONS:
-            return False
-        direction = -1 if action == "font_down" else 1
-        replacement = UiSettings(
-            font_scale=self.desired.font_scale,
-            font_size=step_font_size(self.desired.font_size, direction),
-        )
+    def _replace(self, replacement: UiSettings) -> bool:
         if replacement == self.desired:
             return False
         self.desired = replacement
@@ -519,6 +513,27 @@ class UiSettingsController:
         except (OSError, ValueError) as exc:
             self.persistence_error = str(exc)
         return True
+
+    def apply_panel_action(self, action: str, *, active: bool) -> bool:
+        if not active or action not in _UI_PANEL_ACTIONS:
+            return False
+        direction = -1 if action == "font_down" else 1
+        return self._replace(
+            UiSettings(
+                font_scale=self.desired.font_scale,
+                font_size=step_font_size(self.desired.font_size, direction),
+            )
+        )
+
+    def apply_font_size(self, font_size: int, *, active: bool) -> bool:
+        if not active:
+            return False
+        return self._replace(
+            UiSettings(
+                font_scale=self.desired.font_scale,
+                font_size=canonical_font_size(font_size),
+            )
+        )
 
     def live_mapping(self) -> dict[str, object]:
         return {
@@ -3880,6 +3895,7 @@ class OverlayIntent:
     action: str | None = None
     command: str | None = None
     active: bool | None = None
+    font_size: int | None = None
 
 
 def function_library_mapping(
@@ -4601,6 +4617,23 @@ class CalibrationOverlaySupervisor:
                         "invalid calibration overlay command-quick-submit intent"
                     )
                 intent = OverlayIntent(kind="command_quick_submit", command=command)
+            elif kind == "font_size":
+                raw_font_size = value.get("font_size")
+                if set(value) != {
+                    "version",
+                    "session",
+                    "sequence",
+                    "kind",
+                    "font_size",
+                }:
+                    raise RuntimeError("invalid calibration overlay font-size intent")
+                try:
+                    font_size = canonical_font_size(raw_font_size)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "invalid calibration overlay font-size intent"
+                    ) from exc
+                intent = OverlayIntent(kind="font_size", font_size=font_size)
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -5340,10 +5373,15 @@ def main() -> int:
                 and (publisher is None or publisher.connected)
             )
             panel_actions: list[str] = []
+            panel_font_sizes: list[int] = []
             for intent in panel_intents:
                 if intent.kind == "action":
                     assert intent.action is not None
                     panel_actions.append(intent.action)
+                    continue
+                if intent.kind == "font_size":
+                    assert intent.font_size is not None
+                    panel_font_sizes.append(intent.font_size)
                     continue
                 if intent.kind == "command_edit":
                     assert intent.active is not None
@@ -5487,6 +5525,14 @@ def main() -> int:
                         if game_command_client.in_flight:
                             current_movement_mode = movement_mode
                         apply_return.cancel_pending()
+            for font_size in panel_font_sizes:
+                ui_settings_changed = bool(
+                    ui_settings.apply_font_size(
+                        font_size,
+                        active=settings_action_active,
+                    )
+                    or ui_settings_changed
+                )
             motion_pending_restart = bool(
                 motion_store is not None
                 and applied_motion is not None

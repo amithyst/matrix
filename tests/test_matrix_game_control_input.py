@@ -174,6 +174,55 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 receiver.close()
                 supervisor._action_socket = None
 
+    def test_font_size_intent_drains_into_atomic_ui_settings_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "matrix_calibration_overlay.py"
+            script.write_text("", encoding="utf-8")
+            supervisor = MODULE.CalibrationOverlaySupervisor(
+                state_file=root / "state.json",
+                display_name=None,
+                expected_ue_pid=41,
+                script=script,
+            )
+            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            receiver.setblocking(False)
+            supervisor._action_socket = receiver
+            settings_file = root / "config/ui.json"
+            controller = MODULE.UiSettingsController(
+                path=settings_file,
+                desired=MODULE.UiSettings(),
+                load_status="missing",
+                load_error=None,
+            )
+            packet = {
+                "version": 1,
+                "session": supervisor._action_session,
+                "sequence": 1,
+                "kind": "font_size",
+                "font_size": 18,
+            }
+            try:
+                sender.send(json.dumps(packet).encode("ascii"))
+                intents = supervisor.drain_intents()
+                self.assertEqual(
+                    intents,
+                    (MODULE.OverlayIntent(kind="font_size", font_size=18),),
+                )
+                for intent in intents:
+                    self.assertTrue(
+                        controller.apply_font_size(intent.font_size, active=True)
+                    )
+                self.assertEqual(
+                    json.loads(settings_file.read_text(encoding="utf-8")),
+                    {"font_scale": 1.0, "font_size": 18, "version": 2},
+                )
+                self.assertEqual(settings_file.stat().st_mode & 0o777, 0o600)
+            finally:
+                sender.close()
+                receiver.close()
+                supervisor._action_socket = None
+
     def test_private_action_socket_rejects_wrong_session_and_direct_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -286,6 +335,20 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "sequence": 1,
                     "kind": "command_edit",
                     "active": 1,
+                },
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "kind": "font_size",
+                    "font_size": True,
+                },
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "kind": "font_size",
+                    "font_size": 99,
                 },
                 {
                     "version": 1,
