@@ -241,6 +241,8 @@ class MatrixWorldState:
             "fallen_xy_last_safe_upright",
             "teleport_command",
             "home",
+            "pose_command",
+            "recover_here",
         }:
             raise WorldStateError("resume_source is invalid")
         if not isinstance(self.teleport_points, tuple) or len(
@@ -393,7 +395,7 @@ class MatrixWorldState:
         source: str = "teleport_command",
         now_unix_ns: int | None = None,
     ) -> "MatrixWorldState":
-        if source not in {"teleport_command", "home"}:
+        if source not in {"teleport_command", "home", "pose_command", "recover_here"}:
             raise WorldStateError("unsupported explicit resume source")
         timestamp = time.time_ns() if now_unix_ns is None else now_unix_ns
         return replace(

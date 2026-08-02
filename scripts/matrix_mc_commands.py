@@ -40,6 +40,13 @@ _SUMMON_RE = re.compile(
     r"\{Tags:\[(?P<tags>.*)\]\}\s*\Z"
 )
 _TP_RE = re.compile(r"/?tp\s+@s\s+(?P<target>.+?)\s*\Z")
+_POSE_YAW_RE = re.compile(r"/?(?:pose|rot)\s+@s\s+yaw\s+(?P<angle>\S+)\s*\Z")
+_RECOVER_RE = re.compile(r"/?(?:recover|tpstand)(?:\s+@s)?\s*\Z")
+_MODE_RE = re.compile(r"/?mode\s+(?P<mode>[A-Za-z0-9_+-]+)\s*\Z")
+_SONIC_MODE_RE = re.compile(
+    r"/?(?:sonic|native)\s+mode\s+(?P<mode>auto|[0-9]{1,2})\s*\Z"
+)
+_FUNCTION_RE = re.compile(r"/?function\s+(?P<body>.+?)\s*\Z")
 _SELECTOR_RE = re.compile(r"@e\[(?P<body>[^\]]+)\]\Z")
 
 
@@ -94,6 +101,44 @@ class Coordinate:
             raise CommandProtocolError(f"coordinates[{index}] has an invalid schema")
         try:
             return cls(value=value.get("value"), relative=value.get("relative"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+
+
+@dataclass(frozen=True)
+class Angle:
+    value_rad: float
+    relative: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.value_rad, bool) or not isinstance(
+            self.value_rad, (int, float)
+        ):
+            raise CommandParseError("E_ANGLE_INVALID", "angle must be numeric")
+        value = float(self.value_rad)
+        if not math.isfinite(value):
+            raise CommandParseError("E_ANGLE_NONFINITE", "angle must be finite")
+        if type(self.relative) is not bool:
+            raise CommandParseError("E_ANGLE_INVALID", "relative flag must be boolean")
+        object.__setattr__(self, "value_rad", value)
+
+    def resolve(self, origin_rad: float) -> float:
+        result = self.value_rad + float(origin_rad) if self.relative else self.value_rad
+        if not math.isfinite(result):
+            raise CommandExecutionError(
+                "E_ANGLE_NONFINITE", "resolved angle is not finite"
+            )
+        return math.atan2(math.sin(result), math.cos(result))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {"relative": self.relative, "value_rad": self.value_rad}
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "Angle":
+        if not isinstance(value, dict) or set(value) != {"relative", "value_rad"}:
+            raise CommandProtocolError("angle has an invalid schema")
+        try:
+            return cls(value_rad=value.get("value_rad"), relative=value.get("relative"))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
 
@@ -163,6 +208,20 @@ class TeleportSelector:
 
 
 @dataclass(frozen=True)
+class PoseYawSet:
+    angle: Angle
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.angle, Angle):
+            raise CommandParseError("E_ANGLE_INVALID", "pose yaw requires an angle")
+
+
+@dataclass(frozen=True)
+class RecoverHere:
+    """Reload at the current XY using the last known safe upright pose."""
+
+
+@dataclass(frozen=True)
 class MovementModeSet:
     movement_mode: str
 
@@ -174,8 +233,48 @@ class MovementModeSet:
         object.__setattr__(self, "movement_mode", mode)
 
 
+@dataclass(frozen=True)
+class NativeModeSet:
+    native_mode: int | None
+
+    def __post_init__(self) -> None:
+        mode = self.native_mode
+        if mode is not None and (
+            type(mode) is not int or not 0 <= mode <= 19
+        ):
+            raise CommandParseError(
+                "E_NATIVE_MODE", "native SONIC mode must be auto or an integer in [0, 19]"
+            )
+
+
+@dataclass(frozen=True)
+class CommandFunctionRun:
+    commands: tuple["AtomicMcCommand", ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.commands, tuple)
+            or not self.commands
+            or len(self.commands) > 8
+            or any(not _is_atomic_command(command) for command in self.commands)
+        ):
+            raise CommandParseError(
+                "E_FUNCTION_INVALID",
+                "function requires 1-8 non-nested Matrix commands",
+            )
+
+
+AtomicMcCommand: TypeAlias = (
+    SummonTeleportPoint
+    | TeleportCoordinates
+    | TeleportSelector
+    | PoseYawSet
+    | RecoverHere
+    | MovementModeSet
+    | NativeModeSet
+)
 McCommand: TypeAlias = (
-    SummonTeleportPoint | TeleportCoordinates | TeleportSelector | MovementModeSet
+    AtomicMcCommand | CommandFunctionRun
 )
 
 
@@ -222,6 +321,47 @@ def parse_coordinate(token: str) -> Coordinate:
             "E_COORD_INVALID", f"invalid coordinate {token!r}"
         ) from exc
     return Coordinate(value, relative=relative)
+
+
+def parse_angle(token: str) -> Angle:
+    relative = token.startswith("~")
+    body = token[1:] if relative else token
+    if not body:
+        raise CommandParseError(
+            "E_ANGLE_INVALID", "yaw angle requires a value and unit, e.g. 90deg"
+        )
+    unit = None
+    for suffix in ("deg", "rad"):
+        if body.endswith(suffix):
+            unit = suffix
+            body = body[: -len(suffix)]
+            break
+    if unit is None:
+        raise CommandParseError("E_ANGLE_UNIT", "yaw angle must end in deg or rad")
+    if _NUMBER_RE.fullmatch(body) is None:
+        raise CommandParseError("E_ANGLE_INVALID", f"invalid angle {token!r}")
+    try:
+        value = float(body)
+    except ValueError as exc:  # pragma: no cover - guarded by the regex.
+        raise CommandParseError("E_ANGLE_INVALID", f"invalid angle {token!r}") from exc
+    if unit == "deg":
+        value = math.radians(value)
+    return Angle(value, relative=relative)
+
+
+def _is_atomic_command(command: object) -> bool:
+    return isinstance(
+        command,
+        (
+            SummonTeleportPoint,
+            TeleportCoordinates,
+            TeleportSelector,
+            PoseYawSet,
+            RecoverHere,
+            MovementModeSet,
+            NativeModeSet,
+        ),
+    )
 
 
 def _parse_tags(body: str) -> tuple[str, ...]:
@@ -284,8 +424,36 @@ def _parse_selector(text: str) -> TeleportSelector:
     return TeleportSelector(tag=entries["tag"], limit=1, sort=sort)
 
 
-def parse_mc_command(text: object) -> ParsedCommand:
+def _parse_function_body(body: str) -> CommandFunctionRun:
+    named = body.strip()
+    presets = {
+        "recover_here": (RecoverHere(),),
+        "tpstand": (RecoverHere(),),
+        "sonic_auto": (NativeModeSet(None),),
+    }
+    if named in presets:
+        return CommandFunctionRun(presets[named])
+    parts = tuple(part.strip() for part in body.split(";") if part.strip())
+    if not parts:
+        raise CommandParseError("E_FUNCTION_EMPTY", "function command is empty")
+    if len(parts) > 8:
+        raise CommandParseError("E_FUNCTION_TOO_LONG", "function supports at most 8 steps")
+    commands: list[AtomicMcCommand] = []
+    for part in parts:
+        parsed = _parse_mc_command(part, allow_function=False).command
+        if not _is_atomic_command(parsed):
+            raise CommandParseError("E_FUNCTION_NESTED", "nested functions are not supported")
+        commands.append(parsed)
+    return CommandFunctionRun(tuple(commands))
+
+
+def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
     command_text = _validate_text(text)
+    function = _FUNCTION_RE.fullmatch(command_text)
+    if function is not None:
+        if not allow_function:
+            raise CommandParseError("E_FUNCTION_NESTED", "nested functions are not supported")
+        return ParsedCommand(_parse_function_body(function.group("body")))
     summon = _SUMMON_RE.fullmatch(command_text)
     if summon is not None:
         if summon.group("entity") != TELEPORT_POINT_TYPE:
@@ -321,14 +489,37 @@ def parse_mc_command(text: object) -> ParsedCommand:
             TeleportCoordinates(tuple(parse_coordinate(token) for token in tokens))
         )
 
+    pose_yaw = _POSE_YAW_RE.fullmatch(command_text)
+    if pose_yaw is not None:
+        return ParsedCommand(PoseYawSet(parse_angle(pose_yaw.group("angle"))))
+
+    if _RECOVER_RE.fullmatch(command_text) is not None:
+        return ParsedCommand(RecoverHere())
+
+    mode = _MODE_RE.fullmatch(command_text)
+    if mode is not None:
+        return ParsedCommand(MovementModeSet(mode.group("mode")))
+
+    sonic_mode = _SONIC_MODE_RE.fullmatch(command_text)
+    if sonic_mode is not None:
+        value = sonic_mode.group("mode")
+        return ParsedCommand(
+            NativeModeSet(None if value == "auto" else int(value, 10))
+        )
+
     first = command_text.lstrip("/").split(maxsplit=1)[0]
     if first in {"sumon", "summonn", "summom"}:
         raise CommandParseError(
             "E_COMMAND_UNKNOWN", f"unknown command {first!r}; did you mean /summon?"
         )
     raise CommandParseError(
-        "E_COMMAND_UNKNOWN", "supported commands are /summon and /tp"
+        "E_COMMAND_UNKNOWN",
+        "supported commands are /summon, /tp, /pose, /recover, /mode, /sonic mode, and /function",
     )
+
+
+def parse_mc_command(text: object) -> ParsedCommand:
+    return _parse_mc_command(text, allow_function=True)
 
 
 def command_to_mapping(command: McCommand) -> dict[str, object]:
@@ -351,10 +542,24 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "sort": command.sort,
             "type": TELEPORT_POINT_TYPE,
         }
+    if isinstance(command, PoseYawSet):
+        return {"name": "pose_yaw_set", "angle": command.angle.to_mapping()}
+    if isinstance(command, RecoverHere):
+        return {"name": "recover_here"}
     if isinstance(command, MovementModeSet):
         return {
             "name": "movement_mode_set",
             "movement_mode": command.movement_mode,
+        }
+    if isinstance(command, NativeModeSet):
+        return {
+            "name": "native_mode_set",
+            "native_mode": command.native_mode,
+        }
+    if isinstance(command, CommandFunctionRun):
+        return {
+            "name": "function_run",
+            "commands": [command_to_mapping(item) for item in command.commands],
         }
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
@@ -403,6 +608,37 @@ def command_from_mapping(value: object) -> McCommand:
             raise CommandProtocolError("movement mode command has an invalid schema")
         try:
             return MovementModeSet(value.get("movement_mode"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "native_mode_set":
+        if set(value) != {"name", "native_mode"}:
+            raise CommandProtocolError("native mode command has an invalid schema")
+        try:
+            return NativeModeSet(value.get("native_mode"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "pose_yaw_set":
+        if set(value) != {"name", "angle"}:
+            raise CommandProtocolError("pose yaw command has an invalid schema")
+        try:
+            return PoseYawSet(Angle.from_mapping(value.get("angle")))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "recover_here":
+        if set(value) != {"name"}:
+            raise CommandProtocolError("recover command has an invalid schema")
+        return RecoverHere()
+    if name == "function_run":
+        if set(value) != {"name", "commands"}:
+            raise CommandProtocolError("function command has an invalid schema")
+        commands = value.get("commands")
+        if not isinstance(commands, list) or not 1 <= len(commands) <= 8:
+            raise CommandProtocolError("function command requires 1-8 steps")
+        parsed_commands = tuple(command_from_mapping(item) for item in commands)
+        if any(not _is_atomic_command(item) for item in parsed_commands):
+            raise CommandProtocolError("function command cannot contain nested functions")
+        try:
+            return CommandFunctionRun(parsed_commands)
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     raise CommandProtocolError(f"unsupported typed command {name!r}")
@@ -662,6 +898,48 @@ def execute_command(
             restart_required=True,
             data={"position": [pose.x, pose.y, pose.z]},
         )
+    if isinstance(command, PoseYawSet):
+        yaw_rad = command.angle.resolve(current_pose.yaw_rad)
+        pose = WorldPose(current_pose.x, current_pose.y, current_pose.z, yaw_rad)
+        next_state = state.set_resume_pose(
+            pose, source="pose_command", now_unix_ns=now_unix_ns
+        )
+        return CommandEffect(
+            state=next_state,
+            code="OK_POSE_RESTART",
+            message="Pose saved; reloading Matrix with the requested yaw",
+            restart_required=True,
+            data={
+                "position": [pose.x, pose.y, pose.z],
+                "yaw_rad": pose.yaw_rad,
+            },
+        )
+    if isinstance(command, RecoverHere):
+        if state.last_safe is None:
+            raise CommandExecutionError(
+                "E_RECOVER_NO_SAFE_POSE",
+                "No upright checkpoint is available for recover-here",
+            )
+        pose = WorldPose(
+            current_pose.x,
+            current_pose.y,
+            state.last_safe.z,
+            state.last_safe.yaw_rad,
+        )
+        next_state = state.set_resume_pose(
+            pose, source="recover_here", now_unix_ns=now_unix_ns
+        )
+        return CommandEffect(
+            state=next_state,
+            code="OK_RECOVER_RESTART",
+            message="Recover pose saved; reloading Matrix upright at current XY",
+            restart_required=True,
+            data={
+                "position": [pose.x, pose.y, pose.z],
+                "yaw_rad": pose.yaw_rad,
+                "source": "last_safe",
+            },
+        )
     if isinstance(command, TeleportSelector):
         try:
             matches = state.select_teleport_points(
@@ -694,11 +972,48 @@ def execute_command(
                 "tags": list(point.tags),
             },
         )
+    if isinstance(command, CommandFunctionRun):
+        next_state = state
+        working_pose = current_pose
+        restart_required = False
+        results: list[dict[str, object]] = []
+        for item in command.commands:
+            if isinstance(item, (MovementModeSet, NativeModeSet)):
+                raise CommandExecutionError(
+                    "E_FUNCTION_RUNTIME_COMMAND",
+                    "movement/native mode function steps require runtime support",
+                )
+            effect = execute_command(
+                item,
+                state=next_state,
+                current_pose=working_pose,
+                now_unix_ns=now_unix_ns,
+            )
+            next_state = effect.state
+            if effect.state.last_exit is not None:
+                working_pose = effect.state.last_exit
+            restart_required = restart_required or effect.restart_required
+            results.append(
+                {
+                    "code": effect.code,
+                    "message": effect.message,
+                    "restart_required": effect.restart_required,
+                    "data": dict(effect.data),
+                }
+            )
+        return CommandEffect(
+            state=next_state,
+            code="OK_FUNCTION_RESTART" if restart_required else "OK_FUNCTION",
+            message=f"Function executed {len(results)} step(s)",
+            restart_required=restart_required,
+            data={"steps": results},
+        )
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
 __all__ = [
     "COMMAND_PROTOCOL",
+    "Angle",
     "CommandEffect",
     "CommandExecutionError",
     "CommandParseError",
@@ -707,10 +1022,14 @@ __all__ = [
     "GameCommandRequest",
     "GameCommandResponse",
     "MovementModeSet",
+    "NativeModeSet",
     "ParsedCommand",
+    "PoseYawSet",
+    "RecoverHere",
     "SummonTeleportPoint",
     "TeleportCoordinates",
     "TeleportSelector",
+    "CommandFunctionRun",
     "command_from_mapping",
     "command_to_mapping",
     "decode_command_request",

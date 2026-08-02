@@ -35,20 +35,25 @@ from matrix_game_control import (
     SONIC_GAIT_NAMES,
     SONIC_GAIT_SPEED_RANGES_MPS,
     SONIC_IDLE_MODE,
+    SONIC_NATIVE_MODE_MAX,
+    SONIC_NATIVE_MODE_MIN,
     SONIC_RUN_MODE,
     SONIC_SLOW_WALK_MODE,
     SONIC_WALK_MODE,
     UnixInputConnection,
     UnixSeqpacketInputServer,
+    native_mode_label,
     wrap_angle_rad,
 )
 from matrix_mc_commands import (
+    CommandFunctionRun,
     CommandExecutionError,
     CommandProtocolError,
     GameCommandRequest,
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
     MovementModeSet,
+    NativeModeSet,
     decode_command_request,
     encode_command_response,
     execute_command,
@@ -1577,6 +1582,8 @@ def _game_control_status_fields(
         "native_gait_modes": {
             SONIC_GAIT_NAMES[mode]: mode for mode in sorted(SONIC_GAIT_NAMES)
         },
+        "native_mode_override": "auto unless changed by /sonic mode or ESC native-mode buttons",
+        "native_mode_override_range": [SONIC_NATIVE_MODE_MIN, SONIC_NATIVE_MODE_MAX],
         "keyboard_slow_speed_mps": keyboard_slow_speed,
         "keyboard_walk_speed_mps": keyboard_walk_speed,
         "keyboard_run_speed_mps": keyboard_run_speed,
@@ -2004,13 +2011,13 @@ class NativePlannerClient:
     def send_game_command(self, command: RobotMotionCommand) -> None:
         if not isinstance(command, RobotMotionCommand):
             raise TypeError("command must be a RobotMotionCommand")
-        if command.locomotion_mode not in {
-            SONIC_IDLE_MODE,
-            SONIC_SLOW_WALK_MODE,
-            SONIC_WALK_MODE,
-            SONIC_RUN_MODE,
-        }:
-            raise ValueError("game command must use native IDLE/SLOW_WALK/WALK/RUN")
+        if (
+            type(command.locomotion_mode) is not int
+            or not SONIC_NATIVE_MODE_MIN
+            <= command.locomotion_mode
+            <= SONIC_NATIVE_MODE_MAX
+        ):
+            raise ValueError("game command must use native SONIC mode in [0, 19]")
         has_speed = command.speed_mps > 1e-6
         has_direction = math.hypot(
             command.movement[0], command.movement[1]
@@ -2029,15 +2036,16 @@ class NativePlannerClient:
         else:
             if command.locomotion_mode == SONIC_IDLE_MODE:
                 raise ValueError("moving game command cannot use native IDLE")
-            minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[
-                command.locomotion_mode
-            ]
-            if not minimum <= command.speed_mps <= maximum:
-                gait_name = SONIC_GAIT_NAMES[command.locomotion_mode]
-                raise ValueError(
-                    f"game command speed is outside native {gait_name} "
-                    f"range {minimum:.1f}-{maximum:.1f} m/s"
-                )
+            if command.locomotion_mode in SONIC_GAIT_SPEED_RANGES_MPS:
+                minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[
+                    command.locomotion_mode
+                ]
+                if not minimum <= command.speed_mps <= maximum:
+                    gait_name = SONIC_GAIT_NAMES[command.locomotion_mode]
+                    raise ValueError(
+                        f"game command speed is outside native {gait_name} "
+                        f"range {minimum:.1f}-{maximum:.1f} m/s"
+                    )
         self.send_direction(
             movement=command.movement,
             facing=command.facing,
@@ -2247,9 +2255,13 @@ class GameInputRuntime:
                 command.locomotion_mode if command is not None else SONIC_IDLE_MODE
             ),
             "locomotion_mode_name": (
-                SONIC_GAIT_NAMES.get(command.locomotion_mode, "UNKNOWN")
+                native_mode_label(command.locomotion_mode)
                 if command is not None
                 else SONIC_GAIT_NAMES[SONIC_IDLE_MODE]
+            ),
+            "native_mode_override": self.core.native_mode_override,
+            "native_mode_override_name": native_mode_label(
+                self.core.native_mode_override
             ),
             "moving_command_frames": self.moving_command_frames,
             "packets_applied": self.packets_applied,
@@ -2355,6 +2367,120 @@ class GameCommandRuntime:
             self.request_ids = {request.request_id}
         return None
 
+    def _apply_movement_mode_command(
+        self,
+        command: MovementModeSet,
+        *,
+        neutral_authorized: bool,
+    ) -> tuple[str, str, dict[str, object]]:
+        try:
+            changed = self.core.set_movement_mode(
+                command.movement_mode,
+                neutral_authorized=neutral_authorized,
+            )
+        except ValueError as exc:
+            raise CommandExecutionError(
+                "E_MOVEMENT_MODE_BOUNDARY", str(exc)
+            ) from exc
+        mode = self.core.movement_mode
+        return (
+            "OK_MOVEMENT_MODE_CHANGED" if changed else "OK_MOVEMENT_MODE_UNCHANGED",
+            f"Movement mode is {mode}",
+            {
+                "movement_mode": mode,
+                "movement_mode_mapping": self.core.movement_mode_mapping(),
+            },
+        )
+
+    def _apply_native_mode_command(
+        self,
+        command: NativeModeSet,
+    ) -> tuple[str, str, dict[str, object]]:
+        try:
+            changed = self.core.set_native_mode_override(command.native_mode)
+        except ValueError as exc:
+            raise CommandExecutionError("E_NATIVE_MODE", str(exc)) from exc
+        mode = self.core.native_mode_override
+        label = native_mode_label(mode)
+        return (
+            "OK_NATIVE_MODE_CHANGED" if changed else "OK_NATIVE_MODE_UNCHANGED",
+            f"Native SONIC mode override is {label}",
+            {
+                "native_mode": mode,
+                "native_mode_name": label,
+            },
+        )
+
+    def _execute_function_command(
+        self,
+        command: CommandFunctionRun,
+        *,
+        current_pose: WorldPose,
+    ) -> tuple[str, str, bool, dict[str, object]]:
+        state = self.world.state if self.world is not None else None
+        working_pose = current_pose
+        restart_required = False
+        steps: list[dict[str, object]] = []
+        for step in command.commands:
+            if isinstance(step, MovementModeSet):
+                code, message, data = self._apply_movement_mode_command(
+                    step,
+                    neutral_authorized=True,
+                )
+                steps.append(
+                    {
+                        "code": code,
+                        "message": message,
+                        "restart_required": False,
+                        "data": data,
+                    }
+                )
+                continue
+            if isinstance(step, NativeModeSet):
+                code, message, data = self._apply_native_mode_command(step)
+                steps.append(
+                    {
+                        "code": code,
+                        "message": message,
+                        "restart_required": False,
+                        "data": data,
+                    }
+                )
+                continue
+            if self.world is None or state is None:
+                raise CommandExecutionError(
+                    "E_WORLD_UNAVAILABLE",
+                    "World function steps require game world persistence",
+                )
+            effect = execute_command(
+                step,
+                state=state,
+                current_pose=working_pose,
+                now_unix_ns=time.time_ns(),
+            )
+            state = effect.state
+            if state.last_exit is not None:
+                working_pose = state.last_exit
+            restart_required = restart_required or effect.restart_required
+            steps.append(
+                {
+                    "code": effect.code,
+                    "message": effect.message,
+                    "restart_required": effect.restart_required,
+                    "data": dict(effect.data),
+                }
+            )
+        if self.world is not None and state is not None:
+            self.world.store.save(state)
+            self.world.state = state
+            self.world.last_error = None
+        return (
+            "OK_FUNCTION_RESTART" if restart_required else "OK_FUNCTION",
+            f"Function executed {len(steps)} step(s)",
+            restart_required,
+            {"steps": steps},
+        )
+
     def poll(
         self,
         *,
@@ -2416,39 +2542,130 @@ class GameCommandRuntime:
                     )
                     continue
                 try:
-                    changed = self.core.set_movement_mode(
-                        request.command.movement_mode,
+                    code, message, data = self._apply_movement_mode_command(
+                        request.command,
                         neutral_authorized=command_allowed,
                     )
-                except ValueError as exc:
+                except CommandExecutionError as exc:
                     self.rejected_commands += 1
                     self._send(
                         self._response(
                             request,
                             ok=False,
-                            code="E_MOVEMENT_MODE_BOUNDARY",
-                            message=str(exc),
+                            code=exc.code,
+                            message=exc.message,
                         )
                     )
                     continue
                 self.commands_executed += 1
-                mode = self.core.movement_mode
                 self._send(
                     self._response(
                         request,
                         ok=True,
-                        code=(
-                            "OK_MOVEMENT_MODE_CHANGED"
-                            if changed
-                            else "OK_MOVEMENT_MODE_UNCHANGED"
-                        ),
-                        message=f"Movement mode is {mode}",
-                        data={
-                            "movement_mode": mode,
-                            "movement_mode_mapping": self.core.movement_mode_mapping(),
-                        },
+                        code=code,
+                        message=message,
+                        data=data,
                     )
                 )
+                continue
+            if isinstance(request.command, NativeModeSet):
+                if not (command_allowed or movement_mode_allowed):
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_NEUTRAL_REQUIRED",
+                            message=(
+                                "Native mode changes require neutral input "
+                                "or the ESC safety panel"
+                            ),
+                        )
+                    )
+                    continue
+                try:
+                    code, message, data = self._apply_native_mode_command(
+                        request.command
+                    )
+                except CommandExecutionError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=code,
+                        message=message,
+                        data=data,
+                    )
+                )
+                continue
+            if isinstance(request.command, CommandFunctionRun):
+                if not command_allowed:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_NOT_PAUSED",
+                            message="Open ESC and wait for a neutral frame before functions",
+                        )
+                    )
+                    continue
+                try:
+                    code, message, restart_required, data = (
+                        self._execute_function_command(
+                            request.command,
+                            current_pose=current_pose,
+                        )
+                    )
+                except CommandExecutionError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                        )
+                    )
+                    continue
+                except WorldStateError as exc:
+                    self.rejected_commands += 1
+                    if self.world is not None:
+                        self.world.last_error = str(exc)
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_STATE_PERSIST",
+                            message="Could not persist the function result",
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=code,
+                        message=message,
+                        restart_required=restart_required,
+                        data=data,
+                    )
+                )
+                if restart_required:
+                    self.restart_requested = True
+                    return True
                 continue
             if not command_allowed:
                 self.rejected_commands += 1
@@ -2470,7 +2687,7 @@ class GameCommandRuntime:
                         code="E_WORLD_UNAVAILABLE",
                         message=(
                             "World commands require game world persistence; "
-                            "movement-mode commands remain available"
+                            "movement/native-mode commands remain available"
                         ),
                     )
                 )
@@ -2537,6 +2754,10 @@ class GameCommandRuntime:
             "restart_requested": self.restart_requested,
             "movement_mode": self.core.movement_mode,
             "movement_mode_mapping": self.core.movement_mode_mapping(),
+            "native_mode_override": self.core.native_mode_override,
+            "native_mode_override_name": native_mode_label(
+                self.core.native_mode_override
+            ),
             "world_available": self.world is not None,
             "last_response": self.last_response,
         }

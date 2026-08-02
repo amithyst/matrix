@@ -215,6 +215,50 @@ class OverlayLayoutTest(unittest.TestCase):
             )
         self.assertIsNone(MODULE.panel_action_at(layout, geometry.x + 3, geometry.y + 3))
 
+    def test_functions_page_hit_test_exposes_presets_and_native_modes(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        for action in ("function_preset_0", "native_mode_auto", "native_mode_7"):
+            x, y, width, height = layout[action]
+            self.assertEqual(
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="functions",
+                ),
+                action,
+            )
+        self.assertEqual(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("function_preset_0"),
+            "/recover",
+        )
+        self.assertEqual(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_auto"),
+            "/sonic mode auto",
+        )
+        self.assertEqual(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_7"),
+            "/sonic mode 7",
+        )
+
+    def test_keybindings_page_exposes_hot_movement_mode_switches(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        x, y, width, height = layout["movement_mode_body_relative"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="keybindings",
+            ),
+            "movement_mode_body_relative",
+        )
+        x, y, width, height = layout["tab_keybindings"]
+        self.assertEqual(
+            MODULE.panel_action_at(layout, x + width // 2, y + height // 2),
+            "tab_keybindings",
+        )
+
 
 class CursorShapeTest(unittest.TestCase):
     @staticmethod
@@ -489,12 +533,18 @@ class PointerActionPublisherTest(unittest.TestCase):
         try:
             publisher.publish("profile_remote")
             publisher.publish("speed_down")
+            publisher.publish("movement_mode_body_relative")
             first = json.loads(receiver.recv(1024).decode("ascii"))
             second = json.loads(receiver.recv(1024).decode("ascii"))
+            third = json.loads(receiver.recv(1024).decode("ascii"))
             self.assertEqual(first["session"], "known-session")
-            self.assertEqual((first["sequence"], second["sequence"]), (1, 2))
+            self.assertEqual(
+                (first["sequence"], second["sequence"], third["sequence"]),
+                (1, 2, 3),
+            )
             self.assertEqual(first["kind"], "action")
             self.assertEqual(second["action"], "speed_down")
+            self.assertEqual(third["action"], "movement_mode_body_relative")
             with self.assertRaisesRegex(ValueError, "unsupported"):
                 publisher.publish("restart_directly")
         finally:
@@ -510,10 +560,11 @@ class PointerActionPublisherTest(unittest.TestCase):
         try:
             publisher.publish_command_edit(True)
             publisher.publish_command_submit("/tp @s ~ ~ ~")
+            publisher.publish_command_quick_submit("/sonic mode 7")
             publisher.publish_command_edit(False)
             packets = [
                 json.loads(receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES).decode("ascii"))
-                for _ in range(3)
+                for _ in range(4)
             ]
             self.assertEqual(
                 set(packets[0]),
@@ -527,11 +578,19 @@ class PointerActionPublisherTest(unittest.TestCase):
             )
             self.assertEqual(packets[1]["kind"], "command_submit")
             self.assertEqual(packets[1]["command"], "/tp @s ~ ~ ~")
-            self.assertEqual([packet["sequence"] for packet in packets], [1, 2, 3])
+            self.assertEqual(
+                set(packets[2]),
+                {"version", "session", "sequence", "kind", "command"},
+            )
+            self.assertEqual(packets[2]["kind"], "command_quick_submit")
+            self.assertEqual(packets[2]["command"], "/sonic mode 7")
+            self.assertEqual([packet["sequence"] for packet in packets], [1, 2, 3, 4])
             with self.assertRaisesRegex(ValueError, "printable ASCII"):
                 publisher.publish_command_submit("/tp @s 1 2 3\n")
             with self.assertRaisesRegex(ValueError, "printable ASCII"):
                 publisher.publish_command_submit("x" * (MODULE.MAX_COMMAND_CHARS + 1))
+            with self.assertRaisesRegex(ValueError, "printable ASCII"):
+                publisher.publish_command_quick_submit("/sonic mode 7\n")
             with self.assertRaisesRegex(ValueError, "boolean"):
                 publisher.publish_command_edit(1)
         finally:

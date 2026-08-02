@@ -485,7 +485,8 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_height = 32 if compact else 46
     tab_y = panel_y + (30 if compact else 76)
     tab_gap = 4 if compact else 8
-    tab_width = max(1, (panel_width - 2 * margin - 6 * tab_gap) // 7)
+    tab_count = 9
+    tab_width = max(1, (panel_width - 2 * margin - (tab_count - 1) * tab_gap) // tab_count)
     profile_y = centre_panel_y - safe_half_size - gap - button_height
     speed_y = centre_panel_y + safe_half_size + gap
     profile_gap = max(4, min(10, gap // 2))
@@ -655,26 +656,38 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             tab_width,
             tab_height,
         ),
-        "tab_inventory": (
+        "tab_functions": (
             panel_x + margin + 3 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
         ),
-        "tab_navigation": (
+        "tab_keybindings": (
             panel_x + margin + 4 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
         ),
-        "tab_video": (
+        "tab_inventory": (
             panel_x + margin + 5 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
         ),
-        "tab_system": (
+        "tab_navigation": (
             panel_x + margin + 6 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_video": (
+            panel_x + margin + 7 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_system": (
+            panel_x + margin + 8 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
@@ -845,6 +858,43 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             inventory_top + row * (inventory_height + inventory_gap),
             inventory_width,
             inventory_height,
+        )
+    function_top = console_top + (20 if compact else 38)
+    function_gap = 6 if compact else 12
+    function_button_height = max(28, min(button_height, 60))
+    function_button_width = max(1, (console_width - function_gap) // 2)
+    for index in range(4):
+        row, column = divmod(index, 2)
+        result[f"function_preset_{index}"] = (
+            console_left + column * (function_button_width + function_gap),
+            function_top + row * (function_button_height + function_gap),
+            function_button_width,
+            function_button_height,
+        )
+    native_top = function_top + 2 * (function_button_height + function_gap) + (
+        16 if compact else 28
+    )
+    native_gap = 4 if compact else 8
+    native_columns = 10
+    native_cell_width = max(
+        1,
+        (console_width - (native_columns - 1) * native_gap) // native_columns,
+    )
+    native_cell_height = max(24, min(42, function_button_height))
+    result["native_mode_auto"] = (
+        console_left,
+        native_top,
+        max(1, 2 * native_cell_width + native_gap),
+        native_cell_height,
+    )
+    native_grid_top = native_top + native_cell_height + native_gap
+    for index in range(20):
+        row, column = divmod(index, native_columns)
+        result[f"native_mode_{index}"] = (
+            console_left + column * (native_cell_width + native_gap),
+            native_grid_top + row * (native_cell_height + native_gap),
+            native_cell_width,
+            native_cell_height,
         )
     for index in range(_MAX_LOCOMOTION_POLICY_BUTTONS):
         result[f"locomotion_policy_{index}"] = (
@@ -1185,10 +1235,24 @@ _PANEL_TABS = (
     "tab_loadout",
     "tab_settings",
     "tab_console",
+    "tab_functions",
+    "tab_keybindings",
     "tab_inventory",
     "tab_navigation",
     "tab_video",
     "tab_system",
+)
+_FUNCTION_PRESETS = (
+    ("原地站立恢复", "/recover"),
+    ("当前位置面向北", "/pose @s yaw 0deg"),
+    ("当前位置右转90", "/pose @s yaw ~90deg"),
+    ("TP+姿态示例", "/function /tp @s ~ ~ ~; /pose @s yaw ~0deg"),
+)
+_FUNCTION_PRESET_HIT_TARGETS = tuple(
+    f"function_preset_{index}" for index in range(len(_FUNCTION_PRESETS))
+)
+_NATIVE_MODE_HIT_TARGETS = ("native_mode_auto",) + tuple(
+    f"native_mode_{index}" for index in range(20)
 )
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider", "video_camera_distance_cm_slider")
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
@@ -1218,6 +1282,8 @@ _PANEL_HIT_TARGETS = (
     + _POLICY_HIT_TARGETS
     + _INVENTORY_HIT_TARGETS
     + _NAVIGATION_HIT_TARGETS
+    + _FUNCTION_PRESET_HIT_TARGETS
+    + _NATIVE_MODE_HIT_TARGETS
     + _VIDEO_STEP_ACTIONS
     + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
 )
@@ -1263,6 +1329,19 @@ def panel_action_at(
             "quit_game",
             "apply_return",
             "command_input",
+        )
+    elif page == "functions":
+        targets = (
+            _PANEL_TABS
+            + ("runtime_pause", "quit_game", "apply_return")
+            + _FUNCTION_PRESET_HIT_TARGETS
+            + _NATIVE_MODE_HIT_TARGETS
+        )
+    elif page == "keybindings":
+        targets = (
+            _PANEL_TABS
+            + ("runtime_pause", "quit_game", "apply_return")
+            + _MOVEMENT_MODE_ACTIONS
         )
     elif page == "inventory":
         targets = (
@@ -3843,7 +3922,7 @@ class PointerActionPublisher:
     def publish(self, action: str) -> None:
         """Compatibility entry point for the existing pointer actions."""
 
-        if action not in _PANEL_ACTIONS:
+        if action not in _PANEL_ACTIONS and action not in _MOVEMENT_MODE_ACTIONS:
             raise ValueError(f"unsupported pointer action: {action}")
         self._publish("action", {"action": action})
 
@@ -3864,6 +3943,19 @@ class PointerActionPublisher:
         ):
             raise ValueError("command submit text must be bounded printable ASCII")
         self._publish("command_submit", {"command": command})
+
+    def publish_command_quick_submit(self, command: str) -> None:
+        if (
+            not isinstance(command, str)
+            or not command
+            or len(command) > MAX_COMMAND_CHARS
+            or any(
+                ord(character) < 0x20 or ord(character) > 0x7E
+                for character in command
+            )
+        ):
+            raise ValueError("quick command text must be bounded printable ASCII")
+        self._publish("command_quick_submit", {"command": command})
 
     def publish_movement_mode_select(self, movement_mode: object) -> None:
         mode = validate_movement_mode(movement_mode)
@@ -5467,6 +5559,12 @@ class X11CalibrationOverlay:
                 self._active_page = next_page
                 self._last_page = None
             return emitted
+        quick_command = self._quick_command_for_action(action)
+        if quick_command is not None:
+            if self._quick_command_allowed():
+                publisher.publish_command_quick_submit(quick_command)
+                emitted += 1
+            return emitted
         if action == "runtime_pause":
             panel_model = self._last_panel_model
             if (
@@ -5562,7 +5660,7 @@ class X11CalibrationOverlay:
                 and self._last_command_status.status
                 not in {"pending", "restarting", "unavailable"}
             ):
-                publisher.publish_movement_mode_select(movement_mode)
+                publisher.publish(action)
                 emitted += 1
             return emitted
         if action in _MOTION_STEP_ACTIONS:
@@ -6070,6 +6168,8 @@ class X11CalibrationOverlay:
             ("tab_loadout", "策略装配", "策略", "loadout"),
             ("tab_settings", "控制设置", "控制", "settings"),
             ("tab_console", "命令台", "命令", "console"),
+            ("tab_functions", "函数命令", "函数", "functions"),
+            ("tab_keybindings", "按键绑定", "按键", "keybindings"),
             ("tab_inventory", "创造物品", "物品", "inventory"),
             ("tab_navigation", "星体导航", "导航", "navigation"),
             ("tab_video", "视频设置", "视频", "video"),
@@ -6616,6 +6716,155 @@ class X11CalibrationOverlay:
                 x=self._panel_rectangle(layout, "profile_local")[0],
                 y=max(112, self._panel_rectangle(layout, "profile_local")[1] - 40),
                 colour=self._colours["muted"],
+                )
+
+    def _draw_functions_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        command_status: CommandConsoleStatus,
+    ) -> None:
+        content = self._panel_rectangle(layout, "system_content")
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        quick_disabled = not self._quick_command_allowed()
+        self._draw_text(
+            "函数命令：可在命令台热编辑 /function /tp ...; /pose ...",
+            x=content[0],
+            y=content[1] + (18 if compact else 26),
+            colour=self._colours["muted"],
+        )
+        for index, (label, _command) in enumerate(_FUNCTION_PRESETS):
+            self._draw_button(
+                layout,
+                f"function_preset_{index}",
+                label,
+                fill=self._colours["disabled" if quick_disabled else "button"],
+                disabled=quick_disabled,
+            )
+        auto_rect = self._panel_rectangle(layout, "native_mode_auto")
+        self._draw_text(
+            "SONIC 原生 mode override：Auto 保持稳定自动步态；0-19 为手动档",
+            x=content[0],
+            y=max(auto_rect[1] - 12, content[1] + 72),
+            colour=self._colours["muted"],
+        )
+        self._draw_button(
+            layout,
+            "native_mode_auto",
+            "AUTO",
+            fill=self._colours["disabled" if quick_disabled else "button"],
+            disabled=quick_disabled,
+        )
+        for index in range(20):
+            self._draw_button(
+                layout,
+                f"native_mode_{index}",
+                str(index),
+                fill=self._colours["disabled" if quick_disabled else "button"],
+                disabled=quick_disabled,
+            )
+        key_y = self._panel_rectangle(layout, "native_mode_10")[1] + (
+            46 if compact else 64
+        )
+        for offset, line in enumerate(
+            (
+                "函数按钮会直接提交命令；命令台仍可手动热编辑组合命令",
+                "按键绑定和三种 WASD 坐标模式已移到“按键绑定”页",
+                "命令：/recover，/pose @s yaw 90deg，/sonic mode 7，/sonic mode auto",
+            )
+        ):
+            self._draw_text(
+                line,
+                x=content[0],
+                y=key_y + offset * (18 if compact else 24),
+                colour=self._colours[
+                    "pending" if quick_disabled and offset == 0 else "muted"
+                ],
+            )
+        if command_status.message:
+            self._draw_text(
+                self._clip_console_line(command_status.message, content[2]),
+                x=content[0],
+                y=content[1] + content[3] - (30 if compact else 42),
+                colour=self._colours[
+                    "error" if command_status.status == "error" else "cyan"
+                ],
+            )
+
+    def _draw_keybindings_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        motion_model: MotionSettingsPanelModel,
+        command_status: CommandConsoleStatus,
+    ) -> None:
+        content = self._panel_rectangle(layout, "system_content")
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        panel_model = getattr(self, "_last_panel_model", None)
+        controls_disabled = bool(
+            panel_model is None
+            or panel_model.restart_requested
+            or panel_model.status == "restarting"
+        )
+        command_blocked = bool(
+            command_status.in_flight
+            or command_status.restart_required
+            or command_status.outcome_unknown
+            or command_status.status in {"pending", "restarting", "unavailable"}
+            or self._command_editor.editing
+            or self._command_editor.pending
+        )
+        movement_controls_disabled = bool(
+            controls_disabled or command_blocked or not motion_model.available
+        )
+        self._draw_text(
+            "按键绑定 / 热切换：当前先支持三种 WASD 坐标模式的局内切换",
+            x=content[0],
+            y=content[1] + (18 if compact else 26),
+            colour=self._colours["muted"],
+        )
+        for movement_mode in MOVEMENT_MODES:
+            selected = movement_mode == motion_model.settings.movement_mode
+            self._draw_button(
+                layout,
+                f"movement_mode_{movement_mode}",
+                _MOVEMENT_MODE_LABELS[movement_mode],
+                fill=self._colours[
+                    "selected"
+                    if selected
+                    else "disabled" if movement_controls_disabled else "button"
+                ],
+                disabled=movement_controls_disabled,
+            )
+        key_y = self._panel_rectangle(layout, "movement_mode_camera_face")[1] + (
+            58 if compact else 88
+        )
+        current_mode = _MOVEMENT_MODE_LABELS.get(
+            motion_model.settings.movement_mode,
+            motion_model.settings.movement_mode,
+        )
+        lines = (
+            f"当前 WASD 坐标模式：{current_mode}",
+            "W / A / S / D：前后左右移动；Shift/Ctrl/Alt：速度档位",
+            "Q / E：按 SONIC/PICO 原生右摇杆语义做左右转向",
+            "方向键：调整相机；鼠标拖拽：相机视角；V：循环三种 WASD 模式",
+            "ESC：打开/关闭战术终端；Enter：命令台提交；F6：应用重启",
+        )
+        for offset, line in enumerate(lines):
+            self._draw_text(
+                line,
+                x=content[0],
+                y=key_y + offset * (18 if compact else 26),
+                colour=self._colours[
+                    "pending" if movement_controls_disabled and offset == 0 else "muted"
+                ],
+            )
+        if command_status.message:
+            self._draw_text(
+                self._clip_console_line(command_status.message, content[2]),
+                x=content[0],
+                y=content[1] + content[3] - (30 if compact else 42),
+                colour=self._colours[
+                    "error" if command_status.status == "error" else "cyan"
+                ],
             )
 
     def _draw_inventory_page(
@@ -7607,6 +7856,19 @@ class X11CalibrationOverlay:
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
             )
+        elif page == "functions":
+            self._draw_functions_page(
+                layout,
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+            )
+        elif page == "keybindings":
+            self._draw_keybindings_page(
+                layout,
+                motion_model or motion_settings_panel_model({}),
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+            )
         elif page == "inventory":
             self._draw_inventory_page(
                 layout,
@@ -7751,6 +8013,47 @@ class X11CalibrationOverlay:
             self._ungrab_keyboard()
             raise
         return True
+
+    def _quick_command_allowed(self) -> bool:
+        status = self._last_command_status
+        panel_model = self._last_panel_model
+        return bool(
+            self._visible
+            and status.available
+            and not status.in_flight
+            and not status.restart_required
+            and not status.outcome_unknown
+            and status.status not in {"pending", "restarting", "unavailable"}
+            and panel_model is not None
+            and not panel_model.restart_requested
+            and panel_model.status != "restarting"
+            and not self._command_editor.editing
+            and not self._command_editor.pending
+            and not self._video_distance_bound_editing()
+        )
+
+    @staticmethod
+    def _quick_command_for_action(action: str | None) -> str | None:
+        if action is None:
+            return None
+        if action.startswith("function_preset_"):
+            try:
+                index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return None
+            if 0 <= index < len(_FUNCTION_PRESETS):
+                return _FUNCTION_PRESETS[index][1]
+            return None
+        if action == "native_mode_auto":
+            return "/sonic mode auto"
+        if action.startswith("native_mode_"):
+            try:
+                index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return None
+            if 0 <= index <= 19:
+                return f"/sonic mode {index}"
+        return None
 
     def _begin_video_distance_bound_editing(self, action: str) -> bool:
         if (
@@ -8101,6 +8404,12 @@ class X11CalibrationOverlay:
                         self._active_page = next_page
                         self._last_page = None
                     continue
+                quick_command = self._quick_command_for_action(action)
+                if quick_command is not None:
+                    if self._quick_command_allowed():
+                        publisher.publish_command_quick_submit(quick_command)
+                        emitted += 1
+                    continue
                 if action == "runtime_pause":
                     panel_model = self._last_panel_model
                     if (
@@ -8255,8 +8564,8 @@ class X11CalibrationOverlay:
                         and self._last_command_status.status
                         not in {"pending", "restarting", "unavailable"}
                     ):
-                        publisher.publish_movement_mode_select(movement_mode)
-                        emitted += 1
+                            publisher.publish(action)
+                            emitted += 1
                 elif action in _VIDEO_STEP_ACTIONS:
                     video_model = getattr(self, "_last_video_model", None)
                     panel_model = self._last_panel_model

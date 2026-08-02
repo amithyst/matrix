@@ -98,6 +98,13 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "kind": "action",
                     "action": "speed_down",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 3,
+                    "kind": "action",
+                    "action": "movement_mode_body_relative",
+                },
             )
             try:
                 for packet in packets:
@@ -107,6 +114,9 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     (
                         MODULE.OverlayIntent(kind="action", action="profile_remote"),
                         MODULE.OverlayIntent(kind="action", action="speed_down"),
+                        MODULE.OverlayIntent(
+                            kind="action", action="movement_mode_body_relative"
+                        ),
                     ),
                 )
                 self.assertEqual(supervisor.drain_intents(), ())
@@ -236,6 +246,13 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "kind": "command_submit",
                     "command": "/tp @s ~1 ~ ~",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 3,
+                    "kind": "command_quick_submit",
+                    "command": "/sonic mode 7",
+                },
             )
             try:
                 for packet in packets:
@@ -246,6 +263,9 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                         MODULE.OverlayIntent(kind="command_edit", active=True),
                         MODULE.OverlayIntent(
                             kind="command_submit", command="/tp @s ~1 ~ ~"
+                        ),
+                        MODULE.OverlayIntent(
+                            kind="command_quick_submit", command="/sonic mode 7"
                         ),
                     ),
                 )

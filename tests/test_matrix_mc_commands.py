@@ -63,6 +63,24 @@ class McCommandParserTest(unittest.TestCase):
         self.assertIsInstance(selector, MODULE.TeleportSelector)
         self.assertEqual(selector.tag, "XX")
 
+    def test_parses_pose_recover_mode_native_and_function_commands(self) -> None:
+        pose = MODULE.parse_mc_command("/pose @s yaw ~90deg").command
+        recover = MODULE.parse_mc_command("/recover").command
+        movement = MODULE.parse_mc_command("/mode camera_strafe").command
+        native = MODULE.parse_mc_command("/sonic mode 7").command
+        auto = MODULE.parse_mc_command("/sonic mode auto").command
+        function = MODULE.parse_mc_command(
+            "/function /tp @s ~1 ~ ~; /pose @s yaw 180deg"
+        ).command
+
+        self.assertEqual(pose, MODULE.PoseYawSet(MODULE.Angle(math.pi / 2.0, True)))
+        self.assertIsInstance(recover, MODULE.RecoverHere)
+        self.assertEqual(movement, MODULE.MovementModeSet("camera_strafe"))
+        self.assertEqual(native, MODULE.NativeModeSet(7))
+        self.assertEqual(auto, MODULE.NativeModeSet(None))
+        self.assertIsInstance(function, MODULE.CommandFunctionRun)
+        self.assertEqual(len(function.commands), 2)
+
     def test_selector_order_is_irrelevant_but_contract_is_strict(self) -> None:
         selector = MODULE.parse_mc_command(
             "/tp @s @e[tag=XX,sort=nearest,limit=1,type=matrix:teleport_point]"
@@ -198,6 +216,47 @@ class McCommandExecutionTest(unittest.TestCase):
 
         self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, 0.5))
         self.assertTrue(effect.restart_required)
+
+    def test_pose_yaw_and_recover_here_write_resume_pose(self) -> None:
+        pose_command = MODULE.parse_mc_command("/pose @s yaw ~90deg").command
+        pose_effect = MODULE.execute_command(
+            pose_command,
+            state=self.state,
+            current_pose=self.origin,
+            now_unix_ns=2,
+        )
+        self.assertEqual(
+            pose_effect.state.last_exit,
+            WorldPose(10.0, 20.0, 0.8, 0.5 + math.pi / 2.0),
+        )
+        self.assertEqual(pose_effect.state.resume_source, "pose_command")
+
+        fallen = WorldPose(12.0, 24.0, 0.2, -2.0)
+        recover_command = MODULE.parse_mc_command("/tpstand @s").command
+        recover_effect = MODULE.execute_command(
+            recover_command,
+            state=self.state,
+            current_pose=fallen,
+            now_unix_ns=3,
+        )
+        self.assertEqual(recover_effect.state.last_exit, WorldPose(12.0, 24.0, 0.8, 0.5))
+        self.assertEqual(recover_effect.state.resume_source, "recover_here")
+
+    def test_function_world_commands_apply_sequential_resume_pose(self) -> None:
+        command = MODULE.parse_mc_command(
+            "/function /tp @s ~1 ~2 1.25; /pose @s yaw 180deg"
+        ).command
+
+        effect = MODULE.execute_command(
+            command,
+            state=self.state,
+            current_pose=self.origin,
+            now_unix_ns=4,
+        )
+
+        self.assertTrue(effect.restart_required)
+        self.assertEqual(effect.code, "OK_FUNCTION_RESTART")
+        self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, math.pi))
 
     def test_missing_selector_target_does_not_mutate_state(self) -> None:
         command = MODULE.parse_mc_command(

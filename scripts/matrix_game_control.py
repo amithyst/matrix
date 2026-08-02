@@ -339,6 +339,8 @@ SONIC_IDLE_MODE = 0
 SONIC_SLOW_WALK_MODE = 1
 SONIC_WALK_MODE = 2
 SONIC_RUN_MODE = 3
+SONIC_NATIVE_MODE_MIN = 0
+SONIC_NATIVE_MODE_MAX = 19
 SONIC_GAIT_NAMES = {
     SONIC_IDLE_MODE: "IDLE",
     SONIC_SLOW_WALK_MODE: "SLOW_WALK",
@@ -361,6 +363,28 @@ PICO_RIGHT_STICK_YAW_GAIN_RAD_S = 1.50
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
 # per-command cap even if a caller supplies a larger dt or tuning rate.
 MAX_MEASURED_FACING_LEAD_RAD = 0.05
+
+
+def validate_native_mode_override(value: object) -> int | None:
+    """Validate a manual native SONIC mode override.
+
+    ``None`` means the proven automatic gait selector is active.  Integer modes
+    are intentionally limited to the user-facing 0-19 range requested for the
+    Matrix ESC surface, even though the lower-level native sender can validate a
+    wider SONIC transport range.
+    """
+
+    if value is None:
+        return None
+    if type(value) is not int or not SONIC_NATIVE_MODE_MIN <= value <= SONIC_NATIVE_MODE_MAX:
+        raise ValueError("native SONIC mode override must be auto or an integer in [0, 19]")
+    return value
+
+
+def native_mode_label(value: int | None) -> str:
+    if value is None:
+        return "AUTO"
+    return SONIC_GAIT_NAMES.get(value, f"MODE_{value:02d}")
 
 
 def native_locomotion_mode_for_speed(
@@ -558,6 +582,7 @@ class GameControlCore:
         self._measured_heading_rad: float | None = None
         self._speed_mps = 0.0
         self._gait_active = False
+        self._native_mode_override: int | None = None
         self._snapshot: InputSnapshot | None = None
         self._last_received_at_s: float | None = None
         self._last_sequence: int | None = None
@@ -574,6 +599,18 @@ class GameControlCore:
 
     def movement_mode_mapping(self) -> dict[str, str]:
         return movement_mode_metadata(self.movement_mode)
+
+    @property
+    def native_mode_override(self) -> int | None:
+        return self._native_mode_override
+
+    def set_native_mode_override(self, value: object) -> bool:
+        mode = validate_native_mode_override(value)
+        changed = mode != self._native_mode_override
+        self._native_mode_override = mode
+        if changed:
+            self.invalidate_input("native_mode_changed")
+        return changed
 
     @property
     def free_camera(self) -> bool:
@@ -1165,6 +1202,15 @@ class GameControlCore:
                 # for this policy; the stationary SLOW_WALK variant can stall
                 # far outside the 15-degree start gate on the packaged runtime.
                 locomotion_mode = SONIC_IDLE_MODE
+        native_override = self._native_mode_override
+        if native_override is not None:
+            if native_override == SONIC_IDLE_MODE:
+                output_speed = 0.0
+                moving = False
+                locomotion_mode = SONIC_IDLE_MODE
+                movement_direction = (0.0, 0.0, 0.0)
+            elif moving or turning_to_heading:
+                locomotion_mode = native_override
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=movement_direction if moving else (0.0, 0.0, 0.0),

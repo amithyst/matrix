@@ -1719,9 +1719,24 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[1]["facing"], [0.0, 1.0, 0.0])
         self.assertEqual(planners[1]["speed"], 0.3)
 
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=10,
+                movement=(1.0, 0.0, 0.0),
+                facing=(1.0, 0.0, 0.0),
+                speed_mps=0.3,
+                locomotion_mode=7,
+                mode="move",
+                safe_stop=False,
+                reason=None,
+            )
+        )
+        self.assertEqual(planners[2]["mode"], 7)
+        self.assertEqual(planners[2]["speed"], 0.3)
+
         for sequence, native_mode, speed in (
-            (10, MODULE.SONIC_WALK_MODE, 0.8),
-            (11, MODULE.SONIC_RUN_MODE, 2.5),
+            (11, MODULE.SONIC_WALK_MODE, 0.8),
+            (12, MODULE.SONIC_RUN_MODE, 2.5),
         ):
             client.send_game_command(
                 MODULE.RobotMotionCommand(
@@ -1750,11 +1765,11 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 reason="sonic_not_ready",
             )
         )
-        self.assertTrue(commands[4]["start"])
-        self.assertFalse(commands[4]["stop"])
-        self.assertEqual(planners[4]["mode"], 0)
-        self.assertEqual(planners[4]["movement"], [0.0, 0.0, 0.0])
-        self.assertEqual(planners[4]["speed"], -1.0)
+        self.assertTrue(commands[5]["start"])
+        self.assertFalse(commands[5]["stop"])
+        self.assertEqual(planners[5]["mode"], 0)
+        self.assertEqual(planners[5]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[5]["speed"], -1.0)
 
         client.send_game_command(
             MODULE.RobotMotionCommand(
@@ -2146,6 +2161,72 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(response.data["movement_mode"], "camera_strafe")
             self.assertEqual(core.movement_mode, "camera_strafe")
             self.assertEqual(runtime.commands_executed, 1)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
+    def test_game_command_runtime_allows_native_mode_without_world_state(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        core = GAME_CONTROL.GameControlCore()
+        runtime = MODULE.GameCommandRuntime(runtime_socket, None, core)
+        request = self.game_command_request(
+            "/sonic mode 7",
+            sequence=1,
+            request_character="e",
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                    command_allowed=False,
+                    movement_mode_allowed=True,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_NATIVE_MODE_CHANGED")
+            self.assertEqual(response.data["native_mode"], 7)
+            self.assertEqual(core.native_mode_override, 7)
+        finally:
+            provider_socket.close()
+            runtime.close()
+
+    def test_game_command_runtime_function_can_set_native_mode(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        core = GAME_CONTROL.GameControlCore()
+        runtime = MODULE.GameCommandRuntime(runtime_socket, None, core)
+        request = self.game_command_request(
+            "/function /sonic mode 9; /sonic mode auto",
+            sequence=1,
+            request_character="f",
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                    command_allowed=True,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_FUNCTION")
+            self.assertFalse(response.restart_required)
+            self.assertIsNone(core.native_mode_override)
+            self.assertEqual(len(response.data["steps"]), 2)
         finally:
             provider_socket.close()
             runtime.close()

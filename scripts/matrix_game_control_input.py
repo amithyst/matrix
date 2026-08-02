@@ -4073,6 +4073,7 @@ class GameCommandClient:
         calibration_active: bool,
         neutral_frame_ready: bool,
         restart_requested: bool,
+        require_editing: bool = True,
     ) -> bool:
         """Parse and atomically send one request when every ESC gate is true."""
 
@@ -4087,7 +4088,7 @@ class GameCommandClient:
                 "Wait for the ESC panel to deliver a neutral frame",
             )
             return False
-        if not self.editing:
+        if require_editing and not self.editing:
             self._local_error(
                 "E_COMMAND_EDIT_REQUIRED", "Activate the command input first"
             )
@@ -4511,6 +4512,24 @@ class CalibrationOverlaySupervisor:
                 ):
                     raise RuntimeError("invalid calibration overlay command-submit intent")
                 intent = OverlayIntent(kind="command_submit", command=command)
+            elif kind == "command_quick_submit":
+                command = value.get("command")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "command",
+                    }
+                    or not isinstance(command, str)
+                    or len(command) > MAX_COMMAND_CHARS
+                ):
+                    raise RuntimeError(
+                        "invalid calibration overlay command-quick-submit intent"
+                    )
+                intent = OverlayIntent(kind="command_quick_submit", command=command)
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -5246,13 +5265,14 @@ def main() -> int:
                     if intent.active:
                         apply_return.cancel_pending()
                     continue
-                assert intent.kind == "command_submit"
+                assert intent.kind in {"command_submit", "command_quick_submit"}
                 assert intent.command is not None
                 command_submitted = game_command_client.submit(
                     intent.command,
                     calibration_active=calibration.active,
                     neutral_frame_ready=neutral_frame_ready,
                     restart_requested=restart_requester.requested,
+                    require_editing=(intent.kind == "command_submit"),
                 )
                 # Local parse/gate failures also change the visible result.
                 command_state_changed = True
@@ -5269,7 +5289,8 @@ def main() -> int:
                 # would turn a same-frame M/-/+/Enter/F9 press into a fresh
                 # settings edge even though the overlay still owned it.
                 or any(
-                    intent.kind in {"command_edit", "command_submit"}
+                    intent.kind
+                    in {"command_edit", "command_submit", "command_quick_submit"}
                     for intent in panel_intents
                 )
             )
