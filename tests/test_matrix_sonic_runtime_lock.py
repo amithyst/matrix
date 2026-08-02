@@ -317,6 +317,18 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         trna = (REPO_ROOT / "config/hosts/trna.env").read_text(encoding="utf-8")
         self.assertIn("worktrees/sonic-matrix-native-final", trna)
         self.assertNotIn("code_bryce", trna)
+        self.assertIn(
+            'MATRIX_GAME_CAMERA_YAW_SOURCE="${MATRIX_GAME_CAMERA_YAW_SOURCE:-ue-final-pov}"',
+            trna,
+        )
+        self.assertIn(
+            'MATRIX_GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"',
+            trna,
+        )
+        self.assertIn(
+            'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG="${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:--90.0}"',
+            trna,
+        )
         zza = (REPO_ROOT / "config/hosts/zza.env").read_text(encoding="utf-8")
         self.assertIn('DISPLAY="${DISPLAY:-:1}"', zza)
         self.assertIn("MATRIX_RUNTIME_ROOT/ros2-humble-prefix", zza)
