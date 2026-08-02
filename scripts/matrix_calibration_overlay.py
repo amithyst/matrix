@@ -55,6 +55,8 @@ from matrix_ui_settings import (
 from matrix_overlay_motion_settings import (
     BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
     BFM_TURN_COMMAND_YAW_LIMIT_PATH,
+    CAMERA_HEADING_SNAP_ERROR_FIELD,
+    CAMERA_HEADING_SNAP_ERROR_PATH,
     DOUBLE_TAP_SPEED_FIELD,
     GEARS,
     GAIT_START_HEADING_ERROR_FIELD,
@@ -1066,12 +1068,18 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         ),
         ("motion_camera_look_rate", motion_left_x, motion_left_width, look_y),
         (
-            "motion_gait_start_heading_error",
+            "motion_camera_heading_snap_error",
             motion_right_x,
             motion_right_width,
             look_y,
         ),
-        ("motion_gait_stop_heading_error", motion_left_x, motion_left_width, gait_y),
+        (
+            "motion_gait_start_heading_error",
+            motion_left_x,
+            motion_left_width,
+            gait_y,
+        ),
+        ("motion_gait_stop_heading_error", motion_right_x, motion_right_width, gait_y),
     )
     for stem, cell_x, cell_width, row_y in turn_specs:
         button_width = 24 if compact else max(32, min(52, cell_width // 4))
@@ -1285,6 +1293,16 @@ _MOTION_STEP_ACTION_DETAILS.update(
         f"motion_camera_look_rate_{suffix}": (
             "camera",
             KEYBOARD_LOOK_RATE_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_camera_heading_snap_error_{suffix}": (
+            "camera",
+            CAMERA_HEADING_SNAP_ERROR_FIELD,
             direction,
         )
         for suffix, direction in (("down", -1), ("up", 1))
@@ -3024,6 +3042,8 @@ class MotionSettingsPanelModel:
             return self.settings.value_for_path(GAIT_STOP_HEADING_ERROR_PATH)
         if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
             return self.settings.value_for_path(KEYBOARD_LOOK_RATE_PATH)
+        if gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+            return self.settings.value_for_path(CAMERA_HEADING_SNAP_ERROR_PATH)
         return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
 
     def action_enabled(self, action: str) -> bool:
@@ -3248,12 +3268,18 @@ def motion_step_target(
     if not model.available:
         return None
     gear, field, direction = details
-    if gear == "camera" and model.camera_control_available is False:
+    if (
+        gear == "camera"
+        and field == KEYBOARD_LOOK_RATE_FIELD
+        and model.camera_control_available is False
+    ):
         return None
     if gear is None:
         path = MAX_TURN_RATE_PATH
-    elif gear == "camera":
+    elif gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
         path = KEYBOARD_LOOK_RATE_PATH
+    elif gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+        path = CAMERA_HEADING_SNAP_ERROR_PATH
     elif gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
         path = KEYBOARD_SPEED_CAP_PATH
     elif gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
@@ -3303,10 +3329,15 @@ def motion_step_command(
             f"/data modify entity @s {BFM_TURN_COMMAND_YAW_LIMIT_PATH} "
             f"set value {target:.2f}"
         )
-    if gear == "camera":
+    if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
         return (
             f"/data modify entity @s {KEYBOARD_LOOK_RATE_PATH} "
             f"set value {target:.2f}"
+        )
+    if gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+        return (
+            f"/data modify entity @s {CAMERA_HEADING_SNAP_ERROR_PATH} "
+            f"set value {target:.10f}"
         )
     if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
         return (
@@ -3355,6 +3386,9 @@ def motion_value_label(
             return "相机不可用" if compact else "方向键相机不可用"
         value = model.value(gear, field)
         return f"相{value:.0f}" if compact else f"相机标称转速 {value:.0f}"
+    if gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+        value_deg = math.degrees(model.value(gear, field))
+        return f"准{value_deg:.0f}°" if compact else f"对齐精度 {value_deg:.0f}°"
     if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
         value = model.value(gear, field)
         return f"限{value:.2f}" if compact else f"键盘速度上限 {value:.2f} m/s"
@@ -6962,7 +6996,7 @@ class X11CalibrationOverlay:
                 (
                     "WASD 模式：相机朝向=按镜头前方行走并自动面向；相机侧移=按镜头平移；机身相对=按机器人自身坐标。",
                     "SONIC：" + native_mode_description_zh(None) + " 4-19 含蹲/跪/爬行/拳击/跳跃/风格走路。",
-                    "相机朝向阈值：边走≤45°默认可走着转；移动中>65°默认退回原地转，差值用于防抖。",
+                    "相机朝向：默认边走转≤45°、原地转≥90°、最终对齐精度2°；15°这类转相机应边走边转。",
                 )
             ):
                 self._draw_text(
@@ -7086,6 +7120,11 @@ class X11CalibrationOverlay:
             ),
             ("motion_camera_look_rate", "camera", KEYBOARD_LOOK_RATE_FIELD),
             (
+                "motion_camera_heading_snap_error",
+                "camera",
+                CAMERA_HEADING_SNAP_ERROR_FIELD,
+            ),
+            (
                 "motion_gait_start_heading_error",
                 "gait",
                 GAIT_START_HEADING_ERROR_FIELD,
@@ -7112,6 +7151,7 @@ class X11CalibrationOverlay:
                 motion_model.available
                 and not (
                     gear == "camera"
+                    and field == KEYBOARD_LOOK_RATE_FIELD
                     and motion_model.camera_control_available is False
                 )
             )

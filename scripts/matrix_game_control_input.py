@@ -55,6 +55,7 @@ from matrix_mouse_settings import (
     step_remote_speed_scale,
 )
 from matrix_motion_settings import (
+    CAMERA_HEADING_SNAP_ERROR_PATH,
     GEAR_RUN,
     GEAR_SLOW,
     GEAR_WALK,
@@ -157,6 +158,14 @@ _MOTION_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
     "motion_gait_start_heading_error_up": (GAIT_START_HEADING_ERROR_PATH, 1),
     "motion_gait_stop_heading_error_down": (GAIT_STOP_HEADING_ERROR_PATH, -1),
     "motion_gait_stop_heading_error_up": (GAIT_STOP_HEADING_ERROR_PATH, 1),
+    "motion_camera_heading_snap_error_down": (
+        CAMERA_HEADING_SNAP_ERROR_PATH,
+        -1,
+    ),
+    "motion_camera_heading_snap_error_up": (
+        CAMERA_HEADING_SNAP_ERROR_PATH,
+        1,
+    ),
 }
 _VIDEO_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
     "video_camera_distance_down": (CAMERA_DISTANCE_CM_FIELD, -1),

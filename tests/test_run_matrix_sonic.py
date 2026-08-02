@@ -835,7 +835,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
         self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
         self.assertAlmostEqual(status["gait_start_heading_error_deg"], 45.0)
-        self.assertAlmostEqual(status["gait_stop_heading_error_deg"], 65.0)
+        self.assertAlmostEqual(status["gait_stop_heading_error_deg"], 90.0)
+        self.assertAlmostEqual(status["camera_heading_snap_error_deg"], 2.0)
         self.assertEqual(status["maximum_speed_mps"], 0.30)
         self.assertEqual(status["analog_maximum_speed_mps"], 0.30)
         self.assertEqual(status["keyboard_maximum_target_speed_mps"], 2.50)
@@ -981,10 +982,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         tuned_args.game_motion_settings = MOTION_SETTINGS.MotionSettings(
             gait_start_heading_error_rad=math.radians(35.0),
             gait_stop_heading_error_rad=math.radians(55.0),
+            camera_heading_snap_error_rad=math.radians(4.0),
         )
         tuned_status = MODULE._game_control_status_fields(tuned_args)
         self.assertAlmostEqual(tuned_status["gait_start_heading_error_deg"], 35.0)
         self.assertAlmostEqual(tuned_status["gait_stop_heading_error_deg"], 55.0)
+        self.assertAlmostEqual(tuned_status["camera_heading_snap_error_deg"], 4.0)
 
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
         failures = MODULE._acceptance_failures(
@@ -2267,8 +2270,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             request = self.game_command_request(
                 (
                     "/data modify entity @s "
-                    "control.motion.gait_start_heading_error_rad "
-                    f"set value {math.radians(50.0):.10f}"
+                    "control.motion.camera_heading_snap_error_rad "
+                    f"set value {math.radians(3.0):.10f}"
                 ),
                 sequence=1,
                 request_character="8",
@@ -2288,21 +2291,21 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertEqual(response.code, "OK_MOTION_SETTING_CHANGED")
                 self.assertEqual(
                     response.data["path"],
-                    MOTION_SETTINGS.GAIT_START_HEADING_ERROR_PATH,
+                    MOTION_SETTINGS.CAMERA_HEADING_SNAP_ERROR_PATH,
                 )
                 self.assertAlmostEqual(
-                    response.data["gait_start_heading_error_deg"],
-                    50.0,
+                    response.data["camera_heading_snap_error_deg"],
+                    3.0,
                 )
                 self.assertAlmostEqual(
-                    core.config.gait_start_heading_error_rad,
-                    math.radians(50.0),
+                    core.config.camera_heading_snap_error_rad,
+                    math.radians(3.0),
                 )
                 self.assertAlmostEqual(
                     MOTION_SETTINGS.load_settings(
                         settings_path
-                    ).settings.gait_start_heading_error_rad,
-                    math.radians(50.0),
+                    ).settings.camera_heading_snap_error_rad,
+                    math.radians(3.0),
                 )
                 self.assertTrue(response.data["motion_settings"]["available"])
             finally:
@@ -2351,7 +2354,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertEqual(runtime.rejected_commands, 1)
                 self.assertAlmostEqual(
                     motion_store.settings.gait_stop_heading_error_rad,
-                    math.radians(65.0),
+                    math.radians(90.0),
                 )
                 self.assertFalse(settings_path.exists())
             finally:

@@ -67,6 +67,7 @@ from matrix_mc_commands import (
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_motion_settings import (
+    DEFAULT_CAMERA_HEADING_SNAP_ERROR_RAD,
     DEFAULT_GAIT_START_HEADING_ERROR_RAD,
     DEFAULT_GAIT_STOP_HEADING_ERROR_RAD,
     MotionSettings,
@@ -1606,6 +1607,11 @@ def _game_control_status_fields(
         if isinstance(motion_settings, MotionSettings)
         else DEFAULT_GAIT_STOP_HEADING_ERROR_RAD
     )
+    camera_heading_snap_error_rad = (
+        motion_settings.camera_heading_snap_error_rad
+        if isinstance(motion_settings, MotionSettings)
+        else DEFAULT_CAMERA_HEADING_SNAP_ERROR_RAD
+    )
     return {
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
@@ -1663,6 +1669,10 @@ def _game_control_status_fields(
         "gait_start_heading_error_deg": math.degrees(gait_start_heading_error_rad),
         "gait_stop_heading_error_rad": gait_stop_heading_error_rad,
         "gait_stop_heading_error_deg": math.degrees(gait_stop_heading_error_rad),
+        "camera_heading_snap_error_rad": camera_heading_snap_error_rad,
+        "camera_heading_snap_error_deg": math.degrees(
+            camera_heading_snap_error_rad
+        ),
         "keyboard_camera_look_rate_deg_s": (
             motion_settings.keyboard_look_rate_deg_s
             if isinstance(motion_settings, MotionSettings)
@@ -1767,6 +1777,7 @@ def _control_config_with_motion_settings(
         gait_stop_speed_mps=base.gait_stop_speed_mps,
         gait_start_heading_error_rad=motion_settings.gait_start_heading_error_rad,
         gait_stop_heading_error_rad=motion_settings.gait_stop_heading_error_rad,
+        camera_heading_snap_error_rad=motion_settings.camera_heading_snap_error_rad,
         stick_deadzone=base.stick_deadzone,
         input_timeout_s=base.input_timeout_s,
         max_snapshot_age_s=base.max_snapshot_age_s,
@@ -2577,6 +2588,9 @@ class GameCommandRuntime:
                 ),
                 "gait_stop_heading_error_deg": math.degrees(
                     modification.settings.gait_stop_heading_error_rad
+                ),
+                "camera_heading_snap_error_deg": math.degrees(
+                    modification.settings.camera_heading_snap_error_rad
                 ),
             },
         )
@@ -3703,6 +3717,11 @@ def main() -> int:
                     motion_settings.gait_stop_heading_error_rad
                     if motion_settings is not None
                     else DEFAULT_GAIT_STOP_HEADING_ERROR_RAD
+                ),
+                camera_heading_snap_error_rad=(
+                    motion_settings.camera_heading_snap_error_rad
+                    if motion_settings is not None
+                    else DEFAULT_CAMERA_HEADING_SNAP_ERROR_RAD
                 ),
                 keyboard_slow_speed_mps=(
                     motion_settings.slow_speed_mps

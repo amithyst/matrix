@@ -175,6 +175,7 @@ class OverlayLayoutTest(unittest.TestCase):
                     layout["motion_keyboard_turn_boost_rate_value"],
                     layout["motion_bfm_turn_command_yaw_limit_value"],
                     layout["motion_camera_look_rate_value"],
+                    layout["motion_camera_heading_snap_error_value"],
                     layout["motion_gait_start_heading_error_value"],
                     layout["motion_gait_stop_heading_error_value"],
                 ]
@@ -647,6 +648,8 @@ class OverlayStateTest(unittest.TestCase):
             "motion_gait_start_heading_error_up",
             "motion_gait_stop_heading_error_down",
             "motion_gait_stop_heading_error_up",
+            "motion_camera_heading_snap_error_down",
+            "motion_camera_heading_snap_error_up",
         ):
             self.assertIs(disabled_by_action[action], False)
 
@@ -749,7 +752,16 @@ class OverlayStateTest(unittest.TestCase):
                 MODULE.GAIT_STOP_HEADING_ERROR_FIELD,
                 compact=False,
             ),
-            "原地≥65°",
+            "原地≥90°",
+        )
+        self.assertEqual(
+            MODULE.motion_value_label(
+                model,
+                "camera",
+                MODULE.CAMERA_HEADING_SNAP_ERROR_FIELD,
+                compact=False,
+            ),
+            "对齐精度 2°",
         )
 
         start_command = MODULE.motion_step_command(
@@ -760,12 +772,19 @@ class OverlayStateTest(unittest.TestCase):
             model,
             "motion_gait_stop_heading_error_down",
         )
+        snap_command = MODULE.motion_step_command(
+            model,
+            "motion_camera_heading_snap_error_up",
+        )
         self.assertIsNotNone(start_command)
         self.assertIsNotNone(stop_command)
+        self.assertIsNotNone(snap_command)
         self.assertIn(MODULE.GAIT_START_HEADING_ERROR_PATH, start_command)
         self.assertIn(MODULE.GAIT_STOP_HEADING_ERROR_PATH, stop_command)
-        self.assertIn(f"set value {math.radians(50.0):.10f}", start_command)
-        self.assertIn(f"set value {math.radians(60.0):.10f}", stop_command)
+        self.assertIn(MODULE.CAMERA_HEADING_SNAP_ERROR_PATH, snap_command)
+        self.assertIn(f"set value {math.radians(46.0):.10f}", start_command)
+        self.assertIn(f"set value {math.radians(89.0):.10f}", stop_command)
+        self.assertIn(f"set value {math.radians(3.0):.10f}", snap_command)
 
     def test_low_remote_scale_is_rendered_with_discrete_step_hint(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)

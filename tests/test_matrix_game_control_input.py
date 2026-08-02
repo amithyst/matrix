@@ -112,6 +112,13 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "kind": "action",
                     "action": "motion_gait_start_heading_error_down",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 5,
+                    "kind": "action",
+                    "action": "motion_camera_heading_snap_error_up",
+                },
             )
             try:
                 for packet in packets:
@@ -127,6 +134,10 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                         MODULE.OverlayIntent(
                             kind="action",
                             action="motion_gait_start_heading_error_down",
+                        ),
+                        MODULE.OverlayIntent(
+                            kind="action",
+                            action="motion_camera_heading_snap_error_up",
                         ),
                     ),
                 )

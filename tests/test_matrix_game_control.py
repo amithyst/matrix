@@ -845,8 +845,8 @@ class GameControlCoreTest(unittest.TestCase):
         core = armed_core(
             MODULE.ControlConfig(
                 max_speed_mps=0.3,
-                max_acceleration_mps2=100.0,
-                max_deceleration_mps2=100.0,
+                max_acceleration_mps2=1000.0,
+                max_deceleration_mps2=1000.0,
                 max_turn_rate_rad_s=100.0,
             )
         )
@@ -857,9 +857,9 @@ class GameControlCoreTest(unittest.TestCase):
         core.synchronize_heading(0.0)
         self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "move")
 
-        # Once active, noise near the 65-degree stop edge stops exactly once;
+        # Once active, noise near the 90-degree stop edge stops exactly once;
         # it cannot restart until alignment crosses the tighter 45-degree edge.
-        stop_error = math.radians(65.0)
+        stop_error = math.radians(90.0)
         active_modes = []
         for sequence, delta in enumerate((-0.002, 0.002, -0.002, 0.002), start=2):
             now = 10.0 + sequence * 0.01
@@ -878,7 +878,7 @@ class GameControlCoreTest(unittest.TestCase):
 
         # A request outside the 45-degree start edge remains turn-only.
         # Crossing that edge starts once, and drifting just outside it remains
-        # active because the wider 65-degree stop edge has not been crossed.
+        # active because the wider 90-degree stop edge has not been crossed.
         sequence = 6
         now = 10.06
         core.synchronize_heading(math.radians(46.0))
@@ -894,7 +894,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(core.command(now_s=now, dt_s=0.02).mode, "turn")
 
         restart_modes = []
-        for sequence, error_deg in enumerate((45.1, 44.9, 45.1), start=7):
+        for sequence, error_deg in enumerate((46.0, 44.0, 60.0), start=7):
             now = 10.0 + sequence * 0.01
             core.synchronize_heading(math.radians(error_deg))
             core.accept_snapshot(
@@ -909,7 +909,65 @@ class GameControlCoreTest(unittest.TestCase):
             restart_modes.append(core.command(now_s=now, dt_s=0.02).mode)
         self.assertEqual(restart_modes, ["turn", "move", "move"])
 
-    def test_slow_walk_tolerates_small_measured_heading_error(self) -> None:
+    def test_keyboard_walk_turn_keeps_native_tier_inside_stop_gate(self) -> None:
+        core = armed_core(
+            MODULE.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=1000.0,
+                max_deceleration_mps2=1000.0,
+                max_turn_rate_rad_s=100.0,
+            )
+        )
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            received_at_s=10.0,
+        )
+        self.assertEqual(core.command(now_s=10.0, dt_s=0.02).mode, "move")
+
+        core.synchronize_heading(0.0)
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.02,
+                yaw=math.radians(60.0),
+                pressed=("w",),
+                speed_modifiers=("shift",),
+            ),
+            received_at_s=10.02,
+        )
+        walking_turn = core.command(now_s=10.02, dt_s=0.02)
+
+        self.assertEqual(walking_turn.mode, "move")
+        self.assertEqual(walking_turn.locomotion_mode, MODULE.SONIC_RUN_MODE)
+        self.assertAlmostEqual(walking_turn.speed_mps, 2.50)
+        self.assertAlmostEqual(
+            math.atan2(walking_turn.desired_facing[1], walking_turn.desired_facing[0]),
+            math.radians(60.0),
+        )
+        self.assertGreater(
+            math.atan2(walking_turn.facing[1], walking_turn.facing[0]),
+            0.0,
+        )
+
+    def test_camera_heading_snap_precision_does_not_gate_wasd(self) -> None:
+        core = armed_core(immediate_config(max_speed_mps=0.3))
+        core.synchronize_heading(math.radians(1.5))
+        core.accept_snapshot(
+            snapshot(pressed=("w",), yaw=0.0),
+            received_at_s=10.0,
+        )
+
+        command = core.command(now_s=10.0, dt_s=0.02)
+
+        self.assertEqual(command.mode, "move")
+        self.assertAlmostEqual(
+            math.atan2(command.facing[1], command.facing[0]),
+            0.0,
+            places=7,
+        )
+
+    def test_slow_walk_tolerates_medium_measured_heading_error(self) -> None:
         config = immediate_config(max_speed_mps=0.3)
         aligned = armed_core(config)
         for sequence, heading_deg in enumerate((5.0, 35.0), start=1):

@@ -579,14 +579,15 @@ class ControlConfig:
     gait_stop_speed_mps: float = 0.05
     # Camera-face movement should feel like Pico left-stick + right-stick:
     # ordinary camera-relative W/A/S/D keeps walking while the body yaws toward
-    # the requested facing.  The native IDLE yaw manifold can stall with a
-    # residual ~35-40 degree error on the packaged runtime, so the translation
-    # gate must not wait for a near-perfect 15 degree alignment.  Keep a large
-    # reversal guard, but release medium turns into locomotion so SONIC can use
-    # its stronger walking-turn manifold instead of leaving the operator
-    # apparently frozen in place.
+    # the requested facing.  The gait thresholds are motion gates, not final
+    # alignment tolerances: medium camera turns such as 15 degrees should keep
+    # moving while yaw catches up, while near-reversals may stop and turn first.
     gait_start_heading_error_rad: float = math.radians(45.0)
-    gait_stop_heading_error_rad: float = math.radians(65.0)
+    gait_stop_heading_error_rad: float = math.radians(90.0)
+    # Separate final-facing precision.  Once the rate-limited facing target is
+    # within this error of the camera/movement yaw, publish the exact requested
+    # yaw so the target does not hover inside a broad gait gate.
+    camera_heading_snap_error_rad: float = math.radians(2.0)
     stick_deadzone: float = 0.15
     input_timeout_s: float = 0.15
     max_snapshot_age_s: float = 0.15
@@ -610,6 +611,7 @@ class ControlConfig:
             "gait_stop_speed_mps",
             "gait_start_heading_error_rad",
             "gait_stop_heading_error_rad",
+            "camera_heading_snap_error_rad",
             "input_timeout_s",
             "max_snapshot_age_s",
             "max_step_s",
@@ -1127,9 +1129,12 @@ class GameControlCore:
                     heading_error = self._turn_sign * abs(heading_error)
                 elif abs(heading_error) > 1e-6:
                     self._turn_sign = math.copysign(1.0, heading_error)
-                heading_delta = max(
-                    -max_heading_delta, min(max_heading_delta, heading_error)
-                )
+                if abs(heading_error) <= self.config.camera_heading_snap_error_rad:
+                    heading_delta = heading_error
+                else:
+                    heading_delta = max(
+                        -max_heading_delta, min(max_heading_delta, heading_error)
+                    )
                 self._command_heading_rad = wrap_angle_rad(
                     heading_origin + heading_delta
                 )
@@ -1167,15 +1172,22 @@ class GameControlCore:
             if (
                 digital_movement
                 and movement_mode == CAMERA_FACE
-                and alignment
-                >= math.cos(self.config.gait_start_heading_error_rad)
+                and (
+                    alignment
+                    >= math.cos(self.config.gait_start_heading_error_rad)
+                    or (
+                        self._gait_active
+                        and alignment
+                        >= math.cos(self.config.gait_stop_heading_error_rad)
+                    )
+                )
             ):
                 # Keyboard targets sit exactly on native gait boundaries.
                 # Cosine attenuation at a harmless residual heading error
                 # would otherwise make WALK/RUN mathematically unreachable.
-                # The 15-degree translation gate already supplies the intended
-                # turn-before-move behavior, so preserve the exact tier target
-                # once the body is inside that gate.
+                # The heading gate already supplies the intended turn-before-
+                # move behavior on entry.  Once walking, keep the keyboard tier
+                # stable until the wider in-place/reversal edge is crossed.
                 target_speed = requested_speed
         elif manual_turn:
             self._stopped_heading_latched = False
