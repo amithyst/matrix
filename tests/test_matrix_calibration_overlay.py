@@ -375,6 +375,16 @@ class OverlayLayoutTest(unittest.TestCase):
             any("19 受伤行走" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
         )
 
+    def test_hover_hit_test_includes_read_only_value_cells(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        x, y, width, height = layout["motion_gait_start_heading_error_value"]
+        point = (x + width // 2, y + height // 2)
+        self.assertIsNone(MODULE.panel_action_at(layout, *point, page="settings"))
+        self.assertEqual(
+            MODULE.panel_hover_action_at(layout, *point, page="settings"),
+            "motion_gait_start_heading_error_value",
+        )
+
     def test_function_detail_run_uses_selected_mcfunction(self) -> None:
         overlay = MODULE.X11CalibrationOverlay.__new__(MODULE.X11CalibrationOverlay)
         overlay._selected_function_name = "pose/right_90"
@@ -478,6 +488,7 @@ class OverlayStateTest(unittest.TestCase):
                     "error",
                     "apply",
                     "outline",
+                    "cyan",
                 ),
                 10,
             )
@@ -528,6 +539,27 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn("返回目录", settings_labels)
         self.assertNotIn("策略装配", settings_labels)
         settings_overlay._draw_tabs.assert_not_called()
+
+    def test_hover_tooltips_explain_buttons_without_inline_comments(self) -> None:
+        self.assertIn(
+            "边走转向",
+            MODULE.tooltip_lines_for_action("motion_gait_start_heading_error_up")[0],
+        )
+        self.assertIn(
+            "原地转向",
+            MODULE.tooltip_lines_for_action("motion_gait_stop_heading_error_down")[0],
+        )
+        snap_lines = MODULE.tooltip_lines_for_action(
+            "motion_camera_heading_snap_error_value"
+        )
+        self.assertIn("对齐精度", snap_lines[0])
+        self.assertIn("2-3°", snap_lines[1])
+        self.assertIn(
+            "相机朝向",
+            MODULE.tooltip_lines_for_action("movement_mode_camera_face")[0],
+        )
+        self.assertIn("AUTO", MODULE.tooltip_lines_for_action("native_mode_auto")[0])
+        self.assertEqual(MODULE.tooltip_lines_for_action("unknown_action"), ())
 
     def test_settings_panel_distinguishes_current_next_and_pending(self) -> None:
         lines = MODULE.settings_hint_lines(
@@ -1249,7 +1281,9 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay._command_editor = MODULE.CommandLineEditor()
         overlay._last_command_status = MODULE.command_console_status({})
         overlay._last_command_revision = -1
+        overlay._last_video_distance_bound_revision = -1
         overlay._last_pointer = None
+        overlay._last_hover_action = None
         overlay._last_raise_s = None
         overlay._pressed_action = None
         overlay._pressed_window = None
@@ -1291,6 +1325,45 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay.show(geometry, (301, 302), changed, now_s=11.2)
         self.assertEqual(overlay._draw_panel.call_count, 2)
         self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
+
+    def test_hover_target_changes_redraw_panel_but_same_target_does_not(self) -> None:
+        overlay = self.make_overlay()
+        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        layout = MODULE.overlay_layout(geometry)
+        state = self.state()
+        outside_panel = (geometry.x + 5, geometry.y + 5)
+        overlay.show(geometry, outside_panel, state, now_s=20.0)
+        self.assertEqual(overlay._draw_panel.call_count, 1)
+
+        x, y, width, height = layout["tab_settings"]
+        overlay.show(
+            geometry,
+            (x + width // 2, y + height // 2),
+            {**state, "updated_monotonic_s": 1.0},
+            now_s=20.03,
+        )
+        self.assertEqual(overlay._draw_panel.call_count, 2)
+        self.assertEqual(
+            overlay._draw_panel.call_args.args[-2],
+            "tab_settings",
+        )
+
+        overlay.show(
+            geometry,
+            (x + width // 2 + 1, y + height // 2),
+            {**state, "updated_monotonic_s": 2.0},
+            now_s=20.06,
+        )
+        self.assertEqual(overlay._draw_panel.call_count, 2)
+
+        overlay.show(
+            geometry,
+            outside_panel,
+            {**state, "updated_monotonic_s": 3.0},
+            now_s=20.09,
+        )
+        self.assertEqual(overlay._draw_panel.call_count, 3)
+        self.assertIsNone(overlay._draw_panel.call_args.args[-2])
 
 
 class TargetCacheTest(unittest.TestCase):

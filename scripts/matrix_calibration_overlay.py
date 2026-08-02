@@ -1329,6 +1329,20 @@ _MOTION_STEP_ACTION_DETAILS.update(
     }
 )
 _MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
+_MOTION_VALUE_HOVER_TARGETS = tuple(
+    f"motion_{gear}_{field}_value"
+    for gear, field in _MOTION_CONTROL_SPECS
+) + (
+    "motion_turn_rate_value",
+    "motion_keyboard_turn_rate_value",
+    "motion_keyboard_turn_boost_rate_value",
+    "motion_bfm_turn_command_yaw_limit_value",
+    "motion_keyboard_speed_cap_value",
+    "motion_camera_look_rate_value",
+    "motion_camera_heading_snap_error_value",
+    "motion_gait_start_heading_error_value",
+    "motion_gait_stop_heading_error_value",
+)
 _MOVEMENT_MODE_ACTIONS = tuple(
     f"movement_mode_{movement_mode}" for movement_mode in MOVEMENT_MODES
 )
@@ -1391,6 +1405,10 @@ _VIDEO_STEP_ACTION_DETAILS.update(
     }
 )
 _VIDEO_STEP_ACTIONS = tuple(_VIDEO_STEP_ACTION_DETAILS)
+_VIDEO_VALUE_HOVER_TARGETS = tuple(
+    f"video_{field}_value"
+    for field in tuple(_VIDEO_SETTING_PRESETS) + _VIDEO_CAMERA_DISTANCE_FIELDS
+)
 
 _PANEL_DIRECTORY_PAGE = "directory"
 _BACK_TO_DIRECTORY_ACTION = "back_to_directory"
@@ -1531,35 +1549,29 @@ _PANEL_HIT_TARGETS = (
     + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
 )
 
-
-def point_in_rectangle(
-    point: tuple[int, int], rectangle: tuple[int, int, int, int]
-) -> bool:
-    x, y = point
-    left, top, width, height = rectangle
-    return left <= x < left + width and top <= y < top + height
+_SETTINGS_VALUE_HOVER_TARGETS = (
+    "speed_value",
+    "font_value",
+    "font_size_slider",
+) + _MOTION_VALUE_HOVER_TARGETS
 
 
-def panel_action_at(
-    layout: dict[str, tuple[int, int, int, int]],
-    root_x: int,
-    root_y: int,
+def _targets_for_panel_page(
+    page: str | None,
     *,
-    page: str | None = None,
     function_subpage: str | None = None,
-) -> str | None:
-    """Hit-test X11 root coordinates, including remote-desktop absolute input."""
-
+    include_hover_only: bool = False,
+) -> tuple[str, ...]:
     effective_page = _PANEL_DIRECTORY_PAGE if page is None else page
     if effective_page == _PANEL_DIRECTORY_PAGE:
-        targets = _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
-    elif effective_page == "loadout":
-        targets = (
+        return _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
+    if effective_page == "loadout":
+        return (
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _LOCOMOTION_POLICY_HIT_TARGETS
             + _POLICY_HIT_TARGETS
         )
-    elif effective_page == "settings":
+    if effective_page == "settings":
         targets = (
             (_BACK_TO_DIRECTORY_ACTION,)
             + _PANEL_ACTIONS
@@ -1568,15 +1580,18 @@ def panel_action_at(
             + _MOTION_STEP_ACTIONS
             + _OVERLAY_LOCAL_HIT_TARGETS
         )
-    elif effective_page == "console":
-        targets = (
+        if include_hover_only:
+            targets = targets + _SETTINGS_VALUE_HOVER_TARGETS
+        return targets
+    if effective_page == "console":
+        return (
             _BACK_TO_DIRECTORY_ACTION,
             "runtime_pause",
             "quit_game",
             "apply_return",
             "command_input",
         )
-    elif effective_page == "functions":
+    if effective_page == "functions":
         subpage = function_subpage or "home"
         if subpage == "files":
             function_targets = (
@@ -1596,46 +1611,266 @@ def panel_action_at(
             )
         else:
             function_targets = _FUNCTION_HOME_HIT_TARGETS
-        targets = (
+        return (
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + function_targets
         )
-    elif effective_page == "keybindings":
-        targets = (
+    if effective_page == "keybindings":
+        return (
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _MOVEMENT_MODE_ACTIONS
         )
-    elif effective_page == "inventory":
-        targets = (
+    if effective_page == "inventory":
+        return (
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _INVENTORY_HIT_TARGETS
         )
-    elif effective_page == "navigation":
-        targets = (
+    if effective_page == "navigation":
+        return (
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + _NAVIGATION_HIT_TARGETS
         )
-    elif effective_page == "video":
+    if effective_page == "video":
         targets = (
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + ("video_camera_distance_cm_slider",)
             + _VIDEO_STEP_ACTIONS
             + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
         )
-    elif effective_page == "system":
-        targets = (
+        if include_hover_only:
+            targets = targets + _VIDEO_VALUE_HOVER_TARGETS
+        return targets
+    if effective_page == "system":
+        return (
             _BACK_TO_DIRECTORY_ACTION,
             "runtime_pause",
             "quit_game",
             "apply_return",
         )
-    else:
-        targets = _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
+    return _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
+
+
+def _panel_target_at(
+    layout: dict[str, tuple[int, int, int, int]],
+    root_x: int,
+    root_y: int,
+    targets: tuple[str, ...],
+) -> str | None:
     for action in targets:
         rectangle = layout.get(action)
         if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
             return action
     return None
+
+
+def point_in_rectangle(
+    point: tuple[int, int], rectangle: tuple[int, int, int, int]
+) -> bool:
+    x, y = point
+    left, top, width, height = rectangle
+    return left <= x < left + width and top <= y < top + height
+
+
+def panel_action_at(
+    layout: dict[str, tuple[int, int, int, int]],
+    root_x: int,
+    root_y: int,
+    *,
+    page: str | None = None,
+    function_subpage: str | None = None,
+) -> str | None:
+    """Hit-test X11 root coordinates, including remote-desktop absolute input."""
+
+    return _panel_target_at(
+        layout,
+        root_x,
+        root_y,
+        _targets_for_panel_page(page, function_subpage=function_subpage),
+    )
+
+
+def panel_hover_action_at(
+    layout: dict[str, tuple[int, int, int, int]],
+    root_x: int,
+    root_y: int,
+    *,
+    page: str | None = None,
+    function_subpage: str | None = None,
+) -> str | None:
+    """Hit-test controls and read-only value cells for hover help."""
+
+    return _panel_target_at(
+        layout,
+        root_x,
+        root_y,
+        _targets_for_panel_page(
+            page,
+            function_subpage=function_subpage,
+            include_hover_only=True,
+        ),
+    )
+
+
+_BASIC_TOOLTIP_LINES = {
+    "profile_local": ("本机控制：鼠标和键盘按本机输入比例运行。",),
+    "profile_remote": ("远程控制：给远程桌面鼠标输入使用的缩放配置。",),
+    "speed_down": ("降低远程鼠标速度缩放；只影响远程鼠标灵敏度。",),
+    "speed_up": ("提高远程鼠标速度缩放；只影响远程鼠标灵敏度。",),
+    "speed_value": ("远程鼠标速度缩放当前值；本机控制时通常不用调。",),
+    "font_down": ("减小 ESC 面板字号。",),
+    "font_up": ("增大 ESC 面板字号。",),
+    "font_value": ("当前 ESC 面板字号。",),
+    "font_size_slider": ("拖动调整 ESC 面板字号；过大容易挤压布局。",),
+    "apply_return": ("保存设置并返回游戏；需要重启的设置会安全应用。",),
+    "runtime_pause": ("暂停/继续仿真；执行 TP、姿态控制前建议先暂停。",),
+    "quit_game": ("结束当前 Matrix 游戏/仿真进程。",),
+    _BACK_TO_DIRECTORY_ACTION: ("返回 ESC 目录页；当前子页面会收起。",),
+    "command_input": ("点击后输入局内命令；Enter 提交，Esc 退出输入。",),
+    "functions_open_dir": ("打开 .mcfunction 文件目录；一行就是一条命令。",),
+    "function_nav_files": ("进入函数文件列表，选择一个 .mcfunction 查看或运行。",),
+    "function_nav_presets": ("进入常用恢复/姿态组合命令。",),
+    "function_nav_sonic": ("进入 SONIC 原生模式按钮；AUTO 或 0-19 单档。",),
+    "function_back": ("返回函数命令的上一级菜单。",),
+    "function_run_selected": ("运行当前选中的 .mcfunction 文件。",),
+    "navigation_refresh": ("刷新机器人/场景坐标和可用传送点。",),
+    "video_camera_distance_cm_slider": ("拖动调整相机距离；受距离上下限约束。",),
+}
+
+_MOVEMENT_MODE_TOOLTIP_LINES = {
+    "camera_face": (
+        "相机朝向：WASD 按镜头方向移动。",
+        "机器人身体会自动转到运动方向，适合正常游玩。",
+    ),
+    "camera_strafe": (
+        "相机侧移：WASD 仍按镜头方向平移。",
+        "身体朝向尽量保持，适合横移观察。",
+    ),
+    "body_relative": (
+        "机身相对：WASD 按机器人自身前后左右。",
+        "不跟随相机 yaw，适合排查坐标系问题。",
+    ),
+}
+
+_MOTION_TOOLTIP_LINES = {
+    **{
+        f"motion_{gear}_{SPEED_FIELD}": (
+            f"{_MOTION_GEAR_LABELS[gear][0]}基础速度：单按 WASD 时的目标速度。",
+        )
+        for gear in GEARS
+    },
+    **{
+        f"motion_{gear}_{DOUBLE_TAP_SPEED_FIELD}": (
+            f"{_MOTION_GEAR_LABELS[gear][0]}双击速度：双击方向键后的目标速度。",
+        )
+        for gear in GEARS
+    },
+    "motion_keyboard_speed_cap": (
+        "键盘速度上限：WASD 最终速度不会超过这里。",
+        "如果跑步/走路忽快忽停，可先检查这个上限。",
+    ),
+    "motion_turn_rate": ("身体最大转向速度上限；限制自动转身有多快。",),
+    "motion_keyboard_turn_rate": (
+        "Q/E 普通转向速度；对齐 PICO 右摇杆的左右旋转语义。",
+    ),
+    "motion_keyboard_turn_boost_rate": (
+        "Q/E 加速转向速度；用于更快的手动左右旋转。",
+    ),
+    "motion_bfm_turn_command_yaw_limit": (
+        "外部策略转向限幅；SONIC-only 默认路径通常不用调大。",
+    ),
+    "motion_camera_look_rate": (
+        "方向键/鼠标拖拽调整相机朝向的速度。",
+        "转相机时 WASD 会读取最新相机 yaw。",
+    ),
+    "motion_camera_heading_snap_error": (
+        "对齐精度：最后差几度以内直接贴到相机方向。",
+        "它不决定能不能边走；建议初始保持 2-3°。",
+    ),
+    "motion_gait_start_heading_error": (
+        "边走转向：方向差在这个范围内，WASD 边走边转。",
+        "例：相机转 15°，机器人应继续走并慢慢转过去。",
+    ),
+    "motion_gait_stop_heading_error": (
+        "原地转向：方向差超过这里，才先停下原地转。",
+        "用于接近反向时避免边走边硬拧摔倒。",
+    ),
+}
+
+
+def _control_stem_from_adjust_action(action: str) -> str:
+    for suffix in ("_down", "_up", "_value"):
+        if action.endswith(suffix):
+            return action[: -len(suffix)]
+    return action
+
+
+def _video_field_from_action(action: str) -> str | None:
+    if not action.startswith("video_"):
+        return None
+    for suffix in ("_down", "_up", "_value"):
+        if action.endswith(suffix):
+            return action[len("video_") : -len(suffix)]
+    if action == "video_camera_distance_cm_slider":
+        return "camera_distance_cm"
+    return None
+
+
+def tooltip_lines_for_action(action: str | None) -> tuple[str, ...]:
+    """Return concise hover-only Chinese help for a panel target."""
+
+    if not action:
+        return ()
+    if action in _BASIC_TOOLTIP_LINES:
+        return _BASIC_TOOLTIP_LINES[action]
+    for tab, label, description, _target_page in _PANEL_DIRECTORY_ENTRIES:
+        if action == tab:
+            return (f"{label}：{description}",)
+    if action in _MOVEMENT_MODE_ACTIONS:
+        movement_mode = action.removeprefix("movement_mode_")
+        return _MOVEMENT_MODE_TOOLTIP_LINES.get(movement_mode, ())
+    stem = _control_stem_from_adjust_action(action)
+    if stem in _MOTION_TOOLTIP_LINES:
+        return _MOTION_TOOLTIP_LINES[stem]
+    if action.startswith("locomotion_policy_"):
+        return ("运动策略槽：当前稳定版只保留 SONIC。",)
+    if action.startswith("recovery_policy_"):
+        return ("起身策略槽：当前稳定版默认关闭，仅保留状态位。",)
+    if action.startswith("creative_item_"):
+        return ("创造物品：点击后在机器人前方生成调试物体。",)
+    if action.startswith("navigation_destination_"):
+        return ("传送点：点击后传送到对应目标位置。",)
+    if action.startswith("function_file_"):
+        return ("函数文件：点击进入详情页；文件内容可在目录中热编辑。",)
+    if action.startswith("function_preset_"):
+        try:
+            index = int(action.rsplit("_", 1)[1])
+            label, command = _FUNCTION_PRESETS[index]
+        except (IndexError, ValueError):
+            return ("预置函数：点击后提交一组恢复/姿态命令。",)
+        return (f"{label}：提交 {command}",)
+    if action == "native_mode_auto":
+        return (
+            "AUTO：" + native_mode_description_zh(None),
+            "自动合并 0-3，由运动输入选择空闲/走/跑。",
+        )
+    if action.startswith("native_mode_"):
+        try:
+            index = int(action.rsplit("_", 1)[1])
+        except ValueError:
+            return ()
+        return (
+            f"SONIC {index}：{native_mode_description_zh(index)}",
+            f"点击提交 /sonic mode {index}。",
+        )
+    video_field = _video_field_from_action(action)
+    if video_field is not None:
+        label = _VIDEO_SETTING_LABELS.get(video_field, video_field)
+        if video_field == "camera_distance_min_cm":
+            return (f"{label}：相机距离允许的最近值；可点击数字直接输入。",)
+        if video_field == "camera_distance_max_cm":
+            return (f"{label}：相机距离允许的最远值；可点击数字直接输入。",)
+        return (f"{label}：调整下一次运行使用的视频/相机设置。",)
+    return ()
 
 
 @dataclass(frozen=True)
@@ -4574,6 +4809,7 @@ class X11CalibrationOverlay:
         self._last_command_revision = -1
         self._last_video_distance_bound_revision = -1
         self._last_pointer: tuple[int, int] | None = None
+        self._last_hover_action: str | None = None
         self._last_raise_s: float | None = None
         self._pressed_action: str | None = None
         self._pressed_window: int | None = None
@@ -6238,6 +6474,74 @@ class X11CalibrationOverlay:
             centred_in=(x, y, width, height),
         )
 
+    @staticmethod
+    def _estimated_text_width_px(value: str) -> int:
+        return sum(14 if ord(character) > 0x7F else 8 for character in value)
+
+    def _draw_hover_tooltip(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        hover_action: str | None,
+        pointer: tuple[int, int] | None,
+    ) -> None:
+        lines = tooltip_lines_for_action(hover_action)
+        if not lines or pointer is None:
+            return
+        panel_x, panel_y, panel_width, panel_height = layout["panel"]
+        local_pointer_x = pointer[0] - panel_x
+        local_pointer_y = pointer[1] - panel_y
+        if (
+            local_pointer_x < 0
+            or local_pointer_y < 0
+            or local_pointer_x >= panel_width
+            or local_pointer_y >= panel_height
+        ):
+            return
+        font_size = getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
+        line_height = max(18, min(28, font_size + 8))
+        margin = 12
+        max_width = max(220, min(620, panel_width - 2 * margin))
+        box_width = min(
+            max_width,
+            max(260, max(self._estimated_text_width_px(line) for line in lines) + 28),
+        )
+        box_height = 18 + line_height * len(lines)
+        x = local_pointer_x + 18
+        y = local_pointer_y + 18
+        if x + box_width > panel_width - margin:
+            x = max(margin, local_pointer_x - box_width - 18)
+        if y + box_height > panel_height - margin:
+            y = max(margin, local_pointer_y - box_height - 18)
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            box_width,
+            box_height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, box_width - 1),
+            max(1, box_height - 1),
+        )
+        for offset, line in enumerate(lines):
+            self._draw_text(
+                self._clip_console_line(line, box_width - 24),
+                x=x + 12,
+                y=y + 14 + offset * line_height,
+                colour=self._colours["white" if offset == 0 else "muted"],
+            )
+
     def _draw_progress_bar(
         self,
         rectangle: tuple[int, int, int, int],
@@ -6609,29 +6913,20 @@ class X11CalibrationOverlay:
         self,
         layout: dict[str, tuple[int, int, int, int]],
     ) -> None:
-        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
         back_rect = self._panel_rectangle(layout, _BACK_TO_DIRECTORY_ACTION)
         self._draw_text(
-            "ESC 目录页：点击一个入口进入独立页面；进入后其它一级栏目隐藏，用“返回目录”回到这里。",
+            "ESC 目录页：点击入口进入独立页面；悬停按钮查看说明。",
             x=back_rect[0],
             y=back_rect[1] + back_rect[3] - 8,
             colour=self._colours["muted"],
         )
-        for action, label, description, _target_page in _PANEL_DIRECTORY_ENTRIES:
+        for action, label, _description, _target_page in _PANEL_DIRECTORY_ENTRIES:
             self._draw_button(
                 layout,
                 action,
                 label,
                 fill=self._colours["button"],
             )
-            x, y, width, height = self._panel_rectangle(layout, action)
-            if height >= 52:
-                self._draw_text(
-                    self._clip_console_line(description, width - 24),
-                    x=x + 12,
-                    y=y + height - (10 if compact else 16),
-                    colour=self._colours["muted"],
-                )
 
     def _draw_back_to_directory(
         self,
@@ -6981,30 +7276,6 @@ class X11CalibrationOverlay:
                 ],
                 disabled=movement_controls_disabled,
             )
-        content = self._panel_rectangle(layout, "system_content")
-        if layout["panel"][3] >= 820:
-            mode_button = self._panel_rectangle(layout, "movement_mode_camera_face")
-            mode_help_y = mode_button[1] + mode_button[3] + 28
-            line_step = max(
-                24,
-                min(
-                    32,
-                    getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE) + 10,
-                ),
-            )
-            for offset, line in enumerate(
-                (
-                    "WASD 模式：相机朝向=按镜头前方行走并自动面向；相机侧移=按镜头平移；机身相对=按机器人自身坐标。",
-                    "SONIC：" + native_mode_description_zh(None) + " 4-19 含蹲/跪/爬行/拳击/跳跃/风格走路。",
-                    "相机朝向：默认边走转≤45°、原地转≥90°、最终对齐精度2°；15°这类转相机应边走边转。",
-                )
-            ):
-                self._draw_text(
-                    self._clip_console_line(line, content[2]),
-                    x=content[0],
-                    y=mode_help_y + offset * line_step,
-                    colour=self._colours["muted"],
-                )
         down_disabled = not model.action_enabled("speed_down")
         up_disabled = not model.action_enabled("speed_up")
         self._draw_button(
@@ -7214,7 +7485,7 @@ class X11CalibrationOverlay:
         if selected_function not in function_model.files:
             selected_function = None
         self._draw_text(
-            "函数命令：MC 风格层级菜单；.mcfunction 文件每行一条命令",
+            "函数命令：MC 风格层级菜单；悬停按钮查看说明。",
             x=content[0],
             y=content[1] + (18 if compact else 26),
             colour=self._colours["muted"],
@@ -7265,21 +7536,15 @@ class X11CalibrationOverlay:
                     ],
                     disabled=action == "functions_open_dir" and open_disabled,
                 )
-            details = (
-                f"函数文件：{len(function_model.files)} 个；点击“函数文件”进入列表，再点文件进入详情页运行。",
-                "恢复/姿态函数：暂停、TP、姿态控制等组合命令放在 .mcfunction 文件里热编辑。",
-                "SONIC 原生模式：AUTO 或 0-19 单档切换；每个按钮带中文含义。",
-            )
-            base_y = self._panel_rectangle(layout, "function_file_4")[1] + (
+            summary_y = self._panel_rectangle(layout, "function_file_4")[1] + (
                 46 if compact else 64
             )
-            for offset, line in enumerate(details):
-                self._draw_text(
-                    self._clip_console_line(line, content[2]),
-                    x=content[0],
-                    y=base_y + offset * (18 if compact else 24),
-                    colour=self._colours["muted"],
-                )
+            self._draw_text(
+                f"函数文件：{len(function_model.files)} 个；说明已移到按钮悬停框。",
+                x=content[0],
+                y=summary_y,
+                colour=self._colours["muted"],
+            )
             draw_command_message()
             return
 
@@ -7400,7 +7665,7 @@ class X11CalibrationOverlay:
         if subpage == "sonic":
             auto_rect = self._panel_rectangle(layout, "native_mode_auto")
             self._draw_text(
-                "SONIC 原生模式：AUTO 合并 0-3；0-19 为单档强制切换",
+                "SONIC 原生模式：悬停 AUTO / 0-19 查看中文说明。",
                 x=content[0],
                 y=max(auto_rect[1] - 12, content[1] + 72),
                 colour=self._colours["muted"],
@@ -7425,9 +7690,7 @@ class X11CalibrationOverlay:
             )
             for offset, line in enumerate(
                 (
-                    "AUTO：" + native_mode_description_zh(None),
                     "按钮会提交 /sonic mode auto 或 /sonic mode <0-19>。",
-                    *_NATIVE_MODE_LEGEND_LINES_ZH,
                 )
             ):
                 self._draw_text(
@@ -7490,7 +7753,7 @@ class X11CalibrationOverlay:
             controls_disabled or not motion_model.available
         )
         self._draw_text(
-            "按键绑定 / 热切换：当前先支持三种 WASD 坐标模式的局内切换",
+            "按键绑定 / 热切换：悬停三种 WASD 模式查看区别。",
             x=content[0],
             y=content[1] + (18 if compact else 26),
             colour=self._colours["muted"],
@@ -7517,9 +7780,6 @@ class X11CalibrationOverlay:
         )
         lines = (
             f"当前 WASD 坐标模式：{current_mode}",
-            "相机朝向：WASD 按镜头方向移动，机器人自动面向运动方向（默认）。",
-            "相机侧移：WASD 按镜头方向平移，身体朝向尽量保持，用于横移观察。",
-            "机身相对：WASD 按机器人自身坐标前后左右，不跟随相机 yaw。",
             "W / A / S / D：前后左右移动；Shift/Ctrl/Alt：速度档位。",
             "Q / E：按 SONIC/PICO 原生右摇杆语义做左右转向",
             "方向键：调整相机；鼠标拖拽：相机视角；V：循环三种 WASD 模式",
@@ -8492,6 +8752,8 @@ class X11CalibrationOverlay:
         runtime_pause_model: RuntimePausePanelModel | None = None,
         build_info_model: BuildInfoPanelModel | None = None,
         startup_loading: StartupLoadingModel | None = None,
+        hover_action: str | None = None,
+        pointer: tuple[int, int] | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -8670,6 +8932,7 @@ class X11CalibrationOverlay:
             ],
             disabled=apply_disabled,
         )
+        self._draw_hover_tooltip(layout, hover_action, pointer)
 
     def _video_distance_bound_editing(self) -> bool:
         editor = getattr(self, "_video_distance_bound_editor", None)
@@ -9451,6 +9714,18 @@ class X11CalibrationOverlay:
             layout = overlay_layout(geometry)
         else:
             layout = self._last_layout
+        hover_action = None
+        if not startup_model.active:
+            hover_action = panel_hover_action_at(
+                layout,
+                pointer[0],
+                pointer[1],
+                page=getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE),
+                function_subpage=getattr(self, "_functions_subpage", "home"),
+            )
+            if not tooltip_lines_for_action(hover_action):
+                hover_action = None
+        hover_changed = hover_action != getattr(self, "_last_hover_action", None)
         modal_shield = bool(getattr(self, "_modal_shield", True))
         pointer_recenter = bool(getattr(self, "_pointer_recenter", True))
         keep_raised = bool(getattr(self, "_keep_raised", True))
@@ -9475,7 +9750,7 @@ class X11CalibrationOverlay:
         elif raise_due:
             for name in static_order:
                 self._x11.XRaiseWindow(self._display, self._windows[name])
-        if first_show or geometry_changed or model_changed:
+        if first_show or geometry_changed or model_changed or hover_changed:
             self._draw_panel(
                 layout,
                 model,
@@ -9489,6 +9764,8 @@ class X11CalibrationOverlay:
                 runtime_pause_model,
                 build_info_model,
                 startup_model,
+                hover_action,
+                pointer,
             )
         pointer_recentered = False
         game_rectangle = (
@@ -9550,6 +9827,7 @@ class X11CalibrationOverlay:
             first_show
             or geometry_changed
             or model_changed
+            or hover_changed
             or pointer_changed
             or raise_due
             or pointer_recentered
@@ -9587,6 +9865,7 @@ class X11CalibrationOverlay:
             CameraDistanceBoundEditor(),
         ).revision
         self._last_pointer = pointer
+        self._last_hover_action = hover_action
         if raise_due:
             self._last_raise_s = now
         self._visible = True
@@ -9624,6 +9903,7 @@ class X11CalibrationOverlay:
             CameraDistanceBoundEditor(),
         ).revision
         self._last_pointer = None
+        self._last_hover_action = None
         self._last_raise_s = None
         self._pressed_action = None
         self._pressed_window = None
