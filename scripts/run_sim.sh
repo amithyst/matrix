@@ -1512,12 +1512,17 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] MATRIX_GAME_WORLD_STATE_FILE must be absolute" >&2
             exit 1
         fi
+        GAME_WORLD_RESUME_SAFETY_ARGS=()
+        if [[ "$SCENE" != "scene_terrain_moon_dynamic.xml" ]]; then
+            GAME_WORLD_RESUME_SAFETY_ARGS+=(--min-resume-z 0.55)
+        fi
         if ! GAME_WORLD_START_OUTPUT="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 resolve-start \
                 --file "$GAME_WORLD_STATE_FILE" \
                 --world-id "$GAME_WORLD_ID" \
-                --world-revision "$GAME_WORLD_REVISION"
+                --world-revision "$GAME_WORLD_REVISION" \
+                "${GAME_WORLD_RESUME_SAFETY_ARGS[@]}"
         )"; then
             echo "[ERROR] Could not resolve the Matrix world resume pose" >&2
             exit 1

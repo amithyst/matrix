@@ -917,6 +917,7 @@ def _parse_cli_args() -> argparse.Namespace:
     resolve.add_argument("--file", type=Path, required=True)
     resolve.add_argument("--world-id", required=True)
     resolve.add_argument("--world-revision", required=True)
+    resolve.add_argument("--min-resume-z", type=float)
     return parser.parse_args()
 
 
@@ -948,6 +949,13 @@ def main() -> int:
             pose, source = state.startup_pose(default)
             if source == "default":
                 pose = None
+            if pose is not None and args.min_resume_z is not None:
+                min_resume_z = _finite_number(
+                    args.min_resume_z,
+                    label="min_resume_z",
+                )
+                if pose.z < min_resume_z:
+                    pose = None
             if pose is None:
                 print("none")
             else:

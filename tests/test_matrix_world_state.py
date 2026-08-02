@@ -415,6 +415,39 @@ class WorldStateStoreTest(unittest.TestCase):
 
             self.assertEqual(completed.stdout.splitlines(), ["none", "invalid"])
 
+    def test_resolve_start_cli_can_reject_low_resume_height(self) -> None:
+        script = SCRIPTS / "matrix_world_state.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.json"
+            store = MODULE.WorldStateStore(
+                path,
+                world_id="town10",
+                world_revision="revision",
+            )
+            pose = MODULE.WorldPose(1.0, 2.0, 0.1514, 0.25)
+            store.save(store.state.set_resume_pose(pose, now_unix_ns=1))
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "resolve-start",
+                    "--file",
+                    str(path),
+                    "--world-id",
+                    "town10",
+                    "--world-revision",
+                    "revision",
+                    "--min-resume-z",
+                    "0.55",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertEqual(completed.stdout.splitlines(), ["none", "loaded"])
+
     def test_save_does_not_replace_correct_backup_with_other_world_identity(self) -> None:
         for wrong_world_id, wrong_revision in (
             ("warehouse", "revision"),
