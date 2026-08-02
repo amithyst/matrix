@@ -145,7 +145,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
 
-    def test_moon_dynamic_ground_anchors_origin_elastic_band_to_spawn(self) -> None:
+    def test_moon_dynamic_ground_installs_following_elastic_band(self) -> None:
         class FakeForce:
             def __init__(self) -> None:
                 self.values: dict[int, object] = {}
@@ -153,7 +153,20 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             def __setitem__(self, key: int, value: object) -> None:
                 self.values[key] = value
 
-        elastic_band = SimpleNamespace(enable=True, point=None, reset_count=0)
+        def advance(pose, *, scale: float = 1.0):
+            return {
+                "point": list(elastic_band.point),
+                "scale": scale,
+                "pose_xy": [pose[0], pose[1]],
+            }
+
+        elastic_band = SimpleNamespace(
+            enable=True,
+            point=None,
+            release_enabled=True,
+            Advance=advance,
+            reset_count=0,
+        )
 
         def reset_release() -> None:
             elastic_band.reset_count += 1
@@ -170,12 +183,27 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             band_attached_link=3,
             mj_data=data,
         )
+        dynamic_ground = SimpleNamespace(
+            sample_height=lambda x, y: -2.0
+            if abs(x - 23.0) < 1e-9 and abs(y - 13.0) < 1e-9
+            else -1.7
+        )
 
-        self.assertTrue(MODULE._anchor_elastic_band_for_moon_dynamic_ground(environment))
+        self.assertTrue(
+            MODULE._install_moon_following_elastic_band(
+                environment,
+                dynamic_ground,
+            )
+        )
         self.assertTrue(elastic_band.enable)
+        self.assertFalse(elastic_band.release_enabled)
         self.assertEqual(list(elastic_band.point), [23.0, 13.0, -0.459])
         self.assertEqual(elastic_band.reset_count, 1)
         self.assertEqual(data.xfrc_applied.values[3], 0.0)
+        result = elastic_band.Advance([24.0, 14.0, 0.0], scale=0.5)
+        for actual, expected in zip(result["point"], [24.0, 14.0, -0.159]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(result["scale"], 0.5)
 
     def test_moon_dynamic_map_and_model_manifest_are_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -538,6 +566,49 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             received_at_s=11.02,
         )
         moving = gate.apply(core.command(now_s=11.02, dt_s=0.02), core)
+        self.assertEqual(moving.mode, "move")
+        self.assertGreater(moving.speed_mps, 0.0)
+
+    def test_game_control_can_allow_active_following_elastic_band(self) -> None:
+        core = GAME_CONTROL.GameControlCore(
+            GAME_CONTROL.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+        active_band = self.snapshot(
+            low_cmd_fresh=True,
+            elastic_band_enabled=True,
+            elastic_band_scale=1.0,
+        )
+        self.assertFalse(MODULE._GameSonicReadinessGate.snapshot_ready(active_band))
+        self.assertTrue(
+            MODULE._GameSonicReadinessGate.snapshot_ready(
+                active_band,
+                allow_active_elastic_band=True,
+            )
+        )
+        gate = MODULE._GameSonicReadinessGate(
+            active_band,
+            allow_active_elastic_band=True,
+        )
+        gate.begin_frame(active_band, core)
+        core.accept_snapshot(
+            self.game_input_snapshot(1, 12.0, w=False),
+            received_at_s=12.0,
+        )
+        self.assertEqual(
+            gate.apply(core.command(now_s=12.0, dt_s=0.02), core).mode,
+            "idle",
+        )
+        core.accept_snapshot(
+            self.game_input_snapshot(2, 12.02, w=True),
+            received_at_s=12.02,
+        )
+        moving = gate.apply(core.command(now_s=12.02, dt_s=0.02), core)
         self.assertEqual(moving.mode, "move")
         self.assertGreater(moving.speed_mps, 0.0)
 

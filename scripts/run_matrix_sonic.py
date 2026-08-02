@@ -1184,8 +1184,11 @@ def _install_moon_relative_fall_check(
     environment.check_fall = check_relative_fall
 
 
-def _anchor_elastic_band_for_moon_dynamic_ground(environment: Any) -> bool:
-    """Move SONIC's startup band anchor to the current non-origin Moon spawn."""
+def _install_moon_following_elastic_band(
+    environment: Any,
+    dynamic_ground: Any,
+) -> bool:
+    """Make SONIC's startup band follow MoonWorld terrain without XY pullback."""
 
     elastic_band = getattr(environment, "elastic_band", None)
     if elastic_band is None:
@@ -1203,12 +1206,46 @@ def _anchor_elastic_band_for_moon_dynamic_ground(environment: Any) -> bool:
         raise RuntimeError("cannot anchor MoonWorld startup band") from exc
     if len(anchor_xyz) != 3 or not all(math.isfinite(value) for value in anchor_xyz):
         raise RuntimeError("MoonWorld startup band anchor is non-finite")
+    if not callable(getattr(dynamic_ground, "sample_height", None)):
+        raise RuntimeError("MoonWorld startup band requires dynamic ground sampling")
+    try:
+        anchor_ground_z = float(dynamic_ground.sample_height(anchor_xyz[0], anchor_xyz[1]))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("cannot sample MoonWorld startup-band anchor ground") from exc
+    if not math.isfinite(anchor_ground_z):
+        raise RuntimeError("MoonWorld startup-band anchor ground is non-finite")
+    anchor_clearance_m = anchor_xyz[2] - anchor_ground_z
+    if not math.isfinite(anchor_clearance_m):
+        raise RuntimeError("MoonWorld startup-band anchor clearance is non-finite")
+    advance = getattr(elastic_band, "Advance", None)
+    if not callable(advance):
+        raise RuntimeError("MoonWorld startup band has no Advance method")
     try:
         import numpy as np
 
-        elastic_band.point = np.asarray(anchor_xyz, dtype=float)
+        def point_array(values: list[float]):
+            return np.asarray(values, dtype=float)
+
     except ImportError:
-        elastic_band.point = anchor_xyz
+        def point_array(values: list[float]):
+            return values
+
+    elastic_band.point = point_array(anchor_xyz)
+    elastic_band.release_enabled = False
+
+    def moon_following_advance(pose: Any, scale: float = 1.0):
+        try:
+            pos_x, pos_y = float(pose[0]), float(pose[1])
+            ground_z = float(dynamic_ground.sample_height(pos_x, pos_y))
+        except (IndexError, TypeError, ValueError):
+            return advance(pose, scale=scale)
+        if math.isfinite(pos_x) and math.isfinite(pos_y) and math.isfinite(ground_z):
+            elastic_band.point = point_array(
+                [pos_x, pos_y, ground_z + anchor_clearance_m]
+            )
+        return advance(pose, scale=scale)
+
+    elastic_band.Advance = moon_following_advance
     if callable(getattr(elastic_band, "reset_release", None)):
         elastic_band.reset_release()
     try:
@@ -1462,16 +1499,27 @@ class _GameSonicReadinessGate:
 
     ELASTIC_BAND_ZERO_ABS_TOL = 1e-6
 
-    def __init__(self, initial_snapshot: Any) -> None:
+    def __init__(
+        self,
+        initial_snapshot: Any,
+        *,
+        allow_active_elastic_band: bool = False,
+    ) -> None:
         initial_fresh = getattr(initial_snapshot, "low_cmd_fresh", False)
         self._previous_low_cmd_fresh = (
             initial_fresh if type(initial_fresh) is bool else False
         )
+        self._allow_active_elastic_band = bool(allow_active_elastic_band)
         self._ready = False
         self._stop_facing = (1.0, 0.0, 0.0)
 
     @classmethod
-    def snapshot_ready(cls, snapshot: Any) -> bool:
+    def snapshot_ready(
+        cls,
+        snapshot: Any,
+        *,
+        allow_active_elastic_band: bool = False,
+    ) -> bool:
         if type(getattr(snapshot, "low_cmd_fresh", None)) is not bool:
             return False
         elastic_band_enabled = getattr(snapshot, "elastic_band_enabled", True)
@@ -1482,6 +1530,8 @@ class _GameSonicReadinessGate:
             return False
         if not snapshot.low_cmd_fresh or not math.isfinite(elastic_band_scale):
             return False
+        if allow_active_elastic_band and elastic_band_enabled:
+            return True
         if not elastic_band_enabled:
             return True
         return math.isclose(
@@ -1496,7 +1546,10 @@ class _GameSonicReadinessGate:
 
         fresh_value = getattr(snapshot, "low_cmd_fresh", False)
         fresh = fresh_value if type(fresh_value) is bool else False
-        self._ready = self.snapshot_ready(snapshot)
+        self._ready = self.snapshot_ready(
+            snapshot,
+            allow_active_elastic_band=self._allow_active_elastic_band,
+        )
         if not self._ready:
             reason = (
                 "low_cmd_stale"
@@ -4202,6 +4255,7 @@ def main() -> int:
     moon_dynamic_ground = None
     moon_dynamic_ground_disabled_startup_band = False
     moon_dynamic_ground_anchored_startup_band = False
+    moon_dynamic_ground_following_startup_band = False
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -4256,8 +4310,14 @@ def main() -> int:
                     model,
                     expected_sha256=args.moon_dynamic_map_sha256,
                 )
+                moon_dynamic_ground_following_startup_band = (
+                    _install_moon_following_elastic_band(
+                        environment,
+                        moon_dynamic_ground,
+                    )
+                )
                 moon_dynamic_ground_anchored_startup_band = (
-                    _anchor_elastic_band_for_moon_dynamic_ground(environment)
+                    moon_dynamic_ground_following_startup_band
                 )
                 moon_dynamic_ground.update_mocap(data)
                 moon_dynamic_ground.activate_collision_handoff(
@@ -4377,7 +4437,12 @@ def main() -> int:
                     args.game_input_socket,
                     GameControlCore(game_config),
                 )
-                game_readiness = _GameSonicReadinessGate(snapshot)
+                game_readiness = _GameSonicReadinessGate(
+                    snapshot,
+                    allow_active_elastic_band=(
+                        moon_dynamic_ground_following_startup_band
+                    ),
+                )
                 if not args.no_game_input_provider:
                     command_parent, game_command_child_socket = socket.socketpair(
                         socket.AF_UNIX,
@@ -4839,6 +4904,9 @@ def main() -> int:
                     "moon_dynamic_ground_anchored_startup_band": (
                         moon_dynamic_ground_anchored_startup_band
                     ),
+                    "moon_dynamic_ground_following_startup_band": (
+                        moon_dynamic_ground_following_startup_band
+                    ),
                     "startup_band_hold_s": args.startup_band_hold,
                     "startup_band_fade_s": args.startup_band_fade,
                     "startup_band_scale": round(float(snapshot.elastic_band_scale), 5),
@@ -5120,6 +5188,9 @@ def main() -> int:
             ),
             "moon_dynamic_ground_anchored_startup_band": (
                 moon_dynamic_ground_anchored_startup_band
+            ),
+            "moon_dynamic_ground_following_startup_band": (
+                moon_dynamic_ground_following_startup_band
             ),
             "startup_band_fade_s": args.startup_band_fade,
             "startup_band_hold_s": args.startup_band_hold,
