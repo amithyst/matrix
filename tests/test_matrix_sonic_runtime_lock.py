@@ -322,11 +322,11 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             trna,
         )
         self.assertIn(
-            'MATRIX_GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"',
+            'MATRIX_GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:-1}"',
             trna,
         )
         self.assertIn(
-            'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG="${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:--90.0}"',
+            'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG="${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"',
             trna,
         )
         zza = (REPO_ROOT / "config/hosts/zza.env").read_text(encoding="utf-8")
