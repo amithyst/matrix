@@ -1494,6 +1494,46 @@ if $MATRIX_SONIC_ENABLED; then
             "z=${MOON_SPAWN_LINES[3]} yaw=${MOON_SPAWN_LINES[4]} " \
             "${MOON_SPAWN_LINES[6]}"
     }
+    resolve_default_moon_spawn_args() {
+        local -a moon_spawn_override=(
+            "${MATRIX_MOON_SPAWN_X:-}"
+            "${MATRIX_MOON_SPAWN_Y:-}"
+            "${MATRIX_MOON_SPAWN_Z:-}"
+            "${MATRIX_MOON_SPAWN_YAW:-}"
+        )
+        local moon_spawn_override_count=0
+        local value
+        for value in "${moon_spawn_override[@]}"; do
+            [[ -n "$value" ]] && ((moon_spawn_override_count += 1))
+        done
+        if [[ "$moon_spawn_override_count" == "0" ]]; then
+            # Verified playable MoonWorld route from the stable desktop branch.
+            # The historical map default at 23,13 can idle-drift into a slope
+            # after the startup band releases.
+            resolve_moon_spawn_args \
+                "verified_route" \
+                24.43 \
+                110.77 \
+                -5.3145942731628422 \
+                3.141592653589793 \
+                || return 1
+            echo "[INFO] MoonWorld verified playable spawn route selected"
+            return 0
+        fi
+        if [[ "$moon_spawn_override_count" == "4" ]]; then
+            resolve_moon_spawn_args \
+                "explicit" \
+                "${moon_spawn_override[0]}" \
+                "${moon_spawn_override[1]}" \
+                "${moon_spawn_override[2]}" \
+                "${moon_spawn_override[3]}" \
+                || return 1
+            echo "[INFO] MoonWorld explicit spawn aligned by caller"
+            return 0
+        fi
+        echo "[ERROR] MATRIX_MOON_SPAWN_X/Y/Z/YAW are all-or-none" >&2
+        return 2
+    }
     if [[ "$SCENE" == "scene_terrain_t10.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
             --scene-transform town10-open-boundary-v1
@@ -1601,7 +1641,7 @@ if $MATRIX_SONIC_ENABLED; then
         elif [[ "${GAME_WORLD_START_LINES[0]:-}" == "none" \
             && "${#GAME_WORLD_START_LINES[@]}" == "2" ]]; then
             if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
-                resolve_moon_spawn_args "map_default" || exit 1
+                resolve_default_moon_spawn_args || exit 1
             fi
             echo "[INFO] Matrix resume pose: map default " \
                 "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]}"
@@ -1626,7 +1666,7 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
         && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
-        resolve_moon_spawn_args "map_default" || exit 1
+        resolve_default_moon_spawn_args || exit 1
     fi
     SONIC_PHYSICS_DIR="${MATRIX_SONIC_PHYSICS_DIR:-$PROJECT_ROOT/outputs/runtime/matrix_sonic/$CUSTOM_NAME/${SCENE%.xml}}"
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
