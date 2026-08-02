@@ -1030,7 +1030,7 @@ class GameControlCoreTest(unittest.TestCase):
             places=7,
         )
 
-    def test_slow_walk_tolerates_medium_measured_heading_error(self) -> None:
+    def test_keyboard_camera_face_keeps_walking_until_stop_edge(self) -> None:
         config = immediate_config(max_speed_mps=0.3)
         aligned = armed_core(config)
         for sequence, heading_deg in enumerate((5.0, 35.0), start=1):
@@ -1049,13 +1049,40 @@ class GameControlCoreTest(unittest.TestCase):
             self.assertEqual(slow.mode, "move")
             self.assertAlmostEqual(slow.speed_mps, 0.10)
 
-        turning = armed_core(config)
-        turning.synchronize_heading(math.radians(70.0))
-        turning.accept_snapshot(
+        slow_turning = armed_core(config)
+        slow_turning.synchronize_heading(math.radians(70.0))
+        slow_turning.accept_snapshot(
             snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
             received_at_s=10.0,
         )
-        turn_only = turning.command(now_s=10.0, dt_s=0.1)
+        slow = slow_turning.command(now_s=10.0, dt_s=0.1)
+        self.assertEqual(slow.mode, "move")
+        self.assertEqual(slow.locomotion_mode, MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertAlmostEqual(slow.speed_mps, 0.10)
+        self.assertAlmostEqual(
+            math.atan2(slow.movement[1], slow.movement[0]),
+            math.atan2(slow.facing[1], slow.facing[0]),
+        )
+
+        running_turning = armed_core(config)
+        running_turning.synchronize_heading(math.radians(70.0))
+        running_turning.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("shift",)),
+            received_at_s=10.0,
+        )
+        running_turning.command(now_s=10.0, dt_s=0.1)
+        running = running_turning.command(now_s=10.1, dt_s=0.1)
+        self.assertEqual(running.mode, "move")
+        self.assertEqual(running.locomotion_mode, MODULE.SONIC_RUN_MODE)
+        self.assertAlmostEqual(running.speed_mps, 2.50)
+
+        over_stop_edge = armed_core(config)
+        over_stop_edge.synchronize_heading(math.radians(95.0))
+        over_stop_edge.accept_snapshot(
+            snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
+            received_at_s=10.0,
+        )
+        turn_only = over_stop_edge.command(now_s=10.0, dt_s=0.1)
         self.assertEqual(turn_only.mode, "turn")
         self.assertEqual(
             turn_only.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE

@@ -747,6 +747,7 @@ class GameControlCore:
         self._measured_heading_rad: float | None = None
         self._speed_mps = 0.0
         self._gait_active = False
+        self._gait_heading_interlocked = False
         self._native_mode_override: int | None = None
         self._snapshot: InputSnapshot | None = None
         self._last_received_at_s: float | None = None
@@ -813,6 +814,7 @@ class GameControlCore:
         self._command_heading_rad = heading
         self._speed_mps = 0.0
         self._gait_active = False
+        self._gait_heading_interlocked = False
         self._stopped_heading_latched = True
 
     def invalidate_input(self, reason: str = "input_invalidated") -> None:
@@ -824,6 +826,7 @@ class GameControlCore:
         self._last_received_at_s = None
         self._speed_mps = 0.0
         self._gait_active = False
+        self._gait_heading_interlocked = False
         self._requires_neutral_rearm = True
         self._invalid_reason = reason
 
@@ -957,6 +960,7 @@ class GameControlCore:
         # focus loss, and free-camera mode can never leave residual velocity.
         self._speed_mps = 0.0
         self._gait_active = False
+        self._gait_heading_interlocked = False
         # ``facing`` remains an active orientation target even in SONIC IDLE.
         # If the rate-limited command is ahead of the physical body, preserving
         # it here would let the robot keep turning after focus loss, EOF, or a
@@ -1208,21 +1212,19 @@ class GameControlCore:
                 digital_movement
                 and movement_mode == CAMERA_FACE
                 and (
-                    alignment
-                    >= math.cos(self.config.gait_start_heading_error_rad)
-                    or (
-                        self._gait_active
-                        and alignment
-                        >= math.cos(self.config.gait_stop_heading_error_rad)
-                    )
+                    self._measured_heading_rad is not None
+                    or not camera_auto_turn_needs_native_motion
                 )
+                and alignment
+                > math.cos(self.config.gait_stop_heading_error_rad) + 1e-12
             ):
                 # Keyboard targets sit exactly on native gait boundaries.
                 # Cosine attenuation at a harmless residual heading error
                 # would otherwise make WALK/RUN mathematically unreachable.
-                # The heading gate already supplies the intended turn-before-
-                # move behavior on entry.  Once walking, keep the keyboard tier
-                # stable until the wider in-place/reversal edge is crossed.
+                # For WASD, the wider stop edge is the user's "原地转向"
+                # boundary: below it, keep translation live and yaw toward the
+                # camera; at/above it, use the native turn-capable manifold
+                # before resuming movement.
                 target_speed = requested_speed
         elif manual_turn:
             self._stopped_heading_latched = False
@@ -1256,6 +1258,7 @@ class GameControlCore:
             # measured yaw as well instead of finishing a stale turn target.
             self._speed_mps = 0.0
             self._gait_active = False
+            self._gait_heading_interlocked = False
             if not manual_turn:
                 self._latch_stopped_heading()
         else:
@@ -1297,6 +1300,20 @@ class GameControlCore:
         # Native locomotion starts at SLOW_WALK's 0.10 m/s floor. Keep distinct
         # start/stop thresholds so measured-heading noise cannot chatter between
         # IDLE and locomotion. A deliberate direction release is IDLE above.
+        gait_stop_alignment = math.cos(self.config.gait_stop_heading_error_rad)
+        gait_start_alignment = math.cos(self.config.gait_start_heading_error_rad)
+        digital_entry_aligned = (
+            alignment + self.config.speed_epsilon_mps >= gait_start_alignment
+            if self._gait_heading_interlocked
+            else (
+                (
+                    self._measured_heading_rad is not None
+                    or not camera_auto_turn_needs_native_motion
+                )
+                and alignment > gait_stop_alignment + 1e-12
+            )
+        )
+
         if (
             input_magnitude > 1e-12
             and self._gait_active
@@ -1305,12 +1322,14 @@ class GameControlCore:
                 target_speed + self.config.speed_epsilon_mps
                 < self.config.gait_stop_speed_mps
                 or alignment
-                < math.cos(self.config.gait_stop_heading_error_rad)
+                <= gait_stop_alignment + 1e-12
             )
         ):
             # Keep turning in native IDLE until physical alignment can support
             # the minimum gait; never hold a 0.10 m/s floor in a wrong heading.
             self._gait_active = False
+            if alignment <= gait_stop_alignment + 1e-12:
+                self._gait_heading_interlocked = True
         elif (
             input_magnitude > 1e-12
             and not self._gait_active
@@ -1318,16 +1337,24 @@ class GameControlCore:
             >= self.config.gait_start_speed_mps
             and (
                 movement_mode != CAMERA_FACE
-                or alignment + self.config.speed_epsilon_mps
-                >= math.cos(self.config.gait_start_heading_error_rad)
+                or (
+                    digital_movement
+                    and digital_entry_aligned
+                )
+                or (
+                    not digital_movement
+                    and alignment + self.config.speed_epsilon_mps
+                    >= gait_start_alignment
+                )
             )
             and self._speed_mps + self.config.speed_epsilon_mps
             >= (
                 self.config.min_gait_speed_mps
-                * math.cos(self.config.gait_start_heading_error_rad)
+                * gait_start_alignment
             )
         ):
             self._gait_active = True
+            self._gait_heading_interlocked = False
             # The native manifold cannot publish a speed below its gait floor.
             # Snap the hidden ramp back to that exact floor on entry so the
             # first non-zero frame is 0.10 m/s, then subsequent frames obey the
