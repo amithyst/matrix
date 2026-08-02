@@ -226,7 +226,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             )
         )
         self.assertTrue(elastic_band.enable)
-        self.assertTrue(elastic_band.release_enabled)
+        self.assertFalse(elastic_band.release_enabled)
         self.assertEqual(list(elastic_band.point), [23.0, 13.0, -0.459])
         self.assertEqual(elastic_band.reset_count, 1)
         self.assertEqual(data.xfrc_applied.values[3], 0.0)
@@ -234,6 +234,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         for actual, expected in zip(result["point"], [24.0, 14.0, -0.159]):
             self.assertAlmostEqual(actual, expected)
         self.assertEqual(result["scale"], 0.5)
+
+    def test_moon_dynamic_ground_can_allow_startup_band_release_by_env(self) -> None:
+        elastic_band = SimpleNamespace(
+            enable=True,
+            point=None,
+            release_enabled=True,
+            Advance=lambda pose, *, scale=1.0: {"scale": scale},
+            reset_release=lambda: None,
+        )
+        data = SimpleNamespace(
+            xpos={3: (23.0, 13.0, -0.459)},
+            xfrc_applied={},
+        )
+        environment = SimpleNamespace(
+            elastic_band=elastic_band,
+            band_attached_link=3,
+            mj_data=data,
+        )
+        dynamic_ground = SimpleNamespace(sample_height=lambda _x, _y: -2.0)
+
+        with mock.patch.dict(
+            os.environ,
+            {"MATRIX_MOON_DYNAMIC_GROUND_KEEP_STARTUP_BAND": "0"},
+        ):
+            self.assertTrue(
+                MODULE._install_moon_following_elastic_band(
+                    environment,
+                    dynamic_ground,
+                )
+            )
+
+        self.assertTrue(elastic_band.release_enabled)
 
     def test_moon_dynamic_map_and_model_manifest_are_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

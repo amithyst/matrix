@@ -99,6 +99,18 @@ _MAX_FUNCTION_STEPS = 64
 _MAX_FUNCTION_DEPTH = 4
 
 
+def _moon_keep_startup_band_active() -> bool:
+    raw = os.environ.get("MATRIX_MOON_DYNAMIC_GROUND_KEEP_STARTUP_BAND", "1")
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(
+        "MATRIX_MOON_DYNAMIC_GROUND_KEEP_STARTUP_BAND must be a boolean"
+    )
+
+
 def _remote_speed_scale_argument(value: str) -> float:
     try:
         numeric = float(value)
@@ -1246,6 +1258,8 @@ def _install_moon_following_elastic_band(
         return advance(pose, scale=scale)
 
     elastic_band.Advance = moon_following_advance
+    if _moon_keep_startup_band_active():
+        elastic_band.release_enabled = False
     if callable(getattr(elastic_band, "reset_release", None)):
         elastic_band.reset_release()
     try:
@@ -4297,6 +4311,7 @@ def main() -> int:
     moon_dynamic_ground_disabled_startup_band = False
     moon_dynamic_ground_anchored_startup_band = False
     moon_dynamic_ground_following_startup_band = False
+    moon_dynamic_ground_keep_startup_band_active = False
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -4359,6 +4374,10 @@ def main() -> int:
                 )
                 moon_dynamic_ground_anchored_startup_band = (
                     moon_dynamic_ground_following_startup_band
+                )
+                moon_dynamic_ground_keep_startup_band_active = (
+                    moon_dynamic_ground_following_startup_band
+                    and _moon_keep_startup_band_active()
                 )
                 moon_dynamic_ground.update_mocap(data)
                 _install_moon_relative_fall_check(
@@ -4732,6 +4751,7 @@ def main() -> int:
                                 wait_for_startup_band=(
                                     args.startup_band
                                     and moon_dynamic_ground_following_startup_band
+                                    and not moon_dynamic_ground_keep_startup_band_active
                                 ),
                             )
                         ):
@@ -4957,6 +4977,9 @@ def main() -> int:
                     ),
                     "moon_dynamic_ground_following_startup_band": (
                         moon_dynamic_ground_following_startup_band
+                    ),
+                    "moon_dynamic_ground_keep_startup_band_active": (
+                        moon_dynamic_ground_keep_startup_band_active
                     ),
                     "startup_band_hold_s": args.startup_band_hold,
                     "startup_band_fade_s": args.startup_band_fade,
@@ -5242,6 +5265,9 @@ def main() -> int:
             ),
             "moon_dynamic_ground_following_startup_band": (
                 moon_dynamic_ground_following_startup_band
+            ),
+            "moon_dynamic_ground_keep_startup_band_active": (
+                moon_dynamic_ground_keep_startup_band_active
             ),
             "startup_band_fade_s": args.startup_band_fade,
             "startup_band_hold_s": args.startup_band_hold,
