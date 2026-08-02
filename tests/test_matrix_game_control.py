@@ -617,10 +617,11 @@ class GameControlCoreTest(unittest.TestCase):
         command = core.command(now_s=10.0, dt_s=1.0)
         self.assertAlmostEqual(math.atan2(command.facing[1], command.facing[0]), 0.1)
         self.assertIsNone(command.delta_heading_rad)
-        self.assertEqual(command.speed_mps, 0.0)
+        self.assertAlmostEqual(command.speed_mps, 0.10)
         self.assertEqual(command.mode, "turn")
         self.assertEqual(command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE)
-        self.assertEqual(command.movement, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(command.movement[0], math.cos(0.1))
+        self.assertAlmostEqual(command.movement[1], math.sin(0.1))
 
         core.accept_snapshot(
             snapshot(sequence=2, timestamp=10.1, yaw=math.pi / 2.0, pressed=("w",)),
@@ -635,7 +636,9 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(
             still_turning.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
         )
-        self.assertEqual(still_turning.movement, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(still_turning.speed_mps, 0.10)
+        self.assertAlmostEqual(still_turning.movement[0], math.cos(0.2))
+        self.assertAlmostEqual(still_turning.movement[1], math.sin(0.2))
 
         forward = armed_core(config)
         forward.accept_snapshot(snapshot(pressed=("w",)), received_at_s=10.0)
@@ -654,8 +657,9 @@ class GameControlCoreTest(unittest.TestCase):
 
         self.assertEqual(turning.mode, "turn")
         self.assertEqual(turning.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE)
-        self.assertEqual(turning.speed_mps, 0.0)
-        self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(turning.speed_mps, 0.10)
+        self.assertAlmostEqual(turning.movement[0], -1.0)
+        self.assertAlmostEqual(turning.movement[1], 0.0)
         self.assertAlmostEqual(abs(core.heading_rad), math.pi)
         self.assertEqual(core.measured_heading_rad, 0.0)
 
@@ -759,8 +763,11 @@ class GameControlCoreTest(unittest.TestCase):
         turning = core.command(now_s=10.01, dt_s=0.02)
         self.assertEqual(turning.mode, "turn")
         self.assertEqual(turning.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE)
-        self.assertEqual(turning.speed_mps, 0.0)
-        self.assertEqual(turning.movement, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(turning.speed_mps, 0.10)
+        self.assertAlmostEqual(
+            math.atan2(turning.movement[1], turning.movement[0]),
+            math.atan2(turning.facing[1], turning.facing[0]),
+        )
 
     def test_antipodal_camera_noise_keeps_one_turn_direction(self) -> None:
         config = MODULE.ControlConfig(
@@ -1053,8 +1060,11 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(
             turn_only.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
         )
-        self.assertEqual(turn_only.speed_mps, 0.0)
-        self.assertEqual(turn_only.movement, (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(turn_only.speed_mps, 0.10)
+        self.assertAlmostEqual(
+            math.atan2(turn_only.movement[1], turn_only.movement[0]),
+            math.atan2(turn_only.facing[1], turn_only.facing[0]),
+        )
 
     def test_small_effective_stick_input_can_enter_native_gait(self) -> None:
         core = armed_core(

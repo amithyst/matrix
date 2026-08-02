@@ -1085,6 +1085,7 @@ class GameControlCore:
         requested_locomotion_mode = SONIC_IDLE_MODE
         desired_heading = self._command_heading_rad
         movement_heading = self._command_heading_rad
+        camera_auto_turn_needs_native_motion = False
         manual_turn = bool(
             not digital_movement
             and input_magnitude <= 1e-12
@@ -1124,6 +1125,7 @@ class GameControlCore:
                     measured_error is not None
                     and abs(measured_error) > self.config.gait_start_heading_error_rad
                 )
+                camera_auto_turn_needs_native_motion = turn_before_translation
                 if turn_before_translation:
                     # A large camera-face request is the same physical yaw
                     # intent as Pico's right stick while the left stick is
@@ -1177,6 +1179,11 @@ class GameControlCore:
                 command_error = wrap_angle_rad(
                     desired_heading - self._command_heading_rad
                 )
+                if (
+                    measured_error is None
+                    and abs(command_error) > self.config.gait_start_heading_error_rad
+                ):
+                    camera_auto_turn_needs_native_motion = True
                 command_alignment = max(0.0, math.cos(command_error))
                 if self._measured_heading_rad is None:
                     alignment = command_alignment
@@ -1363,25 +1370,30 @@ class GameControlCore:
             or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
         native_override = self._native_mode_override
-        manual_turn_step = False
+        low_speed_turn_step = False
         if turning_to_heading:
             # Pure facing changes must enter a native turn-capable motion
             # manifold.  Updating only HeadingState.delta_heading leaves the
             # packaged MoonWorld body nearly inert because the native planner
             # does not see a locomotion/facing transition to execute.
             locomotion_mode = SONIC_STATIONARY_TURN_MODE
-            if manual_turn and native_override is None:
+            if native_override is None and (
+                manual_turn or camera_auto_turn_needs_native_motion
+            ):
                 # Native SONIC's planner turns reliably when it is given a real
                 # low-speed gait target.  A zero-speed planner update changes
                 # the facing tensor but leaves the MoonWorld body nearly static.
+                # Apply the same trigger to keyboard Q/E and to camera-face
+                # auto-align turns, so pressing W after a large camera yaw does
+                # not stand frozen while waiting for an unexecuted heading.
                 output_speed = self.config.gait_start_speed_mps
                 moving = True
-                manual_turn_step = True
+                low_speed_turn_step = True
         if native_override is not None:
             if native_override == SONIC_IDLE_MODE:
                 output_speed = 0.0
                 moving = False
-                manual_turn_step = False
+                low_speed_turn_step = False
                 locomotion_mode = SONIC_IDLE_MODE
                 movement_direction = (0.0, 0.0, 0.0)
             elif moving or turning_to_heading:
@@ -1409,7 +1421,7 @@ class GameControlCore:
             ),
             desired_facing=desired_direction,
             delta_heading_rad=(
-                self._command_heading_rad if moving and not manual_turn_step else None
+                self._command_heading_rad if moving and not low_speed_turn_step else None
             ),
         )
 
