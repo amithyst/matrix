@@ -558,6 +558,33 @@ class WorldStateStoreTest(unittest.TestCase):
             self.assertEqual([float(value) for value in lines[1:5]], [12.5, -3.0, 0.81, 0.25])
             self.assertEqual(lines[5:], ["last_exit", "loaded"])
 
+    def test_revision_cli_accepts_moon_dynamic_ground_transform(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "matrix_world_state.py",
+                "revision",
+                "--world-id",
+                "g1:moon",
+                "--native-scene",
+                "/tmp/scene_terrain_moon_dynamic.xml",
+                "--canonical-model",
+                "/tmp/g1.xml",
+                "--canonical-meshes",
+                "/tmp/meshes",
+                "--scene-transform",
+                PHYSICS.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+            ],
+        ):
+            args = MODULE._parse_cli_args()
+
+        self.assertEqual(args.command, "revision")
+        self.assertEqual(
+            args.scene_transform,
+            PHYSICS.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+        )
+
     def test_revision_covers_location_independent_physics_source_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
