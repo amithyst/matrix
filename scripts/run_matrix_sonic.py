@@ -1184,6 +1184,25 @@ def _install_moon_relative_fall_check(
     environment.check_fall = check_relative_fall
 
 
+def _disable_elastic_band_for_moon_dynamic_ground(environment: Any) -> bool:
+    """Disable SONIC's origin-anchored startup band for non-origin Moon spawns."""
+
+    elastic_band = getattr(environment, "elastic_band", None)
+    if elastic_band is None:
+        return False
+    if not bool(getattr(elastic_band, "enable", False)):
+        return False
+    elastic_band.enable = False
+    data = getattr(environment, "mj_data", None)
+    attached_link = getattr(environment, "band_attached_link", None)
+    if data is not None and attached_link is not None:
+        try:
+            data.xfrc_applied[int(attached_link)] = 0.0
+        except (IndexError, TypeError, ValueError):
+            pass
+    return True
+
+
 def _root_yaw_rad(qpos) -> float:
     """Return normalized floating-base yaw from MuJoCo's wxyz quaternion."""
 
@@ -4158,6 +4177,7 @@ def main() -> int:
     game_commands = None
     game_command_child_socket = None
     moon_dynamic_ground = None
+    moon_dynamic_ground_disabled_startup_band = False
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -4211,6 +4231,9 @@ def main() -> int:
                     args.moon_dynamic_map,
                     model,
                     expected_sha256=args.moon_dynamic_map_sha256,
+                )
+                moon_dynamic_ground_disabled_startup_band = (
+                    _disable_elastic_band_for_moon_dynamic_ground(environment)
                 )
                 moon_dynamic_ground.update_mocap(data)
                 moon_dynamic_ground.activate_collision_handoff(
@@ -4782,6 +4805,13 @@ def main() -> int:
                     "last_reset_reason": snapshot.last_reset_reason,
                     "max_resets": args.max_resets,
                     "startup_band_enabled": bool(args.startup_band),
+                    "startup_band_effective_enabled": bool(
+                        args.startup_band
+                        and not moon_dynamic_ground_disabled_startup_band
+                    ),
+                    "moon_dynamic_ground_disabled_startup_band": (
+                        moon_dynamic_ground_disabled_startup_band
+                    ),
                     "startup_band_hold_s": args.startup_band_hold,
                     "startup_band_fade_s": args.startup_band_fade,
                     "startup_band_scale": round(float(snapshot.elastic_band_scale), 5),
@@ -5055,6 +5085,12 @@ def main() -> int:
             "sonic_commit": sonic_commit,
             "sonic_step_index": int(snapshot.step_index),
             "startup_band_enabled": bool(args.startup_band),
+            "startup_band_effective_enabled": bool(
+                args.startup_band and not moon_dynamic_ground_disabled_startup_band
+            ),
+            "moon_dynamic_ground_disabled_startup_band": (
+                moon_dynamic_ground_disabled_startup_band
+            ),
             "startup_band_fade_s": args.startup_band_fade,
             "startup_band_hold_s": args.startup_band_hold,
             "startup_band_scale": round(float(snapshot.elastic_band_scale), 5),

@@ -143,6 +143,27 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
 
+    def test_moon_dynamic_ground_disables_origin_elastic_band(self) -> None:
+        class FakeForce:
+            def __init__(self) -> None:
+                self.values: dict[int, object] = {}
+
+            def __setitem__(self, key: int, value: object) -> None:
+                self.values[key] = value
+
+        elastic_band = SimpleNamespace(enable=True)
+        data = SimpleNamespace(xfrc_applied=FakeForce())
+        environment = SimpleNamespace(
+            elastic_band=elastic_band,
+            band_attached_link=3,
+            mj_data=data,
+        )
+
+        self.assertTrue(MODULE._disable_elastic_band_for_moon_dynamic_ground(environment))
+        self.assertFalse(elastic_band.enable)
+        self.assertEqual(data.xfrc_applied.values[3], 0.0)
+        self.assertFalse(MODULE._disable_elastic_band_for_moon_dynamic_ground(environment))
+
     def test_moon_dynamic_map_and_model_manifest_are_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
