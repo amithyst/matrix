@@ -1243,7 +1243,29 @@ def _install_moon_following_elastic_band(
         def point_array(values: list[float]):
             return values
 
+    keep_startup_band_active = _moon_keep_startup_band_active()
     elastic_band.point = point_array(anchor_xyz)
+
+    def preserve_locomotion_axes(force: Any) -> Any:
+        if not keep_startup_band_active:
+            return force
+        try:
+            import numpy as np
+
+            adjusted = np.asarray(force, dtype=float).copy()
+        except (TypeError, ValueError):
+            return force
+        if adjusted.shape != (6,):
+            return force
+        # The MoonWorld band is kept active as a vertical/upright stabilizer.
+        # Leaving SONIC's stock XY damping and yaw torque enabled makes the
+        # robot accept W/Shift-W/Q/E commands while barely translating or
+        # rotating.  Suppress only those locomotion axes; keep vertical support
+        # and roll/pitch stabilization.
+        adjusted[0] = 0.0
+        adjusted[1] = 0.0
+        adjusted[5] = 0.0
+        return adjusted
 
     def moon_following_advance(pose: Any, scale: float = 1.0):
         try:
@@ -1255,10 +1277,10 @@ def _install_moon_following_elastic_band(
             elastic_band.point = point_array(
                 [pos_x, pos_y, ground_z + anchor_clearance_m]
             )
-        return advance(pose, scale=scale)
+        return preserve_locomotion_axes(advance(pose, scale=scale))
 
     elastic_band.Advance = moon_following_advance
-    if _moon_keep_startup_band_active():
+    if keep_startup_band_active:
         elastic_band.release_enabled = False
     if callable(getattr(elastic_band, "reset_release", None)):
         elastic_band.reset_release()

@@ -15,6 +15,8 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "run_matrix_sonic.py"
@@ -266,6 +268,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             )
 
         self.assertTrue(elastic_band.release_enabled)
+
+    def test_moon_keep_active_band_preserves_walk_and_yaw_axes(self) -> None:
+        elastic_band = SimpleNamespace(
+            enable=True,
+            point=None,
+            release_enabled=True,
+            Advance=lambda pose, *, scale=1.0: np.asarray(
+                [10.0, -20.0, 30.0, 40.0, -50.0, 60.0]
+            ) * scale,
+            reset_release=lambda: None,
+        )
+        data = SimpleNamespace(
+            xpos={3: (23.0, 13.0, -0.459)},
+            xfrc_applied={},
+        )
+        environment = SimpleNamespace(
+            elastic_band=elastic_band,
+            band_attached_link=3,
+            mj_data=data,
+        )
+        dynamic_ground = SimpleNamespace(sample_height=lambda _x, _y: -2.0)
+
+        self.assertTrue(
+            MODULE._install_moon_following_elastic_band(
+                environment,
+                dynamic_ground,
+            )
+        )
+
+        force = elastic_band.Advance([24.0, 14.0, 0.0], scale=0.5)
+        self.assertEqual(force.tolist(), [0.0, 0.0, 15.0, 20.0, -25.0, 0.0])
+        self.assertFalse(elastic_band.release_enabled)
 
     def test_moon_dynamic_map_and_model_manifest_are_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
