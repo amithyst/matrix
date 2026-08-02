@@ -14,6 +14,11 @@ import math
 import re
 from typing import Any, Mapping, TypeAlias
 
+from matrix_game_control import (
+    SONIC_NATIVE_MANUAL_MODE_MAX,
+    SONIC_NATIVE_MANUAL_MODE_MIN,
+    validate_native_mode_override,
+)
 from matrix_movement_modes import validate_movement_mode
 from matrix_motion_settings import MOTION_SETTING_PATHS
 from matrix_world_state import (
@@ -297,13 +302,16 @@ class NativeModeSet:
     native_mode: int | None
 
     def __post_init__(self) -> None:
-        mode = self.native_mode
-        if mode is not None and (
-            type(mode) is not int or not 0 <= mode <= 19
-        ):
+        try:
+            mode = validate_native_mode_override(self.native_mode)
+        except ValueError as exc:
             raise CommandParseError(
-                "E_NATIVE_MODE", "native SONIC mode must be auto or an integer in [0, 19]"
-            )
+                "E_NATIVE_MODE",
+                "native SONIC mode must be auto or an integer in "
+                f"[{SONIC_NATIVE_MANUAL_MODE_MIN}, {SONIC_NATIVE_MANUAL_MODE_MAX}]; "
+                "use auto for modes 0-3",
+            ) from exc
+        object.__setattr__(self, "native_mode", mode)
 
 
 @dataclass(frozen=True)

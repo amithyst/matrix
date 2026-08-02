@@ -102,6 +102,21 @@ class McCommandParserTest(unittest.TestCase):
         self.assertIsInstance(function, MODULE.CommandFunctionRun)
         self.assertEqual(len(function.commands), 2)
 
+    def test_native_mode_manual_commands_exclude_auto_gait_family(self) -> None:
+        self.assertEqual(
+            MODULE.parse_mc_command("/sonic mode 4").command,
+            MODULE.NativeModeSet(4),
+        )
+        self.assertEqual(
+            MODULE.parse_mc_command("/sonic mode 19").command,
+            MODULE.NativeModeSet(19),
+        )
+        for mode in range(4):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                MODULE.CommandParseError, "use auto for modes 0-3"
+            ):
+                MODULE.parse_mc_command(f"/sonic mode {mode}")
+
     def test_data_modify_motion_setting_command_is_whitelisted_and_strict(self) -> None:
         command = MODULE.MotionSettingSet(
             MOTION_SETTINGS.GAIT_STOP_HEADING_ERROR_PATH,

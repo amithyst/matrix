@@ -873,6 +873,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             status["native_gait_modes"],
             {"IDLE": 0, "SLOW_WALK": 1, "WALK": 2, "RUN": 3},
         )
+        self.assertEqual(status["native_mode_override_range"], [4, 19])
+        self.assertIn("慢走", status["native_auto_gait_catalog_zh"]["1"])
+        self.assertNotIn("1", status["native_mode_catalog_zh"])
         self.assertIn("蹲姿", status["native_mode_catalog_zh"]["4"])
         self.assertIn("受伤", status["native_mode_catalog_zh"]["19"])
         self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
@@ -1866,27 +1869,26 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[-1]["facing"], [1.0, 0.0, 0.0])
         self.assertEqual(planners[-1]["speed"], -1.0)
 
-        with self.assertRaisesRegex(ValueError, "SLOW_WALK"):
-            client.send_game_command(
-                MODULE.RobotMotionCommand(
-                    sequence=15,
-                    movement=(1.0, 0.0, 0.0),
-                    facing=(1.0, 0.0, 0.0),
-                    speed_mps=0.81,
-                    locomotion_mode=MODULE.SONIC_SLOW_WALK_MODE,
-                    mode="move",
-                    safe_stop=False,
-                    reason=None,
-                )
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=15,
+                movement=(1.0, 0.0, 0.0),
+                facing=(1.0, 0.0, 0.0),
+                speed_mps=2.5,
+                locomotion_mode=MODULE.SONIC_SLOW_WALK_MODE,
+                mode="move",
+                safe_stop=False,
+                reason=None,
             )
+        )
+        self.assertEqual(planners[-1]["mode"], MODULE.SONIC_SLOW_WALK_MODE)
+        self.assertAlmostEqual(planners[-1]["speed"], 0.8)
 
-        for sequence, native_mode, speed, gait_name in (
-            (16, MODULE.SONIC_WALK_MODE, 0.79995, "WALK"),
-            (17, MODULE.SONIC_RUN_MODE, 2.49995, "RUN"),
+        for sequence, native_mode, speed, clamped in (
+            (16, MODULE.SONIC_WALK_MODE, 0.79995, 0.8),
+            (17, MODULE.SONIC_RUN_MODE, 2.49995, 2.5),
         ):
-            with self.subTest(native_mode=native_mode), self.assertRaisesRegex(
-                ValueError, gait_name
-            ):
+            with self.subTest(native_mode=native_mode):
                 client.send_game_command(
                     MODULE.RobotMotionCommand(
                         sequence=sequence,
@@ -1899,6 +1901,23 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                         reason=None,
                     )
                 )
+                self.assertEqual(planners[-1]["mode"], native_mode)
+                self.assertAlmostEqual(planners[-1]["speed"], clamped)
+
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
+                sequence=18,
+                movement=(1.0, 0.0, 0.0),
+                facing=(1.0, 0.0, 0.0),
+                speed_mps=2.5,
+                locomotion_mode=7,
+                mode="move",
+                safe_stop=False,
+                reason=None,
+            )
+        )
+        self.assertEqual(planners[-1]["mode"], 7)
+        self.assertEqual(planners[-1]["speed"], 2.5)
 
         with mock.patch.object(MODULE.time, "sleep") as sleep:
             client.close()

@@ -341,6 +341,7 @@ class OverlayLayoutTest(unittest.TestCase):
         for action, subpage in (
             ("function_preset_0", "presets"),
             ("native_mode_auto", "sonic"),
+            ("native_mode_4", "sonic"),
             ("native_mode_7", "sonic"),
             ("function_file_0", "files"),
             ("function_file_1", "files"),
@@ -357,7 +358,8 @@ class OverlayLayoutTest(unittest.TestCase):
                 ),
                 action,
             )
-        for action in ("native_mode_auto", "native_mode_7"):
+        self.assertNotIn("native_mode_1", layout)
+        for action in ("native_mode_auto", "native_mode_4", "native_mode_7"):
             x, y, width, height = layout[action]
             self.assertEqual(
                 MODULE.panel_action_at(
@@ -380,10 +382,17 @@ class OverlayLayoutTest(unittest.TestCase):
             MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_7"),
             "/sonic mode 7",
         )
+        self.assertIsNone(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_1")
+        )
+        self.assertIn("蹲姿", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[4])
         self.assertIn("俯卧", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[7])
         self.assertIn("受伤", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[19])
         self.assertTrue(
-            any("19 受伤行走" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
+            any("AUTO 自动负责" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
+        )
+        self.assertTrue(
+            any("4 蹲姿" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
         )
 
     def test_hover_hit_test_includes_read_only_value_cells(self) -> None:
@@ -652,9 +661,10 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertIn("AUTO", MODULE.tooltip_lines_for_action("native_mode_auto")[0])
         self.assertIn(
-            "0-19",
+            "4-19",
             MODULE.tooltip_lines_for_action("tab_sonic_modes")[0],
         )
+        self.assertEqual(MODULE.tooltip_lines_for_action("native_mode_1"), ())
         self.assertIn(
             "安全重载",
             MODULE.tooltip_lines_for_action("navigation_destination_0")[0],

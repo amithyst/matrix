@@ -341,6 +341,8 @@ SONIC_WALK_MODE = 2
 SONIC_RUN_MODE = 3
 SONIC_NATIVE_MODE_MIN = 0
 SONIC_NATIVE_MODE_MAX = 19
+SONIC_NATIVE_MANUAL_MODE_MIN = 4
+SONIC_NATIVE_MANUAL_MODE_MAX = SONIC_NATIVE_MODE_MAX
 SONIC_GAIT_NAMES = {
     SONIC_IDLE_MODE: "IDLE",
     SONIC_SLOW_WALK_MODE: "SLOW_WALK",
@@ -467,20 +469,34 @@ PICO_RIGHT_STICK_YAW_GAIN_RAD_S = 1.50
 MAX_MEASURED_FACING_LEAD_RAD = 0.05
 
 
+def validate_native_mode_value(value: object) -> int:
+    if (
+        type(value) is not int
+        or not SONIC_NATIVE_MODE_MIN <= value <= SONIC_NATIVE_MODE_MAX
+    ):
+        raise ValueError("native SONIC mode must be an integer in [0, 19]")
+    return value
+
+
 def validate_native_mode_override(value: object) -> int | None:
     """Validate a manual native SONIC mode override.
 
-    ``None`` means the proven automatic gait selector is active.  Integer modes
-    are intentionally limited to the user-facing 0-19 range requested for the
-    Matrix ESC surface, even though the lower-level native sender can validate a
-    wider SONIC transport range.
+    ``None`` means the proven automatic gait selector is active.  Manual
+    override intentionally starts at mode 4: modes 0-3 are the ordinary
+    idle/slow/walk/run gait family and are owned by AUTO so Shift/Ctrl speed
+    modifiers can keep selecting the matching native gait instead of pinning an
+    incompatible speed range.
     """
 
     if value is None:
         return None
-    if type(value) is not int or not SONIC_NATIVE_MODE_MIN <= value <= SONIC_NATIVE_MODE_MAX:
-        raise ValueError("native SONIC mode override must be auto or an integer in [0, 19]")
-    return value
+    mode = validate_native_mode_value(value)
+    if mode < SONIC_NATIVE_MANUAL_MODE_MIN:
+        raise ValueError(
+            "native SONIC mode override must be auto or an integer in [4, 19]; "
+            "use auto for modes 0-3"
+        )
+    return mode
 
 
 def native_mode_label(value: int | None) -> str:
@@ -492,10 +508,13 @@ def native_mode_label(value: int | None) -> str:
 def native_mode_label_zh(value: int | None) -> str:
     """User-facing Chinese label for the ESC/native-mode surfaces."""
 
-    try:
-        mode = validate_native_mode_override(value)
-    except ValueError:
-        return "未知模式"
+    if value is None:
+        mode = None
+    else:
+        try:
+            mode = validate_native_mode_value(value)
+        except ValueError:
+            return "未知模式"
     if mode in SONIC_NATIVE_MODE_DESCRIPTIONS_ZH:
         return SONIC_NATIVE_MODE_DESCRIPTIONS_ZH[mode][0]
     assert mode is not None
@@ -505,10 +524,13 @@ def native_mode_label_zh(value: int | None) -> str:
 def native_mode_description_zh(value: int | None) -> str:
     """Concise Chinese description without inventing unknown SONIC semantics."""
 
-    try:
-        mode = validate_native_mode_override(value)
-    except ValueError:
-        return "无效 SONIC 模式。"
+    if value is None:
+        mode = None
+    else:
+        try:
+            mode = validate_native_mode_value(value)
+        except ValueError:
+            return "无效 SONIC 模式。"
     if mode in SONIC_NATIVE_MODE_DESCRIPTIONS_ZH:
         return SONIC_NATIVE_MODE_DESCRIPTIONS_ZH[mode][1]
     assert mode is not None

@@ -35,6 +35,8 @@ from matrix_game_control import (
     SONIC_GAIT_NAMES,
     SONIC_GAIT_SPEED_RANGES_MPS,
     SONIC_IDLE_MODE,
+    SONIC_NATIVE_MANUAL_MODE_MAX,
+    SONIC_NATIVE_MANUAL_MODE_MIN,
     SONIC_NATIVE_MODE_MAX,
     SONIC_NATIVE_MODE_MIN,
     SONIC_RUN_MODE,
@@ -1758,13 +1760,31 @@ def _game_control_status_fields(
                 SONIC_RUN_MODE,
             )
         },
-        "native_mode_override": "auto unless changed by /sonic mode or ESC native-mode buttons",
-        "native_mode_override_range": [SONIC_NATIVE_MODE_MIN, SONIC_NATIVE_MODE_MAX],
+        "native_mode_override": (
+            "auto for modes 0-3 unless changed to manual native modes 4-19 "
+            "by /sonic mode or ESC native-mode buttons"
+        ),
+        "native_mode_override_range": [
+            SONIC_NATIVE_MANUAL_MODE_MIN,
+            SONIC_NATIVE_MANUAL_MODE_MAX,
+        ],
         "native_mode_override_auto_label_zh": native_mode_label_zh(None),
         "native_mode_override_auto_description_zh": native_mode_description_zh(None),
+        "native_auto_gait_catalog_zh": {
+            str(mode): native_mode_label_zh(mode)
+            for mode in (
+                SONIC_IDLE_MODE,
+                SONIC_SLOW_WALK_MODE,
+                SONIC_WALK_MODE,
+                SONIC_RUN_MODE,
+            )
+        },
         "native_mode_catalog_zh": {
             str(mode): native_mode_label_zh(mode)
-            for mode in range(SONIC_NATIVE_MODE_MIN, SONIC_NATIVE_MODE_MAX + 1)
+            for mode in range(
+                SONIC_NATIVE_MANUAL_MODE_MIN,
+                SONIC_NATIVE_MANUAL_MODE_MAX + 1,
+            )
         },
         "game_function_directory": (
             str(args.game_function_directory)
@@ -2267,20 +2287,18 @@ class NativePlannerClient:
         else:
             if command.locomotion_mode == SONIC_IDLE_MODE:
                 raise ValueError("moving game command cannot use native IDLE")
+            speed_mps = command.speed_mps
             if command.locomotion_mode in SONIC_GAIT_SPEED_RANGES_MPS:
                 minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[
                     command.locomotion_mode
                 ]
-                if not minimum <= command.speed_mps <= maximum:
-                    gait_name = SONIC_GAIT_NAMES[command.locomotion_mode]
-                    raise ValueError(
-                        f"game command speed is outside native {gait_name} "
-                        f"range {minimum:.1f}-{maximum:.1f} m/s"
-                    )
+                speed_mps = min(max(command.speed_mps, minimum), maximum)
+        if not moving:
+            speed_mps = command.speed_mps
         self.send_direction(
             movement=command.movement,
             facing=command.facing,
-            speed=command.speed_mps,
+            speed=speed_mps,
             locomotion_mode=command.locomotion_mode,
             allow_stationary_locomotion=stationary_turn,
         )

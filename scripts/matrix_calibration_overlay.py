@@ -42,6 +42,8 @@ from matrix_mouse_settings import (
 from matrix_build_info import BuildInfoError, validate_build_info
 from matrix_mc_commands import MAX_COMMAND_CHARS
 from matrix_game_control import (
+    SONIC_NATIVE_MANUAL_MODE_MAX,
+    SONIC_NATIVE_MANUAL_MODE_MIN,
     native_mode_description_zh,
     native_mode_label_zh,
 )
@@ -997,8 +999,10 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         native_cell_height,
     )
     native_grid_top = native_top + native_cell_height + native_gap
-    for index in range(20):
-        row, column = divmod(index, native_columns)
+    for order, index in enumerate(
+        range(SONIC_NATIVE_MANUAL_MODE_MIN, SONIC_NATIVE_MANUAL_MODE_MAX + 1)
+    ):
+        row, column = divmod(order, native_columns)
         result[f"native_mode_{index}"] = (
             console_left + column * (native_cell_width + native_gap),
             native_grid_top + row * (native_cell_height + native_gap),
@@ -1441,7 +1445,7 @@ _PANEL_DIRECTORY_ENTRIES = (
     (
         "tab_sonic_modes",
         "SONIC模式",
-        "切换 SONIC 原生 AUTO/0-19 单档",
+        "切换 SONIC 原生 AUTO/4-19 单档",
         "sonic_modes",
     ),
     (
@@ -1504,18 +1508,21 @@ _FUNCTION_DETAIL_HIT_TARGETS = (
 _FUNCTION_PRESET_HIT_TARGETS = tuple(
     f"function_preset_{index}" for index in range(len(_FUNCTION_PRESETS))
 )
+_NATIVE_MODE_BUTTON_INDICES = tuple(
+    range(SONIC_NATIVE_MANUAL_MODE_MIN, SONIC_NATIVE_MANUAL_MODE_MAX + 1)
+)
 _NATIVE_MODE_HIT_TARGETS = ("native_mode_auto",) + tuple(
-    f"native_mode_{index}" for index in range(20)
+    f"native_mode_{index}" for index in _NATIVE_MODE_BUTTON_INDICES
 )
 _NATIVE_MODE_BUTTON_LABELS_ZH = {
     None: native_mode_label_zh(None),
-    **{index: native_mode_label_zh(index) for index in range(20)},
+    **{index: native_mode_label_zh(index) for index in _NATIVE_MODE_BUTTON_INDICES},
 }
 _NATIVE_MODE_LEGEND_LINES_ZH = (
-    "0 空闲/原地；1 慢走；2 行走；3 跑步；4 蹲姿待机；5 双膝跪姿",
-    "6 单膝跪姿；7 俯卧待机；8 爬行；9 拳击待机；10 拳击行走",
-    "11 左直拳；12 右直拳；13 随机出拳；14 肘部爬行；15 左勾拳",
-    "16 右勾拳；17 向前跳跃；18 隐蔽行走；19 受伤行走",
+    "AUTO 自动负责 0 空闲 / 1 慢走 / 2 行走 / 3 跑步。",
+    "手动单档从 4 开始：4 蹲姿；5 双膝跪；6 单膝跪；7 俯卧",
+    "8 爬行；9 拳击待机；10 拳击行走；11 左直拳；12 右直拳",
+    "13 随机出拳；14 肘部爬行；15 左勾拳；16 右勾拳；17-19 风格动作",
 )
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider", "video_camera_distance_cm_slider")
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
@@ -1750,7 +1757,7 @@ _BASIC_TOOLTIP_LINES = {
     "functions_open_dir": ("打开 .mcfunction 文件目录；一行就是一条命令。",),
     "function_nav_files": ("进入函数文件列表，选择一个 .mcfunction 查看或运行。",),
     "function_nav_presets": ("进入常用恢复/姿态组合命令。",),
-    "function_nav_sonic": ("进入 SONIC 原生模式按钮；AUTO 或 0-19 单档。",),
+    "function_nav_sonic": ("进入 SONIC 原生模式按钮；AUTO 或 4-19 单档。",),
     "function_back": ("返回函数命令的上一级菜单。",),
     "function_run_selected": ("运行当前选中的 .mcfunction 文件。",),
     "navigation_refresh": ("刷新机器人/场景坐标和可用传送点。",),
@@ -1878,6 +1885,8 @@ def tooltip_lines_for_action(action: str | None) -> tuple[str, ...]:
         try:
             index = int(action.rsplit("_", 1)[1])
         except ValueError:
+            return ()
+        if index not in _NATIVE_MODE_BUTTON_INDICES:
             return ()
         return (
             f"SONIC {index}：{native_mode_description_zh(index)}",
@@ -7547,7 +7556,7 @@ class X11CalibrationOverlay:
             fill=self._colours["disabled" if quick_disabled else "button"],
             disabled=quick_disabled,
         )
-        for index in range(20):
+        for index in _NATIVE_MODE_BUTTON_INDICES:
             self._draw_button(
                 layout,
                 f"native_mode_{index}",
@@ -9073,7 +9082,7 @@ class X11CalibrationOverlay:
                 index = int(action.rsplit("_", 1)[1])
             except (IndexError, ValueError):
                 return None
-            if 0 <= index <= 19:
+            if index in _NATIVE_MODE_BUTTON_INDICES:
                 return f"/sonic mode {index}"
         return None
 

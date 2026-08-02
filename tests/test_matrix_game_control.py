@@ -85,6 +85,16 @@ class InputProtocolTest(unittest.TestCase):
                 self.assertIn(str(mode), MODULE.native_mode_label_zh(mode))
                 self.assertGreater(len(MODULE.native_mode_description_zh(mode)), 8)
 
+    def test_manual_native_mode_override_excludes_auto_gait_family(self) -> None:
+        self.assertIsNone(MODULE.validate_native_mode_override(None))
+        self.assertEqual(MODULE.validate_native_mode_override(4), 4)
+        self.assertEqual(MODULE.validate_native_mode_override(19), 19)
+        for mode in range(4):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                ValueError, "use auto for modes 0-3"
+            ):
+                MODULE.validate_native_mode_override(mode)
+
     def test_snapshot_packet_round_trip(self) -> None:
         original = snapshot(pressed=("w", "q"), stick=(0.25, -0.5), yaw=1.25)
         payload = MODULE.encode_input_packet(original)
@@ -314,6 +324,41 @@ class GameControlCoreTest(unittest.TestCase):
         # The slower modifier wins an accidental overlap.
         conflict = command_for(("ctrl", "shift"))
         self.assertEqual((conflict.locomotion_mode, conflict.speed_mps), (1, 0.10))
+
+    def test_manual_native_modes_keep_keyboard_speed_modifiers(self) -> None:
+        core = armed_core(immediate_config(max_speed_mps=0.3))
+        self.assertTrue(core.set_native_mode_override(10))
+        core.accept_snapshot(snapshot(sequence=1, timestamp=10.0), received_at_s=10.0)
+        self.assertEqual(
+            core.command(now_s=10.0, dt_s=0.1).locomotion_mode,
+            MODULE.SONIC_IDLE_MODE,
+        )
+        core.accept_snapshot(
+            snapshot(
+                sequence=2,
+                timestamp=10.1,
+                pressed=("w",),
+                speed_modifiers=("shift",),
+            ),
+            received_at_s=10.1,
+        )
+        core.command(now_s=10.1, dt_s=0.1)
+        fast_boxing = core.command(now_s=10.1, dt_s=0.1)
+        self.assertEqual(fast_boxing.locomotion_mode, 10)
+        self.assertAlmostEqual(fast_boxing.speed_mps, 2.5)
+
+        core.accept_snapshot(
+            snapshot(
+                sequence=3,
+                timestamp=10.2,
+                pressed=("w",),
+                speed_modifiers=("ctrl",),
+            ),
+            received_at_s=10.2,
+        )
+        precise_boxing = core.command(now_s=10.2, dt_s=0.1)
+        self.assertEqual(precise_boxing.locomotion_mode, 10)
+        self.assertAlmostEqual(precise_boxing.speed_mps, 0.1)
 
     def test_modifiers_without_direction_are_native_idle(self) -> None:
         for modifiers in (("ctrl",), ("shift",), ("ctrl", "shift")):

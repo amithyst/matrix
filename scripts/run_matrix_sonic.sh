@@ -302,6 +302,10 @@ seed_matrix_game_functions() {
             cp -- "$source_file" "$target"
         fi
     done < <(find "$source_dir" -type f -name '*.mcfunction' -print0)
+    local retired
+    for retired in sonic/mode_00.mcfunction sonic/mode_01.mcfunction sonic/mode_02.mcfunction sonic/mode_03.mcfunction; do
+        rm -f -- "$MATRIX_GAME_FUNCTION_DIR/$retired"
+    done
 }
 if [[ "$CONTROL_SOURCE" == "game" ]]; then
     seed_matrix_game_functions
