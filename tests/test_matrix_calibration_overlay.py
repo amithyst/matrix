@@ -215,13 +215,26 @@ class OverlayLayoutTest(unittest.TestCase):
             )
         self.assertIsNone(MODULE.panel_action_at(layout, geometry.x + 3, geometry.y + 3))
 
-    def test_functions_page_hit_test_exposes_presets_and_native_modes(self) -> None:
+    def test_functions_page_hit_test_exposes_nested_menu_presets_and_native_modes(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        for action in (
-            "functions_open_dir",
-            "function_preset_0",
-            "native_mode_auto",
-            "native_mode_7",
+        for action in ("function_nav_files", "function_nav_sonic", "functions_open_dir"):
+            x, y, width, height = layout[action]
+            self.assertEqual(
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="functions",
+                ),
+                action,
+            )
+        for action, subpage in (
+            ("function_preset_0", "presets"),
+            ("native_mode_auto", "sonic"),
+            ("native_mode_7", "sonic"),
+            ("function_file_0", "files"),
+            ("function_file_1", "files"),
+            ("function_run_selected", "detail"),
         ):
             x, y, width, height = layout[action]
             self.assertEqual(
@@ -230,6 +243,7 @@ class OverlayLayoutTest(unittest.TestCase):
                     x + width // 2,
                     y + height // 2,
                     page="functions",
+                    function_subpage=subpage,
                 ),
                 action,
             )
@@ -249,6 +263,26 @@ class OverlayLayoutTest(unittest.TestCase):
         self.assertIn("受伤", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[19])
         self.assertTrue(
             any("19 受伤行走" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
+        )
+
+    def test_function_detail_run_uses_selected_mcfunction(self) -> None:
+        overlay = MODULE.X11CalibrationOverlay.__new__(MODULE.X11CalibrationOverlay)
+        overlay._selected_function_name = "pose/right_90"
+        overlay._last_function_model = MODULE.FunctionLibraryModel(
+            directory="/tmp/matrix-functions",
+            available=True,
+            open_available=True,
+            files=("recover_here", "pose/right_90"),
+            open_error=None,
+            open_count=0,
+        )
+        self.assertEqual(
+            overlay._quick_command_for_current_action("function_run_selected"),
+            "/function pose/right_90",
+        )
+        overlay._selected_function_name = "missing"
+        self.assertIsNone(
+            overlay._quick_command_for_current_action("function_run_selected")
         )
 
     def test_keybindings_page_exposes_hot_movement_mode_switches(self) -> None:

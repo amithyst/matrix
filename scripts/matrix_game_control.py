@@ -576,9 +576,17 @@ class ControlConfig:
     movement_mode: str = DEFAULT_MOVEMENT_MODE
     min_gait_speed_mps: float = 0.10
     gait_start_speed_mps: float = 0.10
-    gait_stop_speed_mps: float = 0.08
-    gait_start_heading_error_rad: float = math.radians(15.0)
-    gait_stop_heading_error_rad: float = math.radians(30.0)
+    gait_stop_speed_mps: float = 0.05
+    # Camera-face movement should feel like Pico left-stick + right-stick:
+    # ordinary camera-relative W/A/S/D keeps walking while the body yaws toward
+    # the requested facing.  The native IDLE yaw manifold can stall with a
+    # residual ~35-40 degree error on the packaged runtime, so the translation
+    # gate must not wait for a near-perfect 15 degree alignment.  Keep a large
+    # reversal guard, but release medium turns into locomotion so SONIC can use
+    # its stronger walking-turn manifold instead of leaving the operator
+    # apparently frozen in place.
+    gait_start_heading_error_rad: float = math.radians(45.0)
+    gait_stop_heading_error_rad: float = math.radians(65.0)
     stick_deadzone: float = 0.15
     input_timeout_s: float = 0.15
     max_snapshot_age_s: float = 0.15

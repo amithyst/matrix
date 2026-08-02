@@ -825,8 +825,8 @@ class GameControlCoreTest(unittest.TestCase):
             core.command(now_s=10.0 + (index * 0.02), dt_s=0.02)
             for index in range(5)
         ]
-        self.assertTrue(all(command.speed_mps == 0.0 for command in starting[:4]))
-        self.assertAlmostEqual(starting[4].speed_mps, 0.1)
+        self.assertTrue(all(command.speed_mps == 0.0 for command in starting[:2]))
+        self.assertAlmostEqual(starting[2].speed_mps, 0.1)
         after_entry = core.command(now_s=10.1, dt_s=0.02)
         self.assertAlmostEqual(after_entry.speed_mps - starting[4].speed_mps, 0.024)
 
@@ -857,9 +857,9 @@ class GameControlCoreTest(unittest.TestCase):
         core.synchronize_heading(0.0)
         self.assertEqual(core.command(now_s=10.0, dt_s=0.1).mode, "move")
 
-        # Once active, noise near the 30-degree stop edge stops exactly once;
-        # it cannot restart until alignment crosses the tighter 15-degree edge.
-        stop_error = math.radians(30.0)
+        # Once active, noise near the 65-degree stop edge stops exactly once;
+        # it cannot restart until alignment crosses the tighter 45-degree edge.
+        stop_error = math.radians(65.0)
         active_modes = []
         for sequence, delta in enumerate((-0.002, 0.002, -0.002, 0.002), start=2):
             now = 10.0 + sequence * 0.01
@@ -876,12 +876,12 @@ class GameControlCoreTest(unittest.TestCase):
             active_modes.append(core.command(now_s=now, dt_s=0.02).mode)
         self.assertEqual(active_modes, ["move", "turn", "turn", "turn"])
 
-        # A request outside the 15-degree start edge remains turn-only.
+        # A request outside the 45-degree start edge remains turn-only.
         # Crossing that edge starts once, and drifting just outside it remains
-        # active because the wider 30-degree stop edge has not been crossed.
+        # active because the wider 65-degree stop edge has not been crossed.
         sequence = 6
         now = 10.06
-        core.synchronize_heading(math.radians(16.0))
+        core.synchronize_heading(math.radians(46.0))
         core.accept_snapshot(
             snapshot(
                 sequence=sequence,
@@ -894,7 +894,7 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertEqual(core.command(now_s=now, dt_s=0.02).mode, "turn")
 
         restart_modes = []
-        for sequence, error_deg in enumerate((15.1, 14.9, 15.1), start=7):
+        for sequence, error_deg in enumerate((45.1, 44.9, 45.1), start=7):
             now = 10.0 + sequence * 0.01
             core.synchronize_heading(math.radians(error_deg))
             core.accept_snapshot(
@@ -912,17 +912,24 @@ class GameControlCoreTest(unittest.TestCase):
     def test_slow_walk_tolerates_small_measured_heading_error(self) -> None:
         config = immediate_config(max_speed_mps=0.3)
         aligned = armed_core(config)
-        aligned.synchronize_heading(math.radians(5.0))
-        aligned.accept_snapshot(
-            snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
-            received_at_s=10.0,
-        )
-        slow = aligned.command(now_s=10.0, dt_s=0.1)
-        self.assertEqual(slow.mode, "move")
-        self.assertAlmostEqual(slow.speed_mps, 0.10)
+        for sequence, heading_deg in enumerate((5.0, 35.0), start=1):
+            now = 10.0 + sequence * 0.01
+            aligned.synchronize_heading(math.radians(heading_deg))
+            aligned.accept_snapshot(
+                snapshot(
+                    sequence=sequence,
+                    timestamp=now,
+                    pressed=("w",),
+                    speed_modifiers=("ctrl",),
+                ),
+                received_at_s=now,
+            )
+            slow = aligned.command(now_s=now, dt_s=0.1)
+            self.assertEqual(slow.mode, "move")
+            self.assertAlmostEqual(slow.speed_mps, 0.10)
 
         turning = armed_core(config)
-        turning.synchronize_heading(math.radians(20.0))
+        turning.synchronize_heading(math.radians(70.0))
         turning.accept_snapshot(
             snapshot(pressed=("w",), speed_modifiers=("ctrl",)),
             received_at_s=10.0,

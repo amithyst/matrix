@@ -867,16 +867,54 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     function_gap = 6 if compact else 12
     function_button_height = max(28, min(button_height, 60))
     function_button_width = max(1, (console_width - function_gap) // 2)
-    result["functions_open_dir"] = (
+    result["function_nav_files"] = (
         console_left,
         function_top,
-        console_width,
+        function_button_width,
         function_button_height,
     )
-    function_preset_top = function_top + function_button_height + function_gap
+    result["function_nav_presets"] = (
+        console_left + function_button_width + function_gap,
+        function_top,
+        function_button_width,
+        function_button_height,
+    )
+    result["function_nav_sonic"] = (
+        console_left,
+        function_top + function_button_height + function_gap,
+        function_button_width,
+        function_button_height,
+    )
+    result["functions_open_dir"] = (
+        console_left + function_button_width + function_gap,
+        function_top + function_button_height + function_gap,
+        function_button_width,
+        function_button_height,
+    )
+    result["function_back"] = (
+        console_left,
+        function_top,
+        function_button_width,
+        function_button_height,
+    )
+    result["function_run_selected"] = (
+        console_left + function_button_width + function_gap,
+        function_top,
+        function_button_width,
+        function_button_height,
+    )
+    function_preset_top = function_top + 2 * (function_button_height + function_gap)
     for index in range(4):
         row, column = divmod(index, 2)
         result[f"function_preset_{index}"] = (
+            console_left + column * (function_button_width + function_gap),
+            function_preset_top + row * (function_button_height + function_gap),
+            function_button_width,
+            function_button_height,
+        )
+    for index in range(_MAX_FUNCTION_FILE_BUTTONS):
+        row, column = divmod(index, 2)
+        result[f"function_file_{index}"] = (
             console_left + column * (function_button_width + function_gap),
             function_preset_top + row * (function_button_height + function_gap),
             function_button_width,
@@ -1259,6 +1297,22 @@ _FUNCTION_PRESETS = (
     ("当前位置右转90", "/function pose/right_90"),
     ("TP+姿态示例", "/function tp_pose_example"),
 )
+_MAX_FUNCTION_FILE_BUTTONS = 8
+_FUNCTION_HOME_HIT_TARGETS = (
+    "function_nav_files",
+    "function_nav_presets",
+    "function_nav_sonic",
+    "functions_open_dir",
+)
+_FUNCTION_FILE_HIT_TARGETS = tuple(
+    f"function_file_{index}" for index in range(_MAX_FUNCTION_FILE_BUTTONS)
+)
+_FUNCTION_COMMON_SUBPAGE_HIT_TARGETS = ("function_back",)
+_FUNCTION_DETAIL_HIT_TARGETS = (
+    "function_back",
+    "function_run_selected",
+    "functions_open_dir",
+)
 _FUNCTION_PRESET_HIT_TARGETS = tuple(
     f"function_preset_{index}" for index in range(len(_FUNCTION_PRESETS))
 )
@@ -1304,6 +1358,10 @@ _PANEL_HIT_TARGETS = (
     + _INVENTORY_HIT_TARGETS
     + _NAVIGATION_HIT_TARGETS
     + ("functions_open_dir",)
+    + _FUNCTION_HOME_HIT_TARGETS
+    + _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS
+    + _FUNCTION_DETAIL_HIT_TARGETS
+    + _FUNCTION_FILE_HIT_TARGETS
     + _FUNCTION_PRESET_HIT_TARGETS
     + _NATIVE_MODE_HIT_TARGETS
     + _VIDEO_STEP_ACTIONS
@@ -1325,6 +1383,7 @@ def panel_action_at(
     root_y: int,
     *,
     page: str | None = None,
+    function_subpage: str | None = None,
 ) -> str | None:
     """Hit-test X11 root coordinates, including remote-desktop absolute input."""
 
@@ -1353,12 +1412,29 @@ def panel_action_at(
             "command_input",
         )
     elif page == "functions":
+        subpage = function_subpage or "home"
+        if subpage == "files":
+            function_targets = (
+                _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS
+                + ("functions_open_dir",)
+                + _FUNCTION_FILE_HIT_TARGETS
+            )
+        elif subpage == "detail":
+            function_targets = _FUNCTION_DETAIL_HIT_TARGETS
+        elif subpage == "presets":
+            function_targets = (
+                _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS + _FUNCTION_PRESET_HIT_TARGETS
+            )
+        elif subpage == "sonic":
+            function_targets = (
+                _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS + _NATIVE_MODE_HIT_TARGETS
+            )
+        else:
+            function_targets = _FUNCTION_HOME_HIT_TARGETS
         targets = (
             _PANEL_TABS
             + ("runtime_pause", "quit_game", "apply_return")
-            + ("functions_open_dir",)
-            + _FUNCTION_PRESET_HIT_TARGETS
-            + _NATIVE_MODE_HIT_TARGETS
+            + function_targets
         )
     elif page == "keybindings":
         targets = (
@@ -4317,6 +4393,10 @@ class X11CalibrationOverlay:
         self._keyboard_grabbed = False
         self._deferred_ungrab_keycode: int | None = None
         self._active_page = "loadout"
+        self._functions_subpage = "home"
+        self._selected_function_name: str | None = None
+        self._last_functions_subpage: str | None = None
+        self._last_selected_function_name: str | None = None
         self._create_windows()
 
     def _configure_signatures(self) -> None:
@@ -5495,6 +5575,44 @@ class X11CalibrationOverlay:
         self._polled_left_pressed = bool(mask.value & _BUTTON_1_MASK)
         return (root_x.value, root_y.value)
 
+    def _handle_function_navigation_action(self, action: str | None) -> bool:
+        if getattr(self, "_active_page", "loadout") != "functions":
+            return False
+        if action == "function_nav_files":
+            self._functions_subpage = "files"
+            self._last_functions_subpage = None
+            return True
+        if action == "function_nav_presets":
+            self._functions_subpage = "presets"
+            self._last_functions_subpage = None
+            return True
+        if action == "function_nav_sonic":
+            self._functions_subpage = "sonic"
+            self._last_functions_subpage = None
+            return True
+        if action == "function_back":
+            self._functions_subpage = (
+                "files"
+                if getattr(self, "_functions_subpage", "home") == "detail"
+                else "home"
+            )
+            self._last_functions_subpage = None
+            return True
+        if action is not None and action.startswith("function_file_"):
+            try:
+                index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return True
+            function_model = getattr(self, "_last_function_model", None)
+            files = function_model.files if function_model is not None else ()
+            if 0 <= index < len(files):
+                self._selected_function_name = files[index]
+                self._functions_subpage = "detail"
+                self._last_functions_subpage = None
+                self._last_selected_function_name = None
+            return True
+        return False
+
     def _queue_polled_left_transition(
         self,
         publisher: PointerActionPublisher,
@@ -5542,6 +5660,7 @@ class X11CalibrationOverlay:
             root_x,
             root_y,
             page=getattr(self, "_active_page", "loadout"),
+            function_subpage=getattr(self, "_functions_subpage", "home"),
         )
         self._last_polled_action = action
         if getattr(
@@ -5619,7 +5738,9 @@ class X11CalibrationOverlay:
                 self._active_page = next_page
                 self._last_page = None
             return emitted
-        quick_command = self._quick_command_for_action(action)
+        if self._handle_function_navigation_action(action):
+            return emitted
+        quick_command = self._quick_command_for_current_action(action)
         if quick_command is not None:
             if self._quick_command_allowed():
                 publisher.publish_command_quick_submit(quick_command)
@@ -6815,20 +6936,19 @@ class X11CalibrationOverlay:
         content = self._panel_rectangle(layout, "system_content")
         compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
         quick_disabled = not self._quick_command_allowed()
+        subpage = getattr(self, "_functions_subpage", "home")
+        if subpage not in {"home", "files", "detail", "presets", "sonic"}:
+            subpage = "home"
+        selected_function = getattr(self, "_selected_function_name", None)
+        if selected_function not in function_model.files:
+            selected_function = None
         self._draw_text(
-            "函数命令：.mcfunction 文件每行一条命令，支持局内热编辑",
+            "函数命令：MC 风格层级菜单；.mcfunction 文件每行一条命令",
             x=content[0],
             y=content[1] + (18 if compact else 26),
             colour=self._colours["muted"],
         )
         open_disabled = not function_model.open_available or not function_model.directory
-        self._draw_button(
-            layout,
-            "functions_open_dir",
-            "打开函数目录",
-            fill=self._colours["disabled" if open_disabled else "button"],
-            disabled=open_disabled,
-        )
         path_line = (
             f"目录：{function_model.directory}"
             if function_model.directory
@@ -6838,70 +6958,248 @@ class X11CalibrationOverlay:
             path_line = f"{path_line}  打开失败：{function_model.open_error}"
         elif function_model.open_count:
             path_line = f"{path_line}  已打开 {function_model.open_count} 次"
-        for index, (label, _command) in enumerate(_FUNCTION_PRESETS):
-            self._draw_button(
-                layout,
-                f"function_preset_{index}",
-                label,
-                fill=self._colours["disabled" if quick_disabled else "button"],
-                disabled=quick_disabled,
-            )
-        auto_rect = self._panel_rectangle(layout, "native_mode_auto")
+        info_y = content[1] + (44 if compact else 56)
         self._draw_text(
-            "SONIC 模式：AUTO 自动稳定；0-19 为原生 LocomotionMode，按钮含中文说明",
+            self._clip_console_line(path_line, content[2]),
             x=content[0],
-            y=max(auto_rect[1] - 12, content[1] + 72),
+            y=info_y,
             colour=self._colours["muted"],
         )
-        self._draw_button(
-            layout,
-            "native_mode_auto",
-            _NATIVE_MODE_BUTTON_LABELS_ZH[None],
-            fill=self._colours["disabled" if quick_disabled else "button"],
-            disabled=quick_disabled,
-        )
-        for index in range(20):
+        def draw_command_message() -> None:
+            if command_status.message:
+                self._draw_text(
+                    self._clip_console_line(command_status.message, content[2]),
+                    x=content[0],
+                    y=content[1] + content[3] - (30 if compact else 42),
+                    colour=self._colours[
+                        "error" if command_status.status == "error" else "cyan"
+                    ],
+                )
+
+        if subpage == "home":
+            for action, label in (
+                ("function_nav_files", "函数文件"),
+                ("function_nav_presets", "恢复/姿态函数"),
+                ("function_nav_sonic", "SONIC 原生模式"),
+                ("functions_open_dir", "打开函数目录"),
+            ):
+                self._draw_button(
+                    layout,
+                    action,
+                    label,
+                    fill=self._colours[
+                        "disabled"
+                        if action == "functions_open_dir" and open_disabled
+                        else "button"
+                    ],
+                    disabled=action == "functions_open_dir" and open_disabled,
+                )
+            details = (
+                f"函数文件：{len(function_model.files)} 个；点击“函数文件”进入列表，再点文件进入详情页运行。",
+                "恢复/姿态函数：暂停、TP、姿态控制等组合命令放在 .mcfunction 文件里热编辑。",
+                "SONIC 原生模式：AUTO 或 0-19 单档切换；每个按钮带中文含义。",
+            )
+            base_y = self._panel_rectangle(layout, "function_file_4")[1] + (
+                46 if compact else 64
+            )
+            for offset, line in enumerate(details):
+                self._draw_text(
+                    self._clip_console_line(line, content[2]),
+                    x=content[0],
+                    y=base_y + offset * (18 if compact else 24),
+                    colour=self._colours["muted"],
+                )
+            draw_command_message()
+            return
+
+        if subpage in {"files", "detail", "presets", "sonic"}:
             self._draw_button(
                 layout,
-                f"native_mode_{index}",
-                _NATIVE_MODE_BUTTON_LABELS_ZH.get(index, f"{index} 单档"),
+                "function_back",
+                "返回",
+                fill=self._colours["button"],
+            )
+
+        if subpage == "files":
+            self._draw_button(
+                layout,
+                "functions_open_dir",
+                "打开目录编辑",
+                fill=self._colours["disabled" if open_disabled else "button"],
+                disabled=open_disabled,
+            )
+            files = function_model.files[:_MAX_FUNCTION_FILE_BUTTONS]
+            if not files:
+                self._draw_text(
+                    "未发现 .mcfunction；点击“打开目录编辑”新建文件。",
+                    x=content[0],
+                    y=self._panel_rectangle(layout, "function_file_0")[1] + 18,
+                    colour=self._colours["muted"],
+                )
+            for index in range(_MAX_FUNCTION_FILE_BUTTONS):
+                label = files[index] if index < len(files) else "空"
+                self._draw_button(
+                    layout,
+                    f"function_file_{index}",
+                    label,
+                    fill=self._colours["button" if index < len(files) else "disabled"],
+                    disabled=index >= len(files),
+                )
+            more_count = max(0, len(function_model.files) - _MAX_FUNCTION_FILE_BUTTONS)
+            note = (
+                f"只显示前 {_MAX_FUNCTION_FILE_BUTTONS} 个；还有 {more_count} 个请从目录编辑。"
+                if more_count
+                else "点击文件进入详情页；文件保存后状态会自动刷新。"
+            )
+            self._draw_text(
+                self._clip_console_line(note, content[2]),
+                x=content[0],
+                y=self._panel_rectangle(layout, "function_file_6")[1]
+                + (46 if compact else 64),
+                colour=self._colours["muted"],
+            )
+            draw_command_message()
+            return
+
+        if subpage == "detail":
+            self._draw_button(
+                layout,
+                "function_run_selected",
+                "运行函数",
+                fill=self._colours[
+                    "disabled" if quick_disabled or selected_function is None else "button"
+                ],
+                disabled=quick_disabled or selected_function is None,
+            )
+            self._draw_button(
+                layout,
+                "functions_open_dir",
+                "打开目录编辑此文件",
+                fill=self._colours["disabled" if open_disabled else "button"],
+                disabled=open_disabled,
+            )
+            preview_top = self._panel_rectangle(layout, "function_file_0")[1]
+            if selected_function is None:
+                lines = ("未选择函数文件；返回列表选择一个 .mcfunction。",)
+            else:
+                lines = (
+                    f"文件：{selected_function}.mcfunction",
+                    f"执行：/function {selected_function}",
+                    "内容预览：打开目录后直接编辑文本，一行一条命令。",
+                    *self._function_file_preview_lines(
+                        function_model,
+                        selected_function,
+                        maximum_lines=6 if compact else 8,
+                    ),
+                )
+            for offset, line in enumerate(lines[:10]):
+                self._draw_text(
+                    self._clip_console_line(line, content[2]),
+                    x=content[0],
+                    y=preview_top + offset * (18 if compact else 24),
+                    colour=self._colours[
+                        "white" if offset in {0, 1} and selected_function else "muted"
+                    ],
+                )
+            draw_command_message()
+            return
+
+        if subpage == "presets":
+            for index, (label, _command) in enumerate(_FUNCTION_PRESETS):
+                self._draw_button(
+                    layout,
+                    f"function_preset_{index}",
+                    label,
+                    fill=self._colours["disabled" if quick_disabled else "button"],
+                    disabled=quick_disabled,
+                )
+            key_y = self._panel_rectangle(layout, "function_file_2")[1] + (
+                46 if compact else 64
+            )
+            for offset, (_label, command) in enumerate(_FUNCTION_PRESETS):
+                self._draw_text(
+                    self._clip_console_line(command, content[2]),
+                    x=content[0],
+                    y=key_y + offset * (18 if compact else 24),
+                    colour=self._colours["muted"],
+                )
+            draw_command_message()
+            return
+
+        if subpage == "sonic":
+            auto_rect = self._panel_rectangle(layout, "native_mode_auto")
+            self._draw_text(
+                "SONIC 原生模式：AUTO 合并 0-3；0-19 为单档强制切换",
+                x=content[0],
+                y=max(auto_rect[1] - 12, content[1] + 72),
+                colour=self._colours["muted"],
+            )
+            self._draw_button(
+                layout,
+                "native_mode_auto",
+                _NATIVE_MODE_BUTTON_LABELS_ZH[None],
                 fill=self._colours["disabled" if quick_disabled else "button"],
                 disabled=quick_disabled,
             )
-        key_y = self._panel_rectangle(layout, "native_mode_10")[1] + (
-            46 if compact else 64
-        )
-        files_line = (
-            "函数文件：" + ", ".join(function_model.files[:4])
-            if function_model.files
-            else "函数文件：未发现 .mcfunction；可从目录中新建或编辑"
-        )
-        for offset, line in enumerate(
-            (
-                self._clip_console_line(path_line, content[2]),
-                self._clip_console_line(files_line, content[2]),
-                "AUTO：" + native_mode_description_zh(None),
-                "示例：/function recover_here，/function sonic/mode_07，/function sonic/auto",
-                *_NATIVE_MODE_LEGEND_LINES_ZH,
+            for index in range(20):
+                self._draw_button(
+                    layout,
+                    f"native_mode_{index}",
+                    _NATIVE_MODE_BUTTON_LABELS_ZH.get(index, f"{index} 单档"),
+                    fill=self._colours["disabled" if quick_disabled else "button"],
+                    disabled=quick_disabled,
+                )
+            key_y = self._panel_rectangle(layout, "native_mode_10")[1] + (
+                46 if compact else 64
             )
-        ):
-            self._draw_text(
-                line,
-                x=content[0],
-                y=key_y + offset * (18 if compact else 24),
-                colour=self._colours[
-                    "pending" if quick_disabled and offset == 0 else "muted"
-                ],
-            )
-        if command_status.message:
-            self._draw_text(
-                self._clip_console_line(command_status.message, content[2]),
-                x=content[0],
-                y=content[1] + content[3] - (30 if compact else 42),
-                colour=self._colours[
-                    "error" if command_status.status == "error" else "cyan"
-                ],
-            )
+            for offset, line in enumerate(
+                (
+                    "AUTO：" + native_mode_description_zh(None),
+                    "按钮会提交 /sonic mode auto 或 /sonic mode <0-19>。",
+                    *_NATIVE_MODE_LEGEND_LINES_ZH,
+                )
+            ):
+                self._draw_text(
+                    self._clip_console_line(line, content[2]),
+                    x=content[0],
+                    y=key_y + offset * (18 if compact else 24),
+                    colour=self._colours[
+                        "pending" if quick_disabled and offset == 0 else "muted"
+                    ],
+                )
+            draw_command_message()
+            return
+
+    def _function_file_preview_lines(
+        self,
+        function_model: FunctionLibraryModel,
+        function_name: str,
+        *,
+        maximum_lines: int,
+    ) -> tuple[str, ...]:
+        if not function_model.directory:
+            return ("- 本次运行没有函数目录。",)
+        try:
+            root = Path(function_model.directory).resolve()
+            path = (root / f"{function_name}.mcfunction").resolve()
+            path.relative_to(root)
+        except (OSError, ValueError):
+            return ("- 文件路径不可用。",)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ("- 文件不存在；可能刚被删除。",)
+        except (OSError, UnicodeError) as exc:
+            return (f"- 读取失败：{exc}",)
+        lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lines.append(f"- {line}")
+            if len(lines) >= maximum_lines:
+                break
+        return tuple(lines or ("- 文件暂无可执行命令。",))
 
     def _draw_keybindings_page(
         self,
@@ -8150,6 +8448,25 @@ class X11CalibrationOverlay:
             and not self._video_distance_bound_editing()
         )
 
+    def _selected_function_command(self) -> str | None:
+        name = getattr(self, "_selected_function_name", None)
+        function_model = getattr(self, "_last_function_model", None)
+        files = function_model.files if function_model is not None else ()
+        if (
+            not isinstance(name, str)
+            or name not in files
+            or not name
+            or len(name) > MAX_COMMAND_CHARS - len("/function ")
+            or any(ord(character) < 0x20 or ord(character) > 0x7E for character in name)
+        ):
+            return None
+        return f"/function {name}"
+
+    def _quick_command_for_current_action(self, action: str | None) -> str | None:
+        if action == "function_run_selected":
+            return self._selected_function_command()
+        return self._quick_command_for_action(action)
+
     @staticmethod
     def _quick_command_for_action(action: str | None) -> str | None:
         if action is None:
@@ -8406,6 +8723,7 @@ class X11CalibrationOverlay:
                     button.x_root,
                     button.y_root,
                     page=getattr(self, "_active_page", "loadout"),
+                    function_subpage=getattr(self, "_functions_subpage", "home"),
                 )
                 if layout is not None
                 else None
@@ -8522,7 +8840,9 @@ class X11CalibrationOverlay:
                         self._active_page = next_page
                         self._last_page = None
                     continue
-                quick_command = self._quick_command_for_action(action)
+                if self._handle_function_navigation_action(action):
+                    continue
+                quick_command = self._quick_command_for_current_action(action)
                 if quick_command is not None:
                     if self._quick_command_allowed():
                         publisher.publish_command_quick_submit(quick_command)
@@ -8792,6 +9112,13 @@ class X11CalibrationOverlay:
         navigation_model = celestial_navigation_model(state)
         video_model = video_settings_panel_model(state)
         function_model = function_library_model(state)
+        selected_function = getattr(self, "_selected_function_name", None)
+        if selected_function is not None and selected_function not in function_model.files:
+            self._selected_function_name = None
+            self._last_selected_function_name = None
+            if getattr(self, "_functions_subpage", "home") == "detail":
+                self._functions_subpage = "files"
+                self._last_functions_subpage = None
         build_info_model = build_info_panel_model(state)
         startup_model = startup_loading_model(state)
         command_status = command_console_status(state)
@@ -8816,6 +9143,10 @@ class X11CalibrationOverlay:
             != getattr(self, "_last_rendered_font_size", None)
             or getattr(self, "_active_page", "loadout")
             != getattr(self, "_last_page", None)
+            or getattr(self, "_functions_subpage", "home")
+            != getattr(self, "_last_functions_subpage", None)
+            or getattr(self, "_selected_function_name", None)
+            != getattr(self, "_last_selected_function_name", None)
             or command_status != self._last_command_status
             or self._command_editor.revision != self._last_command_revision
             or getattr(
@@ -8951,6 +9282,12 @@ class X11CalibrationOverlay:
             _DEFAULT_OVERLAY_FONT_SIZE,
         )
         self._last_page = getattr(self, "_active_page", "loadout")
+        self._last_functions_subpage = getattr(self, "_functions_subpage", "home")
+        self._last_selected_function_name = getattr(
+            self,
+            "_selected_function_name",
+            None,
+        )
         self._last_command_status = command_status
         self._last_command_revision = self._command_editor.revision
         self._last_video_distance_bound_revision = getattr(
@@ -8986,6 +9323,8 @@ class X11CalibrationOverlay:
         self._last_build_info_model = None
         self._last_startup_loading_model = startup_loading_model({})
         self._last_page = None
+        self._last_functions_subpage = None
+        self._last_selected_function_name = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision
         self._last_video_distance_bound_revision = getattr(
