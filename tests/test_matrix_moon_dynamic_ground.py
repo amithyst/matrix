@@ -50,6 +50,11 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
         self.assertGreater(float(np.max(filtered) - np.min(filtered)), 0.0)
 
     def test_playable_local_height_delta_validates_positive_finite_values(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertAlmostEqual(
+                MODULE.normalize_playable_local_height_delta(),
+                0.06,
+            )
         self.assertAlmostEqual(
             MODULE.normalize_playable_local_height_delta("0.12"),
             0.12,
