@@ -2349,7 +2349,6 @@ class NativePlannerClient:
                 raise ValueError("delta_heading must be finite")
             self._delta_heading_rad = self._wrap_angle(delta_heading_value)
             movement_values = self._rotate_xy(movement_values, -self._delta_heading_rad)
-            facing_values = self._rotate_xy(facing_values, -self._delta_heading_rad)
         stationary_locomotion = bool(
             allow_stationary_locomotion
             and not moving
