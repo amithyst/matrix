@@ -70,6 +70,8 @@ class McCommandParserTest(unittest.TestCase):
         movement = MODULE.parse_mc_command("/mode camera_strafe").command
         native = MODULE.parse_mc_command("/sonic mode 7").command
         auto = MODULE.parse_mc_command("/sonic mode auto").command
+        world = MODULE.parse_mc_command("/world moon").command
+        scene_alias = MODULE.parse_mc_command("/scene MoonWorld").command
         gait_threshold = MODULE.parse_mc_command(
             (
                 "/data modify entity @s "
@@ -87,6 +89,8 @@ class McCommandParserTest(unittest.TestCase):
         self.assertEqual(movement, MODULE.MovementModeSet("camera_strafe"))
         self.assertEqual(native, MODULE.NativeModeSet(7))
         self.assertEqual(auto, MODULE.NativeModeSet(None))
+        self.assertEqual(world, MODULE.WorldSceneSet("moon"))
+        self.assertEqual(scene_alias, MODULE.WorldSceneSet("moon"))
         self.assertEqual(
             gait_threshold,
             MODULE.MotionSettingSet(
@@ -133,6 +137,25 @@ class McCommandParserTest(unittest.TestCase):
                 MODULE.CommandProtocolError
             ):
                 MODULE.command_from_mapping(payload)
+
+    def test_world_scene_command_is_whitelisted_and_strict(self) -> None:
+        command = MODULE.WorldSceneSet("luna")
+        self.assertEqual(command.destination_id, "moon")
+        self.assertEqual(
+            MODULE.command_from_mapping(MODULE.command_to_mapping(command)),
+            MODULE.WorldSceneSet("moon"),
+        )
+        self.assertEqual(MODULE.world_scene_target("earth")["scene_id"], 2)
+        self.assertEqual(MODULE.world_scene_target("moon")["scene_id"], 15)
+
+        for text in ("/world mars", "/scene 999", "/planet ../../moon"):
+            with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
+                MODULE.parse_mc_command(text)
+
+        with self.assertRaises(MODULE.CommandProtocolError):
+            MODULE.command_from_mapping(
+                {"name": "world_scene_set", "destination_id": "mars"}
+            )
 
     def test_selector_order_is_irrelevant_but_contract_is_strict(self) -> None:
         selector = MODULE.parse_mc_command(
@@ -269,6 +292,23 @@ class McCommandExecutionTest(unittest.TestCase):
 
         self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, 0.5))
         self.assertTrue(effect.restart_required)
+
+    def test_world_scene_command_requests_bounded_internal_reload(self) -> None:
+        command = MODULE.parse_mc_command("/world moon").command
+        effect = MODULE.execute_command(
+            command,
+            state=self.state,
+            current_pose=self.origin,
+            now_unix_ns=2,
+        )
+
+        self.assertTrue(effect.restart_required)
+        self.assertEqual(effect.code, "OK_WORLD_RESTART")
+        self.assertEqual(effect.state.last_exit, self.origin)
+        self.assertEqual(effect.state.resume_source, "teleport_command")
+        self.assertEqual(effect.data["destination_id"], "moon")
+        self.assertEqual(effect.data["target_scene_id"], 15)
+        self.assertEqual(effect.data["target_scene_name"], "MoonWorld")
 
     def test_pose_yaw_and_recover_here_write_resume_pose(self) -> None:
         pose_command = MODULE.parse_mc_command("/pose @s yaw ~90deg").command

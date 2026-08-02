@@ -2387,6 +2387,80 @@ exit 0
             self.assertIn("Validated Matrix world reload", result.stdout)
             self.assertIn("count=1/6", result.stdout)
 
+    def test_outer_launcher_restarts_with_internal_target_scene_arg(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            generations = project / "generations.txt"
+            scene_trace = project / "scene-trace.txt"
+            self.write(
+                project / "scripts/run_sim.sh",
+                """#!/usr/bin/env bash
+set -euo pipefail
+generation=1
+if [[ -f "${GENERATION_FILE:?}" ]]; then
+    generation=$(( $(<"$GENERATION_FILE") + 1 ))
+fi
+printf '%s' "$generation" > "$GENERATION_FILE"
+printf '%s\\n' "${2:-missing}" >> "${SCENE_TRACE_FILE:?}"
+if [[ "$generation" == "1" ]]; then
+    mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
+    printf '%s\\n' '{"internal_restart":{"requested":true,"reason":"game_teleport","target_scene_id":15},"game_world_state":{"has_last_exit":true,"last_error":null},"game_auto_respawn":true,"termination_reason":"game_teleport","termination_signal":null,"failed_child_name":null,"failed_child_exit_code":null}' > "$MATRIX_SONIC_STATUS_FILE"
+    exit 75
+fi
+exit 0
+""",
+                executable=True,
+            )
+            environment = {
+                "GENERATION_FILE": os.fspath(generations),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SCENE_TRACE_FILE": os.fspath(scene_trace),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "2",
+                    "--control-source",
+                    "game",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
+            self.assertEqual(
+                scene_trace.read_text(encoding="utf-8").splitlines(),
+                ["2", "15"],
+            )
+            self.assertIn("Validated Matrix world reload", result.stdout)
+            self.assertIn("target scene 15", result.stdout)
+
     def test_private_request_restarts_whole_runtime_after_clean_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"

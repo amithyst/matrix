@@ -1126,6 +1126,7 @@ RUN_SIM_PID=""
 FORWARDED_SIGNAL_EXIT_CODE=0
 RESTART_REQUEST_VALID=0
 RESTART_EXPECTED_EXIT_CODE=143
+INTERNAL_RESTART_TARGET_SCENE_ID=""
 STOP_REQUESTED=0
 FORCED_STOP=0
 INTERNAL_RESTART_TIMEOUT=0
@@ -1297,6 +1298,29 @@ if reason == "game_fall_respawn" and status.get("game_auto_respawn") is not True
     raise SystemExit(1)
 PY
     then
+        if ! INTERNAL_RESTART_TARGET_SCENE_ID="$(
+            /usr/bin/python3 -I - "$MATRIX_SONIC_STATUS_FILE" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+status = json.loads(path.read_text(encoding="utf-8"))
+internal = status.get("internal_restart")
+if not isinstance(internal, dict):
+    raise SystemExit(1)
+target = internal.get("target_scene_id")
+if target is None:
+    print("")
+elif type(target) is int and target in {2, 15}:
+    print(target)
+else:
+    raise SystemExit(1)
+PY
+        )"; then
+            echo "[ERROR] Refusing Matrix world reload with invalid target scene" >&2
+            INTERNAL_RESTART_TARGET_SCENE_ID=""
+        else
         INTERNAL_RESTART_NOW="$(date +%s)"
         INTERNAL_RESTART_WINDOW="${MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH:-$INTERNAL_RESTART_NOW}"
         INTERNAL_RESTART_COUNT="${MATRIX_GAME_INTERNAL_RESTART_COUNT:-0}"
@@ -1320,6 +1344,7 @@ PY
                 echo "[ERROR] Matrix world reload rate limit exceeded; " \
                     "leaving the runtime stopped" >&2
             fi
+        fi
         fi
     else
         echo "[ERROR] Refusing unverified Matrix world reload request" >&2
@@ -1394,12 +1419,32 @@ if [[ "$FORWARDED_SIGNAL_EXIT_CODE" == "0" \
             exit_code="$FORWARDED_SIGNAL_EXIT_CODE"
             echo "[INFO] External stop cancelled the pending Matrix restart" >&2
         else
+            RESTART_ARGS=("${ORIGINAL_ARGS[@]}")
+            if [[ -n "$INTERNAL_RESTART_TARGET_SCENE_ID" ]]; then
+                RESTART_ARGS=()
+                RESTART_SCENE_REPLACED=0
+                for ((index = 0; index < ${#ORIGINAL_ARGS[@]}; index++)); do
+                    if [[ "${ORIGINAL_ARGS[$index]}" == "--scene" ]]; then
+                        RESTART_ARGS+=("--scene" "$INTERNAL_RESTART_TARGET_SCENE_ID")
+                        if ((index + 1 < ${#ORIGINAL_ARGS[@]})); then
+                            index=$((index + 1))
+                        fi
+                        RESTART_SCENE_REPLACED=1
+                    else
+                        RESTART_ARGS+=("${ORIGINAL_ARGS[$index]}")
+                    fi
+                done
+                if [[ "$RESTART_SCENE_REPLACED" == "0" ]]; then
+                    RESTART_ARGS+=("--scene" "$INTERNAL_RESTART_TARGET_SCENE_ID")
+                fi
+                echo "[INFO] Matrix world reload target scene ${INTERNAL_RESTART_TARGET_SCENE_ID}"
+            fi
             exec /usr/bin/env -i \
                 "${ORIGINAL_ENVIRONMENT[@]}" \
                 MATRIX_SONIC_RESTART_LOCK_FD=9 \
                 MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH="${INTERNAL_RESTART_WINDOW:-0}" \
                 MATRIX_GAME_INTERNAL_RESTART_COUNT="${INTERNAL_RESTART_COUNT:-0}" \
-                "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${ORIGINAL_ARGS[@]}"
+                "$PROJECT_ROOT/scripts/run_matrix_sonic.sh" "${RESTART_ARGS[@]}"
             echo "[ERROR] Failed to exec restarted Matrix launcher" >&2
             exit 1
         fi

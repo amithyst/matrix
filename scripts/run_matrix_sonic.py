@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, Mapping, TypedDict
 from urllib.parse import urlsplit
 import uuid
 
@@ -2435,6 +2435,7 @@ class GameCommandRuntime:
         self.rejected_commands = 0
         self.response_errors = 0
         self.restart_requested = False
+        self.restart_target: dict[str, object] | None = None
         self.last_response: dict[str, object] | None = None
 
     def _send(self, response: GameCommandResponse) -> None:
@@ -2773,6 +2774,7 @@ class GameCommandRuntime:
             next_state = effect.state
             if effect.state.last_exit is not None:
                 working_pose = effect.state.last_exit
+            self._record_restart_target(effect.data)
             restart_required = restart_required or effect.restart_required
             steps.append(
                 {
@@ -2783,6 +2785,29 @@ class GameCommandRuntime:
                 }
             )
         return next_state, working_pose, restart_required, steps
+
+    @staticmethod
+    def _restart_target_from_data(data: Mapping[str, object]) -> dict[str, object] | None:
+        scene_id = data.get("target_scene_id")
+        if type(scene_id) is not int or scene_id not in {2, 15}:
+            return None
+        target: dict[str, object] = {"scene_id": scene_id}
+        for field in (
+            "destination_id",
+            "target_scene_name",
+            "target_scene_xml",
+            "target_map_name",
+            "target_body_id",
+        ):
+            value = data.get(field)
+            if isinstance(value, str) and 1 <= len(value) <= 160:
+                target[field] = value
+        return target
+
+    def _record_restart_target(self, data: Mapping[str, object]) -> None:
+        target = self._restart_target_from_data(data)
+        if target is not None:
+            self.restart_target = target
 
     def _execute_function_call(
         self,
@@ -3173,6 +3198,7 @@ class GameCommandRuntime:
                 continue
             self.world.state = effect.state
             self.world.last_error = None
+            self._record_restart_target(effect.data)
             self.commands_executed += 1
             self._send(
                 self._response(
@@ -3215,6 +3241,7 @@ class GameCommandRuntime:
             "motion_settings": self._motion_settings_telemetry(),
             "function_library": self._function_library_telemetry(),
             "world_available": self.world is not None,
+            "restart_target": self.restart_target,
             "last_response": self.last_response,
         }
 
@@ -4850,10 +4877,21 @@ def main() -> int:
             and not unstable
             and not world_checkpoint_failed
         )
-        final_status["internal_restart"] = {
+        internal_restart_status: dict[str, object] = {
             "requested": internal_restart_requested,
             "reason": termination_reason if internal_restart_requested else None,
         }
+        if (
+            internal_restart_requested
+            and game_commands is not None
+            and game_commands.restart_target is not None
+        ):
+            internal_restart_status.update(game_commands.restart_target)
+            if "scene_id" in game_commands.restart_target:
+                internal_restart_status["target_scene_id"] = (
+                    game_commands.restart_target["scene_id"]
+                )
+        final_status["internal_restart"] = internal_restart_status
         final_status["game_auto_respawn"] = bool(args.game_auto_respawn)
         if game_world is not None:
             final_status["game_world_state"] = game_world.telemetry()

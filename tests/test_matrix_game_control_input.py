@@ -20,6 +20,7 @@ if os.fspath(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, os.fspath(SCRIPTS))
 CORE = importlib.import_module("matrix_game_control")
 MC_COMMANDS = importlib.import_module("matrix_mc_commands")
+OVERLAY_MODEL = importlib.import_module("matrix_calibration_overlay")
 RESTART = importlib.import_module("matrix_restart_request")
 SCRIPT_PATH = SCRIPTS / "matrix_game_control_input.py"
 SPEC = importlib.util.spec_from_file_location("matrix_game_control_input", SCRIPT_PATH)
@@ -119,6 +120,13 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "kind": "action",
                     "action": "motion_camera_heading_snap_error_up",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 6,
+                    "kind": "action",
+                    "action": "navigation_refresh",
+                },
             )
             try:
                 for packet in packets:
@@ -139,6 +147,7 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                             kind="action",
                             action="motion_camera_heading_snap_error_up",
                         ),
+                        MODULE.OverlayIntent(kind="action", action="navigation_refresh"),
                     ),
                 )
                 self.assertEqual(supervisor.drain_intents(), ())
@@ -427,6 +436,44 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 sender.close()
                 receiver.close()
                 supervisor._action_socket = None
+
+
+class CelestialNavigationMappingTest(unittest.TestCase):
+    @staticmethod
+    def touch(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+
+    def test_mapping_exposes_ready_moon_destination_for_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for scene_xml in ("scene_terrain_t10.xml", "scene_terrain_moon_dynamic.xml"):
+                self.touch(root / "src/robot_mujoco/zsibot_robots/xgb" / scene_xml)
+                self.touch(
+                    root
+                    / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb"
+                    / scene_xml
+                )
+            self.touch(root / "dynamicmaps/moonworld.bin")
+
+            raw = MODULE.celestial_navigation_mapping(
+                {"scene_id": 2},
+                project_root=root,
+            )
+            model = OVERLAY_MODEL.celestial_navigation_model(
+                {"celestial_navigation": raw}
+            )
+
+            self.assertTrue(model.available)
+            self.assertEqual(model.current_body_id, "earth")
+            moon = next(
+                destination
+                for destination in model.destinations
+                if destination.destination_id == "moon"
+            )
+            self.assertTrue(model.destination_enabled("moon"))
+            self.assertEqual(moon.body_name, "月球")
+            self.assertEqual(moon.local_position_m, (-94.7, -65.6, 0.8))
 
 
 @unittest.skipUnless(

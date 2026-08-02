@@ -1847,7 +1847,7 @@ def tooltip_lines_for_action(action: str | None) -> tuple[str, ...]:
     if action.startswith("creative_item_"):
         return ("创造物品：点击后在机器人前方生成调试物体。",)
     if action.startswith("navigation_destination_"):
-        return ("传送点：点击后传送到对应目标位置。",)
+        return ("星体导航：点击后安全重载到对应星体/地图；不是无缝切图。",)
     if action.startswith("function_file_"):
         return ("函数文件：点击进入详情页；文件内容可在目录中热编辑。",)
     if action.startswith("function_preset_"):
@@ -4578,7 +4578,7 @@ class PointerActionPublisher:
         self._publish("creative_spawn", {"item_id": item_id})
 
     def publish_navigation_refresh(self) -> None:
-        self._publish("navigation_refresh", {})
+        self._publish("action", {"action": "navigation_refresh"})
 
     def publish_navigation_select(self, destination_id: str) -> None:
         normalized = _celestial_identifier(destination_id, maximum=64)
@@ -9469,8 +9469,8 @@ class X11CalibrationOverlay:
                             and self._last_command_status.status
                             not in {"pending", "restarting", "unavailable"}
                         ):
-                            publisher.publish_navigation_select(
-                                destination.destination_id
+                            publisher.publish_command_quick_submit(
+                                f"/world {destination.destination_id}"
                             )
                             emitted += 1
                 elif action.startswith("recovery_policy_"):

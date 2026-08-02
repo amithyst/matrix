@@ -37,7 +37,7 @@ import tempfile
 import threading
 import time
 import traceback
-from typing import Any, Callable, Iterator, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from matrix_build_info import (
     BuildInfoError,
@@ -109,6 +109,7 @@ from matrix_mc_commands import (
     MovementModeSet,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
+    WORLD_SCENE_TARGETS,
     decode_command_response,
     encode_command_request,
     parse_mc_command,
@@ -3946,6 +3947,210 @@ def function_library_mapping(
     }
 
 
+_CELESTIAL_WEATHER_STATE = {
+    "cloudiness": 0.0,
+    "precipitation": 0.0,
+    "precipitation_deposits": 0.0,
+    "wind_intensity": 0.0,
+    "sun_azimuth_angle": 45.0,
+    "sun_altitude_angle": 45.0,
+    "fog_density": 0.0,
+    "fog_distance": 100_000.0,
+    "fog_falloff": 0.0,
+    "wetness": 0.0,
+    "scattering_intensity": 1.0,
+    "mie_scattering_scale": 1.0,
+    "rayleigh_scattering_scale": 1.0,
+    "dust_storm": 0.0,
+}
+
+
+def _celestial_project_root(project_root: Path | None) -> Path:
+    if project_root is not None:
+        return project_root
+    return Path(os.environ.get("MATRIX_PROJECT_ROOT", Path(__file__).resolve().parents[1]))
+
+
+def _celestial_scene_assets_available(
+    project_root: Path,
+    target: Mapping[str, object],
+) -> bool:
+    scene_xml = target.get("scene_xml")
+    destination_id = target.get("destination_id")
+    if not isinstance(scene_xml, str) or not isinstance(destination_id, str):
+        return False
+    required = [
+        project_root / "src/robot_mujoco/zsibot_robots/xgb" / scene_xml,
+        project_root
+        / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb"
+        / scene_xml,
+    ]
+    if destination_id == "moon":
+        required.append(project_root / "dynamicmaps/moonworld.bin")
+    return all(path.is_file() for path in required)
+
+
+def _celestial_target_vector(
+    target: Mapping[str, object],
+    field: str,
+) -> list[float]:
+    value = target[field]
+    assert isinstance(value, list)
+    return [float(component) for component in value]
+
+
+def celestial_navigation_mapping(
+    build_info: Mapping[str, object],
+    *,
+    project_root: Path | None = None,
+) -> dict[str, object]:
+    """Publish the safe scene-reload destinations understood by the ESC overlay."""
+
+    root = _celestial_project_root(project_root)
+    raw_scene_id = build_info.get("scene_id")
+    current_destination = "moon" if raw_scene_id == 15 else "town10"
+    ready: dict[str, bool] = {}
+    for destination_id, target in WORLD_SCENE_TARGETS.items():
+        ready[destination_id] = _celestial_scene_assets_available(root, target)
+    ready[current_destination] = True
+
+    moon_ready = ready.get("moon", False)
+    town_ready = ready.get("town10", False)
+    current_body_id = (
+        WORLD_SCENE_TARGETS[current_destination]["body_id"]
+        if current_destination in WORLD_SCENE_TARGETS
+        else "earth"
+    )
+    assert isinstance(current_body_id, str)
+    current_atmosphere = (
+        WORLD_SCENE_TARGETS[current_destination]["atmosphere"]
+        if current_destination in WORLD_SCENE_TARGETS
+        else "terrestrial"
+    )
+    assert isinstance(current_atmosphere, str)
+    destinations: list[dict[str, object]] = []
+    for destination_id in ("town10", "moon"):
+        target = WORLD_SCENE_TARGETS[destination_id]
+        is_ready = ready.get(destination_id, False)
+        destinations.append(
+            {
+                "id": destination_id,
+                "body_id": target["body_id"],
+                "body_name": target["body_name"],
+                "display_name": target["display_name"],
+                "teleport_tag": target["teleport_tag"],
+                "runtime_status": "active" if is_ready else "planned",
+                "status": "ready" if is_ready else "world_unavailable",
+                "enabled": is_ready,
+                "surface_coordinates_deg_m": _celestial_target_vector(
+                    target, "surface_coordinates_deg_m"
+                ),
+                "surface_heading_deg": float(target["surface_heading_deg"]),
+                "local_position_m": (
+                    _celestial_target_vector(target, "local_position_m")
+                    if is_ready
+                    else None
+                ),
+                "site_universe_position_m": _celestial_target_vector(
+                    target, "site_universe_position_m"
+                ),
+                "universe_position_m": (
+                    _celestial_target_vector(target, "universe_position_m")
+                    if is_ready
+                    else None
+                ),
+                "gravity_m_s2": float(target["gravity_m_s2"]),
+                "atmosphere": target["atmosphere"],
+            }
+        )
+
+    return {
+        "version": 2,
+        "available": True,
+        "status": "ready",
+        "universe_id": "sol_2080",
+        "display_name": "SOL 星体导航",
+        "reference_epoch_utc": "2080-01-01T00:00:00Z",
+        "time_scale": "TAI",
+        "frame": "matrix_mj_world",
+        "ephemeris": {
+            "provider": "static-sol-v1",
+            "accuracy_class": "static-demo",
+            "upgrade_target": "spice-v2",
+        },
+        "simulation_time": {
+            "elapsed_tai_ns": 0,
+            "scenario_tai_ns": 0,
+            "scenario_utc": "2080-01-01T00:00:00Z",
+            "rate_numerator": 1,
+            "rate_denominator": 1,
+            "utc_assumption": "static_demo",
+        },
+        "origin_rebasing": True,
+        "simulation_local_bound_m": 100_000.0,
+        "current_body_id": current_body_id,
+        "bodies": [
+            {
+                "id": "sun",
+                "display_name": "太阳",
+                "naif_id": 10,
+                "runtime_status": "reference",
+                "center_inertial_m": [0.0, 0.0, 0.0],
+                "solar_distance_m": 0.0,
+            },
+            {
+                "id": "earth",
+                "display_name": "地球",
+                "naif_id": 399,
+                "runtime_status": "active" if town_ready else "planned",
+                "center_inertial_m": [149_597_870_700.0, 0.0, 0.0],
+                "solar_distance_m": 149_597_870_700.0,
+            },
+            {
+                "id": "moon",
+                "display_name": "月球",
+                "naif_id": 301,
+                "runtime_status": "active" if moon_ready else "planned",
+                "center_inertial_m": [149_982_270_700.0, 0.0, 0.0],
+                "solar_distance_m": 149_982_270_700.0,
+            },
+        ],
+        "lighting": {
+            "body_id": current_body_id,
+            "atmosphere": current_atmosphere,
+            "sun_direction_local": [0.70710678, 0.0, -0.70710678],
+            "directional_light_direction_local": [-0.70710678, -0.0, 0.70710678],
+            "sun_altitude_deg": 45.0,
+            "sun_azimuth_deg": 45.0,
+            "solar_distance_m": (
+                149_982_270_700.0 if current_body_id == "moon" else 149_597_870_700.0
+            ),
+            "solar_irradiance_w_m2": 1361.0,
+            "sun_angular_radius_deg": 0.2666,
+            "eclipse_fraction": 0.0,
+            "eclipse_occluder_id": None,
+            "starfield_visibility": 1.0 if current_body_id == "moon" else 0.15,
+            "visual_profile": {
+                "schema": "matrix-celestial-visual-profile/v1",
+                "id": f"{current_body_id}-static-v1",
+                "sha256": "0" * 64,
+                "display_name": (
+                    "Moon static visual" if current_body_id == "moon" else "Earth static visual"
+                ),
+                "body_id": current_body_id,
+                "atmosphere": current_atmosphere,
+                "renderer": "carla-weather-v1",
+                "weather_parameters": dict(_CELESTIAL_WEATHER_STATE),
+            },
+            "render_authority": "state-only",
+            "render_status": "not-applied",
+            "render_error": None,
+            "visible_camera_verified": False,
+        },
+        "destinations": destinations,
+    }
+
+
 def open_function_directory(path: Path | None) -> tuple[bool, str | None]:
     if path is None:
         return False, "function directory is not configured"
@@ -4404,6 +4609,7 @@ class CalibrationOverlaySupervisor:
             "speed_up",
             "apply_return",
             "functions_open_dir",
+            "navigation_refresh",
         }
         | _MOVEMENT_MODE_ACTIONS
         | set(_MOTION_PANEL_ACTIONS)
@@ -5290,6 +5496,7 @@ def main() -> int:
                         "command_console": game_command_client.mapping(),
                         "function_library": live_function_library_mapping(),
                         "build_info": build_info,
+                        "celestial_navigation": celestial_navigation_mapping(build_info),
                         "strategy_loadout": locked_sonic_strategy_loadout(),
                         "movement_mode": current_movement_mode,
                         "mirror_sensitivity": sensitivity_telemetry,
@@ -5760,6 +5967,7 @@ def main() -> int:
                                 "command_console": game_command_client.mapping(),
                                 "function_library": live_function_library_mapping(),
                                 "build_info": build_info,
+                                "celestial_navigation": celestial_navigation_mapping(build_info),
                                 "strategy_loadout": locked_sonic_strategy_loadout(),
                                 "movement_mode": current_movement_mode,
                                 "mirror_sensitivity": sensitivity_telemetry,
@@ -5906,6 +6114,7 @@ def main() -> int:
                 "command_console": game_command_client.mapping(),
                 "function_library": live_function_library_mapping(),
                 "build_info": build_info,
+                "celestial_navigation": celestial_navigation_mapping(build_info),
                 "strategy_loadout": locked_sonic_strategy_loadout(),
                 "gamepad_camera": {
                     "driver": "carla-spectator"

@@ -559,6 +559,10 @@ class OverlayStateTest(unittest.TestCase):
             MODULE.tooltip_lines_for_action("movement_mode_camera_face")[0],
         )
         self.assertIn("AUTO", MODULE.tooltip_lines_for_action("native_mode_auto")[0])
+        self.assertIn(
+            "安全重载",
+            MODULE.tooltip_lines_for_action("navigation_destination_0")[0],
+        )
         self.assertEqual(MODULE.tooltip_lines_for_action("unknown_action"), ())
 
     def test_settings_panel_distinguishes_current_next_and_pending(self) -> None:
@@ -902,17 +906,26 @@ class PointerActionPublisherTest(unittest.TestCase):
             publisher.publish("profile_remote")
             publisher.publish("speed_down")
             publisher.publish("movement_mode_body_relative")
+            publisher.publish_navigation_refresh()
             first = json.loads(receiver.recv(1024).decode("ascii"))
             second = json.loads(receiver.recv(1024).decode("ascii"))
             third = json.loads(receiver.recv(1024).decode("ascii"))
+            fourth = json.loads(receiver.recv(1024).decode("ascii"))
             self.assertEqual(first["session"], "known-session")
             self.assertEqual(
-                (first["sequence"], second["sequence"], third["sequence"]),
-                (1, 2, 3),
+                (
+                    first["sequence"],
+                    second["sequence"],
+                    third["sequence"],
+                    fourth["sequence"],
+                ),
+                (1, 2, 3, 4),
             )
             self.assertEqual(first["kind"], "action")
             self.assertEqual(second["action"], "speed_down")
             self.assertEqual(third["action"], "movement_mode_body_relative")
+            self.assertEqual(fourth["kind"], "action")
+            self.assertEqual(fourth["action"], "navigation_refresh")
             with self.assertRaisesRegex(ValueError, "unsupported"):
                 publisher.publish("restart_directly")
         finally:

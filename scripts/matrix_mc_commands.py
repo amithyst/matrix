@@ -47,6 +47,9 @@ _MODE_RE = re.compile(r"/?mode\s+(?P<mode>[A-Za-z0-9_+-]+)\s*\Z")
 _SONIC_MODE_RE = re.compile(
     r"/?(?:sonic|native)\s+mode\s+(?P<mode>auto|[0-9]{1,2})\s*\Z"
 )
+_WORLD_SCENE_RE = re.compile(
+    r"/?(?:world|scene|planet)\s+(?P<destination>[A-Za-z0-9_.:-]+)\s*\Z"
+)
 _DATA_MODIFY_RE = re.compile(
     r"/?data\s+modify\s+entity\s+@s\s+"
     r"(?P<path>[A-Za-z0-9_.]+)\s+set\s+value\s+(?P<value>\S+)\s*\Z"
@@ -56,6 +59,54 @@ _FUNCTION_NAME_RE = re.compile(
     r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z"
 )
 _SELECTOR_RE = re.compile(r"@e\[(?P<body>[^\]]+)\]\Z")
+
+WORLD_SCENE_TARGETS: Mapping[str, Mapping[str, object]] = {
+    "town10": {
+        "destination_id": "town10",
+        "scene_id": 2,
+        "scene_name": "Town10World",
+        "scene_xml": "scene_terrain_t10.xml",
+        "map_name": "/Game/Maps/Town10World",
+        "body_id": "earth",
+        "body_name": "地球",
+        "display_name": "Town10 城市",
+        "teleport_tag": "world:town10",
+        "surface_coordinates_deg_m": [31.2304, 121.4737, 4.0],
+        "surface_heading_deg": 0.0,
+        "local_position_m": [0.0, 0.0, 0.8],
+        "site_universe_position_m": [0.0, 0.0, 0.0],
+        "universe_position_m": [0.0, 0.0, 0.0],
+        "gravity_m_s2": 9.80665,
+        "atmosphere": "terrestrial",
+    },
+    "moon": {
+        "destination_id": "moon",
+        "scene_id": 15,
+        "scene_name": "MoonWorld",
+        "scene_xml": "scene_terrain_moon_dynamic.xml",
+        "map_name": "/Game/Maps/MoonWorld",
+        "body_id": "moon",
+        "body_name": "月球",
+        "display_name": "MoonWorld 月面",
+        "teleport_tag": "world:moon",
+        "surface_coordinates_deg_m": [0.67408, 23.47297, 0.0],
+        "surface_heading_deg": 0.0,
+        "local_position_m": [-94.7, -65.6, 0.8],
+        "site_universe_position_m": [384_400_000.0, 0.0, 0.0],
+        "universe_position_m": [384_399_905.3, -65.6, 0.8],
+        "gravity_m_s2": 1.62,
+        "atmosphere": "vacuum",
+    },
+}
+_WORLD_SCENE_ALIASES = {
+    "earth": "town10",
+    "terra": "town10",
+    "town10": "town10",
+    "town10world": "town10",
+    "moon": "moon",
+    "moonworld": "moon",
+    "luna": "moon",
+}
 
 
 class CommandParseError(ValueError):
@@ -256,6 +307,18 @@ class NativeModeSet:
 
 
 @dataclass(frozen=True)
+class WorldSceneSet:
+    destination_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "destination_id",
+            validate_world_scene_destination(self.destination_id),
+        )
+
+
+@dataclass(frozen=True)
 class MotionSettingSet:
     path: str
     value: float
@@ -311,6 +374,7 @@ AtomicMcCommand: TypeAlias = (
     | RecoverHere
     | MovementModeSet
     | NativeModeSet
+    | WorldSceneSet
     | MotionSettingSet
 )
 McCommand: TypeAlias = (
@@ -365,6 +429,25 @@ def validate_function_name(value: object) -> str:
             "function name must use safe segments like recover_here or sonic/mode_07",
         )
     return name
+
+
+def validate_world_scene_destination(value: object) -> str:
+    if not isinstance(value, str):
+        raise CommandParseError("E_WORLD_DESTINATION", "world destination must be text")
+    key = value.strip().lower()
+    canonical = _WORLD_SCENE_ALIASES.get(key)
+    if canonical is None:
+        supported = ", ".join(sorted(WORLD_SCENE_TARGETS))
+        raise CommandParseError(
+            "E_WORLD_DESTINATION",
+            f"world destination must be one of: {supported}",
+        )
+    return canonical
+
+
+def world_scene_target(destination_id: object) -> Mapping[str, object]:
+    canonical = validate_world_scene_destination(destination_id)
+    return WORLD_SCENE_TARGETS[canonical]
 
 
 def parse_coordinate(token: str) -> Coordinate:
@@ -426,6 +509,7 @@ def _is_atomic_command(command: object) -> bool:
             RecoverHere,
             MovementModeSet,
             NativeModeSet,
+            WorldSceneSet,
             MotionSettingSet,
         ),
     )
@@ -577,6 +661,10 @@ def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
             NativeModeSet(None if value == "auto" else int(value, 10))
         )
 
+    world_scene = _WORLD_SCENE_RE.fullmatch(command_text)
+    if world_scene is not None:
+        return ParsedCommand(WorldSceneSet(world_scene.group("destination")))
+
     data_modify = _DATA_MODIFY_RE.fullmatch(command_text)
     if data_modify is not None:
         raw_value = data_modify.group("value")
@@ -599,7 +687,7 @@ def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
         )
     raise CommandParseError(
         "E_COMMAND_UNKNOWN",
-        "supported commands are /summon, /tp, /pose, /recover, /mode, /sonic mode, /data modify, and /function",
+        "supported commands are /summon, /tp, /pose, /recover, /mode, /sonic mode, /world, /data modify, and /function",
     )
 
 
@@ -640,6 +728,11 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
         return {
             "name": "native_mode_set",
             "native_mode": command.native_mode,
+        }
+    if isinstance(command, WorldSceneSet):
+        return {
+            "name": "world_scene_set",
+            "destination_id": command.destination_id,
         }
     if isinstance(command, MotionSettingSet):
         return {
@@ -711,6 +804,13 @@ def command_from_mapping(value: object) -> McCommand:
             raise CommandProtocolError("native mode command has an invalid schema")
         try:
             return NativeModeSet(value.get("native_mode"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "world_scene_set":
+        if set(value) != {"name", "destination_id"}:
+            raise CommandProtocolError("world scene command has an invalid schema")
+        try:
+            return WorldSceneSet(value.get("destination_id"))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     if name == "motion_setting_set":
@@ -1080,6 +1180,30 @@ def execute_command(
                 "entity_id": point.entity_id,
                 "position": [point.pose.x, point.pose.y, point.pose.z],
                 "tags": list(point.tags),
+            },
+        )
+    if isinstance(command, WorldSceneSet):
+        target = world_scene_target(command.destination_id)
+        next_state = state.set_resume_pose(
+            current_pose,
+            source="teleport_command",
+            now_unix_ns=now_unix_ns,
+        )
+        return CommandEffect(
+            state=next_state,
+            code="OK_WORLD_RESTART",
+            message=(
+                f"World target {target['scene_name']} saved; "
+                "reloading Matrix"
+            ),
+            restart_required=True,
+            data={
+                "destination_id": command.destination_id,
+                "target_scene_id": target["scene_id"],
+                "target_scene_name": target["scene_name"],
+                "target_scene_xml": target["scene_xml"],
+                "target_map_name": target["map_name"],
+                "target_body_id": target["body_id"],
             },
         )
     if isinstance(command, CommandFunctionRun):
