@@ -1444,11 +1444,45 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_SPAWN_ARGS=()
     SONIC_WORLD_ARGS=()
     SONIC_SCENE_TRANSFORM_ARGS=()
+    SONIC_DYNAMIC_GROUND_ARGS=()
+    SONIC_DYNAMIC_GROUND_COLLISION_ARGS=()
     if [[ "$SCENE" == "scene_terrain_t10.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
             --scene-transform town10-open-boundary-v1
         )
         echo "[INFO] Town10 perimeter collision walls removed in derived physics scene"
+    fi
+    if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+        MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="$(
+            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1}" \
+                | tr '[:upper:]' '[:lower:]' \
+                | tr '_' '-'
+        )"
+        case "$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE" in
+            ""|stable|default|tiles|tile|mocap-tiles|rolling-tiles|rolling-mocap-tiles|rolling-mocap-tiles-v1|leo|official)
+                MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="rolling-mocap-tiles-v1"
+                ;;
+            hfield|heightfield|continuous|continuous-hfield|rolling-hfield|rolling-heightfield|rolling-heightfield-v2)
+                MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="rolling-heightfield-v2"
+                ;;
+            *)
+                echo "[ERROR] MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE must be rolling-heightfield-v2 or rolling-mocap-tiles-v1" >&2
+                exit 2
+                ;;
+        esac
+        export MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE="$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE"
+        export MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER="${MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-flat-anchor}"
+        SONIC_SCENE_TRANSFORM_ARGS+=(
+            --scene-transform moon-dynamic-ground-mocap-v3
+        )
+        SONIC_DYNAMIC_GROUND_COLLISION_ARGS=(
+            --moon-dynamic-ground-collision-mode "$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE"
+        )
+        SONIC_DYNAMIC_GROUND_ARGS=(
+            --moon-dynamic-map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
+            --moon-dynamic-map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+        )
+        echo "[INFO] MoonWorld dynamic ground enabled from locked height map: collision=$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE height_filter=$MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER"
     fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
@@ -1532,7 +1566,8 @@ if $MATRIX_SONIC_ENABLED; then
         --native-scene "$NATIVE_SONIC_SCENE" \
         --output-dir "$SONIC_PHYSICS_DIR" \
         "${SONIC_SPAWN_ARGS[@]}" \
-        "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
+        "${SONIC_SCENE_TRANSFORM_ARGS[@]}" \
+        "${SONIC_DYNAMIC_GROUND_COLLISION_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
     GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
@@ -1550,7 +1585,14 @@ if $MATRIX_SONIC_ENABLED; then
             ;;
     esac
     SONIC_ACCEPTANCE_ARGS=()
-    case "${MATRIX_SONIC_FAIL_ON_FALL:-1}" in
+    SONIC_FAIL_ON_FALL_DEFAULT=1
+    SONIC_MAX_RESETS_DEFAULT=0
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" \
+        && "${MATRIX_SONIC_MAX_SECONDS:-0}" == "0" ]]; then
+        SONIC_FAIL_ON_FALL_DEFAULT=0
+        SONIC_MAX_RESETS_DEFAULT=100000
+    fi
+    case "${MATRIX_SONIC_FAIL_ON_FALL:-$SONIC_FAIL_ON_FALL_DEFAULT}" in
         1|true|yes|on) SONIC_ACCEPTANCE_ARGS+=(--fail-on-fall) ;;
         0|false|no|off|"") ;;
         *)
@@ -1666,7 +1708,7 @@ if $MATRIX_SONIC_ENABLED; then
         --low-cmd-fresh-timeout-seconds "${MATRIX_SONIC_LOW_CMD_FRESH_TIMEOUT_SECONDS:-0.1}" \
         --min-physics-hz "${MATRIX_SONIC_MIN_PHYSICS_HZ:-195}" \
         --min-rtf "${MATRIX_SONIC_MIN_RTF:-0.95}" \
-        --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
+        --max-resets "${MATRIX_SONIC_MAX_RESETS:-$SONIC_MAX_RESETS_DEFAULT}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \
         "${SONIC_STARTUP_ARGS[@]}" \
@@ -1674,6 +1716,7 @@ if $MATRIX_SONIC_ENABLED; then
         --startup-band-fade "${MATRIX_SONIC_STARTUP_BAND_FADE:-3}" \
         "${GAME_INPUT_ARGS[@]}" \
         "${SONIC_WORLD_ARGS[@]}" \
+        "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         --status-file "$SONIC_STATUS_FILE" \
         > "$PROJECT_ROOT/outputs/logs/matrix_sonic_runtime.log" 2>&1 &
     SONIC_PID=$!

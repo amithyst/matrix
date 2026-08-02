@@ -874,6 +874,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         "tab_settings",
         "tab_console",
         "tab_functions",
+        "tab_sonic_modes",
         "tab_keybindings",
         "tab_inventory",
         "tab_navigation",
@@ -884,7 +885,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     directory_bottom = apply_y - gap
     directory_gap = 8 if compact else 16
     directory_columns = 3
-    directory_rows = 3
+    directory_rows = max(1, math.ceil(len(directory_names) / directory_columns))
     directory_width = max(
         1,
         (console_width - (directory_columns - 1) * directory_gap)
@@ -1438,6 +1439,12 @@ _PANEL_DIRECTORY_ENTRIES = (
         "functions",
     ),
     (
+        "tab_sonic_modes",
+        "SONIC模式",
+        "切换 SONIC 原生 AUTO/0-19 单档",
+        "sonic_modes",
+    ),
+    (
         "tab_keybindings",
         "按键绑定",
         "查看热键与运控模式说明",
@@ -1614,6 +1621,11 @@ def _targets_for_panel_page(
         return (
             (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
             + function_targets
+        )
+    if effective_page == "sonic_modes":
+        return (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + _NATIVE_MODE_HIT_TARGETS
         )
     if effective_page == "keybindings":
         return (
@@ -7511,6 +7523,48 @@ class X11CalibrationOverlay:
                     else ("pending" if model.pending_restart else "muted")
                 ],
             )
+    def _draw_native_modes_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        command_status: CommandConsoleStatus,
+        *,
+        title: str = "SONIC 原生模式",
+    ) -> None:
+        content = self._panel_rectangle(layout, "system_content")
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        quick_disabled = not self._quick_command_allowed()
+        auto_rect = self._panel_rectangle(layout, "native_mode_auto")
+        self._draw_text(
+            title,
+            x=content[0],
+            y=max(auto_rect[1] - 12, content[1] + (44 if compact else 56)),
+            colour=self._colours["muted"],
+        )
+        self._draw_button(
+            layout,
+            "native_mode_auto",
+            _NATIVE_MODE_BUTTON_LABELS_ZH[None],
+            fill=self._colours["disabled" if quick_disabled else "button"],
+            disabled=quick_disabled,
+        )
+        for index in range(20):
+            self._draw_button(
+                layout,
+                f"native_mode_{index}",
+                _NATIVE_MODE_BUTTON_LABELS_ZH.get(index, f"{index} 单档"),
+                fill=self._colours["disabled" if quick_disabled else "button"],
+                disabled=quick_disabled,
+            )
+        if command_status.message:
+            self._draw_text(
+                self._clip_console_line(command_status.message, content[2]),
+                x=content[0],
+                y=content[1] + content[3] - (30 if compact else 42),
+                colour=self._colours[
+                    "error" if command_status.status == "error" else "cyan"
+                ],
+            )
+
     def _draw_functions_page(
         self,
         layout: dict[str, tuple[int, int, int, int]],
@@ -7695,29 +7749,7 @@ class X11CalibrationOverlay:
             return
 
         if subpage == "sonic":
-            auto_rect = self._panel_rectangle(layout, "native_mode_auto")
-            self._draw_text(
-                "SONIC 原生模式",
-                x=content[0],
-                y=max(auto_rect[1] - 12, content[1] + 72),
-                colour=self._colours["muted"],
-            )
-            self._draw_button(
-                layout,
-                "native_mode_auto",
-                _NATIVE_MODE_BUTTON_LABELS_ZH[None],
-                fill=self._colours["disabled" if quick_disabled else "button"],
-                disabled=quick_disabled,
-            )
-            for index in range(20):
-                self._draw_button(
-                    layout,
-                    f"native_mode_{index}",
-                    _NATIVE_MODE_BUTTON_LABELS_ZH.get(index, f"{index} 单档"),
-                    fill=self._colours["disabled" if quick_disabled else "button"],
-                    disabled=quick_disabled,
-                )
-            draw_command_message()
+            self._draw_native_modes_page(layout, command_status)
             return
 
     def _function_file_preview_lines(
@@ -8824,6 +8856,13 @@ class X11CalibrationOverlay:
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
                 function_model or function_library_model({}),
+            )
+        elif page == "sonic_modes":
+            self._draw_native_modes_page(
+                layout,
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+                title="SONIC 模式切换",
             )
         elif page == "keybindings":
             self._draw_keybindings_page(

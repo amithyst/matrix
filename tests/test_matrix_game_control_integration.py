@@ -1417,6 +1417,69 @@ else:
             self.assertEqual(xset_log.read_text(encoding="utf-8"), "")
             self.assertEqual(xset_state.read_text(encoding="utf-8"), "2/1 4\n")
 
+    def test_unbounded_game_launch_does_not_exit_on_fall_when_auto_respawn_off(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "matrix"
+            fixture = self.make_project(project)
+            runtime_dir = project / "runtime"
+            runtime_dir.mkdir()
+            environment = {
+                "CAPTURE_PATH": os.fspath(fixture["capture"]),
+                "HOME": os.fspath(project / "home"),
+                "LANG": "C.UTF-8",
+                "MATRIX_GAME_CENTERED_CAMERA": "off",
+                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
+                "MATRIX_SKIP_ENV_CHECK": "1",
+                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
+                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
+                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
+                "MATRIX_UE_STARTUP_SECONDS": "0",
+                "MATRIX_VERIFY_RUNTIME": "0",
+                "PATH": os.fspath(fixture["fake_bin"])
+                + os.pathsep
+                + os.environ.get("PATH", "/usr/bin:/bin"),
+                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
+                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
+                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
+            }
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
+                    "--scene",
+                    "21",
+                    "--control-source",
+                    "game",
+                    "--game-world-persistence",
+                    "off",
+                    "--game-auto-respawn",
+                    "off",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=20.0,
+                check=False,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            capture = json.loads(fixture["capture"].read_text(encoding="utf-8"))
+            self.assertEqual(capture["world_persistence_env"], "0")
+            self.assertEqual(capture["auto_respawn_env"], "0")
+            self.assertNotIn("--fail-on-fall", capture["argv"])
+            with mock.patch.object(
+                sys, "argv", ["run_matrix_sonic.py", *capture["argv"]]
+            ):
+                parsed = RUNTIME._parse_args()
+            self.assertFalse(parsed.game_auto_respawn)
+            self.assertFalse(parsed.fail_on_fall)
+            self.assertEqual(parsed.max_resets, 100000)
+
     def test_corrupt_mouse_settings_fall_back_to_explicit_local_one_x(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"

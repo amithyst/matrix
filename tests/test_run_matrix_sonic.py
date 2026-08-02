@@ -143,6 +143,50 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_root_up_z_is_negative_for_upside_down_quaternion(self) -> None:
         self.assertAlmostEqual(MODULE._root_up_z([0, 0, 0, 0, 1, 0, 0]), -1.0)
 
+    def test_moon_dynamic_map_and_model_manifest_are_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            model = root / "scene_terrain_moon_dynamic.xml"
+            model.write_text("<mujoco />", encoding="utf-8")
+            map_path = root / "moonworld.bin"
+            map_path.write_bytes(b"placeholder")
+            locked_sha = (
+                "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+            )
+
+            MODULE._validate_moon_dynamic_ground_model_binding(
+                model,
+                map_path=None,
+                map_sha256=None,
+            )
+
+            (root / "manifest.json").write_text(
+                json.dumps({"scene_transform": "moon-dynamic-ground-mocap-v3"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "requires the locked"):
+                MODULE._validate_moon_dynamic_ground_model_binding(
+                    model,
+                    map_path=None,
+                    map_sha256=None,
+                )
+            MODULE._validate_moon_dynamic_ground_model_binding(
+                model,
+                map_path=map_path,
+                map_sha256=locked_sha,
+            )
+
+            (root / "manifest.json").write_text(
+                json.dumps({"scene_transform": "none"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "require a moon-dynamic"):
+                MODULE._validate_moon_dynamic_ground_model_binding(
+                    model,
+                    map_path=map_path,
+                    map_sha256=locked_sha,
+                )
+
     def test_world_safe_checkpoint_rejects_fall_motion_but_allows_horizontal_walk(self) -> None:
         def upright_snapshot() -> SimpleNamespace:
             snapshot = self.snapshot()

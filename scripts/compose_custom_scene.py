@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
-import re
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
@@ -18,7 +17,6 @@ class SceneCompositionError(RuntimeError):
 
 
 MOON_DYNAMIC_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
-_MOON_GROUND_JOINT_RE = re.compile(r"gb_joint_\d+_\d+")
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -123,38 +121,45 @@ def _remove_named_geoms(
     return tuple(name for name in remove_geoms if name in removed)
 
 
-def _strip_moon_dynamic_ground_joints(root: ET.Element, *, source_scene: Path) -> int:
-    """Make the legacy MoonWorld grid static for the body-only SONIC runtime."""
-
-    if source_scene.name != MOON_DYNAMIC_SCENE_NAME:
-        return 0
+def freejoint_body_names(root: ET.Element) -> tuple[str, ...]:
     worldbody = root.find("worldbody")
     if worldbody is None:
-        raise SceneCompositionError("MoonWorld scene has no worldbody")
+        raise SceneCompositionError("native scene has no worldbody")
 
-    removed = 0
-    for parent in worldbody.iter():
-        for child in list(parent):
-            if (
-                child.tag == "joint"
-                and child.get("type") == "free"
-                and _MOON_GROUND_JOINT_RE.fullmatch(child.get("name") or "")
-            ):
-                parent.remove(child)
-                removed += 1
-
-    remaining_scene_joints = [
-        child.get("name") or child.tag
-        for parent in worldbody.iter()
-        for child in list(parent)
-        if child.tag in {"joint", "freejoint"}
-    ]
-    if remaining_scene_joints:
-        raise SceneCompositionError(
-            "MoonWorld scene must be static after compatibility strip; "
-            f"remaining joints: {', '.join(remaining_scene_joints[:8])}"
+    names: list[str] = []
+    seen: set[str] = set()
+    for body in worldbody.iter("body"):
+        has_freejoint = any(
+            child.tag == "freejoint"
+            or (child.tag == "joint" and child.get("type") == "free")
+            for child in list(body)
         )
-    return removed
+        if not has_freejoint:
+            continue
+        name = body.get("name")
+        if not name:
+            raise SceneCompositionError("freejoint body must have a name")
+        if name in seen:
+            raise SceneCompositionError(f"duplicate freejoint body name: {name}")
+        seen.add(name)
+        names.append(name)
+    return tuple(names)
+
+
+def _staticize_freejoint_bodies(root: ET.Element) -> tuple[str, ...]:
+    names = freejoint_body_names(root)
+    if not names:
+        return ()
+
+    worldbody = root.find("worldbody")
+    assert worldbody is not None
+    for body in worldbody.iter("body"):
+        for child in list(body):
+            if child.tag == "freejoint" or (
+                child.tag == "joint" and child.get("type") == "free"
+            ):
+                body.remove(child)
+    return names
 
 
 def compose_custom_scene(
@@ -165,6 +170,7 @@ def compose_custom_scene(
     source_asset_root: Path | None = None,
     target_asset_root: Path | None = None,
     remove_geoms: tuple[str, ...] = (),
+    staticize_freejoint_bodies: bool = False,
 ) -> list[Path]:
     source_scene = source_scene.resolve()
     output_scene = output_scene.resolve()
@@ -191,22 +197,22 @@ def compose_custom_scene(
             f"native scene must have exactly one top-level robot include, got {len(includes)}"
         )
     includes[0].set("file", robot_include)
+    staticized = (
+        _staticize_freejoint_bodies(root) if staticize_freejoint_bodies else ()
+    )
     removed = _remove_named_geoms(root, remove_geoms=remove_geoms)
     if removed:
         root.insert(
             0,
             ET.Comment(f" removed environment geoms: {','.join(removed)} "),
         )
-    stripped_moon_joints = _strip_moon_dynamic_ground_joints(
-        root,
-        source_scene=source_scene,
-    )
-    if stripped_moon_joints:
+    if staticized:
         root.insert(
             0,
             ET.Comment(
-                " MoonWorld compatibility: stripped "
-                f"{stripped_moon_joints} dynamic ground joints "
+                " staticized freejoint bodies: "
+                f"{len(staticized)} ({','.join(staticized[:8])}"
+                f"{'...' if len(staticized) > 8 else ''}) "
             ),
         )
     root.set("model", f"custom::{source_scene.stem}")

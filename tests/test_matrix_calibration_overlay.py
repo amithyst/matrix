@@ -357,6 +357,17 @@ class OverlayLayoutTest(unittest.TestCase):
                 ),
                 action,
             )
+        for action in ("native_mode_auto", "native_mode_7"):
+            x, y, width, height = layout[action]
+            self.assertEqual(
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="sonic_modes",
+                ),
+                action,
+            )
         self.assertEqual(
             MODULE.X11CalibrationOverlay._quick_command_for_action("function_preset_0"),
             "/function recover_here",
@@ -607,6 +618,7 @@ class OverlayStateTest(unittest.TestCase):
             call.args[2] for call in directory_overlay._draw_button.call_args_list
         ]
         self.assertIn("策略装配", directory_labels)
+        self.assertIn("SONIC模式", directory_labels)
         self.assertIn("运行信息", directory_labels)
         self.assertNotIn("返回目录", directory_labels)
         directory_overlay._draw_tabs.assert_not_called()
@@ -639,6 +651,10 @@ class OverlayStateTest(unittest.TestCase):
             MODULE.tooltip_lines_for_action("movement_mode_camera_face")[0],
         )
         self.assertIn("AUTO", MODULE.tooltip_lines_for_action("native_mode_auto")[0])
+        self.assertIn(
+            "0-19",
+            MODULE.tooltip_lines_for_action("tab_sonic_modes")[0],
+        )
         self.assertIn(
             "安全重载",
             MODULE.tooltip_lines_for_action("navigation_destination_0")[0],

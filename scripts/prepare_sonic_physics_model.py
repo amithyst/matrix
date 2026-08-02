@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -17,12 +18,54 @@ import xml.etree.ElementTree as ET
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from compose_custom_scene import compose_custom_scene  # noqa: E402
+from compose_custom_scene import compose_custom_scene, freejoint_body_names  # noqa: E402
 
 
 PIPELINE_VERSION = 5
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
+MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
+MOON_DYNAMIC_GROUND_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
+MOON_DYNAMIC_GROUND_COLLISION_TILES = "rolling-mocap-tiles-v1"
+MOON_DYNAMIC_GROUND_COLLISION_HFIELD = "rolling-heightfield-v2"
+MOON_DYNAMIC_GROUND_COLLISION_DEFAULT = MOON_DYNAMIC_GROUND_COLLISION_TILES
+MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256 = (
+    "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
+)
+MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT = 256
+MOON_DYNAMIC_GROUND_BODY_PATTERN = re.compile(
+    r"gb_(?:[0-9]|1[0-5])_(?:[0-9]|1[0-5])\Z"
+)
+MOON_DYNAMIC_MAP_SIZE_BYTES = 144_000_000
+MOON_DYNAMIC_MAP_SHA256 = (
+    "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+)
+MOON_DYNAMIC_MAP_SIDE_SAMPLES = 6000
+MOON_DYNAMIC_MAP_RESOLUTION_M = 0.1
+MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M = -0.9296965003013611
+MOON_CONTINUOUS_SUPPORT_ASSET_NAME = "matrix_moon_continuous_support_hfield"
+MOON_CONTINUOUS_SUPPORT_GEOM_NAME = "matrix_moon_continuous_support"
+MOON_SPAWN_PAD_GEOM_NAME = "matrix_moon_spawn_pad"
+MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES = 33
+MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M = 1.6
+MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M = 64.0
+MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
+MOON_SPAWN_PAD_HALF_SIZE_M = (6.0, 6.0, 0.01)
+MOON_SPAWN_PAD_CENTER_M = (
+    -94.7,
+    -65.6,
+    -6.101562023162842 - MOON_SPAWN_PAD_HALF_SIZE_M[2],
+)
+MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE = (1993, 2113)
+MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE = (2284, 2404)
+MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M = (
+    -6.101562023162842,
+    -6.101562023162842,
+)
+MOON_SPAWN_PAD_ROOT_CLEARANCE_M = 0.85
+MOON_COLLISION_FRICTION = "1 0.005 0.0001"
+MOON_COLLISION_SOLREF = "0.02 1"
+MOON_COLLISION_SOLIMP = "0.9 0.95 0.001 0.5 2"
 TOWN10_SOURCE_SCENE_SHA256 = (
     "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
 )
@@ -89,6 +132,49 @@ G1_BODY_JOINT_NAMES = (
 
 class SonicPhysicsModelError(RuntimeError):
     """Raised when the canonical SONIC model contract is not satisfied."""
+
+
+def normalize_moon_dynamic_ground_collision_mode(
+    value: str | None = None,
+) -> str:
+    """Normalize the MoonWorld dynamic-ground collision backend."""
+
+    raw = (
+        os.environ.get("MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE")
+        if value is None
+        else value
+    )
+    text = str(raw or MOON_DYNAMIC_GROUND_COLLISION_DEFAULT)
+    text = text.strip().lower().replace("_", "-")
+    if text in {
+        "",
+        "stable",
+        "default",
+        "tiles",
+        "tile",
+        "mocap-tiles",
+        "rolling-tiles",
+        "rolling-mocap-tiles",
+        MOON_DYNAMIC_GROUND_COLLISION_TILES,
+        "leo",
+        "official",
+    }:
+        return MOON_DYNAMIC_GROUND_COLLISION_TILES
+    if text in {
+        "hfield",
+        "heightfield",
+        "continuous",
+        "continuous-hfield",
+        "rolling-hfield",
+        "rolling-heightfield",
+        MOON_DYNAMIC_GROUND_COLLISION_HFIELD,
+    }:
+        return MOON_DYNAMIC_GROUND_COLLISION_HFIELD
+    raise SonicPhysicsModelError(
+        "MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE must be "
+        f"{MOON_DYNAMIC_GROUND_COLLISION_HFIELD} or "
+        f"{MOON_DYNAMIC_GROUND_COLLISION_TILES}"
+    )
 
 
 def _file_sha256(path: Path) -> str:
@@ -159,12 +245,91 @@ def _vectors_equal(
     )
 
 
+def _mjcf_vector(values: tuple[float, ...]) -> str:
+    return " ".join(str(value).removesuffix(".0") for value in values)
+
+
+def _moon_spawn_pad_center_m(
+    spawn_xyz: tuple[float, float, float] | None,
+) -> tuple[float, float, float]:
+    if spawn_xyz is None:
+        return MOON_SPAWN_PAD_CENTER_M
+    top_z = float(spawn_xyz[2]) - MOON_SPAWN_PAD_ROOT_CLEARANCE_M
+    return (
+        float(spawn_xyz[0]),
+        float(spawn_xyz[1]),
+        top_z - MOON_SPAWN_PAD_HALF_SIZE_M[2],
+    )
+
+
+def _moon_spawn_pad_contract(
+    spawn_xyz: tuple[float, float, float] | None,
+) -> dict[str, object]:
+    center_m = _moon_spawn_pad_center_m(spawn_xyz)
+    top_z_m = center_m[2] + MOON_SPAWN_PAD_HALF_SIZE_M[2]
+    locked_footprint = None
+    if _vectors_equal(center_m, MOON_SPAWN_PAD_CENTER_M):
+        locked_footprint = {
+            "map_sha256": MOON_DYNAMIC_MAP_SHA256,
+            "pixel_x_range": list(MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE),
+            "pixel_y_range": list(MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE),
+            "native_height_range_m": list(MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M),
+        }
+    return {
+        "mode": "finite-collision-only-box-v1",
+        "geom_name": MOON_SPAWN_PAD_GEOM_NAME,
+        "collision_enabled_initial": True,
+        "collision_enabled_after_handoff": False,
+        "center_m": list(center_m),
+        "half_size_m": list(MOON_SPAWN_PAD_HALF_SIZE_M),
+        "top_z_m": top_z_m,
+        "top_offset_above_native_floor_m": 0.0,
+        "root_clearance_m": MOON_SPAWN_PAD_ROOT_CLEARANCE_M,
+        "center_source": "spawn_xyz" if spawn_xyz is not None else "default",
+        "locked_footprint": locked_footprint,
+        "rgba": [0.0, 0.0, 0.0, 0.0],
+    }
+
+
 def _scene_transform_removals(
     native_scene: Path, scene_transform: str | None
-) -> tuple[str, tuple[str, ...]]:
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     transform = scene_transform or SCENE_TRANSFORM_NONE
     if transform == SCENE_TRANSFORM_NONE:
-        return transform, ()
+        return transform, (), ()
+    if transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        if native_scene.name != MOON_DYNAMIC_GROUND_SCENE_NAME:
+            raise SonicPhysicsModelError(
+                f"{transform} requires {MOON_DYNAMIC_GROUND_SCENE_NAME}, got {native_scene.name}"
+            )
+        actual_sha256 = _file_sha256(native_scene)
+        if actual_sha256 != MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256:
+            raise SonicPhysicsModelError(
+                f"{transform} source SHA drift: "
+                f"expected={MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256} "
+                f"actual={actual_sha256}"
+            )
+        try:
+            root = ET.parse(native_scene).getroot()
+        except ET.ParseError as exc:
+            raise SonicPhysicsModelError(
+                f"invalid Matrix native scene {native_scene}: {exc}"
+            ) from exc
+        names = freejoint_body_names(root)
+        if len(names) != MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT:
+            raise SonicPhysicsModelError(
+                f"{transform} freejoint body count drifted: "
+                f"expected={MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT} actual={len(names)}"
+            )
+        if (
+            len(set(names)) != len(names)
+            or any(
+                MOON_DYNAMIC_GROUND_BODY_PATTERN.fullmatch(name) is None
+                for name in names
+            )
+        ):
+            raise SonicPhysicsModelError(f"{transform} tile body names drifted")
+        return transform, (), names
     if transform != TOWN10_OPEN_BOUNDARY_TRANSFORM:
         raise SonicPhysicsModelError(f"unsupported scene transform: {transform}")
     if native_scene.name != "scene_terrain_t10.xml":
@@ -231,7 +396,248 @@ def _scene_transform_removals(
             raise SonicPhysicsModelError(
                 f"Town10 perimeter geom {name} collision contract drifted"
             )
-    return transform, TOWN10_PERIMETER_WALL_NAMES
+    return transform, TOWN10_PERIMETER_WALL_NAMES, ()
+
+
+def _scene_transform_contract(
+    scene_transform: str,
+    *,
+    moon_dynamic_ground_collision_mode: str | None = None,
+    spawn_xyz: tuple[float, float, float] | None = None,
+) -> dict[str, object] | None:
+    if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        return None
+    collision_mode = normalize_moon_dynamic_ground_collision_mode(
+        moon_dynamic_ground_collision_mode
+    )
+    support_collision_enabled_after_handoff = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_HFIELD
+    )
+    tile_collision_enabled_after_handoff = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_TILES
+    )
+    return {
+        "dynamic_ground": {
+            "schema": "matrix-moon-dynamic-ground/v3",
+            "body_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
+            "body_name_pattern": MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern,
+            "body_mode": "mocap",
+            "map_dtype": "little-endian-float32",
+            "map_shape": [
+                MOON_DYNAMIC_MAP_SIDE_SAMPLES,
+                MOON_DYNAMIC_MAP_SIDE_SAMPLES,
+            ],
+            "map_size_bytes": MOON_DYNAMIC_MAP_SIZE_BYTES,
+            "map_sha256": MOON_DYNAMIC_MAP_SHA256,
+            "resolution_m": MOON_DYNAMIC_MAP_RESOLUTION_M,
+            "height_mode": "absolute_world_z",
+            "update_timing": "before_each_mj_step",
+            "fallback_support_plane": False,
+            "collision": {
+                "mode": collision_mode,
+                "asset_name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+                "geom_name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "collision_enabled_initial": False,
+                "collision_enabled_after_handoff": (
+                    support_collision_enabled_after_handoff
+                ),
+                "observation_hfield_only": (
+                    not support_collision_enabled_after_handoff
+                ),
+                "handoff": {
+                    "trigger": "initial_spawn_clearance_passed",
+                    "contract": "exactly-one-active-ground-v1",
+                    "mujoco_forward_after_mask_swap": True,
+                },
+                "grid_shape": [
+                    MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                    MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
+                ],
+                "half_extent_m": MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                "height_range_m": MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+                "base_depth_m": MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+                "source_tile_count": MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT,
+                "source_tile_compiled_collision_mask": (
+                    [1, 1] if tile_collision_enabled_after_handoff else [0, 0]
+                ),
+                "source_tile_collision_enabled_initial": False,
+                "source_tile_collision_enabled_after_handoff": (
+                    tile_collision_enabled_after_handoff
+                ),
+                "friction": MOON_COLLISION_FRICTION,
+                "solref": MOON_COLLISION_SOLREF,
+                "solimp": MOON_COLLISION_SOLIMP,
+                "spawn_pad": _moon_spawn_pad_contract(spawn_xyz),
+            },
+        }
+    }
+
+
+def _apply_scene_transform_additions(
+    scene_path: Path,
+    scene_transform: str,
+    *,
+    moon_dynamic_ground_collision_mode: str | None = None,
+    spawn_xyz: tuple[float, float, float] | None = None,
+) -> None:
+    if scene_transform != MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        return
+    collision_mode = normalize_moon_dynamic_ground_collision_mode(
+        moon_dynamic_ground_collision_mode
+    )
+    support_compiled_collision = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_HFIELD
+    )
+    tile_compiled_collision = (
+        collision_mode == MOON_DYNAMIC_GROUND_COLLISION_TILES
+    )
+    spawn_pad_center_m = _moon_spawn_pad_center_m(spawn_xyz)
+    try:
+        tree = ET.parse(scene_path)
+    except ET.ParseError as exc:
+        raise SonicPhysicsModelError(
+            f"invalid derived Matrix scene {scene_path}: {exc}"
+        ) from exc
+    root = tree.getroot()
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise SonicPhysicsModelError("MoonWorld derived scene has no worldbody")
+    if any(
+        item.get("name") == MOON_CONTINUOUS_SUPPORT_ASSET_NAME
+        for item in root.iter("hfield")
+    ) or any(
+        item.get("name")
+        in {MOON_CONTINUOUS_SUPPORT_GEOM_NAME, MOON_SPAWN_PAD_GEOM_NAME}
+        for item in root.iter("geom")
+    ):
+        raise SonicPhysicsModelError(
+            "MoonWorld source already contains Matrix dynamic-ground support"
+        )
+    tile_bodies = [
+        body
+        for body in worldbody.iter("body")
+        if isinstance(body.get("name"), str)
+        and body.get("name", "").startswith("gb_")
+    ]
+    if (
+        len(tile_bodies) != MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT
+        or len({body.get("name") for body in tile_bodies}) != len(tile_bodies)
+        or any(
+            MOON_DYNAMIC_GROUND_BODY_PATTERN.fullmatch(body.get("name", ""))
+            is None
+            for body in tile_bodies
+        )
+    ):
+        raise SonicPhysicsModelError(
+            "MoonWorld derived mocap tile body set drifted"
+        )
+    for body in tile_bodies:
+        if any(
+            child.tag == "freejoint"
+            or (child.tag == "joint" and child.get("type") == "free")
+            for child in list(body)
+        ):
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body.get('name')} still owns a free joint"
+            )
+        body.set("mocap", "true")
+        body_name = body.get("name", "")
+        suffix = body_name.removeprefix("gb_")
+        tile_geoms = list(body.findall("geom"))
+        if len(tile_geoms) != 1:
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body_name} must own exactly one geom"
+            )
+        tile_geom = tile_geoms[0]
+        if (
+            tile_geom.get("name") != f"soil_{suffix}"
+            or tile_geom.get("type") != "box"
+            or not _vectors_equal(
+                _float_vector(tile_geom, "size", length=3),
+                (0.049, 0.049, 0.5),
+            )
+            or not _vectors_equal(
+                _float_vector(tile_geom, "pos", length=3),
+                (0.0, 0.0, -0.5),
+            )
+        ):
+            raise SonicPhysicsModelError(
+                f"MoonWorld tile {body_name} collision source contract drifted"
+            )
+        tile_geom.set("contype", "1" if tile_compiled_collision else "0")
+        tile_geom.set("conaffinity", "1" if tile_compiled_collision else "0")
+
+    asset = root.find("asset")
+    if asset is None:
+        asset = ET.Element("asset")
+        worldbody_index = list(root).index(worldbody)
+        root.insert(worldbody_index, asset)
+    ET.SubElement(
+        asset,
+        "hfield",
+        {
+            "name": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+            "nrow": str(MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES),
+            "ncol": str(MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES),
+            "size": " ".join(
+                f"{value:g}"
+                for value in (
+                    MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                    MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M,
+                    MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
+                    MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M,
+                )
+            ),
+        },
+    )
+    worldbody.insert(
+        0,
+        ET.Element(
+            "geom",
+            {
+                "name": MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
+                "type": "hfield",
+                "hfield": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
+                "pos": f"0 0 {MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M:.12g}",
+                "contype": "1" if support_compiled_collision else "0",
+                "conaffinity": "1" if support_compiled_collision else "0",
+                "friction": MOON_COLLISION_FRICTION,
+                "solref": MOON_COLLISION_SOLREF,
+                "solimp": MOON_COLLISION_SOLIMP,
+                "rgba": "0 0 0 0",
+            },
+        ),
+    )
+    worldbody.insert(
+        1,
+        ET.Element(
+            "geom",
+            {
+                "name": MOON_SPAWN_PAD_GEOM_NAME,
+                "type": "box",
+                "pos": _mjcf_vector(spawn_pad_center_m),
+                "size": _mjcf_vector(MOON_SPAWN_PAD_HALF_SIZE_M),
+                "contype": "1",
+                "conaffinity": "1",
+                "friction": MOON_COLLISION_FRICTION,
+                "solref": MOON_COLLISION_SOLREF,
+                "solimp": MOON_COLLISION_SOLIMP,
+                "rgba": "0 0 0 0",
+            },
+        ),
+    )
+    root.insert(
+        0,
+        ET.Comment(
+            f" converted MoonWorld dynamic ground for {collision_mode}, added "
+            "a runtime-updated hfield, and retained a finite startup pad for "
+            "atomic runtime handoff "
+        ),
+    )
+    ET.indent(tree, space="  ")
+    tree.write(scene_path, encoding="utf-8", xml_declaration=False)
+    with scene_path.open("ab") as stream:
+        stream.write(b"\n")
 
 
 def _native_scene_asset_inventory(native_scene: Path) -> list[dict[str, object]]:
@@ -287,6 +693,8 @@ def _source_contract(
     spawn_yaw: float | None,
     scene_transform: str,
     removed_environment_geoms: tuple[str, ...],
+    staticized_freejoint_bodies: tuple[str, ...] = (),
+    moon_dynamic_ground_collision_mode: str | None = None,
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
     return {
@@ -307,6 +715,12 @@ def _source_contract(
         "spawn_yaw_rad": spawn_yaw,
         "scene_transform": scene_transform,
         "removed_environment_geoms": list(removed_environment_geoms),
+        "staticized_freejoint_bodies": list(staticized_freejoint_bodies),
+        "scene_transform_contract": _scene_transform_contract(
+            scene_transform,
+            moon_dynamic_ground_collision_mode=moon_dynamic_ground_collision_mode,
+            spawn_xyz=spawn_xyz,
+        ),
     }
 
 
@@ -328,9 +742,18 @@ def physics_revision_payload(
     preparation and persistence cannot silently drift apart.
     """
 
-    normalized_scene_transform, removed_environment_geoms = (
+    (
+        normalized_scene_transform,
+        removed_environment_geoms,
+        staticized_freejoint_bodies,
+    ) = (
         _scene_transform_removals(native_scene, scene_transform)
     )
+    normalized_moon_collision_mode = None
+    if normalized_scene_transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        normalized_moon_collision_mode = (
+            normalize_moon_dynamic_ground_collision_mode()
+        )
     contract = _source_contract(
         canonical_model,
         canonical_meshes,
@@ -340,6 +763,8 @@ def physics_revision_payload(
         spawn_yaw=None,
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
+        staticized_freejoint_bodies=staticized_freejoint_bodies,
+        moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
     )
     native_scene_assets = []
     for asset in contract["native_scene_assets"]:
@@ -363,6 +788,8 @@ def physics_revision_payload(
         "body_joint_names": contract["body_joint_names"],
         "scene_transform": contract["scene_transform"],
         "removed_environment_geoms": contract["removed_environment_geoms"],
+        "staticized_freejoint_bodies": contract["staticized_freejoint_bodies"],
+        "scene_transform_contract": contract["scene_transform_contract"],
     }
 
 
@@ -504,6 +931,7 @@ def prepare_sonic_physics_model(
     spawn_xyz: tuple[float, float, float] | None = None,
     spawn_yaw: float | None = None,
     scene_transform: str | None = None,
+    moon_dynamic_ground_collision_mode: str | None = None,
 ) -> Path:
     canonical_model = canonical_model.resolve()
     canonical_meshes = canonical_meshes.resolve()
@@ -530,9 +958,20 @@ def prepare_sonic_physics_model(
         else None
     )
     normalized_spawn_yaw = float(spawn_yaw) if spawn_yaw is not None else None
-    normalized_scene_transform, removed_environment_geoms = (
+    (
+        normalized_scene_transform,
+        removed_environment_geoms,
+        staticized_freejoint_bodies,
+    ) = (
         _scene_transform_removals(native_scene, scene_transform)
     )
+    normalized_moon_collision_mode = None
+    if normalized_scene_transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        normalized_moon_collision_mode = (
+            normalize_moon_dynamic_ground_collision_mode(
+                moon_dynamic_ground_collision_mode
+            )
+        )
 
     contract = _source_contract(
         canonical_model,
@@ -543,6 +982,8 @@ def prepare_sonic_physics_model(
         spawn_yaw=normalized_spawn_yaw,
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
+        staticized_freejoint_bodies=staticized_freejoint_bodies,
+        moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
     )
     manifest_path = output_dir / "manifest.json"
     scene_path = output_dir / native_scene.name
@@ -597,6 +1038,13 @@ def prepare_sonic_physics_model(
             source_asset_root=native_scene.parent / "assets",
             target_asset_root=temporary_dir / "meshes",
             remove_geoms=removed_environment_geoms,
+            staticize_freejoint_bodies=bool(staticized_freejoint_bodies),
+        )
+        _apply_scene_transform_additions(
+            temporary_dir / native_scene.name,
+            normalized_scene_transform,
+            moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
+            spawn_xyz=normalized_spawn_xyz,
         )
         contract["body_joint_names"] = list(body_joint_names)
         contract["derived_robot_sha256"] = _file_sha256(temporary_dir / "robot.xml")
@@ -630,8 +1078,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--spawn-yaw", type=float)
     parser.add_argument(
         "--scene-transform",
-        choices=(SCENE_TRANSFORM_NONE, TOWN10_OPEN_BOUNDARY_TRANSFORM),
+        choices=(
+            SCENE_TRANSFORM_NONE,
+            TOWN10_OPEN_BOUNDARY_TRANSFORM,
+            MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+        ),
         default=SCENE_TRANSFORM_NONE,
+    )
+    parser.add_argument(
+        "--moon-dynamic-ground-collision-mode",
+        choices=(
+            MOON_DYNAMIC_GROUND_COLLISION_HFIELD,
+            MOON_DYNAMIC_GROUND_COLLISION_TILES,
+        ),
+        default=None,
+        help=(
+            "MoonWorld collision backend for moon-dynamic-ground-mocap-v3; "
+            "defaults to the stable rolling mocap tile backend"
+        ),
     )
     return parser.parse_args()
 
@@ -657,6 +1121,9 @@ def main() -> int:
             spawn_xyz=spawn_xyz,
             spawn_yaw=args.spawn_yaw,
             scene_transform=args.scene_transform,
+            moon_dynamic_ground_collision_mode=(
+                args.moon_dynamic_ground_collision_mode
+            ),
         )
     except SonicPhysicsModelError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc

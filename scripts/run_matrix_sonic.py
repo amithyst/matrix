@@ -88,6 +88,7 @@ _GAME_INTERNAL_RESTART_REASONS = frozenset(
 )
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
+_MOON_RELATIVE_FALL_ROOT_UP_Z = 0.5
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
 _MAX_FUNCTION_FILE_BYTES = 16 * 1024
@@ -236,6 +237,8 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="On fall, save an upright resume pose and request a cold full-runtime reload",
     )
+    parser.add_argument("--moon-dynamic-map", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--moon-dynamic-map-sha256", help=argparse.SUPPRESS)
     parser.add_argument(
         "--pico-python",
         default=None,
@@ -432,6 +435,77 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_moon_dynamic_ground_model_binding(
+    model_path: Path,
+    *,
+    map_path: Path | None,
+    map_sha256: str | None,
+) -> None:
+    """Bind the rolling-height-map runtime to its exact derived model contract."""
+
+    moon_dynamic_ground_mocap_transform = "moon-dynamic-ground-mocap-v3"
+    dynamic_values = (map_path, map_sha256)
+    if any(value is not None for value in dynamic_values) and not all(
+        value is not None for value in dynamic_values
+    ):
+        raise SystemExit("MoonWorld dynamic map arguments are all-or-none")
+
+    dynamic_enabled = all(value is not None for value in dynamic_values)
+    if map_path is not None:
+        from matrix_moon_dynamic_ground import LOCKED_MOONWORLD_SHA256
+
+        if (
+            not map_path.is_absolute()
+            or map_path.is_symlink()
+            or not map_path.is_file()
+        ):
+            raise SystemExit(
+                "--moon-dynamic-map must be an absolute regular non-symlink file"
+            )
+        if map_sha256 != LOCKED_MOONWORLD_SHA256:
+            raise SystemExit(
+                "--moon-dynamic-map-sha256 does not match the locked MoonWorld map"
+            )
+
+    manifest_path = model_path.parent / "manifest.json"
+    scene_transform = None
+    if manifest_path.exists() or manifest_path.is_symlink():
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise SystemExit(
+                f"physics model manifest must be a regular non-symlink file: "
+                f"{manifest_path}"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise SystemExit(
+                f"invalid physics model manifest {manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise SystemExit(
+                f"invalid physics model manifest object: {manifest_path}"
+            )
+        scene_transform = manifest.get("scene_transform")
+        if scene_transform is not None and (
+            not isinstance(scene_transform, str) or not scene_transform
+        ):
+            raise SystemExit("physics model manifest has an invalid scene transform")
+
+    model_requires_dynamic_ground = (
+        scene_transform == moon_dynamic_ground_mocap_transform
+    )
+    if model_requires_dynamic_ground and not dynamic_enabled:
+        raise SystemExit(
+            "moon-dynamic-ground-mocap-v3 physics model requires the locked "
+            "MoonWorld dynamic map arguments"
+        )
+    if dynamic_enabled and not model_requires_dynamic_ground:
+        raise SystemExit(
+            "MoonWorld dynamic map arguments require a "
+            "moon-dynamic-ground-mocap-v3 physics model manifest"
+        )
 
 
 def _expected_receipt_roots(
@@ -1048,6 +1122,64 @@ def _root_up_z(qpos) -> float:
     """Diagnostic world-Z component of the floating base's local up axis."""
     _, x, y, _ = [float(value) for value in qpos[3:7]]
     return 1.0 - 2.0 * (x * x + y * y)
+
+
+def _install_moon_relative_fall_check(
+    environment: Any,
+    dynamic_ground: Any,
+) -> None:
+    """Replace SONIC's sea-level fall test with terrain-relative clearance."""
+
+    for name in (
+        "check_fall",
+        "fall",
+        "fall_detected",
+        "mj_data",
+        "reset_on_fall",
+    ):
+        if not hasattr(environment, name):
+            raise RuntimeError(
+                f"SONIC environment is missing MoonWorld fall field {name!r}"
+            )
+    if not callable(getattr(environment, "reset", None)):
+        raise RuntimeError(
+            "SONIC environment has no callable reset for MoonWorld fall handling"
+        )
+
+    def check_relative_fall() -> None:
+        try:
+            qpos = environment.mj_data.qpos
+            root_x = float(qpos[0])
+            root_y = float(qpos[1])
+            root_z = float(qpos[2])
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "SONIC MoonWorld fall check cannot read root qpos"
+            ) from exc
+        ground_z = dynamic_ground.sample_height(root_x, root_y)
+        root_clearance = root_z - ground_z
+        if not math.isfinite(root_clearance):
+            raise RuntimeError("SONIC MoonWorld root clearance is non-finite")
+        root_up_z = _root_up_z(qpos)
+        if not math.isfinite(root_up_z):
+            raise RuntimeError("SONIC MoonWorld root up vector is non-finite")
+        environment.fall = (
+            root_clearance < 0.2
+            and root_up_z < _MOON_RELATIVE_FALL_ROOT_UP_Z
+        )
+        if environment.fall:
+            environment.fall_detected = True
+            print(
+                "Warning: Robot has fallen, terrain-relative height: "
+                f"{root_clearance:.3f} m "
+                f"root_up_z={root_up_z:.3f} "
+                f"(root_z={root_z:.3f}, ground_z={ground_z:.3f})",
+                flush=True,
+            )
+            if bool(environment.reset_on_fall):
+                environment.reset(reason="fall")
+
+    environment.check_fall = check_relative_fall
 
 
 def _root_yaw_rad(qpos) -> float:
@@ -3660,6 +3792,8 @@ def main() -> int:
         ("game_function_directory", None),
         ("game_motion_settings", None),
         ("game_motion_settings_load_status", "disabled"),
+        ("moon_dynamic_map", None),
+        ("moon_dynamic_map_sha256", None),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -3960,6 +4094,11 @@ def main() -> int:
     model_attestation = _validate_qualified_model(
         args, model_path, qualification_receipt
     )
+    _validate_moon_dynamic_ground_model_binding(
+        model_path,
+        map_path=args.moon_dynamic_map,
+        map_sha256=args.moon_dynamic_map_sha256,
+    )
     if (
         not math.isfinite(args.low_cmd_fresh_timeout_seconds)
         or args.low_cmd_fresh_timeout_seconds <= 0.0
@@ -4000,6 +4139,7 @@ def main() -> int:
     game_world = None
     game_commands = None
     game_command_child_socket = None
+    moon_dynamic_ground = None
     game_command = None
     processes = None
     previous_signal_handlers: dict[int, Any] = {}
@@ -4028,6 +4168,45 @@ def main() -> int:
             previous_handler = signal.getsignal(signum)
             signal.signal(signum, request_stop)
             previous_signal_handlers[int(signum)] = previous_handler
+
+        if args.moon_dynamic_map is not None:
+            environment = getattr(simulator, "sim_env", None)
+            model = getattr(environment, "mj_model", None)
+            data = getattr(environment, "mj_data", None)
+            if model is None or data is None:
+                raise SystemExit(
+                    "MoonWorld dynamic ground requires live MuJoCo model/data"
+                )
+            try:
+                import mujoco as mujoco_module
+                from matrix_moon_dynamic_ground import (
+                    MoonDynamicGround,
+                    MoonDynamicGroundError,
+                )
+            except ImportError as exc:
+                raise SystemExit(
+                    f"MoonWorld dynamic ground dependency is missing: {exc}"
+                ) from exc
+
+            try:
+                moon_dynamic_ground = MoonDynamicGround(
+                    args.moon_dynamic_map,
+                    model,
+                    expected_sha256=args.moon_dynamic_map_sha256,
+                )
+                moon_dynamic_ground.update_mocap(data)
+                moon_dynamic_ground.activate_collision_handoff(
+                    data,
+                    forward=mujoco_module.mj_forward,
+                )
+                _install_moon_relative_fall_check(
+                    environment,
+                    moon_dynamic_ground,
+                )
+            except (MoonDynamicGroundError, OSError, RuntimeError, ValueError) as exc:
+                raise SystemExit(
+                    f"cannot initialize MoonWorld dynamic ground: {exc}"
+                ) from exc
 
         snapshot = simulator.get_state_snapshot()
         initial_snapshot_error = _snapshot_validation_error(snapshot)
@@ -4374,6 +4553,22 @@ def main() -> int:
                 # of emitting four back-to-back steps once per 50 Hz frame.
                 # Matrix owns the absolute deadline because SONIC's relative
                 # per-step sleep otherwise accumulates scheduler overshoot.
+                if moon_dynamic_ground is not None:
+                    try:
+                        moon_dynamic_ground.update_mocap(
+                            simulator.sim_env.mj_data
+                        )
+                    except MoonDynamicGroundError as exc:
+                        unstable = True
+                        running = False
+                        termination_reason = "numerical_instability"
+                        numerical_error = f"moon_dynamic_ground:{exc}"
+                        print(
+                            "matrix-sonic-runtime ERROR MoonWorld tile update: "
+                            f"{exc}",
+                            flush=True,
+                        )
+                        break
                 next_snapshot = simulator.step_once(rate_limit=False)
                 physics_steps += 1
                 step_error = _snapshot_validation_error(next_snapshot, snapshot)
@@ -4512,6 +4707,7 @@ def main() -> int:
                     "control_frames": control_frames,
                     "control_hz": args.control_hz,
                     "control_source": args.control_source,
+                    "current_fall_detected": bool(snapshot.fall_detected),
                     "elapsed_wall_s": round(now - started_wall, 3),
                     "model": str(model_path),
                     **model_attestation,
@@ -4597,6 +4793,10 @@ def main() -> int:
                     status["game_auto_respawn"] = bool(args.game_auto_respawn)
                 if game_commands is not None:
                     status["game_commands"] = game_commands.telemetry()
+                if moon_dynamic_ground is not None:
+                    status["moon_dynamic_ground"] = (
+                        moon_dynamic_ground.telemetry()
+                    )
                 print(
                     f"matrix-sonic-runtime status={json.dumps(status, sort_keys=True)}",
                     flush=True,
@@ -4775,6 +4975,7 @@ def main() -> int:
             "control_frames": control_frames,
             "control_hz": args.control_hz,
             "control_source": args.control_source,
+            "current_fall_detected": bool(snapshot.fall_detected),
             "elapsed_wall_s": round(elapsed_wall_s, 3),
             "failed_child_exit_code": failed_child_code,
             "failed_child_name": failed_child_name,
@@ -4897,6 +5098,8 @@ def main() -> int:
             final_status["game_world_state"] = game_world.telemetry()
         if game_commands is not None:
             final_status["game_commands"] = game_commands.telemetry()
+        if moon_dynamic_ground is not None:
+            final_status["moon_dynamic_ground"] = moon_dynamic_ground.telemetry()
         _atomic_json(args.status_file, final_status)
         print(
             "matrix-sonic-runtime stopped "
@@ -4946,6 +5149,7 @@ def main() -> int:
         for name, resource in (
             ("native processes", processes),
             ("renderer", renderer),
+            ("moon dynamic ground", moon_dynamic_ground),
             ("simulator", simulator),
         ):
             error = _close_runtime_resource(name, resource)

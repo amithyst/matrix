@@ -220,6 +220,91 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
                     scene_transform=MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
                 )
 
+    def test_moon_dynamic_ground_transform_converts_tiles_to_mocap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            canonical = root / "canonical.xml"
+            meshes = root / "canonical_meshes"
+            native = root / "xgb"
+            output = root / "output"
+            meshes.mkdir()
+            native.mkdir()
+            canonical.write_text(
+                """<mujoco><worldbody><body name="pelvis">
+<freejoint name="floating" /><joint name="joint_a" />
+</body></worldbody><actuator><motor name="a" joint="joint_a" />
+</actuator></mujoco>""",
+                encoding="utf-8",
+            )
+            scene = native / MODULE.MOON_DYNAMIC_GROUND_SCENE_NAME
+            bodies = []
+            for i in range(16):
+                for j in range(16):
+                    bodies.append(
+                        f"""<body name="gb_{i}_{j}" pos="{i * 0.1:.1f} {j * 0.1:.1f} 0" gravcomp="1">
+  <joint type="free" name="gb_joint_{i}_{j}" />
+  <geom name="soil_{i}_{j}" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>"""
+                    )
+            scene.write_text(
+                "<mujoco><include file=\"xgb.xml\" /><worldbody>\n"
+                + "\n".join(bodies)
+                + "\n</worldbody></mujoco>",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                MODULE,
+                "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
+                MODULE._file_sha256(scene),
+            ):
+                output_scene = MODULE.prepare_sonic_physics_model(
+                    canonical,
+                    meshes,
+                    scene,
+                    output,
+                    body_joint_names=("joint_a",),
+                    scene_transform=MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+                    moon_dynamic_ground_collision_mode=(
+                        MODULE.MOON_DYNAMIC_GROUND_COLLISION_TILES
+                    ),
+                )
+
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(
+                manifest["scene_transform"],
+                MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+            )
+            self.assertEqual(
+                manifest["staticized_freejoint_bodies"][0],
+                "gb_0_0",
+            )
+            contract = manifest["scene_transform_contract"]["dynamic_ground"]
+            self.assertEqual(contract["body_count"], 256)
+            self.assertEqual(
+                contract["collision"]["mode"],
+                MODULE.MOON_DYNAMIC_GROUND_COLLISION_TILES,
+            )
+
+            xml = ET.parse(output_scene).getroot()
+            tile_bodies = [
+                body
+                for body in xml.iter("body")
+                if (body.get("name") or "").startswith("gb_")
+            ]
+            self.assertEqual(len(tile_bodies), 256)
+            self.assertTrue(all(body.get("mocap") == "true" for body in tile_bodies))
+            self.assertFalse(list(xml.iter("joint")))
+            soil = next(geom for geom in xml.iter("geom") if geom.get("name") == "soil_7_8")
+            self.assertEqual(soil.get("contype"), "1")
+            self.assertEqual(soil.get("conaffinity"), "1")
+            self.assertIsNotNone(
+                next(
+                    geom
+                    for geom in xml.iter("geom")
+                    if geom.get("name") == MODULE.MOON_SPAWN_PAD_GEOM_NAME
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

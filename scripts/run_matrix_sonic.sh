@@ -90,6 +90,11 @@ MIN_DISPLACEMENT_M="${MATRIX_SONIC_MIN_DISPLACEMENT_M:-$(read_acceptance_lock ro
 LOW_CMD_FRESH_TIMEOUT_SECONDS="${MATRIX_SONIC_LOW_CMD_FRESH_TIMEOUT_SECONDS:-$(read_acceptance_lock low_cmd_fresh_timeout_seconds)}"
 MIN_PHYSICS_HZ="${MATRIX_SONIC_MIN_PHYSICS_HZ:-$(read_acceptance_lock physics_hz_min)}"
 MIN_RTF="${MATRIX_SONIC_MIN_RTF:-$(read_acceptance_lock rtf_min)}"
+if [[ -n "${MATRIX_SONIC_MAX_RESETS+x}" ]]; then
+    MAX_RESETS_EXPLICIT=1
+else
+    MAX_RESETS_EXPLICIT=0
+fi
 MAX_RESETS="${MATRIX_SONIC_MAX_RESETS:-$(read_acceptance_lock instability_resets_max)}"
 OFFSCREEN=0
 STARTUP_BAND=1
@@ -182,7 +187,7 @@ while [[ $# -gt 0 ]]; do
         --low-cmd-fresh-timeout-seconds) LOW_CMD_FRESH_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --min-physics-hz) MIN_PHYSICS_HZ="$2"; shift 2 ;;
         --min-rtf) MIN_RTF="$2"; shift 2 ;;
-        --max-resets) MAX_RESETS="$2"; shift 2 ;;
+        --max-resets) MAX_RESETS="$2"; MAX_RESETS_EXPLICIT=1; shift 2 ;;
         --startup-band) STARTUP_BAND=1; shift ;;
         --no-startup-band) STARTUP_BAND=0; shift ;;
         --startup-band-hold) STARTUP_BAND_HOLD="$2"; shift 2 ;;
@@ -804,16 +809,24 @@ export MATRIX_SONIC_MIN_DISPLACEMENT_M="$MIN_DISPLACEMENT_M"
 export MATRIX_SONIC_LOW_CMD_FRESH_TIMEOUT_SECONDS="$LOW_CMD_FRESH_TIMEOUT_SECONDS"
 export MATRIX_SONIC_MIN_PHYSICS_HZ="$MIN_PHYSICS_HZ"
 export MATRIX_SONIC_MIN_RTF="$MIN_RTF"
+if [[ "$CONTROL_SOURCE" == "game" \
+    && "$QUALIFICATION_REQUESTED" == "0" \
+    && "$MAX_RESETS_EXPLICIT" == "0" ]]; then
+    MAX_RESETS="${MATRIX_SONIC_DESKTOP_MAX_RESETS:-100000}"
+fi
 export MATRIX_SONIC_MAX_RESETS="$MAX_RESETS"
 export MATRIX_SONIC_QUALIFIED_RUNTIME
 export MATRIX_SONIC_QUALIFICATION_PROFILE
 export MATRIX_SONIC_RUNTIME_LOCK_SHA256
 export MATRIX_SONIC_MATRIX_COMMIT
 export MATRIX_SONIC_VERIFICATION_RECEIPT
-if [[ "$GAME_AUTO_RESPAWN" == "1" ]]; then
-    export MATRIX_SONIC_FAIL_ON_FALL=0
-else
-    export MATRIX_SONIC_FAIL_ON_FALL=1
+if [[ -z "${MATRIX_SONIC_FAIL_ON_FALL+x}" ]]; then
+    if [[ "$GAME_AUTO_RESPAWN" == "1" \
+        || ( "$CONTROL_SOURCE" == "game" && "$QUALIFICATION_REQUESTED" == "0" ) ]]; then
+        export MATRIX_SONIC_FAIL_ON_FALL=0
+    else
+        export MATRIX_SONIC_FAIL_ON_FALL=1
+    fi
 fi
 export MATRIX_SONIC_STARTUP_BAND="$STARTUP_BAND"
 export MATRIX_SONIC_STARTUP_BAND_HOLD="$STARTUP_BAND_HOLD"
