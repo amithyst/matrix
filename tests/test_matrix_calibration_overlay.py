@@ -428,6 +428,86 @@ class OverlayLayoutTest(unittest.TestCase):
             "tab_keybindings",
         )
 
+    def test_polled_navigation_destination_click_submits_world_command(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        x, y, width, height = layout["navigation_destination_0"]
+        pointer = (x + width // 2, y + height // 2)
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._visible = True
+        overlay._last_layout = layout
+        overlay._last_pointer = pointer
+        overlay._active_page = "navigation"
+        overlay._functions_subpage = "home"
+        overlay._polled_pointer_valid = True
+        overlay._polled_left_initialized = False
+        overlay._polled_left_was_down = False
+        overlay._polled_pressed_action = None
+        overlay._polled_pressed_runtime_pause_target = None
+        overlay._polled_pressed_runtime_pause_epoch = None
+        overlay._last_startup_loading_model = MODULE.startup_loading_model({})
+        overlay._last_command_status = MODULE.command_console_status(
+            {"command_console": {"available": True, "status": "idle"}}
+        )
+        overlay._last_navigation_model = MODULE.CelestialNavigationModel(
+            available=True,
+            status="ready",
+            universe_id="sol",
+            display_name="SOL",
+            reference_epoch_utc=None,
+            time_scale=None,
+            frame=None,
+            ephemeris_provider=None,
+            ephemeris_accuracy=None,
+            ephemeris_upgrade_target=None,
+            simulation_time=None,
+            origin_rebasing=False,
+            simulation_local_bound_m=100.0,
+            current_body_id="earth",
+            bodies=(),
+            lighting=None,
+            destinations=(
+                MODULE.CelestialDestinationModel(
+                    destination_id="moon",
+                    body_id="moon",
+                    body_name="月球",
+                    display_name="MoonWorld 月面",
+                    teleport_tag="moon",
+                    runtime_status="ready",
+                    status="ready",
+                    enabled=True,
+                    surface_coordinates_deg_m=(0.0, 0.0, 0.0),
+                    surface_heading_deg=0.0,
+                    local_position_m=(0.0, 0.0, 0.8),
+                    site_universe_position_m=(0.0, 0.0, 0.0),
+                    universe_position_m=(0.0, 0.0, 0.0),
+                    gravity_m_s2=1.62,
+                    atmosphere="none",
+                ),
+            ),
+        )
+        published: list[str] = []
+        publisher = mock.Mock()
+        publisher.publish_command_quick_submit.side_effect = published.append
+
+        overlay._polled_left_pressed = True
+        self.assertEqual(
+            overlay._queue_polled_left_transition(
+                publisher,
+                cooked_button_seen=False,
+            ),
+            0,
+        )
+        overlay._polled_left_pressed = False
+        self.assertEqual(
+            overlay._queue_polled_left_transition(
+                publisher,
+                cooked_button_seen=False,
+            ),
+            1,
+        )
+
+        self.assertEqual(published, ["/world moon"])
+
 
 class CursorShapeTest(unittest.TestCase):
     @staticmethod

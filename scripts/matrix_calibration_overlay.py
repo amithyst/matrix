@@ -6231,6 +6231,46 @@ class X11CalibrationOverlay:
                 publisher.publish(action)
                 emitted += 1
             return emitted
+        if action == "navigation_refresh":
+            navigation = getattr(self, "_last_navigation_model", None)
+            if (
+                navigation is not None
+                and navigation.refresh_enabled
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish_navigation_refresh()
+                emitted += 1
+            return emitted
+        if action.startswith("navigation_destination_"):
+            navigation = getattr(self, "_last_navigation_model", None)
+            try:
+                destination_index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return emitted
+            if (
+                navigation is not None
+                and destination_index < len(navigation.destinations)
+            ):
+                destination = navigation.destinations[destination_index]
+                if (
+                    navigation.destination_enabled(destination.destination_id)
+                    and self._last_command_status.available
+                    and not self._last_command_status.in_flight
+                    and not self._last_command_status.restart_required
+                    and not self._last_command_status.outcome_unknown
+                    and self._last_command_status.status
+                    not in {"pending", "restarting", "unavailable"}
+                ):
+                    publisher.publish_command_quick_submit(
+                        f"/world {destination.destination_id}"
+                    )
+                    emitted += 1
+            return emitted
         if action == "runtime_pause":
             panel_model = self._last_panel_model
             if (
