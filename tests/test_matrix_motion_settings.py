@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -40,9 +41,11 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(settings.max_turn_rate_rad_s, 2.50)
         self.assertEqual(settings.keyboard_turn_rate_rad_s, 1.50)
         self.assertEqual(settings.keyboard_turn_boost_rate_rad_s, 3.00)
+        self.assertAlmostEqual(settings.gait_start_heading_error_rad, math.radians(45.0))
+        self.assertAlmostEqual(settings.gait_stop_heading_error_rad, math.radians(65.0))
         self.assertEqual(settings.keyboard_look_rate_deg_s, 120.0)
         self.assertEqual(settings.movement_mode, "camera_face")
-        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 10)
+        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 12)
 
     def test_strict_mapping_round_trip(self) -> None:
         settings = MODULE.MotionSettings(
@@ -64,6 +67,8 @@ class MotionSettingsValueTest(unittest.TestCase):
                 "max_turn_rate_rad_s",
                 "keyboard_turn_rate_rad_s",
                 "keyboard_turn_boost_rate_rad_s",
+                "gait_start_heading_error_rad",
+                "gait_stop_heading_error_rad",
                 "camera",
                 "movement",
             },
@@ -174,6 +179,10 @@ class MotionSettingsValueTest(unittest.TestCase):
             {"keyboard_turn_boost_rate_rad_s": 4.01},
             {"keyboard_turn_rate_rad_s": True},
             {"keyboard_turn_boost_rate_rad_s": True},
+            {"gait_start_heading_error_rad": math.radians(4.0)},
+            {"gait_stop_heading_error_rad": math.radians(91.0)},
+            {"gait_start_heading_error_rad": True},
+            {"gait_stop_heading_error_rad": float("nan")},
             {"keyboard_look_rate_deg_s": 29.0},
             {"keyboard_look_rate_deg_s": 361.0},
             {"keyboard_look_rate_deg_s": True},
@@ -203,6 +212,18 @@ class MotionSettingsValueTest(unittest.TestCase):
             MODULE.MotionSettings(
                 keyboard_turn_rate_rad_s=3.00,
                 keyboard_turn_boost_rate_rad_s=2.75,
+            )
+
+    def test_gait_heading_thresholds_keep_hysteresis_gap(self) -> None:
+        with self.assertRaisesRegex(MODULE.MotionSettingsError, "at least"):
+            MODULE.MotionSettings(
+                gait_start_heading_error_rad=math.radians(62.0),
+                gait_stop_heading_error_rad=math.radians(65.0),
+            )
+        with self.assertRaisesRegex(MODULE.MotionSettingsError, "at least"):
+            MODULE.MotionSettings(
+                gait_start_heading_error_rad=math.radians(65.0),
+                gait_stop_heading_error_rad=math.radians(65.0),
             )
 
     def test_value_lookup_and_replacement_accept_only_whitelisted_paths(self) -> None:
@@ -248,6 +269,34 @@ class MotionSettingsValueTest(unittest.TestCase):
             settings.value_for_path(MODULE.KEYBOARD_LOOK_RATE_PATH),
             MODULE.DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
         )
+        self.assertAlmostEqual(
+            settings.value_for_path(MODULE.GAIT_START_HEADING_ERROR_PATH),
+            math.radians(45.0),
+        )
+        self.assertAlmostEqual(
+            settings.value_for_path(MODULE.GAIT_STOP_HEADING_ERROR_PATH),
+            math.radians(65.0),
+        )
+        start_replacement = settings.with_value(
+            MODULE.GAIT_START_HEADING_ERROR_PATH,
+            math.radians(50.0),
+            revision=7,
+        )
+        self.assertAlmostEqual(
+            start_replacement.gait_start_heading_error_rad,
+            math.radians(50.0),
+        )
+        self.assertEqual(start_replacement.revision, 7)
+        stop_replacement = settings.with_value(
+            MODULE.GAIT_STOP_HEADING_ERROR_PATH,
+            math.radians(70.0),
+            revision=8,
+        )
+        self.assertAlmostEqual(
+            stop_replacement.gait_stop_heading_error_rad,
+            math.radians(70.0),
+        )
+        self.assertEqual(stop_replacement.revision, 8)
         look_replacement = settings.with_value(
             MODULE.KEYBOARD_LOOK_RATE_PATH,
             180.0,
@@ -402,6 +451,8 @@ class MotionSettingsStepTest(unittest.TestCase):
             (MODULE.MAX_TURN_RATE_PATH, -1, 2.25),
             (MODULE.KEYBOARD_TURN_RATE_PATH, 1, 1.75),
             (MODULE.KEYBOARD_TURN_BOOST_RATE_PATH, -1, 2.75),
+            (MODULE.GAIT_START_HEADING_ERROR_PATH, 1, round(math.radians(50.0), 10)),
+            (MODULE.GAIT_STOP_HEADING_ERROR_PATH, -1, round(math.radians(60.0), 10)),
             (MODULE.KEYBOARD_LOOK_RATE_PATH, 1, 150.0),
         )
         for setting_path, direction, expected in cases:
@@ -496,6 +547,28 @@ class MotionSettingsStepTest(unittest.TestCase):
                 -1,
             ),
             3.0,
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(
+                MODULE.MotionSettings(
+                    gait_start_heading_error_rad=math.radians(60.0),
+                    gait_stop_heading_error_rad=math.radians(65.0),
+                ),
+                MODULE.GAIT_START_HEADING_ERROR_PATH,
+                1,
+            ),
+            round(math.radians(60.0), 10),
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(
+                MODULE.MotionSettings(
+                    gait_start_heading_error_rad=math.radians(60.0),
+                    gait_stop_heading_error_rad=math.radians(65.0),
+                ),
+                MODULE.GAIT_STOP_HEADING_ERROR_PATH,
+                -1,
+            ),
+            round(math.radians(65.0), 10),
         )
 
         sub_step_gap = MODULE.MotionSettings(

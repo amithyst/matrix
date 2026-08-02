@@ -57,6 +57,10 @@ from matrix_overlay_motion_settings import (
     BFM_TURN_COMMAND_YAW_LIMIT_PATH,
     DOUBLE_TAP_SPEED_FIELD,
     GEARS,
+    GAIT_START_HEADING_ERROR_FIELD,
+    GAIT_START_HEADING_ERROR_PATH,
+    GAIT_STOP_HEADING_ERROR_FIELD,
+    GAIT_STOP_HEADING_ERROR_PATH,
     KEYBOARD_LOOK_RATE_FIELD,
     KEYBOARD_LOOK_RATE_PATH,
     KEYBOARD_SPEED_CAP_FIELD,
@@ -587,7 +591,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     motion_bottom = speed_y - motion_outer_gap
     motion_row_height = max(
         1,
-        (motion_bottom - motion_top - 5 * motion_row_gap) // 6,
+        (motion_bottom - motion_top - 6 * motion_row_gap) // 7,
     )
     motion_left_x = panel_x + margin
     motion_left_width = max(
@@ -991,15 +995,32 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     turn_y = motion_top + 3 * (motion_row_height + motion_row_gap)
     boost_y = motion_top + 4 * (motion_row_height + motion_row_gap)
     look_y = motion_top + 5 * (motion_row_height + motion_row_gap)
+    gait_y = motion_top + 6 * (motion_row_height + motion_row_gap)
     turn_specs = (
-        ("motion_turn_rate", motion_left_x, motion_left_width),
-        ("motion_keyboard_turn_rate", motion_right_x, motion_right_width),
-        ("motion_keyboard_turn_boost_rate", motion_left_x, motion_left_width),
-        ("motion_bfm_turn_command_yaw_limit", motion_right_x, motion_right_width),
-        ("motion_camera_look_rate", motion_left_x, motion_left_width),
+        ("motion_turn_rate", motion_left_x, motion_left_width, turn_y),
+        ("motion_keyboard_turn_rate", motion_right_x, motion_right_width, turn_y),
+        (
+            "motion_keyboard_turn_boost_rate",
+            motion_left_x,
+            motion_left_width,
+            boost_y,
+        ),
+        (
+            "motion_bfm_turn_command_yaw_limit",
+            motion_right_x,
+            motion_right_width,
+            boost_y,
+        ),
+        ("motion_camera_look_rate", motion_left_x, motion_left_width, look_y),
+        (
+            "motion_gait_start_heading_error",
+            motion_right_x,
+            motion_right_width,
+            look_y,
+        ),
+        ("motion_gait_stop_heading_error", motion_left_x, motion_left_width, gait_y),
     )
-    for index, (stem, cell_x, cell_width) in enumerate(turn_specs):
-        row_y = turn_y if index < 2 else boost_y if index < 4 else look_y
+    for stem, cell_x, cell_width, row_y in turn_specs:
         button_width = 24 if compact else max(32, min(52, cell_width // 4))
         value_width = max(1, cell_width - 2 * button_width)
         result[f"{stem}_down"] = (
@@ -1211,6 +1232,26 @@ _MOTION_STEP_ACTION_DETAILS.update(
         f"motion_camera_look_rate_{suffix}": (
             "camera",
             KEYBOARD_LOOK_RATE_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_gait_start_heading_error_{suffix}": (
+            "gait",
+            GAIT_START_HEADING_ERROR_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_gait_stop_heading_error_{suffix}": (
+            "gait",
+            GAIT_STOP_HEADING_ERROR_FIELD,
             direction,
         )
         for suffix, direction in (("down", -1), ("up", 1))
@@ -2869,6 +2910,10 @@ class MotionSettingsPanelModel:
             return self.settings.value_for_path(BFM_TURN_COMMAND_YAW_LIMIT_PATH)
         if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
             return self.settings.value_for_path(KEYBOARD_SPEED_CAP_PATH)
+        if gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+            return self.settings.value_for_path(GAIT_START_HEADING_ERROR_PATH)
+        if gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+            return self.settings.value_for_path(GAIT_STOP_HEADING_ERROR_PATH)
         if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
             return self.settings.value_for_path(KEYBOARD_LOOK_RATE_PATH)
         return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
@@ -3109,6 +3154,10 @@ def motion_step_target(
         path = KEYBOARD_TURN_BOOST_RATE_PATH
     elif gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
         path = BFM_TURN_COMMAND_YAW_LIMIT_PATH
+    elif gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+        path = GAIT_START_HEADING_ERROR_PATH
+    elif gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+        path = GAIT_STOP_HEADING_ERROR_PATH
     else:
         path = f"control.motion.gears.{gear}.{field}"
     current = model.settings.value_for_path(path)
@@ -3156,6 +3205,16 @@ def motion_step_command(
             f"/data modify entity @s {KEYBOARD_SPEED_CAP_PATH} "
             f"set value {target:.2f}"
         )
+    if gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+        return (
+            f"/data modify entity @s {GAIT_START_HEADING_ERROR_PATH} "
+            f"set value {target:.10f}"
+        )
+    if gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+        return (
+            f"/data modify entity @s {GAIT_STOP_HEADING_ERROR_PATH} "
+            f"set value {target:.10f}"
+        )
     return (
         f"/data modify entity @s control.motion.gears.{gear}.{field} "
         f"set value {target:.2f}"
@@ -3191,6 +3250,12 @@ def motion_value_label(
     if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
         value = model.value(gear, field)
         return f"限{value:.2f}" if compact else f"键盘速度上限 {value:.2f} m/s"
+    if gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+        value_deg = math.degrees(model.value(gear, field))
+        return f"走{value_deg:.0f}°" if compact else f"边走阈值 {value_deg:.0f}°"
+    if gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+        value_deg = math.degrees(model.value(gear, field))
+        return f"停{value_deg:.0f}°" if compact else f"原地阈值 {value_deg:.0f}°"
     if (gear, field) not in _MOTION_CONTROL_SPECS:
         raise ValueError("unsupported motion value label")
     value = model.value(gear, field)
@@ -6681,6 +6746,7 @@ class X11CalibrationOverlay:
             (
                 "WASD 模式：相机朝向=按镜头前方行走并自动面向；相机侧移=按镜头平移；机身相对=按机器人自身坐标。",
                 "SONIC：" + native_mode_description_zh(None) + " 4-19 含蹲/跪/爬行/拳击/跳跃/风格走路。",
+                "相机朝向阈值：边走≤45°默认可走着转；移动中>65°默认退回原地转，差值用于防抖。",
             )
         ):
             self._draw_text(
@@ -6862,6 +6928,16 @@ class X11CalibrationOverlay:
                 BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
             ),
             ("motion_camera_look_rate", "camera", KEYBOARD_LOOK_RATE_FIELD),
+            (
+                "motion_gait_start_heading_error",
+                "gait",
+                GAIT_START_HEADING_ERROR_FIELD,
+            ),
+            (
+                "motion_gait_stop_heading_error",
+                "gait",
+                GAIT_STOP_HEADING_ERROR_FIELD,
+            ),
         ):
             for suffix in ("down", "up"):
                 action = f"{stem}_{suffix}"

@@ -15,6 +15,7 @@ import re
 from typing import Any, Mapping, TypeAlias
 
 from matrix_movement_modes import validate_movement_mode
+from matrix_motion_settings import MOTION_SETTING_PATHS
 from matrix_world_state import (
     MatrixWorldState,
     TELEPORT_POINT_TYPE,
@@ -45,6 +46,10 @@ _RECOVER_RE = re.compile(r"/?(?:recover|tpstand)(?:\s+@s)?\s*\Z")
 _MODE_RE = re.compile(r"/?mode\s+(?P<mode>[A-Za-z0-9_+-]+)\s*\Z")
 _SONIC_MODE_RE = re.compile(
     r"/?(?:sonic|native)\s+mode\s+(?P<mode>auto|[0-9]{1,2})\s*\Z"
+)
+_DATA_MODIFY_RE = re.compile(
+    r"/?data\s+modify\s+entity\s+@s\s+"
+    r"(?P<path>[A-Za-z0-9_.]+)\s+set\s+value\s+(?P<value>\S+)\s*\Z"
 )
 _FUNCTION_RE = re.compile(r"/?function\s+(?P<body>.+?)\s*\Z")
 _FUNCTION_NAME_RE = re.compile(
@@ -251,6 +256,29 @@ class NativeModeSet:
 
 
 @dataclass(frozen=True)
+class MotionSettingSet:
+    path: str
+    value: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or self.path not in MOTION_SETTING_PATHS:
+            raise CommandParseError(
+                "E_DATA_PATH_UNKNOWN",
+                f"unsupported motion settings path: {self.path!r}",
+            )
+        if (
+            isinstance(self.value, bool)
+            or not isinstance(self.value, (int, float))
+            or not math.isfinite(float(self.value))
+        ):
+            raise CommandParseError(
+                "E_DATA_VALUE",
+                "data modify value must be a finite JSON number",
+            )
+        object.__setattr__(self, "value", float(self.value))
+
+
+@dataclass(frozen=True)
 class CommandFunctionRun:
     commands: tuple["AtomicMcCommand", ...]
 
@@ -283,6 +311,7 @@ AtomicMcCommand: TypeAlias = (
     | RecoverHere
     | MovementModeSet
     | NativeModeSet
+    | MotionSettingSet
 )
 McCommand: TypeAlias = (
     AtomicMcCommand | CommandFunctionRun | CommandFunctionCall
@@ -397,6 +426,7 @@ def _is_atomic_command(command: object) -> bool:
             RecoverHere,
             MovementModeSet,
             NativeModeSet,
+            MotionSettingSet,
         ),
     )
 
@@ -547,6 +577,21 @@ def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
             NativeModeSet(None if value == "auto" else int(value, 10))
         )
 
+    data_modify = _DATA_MODIFY_RE.fullmatch(command_text)
+    if data_modify is not None:
+        raw_value = data_modify.group("value")
+        if _NUMBER_RE.fullmatch(raw_value) is None:
+            raise CommandParseError(
+                "E_DATA_VALUE",
+                f"invalid data modify value {raw_value!r}",
+            )
+        return ParsedCommand(
+            MotionSettingSet(
+                data_modify.group("path"),
+                float(raw_value),
+            )
+        )
+
     first = command_text.lstrip("/").split(maxsplit=1)[0]
     if first in {"sumon", "summonn", "summom"}:
         raise CommandParseError(
@@ -554,7 +599,7 @@ def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
         )
     raise CommandParseError(
         "E_COMMAND_UNKNOWN",
-        "supported commands are /summon, /tp, /pose, /recover, /mode, /sonic mode, and /function",
+        "supported commands are /summon, /tp, /pose, /recover, /mode, /sonic mode, /data modify, and /function",
     )
 
 
@@ -595,6 +640,12 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
         return {
             "name": "native_mode_set",
             "native_mode": command.native_mode,
+        }
+    if isinstance(command, MotionSettingSet):
+        return {
+            "name": "motion_setting_set",
+            "path": command.path,
+            "value": command.value,
         }
     if isinstance(command, CommandFunctionRun):
         return {
@@ -660,6 +711,13 @@ def command_from_mapping(value: object) -> McCommand:
             raise CommandProtocolError("native mode command has an invalid schema")
         try:
             return NativeModeSet(value.get("native_mode"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "motion_setting_set":
+        if set(value) != {"name", "path", "value"}:
+            raise CommandProtocolError("motion setting command has an invalid schema")
+        try:
+            return MotionSettingSet(value.get("path"), value.get("value"))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     if name == "pose_yaw_set":
@@ -1030,10 +1088,10 @@ def execute_command(
         restart_required = False
         results: list[dict[str, object]] = []
         for item in command.commands:
-            if isinstance(item, (MovementModeSet, NativeModeSet)):
+            if isinstance(item, (MovementModeSet, NativeModeSet, MotionSettingSet)):
                 raise CommandExecutionError(
                     "E_FUNCTION_RUNTIME_COMMAND",
-                    "movement/native mode function steps require runtime support",
+                    "movement/native/motion setting function steps require runtime support",
                 )
             effect = execute_command(
                 item,
@@ -1065,6 +1123,11 @@ def execute_command(
             "E_FUNCTION_RUNTIME_ONLY",
             "file-backed functions require runtime support",
         )
+    if isinstance(command, MotionSettingSet):
+        raise CommandExecutionError(
+            "E_MOTION_SETTING_RUNTIME_ONLY",
+            "motion setting commands require runtime support",
+        )
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
@@ -1080,6 +1143,7 @@ __all__ = [
     "GameCommandRequest",
     "GameCommandResponse",
     "MovementModeSet",
+    "MotionSettingSet",
     "NativeModeSet",
     "ParsedCommand",
     "PoseYawSet",

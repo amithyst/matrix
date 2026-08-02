@@ -10,6 +10,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import matrix_mc_commands as MODULE  # noqa: E402
+import matrix_motion_settings as MOTION_SETTINGS  # noqa: E402
 from matrix_world_state import MatrixWorldState, WorldPose  # noqa: E402
 
 
@@ -69,6 +70,13 @@ class McCommandParserTest(unittest.TestCase):
         movement = MODULE.parse_mc_command("/mode camera_strafe").command
         native = MODULE.parse_mc_command("/sonic mode 7").command
         auto = MODULE.parse_mc_command("/sonic mode auto").command
+        gait_threshold = MODULE.parse_mc_command(
+            (
+                "/data modify entity @s "
+                "control.motion.gait_start_heading_error_rad "
+                f"set value {math.radians(50.0):.10f}"
+            )
+        ).command
         file_function = MODULE.parse_mc_command("/function recover_here").command
         function = MODULE.parse_mc_command(
             "/function /tp @s ~1 ~ ~; /pose @s yaw 180deg"
@@ -79,9 +87,52 @@ class McCommandParserTest(unittest.TestCase):
         self.assertEqual(movement, MODULE.MovementModeSet("camera_strafe"))
         self.assertEqual(native, MODULE.NativeModeSet(7))
         self.assertEqual(auto, MODULE.NativeModeSet(None))
+        self.assertEqual(
+            gait_threshold,
+            MODULE.MotionSettingSet(
+                MOTION_SETTINGS.GAIT_START_HEADING_ERROR_PATH,
+                float(f"{math.radians(50.0):.10f}"),
+            ),
+        )
         self.assertEqual(file_function, MODULE.CommandFunctionCall("recover_here"))
         self.assertIsInstance(function, MODULE.CommandFunctionRun)
         self.assertEqual(len(function.commands), 2)
+
+    def test_data_modify_motion_setting_command_is_whitelisted_and_strict(self) -> None:
+        command = MODULE.MotionSettingSet(
+            MOTION_SETTINGS.GAIT_STOP_HEADING_ERROR_PATH,
+            math.radians(70.0),
+        )
+        self.assertEqual(
+            MODULE.command_from_mapping(MODULE.command_to_mapping(command)),
+            command,
+        )
+
+        for text in (
+            "/data modify entity @s control.motion.unknown set value 1.0",
+            "/data modify entity @s control.motion.gait_stop_heading_error_rad set value true",
+            "/data modify entity @s control.motion.gait_stop_heading_error_rad set value nan",
+            "/data modify entity @s control.motion.gait_stop_heading_error_rad set value 1e999",
+        ):
+            with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
+                MODULE.parse_mc_command(text)
+
+        for payload in (
+            {
+                "name": "motion_setting_set",
+                "path": "control.motion.unknown",
+                "value": 1.0,
+            },
+            {
+                "name": "motion_setting_set",
+                "path": MOTION_SETTINGS.GAIT_STOP_HEADING_ERROR_PATH,
+                "value": float("nan"),
+            },
+        ):
+            with self.subTest(payload=payload), self.assertRaises(
+                MODULE.CommandProtocolError
+            ):
+                MODULE.command_from_mapping(payload)
 
     def test_selector_order_is_irrelevant_but_contract_is_strict(self) -> None:
         selector = MODULE.parse_mc_command(
@@ -272,6 +323,25 @@ class McCommandExecutionTest(unittest.TestCase):
             )
 
         self.assertEqual(context.exception.code, "E_FUNCTION_RUNTIME_ONLY")
+
+    def test_motion_settings_command_requires_runtime_support(self) -> None:
+        command = MODULE.parse_mc_command(
+            (
+                "/data modify entity @s "
+                "control.motion.gait_start_heading_error_rad "
+                f"set value {math.radians(50.0):.10f}"
+            )
+        ).command
+
+        with self.assertRaises(MODULE.CommandExecutionError) as context:
+            MODULE.execute_command(
+                command,
+                state=self.state,
+                current_pose=self.origin,
+                now_unix_ns=4,
+            )
+
+        self.assertEqual(context.exception.code, "E_MOTION_SETTING_RUNTIME_ONLY")
 
     def test_missing_selector_target_does_not_mutate_state(self) -> None:
         command = MODULE.parse_mc_command(

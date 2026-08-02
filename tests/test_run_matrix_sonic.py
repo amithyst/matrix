@@ -24,6 +24,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 GAME_CONTROL = sys.modules["matrix_game_control"]
 MC_COMMANDS = sys.modules["matrix_mc_commands"]
+MOTION_SETTINGS = sys.modules["matrix_motion_settings"]
 WORLD_STATE = sys.modules["matrix_world_state"]
 
 
@@ -833,6 +834,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["keyboard_slow_speed_mps"], 0.10)
         self.assertEqual(status["keyboard_walk_speed_mps"], 0.80)
         self.assertEqual(status["keyboard_run_speed_mps"], 2.50)
+        self.assertAlmostEqual(status["gait_start_heading_error_deg"], 45.0)
+        self.assertAlmostEqual(status["gait_stop_heading_error_deg"], 65.0)
         self.assertEqual(status["maximum_speed_mps"], 0.30)
         self.assertEqual(status["analog_maximum_speed_mps"], 0.30)
         self.assertEqual(status["keyboard_maximum_target_speed_mps"], 2.50)
@@ -973,6 +976,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             ),
             90.0,
         )
+
+        tuned_args = SimpleNamespace(**vars(args))
+        tuned_args.game_motion_settings = MOTION_SETTINGS.MotionSettings(
+            gait_start_heading_error_rad=math.radians(35.0),
+            gait_stop_heading_error_rad=math.radians(55.0),
+        )
+        tuned_status = MODULE._game_control_status_fields(tuned_args)
+        self.assertAlmostEqual(tuned_status["gait_start_heading_error_deg"], 35.0)
+        self.assertAlmostEqual(tuned_status["gait_stop_heading_error_deg"], 55.0)
 
     def test_acceptance_rejects_fall_and_short_lowcmd(self) -> None:
         failures = MODULE._acceptance_failures(
@@ -2232,6 +2244,119 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         finally:
             provider_socket.close()
             runtime.close()
+
+    def test_game_command_runtime_can_apply_live_gait_heading_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "motion.json"
+            motion_store = MOTION_SETTINGS.MotionSettingsStore(
+                settings_path,
+                initial=MOTION_SETTINGS.MotionSettings(),
+            )
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            core = GAME_CONTROL.GameControlCore()
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                None,
+                core,
+                motion_settings=motion_store,
+            )
+            request = self.game_command_request(
+                (
+                    "/data modify entity @s "
+                    "control.motion.gait_start_heading_error_rad "
+                    f"set value {math.radians(50.0):.10f}"
+                ),
+                sequence=1,
+                request_character="8",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(
+                        current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                        command_allowed=True,
+                    )
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_MOTION_SETTING_CHANGED")
+                self.assertEqual(
+                    response.data["path"],
+                    MOTION_SETTINGS.GAIT_START_HEADING_ERROR_PATH,
+                )
+                self.assertAlmostEqual(
+                    response.data["gait_start_heading_error_deg"],
+                    50.0,
+                )
+                self.assertAlmostEqual(
+                    core.config.gait_start_heading_error_rad,
+                    math.radians(50.0),
+                )
+                self.assertAlmostEqual(
+                    MOTION_SETTINGS.load_settings(
+                        settings_path
+                    ).settings.gait_start_heading_error_rad,
+                    math.radians(50.0),
+                )
+                self.assertTrue(response.data["motion_settings"]["available"])
+            finally:
+                provider_socket.close()
+                runtime.close()
+
+    def test_game_command_runtime_rejects_motion_settings_outside_esc_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "motion.json"
+            motion_store = MOTION_SETTINGS.MotionSettingsStore(
+                settings_path,
+                initial=MOTION_SETTINGS.MotionSettings(),
+            )
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                None,
+                motion_settings=motion_store,
+            )
+            request = self.game_command_request(
+                (
+                    "/data modify entity @s "
+                    "control.motion.gait_stop_heading_error_rad "
+                    f"set value {math.radians(70.0):.10f}"
+                ),
+                sequence=1,
+                request_character="9",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(
+                        current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                        command_allowed=False,
+                    )
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertFalse(response.ok)
+                self.assertEqual(response.code, "E_NOT_PAUSED")
+                self.assertEqual(runtime.rejected_commands, 1)
+                self.assertAlmostEqual(
+                    motion_store.settings.gait_stop_heading_error_rad,
+                    math.radians(65.0),
+                )
+                self.assertFalse(settings_path.exists())
+            finally:
+                provider_socket.close()
+                runtime.close()
 
     def test_game_command_runtime_file_function_can_set_native_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -497,6 +498,50 @@ class OverlayStateTest(unittest.TestCase):
         )
         self.assertEqual(model.current_scale, 1.0)
         self.assertEqual(model.next_scale, 1.0)
+
+    def test_motion_panel_exposes_adjustable_gait_heading_thresholds(self) -> None:
+        model = MODULE.MotionSettingsPanelModel(
+            settings=MODULE.MotionSettings(),
+            available=True,
+            load_status="loaded",
+            error=None,
+            camera_control_available=True,
+            camera_control_error=None,
+        )
+
+        self.assertEqual(
+            MODULE.motion_value_label(
+                model,
+                "gait",
+                MODULE.GAIT_START_HEADING_ERROR_FIELD,
+                compact=False,
+            ),
+            "边走阈值 45°",
+        )
+        self.assertEqual(
+            MODULE.motion_value_label(
+                model,
+                "gait",
+                MODULE.GAIT_STOP_HEADING_ERROR_FIELD,
+                compact=False,
+            ),
+            "原地阈值 65°",
+        )
+
+        start_command = MODULE.motion_step_command(
+            model,
+            "motion_gait_start_heading_error_up",
+        )
+        stop_command = MODULE.motion_step_command(
+            model,
+            "motion_gait_stop_heading_error_down",
+        )
+        self.assertIsNotNone(start_command)
+        self.assertIsNotNone(stop_command)
+        self.assertIn(MODULE.GAIT_START_HEADING_ERROR_PATH, start_command)
+        self.assertIn(MODULE.GAIT_STOP_HEADING_ERROR_PATH, stop_command)
+        self.assertIn(f"set value {math.radians(50.0):.10f}", start_command)
+        self.assertIn(f"set value {math.radians(60.0):.10f}", stop_command)
 
     def test_low_remote_scale_is_rendered_with_discrete_step_hint(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)

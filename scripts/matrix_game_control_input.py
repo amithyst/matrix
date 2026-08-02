@@ -58,6 +58,8 @@ from matrix_motion_settings import (
     GEAR_RUN,
     GEAR_SLOW,
     GEAR_WALK,
+    GAIT_START_HEADING_ERROR_PATH,
+    GAIT_STOP_HEADING_ERROR_PATH,
     KEYBOARD_LOOK_RATE_PATH,
     KEYBOARD_TURN_RATE_PATH,
     MotionSettings,
@@ -150,6 +152,10 @@ _MOTION_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
     "motion_turn_rate_up": (KEYBOARD_TURN_RATE_PATH, 1),
     "motion_look_rate_down": (KEYBOARD_LOOK_RATE_PATH, -1),
     "motion_look_rate_up": (KEYBOARD_LOOK_RATE_PATH, 1),
+    "motion_gait_start_heading_error_down": (GAIT_START_HEADING_ERROR_PATH, -1),
+    "motion_gait_start_heading_error_up": (GAIT_START_HEADING_ERROR_PATH, 1),
+    "motion_gait_stop_heading_error_down": (GAIT_STOP_HEADING_ERROR_PATH, -1),
+    "motion_gait_stop_heading_error_up": (GAIT_STOP_HEADING_ERROR_PATH, 1),
 }
 _VIDEO_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
     "video_camera_distance_down": (CAMERA_DISTANCE_CM_FIELD, -1),
@@ -534,6 +540,10 @@ def motion_settings_live_mapping(
 ) -> dict[str, object]:
     if store is None:
         return {"available": False, "pending_restart": False}
+    try:
+        store.reload_if_changed()
+    except (MotionSettingsError, OSError, ValueError) as exc:
+        persistence_error = str(exc)
     mapping = store.mapping()
     mapping.update(
         {

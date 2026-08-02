@@ -51,6 +51,16 @@ KEYBOARD_SPEED_CAP_PATH = f"control.motion.{KEYBOARD_SPEED_CAP_FIELD}"
 DEFAULT_KEYBOARD_SPEED_CAP_MPS = 0.40
 KEYBOARD_SPEED_CAP_RANGE_MPS = (0.10, 2.75)
 KEYBOARD_SPEED_CAP_STEP_MPS = 0.05
+GAIT_START_HEADING_ERROR_FIELD = "gait_start_heading_error_rad"
+GAIT_START_HEADING_ERROR_PATH = f"control.motion.{GAIT_START_HEADING_ERROR_FIELD}"
+DEFAULT_GAIT_START_HEADING_ERROR_RAD = math.radians(45.0)
+GAIT_STOP_HEADING_ERROR_FIELD = "gait_stop_heading_error_rad"
+GAIT_STOP_HEADING_ERROR_PATH = f"control.motion.{GAIT_STOP_HEADING_ERROR_FIELD}"
+DEFAULT_GAIT_STOP_HEADING_ERROR_RAD = math.radians(65.0)
+GAIT_HEADING_ERROR_RANGE_RAD = (math.radians(5.0), math.radians(90.0))
+GAIT_HEADING_ERROR_STEP_RAD = math.radians(5.0)
+GAIT_HEADING_ERROR_MIN_GAP_RAD = GAIT_HEADING_ERROR_STEP_RAD
+GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD = 1e-9
 KEYBOARD_LOOK_RATE_FIELD = "keyboard_look_rate_deg_s"
 KEYBOARD_LOOK_RATE_PATH = f"control.camera.{KEYBOARD_LOOK_RATE_FIELD}"
 DEFAULT_KEYBOARD_LOOK_RATE_DEG_S = 120.0
@@ -93,6 +103,8 @@ MOTION_SETTING_PATHS = frozenset(
         KEYBOARD_TURN_BOOST_RATE_PATH,
         BFM_TURN_COMMAND_YAW_LIMIT_PATH,
         KEYBOARD_SPEED_CAP_PATH,
+        GAIT_START_HEADING_ERROR_PATH,
+        GAIT_STOP_HEADING_ERROR_PATH,
         KEYBOARD_LOOK_RATE_PATH,
     ]
     + [
@@ -244,6 +256,14 @@ def _is_keyboard_speed_cap_path(path: object) -> bool:
     return path == KEYBOARD_SPEED_CAP_PATH
 
 
+def _is_gait_heading_error_path(path: object) -> bool:
+    if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
+        raise MotionSettingsError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
+        )
+    return path in {GAIT_START_HEADING_ERROR_PATH, GAIT_STOP_HEADING_ERROR_PATH}
+
+
 @dataclass(frozen=True)
 class MotionSettings:
     """One validated, revisioned snapshot of motion and keyboard camera rates."""
@@ -257,6 +277,8 @@ class MotionSettings:
         DEFAULT_BFM_TURN_COMMAND_YAW_LIMIT_RAD_S
     )
     keyboard_speed_cap_mps: float = DEFAULT_KEYBOARD_SPEED_CAP_MPS
+    gait_start_heading_error_rad: float = DEFAULT_GAIT_START_HEADING_ERROR_RAD
+    gait_stop_heading_error_rad: float = DEFAULT_GAIT_STOP_HEADING_ERROR_RAD
     keyboard_look_rate_deg_s: float = DEFAULT_KEYBOARD_LOOK_RATE_DEG_S
     slow_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][0]
     slow_double_tap_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][1]
@@ -342,6 +364,46 @@ class MotionSettings:
                 f"[{keyboard_speed_cap_minimum:.2f}, {keyboard_speed_cap_maximum:.2f}]",
             )
         object.__setattr__(self, KEYBOARD_SPEED_CAP_FIELD, keyboard_speed_cap)
+        gait_start_heading_error = _finite_speed(
+            self.gait_start_heading_error_rad,
+            name=GAIT_START_HEADING_ERROR_FIELD,
+        )
+        gait_stop_heading_error = _finite_speed(
+            self.gait_stop_heading_error_rad,
+            name=GAIT_STOP_HEADING_ERROR_FIELD,
+        )
+        heading_minimum, heading_maximum = GAIT_HEADING_ERROR_RANGE_RAD
+        for name, value in (
+            (GAIT_START_HEADING_ERROR_FIELD, gait_start_heading_error),
+            (GAIT_STOP_HEADING_ERROR_FIELD, gait_stop_heading_error),
+        ):
+            if not heading_minimum <= value <= heading_maximum:
+                raise MotionSettingsError(
+                    "E_DATA_RANGE",
+                    f"{name} must be in "
+                    f"[{math.degrees(heading_minimum):.0f}deg, "
+                    f"{math.degrees(heading_maximum):.0f}deg]",
+                )
+        if not (
+            gait_start_heading_error + GAIT_HEADING_ERROR_MIN_GAP_RAD
+            <= gait_stop_heading_error + 1e-12
+        ):
+            raise MotionSettingsError(
+                "E_DATA_CONSTRAINT",
+                f"{GAIT_START_HEADING_ERROR_FIELD} must be at least "
+                f"{math.degrees(GAIT_HEADING_ERROR_MIN_GAP_RAD):.0f}deg below "
+                f"{GAIT_STOP_HEADING_ERROR_FIELD}",
+            )
+        object.__setattr__(
+            self,
+            GAIT_START_HEADING_ERROR_FIELD,
+            gait_start_heading_error,
+        )
+        object.__setattr__(
+            self,
+            GAIT_STOP_HEADING_ERROR_FIELD,
+            gait_stop_heading_error,
+        )
         look_rate = _finite_speed(
             self.keyboard_look_rate_deg_s,
             name=KEYBOARD_LOOK_RATE_FIELD,
@@ -389,6 +451,10 @@ class MotionSettings:
             return self.bfm_turn_command_yaw_limit_rad_s
         if path == KEYBOARD_SPEED_CAP_PATH:
             return self.keyboard_speed_cap_mps
+        if path == GAIT_START_HEADING_ERROR_PATH:
+            return self.gait_start_heading_error_rad
+        if path == GAIT_STOP_HEADING_ERROR_PATH:
+            return self.gait_stop_heading_error_rad
         if _is_keyboard_look_rate_path(path):
             return self.keyboard_look_rate_deg_s
         gear, field = _path_parts(path)
@@ -411,6 +477,10 @@ class MotionSettings:
             field_name = BFM_TURN_COMMAND_YAW_LIMIT_FIELD
         elif path == KEYBOARD_SPEED_CAP_PATH:
             field_name = KEYBOARD_SPEED_CAP_FIELD
+        elif path == GAIT_START_HEADING_ERROR_PATH:
+            field_name = GAIT_START_HEADING_ERROR_FIELD
+        elif path == GAIT_STOP_HEADING_ERROR_PATH:
+            field_name = GAIT_STOP_HEADING_ERROR_FIELD
         elif _is_keyboard_look_rate_path(path):
             field_name = KEYBOARD_LOOK_RATE_FIELD
         else:
@@ -444,6 +514,8 @@ class MotionSettings:
                 self.bfm_turn_command_yaw_limit_rad_s
             ),
             KEYBOARD_SPEED_CAP_FIELD: self.keyboard_speed_cap_mps,
+            GAIT_START_HEADING_ERROR_FIELD: self.gait_start_heading_error_rad,
+            GAIT_STOP_HEADING_ERROR_FIELD: self.gait_stop_heading_error_rad,
             "movement": movement_mode_metadata(self.movement_mode),
             "camera": {
                 KEYBOARD_LOOK_RATE_FIELD: self.keyboard_look_rate_deg_s,
@@ -468,6 +540,8 @@ class MotionSettings:
             KEYBOARD_TURN_BOOST_RATE_FIELD,
             BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
             KEYBOARD_SPEED_CAP_FIELD,
+            GAIT_START_HEADING_ERROR_FIELD,
+            GAIT_STOP_HEADING_ERROR_FIELD,
             "camera",
             "movement",
         }
@@ -514,6 +588,14 @@ class MotionSettings:
             KEYBOARD_SPEED_CAP_FIELD: value.get(
                 KEYBOARD_SPEED_CAP_FIELD,
                 DEFAULT_KEYBOARD_SPEED_CAP_MPS,
+            ),
+            GAIT_START_HEADING_ERROR_FIELD: value.get(
+                GAIT_START_HEADING_ERROR_FIELD,
+                DEFAULT_GAIT_START_HEADING_ERROR_RAD,
+            ),
+            GAIT_STOP_HEADING_ERROR_FIELD: value.get(
+                GAIT_STOP_HEADING_ERROR_FIELD,
+                DEFAULT_GAIT_STOP_HEADING_ERROR_RAD,
             ),
             KEYBOARD_LOOK_RATE_FIELD: DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
             "movement_mode": DEFAULT_MOVEMENT_MODE,
@@ -748,6 +830,21 @@ _KEYBOARD_SPEED_CAP_STEP_PRESETS = tuple(
         + 1
     )
 )
+_GAIT_HEADING_ERROR_STEP_PRESETS = tuple(
+    round(
+        GAIT_HEADING_ERROR_RANGE_RAD[0] + index * GAIT_HEADING_ERROR_STEP_RAD,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (GAIT_HEADING_ERROR_RANGE_RAD[1] - GAIT_HEADING_ERROR_RANGE_RAD[0])
+                / GAIT_HEADING_ERROR_STEP_RAD
+            )
+        )
+        + 1
+    )
+)
 
 
 def step_motion_speed(
@@ -815,6 +912,46 @@ def step_motion_speed(
             return candidates[0] if candidates else presets[-1]
         candidates = tuple(value for value in presets if value < current - 1e-12)
         return candidates[-1] if candidates else presets[0]
+    if _is_gait_heading_error_path(path):
+        current = settings.value_for_path(path)
+        presets = _GAIT_HEADING_ERROR_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(
+                value
+                for value in presets
+                if value > current + GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+            )
+            result = candidates[0] if candidates else presets[-1]
+        else:
+            candidates = tuple(
+                value
+                for value in presets
+                if value < current - GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+            )
+            result = candidates[-1] if candidates else presets[0]
+        if path == GAIT_START_HEADING_ERROR_PATH:
+            stop = settings.value_for_path(GAIT_STOP_HEADING_ERROR_PATH)
+            allowed = tuple(
+                value
+                for value in presets
+                if value + GAIT_HEADING_ERROR_MIN_GAP_RAD
+                <= stop + GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+            )
+            if not allowed:
+                return current
+            return min(result, allowed[-1])
+        start = settings.value_for_path(GAIT_START_HEADING_ERROR_PATH)
+        allowed = tuple(
+            value
+            for value in presets
+            if value
+            >= start
+            + GAIT_HEADING_ERROR_MIN_GAP_RAD
+            - GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+        )
+        if not allowed:
+            return current
+        return max(result, allowed[0])
     gear, field = _path_parts(path)
     current = settings.value_for_path(path)
     presets = _GEAR_STEP_PRESETS[gear]
@@ -1030,6 +1167,8 @@ class MotionSettingsStore:
 
 
 __all__ = [
+    "DEFAULT_GAIT_START_HEADING_ERROR_RAD",
+    "DEFAULT_GAIT_STOP_HEADING_ERROR_RAD",
     "DEFAULT_KEYBOARD_LOOK_RATE_DEG_S",
     "DEFAULT_GEAR_SPEEDS_MPS",
     "DEFAULT_MAX_TURN_RATE_RAD_S",
@@ -1037,6 +1176,13 @@ __all__ = [
     "GEARS",
     "GEAR_SPEED_RANGES_MPS",
     "GEAR_STEP_MPS",
+    "GAIT_HEADING_ERROR_MIN_GAP_RAD",
+    "GAIT_HEADING_ERROR_RANGE_RAD",
+    "GAIT_HEADING_ERROR_STEP_RAD",
+    "GAIT_START_HEADING_ERROR_FIELD",
+    "GAIT_START_HEADING_ERROR_PATH",
+    "GAIT_STOP_HEADING_ERROR_FIELD",
+    "GAIT_STOP_HEADING_ERROR_PATH",
     "KEYBOARD_LOOK_RATE_FIELD",
     "KEYBOARD_LOOK_RATE_PATH",
     "KEYBOARD_LOOK_RATE_RANGE_DEG_S",

@@ -57,6 +57,7 @@ from matrix_mc_commands import (
     GameCommandResponse,
     MAX_COMMAND_PACKET_BYTES,
     MovementModeSet,
+    MotionSettingSet,
     NativeModeSet,
     decode_command_request,
     encode_command_response,
@@ -65,7 +66,14 @@ from matrix_mc_commands import (
     validate_function_name,
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
-from matrix_motion_settings import MotionSettings, MotionSettingsStore
+from matrix_motion_settings import (
+    DEFAULT_GAIT_START_HEADING_ERROR_RAD,
+    DEFAULT_GAIT_STOP_HEADING_ERROR_RAD,
+    MotionSettings,
+    MotionSettingsError,
+    MotionSettingsPersistenceError,
+    MotionSettingsStore,
+)
 from matrix_world_state import (
     WorldPose,
     WorldStateError,
@@ -1588,6 +1596,16 @@ def _game_control_status_fields(
         if isinstance(motion_settings, MotionSettings)
         else KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE]
     )
+    gait_start_heading_error_rad = (
+        motion_settings.gait_start_heading_error_rad
+        if isinstance(motion_settings, MotionSettings)
+        else DEFAULT_GAIT_START_HEADING_ERROR_RAD
+    )
+    gait_stop_heading_error_rad = (
+        motion_settings.gait_stop_heading_error_rad
+        if isinstance(motion_settings, MotionSettings)
+        else DEFAULT_GAIT_STOP_HEADING_ERROR_RAD
+    )
     return {
         "input_protocol": PROTOCOL_NAME,
         "input_source_requested": args.game_input_source,
@@ -1641,6 +1659,10 @@ def _game_control_status_fields(
             if isinstance(motion_settings, MotionSettings)
             else 3.00
         ),
+        "gait_start_heading_error_rad": gait_start_heading_error_rad,
+        "gait_start_heading_error_deg": math.degrees(gait_start_heading_error_rad),
+        "gait_stop_heading_error_rad": gait_stop_heading_error_rad,
+        "gait_stop_heading_error_deg": math.degrees(gait_stop_heading_error_rad),
         "keyboard_camera_look_rate_deg_s": (
             motion_settings.keyboard_look_rate_deg_s
             if isinstance(motion_settings, MotionSettings)
@@ -1717,6 +1739,41 @@ def _game_control_status_fields(
         "visible_follow_camera_verified": False,
         "external_visual_evidence_required": True,
     }
+
+
+def _control_config_with_motion_settings(
+    base: ControlConfig,
+    motion_settings: MotionSettings,
+) -> ControlConfig:
+    """Return a live control config with host motion settings applied."""
+
+    if not isinstance(base, ControlConfig):
+        raise TypeError("base control config is required")
+    if not isinstance(motion_settings, MotionSettings):
+        raise TypeError("motion settings are required")
+    return ControlConfig(
+        max_speed_mps=base.max_speed_mps,
+        max_acceleration_mps2=base.max_acceleration_mps2,
+        max_deceleration_mps2=base.max_deceleration_mps2,
+        max_turn_rate_rad_s=motion_settings.max_turn_rate_rad_s,
+        keyboard_turn_rate_rad_s=motion_settings.keyboard_turn_rate_rad_s,
+        keyboard_turn_boost_rate_rad_s=motion_settings.keyboard_turn_boost_rate_rad_s,
+        keyboard_slow_speed_mps=motion_settings.slow_speed_mps,
+        keyboard_walk_speed_mps=motion_settings.walk_speed_mps,
+        keyboard_run_speed_mps=motion_settings.run_speed_mps,
+        movement_mode=motion_settings.movement_mode,
+        min_gait_speed_mps=base.min_gait_speed_mps,
+        gait_start_speed_mps=base.gait_start_speed_mps,
+        gait_stop_speed_mps=base.gait_stop_speed_mps,
+        gait_start_heading_error_rad=motion_settings.gait_start_heading_error_rad,
+        gait_stop_heading_error_rad=motion_settings.gait_stop_heading_error_rad,
+        stick_deadzone=base.stick_deadzone,
+        input_timeout_s=base.input_timeout_s,
+        max_snapshot_age_s=base.max_snapshot_age_s,
+        max_future_skew_s=base.max_future_skew_s,
+        max_step_s=base.max_step_s,
+        speed_epsilon_mps=base.speed_epsilon_mps,
+    )
 
 
 _EXPECTED_SNAPSHOT_DIMS = {
@@ -2348,6 +2405,7 @@ class GameCommandRuntime:
         world: _GameWorldStateRuntime | None,
         core: GameControlCore | None = None,
         function_directory: Path | None = None,
+        motion_settings: MotionSettingsStore | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -2356,6 +2414,7 @@ class GameCommandRuntime:
         self.function_directory = (
             function_directory.resolve() if function_directory is not None else None
         )
+        self.motion_settings = motion_settings
         self.session: str | None = None
         self.last_sequence = 0
         self.request_ids: set[str] = set()
@@ -2461,6 +2520,64 @@ class GameCommandRuntime:
                 "native_mode_name": label,
                 "native_mode_label_zh": native_mode_label_zh(mode),
                 "native_mode_description_zh": native_mode_description_zh(mode),
+            },
+        )
+
+    def _motion_settings_telemetry(self) -> dict[str, object]:
+        if self.motion_settings is None:
+            return {"available": False, "pending_restart": False}
+        return {
+            **self.motion_settings.mapping(),
+            "available": True,
+            "pending_restart": False,
+        }
+
+    def _apply_motion_setting_command(
+        self,
+        command: MotionSettingSet,
+    ) -> tuple[str, str, dict[str, object]]:
+        if self.motion_settings is None:
+            raise CommandExecutionError(
+                "E_MOTION_SETTINGS_UNAVAILABLE",
+                "No Matrix motion settings store was configured for this run",
+            )
+        try:
+            self.motion_settings.reload_if_changed()
+            modification = self.motion_settings.modify(command.path, command.value)
+            self.core.config = _control_config_with_motion_settings(
+                self.core.config,
+                modification.settings,
+            )
+        except (
+            MotionSettingsError,
+            MotionSettingsPersistenceError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise CommandExecutionError(
+                "E_MOTION_SETTING",
+                str(exc),
+            ) from exc
+        code = (
+            "OK_MOTION_SETTING_CHANGED"
+            if modification.changed
+            else "OK_MOTION_SETTING_UNCHANGED"
+        )
+        return (
+            code,
+            f"Motion setting {modification.path} = {modification.value:.10g}",
+            {
+                "path": modification.path,
+                "previous_value": modification.previous_value,
+                "value": modification.value,
+                "changed": modification.changed,
+                "motion_settings": self._motion_settings_telemetry(),
+                "gait_start_heading_error_deg": math.degrees(
+                    modification.settings.gait_start_heading_error_rad
+                ),
+                "gait_stop_heading_error_deg": math.degrees(
+                    modification.settings.gait_stop_heading_error_rad
+                ),
             },
         )
 
@@ -2589,6 +2706,17 @@ class GameCommandRuntime:
                 continue
             if isinstance(step, NativeModeSet):
                 code, message, data = self._apply_native_mode_command(step)
+                steps.append(
+                    {
+                        "code": code,
+                        "message": message,
+                        "restart_required": False,
+                        "data": data,
+                    }
+                )
+                continue
+            if isinstance(step, MotionSettingSet):
+                code, message, data = self._apply_motion_setting_command(step)
                 steps.append(
                     {
                         "code": code,
@@ -2877,6 +3005,44 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, MotionSettingSet):
+                if not command_allowed:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_NOT_PAUSED",
+                            message="Open ESC and wait for a neutral frame before motion settings",
+                        )
+                    )
+                    continue
+                try:
+                    code, message, data = self._apply_motion_setting_command(
+                        request.command
+                    )
+                except CommandExecutionError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=code,
+                        message=message,
+                        data=data,
+                    )
+                )
+                continue
             if isinstance(request.command, (CommandFunctionRun, CommandFunctionCall)):
                 if not command_allowed:
                     self.rejected_commands += 1
@@ -3032,6 +3198,7 @@ class GameCommandRuntime:
             "native_mode_override_description_zh": native_mode_description_zh(
                 self.core.native_mode_override
             ),
+            "motion_settings": self._motion_settings_telemetry(),
             "function_library": self._function_library_telemetry(),
             "world_available": self.world is not None,
             "last_response": self.last_response,
@@ -3480,6 +3647,7 @@ def main() -> int:
     if args.ue_pid is not None and args.ue_pid <= 1:
         raise SystemExit("--ue-pid must identify a live UE process")
     game_config = None
+    motion_settings_store: MotionSettingsStore | None = None
     if args.control_source == "game":
         if args.game_max_speed > 0.8:
             raise SystemExit("--game-max-speed cannot exceed SLOW_WALK maximum 0.8")
@@ -3525,6 +3693,16 @@ def main() -> int:
                     motion_settings.keyboard_turn_boost_rate_rad_s
                     if motion_settings is not None
                     else 3.00
+                ),
+                gait_start_heading_error_rad=(
+                    motion_settings.gait_start_heading_error_rad
+                    if motion_settings is not None
+                    else DEFAULT_GAIT_START_HEADING_ERROR_RAD
+                ),
+                gait_stop_heading_error_rad=(
+                    motion_settings.gait_stop_heading_error_rad
+                    if motion_settings is not None
+                    else DEFAULT_GAIT_STOP_HEADING_ERROR_RAD
                 ),
                 keyboard_slow_speed_mps=(
                     motion_settings.slow_speed_mps
@@ -3920,6 +4098,7 @@ def main() -> int:
                         game_world,
                         game_input.core,
                         args.game_function_directory,
+                        motion_settings_store,
                     )
                 try:
                     game_input.open()
