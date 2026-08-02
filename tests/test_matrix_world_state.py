@@ -80,6 +80,39 @@ class MatrixWorldStateTest(unittest.TestCase):
         )
         self.assertEqual(state.resume_source, "fallen_xy_last_safe_upright")
 
+    def test_implausible_fallen_checkpoint_resumes_last_safe_pose(self) -> None:
+        safe = MODULE.WorldPose(-0.9, 1.1, 0.81, -0.6)
+        state = self.state.checkpoint(safe, upright=True, now_unix_ns=1)
+        exploded = MODULE.WorldPose(919.0, 6197.0, 6157.0, 2.4)
+
+        state = state.checkpoint(exploded, upright=False, now_unix_ns=2)
+
+        self.assertEqual(state.last_observed, exploded)
+        self.assertEqual(state.last_safe, safe)
+        self.assertEqual(state.last_exit, safe)
+        self.assertEqual(state.resume_source, "unstable_fall_last_safe")
+        self.assertEqual(
+            state.startup_pose(self.default),
+            (safe, "last_exit"),
+        )
+
+    def test_startup_ignores_corrupted_fallen_resume_pose(self) -> None:
+        safe = MODULE.WorldPose(-0.9, 1.1, 0.81, -0.6)
+        corrupted = MODULE.MatrixWorldState(
+            world_id=self.state.world_id,
+            world_revision=self.state.world_revision,
+            last_observed=MODULE.WorldPose(919.0, 6197.0, 6157.0, 2.4),
+            last_safe=safe,
+            last_exit=MODULE.WorldPose(919.0, 6197.0, 0.81, -0.6),
+            resume_source="fallen_xy_last_safe_upright",
+            updated_at_unix_ns=1,
+        )
+
+        self.assertEqual(
+            corrupted.startup_pose(self.default),
+            (safe, "unstable_fall_last_safe"),
+        )
+
     def test_fall_without_known_safe_pose_does_not_invent_resume_height(self) -> None:
         fallen = MODULE.WorldPose(3.0, 4.0, 0.15, 1.0)
 

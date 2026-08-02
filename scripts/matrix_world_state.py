@@ -47,6 +47,8 @@ MAX_TELEPORT_POINTS = 1024
 MAX_HORIZONTAL_METRES = 100_000.0
 MIN_VERTICAL_METRES = -1_000.0
 MAX_VERTICAL_METRES = 10_000.0
+MAX_FALLEN_RECOVERY_DISTANCE_M = 10.0
+MAX_FALLEN_RECOVERY_VERTICAL_DELTA_M = 5.0
 
 _WORLD_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}\Z")
 _TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}\Z")
@@ -244,6 +246,7 @@ class MatrixWorldState:
             "home",
             "pose_command",
             "recover_here",
+            "unstable_fall_last_safe",
         }:
             raise WorldStateError("resume_source is invalid")
         if not isinstance(self.teleport_points, tuple) or len(
@@ -375,6 +378,17 @@ class MatrixWorldState:
                 last_observed=pose,
                 updated_at_unix_ns=timestamp,
             )
+        if (
+            pose.distance_xy(self.last_safe) > MAX_FALLEN_RECOVERY_DISTANCE_M
+            or abs(pose.z - self.last_safe.z) > MAX_FALLEN_RECOVERY_VERTICAL_DELTA_M
+        ):
+            return replace(
+                self,
+                last_observed=pose,
+                last_exit=self.last_safe,
+                resume_source="unstable_fall_last_safe",
+                updated_at_unix_ns=timestamp,
+            )
         upright_exit = WorldPose(
             pose.x,
             pose.y,
@@ -465,6 +479,23 @@ class MatrixWorldState:
         return tuple(matches[:limit])
 
     def startup_pose(self, default: WorldPose) -> tuple[WorldPose, str]:
+        if (
+            self.resume_source == "fallen_xy_last_safe_upright"
+            and self.last_exit is not None
+            and self.last_safe is not None
+        ):
+            excessive_xy = (
+                self.last_exit.distance_xy(self.last_safe)
+                > MAX_FALLEN_RECOVERY_DISTANCE_M
+            )
+            excessive_z = (
+                self.last_observed is not None
+                and abs(self.last_observed.z - self.last_safe.z)
+                > MAX_FALLEN_RECOVERY_VERTICAL_DELTA_M
+            )
+            if not excessive_xy and not excessive_z:
+                return self.last_exit, "last_exit"
+            return self.last_safe, "unstable_fall_last_safe"
         if self.last_exit is not None:
             return self.last_exit, "last_exit"
         if self.home is not None:
@@ -913,8 +944,10 @@ def main() -> int:
                 world_revision=args.world_revision,
             )
             state = store.load()
-            pose = state.last_exit or state.home
-            source = "last_exit" if state.last_exit is not None else "home"
+            default = WorldPose(0.0, 0.0, 0.793, 0.0)
+            pose, source = state.startup_pose(default)
+            if source == "default":
+                pose = None
             if pose is None:
                 print("none")
             else:
