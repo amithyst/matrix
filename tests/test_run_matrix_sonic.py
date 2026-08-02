@@ -44,6 +44,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         low_cmd_fresh: bool = False,
         low_cmd_received: bool = False,
         low_cmd_age_s: float | None = None,
+        elastic_band_enabled: bool = True,
         elastic_band_scale: float = 0.0,
     ) -> SimpleNamespace:
         return SimpleNamespace(
@@ -59,6 +60,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             low_cmd_fresh=low_cmd_fresh,
             low_cmd_received=low_cmd_received,
             low_cmd_age_s=low_cmd_age_s,
+            elastic_band_enabled=elastic_band_enabled,
             elastic_band_scale=elastic_band_scale,
         )
 
@@ -493,6 +495,38 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         self.assertEqual(command_for(ready, 4, 10.03, w=False).mode, "idle")
         moving = command_for(ready, 5, 10.04, w=True)
+        self.assertEqual(moving.mode, "move")
+        self.assertGreater(moving.speed_mps, 0.0)
+
+    def test_game_control_treats_disabled_elastic_band_as_released(self) -> None:
+        core = GAME_CONTROL.GameControlCore(
+            GAME_CONTROL.ControlConfig(
+                max_speed_mps=0.3,
+                max_acceleration_mps2=100.0,
+                max_deceleration_mps2=100.0,
+                max_turn_rate_rad_s=100.0,
+                max_step_s=1.0,
+            )
+        )
+        disabled_band = self.snapshot(
+            low_cmd_fresh=True,
+            elastic_band_enabled=False,
+            elastic_band_scale=1.0,
+        )
+        gate = MODULE._GameSonicReadinessGate(disabled_band)
+        self.assertTrue(gate.snapshot_ready(disabled_band))
+        gate.begin_frame(disabled_band, core)
+        core.accept_snapshot(
+            self.game_input_snapshot(1, 11.0, w=False),
+            received_at_s=11.0,
+        )
+        neutral = gate.apply(core.command(now_s=11.0, dt_s=0.02), core)
+        self.assertEqual(neutral.mode, "idle")
+        core.accept_snapshot(
+            self.game_input_snapshot(2, 11.02, w=True),
+            received_at_s=11.02,
+        )
+        moving = gate.apply(core.command(now_s=11.02, dt_s=0.02), core)
         self.assertEqual(moving.mode, "move")
         self.assertGreater(moving.speed_mps, 0.0)
 

@@ -1459,12 +1459,17 @@ class _GameSonicReadinessGate:
     def snapshot_ready(cls, snapshot: Any) -> bool:
         if type(getattr(snapshot, "low_cmd_fresh", None)) is not bool:
             return False
+        elastic_band_enabled = getattr(snapshot, "elastic_band_enabled", True)
+        if type(elastic_band_enabled) is not bool:
+            return False
         elastic_band_scale = getattr(snapshot, "elastic_band_scale", None)
         if type(elastic_band_scale) is not float:
             return False
-        return snapshot.low_cmd_fresh and math.isfinite(
-            elastic_band_scale
-        ) and math.isclose(
+        if not snapshot.low_cmd_fresh or not math.isfinite(elastic_band_scale):
+            return False
+        if not elastic_band_enabled:
+            return True
+        return math.isclose(
             elastic_band_scale,
             0.0,
             rel_tol=0.0,
@@ -2005,6 +2010,9 @@ def _snapshot_validation_error(snapshot, previous_snapshot=None) -> str | None:
             "snapshot_invalid_low_cmd_received:"
             f"{getattr(snapshot, 'low_cmd_received', None)!r}"
         )
+    elastic_band_enabled = getattr(snapshot, "elastic_band_enabled", True)
+    if type(elastic_band_enabled) is not bool:
+        return f"snapshot_invalid_elastic_band_enabled:{elastic_band_enabled!r}"
     low_cmd_age_s = getattr(snapshot, "low_cmd_age_s", None)
     if low_cmd_age_s is not None:
         try:
