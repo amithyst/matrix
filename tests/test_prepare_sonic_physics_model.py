@@ -297,6 +297,13 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             soil = next(geom for geom in xml.iter("geom") if geom.get("name") == "soil_7_8")
             self.assertEqual(soil.get("contype"), "1")
             self.assertEqual(soil.get("conaffinity"), "1")
+            self.assertEqual(
+                contract["collision"]["source_tile_compiled_collision_mask"],
+                [1, 1],
+            )
+            self.assertTrue(
+                contract["collision"]["source_tile_collision_enabled_after_handoff"]
+            )
             self.assertIsNotNone(
                 next(
                     geom

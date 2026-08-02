@@ -48,15 +48,15 @@ CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
 
 COLLISION_MODE_ROLLING_TILES = "rolling-mocap-tiles-v1"
 COLLISION_MODE_ROLLING_HFIELD = "rolling-heightfield-v2"
-DEFAULT_COLLISION_MODE = COLLISION_MODE_ROLLING_HFIELD
+DEFAULT_COLLISION_MODE = COLLISION_MODE_ROLLING_TILES
 LOCKED_MOONWORLD_SHA256 = (
     "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
 )
 TELEMETRY_SCHEMA = "matrix-moon-dynamic-ground/v2"
-DEFAULT_SPAWN_X_M = -94.7
-DEFAULT_SPAWN_Y_M = -65.6
-DEFAULT_SPAWN_PAD_TOP_Z_M = -6.101562023162842
-DEFAULT_ROOT_CLEARANCE_M = 0.85
+DEFAULT_SPAWN_X_M = 23.0
+DEFAULT_SPAWN_Y_M = 13.0
+DEFAULT_SPAWN_PAD_TOP_Z_M = -2.0390634536743164
+DEFAULT_ROOT_CLEARANCE_M = 0.78696775
 DEFAULT_SPAWN_Z_M = DEFAULT_SPAWN_PAD_TOP_Z_M + DEFAULT_ROOT_CLEARANCE_M
 DEFAULT_SPAWN_YAW_RAD = 0.0
 DEFAULT_MIN_RESUME_CLEARANCE_M = 0.45
@@ -259,10 +259,10 @@ def resolve_spawn_pose_for_moon_dynamic_ground(
     pose_xyz: tuple[object, object, object] | None = None,
     yaw_rad: object | None = None,
     source: str = "map_default",
-    fallback_xyz: tuple[object, object, object] = (
+    fallback_xyz: tuple[object, object, object | None] = (
         DEFAULT_SPAWN_X_M,
         DEFAULT_SPAWN_Y_M,
-        DEFAULT_SPAWN_Z_M,
+        None,
     ),
     fallback_yaw_rad: object = DEFAULT_SPAWN_YAW_RAD,
     root_clearance_m: object = DEFAULT_ROOT_CLEARANCE_M,
@@ -294,8 +294,18 @@ def resolve_spawn_pose_for_moon_dynamic_ground(
 
     fallback_x = _finite_float(fallback_xyz[0], label="fallback x")
     fallback_y = _finite_float(fallback_xyz[1], label="fallback y")
-    fallback_z = _finite_float(fallback_xyz[2], label="fallback z")
     fallback_yaw = _finite_float(fallback_yaw_rad, label="fallback yaw")
+    fallback_ground_height = sample_raw_height_from_map(
+        map_path,
+        fallback_x,
+        fallback_y,
+        expected_sha256=expected_sha256,
+    )
+    fallback_z = (
+        fallback_ground_height + root_clearance
+        if fallback_xyz[2] is None
+        else _finite_float(fallback_xyz[2], label="fallback z")
+    )
 
     if pose_xyz is None:
         return {
@@ -305,8 +315,9 @@ def resolve_spawn_pose_for_moon_dynamic_ground(
             "yaw_rad": fallback_yaw,
             "source": "moon_map_default",
             "input_source": source,
-            "raw_ground_height_m": None,
+            "raw_ground_height_m": fallback_ground_height,
             "input_clearance_m": None,
+            "fallback_ground_height_m": fallback_ground_height,
         }
 
     x = _finite_float(pose_xyz[0], label="pose x")
@@ -344,6 +355,7 @@ def resolve_spawn_pose_for_moon_dynamic_ground(
         "input_source": source,
         "raw_ground_height_m": raw_ground_height,
         "input_clearance_m": input_clearance,
+        "fallback_ground_height_m": fallback_ground_height,
     }
 
 
@@ -942,7 +954,7 @@ def _parse_cli_args() -> argparse.Namespace:
     spawn.add_argument("--source", default="map_default")
     spawn.add_argument("--fallback-x", type=float, default=DEFAULT_SPAWN_X_M)
     spawn.add_argument("--fallback-y", type=float, default=DEFAULT_SPAWN_Y_M)
-    spawn.add_argument("--fallback-z", type=float, default=DEFAULT_SPAWN_Z_M)
+    spawn.add_argument("--fallback-z", type=float)
     spawn.add_argument("--fallback-yaw", type=float, default=DEFAULT_SPAWN_YAW_RAD)
     spawn.add_argument(
         "--root-clearance",

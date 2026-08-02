@@ -1467,7 +1467,7 @@ if $MATRIX_SONIC_ENABLED; then
             --map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
             --map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
             --source "$source"
-            --root-clearance "${MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.85}"
+            --root-clearance "${MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.78696775}"
             --min-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MIN_RESUME_CLEARANCE:-0.45}"
             --max-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MAX_RESUME_CLEARANCE:-1.30}"
         )
@@ -1502,7 +1502,7 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
         MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="$(
-            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-heightfield-v2}" \
+            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1}" \
                 | tr '[:upper:]' '[:lower:]' \
                 | tr '_' '-'
         )"
