@@ -1446,6 +1446,54 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_SCENE_TRANSFORM_ARGS=()
     SONIC_DYNAMIC_GROUND_ARGS=()
     SONIC_DYNAMIC_GROUND_COLLISION_ARGS=()
+    set_sonic_spawn_args() {
+        SONIC_SPAWN_ARGS=(
+            --spawn-x "$1"
+            --spawn-y "$2"
+            --spawn-z "$3"
+            --spawn-yaw "$4"
+        )
+    }
+    resolve_moon_spawn_args() {
+        local source="$1"
+        local x="${2:-}"
+        local y="${3:-}"
+        local z="${4:-}"
+        local yaw="${5:-0}"
+        local moon_spawn_output
+        local -a resolver=(
+            "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_moon_dynamic_ground.py"
+            resolve-spawn-pose
+            --map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
+            --map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+            --source "$source"
+            --root-clearance "${MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.85}"
+            --min-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MIN_RESUME_CLEARANCE:-0.45}"
+            --max-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MAX_RESUME_CLEARANCE:-1.30}"
+        )
+        if [[ -n "$x" && -n "$y" && -n "$z" ]]; then
+            resolver+=(--x "$x" --y "$y" --z "$z" --yaw "$yaw")
+        fi
+        if ! moon_spawn_output="$("${resolver[@]}")"; then
+            echo "[ERROR] Could not resolve MoonWorld raw-terrain spawn pose" >&2
+            return 1
+        fi
+        mapfile -t MOON_SPAWN_LINES <<<"$moon_spawn_output"
+        if [[ "${MOON_SPAWN_LINES[0]:-}" != "pose" \
+            || "${#MOON_SPAWN_LINES[@]}" != "7" ]]; then
+            echo "[ERROR] Invalid MoonWorld spawn resolver response" >&2
+            return 1
+        fi
+        set_sonic_spawn_args \
+            "${MOON_SPAWN_LINES[1]}" \
+            "${MOON_SPAWN_LINES[2]}" \
+            "${MOON_SPAWN_LINES[3]}" \
+            "${MOON_SPAWN_LINES[4]}"
+        echo "[INFO] Matrix MoonWorld spawn pose: ${MOON_SPAWN_LINES[5]} " \
+            "x=${MOON_SPAWN_LINES[1]} y=${MOON_SPAWN_LINES[2]} " \
+            "z=${MOON_SPAWN_LINES[3]} yaw=${MOON_SPAWN_LINES[4]} " \
+            "${MOON_SPAWN_LINES[6]}"
+    }
     if [[ "$SCENE" == "scene_terrain_t10.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
             --scene-transform town10-open-boundary-v1
@@ -1454,7 +1502,7 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
         MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="$(
-            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1}" \
+            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-heightfield-v2}" \
                 | tr '[:upper:]' '[:lower:]' \
                 | tr '_' '-'
         )"
@@ -1533,16 +1581,28 @@ if $MATRIX_SONIC_ENABLED; then
                 echo "[ERROR] Invalid Matrix world-state pose response" >&2
                 exit 1
             fi
-            SONIC_SPAWN_ARGS=(
-                --spawn-x "${GAME_WORLD_START_LINES[1]}"
-                --spawn-y "${GAME_WORLD_START_LINES[2]}"
-                --spawn-z "${GAME_WORLD_START_LINES[3]}"
-                --spawn-yaw "${GAME_WORLD_START_LINES[4]}"
-            )
+            if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+                resolve_moon_spawn_args \
+                    "${GAME_WORLD_START_LINES[5]}" \
+                    "${GAME_WORLD_START_LINES[1]}" \
+                    "${GAME_WORLD_START_LINES[2]}" \
+                    "${GAME_WORLD_START_LINES[3]}" \
+                    "${GAME_WORLD_START_LINES[4]}" \
+                    || exit 1
+            else
+                set_sonic_spawn_args \
+                    "${GAME_WORLD_START_LINES[1]}" \
+                    "${GAME_WORLD_START_LINES[2]}" \
+                    "${GAME_WORLD_START_LINES[3]}" \
+                    "${GAME_WORLD_START_LINES[4]}"
+            fi
             echo "[INFO] Matrix resume pose: ${GAME_WORLD_START_LINES[5]} " \
                 "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]}"
         elif [[ "${GAME_WORLD_START_LINES[0]:-}" == "none" \
             && "${#GAME_WORLD_START_LINES[@]}" == "2" ]]; then
+            if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+                resolve_moon_spawn_args "map_default" || exit 1
+            fi
             echo "[INFO] Matrix resume pose: map default " \
                 "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]}"
         else
@@ -1563,6 +1623,10 @@ if $MATRIX_SONIC_ENABLED; then
                 exit 1
                 ;;
         esac
+    fi
+    if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
+        && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
+        resolve_moon_spawn_args "map_default" || exit 1
     fi
     SONIC_PHYSICS_DIR="${MATRIX_SONIC_PHYSICS_DIR:-$PROJECT_ROOT/outputs/runtime/matrix_sonic/$CUSTOM_NAME/${SCENE%.xml}}"
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \

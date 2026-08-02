@@ -9,6 +9,7 @@ tile bodies aligned to the locked height map.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import math
 import mmap
@@ -47,11 +48,19 @@ CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
 
 COLLISION_MODE_ROLLING_TILES = "rolling-mocap-tiles-v1"
 COLLISION_MODE_ROLLING_HFIELD = "rolling-heightfield-v2"
-DEFAULT_COLLISION_MODE = COLLISION_MODE_ROLLING_TILES
+DEFAULT_COLLISION_MODE = COLLISION_MODE_ROLLING_HFIELD
 LOCKED_MOONWORLD_SHA256 = (
     "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
 )
 TELEMETRY_SCHEMA = "matrix-moon-dynamic-ground/v2"
+DEFAULT_SPAWN_X_M = -94.7
+DEFAULT_SPAWN_Y_M = -65.6
+DEFAULT_SPAWN_PAD_TOP_Z_M = -6.101562023162842
+DEFAULT_ROOT_CLEARANCE_M = 0.85
+DEFAULT_SPAWN_Z_M = DEFAULT_SPAWN_PAD_TOP_Z_M + DEFAULT_ROOT_CLEARANCE_M
+DEFAULT_SPAWN_YAW_RAD = 0.0
+DEFAULT_MIN_RESUME_CLEARANCE_M = 0.45
+DEFAULT_MAX_RESUME_CLEARANCE_M = 1.30
 _EXPECTED_TILE_KEYS = tuple(
     (i, j)
     for i in range(TILE_SIDE_COUNT)
@@ -142,6 +151,200 @@ def normalize_collision_mode(value: object | None = None) -> str:
         "MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE must be "
         f"{COLLISION_MODE_ROLLING_HFIELD} or {COLLISION_MODE_ROLLING_TILES}"
     )
+
+
+def _sample_raw_height_from_array(
+    heights: np.ndarray,
+    x_m: object,
+    y_m: object,
+) -> float:
+    x = _finite_float(x_m, label="world x")
+    y = _finite_float(y_m, label="world y")
+    fractional_x = min(
+        max((x + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M, 0.0),
+        MAP_SIDE_SAMPLES - 1.0,
+    )
+    fractional_y = min(
+        max((y + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M, 0.0),
+        MAP_SIDE_SAMPLES - 1.0,
+    )
+    x0 = int(math.floor(fractional_x))
+    y0 = int(math.floor(fractional_y))
+    x1 = min(x0 + 1, MAP_SIDE_SAMPLES - 1)
+    y1 = min(y0 + 1, MAP_SIDE_SAMPLES - 1)
+    weight_x = fractional_x - x0
+    weight_y = fractional_y - y0
+    height_00 = float(heights[y0, x0])
+    height_10 = float(heights[y0, x1])
+    height_01 = float(heights[y1, x0])
+    height_11 = float(heights[y1, x1])
+    if weight_x >= weight_y:
+        height = (
+            (1.0 - weight_x) * height_00
+            + (weight_x - weight_y) * height_10
+            + weight_y * height_11
+        )
+    else:
+        height = (
+            (1.0 - weight_y) * height_00
+            + (weight_y - weight_x) * height_01
+            + weight_x * height_11
+        )
+    if not math.isfinite(height):
+        raise MoonDynamicGroundError("MoonWorld sampled a non-finite height")
+    return height
+
+
+def sample_raw_height_from_map(
+    path: str | os.PathLike[str],
+    x_m: object,
+    y_m: object,
+    *,
+    expected_sha256: str | None = None,
+) -> float:
+    map_path = Path(path).expanduser().resolve()
+    if expected_sha256 is not None and (
+        not isinstance(expected_sha256, str)
+        or _SHA256_PATTERN.fullmatch(expected_sha256) is None
+    ):
+        raise MoonDynamicGroundError(
+            "expected_sha256 must be 64 lowercase hexadecimal characters"
+        )
+    stream = None
+    mapped = None
+    try:
+        stream = map_path.open("rb")
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise MoonDynamicGroundError(
+                f"MoonWorld height map is not a regular file: {map_path}"
+            )
+        if metadata.st_size != MAP_SIZE_BYTES:
+            raise MoonDynamicGroundError(
+                "MoonWorld height map size mismatch: "
+                f"expected={MAP_SIZE_BYTES} actual={metadata.st_size}"
+            )
+        mapped = mmap.mmap(stream.fileno(), MAP_SIZE_BYTES, access=mmap.ACCESS_READ)
+        if expected_sha256 is not None:
+            actual_sha256 = hashlib.sha256(mapped).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise MoonDynamicGroundError(
+                    "MoonWorld height map SHA256 mismatch: "
+                    f"expected={expected_sha256} actual={actual_sha256}"
+                )
+        heights = np.ndarray(
+            shape=(MAP_SIDE_SAMPLES, MAP_SIDE_SAMPLES),
+            dtype=MAP_DTYPE,
+            buffer=mapped,
+            order="C",
+        )
+        return _sample_raw_height_from_array(heights, x_m, y_m)
+    except MoonDynamicGroundError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise MoonDynamicGroundError(
+            f"cannot open MoonWorld height map {map_path}: {exc}"
+        ) from exc
+    finally:
+        if mapped is not None:
+            mapped.close()
+        if stream is not None:
+            stream.close()
+
+
+def resolve_spawn_pose_for_moon_dynamic_ground(
+    *,
+    map_path: str | os.PathLike[str],
+    expected_sha256: str | None = None,
+    pose_xyz: tuple[object, object, object] | None = None,
+    yaw_rad: object | None = None,
+    source: str = "map_default",
+    fallback_xyz: tuple[object, object, object] = (
+        DEFAULT_SPAWN_X_M,
+        DEFAULT_SPAWN_Y_M,
+        DEFAULT_SPAWN_Z_M,
+    ),
+    fallback_yaw_rad: object = DEFAULT_SPAWN_YAW_RAD,
+    root_clearance_m: object = DEFAULT_ROOT_CLEARANCE_M,
+    min_resume_clearance_m: object = DEFAULT_MIN_RESUME_CLEARANCE_M,
+    max_resume_clearance_m: object = DEFAULT_MAX_RESUME_CLEARANCE_M,
+) -> dict[str, object]:
+    """Return a MoonWorld spawn pose that is safe for raw dynamic ground.
+
+    Older flat-anchor or cross-world resumes may have a root z that is far away
+    from the locked MoonWorld height map.  Those poses can cause a large drop or
+    immediate collision impulse when the startup pad hands off to raw ground.
+    Valid MoonWorld resumes keep their x/y/yaw but rebase z to the current raw
+    terrain height plus the configured upright root clearance.
+    """
+
+    root_clearance = _finite_float(root_clearance_m, label="root clearance")
+    min_clearance = _finite_float(
+        min_resume_clearance_m,
+        label="minimum resume clearance",
+    )
+    max_clearance = _finite_float(
+        max_resume_clearance_m,
+        label="maximum resume clearance",
+    )
+    if root_clearance <= 0.0:
+        raise MoonDynamicGroundError("root clearance must be positive")
+    if min_clearance <= 0.0 or max_clearance <= 0.0 or min_clearance > max_clearance:
+        raise MoonDynamicGroundError("resume clearance bounds are invalid")
+
+    fallback_x = _finite_float(fallback_xyz[0], label="fallback x")
+    fallback_y = _finite_float(fallback_xyz[1], label="fallback y")
+    fallback_z = _finite_float(fallback_xyz[2], label="fallback z")
+    fallback_yaw = _finite_float(fallback_yaw_rad, label="fallback yaw")
+
+    if pose_xyz is None:
+        return {
+            "x": fallback_x,
+            "y": fallback_y,
+            "z": fallback_z,
+            "yaw_rad": fallback_yaw,
+            "source": "moon_map_default",
+            "input_source": source,
+            "raw_ground_height_m": None,
+            "input_clearance_m": None,
+        }
+
+    x = _finite_float(pose_xyz[0], label="pose x")
+    y = _finite_float(pose_xyz[1], label="pose y")
+    z = _finite_float(pose_xyz[2], label="pose z")
+    yaw = (
+        _finite_float(yaw_rad, label="pose yaw")
+        if yaw_rad is not None
+        else fallback_yaw
+    )
+    raw_ground_height = sample_raw_height_from_map(
+        map_path,
+        x,
+        y,
+        expected_sha256=expected_sha256,
+    )
+    input_clearance = z - raw_ground_height
+    if min_clearance <= input_clearance <= max_clearance:
+        return {
+            "x": x,
+            "y": y,
+            "z": raw_ground_height + root_clearance,
+            "yaw_rad": yaw,
+            "source": f"moon_terrain_rebased_{source}",
+            "input_source": source,
+            "raw_ground_height_m": raw_ground_height,
+            "input_clearance_m": input_clearance,
+        }
+    return {
+        "x": fallback_x,
+        "y": fallback_y,
+        "z": fallback_z,
+        "yaw_rad": fallback_yaw,
+        "source": f"moon_rejected_{source}_clearance",
+        "input_source": source,
+        "raw_ground_height_m": raw_ground_height,
+        "input_clearance_m": input_clearance,
+    }
 
 
 def _round_array_away_from_zero(values: np.ndarray) -> np.ndarray:
@@ -410,41 +613,7 @@ class MoonDynamicGround:
 
     def _sample_raw_height(self, x_m: object, y_m: object) -> float:
         heights = self._require_open_heights()
-        x = _finite_float(x_m, label="world x")
-        y = _finite_float(y_m, label="world y")
-        fractional_x = min(
-            max((x + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M, 0.0),
-            MAP_SIDE_SAMPLES - 1.0,
-        )
-        fractional_y = min(
-            max((y + MAP_HALF_EXTENT_M) / MAP_RESOLUTION_M, 0.0),
-            MAP_SIDE_SAMPLES - 1.0,
-        )
-        x0 = int(math.floor(fractional_x))
-        y0 = int(math.floor(fractional_y))
-        x1 = min(x0 + 1, MAP_SIDE_SAMPLES - 1)
-        y1 = min(y0 + 1, MAP_SIDE_SAMPLES - 1)
-        weight_x = fractional_x - x0
-        weight_y = fractional_y - y0
-        height_00 = float(heights[y0, x0])
-        height_10 = float(heights[y0, x1])
-        height_01 = float(heights[y1, x0])
-        height_11 = float(heights[y1, x1])
-        if weight_x >= weight_y:
-            height = (
-                (1.0 - weight_x) * height_00
-                + (weight_x - weight_y) * height_10
-                + weight_y * height_11
-            )
-        else:
-            height = (
-                (1.0 - weight_y) * height_00
-                + (weight_y - weight_x) * height_01
-                + weight_x * height_11
-            )
-        if not math.isfinite(height):
-            raise MoonDynamicGroundError("MoonWorld sampled a non-finite height")
-        return height
+        return _sample_raw_height_from_array(heights, x_m, y_m)
 
     def sample_height(self, x_m: object, y_m: object) -> float:
         if (
@@ -753,10 +922,121 @@ class MoonDynamicGround:
         self.close()
 
 
+def _parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    sample = subparsers.add_parser("sample-height")
+    sample.add_argument("--map", type=Path, required=True)
+    sample.add_argument("--map-sha256")
+    sample.add_argument("--x", type=float, required=True)
+    sample.add_argument("--y", type=float, required=True)
+
+    spawn = subparsers.add_parser("resolve-spawn-pose")
+    spawn.add_argument("--map", type=Path, required=True)
+    spawn.add_argument("--map-sha256")
+    spawn.add_argument("--x", type=float)
+    spawn.add_argument("--y", type=float)
+    spawn.add_argument("--z", type=float)
+    spawn.add_argument("--yaw", type=float)
+    spawn.add_argument("--source", default="map_default")
+    spawn.add_argument("--fallback-x", type=float, default=DEFAULT_SPAWN_X_M)
+    spawn.add_argument("--fallback-y", type=float, default=DEFAULT_SPAWN_Y_M)
+    spawn.add_argument("--fallback-z", type=float, default=DEFAULT_SPAWN_Z_M)
+    spawn.add_argument("--fallback-yaw", type=float, default=DEFAULT_SPAWN_YAW_RAD)
+    spawn.add_argument(
+        "--root-clearance",
+        type=float,
+        default=DEFAULT_ROOT_CLEARANCE_M,
+    )
+    spawn.add_argument(
+        "--min-resume-clearance",
+        type=float,
+        default=DEFAULT_MIN_RESUME_CLEARANCE_M,
+    )
+    spawn.add_argument(
+        "--max-resume-clearance",
+        type=float,
+        default=DEFAULT_MAX_RESUME_CLEARANCE_M,
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_cli_args()
+    try:
+        if args.command == "sample-height":
+            print(
+                format(
+                    sample_raw_height_from_map(
+                        args.map,
+                        args.x,
+                        args.y,
+                        expected_sha256=args.map_sha256,
+                    ),
+                    ".17g",
+                )
+            )
+            return 0
+        if args.command == "resolve-spawn-pose":
+            supplied = [args.x is not None, args.y is not None, args.z is not None]
+            if any(supplied) and not all(supplied):
+                raise MoonDynamicGroundError("--x, --y, and --z must be set together")
+            resolved = resolve_spawn_pose_for_moon_dynamic_ground(
+                map_path=args.map,
+                expected_sha256=args.map_sha256,
+                pose_xyz=(
+                    (args.x, args.y, args.z)
+                    if all(supplied)
+                    else None
+                ),
+                yaw_rad=args.yaw,
+                source=args.source,
+                fallback_xyz=(args.fallback_x, args.fallback_y, args.fallback_z),
+                fallback_yaw_rad=args.fallback_yaw,
+                root_clearance_m=args.root_clearance,
+                min_resume_clearance_m=args.min_resume_clearance,
+                max_resume_clearance_m=args.max_resume_clearance,
+            )
+            print("pose")
+            print(format(float(resolved["x"]), ".17g"))
+            print(format(float(resolved["y"]), ".17g"))
+            print(format(float(resolved["z"]), ".17g"))
+            print(format(float(resolved["yaw_rad"]), ".17g"))
+            print(str(resolved["source"]))
+            raw_ground_height = resolved["raw_ground_height_m"]
+            input_clearance = resolved["input_clearance_m"]
+            print(
+                "raw_ground_height="
+                + (
+                    "none"
+                    if raw_ground_height is None
+                    else format(float(raw_ground_height), ".17g")
+                )
+                + " input_clearance="
+                + (
+                    "none"
+                    if input_clearance is None
+                    else format(float(input_clearance), ".17g")
+                )
+            )
+            return 0
+    except MoonDynamicGroundError as exc:
+        raise SystemExit(f"[ERROR] {exc}") from exc
+    raise SystemExit("[ERROR] unsupported MoonWorld command")
+
+
 __all__ = (
     "CONTINUOUS_SUPPORT_HALF_EXTENT_M",
+    "DEFAULT_COLLISION_MODE",
     "LOCKED_MOONWORLD_SHA256",
     "MAP_HALF_EXTENT_M",
     "MoonDynamicGround",
     "MoonDynamicGroundError",
+    "resolve_spawn_pose_for_moon_dynamic_ground",
+    "sample_raw_height_from_map",
 )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
