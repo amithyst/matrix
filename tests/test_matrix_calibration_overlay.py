@@ -157,6 +157,59 @@ class OverlayLayoutTest(unittest.TestCase):
             self.assertEqual(panel[2], 1500)
             self.assertEqual(panel[3], 900)
 
+    def test_settings_page_control_rows_have_readable_height(self) -> None:
+        for width, height, minimum_row_height in (
+            (2560, 1600, 30),
+            (1280, 800, 24),
+        ):
+            with self.subTest(width=width, height=height):
+                layout = MODULE.overlay_layout(
+                    MODULE.WindowGeometry(1, 0, 0, width, height)
+                )
+                motion_rows = [
+                    layout[f"motion_{gear}_{field}_value"]
+                    for gear, field in MODULE._MOTION_CONTROL_SPECS
+                ] + [
+                    layout["motion_turn_rate_value"],
+                    layout["motion_keyboard_turn_rate_value"],
+                    layout["motion_keyboard_turn_boost_rate_value"],
+                    layout["motion_bfm_turn_command_yaw_limit_value"],
+                    layout["motion_camera_look_rate_value"],
+                    layout["motion_gait_start_heading_error_value"],
+                    layout["motion_gait_stop_heading_error_value"],
+                ]
+                for rectangle in motion_rows:
+                    self.assertGreaterEqual(
+                        rectangle[3],
+                        minimum_row_height,
+                        msg=f"{rectangle} is too short for the UI font",
+                    )
+                self.assertLess(
+                    layout["movement_mode_camera_face"][1]
+                    + layout["movement_mode_camera_face"][3],
+                    min(row[1] for row in motion_rows),
+                )
+                self.assertLess(
+                    max(row[1] + row[3] for row in motion_rows),
+                    layout["speed_value"][1],
+                )
+
+    def test_function_home_menu_starts_below_header_copy(self) -> None:
+        for width, height, minimum_gap in (
+            (2560, 1600, 100),
+            (1280, 800, 90),
+            (480, 360, 56),
+        ):
+            with self.subTest(width=width, height=height):
+                layout = MODULE.overlay_layout(
+                    MODULE.WindowGeometry(1, 0, 0, width, height)
+                )
+                content = layout["system_content"]
+                self.assertGreaterEqual(
+                    layout["function_nav_files"][1],
+                    content[1] + minimum_gap,
+                )
+
     def test_compact_layout_is_bounded_and_too_small_client_hides_safely(self) -> None:
         geometry = MODULE.WindowGeometry(1, 20, 30, 640, 420)
         self.assertTrue(MODULE.overlay_supported(geometry))
@@ -755,6 +808,22 @@ class PointerActionPublisherTest(unittest.TestCase):
             self.assertEqual(third["action"], "movement_mode_body_relative")
             with self.assertRaisesRegex(ValueError, "unsupported"):
                 publisher.publish("restart_directly")
+        finally:
+            publisher.close()
+            receiver.close()
+
+    def test_motion_panel_actions_are_direct_actions_not_command_text(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish("motion_gait_start_heading_error_down")
+            packet = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(packet["kind"], "action")
+            self.assertEqual(packet["action"], "motion_gait_start_heading_error_down")
+            self.assertNotIn("command", packet)
         finally:
             publisher.close()
             receiver.close()

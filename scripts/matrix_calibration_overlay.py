@@ -496,8 +496,17 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_count = 9
     tab_width = max(1, (panel_width - 2 * margin - (tab_count - 1) * tab_gap) // tab_count)
     back_width = max(128, min(260, panel_width // 5))
-    profile_y = centre_panel_y - safe_half_size - gap - button_height
-    speed_y = centre_panel_y + safe_half_size + gap
+    apply_height = max(42, min(80, button_height + 6))
+    footer_space = 8 if compact else 42
+    apply_y = panel_y + panel_height - footer_space - apply_height
+    settings_top = tab_y + tab_height + gap
+    settings_bottom = apply_y - gap
+    settings_dense = compact or panel_height < 820
+    profile_y = settings_top + (6 if settings_dense else 48)
+    speed_y = max(
+        profile_y + button_height + gap,
+        settings_bottom - button_height,
+    )
     profile_gap = max(4, min(10, gap // 2))
     profile_width = max(
         1,
@@ -506,9 +515,6 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     settings_content_width = panel_width - 2 * margin
     settings_group_width = max(1, (settings_content_width - 2 * gap) // 3)
     speed_width = max(42, min(112, settings_group_width // 4))
-    apply_height = max(42, min(80, button_height + 6))
-    footer_space = 8 if compact else 42
-    apply_y = panel_y + panel_height - footer_space - apply_height
     footer_width = panel_width - 2 * margin
     pause_width = max(108, min(220, (footer_width - 2 * gap) // 4))
     quit_width = max(112, min(240, (footer_width - 2 * gap) // 4))
@@ -585,9 +591,15 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     )
     motion_outer_gap = 6 if compact else 12
     motion_row_gap = 4 if compact else 8
+    settings_help_lines = 0 if settings_dense else 3
+    settings_help_space = settings_help_lines * (24 if compact else 28)
     motion_top = max(
         tab_y + tab_height + motion_outer_gap,
-        profile_y + button_height + motion_outer_gap,
+        profile_y
+        + button_height
+        + motion_outer_gap
+        + settings_help_space
+        + (0 if settings_help_lines == 0 else motion_outer_gap),
     )
     motion_bottom = speed_y - motion_outer_gap
     motion_row_height = max(
@@ -908,7 +920,7 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             inventory_width,
             inventory_height,
         )
-    function_top = console_top + (20 if compact else 38)
+    function_top = console_top + (62 if compact else 114)
     function_gap = 6 if compact else 12
     function_button_height = max(28, min(button_height, 60))
     function_button_width = max(1, (console_width - function_gap) // 2)
@@ -965,8 +977,8 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             function_button_width,
             function_button_height,
         )
-    native_top = function_preset_top + 2 * (function_button_height + function_gap) + (
-        16 if compact else 28
+    native_top = function_top + function_button_height + function_gap + (
+        6 if compact else 16
     )
     native_gap = 4 if compact else 8
     native_columns = 10
@@ -4217,6 +4229,7 @@ class PointerActionPublisher:
         if (
             action not in _PANEL_ACTIONS
             and action not in _MOVEMENT_MODE_ACTIONS
+            and action not in _MOTION_STEP_ACTIONS
             and action != "functions_open_dir"
         ):
             raise ValueError(f"unsupported pointer action: {action}")
@@ -6059,7 +6072,7 @@ class X11CalibrationOverlay:
                 and self._last_command_status.status
                 not in {"pending", "restarting"}
             ):
-                publisher.publish_command_submit(command)
+                publisher.publish(action)
                 emitted += 1
             return emitted
         if (
@@ -6862,6 +6875,39 @@ class X11CalibrationOverlay:
                 centred_in=recovery,
             )
 
+    def _draw_metric_tile(
+        self,
+        rectangle: tuple[int, int, int, int],
+        *,
+        label: str,
+        value: str,
+        available: bool = True,
+    ) -> None:
+        x, y, width, height = rectangle
+        label_height = max(14, min(24, height // 3))
+        label_box = (x, y + 4, width, label_height)
+        value_box = (
+            x,
+            y + label_height + 8,
+            width,
+            max(1, height - label_height - 10),
+        )
+        self._draw_text(
+            label,
+            x=0,
+            y=0,
+            colour=self._colours["muted"],
+            centred_in=label_box,
+        )
+        self._draw_text(
+            value,
+            x=0,
+            y=0,
+            colour=self._colours["white" if available else "muted"],
+            large=height >= 60,
+            centred_in=value_box,
+        )
+
     def _draw_control_settings_page(
         self,
         layout: dict[str, tuple[int, int, int, int]],
@@ -6910,22 +6956,29 @@ class X11CalibrationOverlay:
                 disabled=movement_controls_disabled,
             )
         content = self._panel_rectangle(layout, "system_content")
-        mode_help_y = self._panel_rectangle(layout, "movement_mode_camera_face")[1] + (
-            40 if layout["panel"][3] < 650 else 58
-        )
-        for offset, line in enumerate(
-            (
-                "WASD 模式：相机朝向=按镜头前方行走并自动面向；相机侧移=按镜头平移；机身相对=按机器人自身坐标。",
-                "SONIC：" + native_mode_description_zh(None) + " 4-19 含蹲/跪/爬行/拳击/跳跃/风格走路。",
-                "相机朝向阈值：边走≤45°默认可走着转；移动中>65°默认退回原地转，差值用于防抖。",
+        if layout["panel"][3] >= 820:
+            mode_button = self._panel_rectangle(layout, "movement_mode_camera_face")
+            mode_help_y = mode_button[1] + mode_button[3] + 28
+            line_step = max(
+                24,
+                min(
+                    32,
+                    getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE) + 10,
+                ),
             )
-        ):
-            self._draw_text(
-                self._clip_console_line(line, content[2]),
-                x=content[0],
-                y=mode_help_y + offset * (16 if layout["panel"][3] < 650 else 20),
-                colour=self._colours["muted"],
-            )
+            for offset, line in enumerate(
+                (
+                    "WASD 模式：相机朝向=按镜头前方行走并自动面向；相机侧移=按镜头平移；机身相对=按机器人自身坐标。",
+                    "SONIC：" + native_mode_description_zh(None) + " 4-19 含蹲/跪/爬行/拳击/跳跃/风格走路。",
+                    "相机朝向阈值：边走≤45°默认可走着转；移动中>65°默认退回原地转，差值用于防抖。",
+                )
+            ):
+                self._draw_text(
+                    self._clip_console_line(line, content[2]),
+                    x=content[0],
+                    y=mode_help_y + offset * line_step,
+                    colour=self._colours["muted"],
+                )
         down_disabled = not model.action_enabled("speed_down")
         up_disabled = not model.action_enabled("speed_up")
         self._draw_button(
@@ -6973,84 +7026,29 @@ class X11CalibrationOverlay:
                 disabled=disabled,
             )
         speed_value = self._panel_rectangle(layout, "speed_value")
-        self._draw_text(
-            "远程鼠标速度",
-            x=0,
-            y=0,
-            colour=self._colours["muted"],
-            centred_in=(
-                speed_value[0],
-                speed_value[1] - 10,
-                speed_value[2],
-                speed_value[3],
-            ),
-        )
-        self._draw_text(
-            f"{model.next_scale:.2f}x",
-            x=0,
-            y=0,
-            colour=self._colours["white"],
-            large=True,
-            centred_in=(
-                speed_value[0],
-                speed_value[1] + 10,
-                speed_value[2],
-                speed_value[3],
-            ),
+        self._draw_metric_tile(
+            speed_value,
+            label="远程鼠标速度",
+            value=f"{model.next_scale:.2f}x",
         )
         cap_value = self._panel_rectangle(layout, "motion_keyboard_speed_cap_value")
-        self._draw_text(
-            "键盘速度上限",
-            x=0,
-            y=0,
-            colour=self._colours["muted"],
-            centred_in=(
-                cap_value[0],
-                cap_value[1] - 18,
-                cap_value[2],
-                cap_value[3],
-            ),
-        )
-        self._draw_text(
+        cap_available = bool(motion_model.available)
+        cap_label = (
             f"{motion_model.value('keyboard', KEYBOARD_SPEED_CAP_FIELD):.2f} m/s"
             if motion_model.available
-            else "--",
-            x=0,
-            y=0,
-            colour=self._colours["white" if motion_model.available else "muted"],
-            large=True,
-            centred_in=(
-                cap_value[0],
-                cap_value[1] + 16,
-                cap_value[2],
-                cap_value[3],
-            ),
+            else "--"
+        )
+        self._draw_metric_tile(
+            cap_value,
+            label="键盘速度上限",
+            value=cap_label,
+            available=cap_available,
         )
         font_value = self._panel_rectangle(layout, "font_value")
-        self._draw_text(
-            "界面字体",
-            x=0,
-            y=0,
-            colour=self._colours["muted"],
-            centred_in=(
-                font_value[0],
-                font_value[1] - 10,
-                font_value[2],
-                font_value[3],
-            ),
-        )
-        self._draw_text(
-            f"{model.font_size:d}px",
-            x=0,
-            y=0,
-            colour=self._colours["white"],
-            large=True,
-            centred_in=(
-                font_value[0],
-                font_value[1] + 10,
-                font_value[2],
-                font_value[3],
-            ),
+        self._draw_metric_tile(
+            font_value,
+            label="界面字体",
+            value=f"{model.font_size:d}px",
         )
         compact_motion_labels = bool(
             layout["panel"][2] < 800 or layout["panel"][3] < 600
@@ -9341,7 +9339,7 @@ class X11CalibrationOverlay:
                         and self._last_command_status.status
                         not in {"pending", "restarting"}
                     ):
-                        publisher.publish_command_submit(command)
+                        publisher.publish(action)
                         emitted += 1
                 elif (
                     self._last_panel_model is not None
