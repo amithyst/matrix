@@ -196,7 +196,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             )
         )
         self.assertTrue(elastic_band.enable)
-        self.assertFalse(elastic_band.release_enabled)
+        self.assertTrue(elastic_band.release_enabled)
         self.assertEqual(list(elastic_band.point), [23.0, 13.0, -0.459])
         self.assertEqual(elastic_band.reset_count, 1)
         self.assertEqual(data.xfrc_applied.values[3], 0.0)

@@ -1231,7 +1231,6 @@ def _install_moon_following_elastic_band(
             return values
 
     elastic_band.point = point_array(anchor_xyz)
-    elastic_band.release_enabled = False
 
     def moon_following_advance(pose: Any, scale: float = 1.0):
         try:
