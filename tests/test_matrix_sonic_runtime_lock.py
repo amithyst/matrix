@@ -77,7 +77,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             packages["Town10World"]["sha256"],
             urban["visual_source"]["release_sha256"],
         )
-        self.assertEqual(sum(item["size"] for item in packages.values()), 7757662559)
+        self.assertEqual(sum(item["size"] for item in packages.values()), 8391341372)
         installed = {
             entry["path"]: entry
             for entry in self.lock["matrix_release"]["installed_files"]
@@ -298,7 +298,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertEqual(self.lock["runtime_id"], "matrix-sonic-native-v2")
         self.assertEqual(
             self.lock["source_revisions"]["gr00t_whole_body_control"]["commit"],
-            "de083d71af8346b0124ab1ae79fd3623b52c3c9b",
+            "a73a2fadd1e3b26e08ec3938e91ddd97099caf4b",
         )
 
     def test_host_profiles_use_repo_local_runtime(self) -> None:
