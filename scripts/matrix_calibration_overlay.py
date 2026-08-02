@@ -41,6 +41,10 @@ from matrix_mouse_settings import (
 )
 from matrix_build_info import BuildInfoError, validate_build_info
 from matrix_mc_commands import MAX_COMMAND_CHARS
+from matrix_game_control import (
+    native_mode_description_zh,
+    native_mode_label_zh,
+)
 from matrix_ui_settings import (
     DEFAULT_FONT_SCALE,
     MAX_FONT_SIZE,
@@ -863,15 +867,22 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     function_gap = 6 if compact else 12
     function_button_height = max(28, min(button_height, 60))
     function_button_width = max(1, (console_width - function_gap) // 2)
+    result["functions_open_dir"] = (
+        console_left,
+        function_top,
+        console_width,
+        function_button_height,
+    )
+    function_preset_top = function_top + function_button_height + function_gap
     for index in range(4):
         row, column = divmod(index, 2)
         result[f"function_preset_{index}"] = (
             console_left + column * (function_button_width + function_gap),
-            function_top + row * (function_button_height + function_gap),
+            function_preset_top + row * (function_button_height + function_gap),
             function_button_width,
             function_button_height,
         )
-    native_top = function_top + 2 * (function_button_height + function_gap) + (
+    native_top = function_preset_top + 2 * (function_button_height + function_gap) + (
         16 if compact else 28
     )
     native_gap = 4 if compact else 8
@@ -1243,10 +1254,10 @@ _PANEL_TABS = (
     "tab_system",
 )
 _FUNCTION_PRESETS = (
-    ("原地站立恢复", "/recover"),
-    ("当前位置面向北", "/pose @s yaw 0deg"),
-    ("当前位置右转90", "/pose @s yaw ~90deg"),
-    ("TP+姿态示例", "/function /tp @s ~ ~ ~; /pose @s yaw ~0deg"),
+    ("原地站立恢复", "/function recover_here"),
+    ("当前位置面向北", "/function pose/north"),
+    ("当前位置右转90", "/function pose/right_90"),
+    ("TP+姿态示例", "/function tp_pose_example"),
 )
 _FUNCTION_PRESET_HIT_TARGETS = tuple(
     f"function_preset_{index}" for index in range(len(_FUNCTION_PRESETS))
@@ -1254,6 +1265,13 @@ _FUNCTION_PRESET_HIT_TARGETS = tuple(
 _NATIVE_MODE_HIT_TARGETS = ("native_mode_auto",) + tuple(
     f"native_mode_{index}" for index in range(20)
 )
+_NATIVE_MODE_BUTTON_LABELS_ZH = {
+    None: native_mode_label_zh(None),
+    0: native_mode_label_zh(0),
+    1: native_mode_label_zh(1),
+    2: native_mode_label_zh(2),
+    3: native_mode_label_zh(3),
+}
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider", "video_camera_distance_cm_slider")
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
     f"locomotion_policy_{index}"
@@ -1282,6 +1300,7 @@ _PANEL_HIT_TARGETS = (
     + _POLICY_HIT_TARGETS
     + _INVENTORY_HIT_TARGETS
     + _NAVIGATION_HIT_TARGETS
+    + ("functions_open_dir",)
     + _FUNCTION_PRESET_HIT_TARGETS
     + _NATIVE_MODE_HIT_TARGETS
     + _VIDEO_STEP_ACTIONS
@@ -1334,6 +1353,7 @@ def panel_action_at(
         targets = (
             _PANEL_TABS
             + ("runtime_pause", "quit_game", "apply_return")
+            + ("functions_open_dir",)
             + _FUNCTION_PRESET_HIT_TARGETS
             + _NATIVE_MODE_HIT_TARGETS
         )
@@ -3165,6 +3185,38 @@ class CommandConsoleStatus:
         )
 
 
+@dataclass(frozen=True)
+class FunctionLibraryModel:
+    directory: str | None
+    available: bool
+    open_available: bool
+    files: tuple[str, ...]
+    open_error: str | None
+    open_count: int
+
+
+def function_library_model(state: dict[str, object]) -> FunctionLibraryModel:
+    raw = state.get("function_library")
+    raw = raw if isinstance(raw, dict) else {}
+    directory = _bounded_status_text(raw.get("directory"), maximum=512)
+    files_value = raw.get("files")
+    files: list[str] = []
+    if isinstance(files_value, list):
+        for item in files_value[:64]:
+            name = _bounded_status_text(item, maximum=160)
+            if name is not None:
+                files.append(name)
+    open_count = raw.get("open_count")
+    return FunctionLibraryModel(
+        directory=directory,
+        available=raw.get("available") is True,
+        open_available=raw.get("open_available") is True,
+        files=tuple(files),
+        open_error=_bounded_status_text(raw.get("open_error"), maximum=256),
+        open_count=open_count if type(open_count) is int and open_count >= 0 else 0,
+    )
+
+
 def _command_console_candidate(state: dict[str, object]) -> dict[str, object]:
     raw = state.get("command_console")
     if isinstance(raw, dict):
@@ -3922,7 +3974,11 @@ class PointerActionPublisher:
     def publish(self, action: str) -> None:
         """Compatibility entry point for the existing pointer actions."""
 
-        if action not in _PANEL_ACTIONS and action not in _MOVEMENT_MODE_ACTIONS:
+        if (
+            action not in _PANEL_ACTIONS
+            and action not in _MOVEMENT_MODE_ACTIONS
+            and action != "functions_open_dir"
+        ):
             raise ValueError(f"unsupported pointer action: {action}")
         self._publish("action", {"action": action})
 
@@ -4222,6 +4278,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_navigation_model: CelestialNavigationModel | None = None
         self._last_video_model: VideoSettingsPanelModel | None = None
+        self._last_function_model: FunctionLibraryModel | None = None
         self._last_build_info_model: BuildInfoPanelModel | None = None
         self._last_startup_loading_model = startup_loading_model({})
         self._last_runtime_pause_model = runtime_pause_panel_model({})
@@ -5565,6 +5622,18 @@ class X11CalibrationOverlay:
                 publisher.publish_command_quick_submit(quick_command)
                 emitted += 1
             return emitted
+        if action == "functions_open_dir":
+            panel_model = self._last_panel_model
+            if (
+                panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+            ):
+                publisher.publish(action)
+                emitted += 1
+            return emitted
         if action == "runtime_pause":
             panel_model = self._last_panel_model
             if (
@@ -6480,6 +6549,22 @@ class X11CalibrationOverlay:
                 ],
                 disabled=movement_controls_disabled,
             )
+        content = self._panel_rectangle(layout, "system_content")
+        mode_help_y = self._panel_rectangle(layout, "movement_mode_camera_face")[1] + (
+            40 if layout["panel"][3] < 650 else 58
+        )
+        for offset, line in enumerate(
+            (
+                "WASD 模式：相机朝向=按镜头前方行走并自动面向；相机侧移=按镜头平移；机身相对=按机器人自身坐标。",
+                "SONIC：" + native_mode_description_zh(None) + " 4-19 是原生单档，语义待确认。",
+            )
+        ):
+            self._draw_text(
+                self._clip_console_line(line, content[2]),
+                x=content[0],
+                y=mode_help_y + offset * (16 if layout["panel"][3] < 650 else 20),
+                colour=self._colours["muted"],
+            )
         down_disabled = not model.action_enabled("speed_down")
         up_disabled = not model.action_enabled("speed_up")
         self._draw_button(
@@ -6722,16 +6807,34 @@ class X11CalibrationOverlay:
         self,
         layout: dict[str, tuple[int, int, int, int]],
         command_status: CommandConsoleStatus,
+        function_model: FunctionLibraryModel,
     ) -> None:
         content = self._panel_rectangle(layout, "system_content")
         compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
         quick_disabled = not self._quick_command_allowed()
         self._draw_text(
-            "函数命令：可在命令台热编辑 /function /tp ...; /pose ...",
+            "函数命令：.mcfunction 文件每行一条命令，支持局内热编辑",
             x=content[0],
             y=content[1] + (18 if compact else 26),
             colour=self._colours["muted"],
         )
+        open_disabled = not function_model.open_available or not function_model.directory
+        self._draw_button(
+            layout,
+            "functions_open_dir",
+            "打开函数目录",
+            fill=self._colours["disabled" if open_disabled else "button"],
+            disabled=open_disabled,
+        )
+        path_line = (
+            f"目录：{function_model.directory}"
+            if function_model.directory
+            else "目录：本次运行未配置函数目录"
+        )
+        if function_model.open_error:
+            path_line = f"{path_line}  打开失败：{function_model.open_error}"
+        elif function_model.open_count:
+            path_line = f"{path_line}  已打开 {function_model.open_count} 次"
         for index, (label, _command) in enumerate(_FUNCTION_PRESETS):
             self._draw_button(
                 layout,
@@ -6742,7 +6845,7 @@ class X11CalibrationOverlay:
             )
         auto_rect = self._panel_rectangle(layout, "native_mode_auto")
         self._draw_text(
-            "SONIC 原生 mode override：Auto 保持稳定自动步态；0-19 为手动档",
+            "SONIC 模式：AUTO 自动稳定；0-3 是已知步态；4-19 为原生单档/语义待确认",
             x=content[0],
             y=max(auto_rect[1] - 12, content[1] + 72),
             colour=self._colours["muted"],
@@ -6750,7 +6853,7 @@ class X11CalibrationOverlay:
         self._draw_button(
             layout,
             "native_mode_auto",
-            "AUTO",
+            _NATIVE_MODE_BUTTON_LABELS_ZH[None],
             fill=self._colours["disabled" if quick_disabled else "button"],
             disabled=quick_disabled,
         )
@@ -6758,18 +6861,25 @@ class X11CalibrationOverlay:
             self._draw_button(
                 layout,
                 f"native_mode_{index}",
-                str(index),
+                _NATIVE_MODE_BUTTON_LABELS_ZH.get(index, f"{index} 单档"),
                 fill=self._colours["disabled" if quick_disabled else "button"],
                 disabled=quick_disabled,
             )
         key_y = self._panel_rectangle(layout, "native_mode_10")[1] + (
             46 if compact else 64
         )
+        files_line = (
+            "函数文件：" + ", ".join(function_model.files[:4])
+            if function_model.files
+            else "函数文件：未发现 .mcfunction；可从目录中新建或编辑"
+        )
         for offset, line in enumerate(
             (
-                "函数按钮会直接提交命令；命令台仍可手动热编辑组合命令",
-                "按键绑定和三种 WASD 坐标模式已移到“按键绑定”页",
-                "命令：/recover，/pose @s yaw 90deg，/sonic mode 7，/sonic mode auto",
+                self._clip_console_line(path_line, content[2]),
+                self._clip_console_line(files_line, content[2]),
+                "AUTO：" + native_mode_description_zh(None),
+                "4-19：SONIC 原生单档，Matrix 只透传编号，具体语义待确认",
+                "示例：/function recover_here，/function sonic/mode_07，/function sonic/auto",
             )
         ):
             self._draw_text(
@@ -6843,7 +6953,10 @@ class X11CalibrationOverlay:
         )
         lines = (
             f"当前 WASD 坐标模式：{current_mode}",
-            "W / A / S / D：前后左右移动；Shift/Ctrl/Alt：速度档位",
+            "相机朝向：WASD 按镜头方向移动，机器人自动面向运动方向（默认）。",
+            "相机侧移：WASD 按镜头方向平移，身体朝向尽量保持，用于横移观察。",
+            "机身相对：WASD 按机器人自身坐标前后左右，不跟随相机 yaw。",
+            "W / A / S / D：前后左右移动；Shift/Ctrl/Alt：速度档位。",
             "Q / E：按 SONIC/PICO 原生右摇杆语义做左右转向",
             "方向键：调整相机；鼠标拖拽：相机视角；V：循环三种 WASD 模式",
             "ESC：打开/关闭战术终端；Enter：命令台提交；F6：应用重启",
@@ -7811,6 +7924,7 @@ class X11CalibrationOverlay:
         inventory_model: CreativeInventoryModel | None = None,
         navigation_model: CelestialNavigationModel | None = None,
         video_model: VideoSettingsPanelModel | None = None,
+        function_model: FunctionLibraryModel | None = None,
         runtime_pause_model: RuntimePausePanelModel | None = None,
         build_info_model: BuildInfoPanelModel | None = None,
         startup_loading: StartupLoadingModel | None = None,
@@ -7861,6 +7975,7 @@ class X11CalibrationOverlay:
                 layout,
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
+                function_model or function_library_model({}),
             )
         elif page == "keybindings":
             self._draw_keybindings_page(
@@ -8410,6 +8525,18 @@ class X11CalibrationOverlay:
                         publisher.publish_command_quick_submit(quick_command)
                         emitted += 1
                     continue
+                if action == "functions_open_dir":
+                    panel_model = self._last_panel_model
+                    if (
+                        panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                    ):
+                        publisher.publish(action)
+                        emitted += 1
+                    continue
                 if action == "runtime_pause":
                     panel_model = self._last_panel_model
                     if (
@@ -8661,6 +8788,7 @@ class X11CalibrationOverlay:
         inventory_model = creative_inventory_model(state)
         navigation_model = celestial_navigation_model(state)
         video_model = video_settings_panel_model(state)
+        function_model = function_library_model(state)
         build_info_model = build_info_panel_model(state)
         startup_model = startup_loading_model(state)
         command_status = command_console_status(state)
@@ -8675,6 +8803,7 @@ class X11CalibrationOverlay:
             or inventory_model != getattr(self, "_last_inventory_model", None)
             or navigation_model != getattr(self, "_last_navigation_model", None)
             or video_model != getattr(self, "_last_video_model", None)
+            or function_model != getattr(self, "_last_function_model", None)
             or build_info_model != getattr(self, "_last_build_info_model", None)
             or startup_model
             != getattr(self, "_last_startup_loading_model", startup_loading_model({}))
@@ -8731,6 +8860,7 @@ class X11CalibrationOverlay:
                 inventory_model,
                 navigation_model,
                 video_model,
+                function_model,
                 runtime_pause_model,
                 build_info_model,
                 startup_model,
@@ -8808,6 +8938,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model = inventory_model
         self._last_navigation_model = navigation_model
         self._last_video_model = video_model
+        self._last_function_model = function_model
         self._last_build_info_model = build_info_model
         self._last_startup_loading_model = startup_model
         self._last_runtime_pause_model = runtime_pause_model
@@ -8848,6 +8979,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model = None
         self._last_navigation_model = None
         self._last_video_model = None
+        self._last_function_model = None
         self._last_build_info_model = None
         self._last_startup_loading_model = startup_loading_model({})
         self._last_page = None

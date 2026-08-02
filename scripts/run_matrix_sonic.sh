@@ -71,6 +71,7 @@ GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
 GAME_WORLD_PERSISTENCE="${MATRIX_GAME_WORLD_PERSISTENCE:-auto}"
 GAME_AUTO_RESPAWN="${MATRIX_GAME_AUTO_RESPAWN:-auto}"
 GAME_WORLD_CHECKPOINT_SECONDS="${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
+GAME_FUNCTION_DIR="${MATRIX_GAME_FUNCTION_DIR:-}"
 WALK_AFTER="-1"
 VX="0.30"
 VY="0.0"
@@ -125,6 +126,7 @@ usage() {
         "  --game-world-persistence MODE  auto, on, or off (default: auto)" \
         "  --game-auto-respawn MODE   auto, on, or off; cold-reloads after a fall" \
         "  --game-world-checkpoint-seconds SEC  Durable last-exit interval (default: 0.75)" \
+        "  --game-function-dir PATH   Directory of hot-editable .mcfunction command files" \
         "  --walk-after SECONDS       Start planner walking after delay; -1 stays idle" \
         "  --vx MPS                    Forward command after walk delay (default: 0.30)" \
         "  --vy MPS                    Lateral command after walk delay" \
@@ -169,6 +171,7 @@ while [[ $# -gt 0 ]]; do
         --game-world-persistence) GAME_WORLD_PERSISTENCE="$2"; shift 2 ;;
         --game-auto-respawn) GAME_AUTO_RESPAWN="$2"; shift 2 ;;
         --game-world-checkpoint-seconds) GAME_WORLD_CHECKPOINT_SECONDS="$2"; shift 2 ;;
+        --game-function-dir) GAME_FUNCTION_DIR="$2"; shift 2 ;;
         --walk-after) WALK_AFTER="$2"; shift 2 ;;
         --vx) VX="$2"; shift 2 ;;
         --vy) VY="$2"; shift 2 ;;
@@ -255,6 +258,7 @@ MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/m
 MATRIX_UI_SETTINGS_FILE="${MATRIX_UI_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/ui-settings.json}"
 MATRIX_MOTION_SETTINGS_FILE="${MATRIX_MOTION_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/motion-control.json}"
 MATRIX_VIDEO_SETTINGS_FILE="${MATRIX_VIDEO_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/video-settings.json}"
+MATRIX_GAME_FUNCTION_DIR="${GAME_FUNCTION_DIR:-${MATRIX_GAME_FUNCTION_DIR:-$MATRIX_SETTINGS_DIR/functions}}"
 if [[ "$MATRIX_MOUSE_SETTINGS_FILE" != /* ]]; then
     echo "[ERROR] MATRIX_MOUSE_SETTINGS_FILE must be absolute" >&2
     exit 2
@@ -271,6 +275,32 @@ for settings_path_name in \
     fi
     printf -v "$settings_path_name" '%s' "$(realpath -m "$settings_path")"
 done
+if [[ "$MATRIX_GAME_FUNCTION_DIR" != /* ]]; then
+    echo "[ERROR] MATRIX_GAME_FUNCTION_DIR must be absolute" >&2
+    exit 2
+fi
+MATRIX_GAME_FUNCTION_DIR="$(realpath -m "$MATRIX_GAME_FUNCTION_DIR")"
+seed_matrix_game_functions() {
+    local source_dir="$PROJECT_ROOT/resources/matrix_functions"
+    local source_file
+    local relative
+    local target
+    if [[ ! -d "$source_dir" ]]; then
+        return 0
+    fi
+    mkdir -p "$MATRIX_GAME_FUNCTION_DIR"
+    while IFS= read -r -d '' source_file; do
+        relative="${source_file#"$source_dir/"}"
+        target="$MATRIX_GAME_FUNCTION_DIR/$relative"
+        mkdir -p "$(dirname "$target")"
+        if [[ ! -e "$target" ]]; then
+            cp -- "$source_file" "$target"
+        fi
+    done < <(find "$source_dir" -type f -name '*.mcfunction' -print0)
+}
+if [[ "$CONTROL_SOURCE" == "game" ]]; then
+    seed_matrix_game_functions
+fi
 MOUSE_LAUNCH_FIELDS="$(
     /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_mouse_settings.py" \
         launch-fields --file "$MATRIX_MOUSE_SETTINGS_FILE"
@@ -328,7 +358,7 @@ fi
 export MATRIX_HOST_PROFILE="${MATRIX_HOST_PROFILE:-$MATRIX_SETTINGS_PROFILE}"
 export MATRIX_SETTINGS_PROFILE MATRIX_UI_SETTINGS_FILE MATRIX_MOTION_SETTINGS_FILE
 export MATRIX_VIDEO_SETTINGS_FILE MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON
-export MATRIX_GAME_CAMERA_DISTANCE_CM
+export MATRIX_GAME_CAMERA_DISTANCE_CM MATRIX_GAME_FUNCTION_DIR
 echo "[INFO] Matrix settings profile: $MATRIX_SETTINGS_PROFILE " \
     "video_camera_distance=${MATRIX_GAME_CAMERA_DISTANCE_CM}cm"
 MATRIX_SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
@@ -759,6 +789,7 @@ export MATRIX_GAME_INPUT_TIMEOUT="$GAME_INPUT_TIMEOUT"
 export MATRIX_GAME_WORLD_PERSISTENCE="$GAME_WORLD_PERSISTENCE"
 export MATRIX_GAME_AUTO_RESPAWN="$GAME_AUTO_RESPAWN"
 export MATRIX_GAME_WORLD_CHECKPOINT_SECONDS="$GAME_WORLD_CHECKPOINT_SECONDS"
+export MATRIX_GAME_FUNCTION_DIR
 export MATRIX_GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
 if [[ "$CONTROL_SOURCE" == "game" ]]; then
     rm -f -- "$MATRIX_GAME_INPUT_STATUS_FILE"

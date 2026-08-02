@@ -347,6 +347,28 @@ SONIC_GAIT_NAMES = {
     SONIC_WALK_MODE: "WALK",
     SONIC_RUN_MODE: "RUN",
 }
+SONIC_NATIVE_MODE_DESCRIPTIONS_ZH: dict[int | None, tuple[str, str]] = {
+    None: (
+        "AUTO 自动稳定",
+        "按当前速度/转向自动选择 0 空闲、1 慢走、2 行走、3 跑步。",
+    ),
+    SONIC_IDLE_MODE: (
+        "0 空闲/原地",
+        "SONIC 空闲档；用于站立、低速原地调整和自动档的静止段。",
+    ),
+    SONIC_SLOW_WALK_MODE: (
+        "1 慢走",
+        "SONIC 慢走档；适合小速度 WASD 和细微位置调整。",
+    ),
+    SONIC_WALK_MODE: (
+        "2 行走",
+        "SONIC 行走档；适合常规 WASD 前后左右移动。",
+    ),
+    SONIC_RUN_MODE: (
+        "3 跑步",
+        "SONIC 跑步档；适合 Shift/高速输入，速度上限更高。",
+    ),
+}
 SONIC_GAIT_SPEED_RANGES_MPS = {
     SONIC_SLOW_WALK_MODE: (0.10, 0.80),
     SONIC_WALK_MODE: (0.80, 2.50),
@@ -385,6 +407,32 @@ def native_mode_label(value: int | None) -> str:
     if value is None:
         return "AUTO"
     return SONIC_GAIT_NAMES.get(value, f"MODE_{value:02d}")
+
+
+def native_mode_label_zh(value: int | None) -> str:
+    """User-facing Chinese label for the ESC/native-mode surfaces."""
+
+    try:
+        mode = validate_native_mode_override(value)
+    except ValueError:
+        return "未知模式"
+    if mode in SONIC_NATIVE_MODE_DESCRIPTIONS_ZH:
+        return SONIC_NATIVE_MODE_DESCRIPTIONS_ZH[mode][0]
+    assert mode is not None
+    return f"{mode} 原生单档"
+
+
+def native_mode_description_zh(value: int | None) -> str:
+    """Concise Chinese description without inventing unknown SONIC semantics."""
+
+    try:
+        mode = validate_native_mode_override(value)
+    except ValueError:
+        return "无效 SONIC 模式。"
+    if mode in SONIC_NATIVE_MODE_DESCRIPTIONS_ZH:
+        return SONIC_NATIVE_MODE_DESCRIPTIONS_ZH[mode][1]
+    assert mode is not None
+    return f"SONIC 原生模式 {mode}；Matrix 只透传编号，具体语义待 SONIC 侧确认。"
 
 
 def native_locomotion_mode_for_speed(

@@ -47,6 +47,9 @@ _SONIC_MODE_RE = re.compile(
     r"/?(?:sonic|native)\s+mode\s+(?P<mode>auto|[0-9]{1,2})\s*\Z"
 )
 _FUNCTION_RE = re.compile(r"/?function\s+(?P<body>.+?)\s*\Z")
+_FUNCTION_NAME_RE = re.compile(
+    r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z"
+)
 _SELECTOR_RE = re.compile(r"@e\[(?P<body>[^\]]+)\]\Z")
 
 
@@ -264,6 +267,14 @@ class CommandFunctionRun:
             )
 
 
+@dataclass(frozen=True)
+class CommandFunctionCall:
+    name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", validate_function_name(self.name))
+
+
 AtomicMcCommand: TypeAlias = (
     SummonTeleportPoint
     | TeleportCoordinates
@@ -274,7 +285,7 @@ AtomicMcCommand: TypeAlias = (
     | NativeModeSet
 )
 McCommand: TypeAlias = (
-    AtomicMcCommand | CommandFunctionRun
+    AtomicMcCommand | CommandFunctionRun | CommandFunctionCall
 )
 
 
@@ -299,6 +310,32 @@ def _validate_text(text: object) -> str:
             "E_COMMAND_CONTROL", "command contains a control character"
         )
     return text.strip()
+
+
+def validate_function_name(value: object) -> str:
+    """Validate a Minecraft-like function resource id under one root directory."""
+
+    if not isinstance(value, str):
+        raise CommandParseError("E_FUNCTION_NAME", "function name must be text")
+    name = value.strip().removeprefix("/")
+    if not name or len(name) > 160:
+        raise CommandParseError(
+            "E_FUNCTION_NAME",
+            "function name must be 1-160 characters",
+        )
+    if (
+        _FUNCTION_NAME_RE.fullmatch(name) is None
+        or name.startswith(".")
+        or name.endswith(".")
+        or "/." in name
+        or "./" in name
+        or ".." in name.split("/")
+    ):
+        raise CommandParseError(
+            "E_FUNCTION_NAME",
+            "function name must use safe segments like recover_here or sonic/mode_07",
+        )
+    return name
 
 
 def parse_coordinate(token: str) -> Coordinate:
@@ -453,7 +490,10 @@ def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
     if function is not None:
         if not allow_function:
             raise CommandParseError("E_FUNCTION_NESTED", "nested functions are not supported")
-        return ParsedCommand(_parse_function_body(function.group("body")))
+        body = function.group("body").strip()
+        if ";" not in body and not body.lstrip().startswith("/"):
+            return ParsedCommand(CommandFunctionCall(validate_function_name(body)))
+        return ParsedCommand(_parse_function_body(body))
     summon = _SUMMON_RE.fullmatch(command_text)
     if summon is not None:
         if summon.group("entity") != TELEPORT_POINT_TYPE:
@@ -561,6 +601,11 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "name": "function_run",
             "commands": [command_to_mapping(item) for item in command.commands],
         }
+    if isinstance(command, CommandFunctionCall):
+        return {
+            "name": "function_call",
+            "function": command.name,
+        }
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
@@ -639,6 +684,13 @@ def command_from_mapping(value: object) -> McCommand:
             raise CommandProtocolError("function command cannot contain nested functions")
         try:
             return CommandFunctionRun(parsed_commands)
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "function_call":
+        if set(value) != {"name", "function"}:
+            raise CommandProtocolError("function call command has an invalid schema")
+        try:
+            return CommandFunctionCall(value.get("function"))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     raise CommandProtocolError(f"unsupported typed command {name!r}")
@@ -1008,6 +1060,11 @@ def execute_command(
             restart_required=restart_required,
             data={"steps": results},
         )
+    if isinstance(command, CommandFunctionCall):
+        raise CommandExecutionError(
+            "E_FUNCTION_RUNTIME_ONLY",
+            "file-backed functions require runtime support",
+        )
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
@@ -1015,6 +1072,7 @@ __all__ = [
     "COMMAND_PROTOCOL",
     "Angle",
     "CommandEffect",
+    "CommandFunctionCall",
     "CommandExecutionError",
     "CommandParseError",
     "CommandProtocolError",
@@ -1038,4 +1096,5 @@ __all__ = [
     "encode_command_response",
     "execute_command",
     "parse_mc_command",
+    "validate_function_name",
 ]

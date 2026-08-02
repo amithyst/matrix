@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -3821,23 +3822,15 @@ def build_snapshot(
     keys, move_stick, _look_yaw = select_physical_inputs(
         keyboard, gamepad, source=input_source
     )
-    native_free_camera_drag = bool(
-        keyboard.camera_dragging and not keyboard_camera_arrow_active(keyboard)
-    )
     return InputSnapshot(
         sequence=sequence,
         timestamp_monotonic_s=timestamp_monotonic_s,
         # Missing actual camera yaw is a safety condition, not permission to
         # keep walking using the last direction.
-        # Native Matrix documents held mouse-drag as temporary free camera.
-        # Treat it like a focus interlock so camera-WASD cannot also walk G1.
-        # Arrow camera deliberately synthesizes that drag and remains movement-safe.
-        focused=(
-            keyboard.focused
-            and not native_free_camera_drag
-            and camera_available
-            and input_available
-        ),
+        # The current Matrix launcher reads the actual UE PlayerCameraManager
+        # final POV, so mouse/arrow camera movement can safely coexist with
+        # held WASD.  Focus/camera/input availability remain hard gates.
+        focused=keyboard.focused and camera_available and input_available,
         camera_yaw_rad=camera_yaw_rad,
         keys=keys,
         move_stick=move_stick,
@@ -3877,6 +3870,73 @@ class OverlayIntent:
     action: str | None = None
     command: str | None = None
     active: bool | None = None
+
+
+def function_library_mapping(
+    path: Path | None,
+    *,
+    open_count: int = 0,
+    open_error: str | None = None,
+) -> dict[str, object]:
+    if path is None:
+        return {
+            "directory": None,
+            "available": False,
+            "files": [],
+            "open_available": False,
+            "open_count": open_count,
+            "open_error": open_error,
+        }
+    files: list[str] = []
+    available = path.is_dir()
+    if available:
+        try:
+            root = path.resolve()
+            for item in sorted(root.rglob("*.mcfunction")):
+                if item.is_file():
+                    files.append(item.relative_to(root).with_suffix("").as_posix())
+                if len(files) >= 64:
+                    break
+        except OSError as exc:
+            available = False
+            files = []
+            open_error = str(exc)
+    return {
+        "directory": str(path),
+        "available": available,
+        "files": files,
+        "open_available": bool(shutil.which("xdg-open") or shutil.which("gio")),
+        "open_count": open_count,
+        "open_error": open_error,
+    }
+
+
+def open_function_directory(path: Path | None) -> tuple[bool, str | None]:
+    if path is None:
+        return False, "function directory is not configured"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"cannot create function directory: {exc}"
+    opener = shutil.which("xdg-open")
+    command = [opener, str(path)] if opener else None
+    if command is None:
+        gio = shutil.which("gio")
+        if gio is not None:
+            command = [gio, "open", str(path)]
+    if command is None:
+        return False, "xdg-open/gio is not available"
+    try:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return False, f"cannot open function directory: {exc}"
+    return True, None
 
 
 class GameCommandClient:
@@ -4308,6 +4368,7 @@ class CalibrationOverlaySupervisor:
             "speed_down",
             "speed_up",
             "apply_return",
+            "functions_open_dir",
         }
         | _MOVEMENT_MODE_ACTIONS
         | set(_MOTION_PANEL_ACTIONS)
@@ -4698,6 +4759,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-settings-file", type=Path)
     parser.add_argument("--video-settings-file", type=Path)
     parser.add_argument(
+        "--function-directory",
+        type=Path,
+        help="Directory containing newline-based Matrix .mcfunction files",
+    )
+    parser.add_argument(
         "--applied-video-settings-json",
         help="Launcher-applied video settings JSON for pending-restart display",
     )
@@ -4837,6 +4903,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         path = getattr(args, name)
         if path is not None and not path.is_absolute():
             raise SystemExit(f"--{name.replace('_', '-')} must be absolute")
+    if args.function_directory is not None and not args.function_directory.is_absolute():
+        raise SystemExit("--function-directory must be absolute")
     if args.restart_launcher_pid is not None and args.restart_launcher_pid <= 1:
         raise SystemExit("--restart-launcher-pid must be greater than one")
     game_command_fd = getattr(args, "game_command_fd", None)
@@ -4864,6 +4932,11 @@ def _validate_args(args: argparse.Namespace) -> None:
 def main() -> int:
     args = _parse_args()
     _validate_args(args)
+    function_directory = (
+        args.function_directory.resolve()
+        if args.function_directory is not None
+        else None
+    )
     raw_build_info = os.environ.get("MATRIX_BUILD_INFO_JSON")
     try:
         build_info = parse_build_info_json(raw_build_info or "")
@@ -5079,6 +5152,8 @@ def main() -> int:
     exception_detail: dict[str, object] | None = None
     overlay_error: str | None = None
     overlay_failures = 0
+    function_directory_open_count = 0
+    function_directory_open_error: str | None = None
     provider_yaw = tracker.yaw
     camera_yaw = transform_camera_yaw(
         provider_yaw,
@@ -5102,6 +5177,13 @@ def main() -> int:
             "failures": overlay_failures,
             "last_error": overlay_error,
         }
+
+    def live_function_library_mapping() -> dict[str, object]:
+        return function_library_mapping(
+            function_directory,
+            open_count=function_directory_open_count,
+            open_error=function_directory_open_error,
+        )
 
     def disable_overlay(context: str, exc: Exception) -> bool:
         """Disable the ESC overlay without killing the movement input provider."""
@@ -5154,6 +5236,7 @@ def main() -> int:
                         "restart": restart_requester.mapping(),
                         "apply_return": apply_return.mapping(),
                         "command_console": game_command_client.mapping(),
+                        "function_library": live_function_library_mapping(),
                         "build_info": build_info,
                         "strategy_loadout": locked_sonic_strategy_loadout(),
                         "movement_mode": current_movement_mode,
@@ -5309,6 +5392,7 @@ def main() -> int:
             ui_settings_changed = False
             motion_settings_changed = False
             video_settings_changed = False
+            function_library_changed = False
             settings_action_active = bool(
                 calibration.active
                 and not restart_requester.requested
@@ -5370,6 +5454,15 @@ def main() -> int:
                         ) as exc:
                             video_settings_error = str(exc)
                             video_settings_changed = True
+                elif panel_action == "functions_open_dir":
+                    if settings_action_active:
+                        opened, open_error = open_function_directory(
+                            function_directory
+                        )
+                        if opened:
+                            function_directory_open_count += 1
+                        function_directory_open_error = open_error
+                        function_library_changed = True
                 elif panel_action in _MOVEMENT_MODE_ACTIONS:
                     if settings_action_active:
                         movement_mode = panel_action.removeprefix("movement_mode_")
@@ -5565,6 +5658,7 @@ def main() -> int:
                         or ui_settings_changed
                         or motion_settings_changed
                         or video_settings_changed
+                        or function_library_changed
                         or restart_requested
                         or teleport_rejections != last_teleport_rejections
                         or now >= next_overlay_heartbeat
@@ -5599,6 +5693,7 @@ def main() -> int:
                                 "restart": restart_requester.mapping(),
                                 "apply_return": apply_return.mapping(),
                                 "command_console": game_command_client.mapping(),
+                                "function_library": live_function_library_mapping(),
                                 "build_info": build_info,
                                 "strategy_loadout": locked_sonic_strategy_loadout(),
                                 "movement_mode": current_movement_mode,
@@ -5744,6 +5839,7 @@ def main() -> int:
                 "restart": restart_requester.mapping(),
                 "apply_return": apply_return.mapping(),
                 "command_console": game_command_client.mapping(),
+                "function_library": live_function_library_mapping(),
                 "build_info": build_info,
                 "strategy_loadout": locked_sonic_strategy_loadout(),
                 "gamepad_camera": {

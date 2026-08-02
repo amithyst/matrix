@@ -42,12 +42,16 @@ from matrix_game_control import (
     SONIC_WALK_MODE,
     UnixInputConnection,
     UnixSeqpacketInputServer,
+    native_mode_description_zh,
     native_mode_label,
+    native_mode_label_zh,
     wrap_angle_rad,
 )
 from matrix_mc_commands import (
+    CommandFunctionCall,
     CommandFunctionRun,
     CommandExecutionError,
+    CommandParseError,
     CommandProtocolError,
     GameCommandRequest,
     GameCommandResponse,
@@ -57,6 +61,8 @@ from matrix_mc_commands import (
     decode_command_request,
     encode_command_response,
     execute_command,
+    parse_mc_command,
+    validate_function_name,
 )
 from matrix_mouse_settings import canonical_remote_speed_scale
 from matrix_motion_settings import MotionSettings, MotionSettingsStore
@@ -75,6 +81,9 @@ _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
+_MAX_FUNCTION_FILE_BYTES = 16 * 1024
+_MAX_FUNCTION_STEPS = 64
+_MAX_FUNCTION_DEPTH = 4
 
 
 def _remote_speed_scale_argument(value: str) -> float:
@@ -198,6 +207,11 @@ def _parse_args() -> argparse.Namespace:
         help="Ask the game input provider to consume ESC/Q/E before cooked UE",
     )
     parser.add_argument("--game-input-status-file", type=Path)
+    parser.add_argument(
+        "--game-function-directory",
+        type=Path,
+        help="Directory containing newline-based Matrix .mcfunction files",
+    )
     parser.add_argument("--no-game-input-provider", action="store_true")
     parser.add_argument("--game-world-id")
     parser.add_argument("--game-world-revision")
@@ -1584,6 +1598,13 @@ def _game_control_status_fields(
         },
         "native_mode_override": "auto unless changed by /sonic mode or ESC native-mode buttons",
         "native_mode_override_range": [SONIC_NATIVE_MODE_MIN, SONIC_NATIVE_MODE_MAX],
+        "native_mode_override_auto_label_zh": native_mode_label_zh(None),
+        "native_mode_override_auto_description_zh": native_mode_description_zh(None),
+        "game_function_directory": (
+            str(args.game_function_directory)
+            if getattr(args, "game_function_directory", None) is not None
+            else None
+        ),
         "keyboard_slow_speed_mps": keyboard_slow_speed,
         "keyboard_walk_speed_mps": keyboard_walk_speed,
         "keyboard_run_speed_mps": keyboard_run_speed,
@@ -2259,8 +2280,24 @@ class GameInputRuntime:
                 if command is not None
                 else SONIC_GAIT_NAMES[SONIC_IDLE_MODE]
             ),
+            "locomotion_mode_label_zh": (
+                native_mode_label_zh(command.locomotion_mode)
+                if command is not None
+                else native_mode_label_zh(SONIC_IDLE_MODE)
+            ),
+            "locomotion_mode_description_zh": (
+                native_mode_description_zh(command.locomotion_mode)
+                if command is not None
+                else native_mode_description_zh(SONIC_IDLE_MODE)
+            ),
             "native_mode_override": self.core.native_mode_override,
             "native_mode_override_name": native_mode_label(
+                self.core.native_mode_override
+            ),
+            "native_mode_override_label_zh": native_mode_label_zh(
+                self.core.native_mode_override
+            ),
+            "native_mode_override_description_zh": native_mode_description_zh(
                 self.core.native_mode_override
             ),
             "moving_command_frames": self.moving_command_frames,
@@ -2300,11 +2337,15 @@ class GameCommandRuntime:
         connection: socket.socket,
         world: _GameWorldStateRuntime | None,
         core: GameControlCore | None = None,
+        function_directory: Path | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
         self.world = world
         self.core = core or GameControlCore()
+        self.function_directory = (
+            function_directory.resolve() if function_directory is not None else None
+        )
         self.session: str | None = None
         self.last_sequence = 0
         self.request_ids: set[str] = set()
@@ -2408,20 +2449,120 @@ class GameCommandRuntime:
             {
                 "native_mode": mode,
                 "native_mode_name": label,
+                "native_mode_label_zh": native_mode_label_zh(mode),
+                "native_mode_description_zh": native_mode_description_zh(mode),
             },
         )
 
-    def _execute_function_command(
+    def _function_library_root(self) -> Path:
+        root = self.function_directory
+        if root is None:
+            raise CommandExecutionError(
+                "E_FUNCTION_LIBRARY_UNAVAILABLE",
+                "No Matrix function directory was configured for this run",
+            )
+        if not root.is_dir():
+            raise CommandExecutionError(
+                "E_FUNCTION_LIBRARY_UNAVAILABLE",
+                f"Matrix function directory is missing: {root}",
+            )
+        return root
+
+    def _function_file_path(self, function_name: str) -> Path:
+        try:
+            name = validate_function_name(function_name)
+        except CommandParseError as exc:
+            raise CommandExecutionError(exc.code, exc.message) from exc
+        root = self._function_library_root()
+        root_real = root.resolve()
+        path = (root / f"{name}.mcfunction").resolve()
+        if not path.is_relative_to(root_real):
+            raise CommandExecutionError(
+                "E_FUNCTION_NAME",
+                "function path escapes the Matrix function directory",
+            )
+        return path
+
+    def _load_function_file(
         self,
-        command: CommandFunctionRun,
+        command: CommandFunctionCall,
+    ) -> tuple[Path, tuple[object, ...]]:
+        path = self._function_file_path(command.name)
+        try:
+            stat = path.stat()
+        except FileNotFoundError as exc:
+            raise CommandExecutionError(
+                "E_FUNCTION_NOT_FOUND",
+                f"Matrix function {command.name!r} was not found",
+            ) from exc
+        except OSError as exc:
+            raise CommandExecutionError(
+                "E_FUNCTION_READ",
+                f"Cannot stat Matrix function {command.name!r}: {exc}",
+            ) from exc
+        if not path.is_file():
+            raise CommandExecutionError(
+                "E_FUNCTION_NOT_FILE",
+                f"Matrix function {command.name!r} is not a file",
+            )
+        if stat.st_size > _MAX_FUNCTION_FILE_BYTES:
+            raise CommandExecutionError(
+                "E_FUNCTION_TOO_LARGE",
+                f"Matrix function {command.name!r} exceeds {_MAX_FUNCTION_FILE_BYTES} bytes",
+            )
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise CommandExecutionError(
+                "E_FUNCTION_READ",
+                f"Cannot read Matrix function {command.name!r}: {exc}",
+            ) from exc
+        steps: list[object] = []
+        for line_number, raw_line in enumerate(lines, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                parsed = parse_mc_command(line).command
+            except CommandParseError as exc:
+                raise CommandExecutionError(
+                    exc.code,
+                    f"{command.name}:{line_number}: {exc.message}",
+                ) from exc
+            if isinstance(parsed, CommandFunctionRun):
+                raise CommandExecutionError(
+                    "E_FUNCTION_INLINE",
+                    (
+                        f"{command.name}:{line_number}: function files use one "
+                        "command per line; do not use semicolon inline functions"
+                    ),
+                )
+            steps.append(parsed)
+            if len(steps) > _MAX_FUNCTION_STEPS:
+                raise CommandExecutionError(
+                    "E_FUNCTION_TOO_LONG",
+                    f"Matrix function {command.name!r} exceeds {_MAX_FUNCTION_STEPS} steps",
+                )
+        if not steps:
+            raise CommandExecutionError(
+                "E_FUNCTION_EMPTY",
+                f"Matrix function {command.name!r} has no executable commands",
+            )
+        return path, tuple(steps)
+
+    def _execute_function_steps(
+        self,
+        commands: tuple[object, ...],
         *,
         current_pose: WorldPose,
-    ) -> tuple[str, str, bool, dict[str, object]]:
-        state = self.world.state if self.world is not None else None
+        state: object,
+        stack: tuple[str, ...],
+    ) -> tuple[object, WorldPose, bool, list[dict[str, object]]]:
         working_pose = current_pose
         restart_required = False
         steps: list[dict[str, object]] = []
-        for step in command.commands:
+        next_state = state
+        for step in commands:
             if isinstance(step, MovementModeSet):
                 code, message, data = self._apply_movement_mode_command(
                     step,
@@ -2447,20 +2588,39 @@ class GameCommandRuntime:
                     }
                 )
                 continue
-            if self.world is None or state is None:
+            if isinstance(step, CommandFunctionCall):
+                code, message, nested_restart, data, next_state, working_pose = (
+                    self._execute_function_call(
+                        step,
+                        current_pose=working_pose,
+                        state=next_state,
+                        stack=stack,
+                    )
+                )
+                restart_required = restart_required or nested_restart
+                steps.append(
+                    {
+                        "code": code,
+                        "message": message,
+                        "restart_required": nested_restart,
+                        "data": data,
+                    }
+                )
+                continue
+            if self.world is None or next_state is None:
                 raise CommandExecutionError(
                     "E_WORLD_UNAVAILABLE",
                     "World function steps require game world persistence",
                 )
             effect = execute_command(
                 step,
-                state=state,
+                state=next_state,
                 current_pose=working_pose,
                 now_unix_ns=time.time_ns(),
             )
-            state = effect.state
-            if state.last_exit is not None:
-                working_pose = state.last_exit
+            next_state = effect.state
+            if effect.state.last_exit is not None:
+                working_pose = effect.state.last_exit
             restart_required = restart_required or effect.restart_required
             steps.append(
                 {
@@ -2470,10 +2630,108 @@ class GameCommandRuntime:
                     "data": dict(effect.data),
                 }
             )
+        return next_state, working_pose, restart_required, steps
+
+    def _execute_function_call(
+        self,
+        command: CommandFunctionCall,
+        *,
+        current_pose: WorldPose,
+        state: object,
+        stack: tuple[str, ...] = (),
+    ) -> tuple[str, str, bool, dict[str, object], object, WorldPose]:
+        if command.name in stack:
+            cycle = " -> ".join((*stack, command.name))
+            raise CommandExecutionError(
+                "E_FUNCTION_CYCLE",
+                f"Matrix function cycle detected: {cycle}",
+            )
+        if len(stack) >= _MAX_FUNCTION_DEPTH:
+            raise CommandExecutionError(
+                "E_FUNCTION_DEPTH",
+                f"Matrix function nesting exceeds {_MAX_FUNCTION_DEPTH}",
+            )
+        path, commands = self._load_function_file(command)
+        next_state, working_pose, restart_required, steps = (
+            self._execute_function_steps(
+                commands,
+                current_pose=current_pose,
+                state=state,
+                stack=(*stack, command.name),
+            )
+        )
+        return (
+            "OK_FUNCTION_RESTART" if restart_required else "OK_FUNCTION",
+            f"Function {command.name} executed {len(steps)} step(s)",
+            restart_required,
+            {
+                "function": command.name,
+                "path": str(path),
+                "steps": steps,
+            },
+            next_state,
+            working_pose,
+        )
+
+    def _save_function_state(self, state: object) -> None:
         if self.world is not None and state is not None:
+            assert isinstance(state, type(self.world.state))
             self.world.store.save(state)
             self.world.state = state
             self.world.last_error = None
+
+    def _function_library_telemetry(self) -> dict[str, object]:
+        root = self.function_directory
+        if root is None:
+            return {"directory": None, "available": False, "files": []}
+        files: list[str] = []
+        available = root.is_dir()
+        if available:
+            try:
+                root_real = root.resolve()
+                for path in sorted(root_real.rglob("*.mcfunction")):
+                    if path.is_file():
+                        files.append(
+                            path.relative_to(root_real)
+                            .with_suffix("")
+                            .as_posix()
+                        )
+                    if len(files) >= 64:
+                        break
+            except OSError:
+                available = False
+                files = []
+        return {
+            "directory": str(root),
+            "available": available,
+            "files": files,
+        }
+
+    def _execute_function_command(
+        self,
+        command: CommandFunctionRun | CommandFunctionCall,
+        *,
+        current_pose: WorldPose,
+    ) -> tuple[str, str, bool, dict[str, object]]:
+        state = self.world.state if self.world is not None else None
+        if isinstance(command, CommandFunctionCall):
+            code, message, restart_required, data, state, _working_pose = (
+                self._execute_function_call(
+                    command,
+                    current_pose=current_pose,
+                    state=state,
+                    stack=(),
+                )
+            )
+            self._save_function_state(state)
+            return code, message, restart_required, data
+        state, _working_pose, restart_required, steps = self._execute_function_steps(
+            command.commands,
+            current_pose=current_pose,
+            state=state,
+            stack=(),
+        )
+        self._save_function_state(state)
         return (
             "OK_FUNCTION_RESTART" if restart_required else "OK_FUNCTION",
             f"Function executed {len(steps)} step(s)",
@@ -2609,7 +2867,7 @@ class GameCommandRuntime:
                     )
                 )
                 continue
-            if isinstance(request.command, CommandFunctionRun):
+            if isinstance(request.command, (CommandFunctionRun, CommandFunctionCall)):
                 if not command_allowed:
                     self.rejected_commands += 1
                     self._send(
@@ -2758,6 +3016,13 @@ class GameCommandRuntime:
             "native_mode_override_name": native_mode_label(
                 self.core.native_mode_override
             ),
+            "native_mode_override_label_zh": native_mode_label_zh(
+                self.core.native_mode_override
+            ),
+            "native_mode_override_description_zh": native_mode_description_zh(
+                self.core.native_mode_override
+            ),
+            "function_library": self._function_library_telemetry(),
             "world_available": self.world is not None,
             "last_response": self.last_response,
         }
@@ -2902,6 +3167,7 @@ class NativeProcessGroup:
         ui_settings_file: Path | None = None,
         motion_settings_file: Path | None = None,
         video_settings_file: Path | None = None,
+        function_directory: Path | None = None,
         applied_video_settings_json: str | None = None,
         applied_mouse_profile: str = "local",
         applied_mouse_speed_scale: float = 1.0,
@@ -2966,6 +3232,8 @@ class NativeProcessGroup:
             command.extend(("--motion-settings-file", str(motion_settings_file)))
         if video_settings_file is not None:
             command.extend(("--video-settings-file", str(video_settings_file)))
+        if function_directory is not None:
+            command.extend(("--function-directory", str(function_directory)))
         if applied_video_settings_json is not None:
             command.extend(
                 ("--applied-video-settings-json", applied_video_settings_json)
@@ -3171,6 +3439,7 @@ def main() -> int:
         ("game_video_settings_file", None),
         ("game_applied_video_settings_json", None),
         ("game_keyboard_camera_look_rate_deg_s", 120.0),
+        ("game_function_directory", None),
         ("game_motion_settings", None),
         ("game_motion_settings_load_status", "disabled"),
     ):
@@ -3328,6 +3597,7 @@ def main() -> int:
             "game_ui_settings_file",
             "game_motion_settings_file",
             "game_video_settings_file",
+            "game_function_directory",
         ):
             path = getattr(args, name)
             if path is not None and not path.is_absolute():
@@ -3639,6 +3909,7 @@ def main() -> int:
                         command_parent,
                         game_world,
                         game_input.core,
+                        args.game_function_directory,
                     )
                 try:
                     game_input.open()
@@ -3660,6 +3931,7 @@ def main() -> int:
                         ui_settings_file=args.game_ui_settings_file,
                         motion_settings_file=args.game_motion_settings_file,
                         video_settings_file=args.game_video_settings_file,
+                        function_directory=args.game_function_directory,
                         applied_video_settings_json=(
                             args.game_applied_video_settings_json
                         ),

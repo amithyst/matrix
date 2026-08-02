@@ -74,6 +74,11 @@ def armed_core(config=None):
 
 
 class InputProtocolTest(unittest.TestCase):
+    def test_native_mode_chinese_labels_cover_auto_known_and_unknown_modes(self) -> None:
+        self.assertIn("自动", MODULE.native_mode_label_zh(None))
+        self.assertIn("慢走", MODULE.native_mode_description_zh(1))
+        self.assertIn("原生模式 19", MODULE.native_mode_description_zh(19))
+
     def test_snapshot_packet_round_trip(self) -> None:
         original = snapshot(pressed=("w", "q"), stick=(0.25, -0.5), yaw=1.25)
         payload = MODULE.encode_input_packet(original)

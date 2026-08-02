@@ -217,7 +217,12 @@ class OverlayLayoutTest(unittest.TestCase):
 
     def test_functions_page_hit_test_exposes_presets_and_native_modes(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        for action in ("function_preset_0", "native_mode_auto", "native_mode_7"):
+        for action in (
+            "functions_open_dir",
+            "function_preset_0",
+            "native_mode_auto",
+            "native_mode_7",
+        ):
             x, y, width, height = layout[action]
             self.assertEqual(
                 MODULE.panel_action_at(
@@ -230,7 +235,7 @@ class OverlayLayoutTest(unittest.TestCase):
             )
         self.assertEqual(
             MODULE.X11CalibrationOverlay._quick_command_for_action("function_preset_0"),
-            "/recover",
+            "/function recover_here",
         )
         self.assertEqual(
             MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_auto"),

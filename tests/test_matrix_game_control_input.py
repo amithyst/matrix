@@ -1020,7 +1020,7 @@ class SnapshotTest(unittest.TestCase):
         )
         self.assertFalse(snapshot.focused)
 
-    def test_native_camera_drag_interlocks_robot_movement(self) -> None:
+    def test_native_camera_drag_keeps_robot_movement_focused(self) -> None:
         snapshot = MODULE.build_snapshot(
             sequence=2,
             timestamp_monotonic_s=1.0,
@@ -1032,7 +1032,7 @@ class SnapshotTest(unittest.TestCase):
             camera_yaw_rad=0.5,
             camera_available=True,
         )
-        self.assertFalse(snapshot.focused)
+        self.assertTrue(snapshot.focused)
         self.assertTrue(snapshot.keys.w)
 
 
@@ -2607,7 +2607,7 @@ class XInput2RawMotionTest(unittest.TestCase):
             {"xi2_button_state_resync": 1, "focus_or_pointer_invalid": 1},
         )
 
-    def test_core_gated_drag_requires_neutral_before_camera_relative_w(self) -> None:
+    def test_core_gated_drag_keeps_camera_relative_w_live(self) -> None:
         accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
         tracker = MODULE.CameraYawTracker(
             0.0,
@@ -2645,25 +2645,23 @@ class XInput2RawMotionTest(unittest.TestCase):
         _, _, press_drag = accumulator.update(
             (), current_look_pressed=True
         )
-        self.assertTrue(deliver(2, 1.01, dragging=press_drag).safe_stop)
+        self.assertFalse(deliver(2, 1.01, dragging=press_drag).safe_stop)
         dx, _, held_drag = accumulator.update(
             (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=1.0),),
             current_look_pressed=True,
         )
         tracker.update(dt=0.02, mouse_dx=dx, gamepad_look_yaw=0.0)
-        self.assertTrue(deliver(3, 1.02, w=True, dragging=held_drag).safe_stop)
+        moving = deliver(3, 1.02, w=True, dragging=held_drag)
+        self.assertFalse(moving.safe_stop)
         _, _, release_drag = accumulator.update(
             (), current_look_pressed=False
         )
-        self.assertTrue(deliver(4, 1.03, w=True, dragging=release_drag).safe_stop)
-        awaiting = deliver(5, 1.04, w=True)
-        self.assertTrue(awaiting.safe_stop)
-        self.assertEqual(awaiting.reason, "awaiting_neutral")
-        self.assertFalse(deliver(6, 1.05).safe_stop)
-        resumed = deliver(7, 1.06, w=True)
-        self.assertFalse(resumed.safe_stop)
-        self.assertAlmostEqual(resumed.movement[0], 0.0, places=7)
-        self.assertAlmostEqual(resumed.movement[1], 1.0, places=7)
+        released = deliver(4, 1.03, w=True, dragging=release_drag)
+        self.assertFalse(released.safe_stop)
+        held = deliver(5, 1.04, w=True)
+        self.assertFalse(held.safe_stop)
+        self.assertAlmostEqual(held.movement[0], 0.0, places=7)
+        self.assertAlmostEqual(held.movement[1], 1.0, places=7)
 
     def test_hierarchy_event_discards_complete_batch_and_rebinds(self) -> None:
         reader = self.reader_for_events(
@@ -3112,7 +3110,7 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             backend.pointer_telemetry["motion_source"], "xi2-raw"
         )
 
-    def test_completed_raw_drag_interlocks_same_frame_w(self) -> None:
+    def test_completed_raw_drag_keeps_same_frame_w_live(self) -> None:
         backend = self._raw_backend(
             focus_results=iter(((True, "Matrix", frozenset({1234})),)),
             raw_deltas=((12.0, 0.0, True),),
@@ -3133,7 +3131,7 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             camera_yaw_rad=0.1,
             camera_available=True,
         )
-        self.assertFalse(snapshot.focused)
+        self.assertTrue(snapshot.focused)
 
         core = CORE.GameControlCore(
             CORE.ControlConfig(
@@ -3157,10 +3155,8 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         )
         core.accept_snapshot(snapshot, received_at_s=1.01)
         command = core.command(now_s=1.01, dt_s=0.01)
-        self.assertTrue(command.safe_stop)
-        self.assertEqual(command.reason, "focus_lost")
-        self.assertEqual(command.speed_mps, 0.0)
-        self.assertEqual(command.locomotion_mode, CORE.SONIC_IDLE_MODE)
+        self.assertFalse(command.safe_stop)
+        self.assertEqual(command.locomotion_mode, CORE.SONIC_SLOW_WALK_MODE)
 
         def focused_snapshot(
             sequence: int,
@@ -3187,10 +3183,9 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
 
         held_w = focused_snapshot(3, 1.02, w=True)
         core.accept_snapshot(held_w, received_at_s=1.02)
-        still_stopped = core.command(now_s=1.02, dt_s=1.0)
-        self.assertTrue(still_stopped.safe_stop)
-        self.assertEqual(still_stopped.reason, "awaiting_neutral")
-        self.assertEqual(still_stopped.locomotion_mode, CORE.SONIC_IDLE_MODE)
+        still_moving = core.command(now_s=1.02, dt_s=1.0)
+        self.assertFalse(still_moving.safe_stop)
+        self.assertEqual(still_moving.locomotion_mode, CORE.SONIC_WALK_MODE)
 
         neutral = focused_snapshot(4, 1.03)
         core.accept_snapshot(neutral, received_at_s=1.03)

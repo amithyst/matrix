@@ -69,6 +69,7 @@ class McCommandParserTest(unittest.TestCase):
         movement = MODULE.parse_mc_command("/mode camera_strafe").command
         native = MODULE.parse_mc_command("/sonic mode 7").command
         auto = MODULE.parse_mc_command("/sonic mode auto").command
+        file_function = MODULE.parse_mc_command("/function recover_here").command
         function = MODULE.parse_mc_command(
             "/function /tp @s ~1 ~ ~; /pose @s yaw 180deg"
         ).command
@@ -78,6 +79,7 @@ class McCommandParserTest(unittest.TestCase):
         self.assertEqual(movement, MODULE.MovementModeSet("camera_strafe"))
         self.assertEqual(native, MODULE.NativeModeSet(7))
         self.assertEqual(auto, MODULE.NativeModeSet(None))
+        self.assertEqual(file_function, MODULE.CommandFunctionCall("recover_here"))
         self.assertIsInstance(function, MODULE.CommandFunctionRun)
         self.assertEqual(len(function.commands), 2)
 
@@ -257,6 +259,19 @@ class McCommandExecutionTest(unittest.TestCase):
         self.assertTrue(effect.restart_required)
         self.assertEqual(effect.code, "OK_FUNCTION_RESTART")
         self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, math.pi))
+
+    def test_file_function_requires_runtime_support(self) -> None:
+        command = MODULE.parse_mc_command("/function recover_here").command
+
+        with self.assertRaises(MODULE.CommandExecutionError) as context:
+            MODULE.execute_command(
+                command,
+                state=self.state,
+                current_pose=self.origin,
+                now_unix_ns=4,
+            )
+
+        self.assertEqual(context.exception.code, "E_FUNCTION_RUNTIME_ONLY")
 
     def test_missing_selector_target_does_not_mutate_state(self) -> None:
         command = MODULE.parse_mc_command(

@@ -2231,6 +2231,52 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_game_command_runtime_file_function_can_set_native_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            function_dir = Path(temporary) / "functions"
+            (function_dir / "sonic").mkdir(parents=True)
+            (function_dir / "sonic" / "mode_09.mcfunction").write_text(
+                "# 手动 SONIC 9\n/sonic mode 9\n",
+                encoding="utf-8",
+            )
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            core = GAME_CONTROL.GameControlCore()
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                None,
+                core,
+                function_dir,
+            )
+            request = self.game_command_request(
+                "/function sonic/mode_09",
+                sequence=1,
+                request_character="f",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(
+                        current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                        command_allowed=True,
+                    )
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_FUNCTION")
+                self.assertFalse(response.restart_required)
+                self.assertEqual(core.native_mode_override, 9)
+                self.assertEqual(response.data["function"], "sonic/mode_09")
+                self.assertEqual(len(response.data["steps"]), 1)
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_game_command_runtime_rejects_world_commands_without_world_state(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
             socket.AF_UNIX,

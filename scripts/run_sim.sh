@@ -1593,6 +1593,7 @@ if $MATRIX_SONIC_ENABLED; then
         --game-ui-settings-file "${MATRIX_UI_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/ui-settings.json}"
         --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/motion-control.json}"
         --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/video-settings.json}"
+        --game-function-directory "${MATRIX_GAME_FUNCTION_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/functions}"
         --game-applied-video-settings-json "${MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON:-}"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
