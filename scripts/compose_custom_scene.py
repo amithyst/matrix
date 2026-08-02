@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import xml.etree.ElementTree as ET
@@ -14,6 +15,10 @@ import xml.etree.ElementTree as ET
 
 class SceneCompositionError(RuntimeError):
     """Raised when a native scene cannot be composed reproducibly."""
+
+
+MOON_DYNAMIC_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
+_MOON_GROUND_JOINT_RE = re.compile(r"gb_joint_\d+_\d+")
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -118,6 +123,40 @@ def _remove_named_geoms(
     return tuple(name for name in remove_geoms if name in removed)
 
 
+def _strip_moon_dynamic_ground_joints(root: ET.Element, *, source_scene: Path) -> int:
+    """Make the legacy MoonWorld grid static for the body-only SONIC runtime."""
+
+    if source_scene.name != MOON_DYNAMIC_SCENE_NAME:
+        return 0
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise SceneCompositionError("MoonWorld scene has no worldbody")
+
+    removed = 0
+    for parent in worldbody.iter():
+        for child in list(parent):
+            if (
+                child.tag == "joint"
+                and child.get("type") == "free"
+                and _MOON_GROUND_JOINT_RE.fullmatch(child.get("name") or "")
+            ):
+                parent.remove(child)
+                removed += 1
+
+    remaining_scene_joints = [
+        child.get("name") or child.tag
+        for parent in worldbody.iter()
+        for child in list(parent)
+        if child.tag in {"joint", "freejoint"}
+    ]
+    if remaining_scene_joints:
+        raise SceneCompositionError(
+            "MoonWorld scene must be static after compatibility strip; "
+            f"remaining joints: {', '.join(remaining_scene_joints[:8])}"
+        )
+    return removed
+
+
 def compose_custom_scene(
     source_scene: Path,
     output_scene: Path,
@@ -157,6 +196,18 @@ def compose_custom_scene(
         root.insert(
             0,
             ET.Comment(f" removed environment geoms: {','.join(removed)} "),
+        )
+    stripped_moon_joints = _strip_moon_dynamic_ground_joints(
+        root,
+        source_scene=source_scene,
+    )
+    if stripped_moon_joints:
+        root.insert(
+            0,
+            ET.Comment(
+                " MoonWorld compatibility: stripped "
+                f"{stripped_moon_joints} dynamic ground joints "
+            ),
         )
     root.set("model", f"custom::{source_scene.stem}")
     root.insert(

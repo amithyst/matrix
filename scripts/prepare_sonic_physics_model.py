@@ -20,7 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from compose_custom_scene import compose_custom_scene  # noqa: E402
 
 
-PIPELINE_VERSION = 4
+PIPELINE_VERSION = 5
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 TOWN10_SOURCE_SCENE_SHA256 = (

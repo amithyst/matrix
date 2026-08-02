@@ -88,6 +88,62 @@ class ComposeCustomSceneTest(unittest.TestCase):
                     remove_geoms=("perimeter", "perimeter"),
                 )
 
+    def test_moonworld_ground_grid_is_static_for_body_only_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            native = root / "xgb"
+            native.mkdir()
+            source = native / MODULE.MOON_DYNAMIC_SCENE_NAME
+            source.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<body name="gb_0_0" pos="0 0 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_0" />
+  <geom name="soil_0_0" type="box" size="0.05 0.05 0.5" mass="100000000" />
+</body>
+<body name="gb_0_1" pos="0.1 0 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_1" />
+  <geom name="soil_0_1" type="box" size="0.05 0.05 0.5" mass="100000000" />
+</body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+            output = root / "custom" / MODULE.MOON_DYNAMIC_SCENE_NAME
+
+            MODULE.compose_custom_scene(source, output)
+
+            scene = ET.parse(output).getroot()
+            self.assertEqual(scene.find("include").get("file"), "current.xml")
+            self.assertEqual(
+                [item.get("name") for item in scene.iter("joint")],
+                [],
+            )
+            self.assertIn(
+                "stripped 2 dynamic ground joints",
+                output.read_text(encoding="utf-8"),
+            )
+
+    def test_moonworld_fails_closed_if_non_grid_joints_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            native = root / "xgb"
+            native.mkdir()
+            source = native / MODULE.MOON_DYNAMIC_SCENE_NAME
+            source.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<body name="decor"><joint type="hinge" name="decor_joint" /></body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.SceneCompositionError,
+                "remaining joints: decor_joint",
+            ):
+                MODULE.compose_custom_scene(
+                    source,
+                    root / "custom" / MODULE.MOON_DYNAMIC_SCENE_NAME,
+                )
+
     def test_rejects_asset_collision_with_custom_robot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

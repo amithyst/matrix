@@ -186,7 +186,7 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             for wall in MODULE.TOWN10_PERIMETER_WALL_NAMES:
                 self.assertNotIn(wall, names)
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(manifest["pipeline_version"], 4)
+            self.assertEqual(manifest["pipeline_version"], 5)
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
