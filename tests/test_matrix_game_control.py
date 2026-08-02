@@ -563,12 +563,13 @@ class GameControlCoreTest(unittest.TestCase):
             command = core.command(now_s=10.0, dt_s=0.1)
             self.assertEqual(command.mode, "turn")
             self.assertEqual(command.reason, "manual_yaw")
-            self.assertEqual(command.movement, (0.0, 0.0, 0.0))
-            self.assertEqual(command.speed_mps, 0.0)
+            self.assertAlmostEqual(command.speed_mps, 0.10)
             self.assertEqual(
                 command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
             )
             expected_heading = 0.15 if key == "q" else -0.15
+            self.assertAlmostEqual(command.movement[0], math.cos(expected_heading))
+            self.assertAlmostEqual(command.movement[1], math.sin(expected_heading))
             self.assertAlmostEqual(
                 math.atan2(command.facing[1], command.facing[0]),
                 expected_heading,
@@ -590,6 +591,7 @@ class GameControlCoreTest(unittest.TestCase):
             headings.append(math.atan2(command.facing[1], command.facing[0]))
             self.assertEqual(command.mode, "turn")
             self.assertEqual(command.reason, "manual_yaw")
+            self.assertAlmostEqual(command.speed_mps, 0.10)
             self.assertEqual(
                 command.locomotion_mode, MODULE.SONIC_STATIONARY_TURN_MODE
             )

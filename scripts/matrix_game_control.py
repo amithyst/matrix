@@ -1362,17 +1362,26 @@ class GameControlCore:
             manual_turn
             or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
+        native_override = self._native_mode_override
+        manual_turn_step = False
         if turning_to_heading:
             # Pure facing changes must enter a native turn-capable motion
             # manifold.  Updating only HeadingState.delta_heading leaves the
             # packaged MoonWorld body nearly inert because the native planner
             # does not see a locomotion/facing transition to execute.
             locomotion_mode = SONIC_STATIONARY_TURN_MODE
-        native_override = self._native_mode_override
+            if manual_turn and native_override is None:
+                # Native SONIC's planner turns reliably when it is given a real
+                # low-speed gait target.  A zero-speed planner update changes
+                # the facing tensor but leaves the MoonWorld body nearly static.
+                output_speed = self.config.gait_start_speed_mps
+                moving = True
+                manual_turn_step = True
         if native_override is not None:
             if native_override == SONIC_IDLE_MODE:
                 output_speed = 0.0
                 moving = False
+                manual_turn_step = False
                 locomotion_mode = SONIC_IDLE_MODE
                 movement_direction = (0.0, 0.0, 0.0)
             elif moving or turning_to_heading:
@@ -1383,7 +1392,13 @@ class GameControlCore:
             facing=facing_direction,
             speed_mps=output_speed,
             locomotion_mode=locomotion_mode,
-            mode=("move" if moving else "turn" if turning_to_heading else "idle"),
+            mode=(
+                "turn"
+                if turning_to_heading
+                else "move"
+                if moving
+                else "idle"
+            ),
             safe_stop=False,
             reason=(
                 "manual_yaw"
@@ -1393,7 +1408,9 @@ class GameControlCore:
                 else None
             ),
             desired_facing=desired_direction,
-            delta_heading_rad=self._command_heading_rad if moving else None,
+            delta_heading_rad=(
+                self._command_heading_rad if moving and not manual_turn_step else None
+            ),
         )
 
 
