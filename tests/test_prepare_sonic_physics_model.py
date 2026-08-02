@@ -312,7 +312,7 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
                 )
             )
 
-    def test_moon_dynamic_ground_transform_defaults_to_continuous_hfield(self) -> None:
+    def test_moon_dynamic_ground_transform_defaults_to_mainline_rolling_tiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             canonical = root / "canonical.xml"
@@ -362,14 +362,14 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             contract = manifest["scene_transform_contract"]["dynamic_ground"]
             self.assertEqual(
                 contract["collision"]["mode"],
-                MODULE.MOON_DYNAMIC_GROUND_COLLISION_HFIELD,
+                MODULE.MOON_DYNAMIC_GROUND_COLLISION_TILES,
             )
             self.assertEqual(
                 contract["collision"]["source_tile_compiled_collision_mask"],
-                [0, 0],
+                [1, 1],
             )
             self.assertTrue(
-                contract["collision"]["collision_enabled_after_handoff"]
+                contract["collision"]["source_tile_collision_enabled_after_handoff"]
             )
 
 

@@ -1555,7 +1555,7 @@ if $MATRIX_SONIC_ENABLED; then
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
         MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="$(
-            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-heightfield-v2}" \
+            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1}" \
                 | tr '[:upper:]' '[:lower:]' \
                 | tr '_' '-'
         )"

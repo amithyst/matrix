@@ -32,11 +32,11 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(MODULE.normalize_height_filter(), "raw")
 
-    def test_collision_default_uses_continuous_heightfield(self) -> None:
+    def test_collision_default_uses_mainline_rolling_tiles(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(
                 MODULE.normalize_collision_mode(),
-                MODULE.COLLISION_MODE_ROLLING_HFIELD,
+                MODULE.COLLISION_MODE_ROLLING_TILES,
             )
 
     def test_run_sim_moon_default_does_not_flatten_height_map(self) -> None:
@@ -51,7 +51,7 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
             run_sim,
         )
         self.assertIn(
-            'MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-heightfield-v2',
+            'MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1',
             run_sim,
         )
         self.assertIn(
