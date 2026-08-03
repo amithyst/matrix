@@ -2464,7 +2464,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             runtime = MODULE.GameCommandRuntime(
                 runtime_socket,
                 world,
-                pose_applier=lambda pose: applied_poses.append(pose) or pose,
+                pose_applier=lambda pose, reset_to_standing: applied_poses.append(pose)
+                or pose,
             )
             current_pose = WORLD_STATE.WorldPose(10.0, 20.0, 0.8, 0.5)
             try:
@@ -2689,7 +2690,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 runtime_socket,
                 world,
                 core,
-                pose_applier=lambda pose: pose,
+                pose_applier=lambda pose, reset_to_standing: pose,
             )
             request = self.game_command_request(
                 "/tp @s ~ ~ 0.8",
@@ -2914,7 +2915,10 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 world,
                 core,
                 function_dir,
-                pose_applier=lambda pose: applied_poses.append(pose) or pose,
+                pose_applier=lambda pose, reset_to_standing: applied_poses.append(
+                    (pose, reset_to_standing)
+                )
+                or pose,
                 runtime_pause=runtime_pause,
             )
             request = self.game_command_request(
@@ -2949,9 +2953,13 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 )
                 self.assertTrue(response.data["hot_pose_applied"])
                 self.assertTrue(response.data["input_rearm_required"])
+                self.assertEqual(response.data["reset_pose_applied"], "standing")
                 self.assertEqual(response.data["position"], [10.0, 20.0, 0.85])
                 self.assertAlmostEqual(response.data["yaw_rad"], 1.2)
-                self.assertEqual(applied_poses, [WORLD_STATE.WorldPose(10.0, 20.0, 0.85, 1.2)])
+                self.assertEqual(
+                    applied_poses,
+                    [(WORLD_STATE.WorldPose(10.0, 20.0, 0.85, 1.2), True)],
+                )
                 self.assertEqual(world.state.resume_source, "recover_here")
             finally:
                 provider_socket.close()

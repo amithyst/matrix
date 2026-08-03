@@ -3060,7 +3060,7 @@ class GameCommandRuntime:
         core: GameControlCore | None = None,
         function_directory: Path | None = None,
         motion_settings: MotionSettingsStore | None = None,
-        pose_applier: Callable[[WorldPose], WorldPose] | None = None,
+        pose_applier: Callable[[WorldPose, bool], WorldPose] | None = None,
         runtime_pause: RuntimePauseState | None = None,
     ) -> None:
         self.connection = connection
@@ -3108,12 +3108,21 @@ class GameCommandRuntime:
                 "E_HOT_POSE_UNAVAILABLE",
                 "This runtime cannot apply same-world pose changes without a reload",
             )
-        applied = applier(pose)
+        reset_pose = data.get("reset_pose")
+        if reset_pose not in {None, "standing"}:
+            raise CommandExecutionError(
+                "E_HOT_POSE_RESET",
+                "hot pose reset_pose must be standing when provided",
+            )
+        reset_to_standing = reset_pose == "standing"
+        applied = applier(pose, reset_to_standing)
         self.core.invalidate_input("hot_pose_recover", require_neutral=True)
         data["position"] = [applied.x, applied.y, applied.z]
         data["yaw_rad"] = applied.yaw_rad
         data["hot_pose_applied"] = True
         data["input_rearm_required"] = True
+        if reset_to_standing:
+            data["reset_pose_applied"] = "standing"
         return data, applied
 
     def _apply_hot_pose_effect(
@@ -3552,6 +3561,26 @@ class GameCommandRuntime:
         if target is not None:
             self.restart_target = target
 
+    @staticmethod
+    def _function_reset_pose_from_steps(steps: object) -> str | None:
+        if not isinstance(steps, list):
+            return None
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            data = step.get("data")
+            if not isinstance(data, Mapping):
+                continue
+            reset_pose = data.get("reset_pose")
+            if reset_pose == "standing":
+                return "standing"
+            nested = GameCommandRuntime._function_reset_pose_from_steps(
+                data.get("steps")
+            )
+            if nested is not None:
+                return nested
+        return None
+
     def _execute_function_call(
         self,
         command: CommandFunctionCall,
@@ -3646,7 +3675,13 @@ class GameCommandRuntime:
             )
             self._save_function_state(state)
             if hot_pose is not None and not restart_required:
-                data, _applied = self._apply_hot_pose(hot_pose, {"hot_pose": True, **data})
+                hot_pose_data = {"hot_pose": True, **data}
+                reset_pose = self._function_reset_pose_from_steps(
+                    data.get("steps")
+                )
+                if reset_pose is not None:
+                    hot_pose_data["reset_pose"] = reset_pose
+                data, _applied = self._apply_hot_pose(hot_pose, hot_pose_data)
             return code, message, restart_required, data
         state, _working_pose, restart_required, hot_pose, steps = self._execute_function_steps(
             command.commands,
@@ -3657,7 +3692,11 @@ class GameCommandRuntime:
         self._save_function_state(state)
         data: dict[str, object] = {"steps": steps}
         if hot_pose is not None and not restart_required:
-            data, _applied = self._apply_hot_pose(hot_pose, {"hot_pose": True, **data})
+            hot_pose_data = {"hot_pose": True, **data}
+            reset_pose = self._function_reset_pose_from_steps(steps)
+            if reset_pose is not None:
+                hot_pose_data["reset_pose"] = reset_pose
+            data, _applied = self._apply_hot_pose(hot_pose, hot_pose_data)
         return (
             "OK_FUNCTION_RESTART" if restart_required else "OK_FUNCTION",
             f"Function executed {len(steps)} step(s)",
@@ -4936,7 +4975,12 @@ def main() -> int:
         except ValueError as exc:
             raise SystemExit(f"invalid native SONIC initial root heading: {exc}") from exc
 
-        def apply_hot_world_pose(pose: WorldPose) -> WorldPose:
+        initial_qpos = np.asarray(qpos, dtype=np.float64).copy()
+
+        def apply_hot_world_pose(
+            pose: WorldPose,
+            reset_to_standing: bool = False,
+        ) -> WorldPose:
             nonlocal snapshot, fall_detected, min_root_z, instability_resets
             if not isinstance(pose, WorldPose):
                 raise WorldStateError("hot pose target must be a WorldPose")
@@ -4954,6 +4998,12 @@ def main() -> int:
                 qpos_live[1] = pose.y
                 qpos_live[2] = pose.z
                 qpos_live[3:7] = _yaw_quat_wxyz(pose.yaw_rad)
+                if reset_to_standing:
+                    if len(qpos_live) != len(initial_qpos):
+                        raise WorldStateError(
+                            "standing pose qpos size does not match live model"
+                        )
+                    qpos_live[7:] = initial_qpos[7:]
                 qvel_live[:] = 0.0
                 if hasattr(data, "ctrl"):
                     data.ctrl[:] = 0.0
@@ -5432,7 +5482,8 @@ def main() -> int:
                                 required=True,
                             )
                             applied_recovery_pose = apply_hot_world_pose(
-                                recovery_pose
+                                recovery_pose,
+                                True,
                             )
                             fall_detected = bool(snapshot.fall_detected)
                             if fall_detected:

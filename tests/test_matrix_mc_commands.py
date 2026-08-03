@@ -370,6 +370,7 @@ class McCommandExecutionTest(unittest.TestCase):
         )
         self.assertEqual(recover_effect.state.last_exit, WorldPose(12.0, 24.0, 0.8, 0.5))
         self.assertEqual(recover_effect.state.resume_source, "recover_here")
+        self.assertEqual(recover_effect.data["reset_pose"], "standing")
 
     def test_recover_here_lifts_contaminated_low_town10_safe_pose(self) -> None:
         contaminated = WorldPose(3.0, 4.0, 0.30, 0.25)
@@ -393,6 +394,7 @@ class McCommandExecutionTest(unittest.TestCase):
             recover_effect.state.last_exit,
             WorldPose(3.0, 4.0, 0.80, 0.25),
         )
+        self.assertEqual(recover_effect.data["reset_pose"], "standing")
 
     def test_function_world_commands_apply_sequential_resume_pose(self) -> None:
         command = MODULE.parse_mc_command(

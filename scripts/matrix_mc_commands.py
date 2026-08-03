@@ -1231,6 +1231,7 @@ def execute_command(
                 "yaw_rad": pose.yaw_rad,
                 "source": "last_safe",
                 "hot_pose": True,
+                "reset_pose": "standing",
             },
         )
     if isinstance(command, TeleportSelector):

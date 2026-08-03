@@ -67,7 +67,10 @@ class MatrixGameCommandEndToEndTest(unittest.TestCase):
         self.runtime = RUNTIME.GameCommandRuntime(
             command_runtime,
             self.world,
-            pose_applier=lambda pose: self.applied_poses.append(pose) or pose,
+            pose_applier=lambda pose, reset_to_standing: self.applied_poses.append(
+                pose
+            )
+            or pose,
         )
 
         self.addCleanup(self.runtime.close)
