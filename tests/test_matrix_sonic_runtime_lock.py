@@ -298,7 +298,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertEqual(self.lock["runtime_id"], "matrix-sonic-native-v2")
         self.assertEqual(
             self.lock["source_revisions"]["gr00t_whole_body_control"]["commit"],
-            "a73a2fadd1e3b26e08ec3938e91ddd97099caf4b",
+            "de083d71af8346b0124ab1ae79fd3623b52c3c9b",
         )
 
     def test_host_profiles_use_repo_local_runtime(self) -> None:
@@ -322,7 +322,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             trna,
         )
         self.assertIn(
-            'MATRIX_GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:-1}"',
+            'MATRIX_GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"',
             trna,
         )
         self.assertIn(
