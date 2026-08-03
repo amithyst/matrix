@@ -93,7 +93,35 @@ class MatrixWorldStateTest(unittest.TestCase):
         self.assertEqual(state.resume_source, "unstable_fall_last_safe")
         self.assertEqual(
             state.startup_pose(self.default),
-            (safe, "last_exit"),
+            (self.default, "default"),
+        )
+
+    def test_startup_does_not_resume_unstable_fall_slot(self) -> None:
+        safe = MODULE.WorldPose(
+            47.442232662454046,
+            -34.65789618554697,
+            0.779525738095,
+            -0.2472785081042412,
+        )
+        exploded = MODULE.WorldPose(
+            -2128.509921525953,
+            -1376.5529320448961,
+            1469.896429082304,
+            -2.3205926517896964,
+        )
+        state = MODULE.MatrixWorldState(
+            world_id=self.state.world_id,
+            world_revision=self.state.world_revision,
+            last_observed=exploded,
+            last_safe=safe,
+            last_exit=safe,
+            resume_source="unstable_fall_last_safe",
+            updated_at_unix_ns=1,
+        )
+
+        self.assertEqual(
+            state.startup_pose(self.default),
+            (self.default, "default"),
         )
 
     def test_startup_ignores_corrupted_fallen_resume_pose(self) -> None:

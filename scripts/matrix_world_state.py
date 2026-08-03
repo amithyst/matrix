@@ -479,6 +479,8 @@ class MatrixWorldState:
         return tuple(matches[:limit])
 
     def startup_pose(self, default: WorldPose) -> tuple[WorldPose, str]:
+        if self.resume_source == "unstable_fall_last_safe":
+            return default, "default"
         if (
             self.resume_source == "fallen_xy_last_safe_upright"
             and self.last_exit is not None
