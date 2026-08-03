@@ -161,14 +161,17 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
                 self.assertEqual(planner_frames[-1]["mode"], 2)
                 # Unmodified keyboard WASD reaches native WALK's lower bound.
                 self.assertAlmostEqual(planner_frames[-1]["speed"], 0.8)
-                # Matrix publishes the camera-facing command through SONIC's
-                # native heading-state frame: delta_heading carries the world
-                # yaw, while movement/facing remain aligned in the local frame.
+                # Matrix's ordinary camera-face WASD publishes absolute
+                # world-frame movement/facing vectors.  It must not also drive
+                # SONIC native HeadingState.delta_heading; otherwise the
+                # deploy layer can rotate the reference frame a second time and
+                # make the body face diagonally relative to the travel vector.
+                self.assertIsNone(moving.delta_heading_rad)
                 self.assertAlmostEqual(
-                    planner_frames[-1]["movement"][0], 1.0, places=7
+                    planner_frames[-1]["movement"][0], 0.0, places=7
                 )
                 self.assertAlmostEqual(
-                    planner_frames[-1]["movement"][1], 0.0, places=7
+                    planner_frames[-1]["movement"][1], 1.0, places=7
                 )
                 self.assertEqual(
                     planner_frames[-1]["movement"],

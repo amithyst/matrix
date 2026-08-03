@@ -1454,9 +1454,13 @@ class GameControlCore:
                 else None
             ),
             desired_facing=desired_direction,
-            delta_heading_rad=(
-                self._command_heading_rad if moving and not low_speed_turn_step else None
-            ),
+            # Ordinary Matrix camera-face WASD already publishes absolute
+            # world-frame movement/facing vectors.  Do not also drive SONIC's
+            # native HeadingState.delta_heading for those moving frames: that
+            # path belongs to native/Pico-style heading-control transitions and
+            # can make the deploy layer rotate the reference frame a second
+            # time, producing diagonal/over-rotated walking after camera turns.
+            delta_heading_rad=None,
         )
 
 
