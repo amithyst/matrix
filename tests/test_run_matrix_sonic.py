@@ -2516,6 +2516,76 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(world.checkpoint_count, 0)
             self.assertIsNone(world.state.last_exit)
 
+    def test_moon_world_upright_uses_terrain_relative_height(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.qpos[0] = -94.7
+        snapshot.qpos[1] = -65.6
+        snapshot.qpos[2] = -5.25
+        snapshot.qpos[3] = 1.0
+
+        class Ground:
+            @staticmethod
+            def sample_height(x: float, y: float) -> float:
+                self.assertAlmostEqual(x, -94.7)
+                self.assertAlmostEqual(y, -65.6)
+                return -6.10
+
+        self.assertFalse(MODULE._snapshot_world_upright(snapshot))
+        self.assertTrue(
+            MODULE._snapshot_world_upright_relative_to_ground(snapshot, Ground())
+        )
+
+    def test_moon_fall_respawn_pose_recovers_above_local_ground(self) -> None:
+        yaw_rad = 0.75
+        snapshot = self.snapshot(fall_detected=True)
+        snapshot.qpos[0] = -12.0
+        snapshot.qpos[1] = 34.0
+        snapshot.qpos[2] = -8.0
+        snapshot.qpos[3] = math.cos(yaw_rad / 2.0)
+        snapshot.qpos[6] = math.sin(yaw_rad / 2.0)
+
+        class Ground:
+            @staticmethod
+            def sample_height(x: float, y: float) -> float:
+                self.assertAlmostEqual(x, -12.0)
+                self.assertAlmostEqual(y, 34.0)
+                return -8.2
+
+        pose = MODULE._moon_fall_respawn_pose(snapshot, Ground())
+        self.assertEqual(pose.x, -12.0)
+        self.assertEqual(pose.y, 34.0)
+        self.assertAlmostEqual(pose.z, -8.2 + 0.85)
+        self.assertAlmostEqual(pose.yaw_rad, yaw_rad)
+
+    def test_world_runtime_set_resume_pose_publishes_last_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="moon:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            pose = WORLD_STATE.WorldPose(-12.0, 34.0, -7.35, 0.75)
+
+            self.assertTrue(
+                world.set_resume_pose(
+                    pose,
+                    source="recover_here",
+                    now_s=12.0,
+                    required=True,
+                )
+            )
+
+            self.assertTrue(world.telemetry()["has_last_exit"])
+            reloaded = WORLD_STATE.WorldStateStore(
+                state_path,
+                world_id="moon:test",
+                world_revision="a" * 64,
+            ).load()
+            self.assertEqual(reloaded.last_exit, pose)
+            self.assertEqual(reloaded.resume_source, "recover_here")
+
     def test_game_command_runtime_rejects_commands_until_panel_safe_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"

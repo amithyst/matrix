@@ -91,6 +91,7 @@ _GAME_INTERNAL_RESTART_REASONS = frozenset(
 _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _MOON_RELATIVE_FALL_ROOT_UP_Z = 0.5
+_MOON_FALL_RESPAWN_ROOT_CLEARANCE_M = 0.85
 _MOON_COLLISION_HANDOFF_ELASTIC_BAND_SCALE_EPS = 1.0e-6
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
@@ -1363,6 +1364,51 @@ def _snapshot_world_upright(snapshot: Any) -> bool:
         return False
 
 
+def _snapshot_world_upright_relative_to_ground(
+    snapshot: Any,
+    dynamic_ground: Any,
+) -> bool:
+    try:
+        qpos = snapshot.qpos
+        qvel = snapshot.qvel
+        root_z = float(qpos[2])
+        ground_z = float(dynamic_ground.sample_height(float(qpos[0]), float(qpos[1])))
+        vertical_speed = float(qvel[2])
+        roll_rate = float(qvel[3])
+        pitch_rate = float(qvel[4])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+    if not math.isfinite(root_z) or not math.isfinite(ground_z):
+        return False
+    return bool(
+        not bool(snapshot.fall_detected)
+        and root_z - ground_z >= _WORLD_SAFE_MIN_ROOT_Z
+        and _root_up_z(qpos) >= _WORLD_SAFE_MIN_ROOT_UP_Z
+        and math.isfinite(vertical_speed)
+        and abs(vertical_speed) <= _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S
+        and math.isfinite(roll_rate)
+        and abs(roll_rate) <= _WORLD_SAFE_MAX_TILT_RATE_RAD_S
+        and math.isfinite(pitch_rate)
+        and abs(pitch_rate) <= _WORLD_SAFE_MAX_TILT_RATE_RAD_S
+    )
+
+
+def _moon_fall_respawn_pose(snapshot: Any, dynamic_ground: Any) -> WorldPose:
+    pose = _snapshot_world_pose(snapshot)
+    try:
+        ground_z = float(dynamic_ground.sample_height(pose.x, pose.y))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise WorldStateError(f"cannot sample MoonWorld fall-respawn height: {exc}") from exc
+    if not math.isfinite(ground_z):
+        raise WorldStateError("MoonWorld fall-respawn height is non-finite")
+    return WorldPose(
+        pose.x,
+        pose.y,
+        ground_z + _MOON_FALL_RESPAWN_ROOT_CLEARANCE_M,
+        pose.yaw_rad,
+    )
+
+
 class _GameWorldStateRuntime:
     """Checkpoint semantic root poses without serializing dynamic MuJoCo state."""
 
@@ -1398,6 +1444,7 @@ class _GameWorldStateRuntime:
         now_s: float,
         force: bool = False,
         required: bool = False,
+        upright: bool | None = None,
     ) -> bool:
         now = float(now_s)
         if not math.isfinite(now) or now < 0.0:
@@ -1408,7 +1455,42 @@ class _GameWorldStateRuntime:
             pose = _snapshot_world_pose(snapshot)
             state = self.state.checkpoint(
                 pose,
-                upright=_snapshot_world_upright(snapshot),
+                upright=(
+                    _snapshot_world_upright(snapshot)
+                    if upright is None
+                    else bool(upright)
+                ),
+            )
+            self.store.save(state)
+        except WorldStateError as exc:
+            self.last_error = str(exc)
+            self.next_checkpoint_s = now + self.checkpoint_seconds
+            if required:
+                raise
+            return False
+        self.state = state
+        self.checkpoint_count += 1
+        self.last_error = None
+        self.last_checkpoint_monotonic_s = now
+        self.next_checkpoint_s = now + self.checkpoint_seconds
+        return True
+
+    def set_resume_pose(
+        self,
+        pose: WorldPose,
+        *,
+        source: str,
+        now_s: float,
+        required: bool = False,
+    ) -> bool:
+        now = float(now_s)
+        if not math.isfinite(now) or now < 0.0:
+            raise WorldStateError("resume-pose monotonic time is invalid")
+        try:
+            state = self.state.set_resume_pose(
+                pose,
+                source=source,
+                now_unix_ns=time.time_ns(),
             )
             self.store.save(state)
         except WorldStateError as exc:
@@ -4511,12 +4593,21 @@ def main() -> int:
                     world_revision=args.game_world_revision,
                     checkpoint_seconds=args.game_world_checkpoint_seconds,
                 )
-                if _snapshot_world_upright(snapshot):
+                initial_world_upright = (
+                    _snapshot_world_upright_relative_to_ground(
+                        snapshot,
+                        moon_dynamic_ground,
+                    )
+                    if moon_dynamic_ground is not None
+                    else _snapshot_world_upright(snapshot)
+                )
+                if initial_world_upright:
                     game_world.checkpoint(
                         snapshot,
                         now_s=time.perf_counter(),
                         force=True,
                         required=bool(args.game_auto_respawn),
+                        upright=True,
                     )
             except WorldStateError as exc:
                 raise SystemExit(f"cannot initialize game world state: {exc}") from exc
@@ -4926,12 +5017,24 @@ def main() -> int:
                         planner.send_game_command(game_command)
                         walking = False
                         try:
-                            game_world.checkpoint(
-                                snapshot,
-                                now_s=time.perf_counter(),
-                                force=True,
-                                required=True,
-                            )
+                            checkpoint_now = time.perf_counter()
+                            if moon_dynamic_ground is not None:
+                                game_world.set_resume_pose(
+                                    _moon_fall_respawn_pose(
+                                        snapshot,
+                                        moon_dynamic_ground,
+                                    ),
+                                    source="recover_here",
+                                    now_s=checkpoint_now,
+                                    required=True,
+                                )
+                            else:
+                                game_world.checkpoint(
+                                    snapshot,
+                                    now_s=checkpoint_now,
+                                    force=True,
+                                    required=True,
+                                )
                         except WorldStateError as exc:
                             running = False
                             termination_reason = "world_state_error"
@@ -4971,7 +5074,18 @@ def main() -> int:
             low_cmd_age_s = snapshot.low_cmd_age_s
             freshness_sample_wall = time.perf_counter()
             if game_world is not None:
-                game_world.checkpoint(snapshot, now_s=freshness_sample_wall)
+                game_world.checkpoint(
+                    snapshot,
+                    now_s=freshness_sample_wall,
+                    upright=(
+                        _snapshot_world_upright_relative_to_ground(
+                            snapshot,
+                            moon_dynamic_ground,
+                        )
+                        if moon_dynamic_ground is not None
+                        else None
+                    ),
+                )
             if active_lowcmd:
                 if active_started_wall is None:
                     active_started_wall = freshness_sample_wall
@@ -5192,6 +5306,14 @@ def main() -> int:
                     now_s=time.perf_counter(),
                     force=True,
                     required=True,
+                    upright=(
+                        _snapshot_world_upright_relative_to_ground(
+                            snapshot,
+                            moon_dynamic_ground,
+                        )
+                        if moon_dynamic_ground is not None
+                        else None
+                    ),
                 )
             except WorldStateError as exc:
                 world_checkpoint_failed = True
