@@ -19,6 +19,15 @@ export MATRIX_PROJECT_ROOT="$PROJECT_ROOT"
 export PYTHONDONTWRITEBYTECODE=1
 ORIGINAL_ARGS=("$@")
 
+cleanup_runtime_generated_integrity_files() {
+    # UE/MuJoCo can emit diagnostics beside packaged binaries.  Those files are
+    # runtime output, not installed artifacts; remove them before the locked
+    # runtime tree audit so auto-respawn reloads do not fail after a fall.
+    rm -f -- \
+        "$PROJECT_ROOT/src/UeSim/Linux/MUJOCO_LOG.TXT" \
+        "$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/MUJOCO_LOG.TXT"
+}
+
 PROFILE="${MATRIX_PROFILE:-}"
 for ((index = 0; index < ${#ORIGINAL_ARGS[@]}; index++)); do
     if [[ "${ORIGINAL_ARGS[$index]}" == "--profile" ]]; then
@@ -728,6 +737,7 @@ if [[ "$CONTROL_SOURCE" == "pico" \
     echo "[ERROR] Locked PICO acceptance requires --profile for runtime verification" >&2
     exit 2
 fi
+cleanup_runtime_generated_integrity_files
 if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]; then
     VERIFY_RUNTIME_ARGS=(
         --runtime-root "$RUNTIME_ROOT"

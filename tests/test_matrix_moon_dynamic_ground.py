@@ -97,6 +97,16 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
             run_sim,
         )
 
+    def test_sonic_launcher_cleans_runtime_logs_before_preflight(self) -> None:
+        launcher = (REPO_ROOT / "scripts" / "run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
+
+        cleanup_index = launcher.index("cleanup_runtime_generated_integrity_files")
+        verify_index = launcher.index("verify_matrix_sonic_runtime.py")
+        self.assertLess(cleanup_index, verify_index)
+        self.assertIn("Binaries/Linux/MUJOCO_LOG.TXT", launcher)
+
     def test_run_sim_moon_default_uses_verified_mainline_plain(self) -> None:
         run_sim = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(encoding="utf-8")
 
