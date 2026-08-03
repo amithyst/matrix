@@ -1224,17 +1224,18 @@ class GameControlCoreTest(unittest.TestCase):
             received_at_s=10.02,
         )
         self.assertGreater(core.command(now_s=10.02, dt_s=0.1).speed_mps, 0.0)
-        command = core.command(now_s=10.17, dt_s=0.01)
+        command = core.command(now_s=10.53, dt_s=0.01)
         self.assertEqual(command.reason, "input_timeout")
         self.assertEqual(command.speed_mps, 0.0)
         self.assertEqual(command.locomotion_mode, MODULE.SONIC_IDLE_MODE)
 
         core.accept_snapshot(
-            snapshot(sequence=4, timestamp=10.171, pressed=("w",)),
-            received_at_s=10.171,
+            snapshot(sequence=4, timestamp=10.531, pressed=("w",)),
+            received_at_s=10.531,
         )
-        command = core.command(now_s=10.171, dt_s=0.01)
-        self.assertEqual(command.reason, "awaiting_neutral")
+        command = core.command(now_s=10.531, dt_s=0.1)
+        self.assertEqual(command.mode, "move")
+        self.assertGreater(command.speed_mps, 0.0)
 
     def test_startup_stick_requires_neutral_before_arming(self) -> None:
         core = MODULE.GameControlCore(immediate_config())
@@ -1259,7 +1260,7 @@ class GameControlCoreTest(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.InputRejectedError, "future"):
             core.accept_snapshot(snapshot(sequence=8, timestamp=10.3), received_at_s=10.2)
 
-        command = core.command(now_s=10.21, dt_s=0.01)
+        command = core.command(now_s=10.51, dt_s=0.01)
         self.assertEqual(command.reason, "input_timeout")
 
 

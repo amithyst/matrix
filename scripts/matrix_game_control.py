@@ -612,7 +612,7 @@ class ControlConfig:
     # yaw so the target does not hover inside a broad gait gate.
     camera_heading_snap_error_rad: float = math.radians(2.0)
     stick_deadzone: float = 0.15
-    input_timeout_s: float = 0.15
+    input_timeout_s: float = 0.50
     max_snapshot_age_s: float = 0.15
     max_future_skew_s: float = 0.05
     max_step_s: float = 0.10
@@ -996,7 +996,6 @@ class GameControlCore:
             or now_s - self._snapshot.timestamp_monotonic_s
             >= self.config.input_timeout_s
         ):
-            self._requires_neutral_rearm = True
             return ("input_timeout", True)
         if not self._snapshot.focused:
             self._requires_neutral_rearm = True

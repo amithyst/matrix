@@ -76,7 +76,7 @@ GAMEPAD_LOOK_DEADZONE="${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
 GAMEPAD_LOOK_MIN_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MIN_PITCH_DEG:--80.0}"
 GAMEPAD_LOOK_MAX_PITCH_DEG="${MATRIX_GAMEPAD_LOOK_MAX_PITCH_DEG:-60.0}"
 GAME_MAX_SPEED="${MATRIX_GAME_MAX_SPEED:-0.30}"
-GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
+GAME_INPUT_TIMEOUT="${MATRIX_GAME_INPUT_TIMEOUT:-0.50}"
 GAME_WORLD_PERSISTENCE="${MATRIX_GAME_WORLD_PERSISTENCE:-auto}"
 GAME_AUTO_RESPAWN="${MATRIX_GAME_AUTO_RESPAWN:-auto}"
 GAME_WORLD_CHECKPOINT_SECONDS="${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
@@ -136,7 +136,7 @@ usage() {
         "  --gamepad-look-min-pitch DEG     Spectator pitch lower limit" \
         "  --gamepad-look-max-pitch DEG     Spectator pitch upper limit" \
         "  --game-max-speed MPS       Analog SLOW_WALK cap (default 0.30; max 0.80)" \
-        "  --game-input-timeout SEC   Deadman timeout (default: 0.15)" \
+        "  --game-input-timeout SEC   Deadman timeout (default: 0.50)" \
         "  --game-world-persistence MODE  auto, on, or off (default: auto)" \
         "  --game-auto-respawn MODE   auto, on, or off; cold-reloads after a fall" \
         "  --game-world-checkpoint-seconds SEC  Durable last-exit interval (default: 0.75)" \

@@ -149,7 +149,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--game-max-deceleration", type=float, default=2.40)
     parser.add_argument("--game-max-turn-rate", type=float, default=2.50)
     parser.add_argument("--game-stick-deadzone", type=float, default=0.15)
-    parser.add_argument("--game-input-timeout", type=float, default=0.15)
+    parser.add_argument("--game-input-timeout", type=float, default=0.50)
     parser.add_argument("--game-max-snapshot-age", type=float, default=0.15)
     parser.add_argument("--game-max-future-skew", type=float, default=0.05)
     parser.add_argument(

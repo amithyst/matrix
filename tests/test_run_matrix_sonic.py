@@ -1138,7 +1138,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             game_max_deceleration=2.40,
             game_max_turn_rate=2.50,
             game_stick_deadzone=0.15,
-            game_input_timeout=0.15,
+            game_input_timeout=0.50,
             game_max_snapshot_age=0.15,
             game_max_future_skew=0.05,
             game_camera_yaw_source="x11-mirror",
@@ -1202,7 +1202,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(status["maximum_deceleration_mps2"], 2.40)
         self.assertEqual(status["maximum_turn_rate_rad_s"], 2.50)
         self.assertEqual(status["stick_deadzone"], 0.15)
-        self.assertEqual(status["input_timeout_s"], 0.15)
+        self.assertEqual(status["input_timeout_s"], 0.50)
         self.assertEqual(status["camera_yaw_sign"], -1)
         self.assertEqual(status["camera_yaw_offset_deg"], 90.0)
         self.assertEqual(status["mouse_sensitivity_deg_per_px"], 0.12)
