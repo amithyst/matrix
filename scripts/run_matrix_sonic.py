@@ -99,6 +99,7 @@ _MOON_FALL_RESPAWN_MAX_ROOT_CLEARANCE_M = 2.0
 _MOON_COLLISION_HANDOFF_ELASTIC_BAND_SCALE_EPS = 1.0e-6
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
+_STANDING_RECOVERY_HOLD_GRACE_S = 1.0
 _MAX_FUNCTION_FILE_BYTES = 16 * 1024
 _MAX_FUNCTION_STEPS = 64
 _MAX_FUNCTION_DEPTH = 4
@@ -5014,12 +5015,19 @@ def main() -> int:
             getattr(getattr(simulator, "sim_env", None), "mj_model", None),
             qpos,
         )
+        standing_recovery_hold_pose: WorldPose | None = None
+        standing_recovery_hold_grace_until_wall = 0.0
+        standing_recovery_hold_applies = 0
 
         def apply_hot_world_pose(
             pose: WorldPose,
             reset_to_standing: bool = False,
+            *,
+            arm_standing_hold: bool = True,
         ) -> WorldPose:
             nonlocal snapshot, fall_detected, min_root_z, instability_resets
+            nonlocal standing_recovery_hold_pose
+            nonlocal standing_recovery_hold_grace_until_wall
             if not isinstance(pose, WorldPose):
                 raise WorldStateError("hot pose target must be a WorldPose")
             environment = getattr(simulator, "sim_env", None)
@@ -5073,7 +5081,13 @@ def main() -> int:
             fall_detected = bool(snapshot.fall_detected)
             instability_resets = int(snapshot.reset_count)
             min_root_z = min(min_root_z, float(snapshot.qpos[2]))
-            return _snapshot_world_pose(snapshot)
+            applied_pose = _snapshot_world_pose(snapshot)
+            if reset_to_standing and arm_standing_hold:
+                standing_recovery_hold_pose = pose
+                standing_recovery_hold_grace_until_wall = (
+                    time.perf_counter() + _STANDING_RECOVERY_HOLD_GRACE_S
+                )
+            return applied_pose
 
         applied_game_camera_yaw_offset_deg = float(
             getattr(args, "game_camera_yaw_offset_deg", 0.0)
@@ -5459,6 +5473,33 @@ def main() -> int:
                     )
                     break
                 snapshot = next_snapshot
+                if standing_recovery_hold_pose is not None:
+                    hold_wall = time.perf_counter()
+                    hold_paused = bool(
+                        runtime_pause_state is not None
+                        and runtime_pause_state.paused
+                    )
+                    if hold_paused or hold_wall <= standing_recovery_hold_grace_until_wall:
+                        try:
+                            apply_hot_world_pose(
+                                standing_recovery_hold_pose,
+                                True,
+                                arm_standing_hold=False,
+                            )
+                            standing_recovery_hold_applies += 1
+                        except WorldStateError as exc:
+                            unstable = True
+                            running = False
+                            termination_reason = "world_state_error"
+                            numerical_error = f"standing_recovery_hold:{exc}"
+                            print(
+                                "matrix-sonic-runtime ERROR cannot hold standing "
+                                f"recovery pose: {exc}",
+                                flush=True,
+                            )
+                            break
+                    else:
+                        standing_recovery_hold_pose = None
                 if heading_anchor_telemetry is not None:
                     try:
                         heading_anchor_telemetry.observe(
