@@ -8,7 +8,6 @@ import base64
 import configparser
 import csv
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -16,7 +15,6 @@ from pathlib import Path
 import re
 import shutil
 import stat
-import struct
 import subprocess
 import sys
 from typing import Any
@@ -119,35 +117,6 @@ def load_lock(path: Path) -> dict[str, Any]:
         payload = json.load(stream)
     validate_schema(payload)
     return payload
-
-
-def validate_policy_manifest_files(
-    lock: dict[str, Any], matrix_root: Path
-) -> None:
-    """Bind policy-candidate declarations to the Matrix runtime lock."""
-
-    root = matrix_root.resolve()
-    for entry in lock["policy_slots"]["manifests"]:
-        relative = str(entry["path"])
-        path = (root / relative).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:  # pragma: no cover - schema rejects traversal.
-            raise ValueError(
-                f"policy slot manifest escapes matrix root: {relative}"
-            ) from exc
-        if not path.is_file():
-            raise ValueError(f"policy slot manifest is missing: {relative}")
-        try:
-            actual = sha256_file(path)
-        except OSError as exc:
-            raise ValueError(
-                f"cannot hash policy slot manifest {relative}: {exc}"
-            ) from exc
-        if actual != entry["sha256"]:
-            raise ValueError(
-                f"policy slot manifest SHA256 mismatch: {relative}"
-            )
 
 
 def is_sha256(value: object) -> bool:
@@ -326,29 +295,6 @@ def validate_schema(lock: dict[str, Any]) -> None:
         raise ValueError(f"runtime lock is missing keys: {', '.join(missing)}")
     if lock["schema_version"] != 2:
         raise ValueError(f"unsupported runtime lock schema: {lock['schema_version']}")
-
-    policy_slots = lock.get("policy_slots")
-    if not isinstance(policy_slots, dict) or set(policy_slots) != {"manifests"}:
-        raise ValueError("policy_slots must contain exactly manifests")
-    policy_manifests = policy_slots["manifests"]
-    if not isinstance(policy_manifests, list) or not policy_manifests:
-        raise ValueError("policy_slots.manifests must be a non-empty list")
-    policy_manifest_paths: set[str] = set()
-    for entry in policy_manifests:
-        if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
-            raise ValueError("policy slot manifest locks must contain path/sha256")
-        path = entry.get("path")
-        if (
-            not isinstance(path, str)
-            or not is_safe_relative_path(path)
-            or not path.startswith("config/runtime/policy-slots/")
-            or not path.endswith(".json")
-            or path in policy_manifest_paths
-        ):
-            raise ValueError(f"invalid or duplicate policy slot manifest path: {path!r}")
-        policy_manifest_paths.add(path)
-        if not is_sha256(entry.get("sha256")):
-            raise ValueError(f"invalid policy slot manifest SHA256: {path}")
 
     matrix_release = lock.get("matrix_release", {})
     installed_files = matrix_release.get("installed_files")
@@ -782,47 +728,6 @@ def _is_loadable_site_packages_file(relative: str) -> bool:
     )
 
 
-def _is_exact_record_owned_pep3147_pyc(
-    relative: str,
-    site_packages: Path,
-    expected_files: dict[str, tuple[str | None, int | None, str]],
-) -> bool:
-    path = Path(relative)
-    if path.suffix != ".pyc" or "__pycache__" not in path.parts:
-        return False
-    try:
-        source_relative = Path(importlib.util.source_from_cache(relative)).as_posix()
-    except (IndexError, ValueError):
-        return False
-    if (
-        not source_relative.endswith(".py")
-        or not is_safe_relative_path(source_relative)
-        or source_relative not in expected_files
-    ):
-        return False
-
-    source_path = site_packages / source_relative
-    cache_path = site_packages / relative
-    try:
-        header = cache_path.read_bytes()[:16]
-        if len(header) != 16 or header[:4] != importlib.util.MAGIC_NUMBER:
-            return False
-        flags = struct.unpack("<I", header[4:8])[0]
-        if flags & ~0b11:
-            return False
-        source_stat = source_path.stat()
-        if flags & 0b1:
-            return header[8:16] == importlib.util.source_hash(
-                source_path.read_bytes()
-            )
-        timestamp, source_size = struct.unpack("<II", header[8:16])
-        return timestamp == (int(source_stat.st_mtime) & 0xFFFFFFFF) and (
-            source_size == (source_stat.st_size & 0xFFFFFFFF)
-        )
-    except (OSError, ValueError):
-        return False
-
-
 def verify_python_wheel_records(
     wheelhouse: Path,
     site_packages: Path,
@@ -1171,22 +1076,17 @@ def verify_python_wheel_records(
         and Path(relative).parts[0] in installer_metadata_roots
         and Path(relative).name in generated_metadata_names
     }
-    unexpected_inventory = unexpected_files - allowed_generated_metadata
-    derived_owned_pycache = {
-        relative
-        for relative in unexpected_inventory
-        if _is_exact_record_owned_pep3147_pyc(
-            relative, site_packages, expected_files
-        )
-    }
     unowned_loadable = sorted(
         relative
-        for relative in unexpected_inventory - derived_owned_pycache
+        for relative in (
+            unexpected_files
+            - allowed_generated_metadata
+        )
         if _is_loadable_site_packages_file(relative)
     )
     unowned_other = sorted(
-        unexpected_inventory
-        - derived_owned_pycache
+        unexpected_files
+        - allowed_generated_metadata
         - set(unowned_loadable)
     )
     inventory_errors = list(non_regular)
@@ -1198,7 +1098,6 @@ def verify_python_wheel_records(
     inventory_detail = (
         f"exact content closure; installer-metadata={len(allowed_generated_metadata)}; "
         f"entry-point-wrappers={len(generated_entry_point_files)}; "
-        f"derived-pyc={len(derived_owned_pycache)}; "
         "unowned-pycache-files=0"
         if inventory_ok
         else _compact_failures(inventory_errors)
@@ -1869,7 +1768,7 @@ def check_tensorrt_version(
         "fn=lib.getInferLibVersion; fn.restype=ctypes.c_int; print(fn())"
     )
     result = subprocess.run(
-        [python_executable, "-B", "-c", code, str(library)],
+        [python_executable, "-c", code, str(library)],
         env=env,
         text=True,
         capture_output=True,
@@ -1889,7 +1788,7 @@ def check_dlopen(
 ) -> tuple[bool, str]:
     code = "import ctypes,sys; ctypes.CDLL(sys.argv[1], mode=ctypes.RTLD_GLOBAL)"
     result = subprocess.run(
-        [python_executable, "-B", "-c", code, str(path)],
+        [python_executable, "-c", code, str(path)],
         env=env,
         text=True,
         capture_output=True,
@@ -1945,12 +1844,6 @@ def main() -> int:
         lock = load_lock(args.lock.resolve())
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         print(f"[FAIL] runtime lock: {exc}", file=sys.stderr)
-        return 2
-
-    try:
-        validate_policy_manifest_files(lock, args.matrix_root)
-    except (OSError, ValueError) as exc:
-        print(f"[FAIL] policy slot manifest: {exc}", file=sys.stderr)
         return 2
 
     if args.schema_only:
@@ -2071,7 +1964,7 @@ def main() -> int:
         identity_prefix = "MATRIX_VERIFY_PYTHON_JSON="
         identity_code = python_identity_probe_code(identity_prefix)
         identity_result = subprocess.run(
-            [python_executable, "-B", "-c", identity_code],
+            [python_executable, "-c", identity_code],
             env=identity_env,
             cwd=matrix_root,
             text=True,
@@ -2166,7 +2059,6 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
         result = subprocess.run(
             [
                 python_executable,
-                "-B",
                 "-c",
                 metadata_code,
                 json.dumps(sorted(pinned_requirements)),
@@ -2215,7 +2107,7 @@ print("MATRIX_VERIFY_DISTRIBUTIONS_JSON=" + json.dumps(versions, sort_keys=True)
             record("native runtime pip check", False, pip_env_error)
         else:
             pip_check = subprocess.run(
-                [python_executable, "-B", "-m", "pip", "check"],
+                [python_executable, "-m", "pip", "check"],
                 env=pip_env,
                 text=True,
                 capture_output=True,
@@ -2546,7 +2438,7 @@ except BaseException:
 print("MATRIX_VERIFY_IMPORT_JSON=" + json.dumps(payload, sort_keys=True))
 """
             result = subprocess.run(
-                [python_executable, "-B", "-c", import_code, str(sonic_root)],
+                [python_executable, "-c", import_code, str(sonic_root)],
                 env=env,
                 text=True,
                 capture_output=True,
@@ -2669,7 +2561,7 @@ print("MATRIX_VERIFY_IMPORT_JSON=" + json.dumps(payload, sort_keys=True))
                 pico_identity_env.pop("PYTHONPATH", None)
                 pico_identity_env["PYTHONNOUSERSITE"] = "1"
                 pico_identity_result = subprocess.run(
-                    [pico_python, "-B", "-c", pico_identity_code],
+                    [pico_python, "-c", pico_identity_code],
                     env=pico_identity_env,
                     cwd=matrix_root,
                     text=True,
@@ -2754,7 +2646,6 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                 result = subprocess.run(
                     [
                         pico_python,
-                        "-B",
                         "-c",
                         pico_code,
                         pico_lock["distribution"],
@@ -2824,7 +2715,7 @@ print("MATRIX_VERIFY_PICO_JSON=" + json.dumps(payload, sort_keys=True))
                     or "import failed",
                 )
                 pico_pip_check = subprocess.run(
-                    [pico_python, "-B", "-m", "pip", "check"],
+                    [pico_python, "-m", "pip", "check"],
                     env=pico_env,
                     text=True,
                     capture_output=True,

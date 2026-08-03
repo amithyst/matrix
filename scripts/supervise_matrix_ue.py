@@ -9,7 +9,6 @@ import importlib
 import json
 import os
 from pathlib import Path
-import re
 import select
 import signal
 import subprocess
@@ -25,7 +24,6 @@ UNKNOWN_EXIT_CODE = 255
 SPAWN_FAILURE_EXIT_CODE = 127
 CAMERA_SAMPLE_INTERVAL_SECONDS = 0.02
 CAMERA_BIND_TIMEOUT_SECONDS = 15.0
-_CAMERA_DISTANCE_EVENT_RE = re.compile(rb"camera_distance_cm\s+([0-9]{1,3})\Z")
 
 
 class _CameraProbeRuntime:
@@ -52,7 +50,6 @@ class _CameraProbeRuntime:
         self.bound = False
         self.closed = False
         self.initialization_error = initialization_error
-        self._published_valid_sample = False
         self._last_diagnostic: str | None = None
         if initialization_error is not None:
             self._diagnose(initialization_error)
@@ -108,8 +105,6 @@ class _CameraProbeRuntime:
         except Exception as exc:
             self._diagnose(f"state_write_failed:{type(exc).__name__}:{exc}")
             return False
-        if bool(getattr(observation, "valid", False)):
-            self._published_valid_sample = True
         return True
 
     def invalidate(self, pid: int, *, identity: bool = False) -> bool:
@@ -155,19 +150,6 @@ class _CameraProbeRuntime:
             observation = self._invalid_observation(
                 pid, self._module.ProbeError.INTERNAL
             )
-        # A TORN_CAMERA_CACHE observation means UE updated its final POV
-        # between the probe's two full-cache reads.  Once one verified sample
-        # has been published, retain that record rather than replacing it with
-        # a one-frame invalid value.  Its monotonic timestamp is deliberately
-        # left unchanged, so CameraStateReader's freshness deadline still
-        # fails closed if valid sampling does not resume promptly.
-        if (
-            self._published_valid_sample
-            and not bool(getattr(observation, "valid", False))
-            and getattr(observation, "error_code", None)
-            == self._module.ProbeError.TORN_CAMERA_CACHE
-        ):
-            return True
         written = self._write(observation)
         if not written and bool(getattr(observation, "valid", False)):
             # If publishing a valid sample itself failed, make one immediate
@@ -296,53 +278,7 @@ def _control_event(stream: BinaryIO, timeout: float) -> str | None:
         return "eof"
     if b"stop" in data.split():
         return "stop"
-    for raw_line in data.splitlines():
-        line = raw_line.strip()
-        match = _CAMERA_DISTANCE_EVENT_RE.fullmatch(line)
-        if match is not None:
-            value = int(match.group(1))
-            if 80 <= value <= 500:
-                return f"camera_distance_cm {value}"
     return None
-
-
-def _apply_camera_distance_with_xdotool(pid: int, distance_cm: int) -> str:
-    command = f"set Engine.SpringArmComponent TargetArmLength {distance_cm}"
-    windows = subprocess.run(
-        ["xdotool", "search", "--onlyvisible", "--pid", str(pid)],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if windows.returncode != 0:
-        raise RuntimeError(
-            "xdotool could not find a visible UE window for pid "
-            f"{pid}: {windows.stderr.strip()}"
-        )
-    window = next(
-        (line.strip() for line in windows.stdout.splitlines() if line.strip()),
-        "",
-    )
-    if not window.isdigit():
-        raise RuntimeError("xdotool returned no numeric UE window id")
-    for args in (
-        ["xdotool", "key", "--window", window, "grave"],
-        ["xdotool", "type", "--window", window, "--clearmodifiers", command],
-        ["xdotool", "key", "--window", window, "Return"],
-    ):
-        result = subprocess.run(
-            args,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"{args[1]} failed for UE window {window}: {result.stderr.strip()}"
-            )
-    return window
 
 
 def supervise(args: argparse.Namespace) -> int:
@@ -494,28 +430,6 @@ def supervise(args: argparse.Namespace) -> int:
                     term_grace_seconds=args.term_grace_seconds,
                 )
                 return 0
-            if isinstance(control_event, str) and control_event.startswith(
-                "camera_distance_cm "
-            ):
-                distance_cm = int(control_event.rsplit(" ", 1)[1])
-                try:
-                    window = _apply_camera_distance_with_xdotool(
-                        process.pid,
-                        distance_cm,
-                    )
-                    print(
-                        "matrix-ue-supervisor camera_distance_cm "
-                        f"{distance_cm} window={window}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(
-                        "matrix-ue-supervisor camera_distance_cm_failed "
-                        f"{distance_cm}: {type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
     finally:
         if camera_runtime is not None:
             camera_runtime.close(process.pid if process is not None else None)

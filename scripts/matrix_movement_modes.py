@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared movement-mode identifiers and stable operator-facing metadata."""
+"""Shared Matrix movement-mode identifiers and operator-facing metadata."""
 
 from __future__ import annotations
 

@@ -8,10 +8,8 @@ import json
 import math
 import os
 from pathlib import Path
-import signal
 import socket
 import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -21,42 +19,15 @@ SCRIPTS = REPO_ROOT / "scripts"
 if os.fspath(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, os.fspath(SCRIPTS))
 CORE = importlib.import_module("matrix_game_control")
-EXTERNAL = importlib.import_module("matrix_external_control")
 MC_COMMANDS = importlib.import_module("matrix_mc_commands")
-MOTION_SETTINGS = importlib.import_module("matrix_motion_settings")
+OVERLAY_MODEL = importlib.import_module("matrix_calibration_overlay")
 RESTART = importlib.import_module("matrix_restart_request")
-VISUALS = importlib.import_module("matrix_celestial_visuals")
 SCRIPT_PATH = SCRIPTS / "matrix_game_control_input.py"
 SPEC = importlib.util.spec_from_file_location("matrix_game_control_input", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 os.sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
-
-EARTH_WORLD_ID = "g1_29dof:scene_terrain_t10"
-MOON_WORLD_ID = "g1_29dof:scene_terrain_moon_dynamic"
-WORLD_CLI_ARGS = ("--game-world-id", EARTH_WORLD_ID)
-
-
-class UiOnlyPublisherTest(unittest.TestCase):
-    def test_ui_only_publisher_drops_snapshots_without_socket_connection(self) -> None:
-        publisher = MODULE.UiOnlyPublisher()
-        snapshot = MODULE.build_snapshot(
-            sequence=1,
-            timestamp_monotonic_s=2.0,
-            keyboard=MODULE.KeyboardMouseSample(
-                w=True,
-                focused=True,
-            ),
-            gamepad=MODULE.GamepadSample(),
-            input_source="keyboard",
-            camera_yaw_rad=0.0,
-            camera_available=True,
-        )
-
-        self.assertTrue(publisher.connected)
-        self.assertTrue(publisher.send(snapshot, now=3.0))
-        self.assertIsNone(publisher.close())
 
 
 class CalibrationOverlaySupervisorTest(unittest.TestCase):
@@ -99,43 +70,6 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
             supervisor._action_socket = None
             supervisor.process = None
 
-    def test_overlay_supervisor_can_disable_desktop_modal_behaviors(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            script = root / "matrix_calibration_overlay.py"
-            script.write_text("", encoding="utf-8")
-            supervisor = MODULE.CalibrationOverlaySupervisor(
-                state_file=root / "state.json",
-                display_name=None,
-                expected_ue_pid=41,
-                modal_shield=False,
-                pointer_recenter=False,
-                keep_raised=False,
-                script=script,
-                startup_timeout_s=0.1,
-            )
-
-            class ReadyProcess:
-                def poll(self):
-                    supervisor.ready_file.write_text(
-                        json.dumps({"ready": True}), encoding="utf-8"
-                    )
-                    return None
-
-            with mock.patch.object(
-                MODULE.subprocess, "Popen", return_value=ReadyProcess()
-            ) as popen:
-                supervisor.start()
-
-            command = popen.call_args.args[0]
-            self.assertIn("--no-modal-shield", command)
-            self.assertIn("--no-pointer-recenter", command)
-            self.assertIn("--no-keep-raised", command)
-            assert supervisor._action_socket is not None
-            supervisor._action_socket.close()
-            supervisor._action_socket = None
-            supervisor.process = None
-
     def test_private_action_socket_drains_ordered_validated_intents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -165,6 +99,42 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "kind": "action",
                     "action": "speed_down",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 3,
+                    "kind": "action",
+                    "action": "movement_mode_body_relative",
+                },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 4,
+                    "kind": "action",
+                    "action": "motion_gait_start_heading_error_down",
+                },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 5,
+                    "kind": "action",
+                    "action": "motion_camera_heading_snap_error_up",
+                },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 6,
+                    "kind": "action",
+                    "action": "navigation_refresh",
+                },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 7,
+                    "kind": "runtime_pause",
+                    "pause_target": "paused",
+                    "expected_epoch": 0,
+                },
             )
             try:
                 for packet in packets:
@@ -174,6 +144,23 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     (
                         MODULE.OverlayIntent(kind="action", action="profile_remote"),
                         MODULE.OverlayIntent(kind="action", action="speed_down"),
+                        MODULE.OverlayIntent(
+                            kind="action", action="movement_mode_body_relative"
+                        ),
+                        MODULE.OverlayIntent(
+                            kind="action",
+                            action="motion_gait_start_heading_error_down",
+                        ),
+                        MODULE.OverlayIntent(
+                            kind="action",
+                            action="motion_camera_heading_snap_error_up",
+                        ),
+                        MODULE.OverlayIntent(kind="action", action="navigation_refresh"),
+                        MODULE.OverlayIntent(
+                            kind="runtime_pause",
+                            pause_target="paused",
+                            expected_epoch=0,
+                        ),
                     ),
                 )
                 self.assertEqual(supervisor.drain_intents(), ())
@@ -231,7 +218,7 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 receiver.close()
                 supervisor._action_socket = None
 
-    def test_movement_mode_intent_is_strict_and_canonical(self) -> None:
+    def test_font_size_intent_drains_into_atomic_ui_settings_save(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "matrix_calibration_overlay.py"
@@ -245,129 +232,36 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
             receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             receiver.setblocking(False)
             supervisor._action_socket = receiver
-            try:
-                sender.send(
-                    json.dumps(
-                        {
-                            "version": 1,
-                            "session": supervisor._action_session,
-                            "sequence": 1,
-                            "kind": "movement_mode_select",
-                            "movement_mode": "body_relative",
-                        }
-                    ).encode("ascii")
-                )
-                self.assertEqual(
-                    supervisor.drain_intents(),
-                    (
-                        MODULE.OverlayIntent(
-                            kind="movement_mode_select",
-                            movement_mode="body_relative",
-                        ),
-                    ),
-                )
-            finally:
-                sender.close()
-                receiver.close()
-                supervisor._action_socket = None
-
-    def test_video_setting_intent_is_strict_cas_and_live_camera_distance(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            script = root / "matrix_calibration_overlay.py"
-            script.write_text("", encoding="utf-8")
-            supervisor = MODULE.CalibrationOverlaySupervisor(
-                state_file=root / "state.json",
-                display_name=None,
-                expected_ue_pid=41,
-                script=script,
-            )
-            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-            receiver.setblocking(False)
-            supervisor._action_socket = receiver
-            path = root / "config/video.json"
-            applied = MODULE.VideoSettings()
-            controller = MODULE.VideoSettingsController(
-                store=MODULE.VideoSettingsStore(path, initial=applied),
-                applied=applied,
+            settings_file = root / "config/ui.json"
+            controller = MODULE.UiSettingsController(
+                path=settings_file,
+                desired=MODULE.UiSettings(),
+                load_status="missing",
+                load_error=None,
             )
             packet = {
                 "version": 1,
                 "session": supervisor._action_session,
                 "sequence": 1,
-                "kind": "video_setting",
-                "field": "fps_limit",
-                "value": 90,
-                "expected_revision": 0,
+                "kind": "font_size",
+                "font_size": 18,
             }
             try:
                 sender.send(json.dumps(packet).encode("ascii"))
                 intents = supervisor.drain_intents()
                 self.assertEqual(
                     intents,
-                    (
-                        MODULE.OverlayIntent(
-                            kind="video_setting",
-                            video_field="fps_limit",
-                            video_value=90,
-                            expected_revision=0,
-                        ),
-                    ),
+                    (MODULE.OverlayIntent(kind="font_size", font_size=18),),
                 )
-                intent = intents[0]
-                self.assertTrue(
-                    controller.apply_intent(
-                        intent.video_field,
-                        intent.video_value,
-                        expected_revision=intent.expected_revision,
-                        active=True,
+                for intent in intents:
+                    self.assertTrue(
+                        controller.apply_font_size(intent.font_size, active=True)
                     )
-                )
-                mapping = controller.live_mapping()
-                self.assertEqual(mapping["current"]["fps_limit"], 60)
-                self.assertEqual(mapping["next_launch"]["fps_limit"], 90)
-                self.assertEqual(mapping["revision"], 1)
-                self.assertTrue(mapping["pending_restart"])
-                self.assertFalse(
-                    controller.apply_intent(
-                        "quality",
-                        "epic",
-                        expected_revision=0,
-                        active=True,
-                    )
-                )
-                self.assertIsNone(controller.persistence_error)
-                reconciled = controller.live_mapping()
-                self.assertEqual(reconciled["revision"], 1)
-                self.assertEqual(reconciled["next_launch"]["fps_limit"], 90)
-                self.assertEqual(reconciled["next_launch"]["quality"], "high")
-                self.assertTrue(reconciled["pending_restart"])
-                camera_packet = {
-                    "version": 1,
-                    "session": supervisor._action_session,
-                    "sequence": 2,
-                    "kind": "video_setting",
-                    "field": "camera_distance_cm",
-                    "value": 175,
-                    "expected_revision": 1,
-                }
-                sender.send(json.dumps(camera_packet).encode("ascii"))
-                camera_intents = supervisor.drain_intents()
-                self.assertEqual(camera_intents[0].video_field, "camera_distance_cm")
-                self.assertEqual(camera_intents[0].video_value, 175)
-                self.assertTrue(
-                    controller.apply_intent(
-                        "camera_distance_cm",
-                        175,
-                        expected_revision=1,
-                        active=True,
-                    )
-                )
-                camera_mapping = controller.live_mapping()
                 self.assertEqual(
-                    camera_mapping["next_launch"]["camera_distance_cm"], 175
+                    json.loads(settings_file.read_text(encoding="utf-8")),
+                    {"font_scale": 1.0, "font_size": 18, "version": 2},
                 )
-                self.assertTrue(camera_mapping["pending_restart"])
+                self.assertEqual(settings_file.stat().st_mode & 0o777, 0o600)
             finally:
                 sender.close()
                 receiver.close()
@@ -449,15 +343,8 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "version": 1,
                     "session": supervisor._action_session,
                     "sequence": 3,
-                    "kind": "strategy_select",
-                    "slot": "recovery",
-                    "policy_id": "kungfu",
-                },
-                {
-                    "version": 1,
-                    "session": supervisor._action_session,
-                    "sequence": 4,
-                    "kind": "game_quit",
+                    "kind": "command_quick_submit",
+                    "command": "/sonic mode 7",
                 },
             )
             try:
@@ -471,137 +358,10 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                             kind="command_submit", command="/tp @s ~1 ~ ~"
                         ),
                         MODULE.OverlayIntent(
-                            kind="strategy_select",
-                            slot="recovery",
-                            policy_id="kungfu",
-                        ),
-                        MODULE.OverlayIntent(kind="game_quit"),
-                    ),
-                )
-            finally:
-                sender.close()
-                receiver.close()
-                supervisor._action_socket = None
-
-    def test_private_socket_accepts_only_strict_runtime_pause_intents(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            script = root / "matrix_calibration_overlay.py"
-            script.write_text("", encoding="utf-8")
-
-            def drain(packet: dict[str, object]):
-                supervisor = MODULE.CalibrationOverlaySupervisor(
-                    state_file=root / "state.json",
-                    display_name=None,
-                    expected_ue_pid=41,
-                    script=script,
-                )
-                packet = {
-                    **packet,
-                    "session": supervisor._action_session,
-                }
-                receiver, sender = socket.socketpair(
-                    socket.AF_UNIX, socket.SOCK_SEQPACKET
-                )
-                receiver.setblocking(False)
-                supervisor._action_socket = receiver
-                try:
-                    sender.send(json.dumps(packet).encode("ascii"))
-                    return supervisor.drain_intents()
-                finally:
-                    sender.close()
-                    receiver.close()
-                    supervisor._action_socket = None
-
-            valid = {
-                "version": 1,
-                "sequence": 1,
-                "kind": "runtime_pause",
-                "pause_target": "paused",
-                "expected_epoch": 7,
-            }
-            self.assertEqual(
-                drain(valid),
-                (
-                    MODULE.OverlayIntent(
-                        kind="runtime_pause",
-                        pause_target="paused",
-                        expected_epoch=7,
-                    ),
-                ),
-            )
-            invalid_packets = (
-                {**valid, "pause_target": "toggle"},
-                {**valid, "pause_target": []},
-                {**valid, "expected_epoch": True},
-                {**valid, "shell": "pause"},
-            )
-            for packet in invalid_packets:
-                with self.subTest(packet=packet), self.assertRaisesRegex(
-                    RuntimeError, "runtime-pause"
-                ):
-                    drain(packet)
-
-    def test_private_intent_socket_accepts_only_strict_navigation_intents(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            script = root / "matrix_calibration_overlay.py"
-            script.write_text("", encoding="utf-8")
-            supervisor = MODULE.CalibrationOverlaySupervisor(
-                state_file=root / "state.json",
-                display_name=None,
-                expected_ue_pid=41,
-                script=script,
-            )
-            receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-            receiver.setblocking(False)
-            supervisor._action_socket = receiver
-            try:
-                sender.send(
-                    json.dumps(
-                        {
-                            "version": 1,
-                            "session": supervisor._action_session,
-                            "sequence": 1,
-                            "kind": "navigation_refresh",
-                        }
-                    ).encode("ascii")
-                )
-                sender.send(
-                    json.dumps(
-                        {
-                            "version": 1,
-                            "session": supervisor._action_session,
-                            "sequence": 2,
-                            "kind": "navigation_select",
-                            "destination_id": "earth-overworld-home",
-                        }
-                    ).encode("ascii")
-                )
-                self.assertEqual(
-                    supervisor.drain_intents(),
-                    (
-                        MODULE.OverlayIntent(kind="navigation_refresh"),
-                        MODULE.OverlayIntent(
-                            kind="navigation_select",
-                            destination_id="earth-overworld-home",
+                            kind="command_quick_submit", command="/sonic mode 7"
                         ),
                     ),
                 )
-
-                sender.send(
-                    json.dumps(
-                        {
-                            "version": 1,
-                            "session": supervisor._action_session,
-                            "sequence": 3,
-                            "kind": "navigation_select",
-                            "destination_id": "Earth Home",
-                        }
-                    ).encode("ascii")
-                )
-                with self.assertRaisesRegex(RuntimeError, "navigation-selection"):
-                    supervisor.drain_intents()
             finally:
                 sender.close()
                 receiver.close()
@@ -619,6 +379,20 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "sequence": 1,
                     "kind": "command_edit",
                     "active": 1,
+                },
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "kind": "font_size",
+                    "font_size": True,
+                },
+                {
+                    "version": 1,
+                    "session": "placeholder",
+                    "sequence": 1,
+                    "kind": "font_size",
+                    "font_size": 99,
                 },
                 {
                     "version": 1,
@@ -677,320 +451,51 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                 supervisor._action_socket = None
 
 
+class CelestialNavigationMappingTest(unittest.TestCase):
+    @staticmethod
+    def touch(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+
+    def test_mapping_exposes_ready_moon_destination_for_overlay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for scene_xml in ("scene_terrain_t10.xml", "scene_terrain_moon_dynamic.xml"):
+                self.touch(root / "src/robot_mujoco/zsibot_robots/xgb" / scene_xml)
+                self.touch(
+                    root
+                    / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb"
+                    / scene_xml
+                )
+            self.touch(root / "dynamicmaps/moonworld.bin")
+
+            raw = MODULE.celestial_navigation_mapping(
+                {"scene_id": 2},
+                project_root=root,
+            )
+            model = OVERLAY_MODEL.celestial_navigation_model(
+                {"celestial_navigation": raw}
+            )
+
+            self.assertTrue(model.available)
+            self.assertEqual(model.current_body_id, "earth")
+            moon = next(
+                destination
+                for destination in model.destinations
+                if destination.destination_id == "moon"
+            )
+            self.assertTrue(model.destination_enabled("moon"))
+            self.assertEqual(moon.body_name, "月球")
+            self.assertEqual(moon.local_position_m, (-94.7, -65.6, 0.8))
+
+
 @unittest.skipUnless(
     hasattr(socket, "SOCK_SEQPACKET"), "Unix SOCK_SEQPACKET is required"
 )
 class GameCommandClientTest(unittest.TestCase):
-    @staticmethod
-    def motion_settings_telemetry(
-        *, revision: int = 0, movement_mode: str = "camera_face"
-    ) -> dict[str, object]:
-        return {
-            "settings_file": "/home/user/.config/matrix/hosts/trna/motion-control.json",
-            "load_status": "loaded",
-            "load_error": None,
-            "settings": MOTION_SETTINGS.MotionSettings(
-                revision=revision,
-                movement_mode=movement_mode,
-            ).to_mapping(),
-        }
-
-    def test_movement_mode_hot_switch_skips_editor_and_tracks_exact_ack(self) -> None:
-        initial = self.motion_settings_telemetry()
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(
-            provider.detach(), initial_motion_settings=initial
-        )
-        runtime.settimeout(1.0)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertTrue(
-            client.set_movement_mode(
-                "camera_strafe",
-                0,
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                hot_switch=True,
-                motion_input_neutral=True,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.MovementModeSet("camera_strafe", 0),
-        )
-        self.assertFalse(client.editing)
-
-        updated = self.motion_settings_telemetry(
-            revision=1, movement_mode="camera_strafe"
-        )
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_MOVEMENT_MODE_SET",
-                    message="updated",
-                    data={"motion_settings": updated},
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertEqual(
-            MODULE.live_motion_settings(None, client).movement_mode,
-            "camera_strafe",
-        )
-
-    def test_movement_mode_switch_fails_closed_on_panel_and_hotkey_gates(self) -> None:
-        cases = (
-            (
-                dict(
-                    calibration_active=False,
-                    neutral_frame_ready=True,
-                    restart_requested=False,
-                ),
-                "E_NOT_PAUSED",
-            ),
-            (
-                dict(
-                    calibration_active=True,
-                    neutral_frame_ready=False,
-                    restart_requested=False,
-                ),
-                "E_NEUTRAL_REQUIRED",
-            ),
-            (
-                dict(
-                    calibration_active=False,
-                    neutral_frame_ready=False,
-                    restart_requested=False,
-                    hot_switch=True,
-                    motion_input_neutral=False,
-                ),
-                "E_NEUTRAL_REQUIRED",
-            ),
-        )
-        for arguments, expected_code in cases:
-            with self.subTest(expected_code=expected_code):
-                client, runtime = self.make_client()
-                self.assertFalse(
-                    client.set_movement_mode("body_relative", 0, **arguments)
-                )
-                self.assertEqual(client.code, expected_code)
-                with self.assertRaises(BlockingIOError):
-                    runtime.recv(4096)
-
-    def test_motion_settings_telemetry_prefers_latest_runtime_ack(self) -> None:
-        initial = self.motion_settings_telemetry(revision=0)
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            initial_strategy_loadout=self.strategy_loadout(),
-            initial_motion_settings=initial,
-        )
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertEqual(
-            MODULE.live_motion_settings_telemetry(initial, client),
-            initial,
-        )
-        updated = self.motion_settings_telemetry(revision=1)
-        self.assertTrue(
-            client.submit(
-                "/data modify entity @s "
-                "control.motion.gears.slow.speed_mps set value 0.15",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        motion_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=motion_request.session,
-                    sequence=motion_request.sequence,
-                    request_id=motion_request.request_id,
-                    ok=True,
-                    code="OK_DATA_MODIFIED",
-                    message="updated",
-                    data={"motion_settings": updated},
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertEqual(
-            MODULE.live_motion_settings_telemetry(initial, client),
-            updated,
-        )
-        # A later unrelated ACK replaces command_client.data, while the
-        # dedicated runtime-owned motion snapshot must stay at revision 1.
-        self.assertTrue(
-            client.select_policy(
-                "recovery",
-                "host",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        policy_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=policy_request.session,
-                    sequence=policy_request.sequence,
-                    request_id=policy_request.request_id,
-                    ok=True,
-                    code="OK_POLICY_SLOT_ASSIGNED",
-                    message="assigned",
-                    data={"strategy_loadout": self.strategy_loadout(recovery="host")},
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertEqual(
-            MODULE.live_motion_settings_telemetry(initial, client),
-            updated,
-        )
-        malformed = dict(updated)
-        malformed["unknown"] = True
-        with self.assertRaisesRegex(ValueError, "schema"):
-            MODULE.validate_motion_settings_telemetry(malformed)
-
-    @staticmethod
-    def strategy_loadout(recovery="kungfu", status="ready"):
-        return {
-            "version": 1,
-            "available": True,
-            "status": status,
-            "active_slot": "locomotion",
-            "pending": None,
-            "slots": [
-                {
-                    "slot": "locomotion",
-                    "selected_policy_id": "sonic",
-                    "locked": True,
-                    "candidates": [
-                        {
-                            "policy_id": "sonic",
-                            "resident": True,
-                            "available": True,
-                        }
-                    ],
-                },
-                {
-                    "slot": "recovery",
-                    "selected_policy_id": recovery,
-                    "locked": False,
-                    "candidates": [
-                        {
-                            "policy_id": policy_id,
-                            "resident": True,
-                            "available": True,
-                        }
-                        for policy_id in ("kungfu", "host", "amp")
-                    ],
-                },
-            ],
-            "resident_models": [],
-        }
-
-    @staticmethod
-    def creative_inventory(remaining=8, spawn_count=0):
-        return {
-            "version": 1,
-            "available": True,
-            "spawn_count": spawn_count,
-            "items": [
-                {
-                    "item_id": "training_blaster",
-                    "label": "Training Blaster",
-                    "pool_size": 8,
-                    "remaining": remaining,
-                }
-            ],
-        }
-
     def make_client(self):
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(
-            provider.detach(), runtime_pause_capable=True
-        )
-        runtime.setblocking(False)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-        return client, runtime
-
-    def test_quit_game_skips_editor_and_tracks_ack(self) -> None:
-        client, runtime = self.make_client()
-        self.assertTrue(
-            client.quit_game(
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(request.command, MC_COMMANDS.GameQuit())
-        self.assertFalse(client.editing)
-
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_GAME_QUIT",
-                    message="Matrix game quit requested",
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertEqual(client.status, "success")
-        self.assertEqual(client.code, "OK_GAME_QUIT")
-        self.assertIsInstance(client.mapping()["result_age_s"], float)
-
-    def test_quit_game_requires_panel_and_neutral_frame(self) -> None:
-        for arguments, expected_code in (
-            (
-                dict(
-                    calibration_active=False,
-                    neutral_frame_ready=True,
-                    restart_requested=False,
-                ),
-                "E_NOT_PAUSED",
-            ),
-            (
-                dict(
-                    calibration_active=True,
-                    neutral_frame_ready=False,
-                    restart_requested=False,
-                ),
-                "E_NEUTRAL_REQUIRED",
-            ),
-        ):
-            with self.subTest(expected_code=expected_code):
-                client, runtime = self.make_client()
-                self.assertFalse(client.quit_game(**arguments))
-                self.assertEqual(client.code, expected_code)
-                with self.assertRaises(BlockingIOError):
-                    runtime.recv(4096)
-
-    def make_celestial_client(self):
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH),
-            celestial_visual_catalog=VISUALS.load_visual_catalog(),
-        )
+        client = MODULE.GameCommandClient(provider.detach())
         runtime.setblocking(False)
         self.addCleanup(client.close)
         self.addCleanup(runtime.close)
@@ -1002,50 +507,6 @@ class GameCommandClientTest(unittest.TestCase):
             True, panel_active=True, restart_requested=False
         )
 
-    @staticmethod
-    def teleport_list_response(
-        request,
-        *,
-        ok: bool = True,
-        code: str = "OK_TELEPORT_LIST",
-        message: str = "Found 2/3 requested teleport points",
-    ):
-        data = (
-            {
-                "world_id": EARTH_WORLD_ID,
-                "teleport_points": [
-                    {
-                        "tag": "home",
-                        "found": True,
-                        "entity_id": "tp-" + "b" * 32,
-                        "position": [160.0, 117.0, 1.2],
-                        "yaw_rad": 0.0,
-                    },
-                    {
-                        "tag": "moon.tranquility",
-                        "found": True,
-                        "entity_id": "tp-" + "c" * 32,
-                        "position": [-94.7, -65.6, -5.251562023162842],
-                        "yaw_rad": 0.0,
-                    },
-                    {"tag": "mars.utopia", "found": False},
-                ],
-            }
-            if ok
-            else None
-        )
-        return MC_COMMANDS.encode_command_response(
-            MC_COMMANDS.GameCommandResponse(
-                session=request.session,
-                sequence=request.sequence,
-                request_id=request.request_id,
-                ok=ok,
-                code=code,
-                message=message,
-                data=data,
-            )
-        )
-
     def test_unavailable_channel_cannot_enter_editor_or_capture_escape(self) -> None:
         client = MODULE.GameCommandClient(None)
         self.addCleanup(client.close)
@@ -1053,137 +514,10 @@ class GameCommandClientTest(unittest.TestCase):
             client.set_editing(True, panel_active=True, restart_requested=False)
         )
         self.assertFalse(client.editing)
-        self.assertEqual(
-            client.mapping()["runtime_pause"]["state"], "unavailable"
-        )
         self.assertTrue(
             client.panel_escape_pressed(True, editor_owned_this_frame=True)
         )
         self.assertFalse(client.panel_escape_pressed(False))
-
-    def test_escape_gate_never_submits_or_changes_runtime_pause(self) -> None:
-        client, runtime = self.make_client()
-        before = client.runtime_pause_mapping()
-
-        self.assertTrue(client.panel_escape_pressed(True))
-        self.assertFalse(client.panel_escape_pressed(False))
-
-        self.assertEqual(client.runtime_pause_mapping(), before)
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-    def test_command_channel_without_runtime_capability_cannot_offer_pause(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(provider.detach())
-        runtime.setblocking(False)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertEqual(
-            client.runtime_pause_mapping(),
-            {
-                "state": "unavailable",
-                "epoch": 0,
-                "can_pause": False,
-                "can_resume": False,
-                "last_error": None,
-            },
-        )
-        self.assertFalse(
-            client.submit_runtime_pause(
-                "paused",
-                0,
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertEqual(client.code, "E_RUNTIME_PAUSE_UNAVAILABLE")
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-    def test_unavailable_pause_state_allows_celestial_periodic_checkpoint(self) -> None:
-        clock = mock.Mock()
-        clock.checkpoint.return_value = True
-        client = MODULE.GameCommandClient(
-            None,
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=mock.Mock(),
-            celestial_clock=clock,
-        )
-
-        self.assertEqual(client.runtime_pause_mapping()["state"], "unavailable")
-        self.assertTrue(client.checkpoint_celestial_clock())
-        clock.checkpoint.assert_called_once_with()
-
-    def test_unavailable_pause_state_finalizes_real_persistent_clock(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "celestial-clock.json"
-            now_ns = [1_000_000_000]
-            catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
-            clock = MODULE.PersistentSimulationClock(
-                universe_id=catalog.universe_id,
-                reference_epoch_utc=catalog.reference_epoch_utc,
-                tai_minus_utc_at_epoch_s=catalog.tai_minus_utc_at_epoch_s,
-                rate_numerator=catalog.clock_rate_numerator,
-                rate_denominator=catalog.clock_rate_denominator,
-                state_path=path,
-                monotonic_ns=lambda: now_ns[0],
-            )
-            self.addCleanup(clock.close, checkpoint=False)
-            client = MODULE.GameCommandClient(
-                None,
-                game_world_id=EARTH_WORLD_ID,
-                celestial_catalog=catalog,
-                celestial_clock=clock,
-            )
-            now_ns[0] = 3_500_000_000
-
-            self.assertFalse(path.exists())
-            client.finalize_celestial_resources()
-
-            persisted = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["elapsed_tai_ns"], 2_500_000_000)
-            self.assertEqual(persisted["universe_id"], catalog.universe_id)
-
-    def test_teleport_response_cannot_smuggle_runtime_pause_ack(self) -> None:
-        client, runtime = self.make_client()
-        before = client.runtime_pause_mapping()
-        self.enable_editor(client)
-        self.assertTrue(
-            client.submit(
-                "/tp @s ~1 2 ~-3",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_TELEPORT",
-                    message="forged pause data",
-                    data={
-                        "runtime_pause": {
-                            "phase": "paused",
-                            "epoch": 1,
-                            "paused": True,
-                        }
-                    },
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        self.assertEqual(client.runtime_pause_mapping(), before)
-        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
-        self.assertTrue(client.outcome_unknown)
-        self.assertIsNone(client.data)
 
     def test_command_channel_rejects_a_unix_stream_socket(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1224,10 +558,8 @@ class GameCommandClientTest(unittest.TestCase):
         runtime.send(MC_COMMANDS.encode_command_response(response))
         self.assertTrue(client.poll())
         self.assertFalse(client.in_flight)
-        mapping = client.mapping()
-        self.assertIsInstance(mapping.pop("result_age_s"), float)
         self.assertEqual(
-            mapping,
+            client.mapping(),
             {
                 "available": True,
                 "editing": True,
@@ -1242,6 +574,7 @@ class GameCommandClientTest(unittest.TestCase):
                 "warning": None,
                 "restart_required": True,
                 "outcome_unknown": False,
+                "data": {"position": [1.0, 2.0, 3.0]},
                 "runtime_pause": {
                     "state": "running",
                     "epoch": 0,
@@ -1249,44 +582,18 @@ class GameCommandClientTest(unittest.TestCase):
                     "can_resume": False,
                     "last_error": None,
                 },
-                "data": {"position": [1.0, 2.0, 3.0]},
             },
         )
 
-    def test_runtime_pause_text_ack_and_celestial_clock_are_epoch_guarded(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        clock = mock.Mock()
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            runtime_pause_capable=True,
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=mock.Mock(),
-            celestial_clock=clock,
-        )
-        runtime.setblocking(False)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
+    def test_runtime_pause_panel_action_sends_typed_hot_command(self) -> None:
+        client, runtime = self.make_client()
 
-        with mock.patch.object(
-            MODULE, "parse_mc_command", wraps=MODULE.parse_mc_command
-        ) as parse:
-            self.assertTrue(
-                client.submit_runtime_pause(
-                    "paused",
-                    0,
-                    calibration_active=True,
-                    neutral_frame_ready=True,
-                    restart_requested=False,
-                )
-            )
-        parse.assert_called_once_with("/runtime pause paused 0")
+        self.assertTrue(client.set_runtime_pause("paused", expected_epoch=0))
+        payload = runtime.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+        request = MC_COMMANDS.decode_command_request(payload)
+        self.assertEqual(request.command, MC_COMMANDS.RuntimePauseSet("paused", 0))
         self.assertEqual(client.mapping()["runtime_pause"]["state"], "pausing")
-        clock.checkpoint.return_value = True
-        self.assertFalse(client.checkpoint_celestial_clock())
-        clock.checkpoint.assert_not_called()
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(request.command, MC_COMMANDS.RuntimePause("paused", 0))
-        pause_ack = {"phase": "paused", "epoch": 1, "paused": True}
+
         runtime.send(
             MC_COMMANDS.encode_command_response(
                 MC_COMMANDS.GameCommandResponse(
@@ -1294,990 +601,121 @@ class GameCommandClientTest(unittest.TestCase):
                     sequence=request.sequence,
                     request_id=request.request_id,
                     ok=True,
-                    code="OK_RUNTIME_PAUSED",
-                    message="paused",
-                    data={"runtime_pause": pause_ack},
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        mapping = client.mapping()
-        self.assertEqual(
-            mapping["runtime_pause"],
-            {
-                "state": "paused",
-                "epoch": 1,
-                "can_pause": False,
-                "can_resume": True,
-                "last_error": None,
-            },
-        )
-        self.assertEqual(mapping["data"]["runtime_pause"], pause_ack)
-        clock.set_paused.assert_called_once_with(True)
-        self.assertFalse(client.checkpoint_celestial_clock())
-        clock.checkpoint.assert_not_called()
-
-        with mock.patch.object(
-            MODULE, "parse_mc_command", wraps=MODULE.parse_mc_command
-        ) as parse:
-            self.assertTrue(
-                client.submit_runtime_pause(
-                    "running",
-                    1,
-                    calibration_active=True,
-                    neutral_frame_ready=True,
-                    restart_requested=False,
-                )
-            )
-        parse.assert_called_once_with("/runtime pause running 1")
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(request.command, MC_COMMANDS.RuntimePause("running", 1))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_RUNTIME_RUNNING",
-                    message="running",
+                    code="OK_RUNTIME_PAUSE_CHANGED",
+                    message="Matrix runtime controls paused",
+                    restart_required=False,
                     data={
                         "runtime_pause": {
-                            "phase": "running",
-                            "epoch": 2,
-                            "paused": False,
+                            "state": "paused",
+                            "epoch": 1,
+                            "can_pause": False,
+                            "can_resume": True,
+                            "last_error": None,
                         }
                     },
                 )
             )
         )
-        self.assertTrue(client.poll())
-        self.assertEqual(client.mapping()["runtime_pause"]["state"], "running")
-        self.assertEqual(
-            clock.set_paused.call_args_list,
-            [mock.call(True), mock.call(False)],
-        )
-        clock.checkpoint.return_value = True
-        self.assertTrue(client.checkpoint_celestial_clock())
-
-    def test_failed_pause_request_restores_celestial_checkpoint_writes(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        clock = mock.Mock()
-        clock.checkpoint.return_value = True
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            runtime_pause_capable=True,
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=mock.Mock(),
-            celestial_clock=clock,
-        )
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertTrue(
-            client.submit_runtime_pause(
-                "paused",
-                0,
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertFalse(client.checkpoint_celestial_clock())
-        clock.checkpoint.assert_not_called()
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=False,
-                    code="E_RUNTIME_PAUSE_BUSY",
-                    message="busy",
-                    data=None,
-                )
-            )
-        )
 
         self.assertTrue(client.poll())
-        self.assertEqual(client.runtime_pause_mapping()["state"], "running")
-        self.assertTrue(client.checkpoint_celestial_clock())
-        clock.checkpoint.assert_called_once_with()
+        self.assertEqual(client.status, "success")
+        self.assertEqual(client.mapping()["runtime_pause"]["state"], "paused")
+        self.assertEqual(client.mapping()["runtime_pause"]["epoch"], 1)
 
-    def test_pending_pause_closes_celestial_clock_without_checkpoint(self) -> None:
-        class FakePersistentClock:
-            def __init__(self) -> None:
-                self.close_calls: list[bool] = []
-
-            def close(self, *, checkpoint: bool = True) -> None:
-                self.close_calls.append(checkpoint)
-
-        clock = FakePersistentClock()
-        with mock.patch.object(
-            MODULE,
-            "PersistentSimulationClock",
-            FakePersistentClock,
-        ):
-            client = MODULE.GameCommandClient(
-                None,
-                game_world_id=EARTH_WORLD_ID,
-                celestial_catalog=mock.Mock(),
-                celestial_clock=clock,
-            )
-            client._pending_runtime_pause = ("paused", 0)
-            client.finalize_celestial_resources()
-
-        self.assertEqual(clock.close_calls, [False])
-
-    def test_failed_runtime_pause_ack_does_not_change_local_pause_state(self) -> None:
+    def test_function_response_updates_nested_runtime_pause_epoch(self) -> None:
         client, runtime = self.make_client()
-        before = client.runtime_pause_mapping()
+
         self.assertTrue(
-            client.submit_runtime_pause(
-                "paused",
-                0,
+            client.submit(
+                "/function pose/north",
                 calibration_active=True,
                 neutral_frame_ready=True,
                 restart_requested=False,
+                require_editing=False,
             )
         )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
+        payload = runtime.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+        request = MC_COMMANDS.decode_command_request(payload)
+        self.assertEqual(request.command, MC_COMMANDS.CommandFunctionCall("pose/north"))
+        self.assertEqual(client.mapping()["runtime_pause"]["epoch"], 0)
+
         runtime.send(
             MC_COMMANDS.encode_command_response(
                 MC_COMMANDS.GameCommandResponse(
                     session=request.session,
                     sequence=request.sequence,
                     request_id=request.request_id,
-                    ok=False,
-                    code="E_RUNTIME_PAUSE_BUSY",
-                    message="busy",
+                    ok=True,
+                    code="OK_FUNCTION",
+                    message="Function pose/north executed 4 step(s)",
+                    restart_required=False,
                     data={
-                        "runtime_pause": {
-                            "phase": "paused",
-                            "epoch": 1,
-                            "paused": True,
-                        }
-                    },
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertEqual(client.runtime_pause_mapping(), before)
-        self.assertEqual(client.code, "E_RUNTIME_PAUSE_BUSY")
-        self.assertNotIn("runtime_pause", client.mapping()["data"])
-
-    def test_runtime_pause_success_code_must_match_pending_ast_target(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        clock = mock.Mock()
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            runtime_pause_capable=True,
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=mock.Mock(),
-            celestial_clock=clock,
-        )
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-        self.assertTrue(
-            client.submit_runtime_pause(
-                "paused",
-                0,
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_RUNTIME_RUNNING",
-                    message="wrong target code",
-                    data={
-                        "runtime_pause": {
-                            "phase": "paused",
-                            "epoch": 1,
-                            "paused": True,
-                        }
-                    },
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
-        self.assertEqual(client.runtime_pause_mapping()["state"], "fault")
-        self.assertEqual(client.runtime_pause_mapping()["epoch"], 0)
-        clock.set_paused.assert_called_once_with(True)
-        self.assertFalse(client.checkpoint_celestial_clock())
-        clock.checkpoint.assert_not_called()
-
-    def test_celestial_pause_sync_fault_never_checkpoints(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        clock = mock.Mock()
-        clock.set_paused.side_effect = OSError("clock unavailable")
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            runtime_pause_capable=True,
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=mock.Mock(),
-            celestial_clock=clock,
-        )
-        runtime.setblocking(False)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertTrue(
-            client.submit_runtime_pause(
-                "paused",
-                0,
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_RUNTIME_PAUSED",
-                    message="paused",
-                    data={
-                        "runtime_pause": {
-                            "phase": "paused",
-                            "epoch": 1,
-                            "paused": True,
-                        }
-                    },
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        self.assertEqual(client.code, "E_CELESTIAL_PAUSE_SYNC")
-        self.assertEqual(client.runtime_pause_mapping()["state"], "fault")
-        self.assertFalse(client.checkpoint_celestial_clock())
-        clock.checkpoint.assert_not_called()
-
-    def test_runtime_pause_ack_mapping_is_exact_finite_and_coherent(self) -> None:
-        self.assertEqual(MODULE.MAX_RUNTIME_PAUSE_EPOCH, 2_147_483_647)
-        self.assertEqual(
-            MODULE.GameCommandClient._validate_runtime_pause_ack(
-                {"phase": "paused", "epoch": 4, "paused": True}
-            ),
-            {"phase": "paused", "epoch": 4, "paused": True},
-        )
-        invalid = (
-            {"phase": "paused", "epoch": 4, "paused": False},
-            {"phase": "running", "epoch": True, "paused": False},
-            {"phase": [], "epoch": 4, "paused": False},
-            {"phase": "running", "epoch": 4, "paused": False, "extra": 1},
-            {
-                "phase": "running",
-                "epoch": MODULE.MAX_RUNTIME_PAUSE_EPOCH + 1,
-                "paused": False,
-            },
-        )
-        for value in invalid:
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                MODULE.GameCommandClient._validate_runtime_pause_ack(value)
-
-    def test_runtime_pause_submission_fails_closed_on_all_provider_gates(self) -> None:
-        cases = (
-            (
-                {
-                    "calibration_active": False,
-                    "neutral_frame_ready": True,
-                    "restart_requested": False,
-                },
-                "E_NOT_PAUSED",
-            ),
-            (
-                {
-                    "calibration_active": True,
-                    "neutral_frame_ready": False,
-                    "restart_requested": False,
-                },
-                "E_NEUTRAL_REQUIRED",
-            ),
-            (
-                {
-                    "calibration_active": True,
-                    "neutral_frame_ready": True,
-                    "restart_requested": True,
-                },
-                "E_RESTART_PENDING",
-            ),
-        )
-        for arguments, code in cases:
-            with self.subTest(code=code):
-                client, runtime = self.make_client()
-                self.assertFalse(client.submit_runtime_pause("paused", 0, **arguments))
-                self.assertEqual(client.code, code)
-                with self.assertRaises(BlockingIOError):
-                    runtime.recv(4096)
-
-        client, runtime = self.make_client()
-        self.assertFalse(
-            client.submit_runtime_pause(
-                "paused",
-                1,
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertEqual(client.code, "E_RUNTIME_PAUSE_EPOCH")
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-    def test_strategy_slot_select_skips_text_editor_and_tracks_runtime_ack(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            initial_strategy_loadout=self.strategy_loadout(),
-        )
-        runtime.settimeout(1.0)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertTrue(
-            client.select_policy(
-                "recovery",
-                "host",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.PolicySlotAssignment("recovery", "host"),
-        )
-        self.assertFalse(client.editing)
-        changed = self.strategy_loadout(recovery="host")
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_POLICY_SLOT_ASSIGNED",
-                    message="assigned",
-                    data={"strategy_loadout": changed},
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        self.assertEqual(
-            client.strategy_loadout_mapping()["slots"][1]["selected_policy_id"],
-            "host",
-        )
-
-    def test_loading_strategy_loadout_refreshes_until_runtime_ready(self) -> None:
-        provider, runtime = socket.socketpair(
-            socket.AF_UNIX,
-            socket.SOCK_SEQPACKET,
-        )
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            initial_strategy_loadout=self.strategy_loadout(status="loading"),
-        )
-        runtime.setblocking(False)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-        gates = {
-            "calibration_active": True,
-            "neutral_frame_ready": True,
-            "restart_requested": False,
-        }
-
-        self.assertTrue(
-            client.refresh_loading_strategy_loadout(now_s=10.0, **gates)
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(request.command, MC_COMMANDS.PolicySlotQuery())
-        self.assertFalse(
-            client.refresh_loading_strategy_loadout(now_s=11.0, **gates)
-        )
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_POLICY_SLOT_STATUS",
-                    message="loading",
-                    data={"strategy_loadout": self.strategy_loadout(status="loading")},
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertFalse(
-            client.refresh_loading_strategy_loadout(now_s=10.5, **gates)
-        )
-        self.assertTrue(
-            client.refresh_loading_strategy_loadout(now_s=11.0, **gates)
-        )
-        retry = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        ready = self.strategy_loadout(status="ready")
-        ready["slots"][0]["locked"] = False
-        ready["slots"][0]["candidates"].append(
-            {
-                "policy_id": "bfm-sonic-teacher50k",
-                "resident": True,
-                "available": True,
-            }
-        )
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=retry.session,
-                    sequence=retry.sequence,
-                    request_id=retry.request_id,
-                    ok=True,
-                    code="OK_POLICY_SLOT_STATUS",
-                    message="ready",
-                    data={"strategy_loadout": ready},
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertFalse(
-            client.refresh_loading_strategy_loadout(now_s=12.0, **gates)
-        )
-        self.assertFalse(
-            client.refresh_loading_strategy_loadout(
-                now_s=13.0,
-                calibration_active=False,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-
-    def test_disabled_recovery_slot_accepts_locked_off_sentinel(self) -> None:
-        loadout = self.strategy_loadout(status="loading")
-        recovery = loadout["slots"][1]
-        recovery["selected_policy_id"] = "off"
-        recovery["locked"] = True
-        recovery["candidates"] = []
-
-        provider, runtime = socket.socketpair(
-            socket.AF_UNIX,
-            socket.SOCK_SEQPACKET,
-        )
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            initial_strategy_loadout=loadout,
-        )
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-        self.assertEqual(
-            client.strategy_loadout_mapping()["slots"][1],
-            recovery,
-        )
-
-    def test_creative_spawn_skips_editor_and_tracks_remaining_inventory(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            initial_creative_inventory=self.creative_inventory(),
-        )
-        runtime.settimeout(1.0)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertTrue(
-            client.spawn_creative_item(
-                "training_blaster",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.CreativeSpawnItem("training_blaster"),
-        )
-        self.assertFalse(client.editing)
-        changed = self.creative_inventory(remaining=7, spawn_count=1)
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_INVENTORY_SPAWNED",
-                    message="placed",
-                    data={
-                        "creative_inventory": changed,
-                        "spawned_item": {
-                            "item_id": "training_blaster",
-                            "instance_name": "creative_item__training_blaster__0",
-                            "position": [0.9, 0.0, 1.0],
-                            "quaternion": [1.0, 0.0, 0.0, 0.0],
-                        },
-                    },
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        inventory = client.creative_inventory_mapping()
-        self.assertEqual(inventory["spawn_count"], 1)
-        self.assertEqual(inventory["items"][0]["remaining"], 7)
-
-    def test_disabled_creative_inventory_never_sends_or_decrements(self) -> None:
-        disabled = self.creative_inventory()
-        disabled["available"] = False
-        disabled["unavailable_reason"] = (
-            "packaged_ue_creative_prop_consumer_missing"
-        )
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            initial_creative_inventory=disabled,
-        )
-        runtime.setblocking(False)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        self.assertFalse(
-            client.spawn_creative_item(
-                "training_blaster",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-        self.assertEqual(client.code, "E_INVENTORY_UNAVAILABLE")
-        inventory = client.creative_inventory_mapping()
-        self.assertEqual(inventory["spawn_count"], 0)
-        self.assertEqual(inventory["items"][0]["remaining"], 8)
-
-    def test_initial_world_binds_navigation_without_fake_destination_probes(self) -> None:
-        catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
-        visuals = VISUALS.load_visual_catalog()
-        cases = (
-            (EARTH_WORLD_ID, "earth", "earth-wet-cloudy-v1"),
-            (MOON_WORLD_ID, "moon", "moon-vacuum-v1"),
-        )
-        for world_id, body_id, profile_id in cases:
-            with self.subTest(world_id=world_id):
-                provider, runtime = socket.socketpair(
-                    socket.AF_UNIX,
-                    socket.SOCK_SEQPACKET,
-                )
-                client = MODULE.GameCommandClient(
-                    provider.detach(),
-                    game_world_id=world_id,
-                    celestial_catalog=catalog,
-                    celestial_visual_catalog=visuals,
-                )
-                try:
-                    navigation = client.celestial_navigation_mapping()
-                    self.assertEqual(navigation["current_body_id"], body_id)
-                    self.assertEqual(navigation["lighting"]["body_id"], body_id)
-                    self.assertEqual(
-                        navigation["lighting"]["visual_profile"]["id"],
-                        profile_id,
-                    )
-                    self.assertTrue(
-                        all(
-                            destination["enabled"] is False
-                            for destination in navigation["destinations"]
-                        )
-                    )
-                    self.assertEqual(
-                        [
-                            destination["status"]
-                            for destination in navigation["destinations"][:2]
-                        ],
-                        ["unknown", "unknown"],
-                    )
-                finally:
-                    client.close()
-                    runtime.close()
-
-    def test_invalid_initial_game_world_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "game world id is invalid"):
-            MODULE.GameCommandClient(
-                None,
-                game_world_id="invalid world id",
-                celestial_catalog=MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH),
-            )
-
-    def test_auto_celestial_refresh_runs_once_without_panel_gates(self) -> None:
-        client, runtime = self.make_celestial_client()
-
-        self.assertTrue(client.auto_refresh_celestial_navigation_once())
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.TeleportList(
-                ("home", "moon.tranquility", "mars.utopia")
-            ),
-        )
-        self.assertTrue(client.in_flight)
-        self.assertEqual(client.status, "pending")
-        self.assertEqual(client.message, "Refreshing celestial teleport points")
-
-        for _ in range(3):
-            self.assertFalse(client.auto_refresh_celestial_navigation_once())
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-        runtime.send(self.teleport_list_response(request))
-        self.assertTrue(client.poll())
-        self.assertEqual(client.code, "OK_TELEPORT_LIST")
-        earth, moon, mars = client.celestial_navigation_mapping()["destinations"]
-        self.assertEqual(earth["status"], "ready")
-        self.assertEqual(moon["status"], "ready")
-        self.assertEqual(mars["status"], "world_unavailable")
-
-        self.assertFalse(client.auto_refresh_celestial_navigation_once())
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-        self.assertTrue(
-            client.refresh_celestial_navigation(
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        manual_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(request.sequence + 1, manual_request.sequence)
-        self.assertEqual(manual_request.command, request.command)
-        runtime.send(self.teleport_list_response(manual_request))
-        self.assertTrue(client.poll())
-
-    def test_auto_celestial_refresh_failure_is_not_retried(self) -> None:
-        client, runtime = self.make_celestial_client()
-
-        self.assertTrue(client.auto_refresh_celestial_navigation_once())
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            self.teleport_list_response(
-                request,
-                ok=False,
-                code="E_TELEPORT_LIST",
-                message="provider not ready",
-            )
-        )
-
-        self.assertTrue(client.poll())
-        self.assertEqual(client.status, "error")
-        self.assertEqual(client.code, "E_TELEPORT_LIST")
-        self.assertFalse(client.auto_refresh_celestial_navigation_once())
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-        self.assertTrue(
-            client.refresh_celestial_navigation(
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        manual_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertIsInstance(manual_request.command, MC_COMMANDS.TeleportList)
-        runtime.send(self.teleport_list_response(manual_request))
-        self.assertTrue(client.poll())
-
-    def test_auto_celestial_refresh_waits_for_busy_channel_and_skips_restart(self) -> None:
-        client, runtime = self.make_celestial_client()
-        self.enable_editor(client)
-        arguments = {
-            "calibration_active": True,
-            "neutral_frame_ready": True,
-            "restart_requested": False,
-        }
-
-        self.assertTrue(client.submit("/tp @s 1 2 3", **arguments))
-        teleport_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertFalse(client.auto_refresh_celestial_navigation_once())
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=teleport_request.session,
-                    sequence=teleport_request.sequence,
-                    request_id=teleport_request.request_id,
-                    ok=True,
-                    code="OK_TELEPORT",
-                    message="teleported",
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-
-        self.assertTrue(client.auto_refresh_celestial_navigation_once())
-        auto_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(self.teleport_list_response(auto_request))
-        self.assertTrue(client.poll())
-
-        self.assertTrue(client.submit("/tp @s 4 5 6", **arguments))
-        restart_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=restart_request.session,
-                    sequence=restart_request.sequence,
-                    request_id=restart_request.request_id,
-                    ok=True,
-                    code="OK_TELEPORT_RESTART",
-                    message="restart",
-                    restart_required=True,
-                )
-            )
-        )
-        self.assertTrue(client.poll())
-        self.assertTrue(client.restart_required)
-        self.assertFalse(client.auto_refresh_celestial_navigation_once())
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-    def test_celestial_refresh_discovers_home_and_routes_active_moon(self) -> None:
-        provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
-        client = MODULE.GameCommandClient(
-            provider.detach(),
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=catalog,
-            celestial_visual_catalog=VISUALS.load_visual_catalog(),
-        )
-        runtime.settimeout(1.0)
-        self.addCleanup(client.close)
-        self.addCleanup(runtime.close)
-
-        initial_navigation = client.celestial_navigation_mapping()
-        self.assertEqual(initial_navigation["current_body_id"], "earth")
-        self.assertTrue(
-            all(
-                destination["enabled"] is False
-                for destination in initial_navigation["destinations"]
-            )
-        )
-
-        self.assertTrue(
-            client.refresh_celestial_navigation(
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.TeleportList(
-                ("home", "moon.tranquility", "mars.utopia")
-            ),
-        )
-        self.assertFalse(
-            client.select_celestial_destination(
-                "moon-tranquility-outpost",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertTrue(client.in_flight)
-        self.assertEqual(client.status, "pending")
-        self.assertIsNone(client.code)
-        self.assertEqual(
-            client.celestial_navigation_mapping()["current_body_id"],
-            "earth",
-        )
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=request.session,
-                    sequence=request.sequence,
-                    request_id=request.request_id,
-                    ok=True,
-                    code="OK_TELEPORT_LIST",
-                    message="Found 1/3 requested teleport points",
-                    data={
-                        "world_id": EARTH_WORLD_ID,
-                        "teleport_points": [
+                        "function": "pose/north",
+                        "steps": [
                             {
-                                "tag": "home",
-                                "found": True,
-                                "entity_id": "tp-" + "b" * 32,
-                                "position": [160.0, 117.0, 1.2],
-                                "yaw_rad": 0.0,
+                                "code": "OK_RUNTIME_PAUSE_CHANGED",
+                                "message": "Matrix runtime controls paused",
+                                "restart_required": False,
+                                "data": {
+                                    "runtime_pause": {
+                                        "state": "paused",
+                                        "epoch": 3,
+                                        "can_pause": False,
+                                        "can_resume": True,
+                                        "last_error": None,
+                                    }
+                                },
                             },
                             {
-                                "tag": "moon.tranquility",
-                                "found": True,
-                                "entity_id": "tp-" + "c" * 32,
-                                "position": [-94.7, -65.6, -5.251562023162842],
-                                "yaw_rad": 0.0,
+                                "code": "OK_RECOVER",
+                                "message": "Recovered Matrix upright at current XY",
+                                "restart_required": False,
+                                "data": {"hot_pose": True},
                             },
-                            {"tag": "mars.utopia", "found": False},
                         ],
                     },
                 )
             )
         )
-        self.assertTrue(client.poll())
 
-        navigation = client.celestial_navigation_mapping()
-        self.assertEqual(
-            navigation["lighting"]["visual_profile"]["id"],
-            "earth-wet-cloudy-v1",
-        )
-        earth, moon, mars = navigation["destinations"]
-        self.assertEqual(earth["status"], "ready")
-        self.assertTrue(earth["enabled"])
-        self.assertEqual(moon["status"], "ready")
-        self.assertEqual(mars["status"], "world_unavailable")
+        self.assertTrue(client.poll())
+        self.assertEqual(client.status, "success")
+        self.assertEqual(client.mapping()["runtime_pause"]["state"], "paused")
+        self.assertEqual(client.mapping()["runtime_pause"]["epoch"], 3)
+        self.assertEqual(client.mapping()["runtime_pause"]["can_resume"], True)
+
+    def test_motion_setting_panel_action_sends_typed_hot_command(self) -> None:
+        client, runtime = self.make_client()
+
         self.assertTrue(
-            client.select_celestial_destination(
-                "moon-tranquility-outpost",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
+            client.set_motion_setting(
+                MODULE.CAMERA_HEADING_SNAP_ERROR_PATH,
+                math.radians(3.0),
             )
         )
-        moon_teleport = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            moon_teleport.command,
-            MC_COMMANDS.TeleportSelector("moon.tranquility"),
-        )
+        payload = runtime.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+        self.assertNotIn(b"data modify", payload)
+        request = MC_COMMANDS.decode_command_request(payload)
+        self.assertIsInstance(request.command, MC_COMMANDS.MotionSettingSet)
+        self.assertEqual(request.command.path, MODULE.CAMERA_HEADING_SNAP_ERROR_PATH)
+        self.assertAlmostEqual(request.command.value, math.radians(3.0))
+
         runtime.send(
             MC_COMMANDS.encode_command_response(
                 MC_COMMANDS.GameCommandResponse(
-                    session=moon_teleport.session,
-                    sequence=moon_teleport.sequence,
-                    request_id=moon_teleport.request_id,
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
                     ok=True,
-                    code="OK_TELEPORT_ROUTE_RESTART",
-                    message="Routing to MoonWorld",
-                    restart_required=True,
-                    data={
-                        "launch_route": {
-                            "schema": "matrix-celestial-launch-route/v1",
-                            "destination_id": "moon-tranquility-outpost",
-                            "teleport_tag": "moon.tranquility",
-                            "target_scene_id": 15,
-                            "target_world_id": "g1_29dof:scene_terrain_moon_dynamic",
-                            "entry_pose": {
-                                "position": [-94.7, -65.6, -5.251562023162842],
-                                "yaw_rad": 0.0,
-                            },
-                            "entity_id": "tp-" + "d" * 32,
-                        }
-                    },
+                    code="OK_MOTION_SETTING_CHANGED",
+                    message="Motion setting applied",
+                    restart_required=False,
                 )
             )
         )
         self.assertTrue(client.poll())
-        self.assertTrue(client.restart_required)
-        self.assertEqual(client.code, "OK_TELEPORT_ROUTE_RESTART")
-
-        self.assertFalse(
-            client.select_celestial_destination(
-                "earth-overworld-home",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertEqual(client.code, "OK_TELEPORT_ROUTE_RESTART")
-
-    def test_final_celestial_mapping_precedes_provider_resource_close(self) -> None:
-        class LightingBridge:
-            def __init__(self) -> None:
-                self.closed = False
-                self.applied = 0
-
-            def apply(self, lighting, sample):
-                self.applied += 1
-                self.assert_open()
-                self.last_profile = sample.profile_id
-                return dict(lighting)
-
-            def assert_open(self) -> None:
-                if self.closed:
-                    raise RuntimeError("bridge is closed")
-
-            def close(self) -> None:
-                self.closed = True
-
-        catalog = MODULE.load_catalog(MODULE.DEFAULT_CATALOG_PATH)
-        bridge = LightingBridge()
-        client = MODULE.GameCommandClient(
-            None,
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=catalog,
-            celestial_visual_catalog=VISUALS.load_visual_catalog(),
-            celestial_lighting_bridge=bridge,
-        )
-
-        client.close()
-        mapping = client.celestial_navigation_mapping()
-        self.assertEqual(mapping["version"], 2)
-        self.assertEqual(bridge.applied, 1)
-        self.assertEqual(bridge.last_profile, "earth-wet-cloudy-v1")
-        self.assertFalse(bridge.closed)
-        client.finalize_celestial_resources()
-        self.assertTrue(bridge.closed)
-
-    def test_celestial_resource_cleanup_continues_after_clock_failure(self) -> None:
-        class Resource:
-            def __init__(self, *, failure: Exception | None = None) -> None:
-                self.closed = False
-                self.failure = failure
-
-            def close(self) -> None:
-                self.closed = True
-                if self.failure is not None:
-                    raise self.failure
-
-        class Catalog:
-            def __init__(self, ephemeris) -> None:
-                self.ephemeris = ephemeris
-
-        clock = Resource(failure=OSError("clock fsync failed"))
-        bridge = Resource()
-        ephemeris = Resource()
-        client = MODULE.GameCommandClient(
-            None,
-            game_world_id=EARTH_WORLD_ID,
-            celestial_catalog=Catalog(ephemeris),
-            celestial_clock=clock,
-            celestial_visual_catalog=mock.Mock(),
-            celestial_lighting_bridge=bridge,
-        )
-
-        with self.assertRaisesRegex(OSError, "clock fsync failed"):
-            client.finalize_celestial_resources()
-
-        self.assertTrue(clock.closed)
-        self.assertTrue(bridge.closed)
-        self.assertTrue(ephemeris.closed)
+        self.assertEqual(client.status, "success")
+        self.assertFalse(client.restart_required)
 
     def test_only_one_request_is_in_flight_and_restart_response_is_terminal(self) -> None:
         client, runtime = self.make_client()
@@ -2312,308 +750,6 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertTrue(client.poll())
         self.assertTrue(client.restart_required)
         self.assertFalse(client.submit("/tp @s 4 5 6", **arguments))
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-    def test_external_data_modify_stays_provider_side_without_panel(self) -> None:
-        client, runtime = self.make_client()
-        modified = []
-        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
-
-        self.assertTrue(
-            client.submit_external(
-                "/data modify entity @s control.input.keyboard.w set value true",
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda command: (
-                    modified.append(command) or token,
-                    {"ok": True},
-                ),
-            )
-        )
-        self.assertEqual(
-            modified,
-            [MC_COMMANDS.DataModifyInput("control.input.keyboard.w", True)],
-        )
-        self.assertTrue(client.in_flight)
-        self.assertEqual(client.status, "pending")
-        self.assertIsNone(client.code)
-        self.assertEqual(client.data, {"ok": True})
-        stale = EXTERNAL.ExternalInputToken("a" * 32, 1, 1)
-        self.assertFalse(
-            client.resolve_external_input_publish(
-                sampled_token=stale,
-                current_token=token,
-                authority_active=True,
-                published=True,
-                locomotion_admitted=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertTrue(client.in_flight)
-        self.assertTrue(
-            client.resolve_external_input_publish(
-                sampled_token=token,
-                current_token=token,
-                authority_active=True,
-                published=True,
-                locomotion_admitted=True,
-                interlock_reason=None,
-                data={"published": True},
-            )
-        )
-        self.assertFalse(client.in_flight)
-        self.assertEqual(client.code, "OK_DATA_INPUT_MODIFIED")
-        self.assertEqual(client.data, {"published": True})
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
-
-    def test_external_input_publish_failures_are_typed_and_terminal(self) -> None:
-        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
-        cases = {
-            "input_source_rejects_keyboard": (True, "E_INPUT_INTERLOCK"),
-            "physical_focus_lost": (True, "E_INPUT_INTERLOCK"),
-            "camera_unavailable": (True, "E_INPUT_INTERLOCK"),
-            "calibration_interlock": (True, "E_INPUT_INTERLOCK"),
-            "gamepad_connected_edge": (True, "E_INPUT_INTERLOCK"),
-            None: (False, "E_INPUT_PUBLISH_FAILED"),
-        }
-        for reason, (published, expected_code) in cases.items():
-            with self.subTest(reason=reason):
-                client, _runtime = self.make_client()
-                self.assertTrue(
-                    client.submit_external(
-                        "/data modify entity @s "
-                        "control.input.keyboard.w set value true",
-                        calibration_active=False,
-                        neutral_frame_ready=False,
-                        restart_requested=False,
-                        input_modifier=lambda _command: (token, None),
-                    )
-                )
-                self.assertTrue(
-                    client.resolve_external_input_publish(
-                        sampled_token=token,
-                        current_token=token,
-                        authority_active=True,
-                        published=published,
-                        locomotion_admitted=True,
-                        interlock_reason=reason,
-                    )
-                )
-                self.assertFalse(client.in_flight)
-                self.assertFalse(client.ok)
-                self.assertEqual(client.code, expected_code)
-                if reason is not None:
-                    self.assertIn(reason, client.message)
-
-    def test_external_input_publish_supersede_revoke_and_shutdown(self) -> None:
-        token = EXTERNAL.ExternalInputToken("a" * 32, 1, 2)
-        successor = EXTERNAL.ExternalInputToken("a" * 32, 1, 3)
-
-        client, _runtime = self.make_client()
-        self.assertTrue(
-            client.submit_external(
-                "/data modify entity @s control.input.keyboard.w set value true",
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda _command: (token, None),
-            )
-        )
-        self.assertTrue(
-            client.resolve_external_input_publish(
-                sampled_token=token,
-                current_token=successor,
-                authority_active=True,
-                published=True,
-                locomotion_admitted=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertEqual(client.code, "E_INPUT_SUPERSEDED")
-
-        client, _runtime = self.make_client()
-        self.assertTrue(
-            client.submit_external(
-                "/data modify entity @s control.input.keyboard.w set value true",
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda _command: (token, None),
-            )
-        )
-        self.assertTrue(
-            client.resolve_external_input_publish(
-                sampled_token=None,
-                current_token=None,
-                authority_active=False,
-                published=False,
-                locomotion_admitted=False,
-                interlock_reason=None,
-            )
-        )
-        self.assertEqual(client.code, "E_AUTHORITY_REVOKED")
-
-        client, _runtime = self.make_client()
-        self.assertTrue(
-            client.submit_external(
-                "/data modify entity @s control.input.keyboard.w set value true",
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda _command: (token, None),
-            )
-        )
-        client.close()
-        self.assertFalse(client.in_flight)
-        self.assertTrue(client.outcome_unknown)
-        self.assertEqual(client.code, "E_COMMAND_OUTCOME_UNKNOWN")
-
-    def test_external_world_command_keeps_pause_gate_but_skips_editor_gate(self) -> None:
-        client, runtime = self.make_client()
-        arguments = {
-            "neutral_frame_ready": True,
-            "restart_requested": False,
-            "input_modifier": lambda _command: None,
-        }
-        self.assertFalse(
-            client.submit_external(
-                "/tp @s ~ ~ ~",
-                calibration_active=False,
-                **arguments,
-            )
-        )
-        self.assertEqual(client.code, "E_NOT_PAUSED")
-        self.assertTrue(
-            client.submit_external(
-                "/tp @s ~ ~ ~",
-                calibration_active=True,
-                **arguments,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertIsInstance(request.command, MC_COMMANDS.TeleportCoordinates)
-        self.assertFalse(client.editing)
-
-    def test_external_runtime_pause_round_trips_strict_ack_without_unknown(self) -> None:
-        client, runtime = self.make_client()
-        unused_input_modifier = mock.Mock(side_effect=AssertionError("input only"))
-        arguments = {
-            "calibration_active": True,
-            "neutral_frame_ready": True,
-            "restart_requested": False,
-            "input_modifier": unused_input_modifier,
-        }
-
-        self.assertTrue(
-            client.submit_external("/runtime pause paused 0", **arguments)
-        )
-        self.assertEqual(
-            client.runtime_pause_mapping(),
-            {
-                "state": "pausing",
-                "epoch": 0,
-                "can_pause": False,
-                "can_resume": False,
-                "last_error": None,
-            },
-        )
-        self.assertTrue(client.in_flight)
-        self.assertFalse(client.outcome_unknown)
-        pause_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            pause_request.command,
-            MC_COMMANDS.RuntimePause("paused", 0),
-        )
-        pause_ack = {"phase": "paused", "epoch": 1, "paused": True}
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=pause_request.session,
-                    sequence=pause_request.sequence,
-                    request_id=pause_request.request_id,
-                    ok=True,
-                    code="OK_RUNTIME_PAUSED",
-                    message="paused",
-                    data={"runtime_pause": pause_ack},
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        self.assertFalse(client.outcome_unknown)
-        self.assertIs(client.ok, True)
-        self.assertEqual(client.code, "OK_RUNTIME_PAUSED")
-        self.assertEqual(client.data, {"runtime_pause": pause_ack})
-        self.assertEqual(
-            client.runtime_pause_mapping(),
-            {
-                "state": "paused",
-                "epoch": 1,
-                "can_pause": False,
-                "can_resume": True,
-                "last_error": None,
-            },
-        )
-
-        self.assertTrue(
-            client.submit_external("/runtime pause running 1", **arguments)
-        )
-        self.assertEqual(client.runtime_pause_mapping()["state"], "resuming")
-        resume_request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            resume_request.command,
-            MC_COMMANDS.RuntimePause("running", 1),
-        )
-        resume_ack = {"phase": "running", "epoch": 2, "paused": False}
-        runtime.send(
-            MC_COMMANDS.encode_command_response(
-                MC_COMMANDS.GameCommandResponse(
-                    session=resume_request.session,
-                    sequence=resume_request.sequence,
-                    request_id=resume_request.request_id,
-                    ok=True,
-                    code="OK_RUNTIME_RUNNING",
-                    message="running",
-                    data={"runtime_pause": resume_ack},
-                )
-            )
-        )
-
-        self.assertTrue(client.poll())
-        self.assertFalse(client.outcome_unknown)
-        self.assertIs(client.ok, True)
-        self.assertEqual(client.code, "OK_RUNTIME_RUNNING")
-        self.assertEqual(client.data, {"runtime_pause": resume_ack})
-        self.assertEqual(
-            client.runtime_pause_mapping(),
-            {
-                "state": "running",
-                "epoch": 2,
-                "can_pause": True,
-                "can_resume": False,
-                "last_error": None,
-            },
-        )
-        unused_input_modifier.assert_not_called()
-
-    def test_external_runtime_pause_requires_panel_gate(self) -> None:
-        client, runtime = self.make_client()
-        self.assertFalse(
-            client.submit_external(
-                "/runtime pause paused 0",
-                calibration_active=False,
-                neutral_frame_ready=True,
-                restart_requested=False,
-                input_modifier=mock.Mock(),
-            )
-        )
-        self.assertEqual(client.code, "E_NOT_PAUSED")
-        self.assertFalse(client.in_flight)
-        self.assertFalse(client.outcome_unknown)
-        self.assertEqual(client.runtime_pause_mapping()["state"], "running")
         with self.assertRaises(BlockingIOError):
             runtime.recv(4096)
 
@@ -2665,57 +801,6 @@ class GameCommandClientTest(unittest.TestCase):
             )
         )
         self.assertEqual(client.code, "E_COMMAND_EDIT_REQUIRED")
-
-    def test_whitelisted_data_modify_button_skips_text_editor_only(self) -> None:
-        client, runtime = self.make_client()
-        self.assertFalse(client.editing)
-
-        self.assertTrue(
-            client.submit(
-                "/data modify entity @s "
-                "control.motion.gears.slow.speed_mps set value 0.15",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        request = MC_COMMANDS.decode_command_request(runtime.recv(4096))
-        self.assertEqual(
-            request.command,
-            MC_COMMANDS.DataModifyNumber(
-                "control.motion.gears.slow.speed_mps", 0.15
-            ),
-        )
-        self.assertFalse(client.editing)
-
-        blocked, blocked_runtime = self.make_client()
-        self.assertFalse(
-            blocked.submit(
-                "/data modify entity @s "
-                "control.motion.gears.slow.speed_mps set value 0.15",
-                calibration_active=False,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertEqual(blocked.code, "E_NOT_PAUSED")
-        with self.assertRaises(BlockingIOError):
-            blocked_runtime.recv(4096)
-
-    def test_data_modify_input_never_crosses_the_private_runtime_channel(self) -> None:
-        client, runtime = self.make_client()
-        self.enable_editor(client)
-        self.assertFalse(
-            client.submit(
-                "/data modify entity @s control.input.keyboard.w set value true",
-                calibration_active=True,
-                neutral_frame_ready=True,
-                restart_requested=False,
-            )
-        )
-        self.assertEqual(client.code, "E_EXTERNAL_API_REQUIRED")
-        with self.assertRaises(BlockingIOError):
-            runtime.recv(4096)
 
     def test_parser_error_and_summom_warning_stay_provider_side(self) -> None:
         client, runtime = self.make_client()
@@ -3097,13 +1182,7 @@ class GameCommandClientTest(unittest.TestCase):
 class SourceArbitrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.keyboard = MODULE.KeyboardMouseSample(
-            w=True,
-            q=True,
-            v=True,
-            ctrl=True,
-            alt=True,
-            shift=True,
-            focused=True,
+            w=True, q=True, v=True, ctrl=True, shift=True, focused=True
         )
         self.gamepad = MODULE.GamepadSample(
             forward=0.75, right=-0.25, look_yaw=0.5, connected=True
@@ -3116,7 +1195,6 @@ class SourceArbitrationTest(unittest.TestCase):
         self.assertTrue(keys.w)
         self.assertTrue(keys.q)
         self.assertTrue(keys.ctrl)
-        self.assertTrue(keys.alt)
         self.assertTrue(keys.shift)
         self.assertEqual((stick.right, stick.forward), (-0.25, 0.75))
         self.assertEqual(look, 0.5)
@@ -3182,7 +1260,6 @@ class SourceArbitrationTest(unittest.TestCase):
         self.assertTrue(keys.q)
         self.assertTrue(keys.v)
         self.assertTrue(keys.ctrl)
-        self.assertTrue(keys.alt)
         self.assertTrue(keys.shift)
         self.assertEqual((stick.right, stick.forward, look), (0.0, 0.0, 0.0))
 
@@ -3193,1576 +1270,9 @@ class SourceArbitrationTest(unittest.TestCase):
         self.assertTrue(keys.q)
         self.assertTrue(keys.v)
         self.assertFalse(keys.ctrl)
-        self.assertFalse(keys.alt)
         self.assertFalse(keys.shift)
         self.assertEqual((stick.right, stick.forward), (-0.25, 0.75))
         self.assertEqual(look, 0.5)
-
-
-class ExternalControlArbitrationTest(unittest.TestCase):
-    def test_virtual_full_state_maps_to_provider_samples_and_source(self) -> None:
-        state = MODULE.ExternalInputState.neutral()
-        mapping = state.to_mapping()
-        mapping["keyboard"]["w"] = True
-        mapping["keyboard"]["alt"] = True
-        mapping["mouse"]["buttons"]["left"] = True
-        mapping["mouse"]["dx"] = 4.5
-        mapping["gamepad"]["connected"] = True
-        mapping["gamepad"]["axes"]["right"] = -0.25
-        state = MODULE.ExternalInputState.from_mapping(mapping)
-        focus = MODULE.KeyboardMouseSample(
-            focused=True,
-            focus_title="Matrix",
-            focus_pid=42,
-        )
-
-        keyboard, gamepad = MODULE.external_input_samples(
-            state,
-            focus=focus,
-            look_button="left",
-        )
-        self.assertTrue(keyboard.w)
-        self.assertTrue(keyboard.alt)
-        self.assertTrue(keyboard.camera_dragging)
-        self.assertEqual(keyboard.mouse_dx, 4.5)
-        self.assertEqual((keyboard.focus_title, keyboard.focus_pid), ("Matrix", 42))
-        self.assertTrue(gamepad.connected)
-        self.assertEqual(gamepad.right, -0.25)
-        self.assertEqual(MODULE.external_active_input_device(state), "mixed")
-        self.assertEqual(
-            MODULE.external_frame_input_source(state, configured_source="auto"),
-            "auto",
-        )
-
-    def test_virtual_gamepad_is_selected_only_when_keyboard_mouse_are_neutral(self) -> None:
-        mapping = MODULE.ExternalInputState.neutral().to_mapping()
-        mapping["gamepad"]["connected"] = True
-        mapping["gamepad"]["axes"]["forward"] = 0.75
-        state = MODULE.ExternalInputState.from_mapping(mapping)
-        self.assertEqual(
-            MODULE.external_frame_input_source(state, configured_source="keyboard"),
-            "keyboard",
-        )
-        self.assertEqual(
-            MODULE.external_frame_input_source(state, configured_source="auto"),
-            "gamepad",
-        )
-
-    def test_trna_auto_final_pov_preserves_external_gamepad_movement(self) -> None:
-        configured_source = MODULE.effective_input_source(
-            "auto", "ue-final-pov"
-        )
-        mapping = MODULE.ExternalInputState.neutral().to_mapping()
-        mapping["gamepad"]["connected"] = True
-        mapping["gamepad"]["axes"]["forward"] = 0.5
-        state = MODULE.ExternalInputState.from_mapping(mapping)
-        keyboard, gamepad = MODULE.external_input_samples(
-            state,
-            focus=MODULE.KeyboardMouseSample(
-                focused=True,
-                focus_title="Matrix",
-                focus_pid=42,
-            ),
-            look_button="left",
-        )
-        frame_source = MODULE.external_frame_input_source(
-            state,
-            configured_source=configured_source,
-        )
-
-        snapshot = MODULE.build_snapshot(
-            sequence=1,
-            timestamp_monotonic_s=10.0,
-            keyboard=keyboard,
-            gamepad=gamepad,
-            input_source=frame_source,
-            camera_yaw_rad=0.25,
-            camera_available=True,
-        )
-
-        self.assertEqual(configured_source, "auto")
-        self.assertEqual(frame_source, "gamepad")
-        self.assertTrue(snapshot.focused)
-        self.assertEqual(snapshot.move_stick.forward, 0.5)
-
-    def test_any_local_safety_intent_identifies_an_external_override(self) -> None:
-        pad = MODULE.GamepadSample()
-        cases = (
-            (MODULE.KeyboardMouseSample(focused=False), pad, "focus_lost"),
-            (
-                MODULE.KeyboardMouseSample(focused=True, escape=True),
-                pad,
-                "physical_escape",
-            ),
-            (
-                MODULE.KeyboardMouseSample(focused=True, w=True),
-                pad,
-                "physical_keyboard",
-            ),
-            (
-                MODULE.KeyboardMouseSample(focused=True, arrow_right=True),
-                pad,
-                "physical_keyboard",
-            ),
-            (
-                MODULE.KeyboardMouseSample(focused=True, mouse_dx=1.0),
-                pad,
-                "physical_mouse",
-            ),
-            (
-                MODULE.KeyboardMouseSample(focused=True),
-                MODULE.GamepadSample(connected=True, forward=0.2),
-                "physical_gamepad",
-            ),
-            (
-                MODULE.KeyboardMouseSample(focused=True),
-                MODULE.GamepadSample(connected=True, buttons_pressed=True),
-                "physical_gamepad",
-            ),
-        )
-        for keyboard, gamepad, expected in cases:
-            with self.subTest(expected=expected):
-                self.assertEqual(
-                    MODULE.physical_external_override_reason(keyboard, gamepad),
-                    expected,
-                )
-        self.assertIsNone(
-            MODULE.physical_external_override_reason(
-                MODULE.KeyboardMouseSample(focused=True),
-                pad,
-            )
-        )
-        self.assertIsNone(
-            MODULE.physical_external_override_reason(
-                MODULE.KeyboardMouseSample(focused=True),
-                MODULE.GamepadSample(
-                    connected=True,
-                    forward=1.0 / 32767.0,
-                    look_yaw=0.10,
-                ),
-            )
-        )
-
-
-class ExternalProviderGateTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        root = Path(self.temporary.name)
-        self.clock_value = 10.0
-
-        def clock() -> float:
-            return self.clock_value
-
-        self.broker = EXTERNAL.ExternalControlBroker(
-            root / "control.sock",
-            root / "control.cap",
-            clock=clock,
-        )
-        self.broker.open()
-        self.client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        self.client.settimeout(1.0)
-        self.client.connect(os.fspath(self.broker.path))
-        self.broker.poll()
-        self.request_sequence = 0
-        self.provider_sequence = 100
-        acquired = self.request("lease.acquire", {})
-        self.lease_id = acquired["data"]["lease_id"]
-        self.gate = MODULE.ExternalLocomotionProviderGate(self.broker)
-
-    def tearDown(self) -> None:
-        self.client.close()
-        self.broker.close()
-        self.temporary.cleanup()
-
-    def request(
-        self,
-        operation: str,
-        payload: dict[str, object],
-        *,
-        expect_ok: bool = True,
-    ) -> dict[str, object]:
-        self.request_sequence += 1
-        packet = {
-            "protocol": EXTERNAL.PROTOCOL,
-            "kind": "request",
-            "sequence": self.request_sequence,
-            "capability": self.broker.capability,
-            "operation": operation,
-            "payload": payload,
-        }
-        self.client.send(json.dumps(packet, separators=(",", ":")).encode())
-        self.broker.poll()
-        response = json.loads(self.client.recv(EXTERNAL.MAX_PACKET_BYTES))
-        if expect_ok:
-            self.assertTrue(response["ok"], response)
-        return response
-
-    def replace_neutral(
-        self,
-        *,
-        connected: bool = False,
-    ) -> EXTERNAL.ExternalInputToken:
-        mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
-        mapping["gamepad"]["connected"] = connected
-        response = self.request(
-            "input.replace",
-            {"lease_id": self.lease_id, "state": mapping},
-        )
-        return EXTERNAL.ExternalInputToken.from_mapping(
-            response["data"]["input_token"]
-        )
-
-    def observe(
-        self,
-        *,
-        published: bool = True,
-        interlock_reason: str | None = None,
-    ) -> bool:
-        state, token = self.broker.sample_with_token()
-        effective, frame = self.gate.prepare(state, token)
-        self.assertIsNotNone(frame)
-        assert frame is not None
-        self.provider_sequence += 1
-        updated = self.gate.observe_published(
-            frame,
-            sequence=self.provider_sequence,
-            published=published,
-            interlock_reason=interlock_reason,
-        )
-        self.last_effective_state = effective
-        return updated
-
-    def qualify(self) -> EXTERNAL.ExternalInputToken:
-        self.assertTrue(self.observe())
-        self.assertTrue(self.observe())
-        token = self.broker.input_token
-        self.assertIsNotNone(token)
-        self.assertTrue(self.broker.provider_gate.ready)
-        assert token is not None
-        return token
-
-    def snapshot_for_external_state(
-        self,
-        state: EXTERNAL.ExternalInputState,
-        *,
-        sequence: int,
-    ) -> CORE.InputSnapshot:
-        keyboard, gamepad = MODULE.external_input_samples(
-            state,
-            focus=MODULE.KeyboardMouseSample(
-                focused=True,
-                focus_title="Matrix",
-                focus_pid=42,
-            ),
-            look_button="left",
-        )
-        return MODULE.build_snapshot(
-            sequence=sequence,
-            timestamp_monotonic_s=self.clock_value,
-            keyboard=keyboard,
-            gamepad=gamepad,
-            input_source=MODULE.external_frame_input_source(
-                state,
-                configured_source="auto",
-            ),
-            camera_yaw_rad=0.0,
-            camera_available=True,
-        )
-
-    def exercise_source_interlocked_publish(
-        self,
-        mapping: dict[str, object],
-        *,
-        configured_source: str,
-        command: str,
-    ) -> dict[str, object]:
-        state = EXTERNAL.ExternalInputState.from_mapping(mapping)
-        current_token = self.broker.input_token
-        self.assertIsNotNone(current_token)
-        effective, frame = self.gate.prepare(state, current_token)
-        self.assertIsNotNone(frame)
-        assert frame is not None
-        gated, early_reason = MODULE.apply_external_source_gate(
-            effective,
-            frame,
-            configured_source=configured_source,
-        )
-        self.assertIsNotNone(early_reason)
-        self.assertEqual(gated, EXTERNAL.ExternalInputState.neutral())
-
-        keyboard, gamepad = MODULE.external_input_samples(
-            gated,
-            focus=MODULE.KeyboardMouseSample(
-                focused=True,
-                focus_title="Matrix",
-                focus_pid=42,
-            ),
-            look_button="left",
-        )
-        initial_yaw = 0.625
-        tracker = MODULE.CameraYawTracker(
-            initial_yaw,
-            mouse_radians_per_pixel=0.1,
-            gamepad_radians_per_second=2.0,
-        )
-        heading = tracker.update(
-            dt=0.5,
-            mouse_dx=keyboard.mouse_dx,
-            gamepad_look_yaw=gamepad.look_yaw,
-        )
-        self.assertEqual(heading, initial_yaw)
-        snapshot = MODULE.build_snapshot(
-            sequence=self.provider_sequence + 1,
-            timestamp_monotonic_s=self.clock_value,
-            keyboard=keyboard,
-            gamepad=gamepad,
-            input_source=MODULE.external_frame_input_source(
-                gated,
-                configured_source=configured_source,
-            ),
-            camera_yaw_rad=heading,
-            camera_available=True,
-        )
-        final_reason = MODULE.external_provider_publish_interlock_reason(
-            frame,
-            configured_source=configured_source,
-            physical_focused=True,
-            camera_dragging=False,
-            camera_available=True,
-            input_available=True,
-            gamepad_connected_edge=False,
-            calibration_interlock_active=False,
-        )
-        self.assertEqual(final_reason, early_reason)
-        publish_snapshot = MODULE.apply_external_publish_interlock(
-            snapshot,
-            frame,
-            final_reason,
-        )
-
-        socket_path = Path(self.temporary.name) / "interlocked-publish.sock"
-        with CORE.UnixSeqpacketInputServer(socket_path) as server:
-            publisher = MODULE.UnixSeqpacketPublisher(socket_path)
-            try:
-                self.assertTrue(
-                    publisher.send(publish_snapshot, now=self.clock_value)
-                )
-                with server.accept(timeout_s=1.0) as connection:
-                    received = connection.receive(timeout_s=1.0)
-            finally:
-                publisher.close()
-        self.assertFalse(received.focused)
-        self.assertFalse(any(received.keys.to_mapping().values()))
-        self.assertEqual(
-            (received.move_stick.right, received.move_stick.forward),
-            (0.0, 0.0),
-        )
-        self.assertEqual(received.camera_yaw_rad, initial_yaw)
-
-        command_client = MODULE.GameCommandClient(None)
-        self.addCleanup(command_client.close)
-        self.assertTrue(
-            command_client.submit_external(
-                command,
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda _command: (frame.token, None),
-            )
-        )
-        self.assertTrue(
-            command_client.resolve_external_input_publish(
-                sampled_token=frame.token,
-                current_token=frame.token,
-                authority_active=True,
-                published=True,
-                locomotion_admitted=frame.locomotion_admitted,
-                interlock_reason=final_reason,
-            )
-        )
-        self.assertFalse(command_client.ok)
-        self.assertEqual(command_client.code, "E_INPUT_INTERLOCK")
-        return {
-            "state": state,
-            "effective": effective,
-            "frame": frame,
-            "keyboard": keyboard,
-            "gamepad": gamepad,
-            "heading": heading,
-            "received": received,
-            "reason": final_reason,
-        }
-
-    def test_connected_edge_then_two_successful_neutral_frames_are_required(self) -> None:
-        token = self.replace_neutral(connected=True)
-        self.assertTrue(
-            self.observe(interlock_reason="gamepad_connected_edge")
-        )
-        self.assertEqual(self.broker.provider_gate.input_token, token)
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 0)
-        self.assertFalse(self.broker.provider_gate.ready)
-        self.assertTrue(self.observe())
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
-        self.assertFalse(self.broker.provider_gate.ready)
-        self.assertTrue(self.observe())
-        self.assertTrue(self.broker.provider_gate.ready)
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 2)
-        self.assertIsNone(self.broker.provider_gate.last_interlock_reason)
-
-    def test_final_snapshot_interlocks_are_typed_and_sticky(self) -> None:
-        for reason in (
-            "camera_unavailable",
-            "calibration_interlock",
-        ):
-            with self.subTest(reason=reason):
-                self.replace_neutral()
-                self.assertTrue(self.observe(interlock_reason=reason))
-                self.assertEqual(self.broker.provider_gate.phase, "interlocked")
-                self.assertEqual(
-                    self.broker.provider_gate.last_interlock_reason,
-                    reason,
-                )
-                self.assertTrue(self.observe())
-                self.assertEqual(self.broker.provider_gate.phase, "interlocked")
-
-    def test_physical_focus_loss_latches_authority_but_calibration_does_not(self) -> None:
-        self.replace_neutral()
-        self.assertTrue(self.observe(interlock_reason="calibration_interlock"))
-        self.assertIsNone(
-            self.broker.telemetry()["fatal_authority_reason"]
-        )
-        renewed = self.request(
-            "lease.renew",
-            {"lease_id": self.lease_id},
-        )
-        self.assertTrue(renewed["ok"])
-        queued = self.request(
-            "command.submit",
-            {"lease_id": self.lease_id, "command": "/tp @s ~ ~ ~"},
-        )
-        self.assertTrue(queued["ok"])
-        noninput = self.broker.drain_commands(limit=1)[0]
-        self.broker.complete_command(
-            noninput,
-            {
-                "ok": True,
-                "outcome_unknown": False,
-                "code": "OK_TELEPORT_RESTART",
-                "message": "saved",
-            },
-        )
-        completed = self.request(
-            "command.result",
-            {"command_id": queued["data"]["command_id"]},
-        )["data"]
-        self.assertTrue(completed["terminal"])
-        self.assertEqual(completed["state"], "completed")
-
-        # A fresh authority demonstrates the fatal focus path independently
-        # from the intentionally sticky calibration gate above.
-        self.request("lease.release", {"lease_id": self.lease_id})
-        acquired = self.request("lease.acquire", {})
-        self.lease_id = acquired["data"]["lease_id"]
-        self.replace_neutral()
-        self.assertTrue(self.observe(interlock_reason="physical_focus_lost"))
-        self.assertEqual(
-            self.broker.telemetry()["fatal_authority_reason"],
-            "physical_focus_lost",
-        )
-        self.assertEqual(
-            self.broker.sample(),
-            EXTERNAL.ExternalInputState.neutral(),
-        )
-
-    def test_failed_send_resets_count_without_counting_as_a_frame(self) -> None:
-        self.replace_neutral()
-        self.assertTrue(self.observe())
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
-        self.assertTrue(self.observe(published=False))
-        self.assertEqual(self.broker.provider_gate.phase, "awaiting_neutral")
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 0)
-        self.assertEqual(
-            self.broker.provider_gate.last_interlock_reason,
-            "publisher_send_failed",
-        )
-        self.assertTrue(self.observe())
-        self.assertFalse(self.broker.provider_gate.ready)
-        self.assertTrue(self.observe())
-        self.assertTrue(self.broker.provider_gate.ready)
-        self.assertIsNone(self.broker.provider_gate.last_interlock_reason)
-
-    def test_duplicate_or_regressed_sequence_cannot_count_as_two_frames(self) -> None:
-        self.replace_neutral()
-        state, token = self.broker.sample_with_token()
-        _effective, frame = self.gate.prepare(state, token)
-        self.assertIsNotNone(frame)
-        assert frame is not None
-        self.provider_sequence += 1
-        sequence = self.provider_sequence
-        self.assertTrue(
-            self.gate.observe_published(
-                frame,
-                sequence=sequence,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
-        self.assertFalse(
-            self.gate.observe_published(
-                frame,
-                sequence=sequence,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertFalse(
-            self.gate.observe_published(
-                frame,
-                sequence=sequence - 1,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 1)
-        self.provider_sequence += 1
-        self.assertTrue(
-            self.gate.observe_published(
-                frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertTrue(self.broker.provider_gate.ready)
-
-    def test_stale_sample_cannot_ack_revision_bumped_by_data_modify(self) -> None:
-        self.replace_neutral()
-        _state, sampled_token = self.broker.sample_with_token()
-        self.assertIsNotNone(sampled_token)
-        _effective, stale_frame = self.gate.prepare(_state, sampled_token)
-        self.assertIsNotNone(stale_frame)
-        current = self.broker.apply_data_modify(
-            "control.input.keyboard.ctrl",
-            True,
-        )
-        assert stale_frame is not None
-        self.provider_sequence += 1
-        self.assertFalse(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertEqual(self.broker.provider_gate.input_token, current)
-        self.assertEqual(self.broker.provider_gate.neutral_sent_count, 0)
-        self.assertFalse(self.broker.provider_gate.ready)
-
-    def test_stale_failed_send_invalidates_ready_successor_revision(self) -> None:
-        self.qualify()
-        state, sampled_token = self.broker.sample_with_token()
-        _effective, stale_frame = self.gate.prepare(state, sampled_token)
-        self.assertIsNotNone(stale_frame)
-        successor = self.broker.apply_data_modify(
-            "control.input.keyboard.w",
-            True,
-        )
-        self.assertTrue(self.broker.provider_gate.ready)
-        assert stale_frame is not None
-        self.provider_sequence += 1
-        self.assertTrue(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                published=False,
-                interlock_reason=None,
-            )
-        )
-        gate = self.broker.provider_gate
-        self.assertEqual(gate.input_token, successor)
-        self.assertEqual(gate.phase, "awaiting_neutral")
-        self.assertFalse(gate.ready)
-        self.assertEqual(gate.neutral_sent_count, 0)
-        self.assertIsNone(gate.qualified_from_revision)
-        self.assertEqual(gate.last_interlock_reason, "publisher_send_failed")
-        current_state, current_token = self.broker.sample_with_token()
-        effective, _frame = self.gate.prepare(current_state, current_token)
-        self.assertFalse(current_state.locomotion_neutral)
-        self.assertTrue(effective.locomotion_neutral)
-
-    def test_stale_failure_then_exact_clamped_frame_cannot_complete_input(self) -> None:
-        self.qualify()
-        stale_state, stale_token = self.broker.sample_with_token()
-        _effective, stale_frame = self.gate.prepare(stale_state, stale_token)
-        self.assertIsNotNone(stale_frame)
-        successor = self.broker.apply_data_modify(
-            "control.input.keyboard.w",
-            True,
-        )
-        command_client = MODULE.GameCommandClient(None)
-        self.addCleanup(command_client.close)
-        self.assertTrue(
-            command_client.submit_external(
-                "/data modify entity @s "
-                "control.input.keyboard.w set value true",
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda _command: (successor, None),
-            )
-        )
-        assert stale_frame is not None
-        self.provider_sequence += 1
-        self.assertTrue(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                published=False,
-                interlock_reason=None,
-            )
-        )
-        current_state, current_token = self.broker.sample_with_token()
-        _clamped, exact_frame = self.gate.prepare(current_state, current_token)
-        self.assertIsNotNone(exact_frame)
-        assert exact_frame is not None
-        self.assertFalse(exact_frame.locomotion_admitted)
-        self.assertTrue(
-            command_client.resolve_external_input_publish(
-                sampled_token=exact_frame.token,
-                current_token=current_token,
-                authority_active=True,
-                published=True,
-                locomotion_admitted=exact_frame.locomotion_admitted,
-                interlock_reason=None,
-            )
-        )
-        self.assertEqual(command_client.code, "E_INPUT_INTERLOCK")
-        self.assertFalse(command_client.ok)
-
-    def test_data_modify_receipt_stays_nonterminal_until_exact_publish(self) -> None:
-        self.qualify()
-        queued = self.request(
-            "command.submit",
-            {
-                "lease_id": self.lease_id,
-                "command": (
-                    "/data modify entity @s "
-                    "control.input.keyboard.w set value true"
-                ),
-            },
-        )
-        external_command = self.broker.drain_commands(limit=1)[0]
-        stale_state, stale_token = self.broker.sample_with_token()
-        _effective, stale_frame = self.gate.prepare(stale_state, stale_token)
-        self.assertIsNotNone(stale_frame)
-        command_client = MODULE.GameCommandClient(None)
-        self.addCleanup(command_client.close)
-
-        def modify(command: MC_COMMANDS.DataModifyInput):
-            token = self.broker.apply_data_modify(command.path, command.value)
-            return token, None
-
-        self.assertTrue(
-            command_client.submit_external(
-                external_command.command,
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=modify,
-            )
-        )
-        pending_token = self.broker.input_token
-        self.assertIsNotNone(pending_token)
-        before = self.request(
-            "command.result",
-            {"command_id": queued["data"]["command_id"]},
-        )["data"]
-        self.assertEqual(before["state"], "admitted")
-        self.assertFalse(before["terminal"])
-
-        assert stale_frame is not None
-        self.assertFalse(
-            command_client.resolve_external_input_publish(
-                sampled_token=stale_frame.token,
-                current_token=pending_token,
-                authority_active=True,
-                published=True,
-                locomotion_admitted=stale_frame.locomotion_admitted,
-                interlock_reason=None,
-            )
-        )
-        still_pending = self.request(
-            "command.result",
-            {"command_id": queued["data"]["command_id"]},
-        )["data"]
-        self.assertFalse(still_pending["terminal"])
-
-        exact_state, exact_token = self.broker.sample_with_token()
-        _effective, exact_frame = self.gate.prepare(exact_state, exact_token)
-        self.assertIsNotNone(exact_frame)
-        assert exact_frame is not None
-        self.assertTrue(exact_frame.locomotion_admitted)
-        self.assertTrue(
-            command_client.resolve_external_input_publish(
-                sampled_token=exact_frame.token,
-                current_token=exact_token,
-                authority_active=True,
-                published=True,
-                locomotion_admitted=exact_frame.locomotion_admitted,
-                interlock_reason=None,
-            )
-        )
-        self.broker.complete_command(
-            external_command,
-            command_client.mapping(),
-        )
-        terminal = self.request(
-            "command.result",
-            {"command_id": queued["data"]["command_id"]},
-        )["data"]
-        self.assertTrue(terminal["terminal"])
-        self.assertEqual(terminal["state"], "completed")
-        self.assertEqual(
-            terminal["result"]["code"],
-            "OK_DATA_INPUT_MODIFIED",
-        )
-
-    def test_stale_success_does_not_clear_ready_successor_revision(self) -> None:
-        self.qualify()
-        state, sampled_token = self.broker.sample_with_token()
-        _effective, stale_frame = self.gate.prepare(state, sampled_token)
-        self.assertIsNotNone(stale_frame)
-        successor = self.broker.apply_data_modify(
-            "control.input.keyboard.w",
-            True,
-        )
-        before = self.broker.provider_gate
-        assert stale_frame is not None
-        self.provider_sequence += 1
-        self.assertFalse(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertEqual(self.broker.provider_gate, before)
-        self.assertEqual(self.broker.provider_gate.input_token, successor)
-        self.assertTrue(self.broker.provider_gate.ready)
-
-    def test_expired_publish_boundary_replaces_stale_motion_and_revokes_pending(self) -> None:
-        self.qualify()
-        self.broker.apply_data_modify(
-            "control.input.keyboard.w",
-            True,
-            now=self.clock_value,
-        )
-        stale_state, stale_token = self.broker.sample_with_token(
-            now=self.clock_value
-        )
-        effective, stale_frame = self.gate.prepare(stale_state, stale_token)
-        self.assertIsNotNone(stale_frame)
-        assert stale_frame is not None
-        self.assertTrue(effective.keyboard["w"])
-
-        command_client = MODULE.GameCommandClient(None)
-        self.addCleanup(command_client.close)
-        self.assertTrue(
-            command_client.submit_external(
-                "/data modify entity @s "
-                "control.input.keyboard.d set value true",
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda command: (
-                    self.broker.apply_data_modify(
-                        command.path,
-                        command.value,
-                        now=self.clock_value,
-                    ),
-                    None,
-                ),
-            )
-        )
-        stale_snapshot = self.snapshot_for_external_state(
-            effective,
-            sequence=self.provider_sequence + 1,
-        )
-        self.assertTrue(stale_snapshot.keys.w)
-
-        self.clock_value += 0.151
-        boundary = MODULE.external_publish_boundary(
-            self.broker,
-            stale_frame,
-            stale_snapshot,
-            now=self.clock_value,
-        )
-        self.assertIsNone(boundary.current_token)
-        self.assertFalse(boundary.exact_revision)
-        self.assertFalse(boundary.snapshot.focused)
-        self.assertFalse(any(boundary.snapshot.keys.to_mapping().values()))
-        self.assertEqual(
-            (
-                boundary.snapshot.move_stick.right,
-                boundary.snapshot.move_stick.forward,
-            ),
-            (0.0, 0.0),
-        )
-
-        # Model a successful send of the replacement safety-neutral packet.
-        # It is not exact proof for the pending revision.
-        self.provider_sequence += 1
-        self.assertFalse(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertTrue(
-            command_client.resolve_external_input_publish(
-                sampled_token=stale_frame.token,
-                current_token=boundary.current_token,
-                authority_active=False,
-                published=False,
-                locomotion_admitted=stale_frame.locomotion_admitted,
-                interlock_reason=None,
-            )
-        )
-        self.assertFalse(command_client.ok)
-        self.assertEqual(command_client.code, "E_AUTHORITY_REVOKED")
-
-    def test_same_frame_revision_bump_sends_neutral_then_exact_publish_is_ok(self) -> None:
-        self.qualify()
-        self.broker.apply_data_modify(
-            "control.input.keyboard.w",
-            True,
-            now=self.clock_value,
-        )
-        stale_state, stale_token = self.broker.sample_with_token(
-            now=self.clock_value
-        )
-        stale_effective, stale_frame = self.gate.prepare(
-            stale_state,
-            stale_token,
-        )
-        self.assertIsNotNone(stale_frame)
-        assert stale_frame is not None
-
-        command_client = MODULE.GameCommandClient(None)
-        self.addCleanup(command_client.close)
-        self.assertTrue(
-            command_client.submit_external(
-                "/data modify entity @s "
-                "control.input.keyboard.d set value true",
-                calibration_active=False,
-                neutral_frame_ready=False,
-                restart_requested=False,
-                input_modifier=lambda command: (
-                    self.broker.apply_data_modify(
-                        command.path,
-                        command.value,
-                        now=self.clock_value,
-                    ),
-                    None,
-                ),
-            )
-        )
-        pending_token = self.broker.input_token
-        self.assertIsNotNone(pending_token)
-        self.assertNotEqual(stale_frame.token, pending_token)
-
-        stale_boundary = MODULE.external_publish_boundary(
-            self.broker,
-            stale_frame,
-            self.snapshot_for_external_state(
-                stale_effective,
-                sequence=self.provider_sequence + 1,
-            ),
-            now=self.clock_value,
-        )
-        self.assertFalse(stale_boundary.exact_revision)
-        self.assertFalse(stale_boundary.snapshot.focused)
-        self.provider_sequence += 1
-        self.assertFalse(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                # The safety-neutral socket write succeeded, so the stale R1
-                # callback must not erase R2's inherited ready proof.
-                published=True,
-                interlock_reason=None,
-            )
-        )
-        self.assertTrue(self.broker.provider_gate.ready)
-        self.assertFalse(
-            command_client.resolve_external_input_publish(
-                sampled_token=stale_frame.token,
-                current_token=stale_boundary.current_token,
-                authority_active=True,
-                published=False,
-                locomotion_admitted=stale_frame.locomotion_admitted,
-                interlock_reason=None,
-            )
-        )
-
-        exact_state, exact_token = self.broker.sample_with_token(
-            now=self.clock_value
-        )
-        exact_effective, exact_frame = self.gate.prepare(exact_state, exact_token)
-        self.assertIsNotNone(exact_frame)
-        assert exact_frame is not None
-        self.clock_value += 0.05
-        exact_boundary = MODULE.external_publish_boundary(
-            self.broker,
-            exact_frame,
-            self.snapshot_for_external_state(
-                exact_effective,
-                sequence=self.provider_sequence + 1,
-            ),
-            now=self.clock_value,
-        )
-        self.assertTrue(exact_boundary.exact_revision)
-        self.assertTrue(exact_boundary.snapshot.focused)
-        self.provider_sequence += 1
-        self.assertTrue(
-            self.gate.observe_published(
-                exact_frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason=None,
-            )
-        )
-
-        # Freeze the send-boundary decision.  Even if scheduling advances the
-        # clock past deadman immediately after send, receipt outcome cannot
-        # flip to revoked by a second post-send authority read.
-        self.clock_value += 0.20
-        self.assertTrue(
-            command_client.resolve_external_input_publish(
-                sampled_token=exact_frame.token,
-                current_token=exact_boundary.current_token,
-                authority_active=exact_boundary.current_token is not None,
-                published=True,
-                locomotion_admitted=exact_frame.locomotion_admitted,
-                interlock_reason=None,
-            )
-        )
-        self.assertTrue(command_client.ok)
-        self.assertEqual(command_client.code, "OK_DATA_INPUT_MODIFIED")
-        self.assertIsNone(
-            self.broker.publish_boundary_token(now=self.clock_value)
-        )
-        self.assertTrue(command_client.ok)
-
-    def test_stale_sticky_interlock_invalidates_ready_successor_revision(self) -> None:
-        self.qualify()
-        state, sampled_token = self.broker.sample_with_token()
-        _effective, stale_frame = self.gate.prepare(state, sampled_token)
-        self.assertIsNotNone(stale_frame)
-        successor = self.broker.apply_data_modify(
-            "control.input.keyboard.w",
-            True,
-        )
-        assert stale_frame is not None
-        self.provider_sequence += 1
-        self.assertTrue(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason="camera_unavailable",
-            )
-        )
-        gate = self.broker.provider_gate
-        self.assertEqual(gate.input_token, successor)
-        self.assertEqual(gate.phase, "interlocked")
-        self.assertFalse(gate.ready)
-        self.assertEqual(gate.last_interlock_reason, "camera_unavailable")
-
-    def test_stale_connect_edge_rearms_ready_successor_revision(self) -> None:
-        self.qualify()
-        state, sampled_token = self.broker.sample_with_token()
-        _effective, stale_frame = self.gate.prepare(state, sampled_token)
-        self.assertIsNotNone(stale_frame)
-        successor = self.broker.apply_data_modify(
-            "control.input.keyboard.w",
-            True,
-        )
-        assert stale_frame is not None
-        self.provider_sequence += 1
-        self.assertTrue(
-            self.gate.observe_published(
-                stale_frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason="gamepad_connected_edge",
-            )
-        )
-        gate = self.broker.provider_gate
-        self.assertEqual(gate.input_token, successor)
-        self.assertEqual(gate.phase, "awaiting_neutral")
-        self.assertFalse(gate.ready)
-        self.assertEqual(gate.last_interlock_reason, "gamepad_connected_edge")
-
-    def test_stale_failure_is_isolated_by_authority_and_revision(self) -> None:
-        current = self.replace_neutral()
-        before = self.broker.provider_gate
-        cases = {
-            "different_lease": EXTERNAL.ExternalInputToken(
-                lease_id=(
-                    "0" * 32
-                    if current.lease_id != "0" * 32
-                    else "1" * 32
-                ),
-                authority_epoch=current.authority_epoch,
-                input_revision=current.input_revision - 1,
-            ),
-            "different_epoch": EXTERNAL.ExternalInputToken(
-                lease_id=current.lease_id,
-                authority_epoch=current.authority_epoch + 1,
-                input_revision=current.input_revision - 1,
-            ),
-            "non_successor_revision": EXTERNAL.ExternalInputToken(
-                lease_id=current.lease_id,
-                authority_epoch=current.authority_epoch,
-                input_revision=current.input_revision + 1,
-            ),
-        }
-        for label, token in cases.items():
-            with self.subTest(label=label):
-                frame = MODULE.ExternalProviderGateFrame(
-                    token=token,
-                    requested_neutral=True,
-                    requested_device=None,
-                    locomotion_admitted=True,
-                )
-                self.provider_sequence += 1
-                self.assertFalse(
-                    self.gate.observe_published(
-                        frame,
-                        sequence=self.provider_sequence,
-                        published=False,
-                        interlock_reason="camera_unavailable",
-                    )
-                )
-                self.assertEqual(self.broker.provider_gate, before)
-
-    def test_ready_motion_is_clamped_after_midhold_camera_interlock(self) -> None:
-        proof = self.qualify()
-        moving = EXTERNAL.ExternalInputState.neutral().to_mapping()
-        moving["keyboard"]["w"] = True
-        response = self.request(
-            "input.replace",
-            {
-                "lease_id": self.lease_id,
-                "state": moving,
-                "qualified_token": proof.to_mapping(),
-            },
-        )
-        active = EXTERNAL.ExternalInputToken.from_mapping(
-            response["data"]["input_token"]
-        )
-        self.assertEqual(self.broker.provider_gate.input_token, active)
-        self.assertTrue(self.observe(interlock_reason="camera_unavailable"))
-        self.assertEqual(self.broker.provider_gate.phase, "interlocked")
-        state, token = self.broker.sample_with_token()
-        effective, frame = self.gate.prepare(state, token)
-        self.assertIsNotNone(frame)
-        self.assertFalse(state.locomotion_neutral)
-        self.assertTrue(effective.locomotion_neutral)
-
-    def test_configured_source_rejects_the_other_virtual_device(self) -> None:
-        self.replace_neutral(connected=True)
-        state, token = self.broker.sample_with_token()
-        _effective, gamepad_frame = self.gate.prepare(state, token)
-        self.assertIsNotNone(gamepad_frame)
-        assert gamepad_frame is not None
-        self.assertEqual(gamepad_frame.requested_device, "gamepad")
-        self.assertEqual(
-            MODULE.external_provider_source_interlock_reason(
-                gamepad_frame,
-                configured_source="keyboard",
-            ),
-            "input_source_rejects_gamepad",
-        )
-        self.assertIsNone(
-            MODULE.external_provider_source_interlock_reason(
-                gamepad_frame,
-                configured_source="auto",
-            )
-        )
-        self.assertTrue(
-            self.observe(interlock_reason="input_source_rejects_gamepad")
-        )
-        self.assertEqual(self.broker.provider_gate.phase, "interlocked")
-
-        self.replace_neutral()
-        proof = self.qualify()
-        moving = EXTERNAL.ExternalInputState.neutral().to_mapping()
-        moving["keyboard"]["w"] = True
-        self.request(
-            "input.replace",
-            {
-                "lease_id": self.lease_id,
-                "state": moving,
-                "qualified_token": proof.to_mapping(),
-            },
-        )
-        state, token = self.broker.sample_with_token()
-        _effective, keyboard_frame = self.gate.prepare(state, token)
-        self.assertIsNotNone(keyboard_frame)
-        assert keyboard_frame is not None
-        self.assertEqual(keyboard_frame.requested_device, "keyboard")
-        self.assertEqual(
-            MODULE.external_provider_source_interlock_reason(
-                keyboard_frame,
-                configured_source="gamepad",
-            ),
-            "input_source_rejects_keyboard",
-        )
-        self.assertIsNone(
-            MODULE.external_provider_source_interlock_reason(
-                keyboard_frame,
-                configured_source="auto",
-            )
-        )
-        self.assertTrue(
-            self.observe(interlock_reason="input_source_rejects_keyboard")
-        )
-        self.assertEqual(self.broker.provider_gate.phase, "interlocked")
-
-    def test_source_gate_covers_nonlocomotion_keyboard_and_mouse_input(self) -> None:
-        cases = {
-            "q": ("keyboard", "q", True),
-            "mouse_button": ("mouse", "left", True),
-            "mouse_delta": ("mouse", "dx", 12.0),
-        }
-        for label, (family, name, value) in cases.items():
-            with self.subTest(label=label):
-                mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
-                if family == "keyboard":
-                    mapping["keyboard"][name] = value
-                elif name == "dx":
-                    mapping["mouse"]["dx"] = value
-                else:
-                    mapping["mouse"]["buttons"][name] = value
-                response = self.request(
-                    "input.replace",
-                    {"lease_id": self.lease_id, "state": mapping},
-                )
-                token = EXTERNAL.ExternalInputToken.from_mapping(
-                    response["data"]["input_token"]
-                )
-                state, sampled_token = self.broker.sample_with_token()
-                self.assertEqual(sampled_token, token)
-                _effective, frame = self.gate.prepare(state, sampled_token)
-                self.assertIsNotNone(frame)
-                assert frame is not None
-                self.assertEqual(frame.requested_device, "keyboard")
-                self.assertEqual(
-                    MODULE.external_provider_source_interlock_reason(
-                        frame,
-                        configured_source="gamepad",
-                    ),
-                    "input_source_rejects_keyboard",
-                )
-
-    def test_device_claim_is_shared_for_warmup_keyboard_and_mixed_input(self) -> None:
-        current_token = self.broker.input_token
-        self.assertIsNotNone(current_token)
-
-        connected_neutral = EXTERNAL.ExternalInputState.neutral().to_mapping()
-        connected_neutral["gamepad"]["connected"] = True
-        neutral_state = EXTERNAL.ExternalInputState.from_mapping(connected_neutral)
-        self.assertEqual(
-            MODULE.external_active_input_device(neutral_state),
-            "gamepad",
-        )
-        self.assertEqual(
-            MODULE.external_frame_input_source(
-                neutral_state,
-                configured_source="auto",
-            ),
-            "gamepad",
-        )
-        _effective, neutral_frame = self.gate.prepare(
-            neutral_state,
-            current_token,
-        )
-        self.assertIsNotNone(neutral_frame)
-        assert neutral_frame is not None
-        self.assertEqual(neutral_frame.requested_device, "gamepad")
-
-        keyboard_mapping = connected_neutral
-        keyboard_mapping["keyboard"]["q"] = True
-        keyboard_state = EXTERNAL.ExternalInputState.from_mapping(keyboard_mapping)
-        self.assertEqual(
-            MODULE.external_active_input_device(keyboard_state),
-            "keyboard",
-        )
-        _effective, keyboard_frame = self.gate.prepare(
-            keyboard_state,
-            current_token,
-        )
-        self.assertIsNotNone(keyboard_frame)
-        assert keyboard_frame is not None
-        self.assertEqual(keyboard_frame.requested_device, "keyboard")
-
-        mixed_mapping = keyboard_state.to_mapping()
-        mixed_mapping["gamepad"]["axes"]["look_yaw"] = 0.5
-        mixed_state = EXTERNAL.ExternalInputState.from_mapping(mixed_mapping)
-        self.assertEqual(MODULE.external_active_input_device(mixed_state), "mixed")
-        _effective, mixed_frame = self.gate.prepare(mixed_state, current_token)
-        self.assertIsNotNone(mixed_frame)
-        assert mixed_frame is not None
-        self.assertEqual(mixed_frame.requested_device, "mixed")
-        self.assertFalse(mixed_frame.locomotion_admitted)
-        for configured_source in ("auto", "keyboard", "gamepad"):
-            with self.subTest(configured_source=configured_source):
-                self.assertEqual(
-                    MODULE.external_provider_source_interlock_reason(
-                        mixed_frame,
-                        configured_source=configured_source,
-                    ),
-                    "input_source_mixed",
-                )
-
-    def test_mixed_q_v_and_gamepad_look_are_neutral_before_publish(self) -> None:
-        mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
-        mapping["keyboard"]["q"] = True
-        mapping["keyboard"]["v"] = True
-        mapping["gamepad"]["connected"] = True
-        mapping["gamepad"]["axes"]["look_yaw"] = 0.75
-        result = self.exercise_source_interlocked_publish(
-            mapping,
-            configured_source="auto",
-            command=(
-                "/data modify entity @s "
-                "control.input.keyboard.q set value true"
-            ),
-        )
-        frame = result["frame"]
-        assert isinstance(frame, MODULE.ExternalProviderGateFrame)
-        self.assertEqual(frame.requested_device, "mixed")
-        self.assertEqual(result["reason"], "input_source_mixed")
-        effective = result["effective"]
-        assert isinstance(effective, EXTERNAL.ExternalInputState)
-        self.assertTrue(effective.keyboard["q"])
-        self.assertTrue(effective.keyboard["v"])
-        self.assertEqual(effective.gamepad_axes["look_yaw"], 0.75)
-        keyboard = result["keyboard"]
-        gamepad = result["gamepad"]
-        assert isinstance(keyboard, MODULE.KeyboardMouseSample)
-        assert isinstance(gamepad, MODULE.GamepadSample)
-        self.assertFalse(keyboard.q)
-        self.assertFalse(keyboard.v)
-        self.assertEqual(gamepad.look_yaw, 0.0)
-
-    def test_configured_mismatch_mouse_delta_and_button_are_neutral(self) -> None:
-        mapping = EXTERNAL.ExternalInputState.neutral().to_mapping()
-        mapping["mouse"]["buttons"]["left"] = True
-        mapping["mouse"]["dx"] = 18.0
-        result = self.exercise_source_interlocked_publish(
-            mapping,
-            configured_source="gamepad",
-            command=(
-                "/data modify entity @s "
-                "control.input.mouse.left set value true"
-            ),
-        )
-        frame = result["frame"]
-        assert isinstance(frame, MODULE.ExternalProviderGateFrame)
-        self.assertEqual(frame.requested_device, "keyboard")
-        self.assertEqual(result["reason"], "input_source_rejects_keyboard")
-        effective = result["effective"]
-        assert isinstance(effective, EXTERNAL.ExternalInputState)
-        self.assertTrue(effective.mouse_buttons["left"])
-        self.assertEqual(effective.mouse_dx, 18.0)
-        keyboard = result["keyboard"]
-        assert isinstance(keyboard, MODULE.KeyboardMouseSample)
-        self.assertFalse(keyboard.camera_dragging)
-        self.assertEqual(keyboard.mouse_dx, 0.0)
-
-    def test_focus_loss_outranks_source_and_calibration_and_latches_deadman(self) -> None:
-        connected_neutral = EXTERNAL.ExternalInputState.neutral().to_mapping()
-        connected_neutral["gamepad"]["connected"] = True
-        response = self.request(
-            "input.replace",
-            {"lease_id": self.lease_id, "state": connected_neutral},
-        )
-        token = EXTERNAL.ExternalInputToken.from_mapping(
-            response["data"]["input_token"]
-        )
-        state, sampled_token = self.broker.sample_with_token()
-        self.assertEqual(sampled_token, token)
-        _effective, frame = self.gate.prepare(state, sampled_token)
-        self.assertIsNotNone(frame)
-        assert frame is not None
-        self.assertEqual(frame.requested_device, "gamepad")
-
-        for calibration_active in (False, True):
-            with self.subTest(calibration_active=calibration_active):
-                self.assertEqual(
-                    MODULE.external_provider_publish_interlock_reason(
-                        frame,
-                        configured_source="keyboard",
-                        physical_focused=False,
-                        camera_dragging=False,
-                        camera_available=True,
-                        input_available=True,
-                        gamepad_connected_edge=False,
-                        calibration_interlock_active=calibration_active,
-                    ),
-                    "physical_focus_lost",
-                )
-
-        self.provider_sequence += 1
-        self.assertTrue(
-            self.gate.observe_published(
-                frame,
-                sequence=self.provider_sequence,
-                published=True,
-                interlock_reason="physical_focus_lost",
-            )
-        )
-        blocked = self.request(
-            "command.submit",
-            {"lease_id": self.lease_id, "command": "/tp @s ~ ~ ~"},
-            expect_ok=False,
-        )
-        self.assertFalse(blocked["ok"])
-        self.assertEqual(blocked["code"], "E_AUTHORITY_REVOKED")
-
-        self.clock_value += 0.10
-        self.assertTrue(
-            self.request(
-                "lease.renew",
-                {"lease_id": self.lease_id},
-            )["ok"]
-        )
-        self.clock_value += 0.051
-        self.assertIsNone(
-            self.broker.publish_boundary_token(now=self.clock_value)
-        )
-        self.assertEqual(self.broker.deadman_stops, 1)
-
-    def test_interlock_reason_uses_final_publish_preconditions(self) -> None:
-        base = {
-            "physical_focused": True,
-            "camera_dragging": False,
-            "camera_available": True,
-            "input_available": True,
-            "gamepad_connected_edge": False,
-            "calibration_interlock_active": False,
-        }
-        cases = {
-            "physical_focused": "physical_focus_lost",
-            "camera_available": "camera_unavailable",
-            "input_available": "input_unavailable",
-            "gamepad_connected_edge": "gamepad_connected_edge",
-            "calibration_interlock_active": "calibration_interlock",
-        }
-        for field, reason in cases.items():
-            with self.subTest(field=field):
-                values = dict(base)
-                values[field] = not values[field]
-                self.assertEqual(
-                    MODULE.external_provider_interlock_reason(**values),
-                    reason,
-                )
-        focus_and_calibration = dict(base)
-        focus_and_calibration["physical_focused"] = False
-        focus_and_calibration["calibration_interlock_active"] = True
-        self.assertEqual(
-            MODULE.external_provider_interlock_reason(**focus_and_calibration),
-            "physical_focus_lost",
-        )
-
-
-class KeyboardDoubleTapDetectorTest(unittest.TestCase):
-    @staticmethod
-    def sample(**keys):
-        return MODULE.KeyboardMouseSample(focused=True, **keys)
-
-    def test_same_key_press_release_press_activates_until_key_up(self) -> None:
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        self.assertFalse(
-            detector.update(self.sample(w=True), now_s=1.00, enabled=True)
-        )
-        self.assertFalse(detector.update(self.sample(), now_s=1.08, enabled=True))
-        self.assertTrue(
-            detector.update(self.sample(w=True), now_s=1.20, enabled=True)
-        )
-        self.assertTrue(
-            detector.update(
-                self.sample(w=True, d=True), now_s=1.25, enabled=True
-            )
-        )
-        self.assertFalse(
-            detector.update(self.sample(d=True), now_s=1.30, enabled=True)
-        )
-
-    def test_q_or_e_double_tap_activates_turn_boost_until_key_up(self) -> None:
-        for key in ("q", "e"):
-            with self.subTest(key=key):
-                detector = MODULE.KeyboardDoubleTapDetector(0.30)
-                self.assertFalse(
-                    detector.update(
-                        self.sample(**{key: True}), now_s=1.00, enabled=True
-                    )
-                )
-                self.assertFalse(
-                    detector.update(self.sample(), now_s=1.08, enabled=True)
-                )
-                self.assertTrue(
-                    detector.update(
-                        self.sample(**{key: True}), now_s=1.20, enabled=True
-                    )
-                )
-                self.assertTrue(
-                    detector.update(
-                        self.sample(**{key: True}), now_s=1.25, enabled=True
-                    )
-                )
-                self.assertFalse(
-                    detector.update(self.sample(), now_s=1.30, enabled=True)
-                )
-
-    def test_hold_timeout_other_key_and_opposites_do_not_activate(self) -> None:
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        self.assertFalse(
-            detector.update(self.sample(w=True), now_s=1.00, enabled=True)
-        )
-        self.assertFalse(
-            detector.update(self.sample(w=True), now_s=1.40, enabled=True)
-        )
-        self.assertFalse(detector.update(self.sample(), now_s=1.41, enabled=True))
-        self.assertFalse(
-            detector.update(self.sample(w=True), now_s=1.42, enabled=True)
-        )
-
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        detector.update(self.sample(w=True), now_s=2.00, enabled=True)
-        detector.update(self.sample(), now_s=2.05, enabled=True)
-        self.assertFalse(
-            detector.update(self.sample(d=True), now_s=2.10, enabled=True)
-        )
-        self.assertFalse(
-            detector.update(
-                self.sample(w=True, s=True), now_s=2.15, enabled=True
-            )
-        )
-
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        detector.update(self.sample(q=True), now_s=3.00, enabled=True)
-        detector.update(self.sample(), now_s=3.05, enabled=True)
-        self.assertFalse(
-            detector.update(self.sample(q=True, e=True), now_s=3.10, enabled=True)
-        )
-        self.assertEqual(detector.last_reset_reason, "opposing_directions")
-
-    def test_turn_double_tap_candidate_does_not_cross_into_wasd_tier(self) -> None:
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        detector.update(self.sample(q=True), now_s=1.00, enabled=True)
-        detector.update(self.sample(), now_s=1.05, enabled=True)
-
-        self.assertFalse(detector.update(self.sample(w=True), now_s=1.10, enabled=True))
-        self.assertEqual(detector.last_reset_reason, "tier_changed")
-
-    def test_interlock_and_source_change_clear_candidates(self) -> None:
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        detector.update(
-            self.sample(w=True), now_s=1.00, enabled=True, source_id="physical"
-        )
-        detector.update(
-            self.sample(), now_s=1.05, enabled=False, source_id="physical"
-        )
-        self.assertFalse(
-            detector.update(
-                self.sample(w=True),
-                now_s=1.10,
-                enabled=True,
-                source_id="physical",
-            )
-        )
-        self.assertFalse(
-            detector.update(
-                self.sample(w=True),
-                now_s=1.15,
-                enabled=True,
-                source_id="external",
-            )
-        )
-
-    def test_speed_tier_change_clears_candidates_and_active_boost(self) -> None:
-        transitions = (
-            ({"alt": True}, {"shift": True}),
-            ({}, {"shift": True}),
-            ({"shift": True}, {}),
-            ({}, {"ctrl": True}),
-            ({"ctrl": True}, {}),
-        )
-        for first_tier, second_tier in transitions:
-            with self.subTest(first_tier=first_tier, second_tier=second_tier):
-                detector = MODULE.KeyboardDoubleTapDetector(0.30)
-                self.assertFalse(
-                    detector.update(
-                        self.sample(w=True, **first_tier),
-                        now_s=1.00,
-                        enabled=True,
-                    )
-                )
-                self.assertFalse(
-                    detector.update(
-                        self.sample(**first_tier),
-                        now_s=1.05,
-                        enabled=True,
-                    )
-                )
-                self.assertFalse(
-                    detector.update(
-                        self.sample(w=True, **second_tier),
-                        now_s=1.10,
-                        enabled=True,
-                    )
-                )
-                self.assertEqual(detector.last_reset_reason, "tier_changed")
-
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        detector.update(self.sample(w=True), now_s=2.00, enabled=True)
-        detector.update(self.sample(), now_s=2.05, enabled=True)
-        self.assertTrue(
-            detector.update(self.sample(w=True), now_s=2.10, enabled=True)
-        )
-        self.assertFalse(
-            detector.update(
-                self.sample(w=True, shift=True),
-                now_s=2.15,
-                enabled=True,
-            )
-        )
-        self.assertEqual(detector.last_reset_reason, "tier_changed")
-
-    def test_ctrl_and_alt_share_the_same_slow_tier_identity(self) -> None:
-        detector = MODULE.KeyboardDoubleTapDetector(0.30)
-        self.assertFalse(
-            detector.update(
-                self.sample(w=True, ctrl=True), now_s=1.00, enabled=True
-            )
-        )
-        self.assertFalse(
-            detector.update(self.sample(ctrl=True), now_s=1.05, enabled=True)
-        )
-        self.assertTrue(
-            detector.update(
-                self.sample(w=True, alt=True), now_s=1.10, enabled=True
-            )
-        )
 
 
 class SnapshotTest(unittest.TestCase):
@@ -4780,22 +1290,7 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(CORE.decode_input_packet(payload), snapshot)
         self.assertEqual(snapshot.protocol, CORE.PROTOCOL_NAME)
         self.assertFalse(snapshot.keys.ctrl)
-        self.assertFalse(snapshot.keys.alt)
         self.assertFalse(snapshot.keys.shift)
-        self.assertFalse(snapshot.keyboard_boost)
-
-        boosted = MODULE.build_snapshot(
-            sequence=8,
-            timestamp_monotonic_s=12.6,
-            keyboard=MODULE.KeyboardMouseSample(w=True, alt=True, focused=True),
-            gamepad=MODULE.GamepadSample(),
-            input_source="keyboard",
-            camera_yaw_rad=0.0,
-            camera_available=True,
-            keyboard_boost=True,
-        )
-        self.assertTrue(boosted.keys.alt)
-        self.assertTrue(boosted.keyboard_boost)
 
     def test_missing_actual_camera_yaw_disables_operator(self) -> None:
         snapshot = MODULE.build_snapshot(
@@ -4809,30 +1304,12 @@ class SnapshotTest(unittest.TestCase):
         )
         self.assertFalse(snapshot.focused)
 
-    def test_native_camera_drag_interlocks_robot_movement(self) -> None:
+    def test_native_camera_drag_keeps_robot_movement_focused(self) -> None:
         snapshot = MODULE.build_snapshot(
             sequence=2,
             timestamp_monotonic_s=1.0,
             keyboard=MODULE.KeyboardMouseSample(
                 w=True, focused=True, camera_dragging=True
-            ),
-            gamepad=MODULE.GamepadSample(),
-            input_source="keyboard",
-            camera_yaw_rad=0.5,
-            camera_available=True,
-        )
-        self.assertFalse(snapshot.focused)
-        self.assertTrue(snapshot.keys.w)
-
-    def test_arrow_camera_drag_keeps_keyboard_locomotion_available(self) -> None:
-        snapshot = MODULE.build_snapshot(
-            sequence=3,
-            timestamp_monotonic_s=1.0,
-            keyboard=MODULE.KeyboardMouseSample(
-                w=True,
-                arrow_right=True,
-                focused=True,
-                camera_dragging=True,
             ),
             gamepad=MODULE.GamepadSample(),
             input_source="keyboard",
@@ -5152,19 +1629,6 @@ class CalibrationModeTest(unittest.TestCase):
         self.assertFalse(controller.update(escape_pressed=True, ue_focused=False))
         self.assertFalse(controller.active)
 
-    def test_focus_loss_exit_is_opt_in_for_desktop_overlay(self) -> None:
-        controller = MODULE.CalibrationModeController()
-        self.assertTrue(controller.update(escape_pressed=True, ue_focused=True))
-        self.assertFalse(
-            controller.exit_on_focus_loss(enabled=False, ue_focused=False)
-        )
-        self.assertTrue(controller.active)
-        self.assertTrue(
-            controller.exit_on_focus_loss(enabled=True, ue_focused=False)
-        )
-        self.assertFalse(controller.active)
-        self.assertEqual(controller.toggle_count, 2)
-
     def test_ui_and_escape_exit_frames_drop_release_delta_and_require_rearm(self) -> None:
         for exit_kind in ("ui", "escape"):
             with self.subTest(exit_kind=exit_kind):
@@ -5256,16 +1720,6 @@ class CalibrationModeTest(unittest.TestCase):
 
 
 class MouseSettingsAndRestartTest(unittest.TestCase):
-    def test_f6_cycle_requires_release_then_emits_only_fresh_edges(self) -> None:
-        key = MODULE.MovementModeCycleKey()
-        self.assertFalse(key.update(True))
-        self.assertFalse(key.update(True))
-        self.assertFalse(key.update(False))
-        self.assertTrue(key.update(True))
-        self.assertFalse(key.update(True))
-        self.assertFalse(key.update(False))
-        self.assertTrue(key.update(True))
-
     def test_applied_remote_scale_is_discrete_but_local_remains_one_x(self) -> None:
         remote = MODULE.AppliedMouseSettings(
             profile="remote", effective_scale=0.01
@@ -5349,95 +1803,6 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
             # The current generation remains exactly the launch snapshot.
             self.assertEqual(applied.effective_scale, 1.0)
 
-    def test_failed_saves_never_publish_uncommitted_desired_values(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            applied = MODULE.AppliedMouseSettings(
-                profile="local", effective_scale=1.0
-            )
-            mouse = MODULE.MouseSettingsController(
-                path=root / "mouse.json",
-                desired=MODULE.MouseSettings(),
-                load_status="loaded",
-                load_error=None,
-            )
-            before_mouse = mouse.live_mapping(applied)
-            with mock.patch.object(
-                MODULE,
-                "atomic_save_settings",
-                side_effect=OSError("read-only mouse settings"),
-            ):
-                self.assertFalse(
-                    mouse.apply_panel_action("profile_remote", active=True)
-                )
-            after_mouse = mouse.live_mapping(applied)
-            self.assertEqual(mouse.desired, MODULE.MouseSettings())
-            self.assertEqual(after_mouse["next_launch"], before_mouse["next_launch"])
-            self.assertEqual(after_mouse["change_count"], 0)
-            self.assertEqual(after_mouse["load_status"], "loaded")
-            self.assertIn("read-only", after_mouse["persistence_error"])
-
-            ui = MODULE.UiSettingsController(
-                path=root / "ui.json",
-                desired=MODULE.UiSettings(),
-                load_status="loaded",
-                load_error=None,
-            )
-            before_ui = ui.live_mapping()
-            with mock.patch.object(
-                MODULE,
-                "atomic_save_ui_settings",
-                side_effect=OSError("read-only UI settings"),
-            ):
-                self.assertFalse(ui.apply_font_size(20, active=True))
-            after_ui = ui.live_mapping()
-            self.assertEqual(ui.desired, MODULE.UiSettings())
-            self.assertEqual(after_ui["font_size"], before_ui["font_size"])
-            self.assertEqual(after_ui["change_count"], 0)
-            self.assertEqual(after_ui["load_status"], "loaded")
-            self.assertIn("read-only", after_ui["persistence_error"])
-
-    def test_finite_settings_telemetry_has_persistence_identity(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            mouse = MODULE.MouseSettingsController(
-                path=root / "mouse.json",
-                desired=MODULE.MouseSettings(),
-                load_status="missing",
-                load_error=None,
-            ).live_mapping(
-                MODULE.AppliedMouseSettings(profile="local", effective_scale=1.0)
-            )
-            ui = MODULE.UiSettingsController(
-                path=root / "ui.json",
-                desired=MODULE.UiSettings(),
-                load_status="missing",
-                load_error=None,
-            ).live_mapping()
-            video = MODULE.VideoSettingsController(
-                store=MODULE.VideoSettingsStore(root / "video.json"),
-                applied=MODULE.VideoSettings(),
-            ).live_mapping()
-            motion = MOTION_SETTINGS.MotionSettingsStore(
-                root / "motion.json"
-            ).mapping()
-
-            for name, telemetry in (
-                ("mouse", mouse),
-                ("ui", ui),
-                ("video", video),
-                ("motion", motion),
-            ):
-                with self.subTest(name=name):
-                    self.assertTrue(Path(telemetry["settings_file"]).is_absolute())
-                    self.assertIsInstance(telemetry["load_status"], str)
-                    self.assertNotIn("runtime_pause", telemetry)
-            self.assertIsInstance(mouse["change_count"], int)
-            self.assertIsInstance(ui["change_count"], int)
-            self.assertIsInstance(video["revision"], int)
-            self.assertIsInstance(video["change_count"], int)
-            self.assertIsInstance(motion["settings"]["revision"], int)
-
     def test_panel_selects_profiles_and_speed_without_key_emulation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config/mouse.json"
@@ -5513,63 +1878,6 @@ class MouseSettingsAndRestartTest(unittest.TestCase):
                 self.assertEqual(panel.desired.speed_scale, scale)
             self.assertFalse(keyboard_step(slower=True))
             self.assertFalse(panel.apply_panel_action("speed_down", active=True))
-
-    def test_ui_font_size_click_and_slider_persist_and_restore(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "config/matrix/hosts/trna/ui-settings.json"
-            controller = MODULE.UiSettingsController(
-                path=path,
-                desired=MODULE.UiSettings(),
-                load_status="missing",
-                load_error=None,
-            )
-            self.assertFalse(
-                controller.apply_panel_action("font_up", active=False)
-            )
-            self.assertTrue(controller.apply_panel_action("font_up", active=True))
-            self.assertEqual(controller.desired.font_scale, 1.0)
-            self.assertEqual(controller.desired.font_size, 14)
-            self.assertTrue(controller.apply_font_size(20, active=True))
-            self.assertEqual(controller.desired.font_size, 20)
-            self.assertEqual(
-                json.loads(path.read_text(encoding="utf-8")),
-                {
-                    "font_scale": 1.0,
-                    "font_size": 20,
-                    "version": 2,
-                },
-            )
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            restored = MODULE.load_ui_settings(path)
-            self.assertEqual(restored.status, "loaded")
-            self.assertEqual(restored.settings.font_scale, 1.0)
-            self.assertEqual(restored.settings.font_size, 20)
-
-    def test_ui_font_size_nine_ack_survives_controller_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "config/matrix/hosts/trna/ui-settings.json"
-            controller = MODULE.UiSettingsController(
-                path=path,
-                desired=MODULE.UiSettings(),
-                load_status="missing",
-                load_error=None,
-            )
-
-            self.assertTrue(controller.apply_font_size(9, active=True))
-            acknowledged = controller.live_mapping()
-            self.assertEqual(acknowledged["font_size"], 9)
-            self.assertEqual(acknowledged["load_status"], "saved")
-            self.assertEqual(acknowledged["change_count"], 1)
-
-            loaded = MODULE.load_ui_settings(path)
-            restarted = MODULE.UiSettingsController(
-                path=path,
-                desired=loaded.settings,
-                load_status=loaded.status,
-                load_error=loaded.error,
-            )
-            self.assertEqual(restarted.live_mapping()["font_size"], 9)
-            self.assertEqual(restarted.live_mapping()["change_count"], 0)
 
     @staticmethod
     def requester(*, available: bool = True, succeeds: bool = True):
@@ -6006,236 +2314,6 @@ class CameraYawTrackerTest(unittest.TestCase):
         )
 
 
-class KeyboardCameraLookTest(unittest.TestCase):
-    def test_arrow_hold_maps_to_yaw_pitch_and_caps_stalled_frames(self) -> None:
-        integrator = MODULE.KeyboardCameraLookIntegrator()
-        sample = MODULE.KeyboardMouseSample(
-            arrow_up=True,
-            arrow_right=True,
-            focused=True,
-        )
-        self.assertEqual(
-            integrator.update(
-                sample,
-                dt=0.02,
-                rate_deg_s=120.0,
-                degrees_per_pixel=0.12,
-                enabled=True,
-            ),
-            (20, -20),
-        )
-        self.assertEqual(
-            integrator.update(
-                sample,
-                dt=1.0,
-                rate_deg_s=120.0,
-                degrees_per_pixel=0.12,
-                enabled=True,
-            ),
-            (50, -50),
-        )
-        self.assertEqual(
-            integrator.update(
-                sample,
-                dt=0.0,
-                rate_deg_s=120.0,
-                degrees_per_pixel=0.12,
-                enabled=True,
-            ),
-            (0, 0),
-        )
-
-    def test_escape_interlock_neutralizes_arrows_and_residuals(self) -> None:
-        keyboard, _pad = MODULE.apply_calibration_interlock(
-            MODULE.KeyboardMouseSample(
-                arrow_left=True,
-                arrow_down=True,
-                focused=True,
-            ),
-            MODULE.GamepadSample(),
-            active=True,
-        )
-        self.assertFalse(keyboard.arrow_left)
-        self.assertFalse(keyboard.arrow_down)
-        integrator = MODULE.KeyboardCameraLookIntegrator()
-        self.assertEqual(
-            integrator.update(
-                keyboard,
-                dt=0.02,
-                rate_deg_s=120.0,
-                degrees_per_pixel=0.12,
-                enabled=False,
-            ),
-            (0, 0),
-        )
-
-    def test_arrow_release_and_opposing_keys_are_inactive(self) -> None:
-        self.assertTrue(
-            MODULE.keyboard_camera_arrow_active(
-                MODULE.KeyboardMouseSample(arrow_left=True, focused=True)
-            )
-        )
-        for sample in (
-            MODULE.KeyboardMouseSample(focused=True),
-            MODULE.KeyboardMouseSample(
-                arrow_left=True,
-                arrow_right=True,
-                focused=True,
-            ),
-            MODULE.KeyboardMouseSample(
-                arrow_up=True,
-                arrow_down=True,
-                focused=True,
-            ),
-        ):
-            with self.subTest(sample=sample):
-                self.assertFalse(MODULE.keyboard_camera_arrow_active(sample))
-
-    def test_background_worker_emits_actual_bridge_action(self) -> None:
-        calls: list[tuple[str, dict[str, object]]] = []
-
-        class Client:
-            def __init__(self, *_args, **_kwargs):
-                pass
-
-            def connect(self):
-                return None
-
-            def request(self, action, payload):
-                calls.append((action, payload))
-                return {
-                    "ok": True,
-                    "data": {
-                        "supported_actions": [
-                            "status",
-                            "look_delta",
-                            "look_stop",
-                        ],
-                    },
-                }
-
-            def close(self):
-                return None
-
-        worker = MODULE.EngineCameraLookWorker(
-            Path("/tmp/engine.sock"),
-            Path("/tmp/engine.cap"),
-            button="left",
-            client_factory=Client,
-        )
-        worker.start()
-        self.addCleanup(worker.close)
-        deadline = time.monotonic() + 1.0
-        while not worker.telemetry["available"] and time.monotonic() < deadline:
-            time.sleep(0.005)
-        self.assertTrue(worker.telemetry["available"])
-        self.assertTrue(worker.submit(18, -6))
-        while worker.telemetry["emitted_batches"] < 1 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        self.assertIn(
-            (
-                "look_delta",
-                {"dx": 18, "dy": -6, "button": "left"},
-            ),
-            calls,
-        )
-        self.assertTrue(worker.cancel_pending())
-        deadline = time.monotonic() + 1.0
-        while (
-            worker.telemetry["releases_emitted"] < 1
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        self.assertIn(("look_stop", {}), calls)
-        self.assertEqual(worker.telemetry["pending_dx"], 0)
-        self.assertEqual(worker.telemetry["pending_dy"], 0)
-
-    def test_unavailable_bridge_drops_input_without_blocking_provider(self) -> None:
-        class FailingClient:
-            def __init__(self, *_args, **_kwargs):
-                pass
-
-            def connect(self):
-                raise FileNotFoundError("bridge missing")
-
-            def close(self):
-                return None
-
-        worker = MODULE.EngineCameraLookWorker(
-            Path("/tmp/missing.sock"),
-            Path("/tmp/missing.cap"),
-            button="left",
-            client_factory=FailingClient,
-        )
-        worker.start()
-        self.addCleanup(worker.close)
-        deadline = time.monotonic() + 1.0
-        while worker.telemetry["status"] == "probing" and time.monotonic() < deadline:
-            time.sleep(0.005)
-        started = time.monotonic()
-        self.assertFalse(worker.submit(10, 0))
-        self.assertLess(time.monotonic() - started, 0.02)
-        telemetry = worker.telemetry
-        self.assertFalse(telemetry["available"])
-        self.assertIn("bridge missing", telemetry["last_error"])
-
-    def test_bridge_without_look_capability_is_not_reported_available(self) -> None:
-        class LegacyClient:
-            def __init__(self, *_args, **_kwargs):
-                pass
-
-            def connect(self):
-                return None
-
-            def request(self, _action, _payload):
-                return {"data": {"supported_actions": ["status", "mouse"]}}
-
-            def close(self):
-                return None
-
-        worker = MODULE.EngineCameraLookWorker(
-            Path("/tmp/legacy.sock"),
-            Path("/tmp/legacy.cap"),
-            button="left",
-            client_factory=LegacyClient,
-        )
-        worker.start()
-        self.addCleanup(worker.close)
-        deadline = time.monotonic() + 1.0
-        while worker.telemetry["status"] == "probing" and time.monotonic() < deadline:
-            time.sleep(0.005)
-        telemetry = worker.telemetry
-        self.assertFalse(telemetry["available"])
-        self.assertFalse(telemetry["capability_compatible"])
-        self.assertEqual(telemetry["status"], "unsupported")
-        self.assertIn("held look protocol", telemetry["last_error"])
-        worker._retry_not_before = 0.0
-        self.assertFalse(worker.submit(10, 0))
-
-    def test_disabled_bridge_telemetry_is_honest(self) -> None:
-        telemetry = MODULE.keyboard_camera_telemetry(
-            None,
-            MODULE.KeyboardCameraLookIntegrator(),
-            MOTION_SETTINGS.MotionSettings(),
-        )
-        self.assertFalse(telemetry["configured"])
-        self.assertFalse(telemetry["available"])
-        self.assertEqual(telemetry["rate_deg_s"], 120.0)
-        self.assertEqual(
-            telemetry["rate_scope"],
-            "nominal_input_rate_not_final_pov_angular_velocity",
-        )
-        missing_arrows = MODULE.keyboard_camera_telemetry(
-            None,
-            MODULE.KeyboardCameraLookIntegrator(),
-            MOTION_SETTINGS.MotionSettings(),
-            arrow_keys_available=False,
-        )
-        self.assertFalse(missing_arrows["available"])
-        self.assertFalse(missing_arrows["arrow_keys_available"])
-        self.assertIn("missing", missing_arrows["last_error"])
-
-
 class CarlaSpectatorCameraTest(unittest.TestCase):
     class Rotation:
         def __init__(self, *, yaw: float = 0.0, pitch: float = 0.0) -> None:
@@ -6359,156 +2437,6 @@ class CarlaSpectatorCameraTest(unittest.TestCase):
                 minimum_pitch_rad=1.0,
                 maximum_pitch_rad=0.0,
             )
-
-
-class CarlaCelestialLightingBridgeTest(unittest.TestCase):
-    class Weather:
-        def __init__(self, values: dict[str, float] | None = None) -> None:
-            values = values or {
-                name: 0.0 for name in VISUALS.CARLA_WEATHER_FIELDS
-            }
-            for name in VISUALS.CARLA_WEATHER_FIELDS:
-                setattr(self, name, values[name])
-
-    class World:
-        def __init__(self) -> None:
-            self.weather = CarlaCelestialLightingBridgeTest.Weather()
-            self.set_calls = 0
-            self.ignore_writes = False
-
-        def get_weather(self):
-            return CarlaCelestialLightingBridgeTest.Weather(
-                {
-                    name: getattr(self.weather, name)
-                    for name in VISUALS.CARLA_WEATHER_FIELDS
-                }
-            )
-
-        def set_weather(self, weather) -> None:
-            self.set_calls += 1
-            if not self.ignore_writes:
-                self.weather = CarlaCelestialLightingBridgeTest.Weather(
-                    {
-                        name: getattr(weather, name)
-                        for name in VISUALS.CARLA_WEATHER_FIELDS
-                    }
-                )
-
-    @staticmethod
-    def lighting() -> dict[str, object]:
-        return {
-            "body_id": "earth",
-            "atmosphere": "earth_nitrogen_oxygen",
-            "sun_altitude_deg": 12.5,
-            "sun_azimuth_deg": 123.0,
-            "render_authority": "state-only",
-            "render_status": "not-applied",
-            "render_error": None,
-        }
-
-    @classmethod
-    def sample(cls):
-        return VISUALS.load_visual_catalog().sample(cls.lighting())
-
-    @staticmethod
-    def wait_status(bridge, expected: str) -> None:
-        deadline = time.monotonic() + 1.0
-        while time.monotonic() < deadline:
-            with bridge._state_lock:
-                if bridge._status == expected:
-                    return
-            time.sleep(0.005)
-        raise AssertionError(f"lighting bridge did not reach {expected}")
-
-    def test_weather_bridge_applies_and_readbacks_sun_angles(self) -> None:
-        world = self.World()
-        bridge = MODULE.CarlaCelestialLightingBridge("127.0.0.1", 2000)
-        bridge._world = world
-        self.addCleanup(bridge.close)
-
-        submitted = bridge.apply(self.lighting(), self.sample(), now=1.0)
-        self.wait_status(bridge, "applied")
-        applied = bridge.apply(self.lighting(), self.sample(), now=1.1)
-
-        self.assertEqual(submitted["render_status"], "pending")
-        self.assertGreaterEqual(world.set_calls, 1)
-        self.assertEqual(applied["render_authority"], "carla-weather")
-        self.assertEqual(applied["render_status"], "applied")
-        self.assertIsNone(applied["render_error"])
-        self.assertAlmostEqual(world.weather.sun_altitude_angle, 12.5)
-        self.assertAlmostEqual(world.weather.sun_azimuth_angle, 123.0)
-        self.assertAlmostEqual(world.weather.cloudiness, 60.0)
-        self.assertAlmostEqual(world.weather.precipitation_deposits, 50.0)
-
-    def test_weather_bridge_fails_closed_on_readback_mismatch(self) -> None:
-        world = self.World()
-        world.ignore_writes = True
-        bridge = MODULE.CarlaCelestialLightingBridge(
-            "127.0.0.1", 2000, retry_seconds=10.0
-        )
-        bridge._world = world
-        self.addCleanup(bridge.close)
-
-        bridge.apply(self.lighting(), self.sample(), now=2.0)
-        self.wait_status(bridge, "unavailable")
-        result = bridge.apply(self.lighting(), self.sample(), now=2.1)
-
-        self.assertEqual(result["render_authority"], "state-only")
-        self.assertEqual(result["render_status"], "unavailable")
-        self.assertEqual(result["render_error"], "carla-weather-unavailable")
-        self.assertIsNone(bridge._world)
-
-    def test_weather_rpc_never_blocks_the_control_thread(self) -> None:
-        world = self.World()
-        original_set_weather = world.set_weather
-
-        def slow_set_weather(weather) -> None:
-            time.sleep(0.05)
-            original_set_weather(weather)
-
-        world.set_weather = slow_set_weather
-        bridge = MODULE.CarlaCelestialLightingBridge("127.0.0.1", 2000)
-        bridge._world = world
-        self.addCleanup(bridge.close)
-
-        started = time.monotonic()
-        submitted = bridge.apply(self.lighting(), self.sample())
-        elapsed = time.monotonic() - started
-
-        self.assertEqual(submitted["render_status"], "pending")
-        self.assertLess(elapsed, 0.02)
-        self.wait_status(bridge, "applied")
-
-    def test_profile_change_returns_to_pending_until_new_readback(self) -> None:
-        world = self.World()
-        bridge = MODULE.CarlaCelestialLightingBridge("127.0.0.1", 2000)
-        bridge._world = world
-        self.addCleanup(bridge.close)
-        catalog = VISUALS.load_visual_catalog()
-        wet = catalog.sample(self.lighting())
-        clear = catalog.sample(self.lighting(), profile_id="earth-clear-v1")
-
-        bridge.apply(self.lighting(), wet)
-        self.wait_status(bridge, "applied")
-        changed = bridge.apply(self.lighting(), clear)
-
-        self.assertEqual(changed["render_authority"], "state-only")
-        self.assertEqual(changed["render_status"], "pending")
-        self.wait_status(bridge, "applied")
-
-    def test_weather_bridge_fails_closed_when_runtime_lacks_profile_field(self) -> None:
-        world = self.World()
-        del world.weather.dust_storm
-        bridge = MODULE.CarlaCelestialLightingBridge(
-            "127.0.0.1", 2000, retry_seconds=10.0
-        )
-        bridge._world = world
-        self.addCleanup(bridge.close)
-
-        bridge.apply(self.lighting(), self.sample())
-        self.wait_status(bridge, "unavailable")
-
-        self.assertIsNone(bridge._world)
 
 
 class XInput2RawMotionTest(unittest.TestCase):
@@ -6963,7 +2891,7 @@ class XInput2RawMotionTest(unittest.TestCase):
             {"xi2_button_state_resync": 1, "focus_or_pointer_invalid": 1},
         )
 
-    def test_core_gated_drag_requires_neutral_before_camera_relative_w(self) -> None:
+    def test_core_gated_drag_keeps_camera_relative_w_live(self) -> None:
         accumulator = MODULE.XInput2CoreGatedAccumulator(look_button_detail=1)
         tracker = MODULE.CameraYawTracker(
             0.0,
@@ -7001,25 +2929,23 @@ class XInput2RawMotionTest(unittest.TestCase):
         _, _, press_drag = accumulator.update(
             (), current_look_pressed=True
         )
-        self.assertTrue(deliver(2, 1.01, dragging=press_drag).safe_stop)
+        self.assertFalse(deliver(2, 1.01, dragging=press_drag).safe_stop)
         dx, _, held_drag = accumulator.update(
             (self.raw(MODULE._XI_RAW_MOTION, source=6, dx=1.0),),
             current_look_pressed=True,
         )
         tracker.update(dt=0.02, mouse_dx=dx, gamepad_look_yaw=0.0)
-        self.assertTrue(deliver(3, 1.02, w=True, dragging=held_drag).safe_stop)
+        moving = deliver(3, 1.02, w=True, dragging=held_drag)
+        self.assertFalse(moving.safe_stop)
         _, _, release_drag = accumulator.update(
             (), current_look_pressed=False
         )
-        self.assertTrue(deliver(4, 1.03, w=True, dragging=release_drag).safe_stop)
-        awaiting = deliver(5, 1.04, w=True)
-        self.assertTrue(awaiting.safe_stop)
-        self.assertEqual(awaiting.reason, "awaiting_neutral")
-        self.assertFalse(deliver(6, 1.05).safe_stop)
-        resumed = deliver(7, 1.06, w=True)
-        self.assertFalse(resumed.safe_stop)
-        self.assertAlmostEqual(resumed.movement[0], 0.0, places=7)
-        self.assertAlmostEqual(resumed.movement[1], 1.0, places=7)
+        released = deliver(4, 1.03, w=True, dragging=release_drag)
+        self.assertFalse(released.safe_stop)
+        held = deliver(5, 1.04, w=True)
+        self.assertFalse(held.safe_stop)
+        self.assertAlmostEqual(held.movement[0], 0.0, places=7)
+        self.assertAlmostEqual(held.movement[1], 1.0, places=7)
 
     def test_hierarchy_event_discards_complete_batch_and_rebinds(self) -> None:
         reader = self.reader_for_events(
@@ -7264,36 +3190,6 @@ class XInput2RawMotionTest(unittest.TestCase):
 
 
 class X11KeyboardMouseSafetyTest(unittest.TestCase):
-    def test_arrow_keysyms_match_x11_standard_values(self) -> None:
-        self.assertEqual(
-            {
-                name: MODULE.X11KeyboardMouse._KEYSYMS[name]
-                for name in (
-                    "arrow_left",
-                    "arrow_up",
-                    "arrow_right",
-                    "arrow_down",
-                )
-            },
-            {
-                "arrow_left": 0xFF51,
-                "arrow_up": 0xFF52,
-                "arrow_right": 0xFF53,
-                "arrow_down": 0xFF54,
-            },
-        )
-        backend = object.__new__(MODULE.X11KeyboardMouse)
-        backend._keycodes = {}
-        self.assertFalse(backend.arrow_keys_available)
-        backend._keycodes = {
-            name: index
-            for index, name in enumerate(
-                MODULE.X11KeyboardMouse._ARROW_KEY_NAMES,
-                start=1,
-            )
-        }
-        self.assertTrue(backend.arrow_keys_available)
-
     class AsyncFocusX11:
         """Deliver one queued X error only when the backend calls XSync."""
 
@@ -7414,52 +3310,6 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         self.assertEqual(x11.delivered, 1)
         self.assertEqual(x11.handler, 0)
 
-    def test_focus_activation_targets_the_exact_supervised_window_via_ewmh(self) -> None:
-        sent = []
-
-        class FakeX11:
-            @staticmethod
-            def XSendEvent(display, window, propagate, mask, source):
-                event = MODULE._XEvent.from_buffer_copy(
-                    ctypes.string_at(source, ctypes.sizeof(MODULE._XEvent))
-                )
-                sent.append((display, window, propagate, mask, event))
-                return 1
-
-            @staticmethod
-            def XFlush(_display):
-                return 1
-
-        backend = object.__new__(MODULE.X11KeyboardMouse)
-        backend._x11 = FakeX11()
-        backend._display = 11
-        backend._root = 2
-        backend._active_window_atom = 91
-        backend._focus_activation_requests = 0
-        backend._focus_activation_successes = 0
-        backend._focus_activation_last_window = None
-        backend._focus_activation_last_error = None
-        backend._find_expected_window = lambda: 77
-
-        self.assertTrue(backend.request_expected_focus())
-        self.assertEqual(len(sent), 1)
-        display, window, propagate, mask, event = sent[0]
-        self.assertEqual((display, window, propagate), (11, 2, 0))
-        self.assertEqual(
-            mask,
-            MODULE._X11_SUBSTRUCTURE_NOTIFY_MASK
-            | MODULE._X11_SUBSTRUCTURE_REDIRECT_MASK,
-        )
-        self.assertEqual(event.xclient.type, MODULE._X11_CLIENT_MESSAGE)
-        self.assertEqual(event.xclient.window, 77)
-        self.assertEqual(event.xclient.message_type, 91)
-        self.assertEqual(event.xclient.format, 32)
-        self.assertEqual(event.xclient.data.l[0], 2)
-        self.assertEqual(backend._focus_activation_requests, 1)
-        self.assertEqual(backend._focus_activation_successes, 1)
-        self.assertEqual(backend._focus_activation_last_window, 77)
-        self.assertIsNone(backend._focus_activation_last_error)
-
     @staticmethod
     def _raw_backend(
         *,
@@ -7544,7 +3394,7 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             backend.pointer_telemetry["motion_source"], "xi2-raw"
         )
 
-    def test_completed_raw_drag_interlocks_same_frame_w(self) -> None:
+    def test_completed_raw_drag_keeps_same_frame_w_live(self) -> None:
         backend = self._raw_backend(
             focus_results=iter(((True, "Matrix", frozenset({1234})),)),
             raw_deltas=((12.0, 0.0, True),),
@@ -7565,7 +3415,7 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             camera_yaw_rad=0.1,
             camera_available=True,
         )
-        self.assertFalse(snapshot.focused)
+        self.assertTrue(snapshot.focused)
 
         core = CORE.GameControlCore(
             CORE.ControlConfig(
@@ -7589,10 +3439,8 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         )
         core.accept_snapshot(snapshot, received_at_s=1.01)
         command = core.command(now_s=1.01, dt_s=0.01)
-        self.assertTrue(command.safe_stop)
-        self.assertEqual(command.reason, "focus_lost")
-        self.assertEqual(command.speed_mps, 0.0)
-        self.assertEqual(command.locomotion_mode, CORE.SONIC_IDLE_MODE)
+        self.assertFalse(command.safe_stop)
+        self.assertEqual(command.locomotion_mode, CORE.SONIC_SLOW_WALK_MODE)
 
         def focused_snapshot(
             sequence: int,
@@ -7619,10 +3467,9 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
 
         held_w = focused_snapshot(3, 1.02, w=True)
         core.accept_snapshot(held_w, received_at_s=1.02)
-        still_stopped = core.command(now_s=1.02, dt_s=1.0)
-        self.assertTrue(still_stopped.safe_stop)
-        self.assertEqual(still_stopped.reason, "awaiting_neutral")
-        self.assertEqual(still_stopped.locomotion_mode, CORE.SONIC_IDLE_MODE)
+        still_moving = core.command(now_s=1.02, dt_s=1.0)
+        self.assertFalse(still_moving.safe_stop)
+        self.assertEqual(still_moving.locomotion_mode, CORE.SONIC_WALK_MODE)
 
         neutral = focused_snapshot(4, 1.03)
         core.accept_snapshot(neutral, received_at_s=1.03)
@@ -8004,22 +3851,21 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         backend._absolute_motion = None
         backend._expected_ue_pid = 1234
         backend._focus_identity = lambda: (True, "Matrix", frozenset({1234}))
-        backend._escape_grabbed_modifiers = (0,)
         backend._grabbed_key_modifiers = {"escape": (0,), "q": (0,), "e": (0,)}
         backend._grabbed_escape_down = False
         backend._grabbed_escape_press_pending = False
-        backend._grabbed_escape_events = 0
+        backend._grabbed_ui_events = 0
 
         one_frame = backend.poll()
         released = backend.poll()
 
         self.assertTrue(one_frame.escape)
         self.assertFalse(released.escape)
-        self.assertEqual(backend.pointer_telemetry["grabbed_escape_events"], 2)
-        self.assertTrue(backend.pointer_telemetry["escape_grabbed"])
+        self.assertEqual(backend.pointer_telemetry["grabbed_ui_events"], 2)
+        self.assertTrue(backend.pointer_telemetry["ui_keys_grabbed"])
         self.assertTrue(backend.pointer_telemetry["turn_keys_grabbed"])
 
-    def test_close_ungrabs_passive_escape_before_closing_display(self) -> None:
+    def test_close_ungrabs_passive_ui_keys_before_closing_display(self) -> None:
         calls: list[tuple[str, object]] = []
 
         class FakeX11:
@@ -8049,7 +3895,6 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             "q": (0, MODULE._X11_MOD2_MASK),
             "e": (0, MODULE._X11_MOD2_MASK),
         }
-        backend._escape_grabbed_modifiers = (0, MODULE._X11_MOD2_MASK)
         backend._grabbed_escape_down = True
         backend._grabbed_escape_press_pending = True
 
@@ -8070,7 +3915,6 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
         )
         self.assertIsNone(backend._display)
         self.assertEqual(backend._grabbed_key_modifiers, {})
-        self.assertEqual(backend._escape_grabbed_modifiers, ())
 
 
 @unittest.skipUnless(
@@ -8203,120 +4047,6 @@ class FrameWaitTest(unittest.TestCase):
         self.assertEqual(now, 1.5)
 
 
-class ProviderCleanupTest(unittest.TestCase):
-    def test_failures_and_broken_logger_never_skip_resources_or_signals(self) -> None:
-        events: list[str] = []
-
-        def failing_step(label: str):
-            def run() -> None:
-                events.append(label)
-                raise OSError(f"{label} failed")
-
-            return run
-
-        def resource(label: str, *, fail: bool = False):
-            instance = mock.Mock()
-
-            def close() -> None:
-                events.append(label)
-                if fail:
-                    raise RuntimeError(f"{label} failed")
-
-            instance.close.side_effect = close
-            return instance
-
-        gamepad = resource("gamepad")
-        overlay = resource("overlay", fail=True)
-        x11 = resource("x11")
-        publisher = resource("publisher")
-        external = resource("external")
-        engine_camera = resource("engine_camera")
-        restored: list[int] = []
-
-        def restore(signum: int, _handler: object) -> None:
-            restored.append(signum)
-            events.append(f"signal:{signum}")
-            if signum == signal.SIGINT:
-                raise OSError("SIGINT restore failed")
-
-        cleanup = MODULE._CleanupCoordinator()
-        with mock.patch("builtins.print", side_effect=OSError("stderr closed")), mock.patch.object(
-            MODULE.signal,
-            "signal",
-            side_effect=restore,
-        ):
-            cleanup.run("publisher_release", failing_step("release"))
-            cleanup.run("command_receipt", failing_step("receipt"))
-            MODULE._close_provider_resources(
-                cleanup,
-                gamepad=gamepad,
-                overlay=overlay,
-                x11=x11,
-                publisher=publisher,
-                external_control=external,
-                engine_camera_worker=engine_camera,
-                previous_handlers={
-                    signal.SIGINT: object(),
-                    signal.SIGTERM: object(),
-                },
-            )
-            cleanup.run("status_write", failing_step("status"))
-
-        for owned in (gamepad, overlay, x11, publisher, external, engine_camera):
-            owned.close.assert_called_once_with()
-        self.assertEqual(restored, [signal.SIGINT, signal.SIGTERM])
-        self.assertEqual(
-            [failure["step"] for failure in cleanup.failures],
-            [
-                "publisher_release",
-                "command_receipt",
-                "overlay_close",
-                "signal_restore_SIGINT",
-                "status_write",
-            ],
-        )
-        return_code, exit_reason = MODULE._cleanup_outcome(
-            cleanup,
-            return_code=0,
-            exit_reason="signal",
-        )
-        self.assertEqual(return_code, 1)
-        self.assertEqual(exit_reason, "cleanup_error:publisher_release")
-        self.assertEqual(
-            events,
-            [
-                "release",
-                "receipt",
-                "engine_camera",
-                "gamepad",
-                "overlay",
-                "x11",
-                "publisher",
-                "external",
-                f"signal:{signal.SIGINT}",
-                f"signal:{signal.SIGTERM}",
-                "status",
-            ],
-        )
-
-    def test_status_write_failure_alone_is_a_nonzero_cleanup_outcome(self) -> None:
-        cleanup = MODULE._CleanupCoordinator()
-        with mock.patch("builtins.print"):
-            cleanup.run(
-                "status_write",
-                lambda: (_ for _ in ()).throw(OSError("disk full")),
-            )
-
-        self.assertEqual(
-            MODULE._cleanup_outcome(
-                cleanup,
-                return_code=0,
-                exit_reason="max_seconds",
-            ),
-            (1, "cleanup_error:status_write"),
-        )
-
-
 class SequenceTest(unittest.TestCase):
     def test_restart_uses_later_host_monotonic_nanoseconds(self) -> None:
         first_client = MODULE.initial_sequence(lambda: 1_000_000_000)
@@ -8357,7 +4087,6 @@ class LinuxJoystickTest(unittest.TestCase):
                 2, -32767, MODULE._JS_EVENT_AXIS | MODULE._JS_EVENT_INIT, 1
             ),
             MODULE._JS_EVENT.pack(3, -16384, MODULE._JS_EVENT_AXIS, 3),
-            MODULE._JS_EVENT.pack(4, 1, MODULE._JS_EVENT_BUTTON, 0),
         ]
         closed: list[int] = []
 
@@ -8381,7 +4110,6 @@ class LinuxJoystickTest(unittest.TestCase):
         self.assertAlmostEqual(sample.right, 16384 / 32767.0)
         self.assertEqual(sample.forward, 1.0)
         self.assertAlmostEqual(sample.look_yaw, -16384 / 32767.0)
-        self.assertTrue(sample.buttons_pressed)
         joystick.close()
         self.assertEqual(closed, [41])
 
@@ -8480,59 +4208,6 @@ class UnixSeqpacketPublisherTest(unittest.TestCase):
 
 
 class CameraYawSourceCliTest(unittest.TestCase):
-    def test_provider_inherits_complete_engine_camera_bridge_paths(self) -> None:
-        environment = {
-            "MATRIX_ENGINE_INPUT_SOCKET": "/run/user/1000/engine.sock",
-            "MATRIX_ENGINE_INPUT_CAPABILITY_FILE": "/run/user/1000/engine.cap",
-        }
-        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
-            os.sys,
-            "argv",
-            ["matrix_game_control_input.py", *WORLD_CLI_ARGS, "--dry-run"],
-        ):
-            args = MODULE._parse_args()
-        MODULE._validate_args(args)
-        self.assertEqual(args.engine_input_socket, Path(environment["MATRIX_ENGINE_INPUT_SOCKET"]))
-        self.assertEqual(
-            args.engine_input_capability_file,
-            Path(environment["MATRIX_ENGINE_INPUT_CAPABILITY_FILE"]),
-        )
-
-        with mock.patch.dict(
-            os.environ,
-            {"MATRIX_ENGINE_INPUT_SOCKET": "/run/user/1000/engine.sock"},
-            clear=True,
-        ), mock.patch.object(
-            os.sys,
-            "argv",
-            ["matrix_game_control_input.py", *WORLD_CLI_ARGS, "--dry-run"],
-        ):
-            incomplete = MODULE._parse_args()
-        with self.assertRaisesRegex(SystemExit, "supplied together"):
-            MODULE._validate_args(incomplete)
-
-    def test_provider_requires_and_strictly_validates_game_world_id(self) -> None:
-        with mock.patch.object(
-            os.sys,
-            "argv",
-            ["matrix_game_control_input.py", "--dry-run"],
-        ), self.assertRaises(SystemExit):
-            MODULE._parse_args()
-
-        with mock.patch.object(
-            os.sys,
-            "argv",
-            [
-                "matrix_game_control_input.py",
-                "--game-world-id",
-                "invalid world id",
-                "--dry-run",
-            ],
-        ):
-            invalid = MODULE._parse_args()
-        with self.assertRaisesRegex(SystemExit, "--game-world-id is invalid"):
-            MODULE._validate_args(invalid)
-
     def test_provider_parser_accepts_an_open_game_command_fd(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
@@ -8541,87 +4216,17 @@ class CameraYawSourceCliTest(unittest.TestCase):
                 "argv",
                 [
                     "matrix_game_control_input.py",
-                    *WORLD_CLI_ARGS,
                     "--game-command-fd",
                     str(provider.fileno()),
-                    "--runtime-pause-capability",
-                    "available",
                     "--dry-run",
                 ],
             ):
                 args = MODULE._parse_args()
             MODULE._validate_args(args)
             self.assertEqual(args.game_command_fd, provider.fileno())
-            self.assertEqual(args.runtime_pause_capability, "available")
         finally:
             provider.close()
             runtime.close()
-
-    def test_provider_rejects_pause_capability_without_command_channel(self) -> None:
-        with mock.patch.object(
-            os.sys,
-            "argv",
-            [
-                "matrix_game_control_input.py",
-                *WORLD_CLI_ARGS,
-                "--runtime-pause-capability",
-                "available",
-                "--dry-run",
-            ],
-        ):
-            args = MODULE._parse_args()
-        with self.assertRaisesRegex(SystemExit, "requires --game-command-fd"):
-            MODULE._validate_args(args)
-
-    def test_provider_external_control_endpoint_is_all_or_none_and_bounded(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            base = [
-                "matrix_game_control_input.py",
-                *WORLD_CLI_ARGS,
-                "--external-control-socket",
-                os.fspath(root / "control.sock"),
-                "--external-control-capability-file",
-                os.fspath(root / "control.cap"),
-                "--external-control-deadman-seconds",
-                "0.10",
-                "--dry-run",
-            ]
-            with mock.patch.object(os.sys, "argv", base):
-                args = MODULE._parse_args()
-            MODULE._validate_args(args)
-            self.assertEqual(args.external_control_deadman_seconds, 0.10)
-
-            with mock.patch.object(
-                os.sys,
-                "argv",
-                [
-                    "matrix_game_control_input.py",
-                    *WORLD_CLI_ARGS,
-                    "--external-control-socket",
-                    os.fspath(root / "control.sock"),
-                    "--dry-run",
-                ],
-            ):
-                incomplete = MODULE._parse_args()
-            with self.assertRaisesRegex(SystemExit, "all-or-none"):
-                MODULE._validate_args(incomplete)
-
-            too_slow = list(base)
-            too_slow[too_slow.index("0.10")] = "0.16"
-            with mock.patch.object(os.sys, "argv", too_slow):
-                invalid = MODULE._parse_args()
-            with self.assertRaisesRegex(SystemExit, r"\[0.01, 0.15\]"):
-                MODULE._validate_args(invalid)
-
-            collision = list(base)
-            collision[
-                collision.index(os.fspath(root / "control.sock"))
-            ] = os.fspath(MODULE.DEFAULT_SOCKET)
-            with mock.patch.object(os.sys, "argv", collision):
-                conflicting = MODULE._parse_args()
-            with self.assertRaisesRegex(SystemExit, "distinct"):
-                MODULE._validate_args(conflicting)
 
     def test_provider_validation_rejects_a_closed_game_command_fd(self) -> None:
         provider, runtime = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -8633,7 +4238,6 @@ class CameraYawSourceCliTest(unittest.TestCase):
             "argv",
             [
                 "matrix_game_control_input.py",
-                *WORLD_CLI_ARGS,
                 "--game-command-fd",
                 str(descriptor),
                 "--dry-run",
@@ -8648,37 +4252,27 @@ class CameraYawSourceCliTest(unittest.TestCase):
             with self.subTest(source=source), mock.patch.object(
                 os.sys,
                 "argv",
-                [
-                    "matrix_game_control_input.py",
-                    *WORLD_CLI_ARGS,
-                    "--camera-yaw-source",
-                    source,
-                ],
+                ["matrix_game_control_input.py", "--camera-yaw-source", source],
             ):
                 args = MODULE._parse_args()
                 self.assertEqual(args.camera_yaw_source, source)
 
-    def test_provider_parser_accepts_explicit_escape_grab(self) -> None:
+    def test_provider_parser_accepts_ui_key_grab(self) -> None:
         with mock.patch.object(
             os.sys,
             "argv",
-            ["matrix_game_control_input.py", *WORLD_CLI_ARGS, "--dry-run"],
+            ["matrix_game_control_input.py", "--dry-run"],
         ):
             default = MODULE._parse_args()
-        self.assertFalse(default.grab_escape)
+        self.assertFalse(default.grab_ui_keys)
 
         with mock.patch.object(
             os.sys,
             "argv",
-            [
-                "matrix_game_control_input.py",
-                *WORLD_CLI_ARGS,
-                "--grab-escape",
-                "--dry-run",
-            ],
+            ["matrix_game_control_input.py", "--grab-ui-keys", "--dry-run"],
         ):
             explicit = MODULE._parse_args()
-        self.assertTrue(explicit.grab_escape)
+        self.assertTrue(explicit.grab_ui_keys)
 
     def test_provider_parser_accepts_final_pov_state_file(self) -> None:
         with mock.patch.object(
@@ -8686,7 +4280,6 @@ class CameraYawSourceCliTest(unittest.TestCase):
             "argv",
             [
                 "matrix_game_control_input.py",
-                *WORLD_CLI_ARGS,
                 "--camera-yaw-source",
                 "ue-final-pov",
                 "--ue-camera-state-file",
@@ -8710,7 +4303,6 @@ class CameraYawSourceCliTest(unittest.TestCase):
             "argv",
             [
                 "matrix_game_control_input.py",
-                *WORLD_CLI_ARGS,
                 "--camera-yaw-source",
                 "ue-final-pov",
                 "--dry-run",
@@ -8719,6 +4311,27 @@ class CameraYawSourceCliTest(unittest.TestCase):
             args = MODULE._parse_args()
         with self.assertRaisesRegex(SystemExit, "expected-ue-pid"):
             MODULE._validate_args(args)
+
+
+class LockedSonicLoadoutTest(unittest.TestCase):
+    def test_fixed_runtime_exposes_only_sonic_and_no_recovery_candidates(self) -> None:
+        loadout = MODULE.locked_sonic_strategy_loadout()
+        self.assertEqual(loadout["status"], "locked")
+        self.assertIsNone(loadout["pending"])
+        slots = {slot["slot"]: slot for slot in loadout["slots"]}
+        self.assertEqual(set(slots), {"locomotion", "recovery"})
+        self.assertTrue(slots["locomotion"]["locked"])
+        self.assertEqual(slots["locomotion"]["selected_policy_id"], "sonic")
+        self.assertEqual(
+            [
+                candidate["policy_id"]
+                for candidate in slots["locomotion"]["candidates"]
+            ],
+            ["sonic"],
+        )
+        self.assertTrue(slots["recovery"]["locked"])
+        self.assertEqual(slots["recovery"]["selected_policy_id"], "off")
+        self.assertEqual(slots["recovery"]["candidates"], [])
 
 
 if __name__ == "__main__":

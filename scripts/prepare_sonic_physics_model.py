@@ -19,15 +19,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from compose_custom_scene import compose_custom_scene, freejoint_body_names  # noqa: E402
-from inject_creative_inventory import (  # noqa: E402
-    INVENTORY_STORAGE_CONTRACT_VERSION,
-    InventoryCatalogError,
-    inject_catalog,
-    load_catalog,
-)
 
 
-PIPELINE_VERSION = 14
+PIPELINE_VERSION = 5
 SCENE_TRANSFORM_NONE = "none"
 TOWN10_OPEN_BOUNDARY_TRANSFORM = "town10-open-boundary-v1"
 MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM = "moon-dynamic-ground-mocap-v3"
@@ -56,9 +50,6 @@ MOON_CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES = 33
 MOON_CONTINUOUS_SUPPORT_HALF_EXTENT_M = 1.6
 MOON_CONTINUOUS_SUPPORT_HEIGHT_RANGE_M = 64.0
 MOON_CONTINUOUS_SUPPORT_BASE_DEPTH_M = 1.0
-# The pad covers a locked-map flat footprint.  Its top is exactly coincident
-# with the locked terrain height so the physical contact plane and the PFNN
-# terrain sample use the same world Z.
 MOON_SPAWN_PAD_HALF_SIZE_M = (6.0, 6.0, 0.01)
 MOON_SPAWN_PAD_CENTER_M = (
     -94.7,
@@ -71,18 +62,10 @@ MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M = (
     -6.101562023162842,
     -6.101562023162842,
 )
-# The historical Leo spawn places the robot root about 0.85 m above the
-# locked flat pad.  Keep that root-to-pad-top relationship for alternate
-# MoonWorld spawn points so the startup clearance audit is local to the
-# selected route instead of the old hard-coded footprint.
 MOON_SPAWN_PAD_ROOT_CLEARANCE_M = 0.85
 MOON_COLLISION_FRICTION = "1 0.005 0.0001"
 MOON_COLLISION_SOLREF = "0.02 1"
 MOON_COLLISION_SOLIMP = "0.9 0.95 0.001 0.5 2"
-MOON_DEFAULT_ROOT_CLEARANCE_M = 0.793
-MOON_DEFAULT_SPAWN_Z_M = (
-    MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M + MOON_DEFAULT_ROOT_CLEARANCE_M
-)
 TOWN10_SOURCE_SCENE_SHA256 = (
     "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6"
 )
@@ -192,94 +175,6 @@ def normalize_moon_dynamic_ground_collision_mode(
         f"{MOON_DYNAMIC_GROUND_COLLISION_HFIELD} or "
         f"{MOON_DYNAMIC_GROUND_COLLISION_TILES}"
     )
-
-
-def _strip_canonical_scene_sections(
-    root: ET.Element,
-    *,
-    robot_worldbody: ET.Element,
-    robot_root_body: ET.Element,
-) -> None:
-    """Keep the canonical robot while dropping any bundled demo scene.
-
-    Some policy releases ship a self-contained MJCF with both the robot and a
-    floor/light/skybox.  Matrix composes that robot into its own native scene;
-    retaining the demo floor creates duplicate assets and collision geometry.
-    Asset pruning is based on references from the retained robot worldbody, so
-    robot meshes and materials remain intact.
-    """
-
-    for worldbody in list(root.findall("worldbody")):
-        if worldbody is not robot_worldbody:
-            root.remove(worldbody)
-    # MJCF also commonly places the robot and demo floor/light in one
-    # worldbody.  Retain only the top-level branch containing the free-root
-    # robot; Matrix supplies all scene siblings itself.
-    for child in list(robot_worldbody):
-        if child is robot_root_body or any(
-            item is robot_root_body for item in child.iter()
-        ):
-            continue
-        robot_worldbody.remove(child)
-    retained_body_names = {
-        body.get("name")
-        for body in robot_worldbody.iter("body")
-        if body.get("name")
-    }
-    for equality in list(root.findall("equality")):
-        for constraint in list(equality):
-            referenced_bodies = tuple(
-                name
-                for name in (
-                    constraint.get("body1"),
-                    constraint.get("body2"),
-                )
-                if name
-            )
-            if any(name not in retained_body_names for name in referenced_bodies):
-                equality.remove(constraint)
-        if not list(equality):
-            root.remove(equality)
-    for tag in ("statistic", "visual"):
-        for element in list(root.findall(tag)):
-            root.remove(element)
-
-    referenced_assets: set[str] = set()
-    reference_roots = [robot_worldbody, *root.findall("default")]
-    for reference_root in reference_roots:
-        for element in reference_root.iter():
-            for attribute in ("mesh", "material", "hfield", "texture", "skin"):
-                value = element.get(attribute)
-                if value:
-                    referenced_assets.add(value)
-
-    asset_sections = list(root.findall("asset"))
-    named_assets: dict[str, ET.Element] = {}
-    for section in asset_sections:
-        for item in list(section):
-            name = item.get("name")
-            if name:
-                named_assets[name] = item
-
-    pending = list(referenced_assets)
-    while pending:
-        name = pending.pop()
-        item = named_assets.get(name)
-        if item is None:
-            continue
-        for attribute in ("mesh", "material", "texture", "hfield", "skin"):
-            dependency = item.get(attribute)
-            if dependency and dependency not in referenced_assets:
-                referenced_assets.add(dependency)
-                pending.append(dependency)
-
-    for section in asset_sections:
-        for item in list(section):
-            name = item.get("name")
-            if name and name not in referenced_assets:
-                section.remove(item)
-        if not list(section):
-            root.remove(section)
 
 
 def _file_sha256(path: Path) -> str:
@@ -433,9 +328,7 @@ def _scene_transform_removals(
                 for name in names
             )
         ):
-            raise SonicPhysicsModelError(
-                f"{transform} tile body names drifted"
-            )
+            raise SonicPhysicsModelError(f"{transform} tile body names drifted")
         return transform, (), names
     if transform != TOWN10_OPEN_BOUNDARY_TRANSFORM:
         raise SonicPhysicsModelError(f"unsupported scene transform: {transform}")
@@ -671,16 +564,8 @@ def _apply_scene_transform_additions(
             raise SonicPhysicsModelError(
                 f"MoonWorld tile {body_name} collision source contract drifted"
             )
-        if tile_compiled_collision:
-            # Preserve the official rolling-box collision mechanism. Runtime
-            # briefly disarms these compiled collision geoms while the finite
-            # spawn pad owns the initial clearance audit, then enables all 256
-            # in one handoff before the next MuJoCo step.
-            tile_geom.set("contype", "1")
-            tile_geom.set("conaffinity", "1")
-        else:
-            tile_geom.set("contype", "0")
-            tile_geom.set("conaffinity", "0")
+        tile_geom.set("contype", "1" if tile_compiled_collision else "0")
+        tile_geom.set("conaffinity", "1" if tile_compiled_collision else "0")
 
     asset = root.find("asset")
     if asset is None:
@@ -714,8 +599,6 @@ def _apply_scene_transform_additions(
                 "type": "hfield",
                 "hfield": MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
                 "pos": f"0 0 {MOON_DYNAMIC_GROUND_DEFAULT_HEIGHT_M:.12g}",
-                # The hfield is the stable default collision backend. In the
-                # explicit rolling-tile experiment it remains observation-only.
                 "contype": "1" if support_compiled_collision else "0",
                 "conaffinity": "1" if support_compiled_collision else "0",
                 "friction": MOON_COLLISION_FRICTION,
@@ -810,12 +693,11 @@ def _source_contract(
     spawn_yaw: float | None,
     scene_transform: str,
     removed_environment_geoms: tuple[str, ...],
-    staticized_freejoint_bodies: tuple[str, ...],
-    creative_inventory_catalog: Path | None,
+    staticized_freejoint_bodies: tuple[str, ...] = (),
     moon_dynamic_ground_collision_mode: str | None = None,
 ) -> dict[str, object]:
     native_assets = native_scene.parent / "assets"
-    contract = {
+    return {
         "pipeline_version": PIPELINE_VERSION,
         "canonical_model": str(canonical_model.resolve()),
         "canonical_model_sha256": _file_sha256(canonical_model),
@@ -834,45 +716,11 @@ def _source_contract(
         "scene_transform": scene_transform,
         "removed_environment_geoms": list(removed_environment_geoms),
         "staticized_freejoint_bodies": list(staticized_freejoint_bodies),
-        "creative_inventory": _creative_inventory_source_contract(
-            creative_inventory_catalog
+        "scene_transform_contract": _scene_transform_contract(
+            scene_transform,
+            moon_dynamic_ground_collision_mode=moon_dynamic_ground_collision_mode,
+            spawn_xyz=spawn_xyz,
         ),
-    }
-    scene_transform_contract = _scene_transform_contract(
-        scene_transform,
-        moon_dynamic_ground_collision_mode=moon_dynamic_ground_collision_mode,
-        spawn_xyz=spawn_xyz,
-    )
-    if scene_transform_contract is not None:
-        contract["scene_transform_contract"] = scene_transform_contract
-    return contract
-
-
-def _creative_inventory_source_contract(
-    catalog: Path | None,
-) -> dict[str, object] | None:
-    if catalog is None:
-        return None
-    try:
-        items = load_catalog(catalog)
-    except InventoryCatalogError as exc:
-        raise SonicPhysicsModelError(f"invalid creative inventory catalog: {exc}") from exc
-    meshes = sorted(
-        {visual.mesh.resolve() for item in items for visual in item.visuals},
-        key=lambda path: path.as_posix(),
-    )
-    return {
-        "storage_contract_version": INVENTORY_STORAGE_CONTRACT_VERSION,
-        "catalog": str(catalog.resolve()),
-        "catalog_sha256": _file_sha256(catalog),
-        "meshes": [
-            {
-                "path": str(mesh),
-                "size": mesh.stat().st_size,
-                "sha256": _file_sha256(mesh),
-            }
-            for mesh in meshes
-        ],
     }
 
 
@@ -883,8 +731,6 @@ def physics_revision_payload(
     *,
     body_joint_names: tuple[str, ...] = G1_BODY_JOINT_NAMES,
     scene_transform: str | None = None,
-    creative_inventory_catalog: Path | None = None,
-    moon_dynamic_ground_collision_mode: str | None = None,
 ) -> dict[str, object]:
     """Return the location-independent source contract for save isolation.
 
@@ -903,6 +749,11 @@ def physics_revision_payload(
     ) = (
         _scene_transform_removals(native_scene, scene_transform)
     )
+    normalized_moon_collision_mode = None
+    if normalized_scene_transform == MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM:
+        normalized_moon_collision_mode = (
+            normalize_moon_dynamic_ground_collision_mode()
+        )
     contract = _source_contract(
         canonical_model,
         canonical_meshes,
@@ -913,8 +764,7 @@ def physics_revision_payload(
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
         staticized_freejoint_bodies=staticized_freejoint_bodies,
-        creative_inventory_catalog=creative_inventory_catalog,
-        moon_dynamic_ground_collision_mode=moon_dynamic_ground_collision_mode,
+        moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
     )
     native_scene_assets = []
     for asset in contract["native_scene_assets"]:
@@ -927,31 +777,7 @@ def physics_revision_payload(
                 "sha256": asset["sha256"],
             }
         )
-    creative_inventory = contract["creative_inventory"]
-    inventory_revision = None
-    if creative_inventory is not None:
-        if not isinstance(creative_inventory, dict):
-            raise SonicPhysicsModelError("creative inventory contract is invalid")
-        meshes = creative_inventory.get("meshes")
-        if not isinstance(meshes, list):
-            raise SonicPhysicsModelError("creative inventory mesh contract is invalid")
-        inventory_revision = {
-            "storage_contract_version": creative_inventory[
-                "storage_contract_version"
-            ],
-            "catalog_sha256": creative_inventory["catalog_sha256"],
-            "meshes": [
-                {
-                    "size": mesh["size"],
-                    "sha256": mesh["sha256"],
-                }
-                for mesh in meshes
-                if isinstance(mesh, dict)
-            ],
-        }
-        if len(inventory_revision["meshes"]) != len(meshes):
-            raise SonicPhysicsModelError("creative inventory mesh entry is invalid")
-    payload = {
+    return {
         "schema": "matrix-sonic-physics-source/v1",
         "pipeline_version": contract["pipeline_version"],
         "canonical_model_sha256": contract["canonical_model_sha256"],
@@ -961,13 +787,10 @@ def physics_revision_payload(
         "native_scene_assets": native_scene_assets,
         "body_joint_names": contract["body_joint_names"],
         "scene_transform": contract["scene_transform"],
-        "creative_inventory": inventory_revision,
         "removed_environment_geoms": contract["removed_environment_geoms"],
         "staticized_freejoint_bodies": contract["staticized_freejoint_bodies"],
+        "scene_transform_contract": contract["scene_transform_contract"],
     }
-    if "scene_transform_contract" in contract:
-        payload["scene_transform_contract"] = contract["scene_transform_contract"]
-    return payload
 
 
 def _strip_non_body_joints(
@@ -1002,37 +825,26 @@ def _strip_non_body_joints(
             f"canonical SONIC model is missing body actuators: {missing_actuators}"
         )
 
-    worldbodies = list(root.findall("worldbody"))
-    if not worldbodies:
+    worldbody = root.find("worldbody")
+    if worldbody is None:
         raise SonicPhysicsModelError("canonical SONIC model has no worldbody")
-    root_body = next(
-        (
-            body
-            for worldbody in worldbodies
-            for body in worldbody.iter("body")
-            if any(
-                child.tag == "freejoint"
-                or (child.tag == "joint" and child.get("type") == "free")
-                for child in list(body)
-            )
-        ),
-        None,
-    )
-    if root_body is None:
-        raise SonicPhysicsModelError(
-            "canonical SONIC model has no body with a free root joint"
-        )
-    worldbody = next(
-        worldbody
-        for worldbody in worldbodies
-        if any(body is root_body for body in worldbody.iter("body"))
-    )
-    _strip_canonical_scene_sections(
-        root,
-        robot_worldbody=worldbody,
-        robot_root_body=root_body,
-    )
     if spawn_xyz is not None or spawn_yaw is not None:
+        root_body = next(
+            (
+                body
+                for body in worldbody.iter("body")
+                if any(
+                    child.tag == "freejoint"
+                    or (child.tag == "joint" and child.get("type") == "free")
+                    for child in list(body)
+                )
+            ),
+            None,
+        )
+        if root_body is None:
+            raise SonicPhysicsModelError(
+                "canonical SONIC model has no body with a free root joint"
+            )
         if spawn_xyz is not None:
             root_body.set("pos", " ".join(f"{value:.12g}" for value in spawn_xyz))
         if spawn_yaw is not None:
@@ -1119,28 +931,18 @@ def prepare_sonic_physics_model(
     spawn_xyz: tuple[float, float, float] | None = None,
     spawn_yaw: float | None = None,
     scene_transform: str | None = None,
-    creative_inventory_catalog: Path | None = None,
     moon_dynamic_ground_collision_mode: str | None = None,
 ) -> Path:
     canonical_model = canonical_model.resolve()
     canonical_meshes = canonical_meshes.resolve()
     native_scene = native_scene.resolve()
     output_dir = output_dir.resolve()
-    creative_inventory_catalog = (
-        creative_inventory_catalog.resolve()
-        if creative_inventory_catalog is not None
-        else None
-    )
     if not canonical_model.is_file():
         raise SonicPhysicsModelError(f"canonical SONIC model is missing: {canonical_model}")
     if not canonical_meshes.is_dir():
         raise SonicPhysicsModelError(f"canonical SONIC meshes are missing: {canonical_meshes}")
     if not native_scene.is_file():
         raise SonicPhysicsModelError(f"Matrix native scene is missing: {native_scene}")
-    if creative_inventory_catalog is not None and not creative_inventory_catalog.is_file():
-        raise SonicPhysicsModelError(
-            f"creative inventory catalog is missing: {creative_inventory_catalog}"
-        )
     if not body_joint_names:
         raise SonicPhysicsModelError("body joint contract must not be empty")
     if spawn_xyz is not None and (
@@ -1181,7 +983,6 @@ def prepare_sonic_physics_model(
         scene_transform=normalized_scene_transform,
         removed_environment_geoms=removed_environment_geoms,
         staticized_freejoint_bodies=staticized_freejoint_bodies,
-        creative_inventory_catalog=creative_inventory_catalog,
         moon_dynamic_ground_collision_mode=normalized_moon_collision_mode,
     )
     manifest_path = output_dir / "manifest.json"
@@ -1230,18 +1031,6 @@ def prepare_sonic_physics_model(
             spawn_xyz=normalized_spawn_xyz,
             spawn_yaw=normalized_spawn_yaw,
         )
-        if creative_inventory_catalog is not None:
-            try:
-                inject_catalog(
-                    temporary_dir / "robot.xml",
-                    temporary_dir / "meshes",
-                    creative_inventory_catalog,
-                    use_default_classes=False,
-                )
-            except InventoryCatalogError as exc:
-                raise SonicPhysicsModelError(
-                    f"cannot inject creative inventory: {exc}"
-                ) from exc
         compose_custom_scene(
             native_scene,
             temporary_dir / native_scene.name,
@@ -1283,7 +1072,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--canonical-meshes", type=Path, required=True)
     parser.add_argument("--native-scene", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--creative-inventory-catalog", type=Path)
     parser.add_argument("--spawn-x", type=float)
     parser.add_argument("--spawn-y", type=float)
     parser.add_argument("--spawn-z", type=float)
@@ -1333,7 +1121,6 @@ def main() -> int:
             spawn_xyz=spawn_xyz,
             spawn_yaw=args.spawn_yaw,
             scene_transform=args.scene_transform,
-            creative_inventory_catalog=args.creative_inventory_catalog,
             moon_dynamic_ground_collision_mode=(
                 args.moon_dynamic_ground_collision_mode
             ),

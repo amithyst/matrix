@@ -1,14 +1,6 @@
 {
   "schema_version": 2,
   "runtime_id": "matrix-sonic-native-v2",
-  "policy_slots": {
-    "manifests": [
-      {
-        "path": "config/runtime/policy-slots/bfm-sonic-teacher50k.json",
-        "sha256": "a04af9296c2a770f5aa04547bbf120f39dc67cd2a0c6facd9b2c5d0d1bcb3f22"
-      }
-    ]
-  },
   "source": {
     "repository": "https://github.com/amithyst/matrix",
     "base_commit": "6609ad59e65b8a360b0de288d126477ea6034c34"
@@ -40,12 +32,6 @@
         "file": "Town10World-0.1.2.tar.gz",
         "size": 1159597956,
         "sha256": "246cc4f96571022f19f7e5cf35aa2788c3c8420a2bf2535b56a6aa2e33a05801"
-      },
-      {
-        "name": "HouseWorld",
-        "file": "HouseWorld-0.1.2.tar.gz",
-        "size": 402917615,
-        "sha256": "489d8db9c8471bc652bbebb5f0555c1bf50ea5854a90490cecc157667e150822"
       },
       {
         "name": "MoonWorld",
@@ -101,19 +87,9 @@
         "sha256": "4492e48e800e46ccfe9eb7511baa7a5c05d4fb73bb99b24d9e2694ce10da16ba"
       },
       {
-        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_house.xml",
-        "size": 13118,
-        "sha256": "2586d8a5f7263eaa31fd1347202b3767888a181c7aad56e0a4a21838ed250a64"
-      },
-      {
         "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_meet.xml",
         "size": 9066,
         "sha256": "17a2370eacfaefd4fe682a040d8543c4a34c46c0d1aa81652704af469486e494"
-      },
-      {
-        "path": "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_moon_dynamic.xml",
-        "size": 61584,
-        "sha256": "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5"
       },
       {
         "path": "src/robot_mujoco/zsibot_robots/xgb/height_field.png",
@@ -124,11 +100,6 @@
         "path": "src/robot_mujoco/zsibot_robots/xgb/unitree_hfield.png",
         "size": 14273,
         "sha256": "8a3f9777e096c5e8b6a5f8b2ca9382d5b25e2cacc15be7b5ac41f1e432e61a6c"
-      },
-      {
-        "path": "dynamicmaps/moonworld.bin",
-        "size": 144000000,
-        "sha256": "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
       }
     ],
     "installed_trees": [
@@ -138,7 +109,7 @@
       },
       {
         "path": "src/UeSim/Linux/zsibot_mujoco_ue/Content/Paks",
-        "sha256": "6063433987ed51cb566e421acf41daf9ef9bacd767c9d7a9abdc88e4034ef2ac"
+        "sha256": "504d56c3e971d116949ffbcb9fb0dad668b62ed12939f5bb00654175706b9063"
       },
       {
         "path": "src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux",
@@ -178,7 +149,7 @@
   "source_revisions": {
     "gr00t_whole_body_control": {
       "repository": "ssh://git@gitlab.xvirobotics.com:2222/hqfu/GR00T-WholeBodyControl.git",
-      "commit": "e19b627f544b2f57bd245800d0e8e91c5a678bbd",
+      "commit": "de083d71af8346b0124ab1ae79fd3623b52c3c9b",
       "critical_source_paths": [
         "gear_sonic/scripts/run_sim_loop.py",
         "gear_sonic/utils/mujoco_sim/configs.py",
@@ -194,8 +165,6 @@
         "gear_sonic/trl/utils/rotation_conversion.py",
         "gear_sonic/trl/utils/torch_transform.py",
         "gear_sonic/scripts/pico_manager_thread_server.py",
-        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/localmotion_kplanner.hpp",
-        "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
         "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
         "gear_sonic_deploy/policy/release/observation_config.yaml"
       ]
@@ -220,7 +189,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic/utils/mujoco_sim/base_sim.py",
-      "sha256": "31b5518c4636bac7f62757ace09e211c9667d7f057aad055698c59787574a402"
+      "sha256": "675772ddf30f1e63dc69d5c02cbefaccb77013114422b057245054f5f6a5dfaf"
     },
     {
       "root": "sonic",
@@ -230,7 +199,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic/utils/mujoco_sim/unitree_sdk2py_bridge.py",
-      "sha256": "a2703452601fd21e36763afa8cd70110b35677b2f909a265f632bef52cefcef3"
+      "sha256": "b1f38bbaa584c4754a7d04384e08c469e1c2d167990ea920ad4e5384f7046359"
     },
     {
       "root": "sonic",
@@ -279,16 +248,6 @@
     },
     {
       "root": "sonic",
-      "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/localmotion_kplanner.hpp",
-      "sha256": "cd7c46763d5cc13ba05fad5c421667ffceb256138faa5ac9e403938172cbeb93"
-    },
-    {
-      "root": "sonic",
-      "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
-      "sha256": "5188eac0de5989bdb5dbd7446475fb4cd4f4906b30f760135a0a2dbe1a301420"
-    },
-    {
-      "root": "sonic",
       "path": "gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml",
       "sha256": "00b4e3d74fcc4a63aae8cc26466a99c33eaa1e6683f2858b059486d9a0f147b5"
     },
@@ -300,7 +259,7 @@
     {
       "root": "sonic",
       "path": "gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
-      "sha256": "378d3b9a85133a2b5836df3da1b824d2f083186a4b5427afadf1b9da4f3f3bba"
+      "sha256": "bf9b2362ed750b6b3f67c33197517474cd18a331d7e3d1c652cfdd740203c21e"
     },
     {
       "root": "sonic",

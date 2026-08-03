@@ -16,6 +16,9 @@ class SceneCompositionError(RuntimeError):
     """Raised when a native scene cannot be composed reproducibly."""
 
 
+MOON_DYNAMIC_SCENE_NAME = "scene_terrain_moon_dynamic.xml"
+
+
 def _is_relative_to(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -148,7 +151,9 @@ def _staticize_freejoint_bodies(root: ET.Element) -> tuple[str, ...]:
     if not names:
         return ()
 
-    for body in root.find("worldbody").iter("body"):  # type: ignore[union-attr]
+    worldbody = root.find("worldbody")
+    assert worldbody is not None
+    for body in worldbody.iter("body"):
         for child in list(body):
             if child.tag == "freejoint" or (
                 child.tag == "joint" and child.get("type") == "free"
@@ -258,7 +263,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--source-asset-root", type=Path)
     parser.add_argument("--target-asset-root", type=Path)
     parser.add_argument("--remove-geom", action="append", default=[])
-    parser.add_argument("--staticize-freejoint-bodies", action="store_true")
     return parser.parse_args()
 
 
@@ -272,7 +276,6 @@ def main() -> int:
             source_asset_root=args.source_asset_root,
             target_asset_root=args.target_asset_root,
             remove_geoms=tuple(args.remove_geom),
-            staticize_freejoint_bodies=args.staticize_freejoint_bodies,
         )
     except SceneCompositionError as exc:
         raise SystemExit(f"[ERROR] {exc}") from exc

@@ -15,8 +15,6 @@ SKIP_ASSETS=0
 SKIP_PYTHON=0
 VERIFY_ONLY=0
 AUDIT_VENV="$PROJECT_ROOT/.venv-audit"
-INVOCATION_SONIC_ROOT_SET="${MATRIX_SONIC_ROOT+x}"
-INVOCATION_SONIC_ROOT_VALUE="${MATRIX_SONIC_ROOT-}"
 
 usage() {
     cat <<'EOF'
@@ -69,11 +67,6 @@ if ! load_matrix_local_env "$PROJECT_ROOT"; then
 fi
 if [[ -n "$RUNTIME_OVERRIDE" ]]; then
     export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"
-fi
-if [[ "$INVOCATION_SONIC_ROOT_SET" == "x" ]]; then
-    export MATRIX_SONIC_ROOT="$INVOCATION_SONIC_ROOT_VALUE"
-elif [[ -n "$RUNTIME_OVERRIDE" ]]; then
-    unset MATRIX_SONIC_ROOT
 fi
 # Load profile defaults after host-local overrides so paths derived from
 # MATRIX_RUNTIME_ROOT always follow the selected runtime bundle.
@@ -407,11 +400,6 @@ import sys
 lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 release = lock["matrix_release"]
 packages = {item["name"]: dict(item) for item in release["packages"]}
-map_packages = [
-    item
-    for item in release["packages"]
-    if item["name"] not in {"assets", "base", "shared"}
-]
 
 def package(name: str, *, required: bool) -> dict[str, object]:
     item = packages[name]
@@ -433,13 +421,9 @@ payload = {
         },
         "maps": [
             {
-                "name": item["name"],
-                "file": item["file"],
-                "required": False,
-                "size": item["size"],
-                "sha256": item["sha256"],
+                "name": "Town10World",
+                **package("Town10World", required=False),
             }
-            for item in map_packages
         ],
     },
 }
@@ -451,20 +435,7 @@ PY
     fi
 
     if [[ "$SKIP_ASSETS" != "1" ]]; then
-        LOCKED_MATRIX_MAPS="$(python3 - "$LOCK_FILE" <<'PY'
-import json
-import sys
-
-release = json.load(open(sys.argv[1], encoding="utf-8"))["matrix_release"]
-maps = [
-    item["name"]
-    for item in release["packages"]
-    if item["name"] not in {"assets", "base", "shared"}
-]
-print(" ".join(maps))
-PY
-        )"
-        INSTALL_ENV=(MATRIX_MAPS="$LOCKED_MATRIX_MAPS" MATRIX_ASSUME_YES=1)
+        INSTALL_ENV=(MATRIX_MAPS=Town10World MATRIX_ASSUME_YES=1)
         if [[ -n "$RELEASE_CACHE" ]]; then
             INSTALL_ENV+=(MATRIX_OFFLINE=1)
         fi
@@ -483,10 +454,6 @@ PY
             ln -sfn "$ue_rmw" "$rmw_dir/librmw_fastrtps_cpp.so"
         fi
     fi
-fi
-
-if [[ "$VERIFY_ONLY" != "1" ]]; then
-    bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh"
 fi
 
 if [[ -z "${RUNTIME_PYTHON:-}" ]]; then
@@ -515,8 +482,6 @@ if [[ "$WRITE_LOCAL_ENV" == "1" ]]; then
     mkdir -p "$PROJECT_ROOT/.matrix"
     python3 "$SCRIPT_DIR/update_matrix_local_env.py" \
         "$PROJECT_ROOT/.matrix/local.env" MATRIX_RUNTIME_ROOT "$RUNTIME_ROOT"
-    python3 "$SCRIPT_DIR/update_matrix_local_env.py" \
-        "$PROJECT_ROOT/.matrix/local.env" MATRIX_SONIC_ROOT "$MATRIX_SONIC_ROOT"
     echo "[INFO] Updated ignored host override: $PROJECT_ROOT/.matrix/local.env"
 fi
 echo "[PASS] Matrix SONIC bootstrap complete: profile=$PROFILE runtime=$RUNTIME_ROOT"

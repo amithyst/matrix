@@ -19,14 +19,9 @@ Implemented behavior:
   and S;
 - diagonals are normalized, with speed, acceleration, deceleration, and turn
   rate limited;
-- keyboard WASD selects native slow/walk/run modes: Ctrl or Alt, no modifier,
-  and Shift map to SONIC modes 1, 2, and 3 respectively; a second tap of the
-  same direction inside the configured window selects that tier's boost speed;
+- keyboard WASD selects native slow/walk/run modes: Ctrl, no modifier, and
+  Shift map to SONIC modes 1, 2, and 3 respectively;
 - Q/E is excluded from locomotion yaw;
-- left/right arrows rotate UE camera yaw and up/down arrows rotate pitch through
-  the main provider's pre-enumerated uinput bridge;
-- ESC-open, UE-focus-loss, and missing-bridge frames disable arrow camera input;
-  bridge I/O is coalesced on a background thread outside the 50 Hz loop;
 - exact UE-PID focus loss, observed V safety-state toggles, camera drag, stale
   input, disconnect, and provider failure stop the robot;
 - native LowCmd must be fresh and the startup elastic band fully released
@@ -55,17 +50,15 @@ be claimed from this implementation.
 | Item | Default / invariant |
 |---|---|
 | Input sampling | 50 Hz |
-| Local input protocol | strict `matrix-game-input/v3` (`ctrl`, `alt`, `shift`, and `keyboard_boost` are required fields) |
+| Local input protocol | strict `matrix-game-input/v2` (`ctrl` and `shift` are required fields) |
 | SONIC control | 50 Hz; native physics remains 200 Hz |
-| Maximum keyboard target | 2.75 m/s by default (run boost; panel configurable) |
+| Maximum keyboard target | 2.50 m/s (`RUN` lower boundary) |
 | Analog maximum | 0.30 m/s default; configurable up to 0.80 m/s, kept inside `SLOW_WALK` |
-| Keyboard gait profiles | Ctrl/Alt slow 0.20/0.30; unmodified walk 0.80/1.00; Shift run 2.50/2.75 m/s; each pair is base/double-tap boost and slow wins a conflict |
+| Keyboard gait profiles | Ctrl mode 1 / 0.10; unmodified mode 2 / 0.80; Shift mode 3 / 2.50 m/s; Ctrl wins a conflict |
 | Native gait intervals | mode 1: 0.10-0.80; mode 2: 0.80-2.50; mode 3: 2.50-7.50 m/s |
 | Acceleration / deceleration | 1.20 / 2.40 m/s² |
 | Maximum heading rate | 2.50 rad/s |
-| Arrow camera rate | Nominal 120 default; 30-360 in host-persisted ESC steps of 30; final velocity comes from UE final POV |
 | Translation heading gate | start within 15 degrees; stop beyond 30 degrees |
-| Turn before translation | native `IDLE + facing`; never `SLOW_WALK + speed=0` |
 | Left-stick radial deadzone | 0.15 |
 | Input timeout | 0.15 s |
 | Maximum snapshot age | 0.15 s |
@@ -99,18 +92,16 @@ git -C /home/kaijie/matrix worktree add --detach \
   /home/kaijie/worktrees/matrix-game-control-exp \
   origin/main
 cd /home/kaijie/worktrees/matrix-game-control-exp
-bash scripts/bootstrap_matrix_sonic.sh \
-  --profile heyuan \
-  --release-cache /home/kaijie/matrix-eval/releases \
-  --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
-  --write-local-env
+MATRIX_SONIC_ROOT=/home/kaijie/worktrees/sonic-matrix-native-final \
+  bash scripts/bootstrap_matrix_sonic.sh \
+    --profile heyuan \
+    --release-cache /home/kaijie/matrix-eval/releases \
+    --runtime-root /home/kaijie/matrix-artifacts/matrix-sonic-native-v2-heyuan \
+    --write-local-env
+/usr/bin/python3 scripts/update_matrix_local_env.py \
+  .matrix/local.env MATRIX_SONIC_ROOT \
+  /home/kaijie/worktrees/sonic-matrix-native-final
 ```
-
-The Heyuan profile consumes the attested
-`$MATRIX_RUNTIME_ROOT/GR00T-WholeBodyControl` archive mirror. The mirror must
-contain the locked `SONIC_COMMIT`, critical source hashes, runtime trees, and
-portable deploy binary; do not point a qualification run at an experimental
-SONIC worktree.
 
 ```bash
 MATRIX_EXPERIMENT_WORKTREE="${MATRIX_EXPERIMENT_WORKTREE:-/home/kaijie/worktrees/matrix-game-control-exp}"
@@ -224,16 +215,14 @@ At fixed SONIC yaw zero, verify the normalized physics directions:
 Also verify:
 
 1. W+A and W+D are not faster than W.
-2. Ctrl+W or Alt+W, W, and Shift+W settle at native modes/base speeds 1/0.10,
-   2/0.80, and 3/2.50 m/s respectively. Double-tapping W in the same tier
-   selects 0.20, 1.00, or 2.75 m/s; changing tier clears boost. Holding a slow
-   modifier with Shift uses the slow tier. During a transition, every
-   intermediate mode/speed pair stays in its native interval.
+2. Ctrl+W, W, and Shift+W settle at native modes/speeds 1/0.10, 2/0.80,
+   and 3/2.50 m/s respectively; holding Ctrl+Shift uses 1/0.10. During a
+   transition, every intermediate mode/speed pair stays in its native interval.
 3. A, D, and S rotate the robot toward movement; a reversal turns before it
    develops full translation speed.
 4. Q and E alone do not move the root or change the game-control heading.
 5. Releasing every movement direction, losing focus, or timing out publishes
-   mode 0 immediately; Ctrl/Alt/Shift without a direction remains mode 0.
+   mode 0 immediately; Ctrl/Shift without a direction remains mode 0.
 
 The visible camera may not align with this table in `fixed` mode. That mismatch
 is expected and is why this stage is not camera-relative acceptance.
@@ -431,8 +420,8 @@ MEASURED_CAMERA_YAW_OFFSET_DEG=0   # replace with the calibrated offset
   --min-active-seconds 60
 ```
 
-During the bounded window, exercise W/A/S/D, all three keyboard tiers and their
-base/double-tap boost speeds, diagonals, a 180-degree reversal, Q/E, a camera drag/re-arm cycle, and one
+During the bounded window, exercise W/A/S/D, all three keyboard speed profiles,
+diagonals, a 180-degree reversal, Q/E, a camera drag/re-arm cycle, and one
 focus-loss/recovery cycle. For V, enter the mirrored safety state, verify the hard stop, press
 V again to clear it, then complete neutral re-arm; a single toggle would correctly
 leave the boundary in safe stop. End with sufficient commanded displacement to

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import math
 from pathlib import Path
-import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -34,24 +32,14 @@ class PrepareSonicPhysicsModelTest(unittest.TestCase):
             (native / "height.png").write_bytes(b"height")
             canonical.write_text(
                 """<mujoco><compiler meshdir="meshes" />
-<default><default class="visual"><geom material="body_material" /></default></default>
-<asset><mesh name="body" file="body.stl" />
-<texture name="body_texture" builtin="flat" rgb1="0.7 0.2 0.1" width="1" height="1" />
-<material name="body_material" texture="body_texture" />
-<texture name="demo_ground" builtin="checker" />
-<material name="demo_ground_material" texture="demo_ground" /></asset>
+<asset><mesh name="body" file="body.stl" /></asset>
 <worldbody><body name="pelvis"><freejoint name="floating" />
-<geom class="visual" mesh="body" />
 <joint name="joint_a" /><joint name="joint_b" /><body name="finger">
-<joint name="finger_joint" /></body></body>
-<light name="demo_light" /><geom name="demo_floor" type="plane"
-material="demo_ground_material" /></worldbody>
+<joint name="finger_joint" /></body></body></worldbody>
 <actuator><motor name="a" joint="joint_a" /><motor name="b" joint="joint_b" />
 <motor name="finger" joint="finger_joint" /></actuator>
 <sensor><jointpos name="a_pos" joint="joint_a" />
-<jointpos name="finger_pos" joint="finger_joint" /></sensor>
-<statistic center="1 2 3" /><visual><global azimuth="10" /></visual>
-</mujoco>""",
+<jointpos name="finger_pos" joint="finger_joint" /></sensor></mujoco>""",
                 encoding="utf-8",
             )
             scene = native / "scene.xml"
@@ -80,32 +68,6 @@ material="demo_ground_material" /></worldbody>
                 ["joint_a", "joint_b"],
             )
             self.assertEqual(robot.find("worldbody/body/freejoint").get("name"), "floating")
-            self.assertEqual(len(robot.findall("worldbody")), 1)
-            self.assertEqual(
-                [(item.tag, item.get("name")) for item in robot.find("worldbody")],
-                [("body", "pelvis")],
-            )
-            self.assertIsNone(robot.find("statistic"))
-            self.assertIsNone(robot.find("visual"))
-            self.assertIsNone(
-                next(
-                    (
-                        item
-                        for asset in robot.findall("asset")
-                        for item in asset
-                        if item.get("name") == "demo_ground"
-                    ),
-                    None,
-                )
-            )
-            retained_assets = {
-                item.get("name")
-                for asset in robot.findall("asset")
-                for item in asset
-            }
-            self.assertIn("body_material", retained_assets)
-            self.assertIn("body_texture", retained_assets)
-            self.assertNotIn("demo_ground_material", retained_assets)
             self.assertEqual(
                 [item.get("joint") for item in robot.find("sensor")],
                 ["joint_a"],
@@ -174,150 +136,6 @@ material="demo_ground_material" /></worldbody>
             )
             self.assertEqual((output / "height.png").read_bytes(), b"height")
 
-    def test_injects_creative_inventory_into_canonical_sonic_robot(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            root = Path(temporary_dir)
-            canonical = root / "canonical.xml"
-            meshes = root / "canonical_meshes"
-            native = root / "xgb"
-            output = root / "output"
-            inventory = root / "inventory"
-            catalog = inventory / "catalog.json"
-            meshes.mkdir()
-            inventory.mkdir()
-            (meshes / "body.stl").write_bytes(b"body")
-            (inventory / "prop.stl").write_bytes(b"prop")
-            (native / "assets").mkdir(parents=True)
-            canonical.write_text(
-                """<mujoco><compiler meshdir="meshes" /><asset>
-<mesh name="body" file="body.stl" /></asset>
-<worldbody><body name="pelvis"><freejoint name="floating" />
-<joint name="joint_a" /><geom mesh="body" /></body>
-<body name="creative_item__prop__0"><freejoint name="stale_freejoint" />
-<geom type="box" size="0.1 0.1 0.1" /></body>
-<body name="demo_body"><geom type="box" size="1 1 1" /></body>
-<light name="demo_light" /></worldbody>
-<actuator><motor name="a" joint="joint_a" /></actuator>
-<equality><weld name="creative_item__prop__0__storage_weld"
-body1="creative_item__prop__0" active="true" /></equality></mujoco>""",
-                encoding="utf-8",
-            )
-            catalog.write_text(
-                json.dumps(
-                    {
-                        "schema": "matrix-creative-inventory/v1",
-                        "items": [
-                            {
-                                "item_id": "prop",
-                                "label": "Prop",
-                                "pool_size": 1,
-                                "mass_kg": 1.0,
-                                "collision_half_size": [0.1, 0.1, 0.1],
-                                "spawn_distance_m": 0.9,
-                                "spawn_height_m": 1.0,
-                                "spawn_quat": [1.0, 0.0, 0.0, 0.0],
-                                "visuals": [
-                                    {
-                                        "mesh": "prop.stl",
-                                        "rgba": [0.2, 0.4, 0.8, 1.0],
-                                        "scale": [1.0, 1.0, 1.0],
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            scene = native / "scene.xml"
-            scene.write_text(
-                """<mujoco><include file="xgb.xml" />
-<worldbody><geom name="floor" type="plane" /></worldbody></mujoco>""",
-                encoding="utf-8",
-            )
-
-            MODULE.prepare_sonic_physics_model(
-                canonical,
-                meshes,
-                scene,
-                output,
-                body_joint_names=("joint_a",),
-                creative_inventory_catalog=catalog,
-            )
-
-            robot = ET.parse(output / "robot.xml").getroot()
-            worldbody_names = [
-                child.get("name") for child in robot.find("worldbody")
-            ]
-            self.assertEqual(
-                worldbody_names,
-                ["pelvis", "creative_item__prop__0"],
-            )
-            storage_weld = robot.find(
-                ".//weld[@name='creative_item__prop__0__storage_weld']"
-            )
-            self.assertIsNotNone(storage_weld)
-            self.assertNotIn("relpose", storage_weld.attrib)
-            self.assertEqual(
-                len(
-                    robot.findall(
-                        ".//weld[@name='creative_item__prop__0__storage_weld']"
-                    )
-                ),
-                1,
-            )
-            retained_assets = {
-                item.get("name") for item in robot.find("asset")
-            }
-            self.assertIn("creative_prop_0", retained_assets)
-            self.assertIn("matrix_source_creative_prop_0", retained_assets)
-            self.assertTrue((output / "meshes" / "creative_prop_0.stl").is_file())
-            inventory_geoms = robot.findall(
-                ".//body[@name='creative_item__prop__0']/geom"
-            )
-            self.assertTrue(inventory_geoms)
-            self.assertTrue(
-                all("class" not in geom.attrib for geom in inventory_geoms)
-            )
-            collision_geom = robot.find(
-                ".//geom[@name='creative_item__prop__0__collision']"
-            )
-            self.assertIsNotNone(collision_geom)
-            self.assertEqual(collision_geom.get("contype"), "0")
-            self.assertEqual(collision_geom.get("conaffinity"), "0")
-            manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(
-                manifest["creative_inventory"]["catalog_sha256"],
-                MODULE._file_sha256(catalog),
-            )
-            self.assertEqual(
-                manifest["creative_inventory"]["storage_contract_version"],
-                MODULE.INVENTORY_STORAGE_CONTRACT_VERSION,
-            )
-
-            with mock.patch.object(
-                MODULE,
-                "INVENTORY_STORAGE_CONTRACT_VERSION",
-                MODULE.INVENTORY_STORAGE_CONTRACT_VERSION + 1,
-            ):
-                MODULE.prepare_sonic_physics_model(
-                    canonical,
-                    meshes,
-                    scene,
-                    output,
-                    body_joint_names=("joint_a",),
-                    creative_inventory_catalog=catalog,
-                )
-                rebuilt_manifest = json.loads(
-                    (output / "manifest.json").read_text()
-                )
-                self.assertEqual(
-                    rebuilt_manifest["creative_inventory"][
-                        "storage_contract_version"
-                    ],
-                    MODULE.INVENTORY_STORAGE_CONTRACT_VERSION,
-                )
-
     def test_town10_open_boundary_removes_four_walls_and_retains_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
@@ -368,14 +186,11 @@ body1="creative_item__prop__0" active="true" /></equality></mujoco>""",
             for wall in MODULE.TOWN10_PERIMETER_WALL_NAMES:
                 self.assertNotIn(wall, names)
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(
-                manifest["pipeline_version"], MODULE.PIPELINE_VERSION
-            )
+            self.assertEqual(manifest["pipeline_version"], 5)
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
             )
-            self.assertNotIn("scene_transform_contract", manifest)
             self.assertEqual(
                 manifest["removed_environment_geoms"],
                 list(MODULE.TOWN10_PERIMETER_WALL_NAMES),
@@ -405,7 +220,7 @@ body1="creative_item__prop__0" active="true" /></equality></mujoco>""",
                     scene_transform=MODULE.TOWN10_OPEN_BOUNDARY_TRANSFORM,
                 )
 
-    def test_moon_dynamic_ground_transform_converts_freejoints_to_mocap(self) -> None:
+    def test_moon_dynamic_ground_transform_converts_tiles_to_mocap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             canonical = root / "canonical.xml"
@@ -413,7 +228,7 @@ body1="creative_item__prop__0" active="true" /></equality></mujoco>""",
             native = root / "xgb"
             output = root / "output"
             meshes.mkdir()
-            (native / "assets").mkdir(parents=True)
+            native.mkdir()
             canonical.write_text(
                 """<mujoco><worldbody><body name="pelvis">
 <freejoint name="floating" /><joint name="joint_a" />
@@ -421,32 +236,26 @@ body1="creative_item__prop__0" active="true" /></equality></mujoco>""",
 </actuator></mujoco>""",
                 encoding="utf-8",
             )
-            scene = native / "scene_terrain_moon_dynamic.xml"
+            scene = native / MODULE.MOON_DYNAMIC_GROUND_SCENE_NAME
+            bodies = []
+            for i in range(16):
+                for j in range(16):
+                    bodies.append(
+                        f"""<body name="gb_{i}_{j}" pos="{i * 0.1:.1f} {j * 0.1:.1f} 0" gravcomp="1">
+  <joint type="free" name="gb_joint_{i}_{j}" />
+  <geom name="soil_{i}_{j}" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>"""
+                    )
             scene.write_text(
-                """<mujoco><include file="xgb.xml" /><worldbody>
-<body name="gb_0_0" pos="-0.75 -0.75 0" gravcomp="1">
-  <joint type="free" name="gb_joint_0_0" />
-  <geom name="soil_0_0" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
-</body>
-<body name="gb_0_1" pos="-0.75 -0.65 0" gravcomp="1">
-  <joint type="free" name="gb_joint_0_1" />
-  <geom name="soil_0_1" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
-</body>
-</worldbody></mujoco>""",
+                "<mujoco><include file=\"xgb.xml\" /><worldbody>\n"
+                + "\n".join(bodies)
+                + "\n</worldbody></mujoco>",
                 encoding="utf-8",
             )
-
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
-                    MODULE._file_sha256(scene),
-                ),
-                mock.patch.object(
-                    MODULE,
-                    "MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT",
-                    2,
-                ),
+            with mock.patch.object(
+                MODULE,
+                "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
+                MODULE._file_sha256(scene),
             ):
                 output_scene = MODULE.prepare_sonic_physics_model(
                     canonical,
@@ -455,239 +264,113 @@ body1="creative_item__prop__0" active="true" /></equality></mujoco>""",
                     output,
                     body_joint_names=("joint_a",),
                     scene_transform=MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
+                    moon_dynamic_ground_collision_mode=(
+                        MODULE.MOON_DYNAMIC_GROUND_COLLISION_TILES
+                    ),
                 )
 
-            scene_root = ET.parse(output_scene).getroot()
-            self.assertEqual(
-                [(body.get("name"), body.get("pos")) for body in scene_root.iter("body")],
-                [("gb_0_0", "-0.75 -0.75 0"), ("gb_0_1", "-0.75 -0.65 0")],
-            )
-            self.assertEqual([joint.get("name") for joint in scene_root.iter("joint")], [])
-            geoms = list(scene_root.iter("geom"))
-            self.assertEqual(
-                [geom.get("name") for geom in geoms],
-                [
-                    MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME,
-                    MODULE.MOON_SPAWN_PAD_GEOM_NAME,
-                    "soil_0_0",
-                    "soil_0_1",
-                ],
-            )
-            support_geom = geoms[0]
-            self.assertEqual(support_geom.get("type"), "hfield")
-            self.assertEqual(
-                support_geom.get("hfield"),
-                MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
-            )
-            self.assertEqual(support_geom.get("contype"), "0")
-            self.assertEqual(support_geom.get("conaffinity"), "0")
-            self.assertEqual(
-                support_geom.get("friction"), MODULE.MOON_COLLISION_FRICTION
-            )
-            self.assertEqual(
-                support_geom.get("solref"), MODULE.MOON_COLLISION_SOLREF
-            )
-            self.assertEqual(
-                support_geom.get("solimp"), MODULE.MOON_COLLISION_SOLIMP
-            )
-            spawn_pad = geoms[1]
-            self.assertEqual(spawn_pad.get("type"), "box")
-            self.assertEqual(
-                [float(value) for value in spawn_pad.get("pos").split()],
-                list(MODULE.MOON_SPAWN_PAD_CENTER_M),
-            )
-            self.assertEqual(
-                [float(value) for value in spawn_pad.get("size").split()],
-                list(MODULE.MOON_SPAWN_PAD_HALF_SIZE_M),
-            )
-            self.assertEqual(spawn_pad.get("contype"), "1")
-            self.assertEqual(spawn_pad.get("conaffinity"), "1")
-            self.assertEqual(
-                spawn_pad.get("friction"), MODULE.MOON_COLLISION_FRICTION
-            )
-            self.assertEqual(spawn_pad.get("solref"), MODULE.MOON_COLLISION_SOLREF)
-            self.assertEqual(spawn_pad.get("solimp"), MODULE.MOON_COLLISION_SOLIMP)
-            self.assertEqual(spawn_pad.get("rgba"), "0 0 0 0")
-            for tile_geom in geoms[2:]:
-                self.assertEqual(tile_geom.get("contype"), "1")
-                self.assertEqual(tile_geom.get("conaffinity"), "1")
-            hfields = list(scene_root.iter("hfield"))
-            self.assertEqual(len(hfields), 1)
-            self.assertEqual(
-                hfields[0].attrib,
-                {
-                    "name": MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME,
-                    "nrow": "33",
-                    "ncol": "33",
-                    "size": "1.6 1.6 64 1",
-                },
-            )
-            self.assertEqual(
-                [body.get("mocap") for body in scene_root.iter("body")],
-                ["true", "true"],
-            )
             manifest = json.loads((output / "manifest.json").read_text())
-            self.assertEqual(
-                manifest["pipeline_version"], MODULE.PIPELINE_VERSION
-            )
             self.assertEqual(
                 manifest["scene_transform"],
                 MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
             )
             self.assertEqual(
-                manifest["scene_transform_contract"],
-                {
-                    "dynamic_ground": {
-                        "schema": "matrix-moon-dynamic-ground/v3",
-                        "body_count": 2,
-                        "body_name_pattern": (
-                            MODULE.MOON_DYNAMIC_GROUND_BODY_PATTERN.pattern
-                        ),
-                        "body_mode": "mocap",
-                        "map_dtype": "little-endian-float32",
-                        "map_shape": [6000, 6000],
-                        "map_size_bytes": 144000000,
-                        "map_sha256": MODULE.MOON_DYNAMIC_MAP_SHA256,
-                        "resolution_m": 0.1,
-                        "height_mode": "absolute_world_z",
-                        "update_timing": "before_each_mj_step",
-                        "fallback_support_plane": False,
-                        "collision": {
-                            "mode": "rolling-mocap-tiles-v1",
-                            "asset_name": (
-                                MODULE.MOON_CONTINUOUS_SUPPORT_ASSET_NAME
-                            ),
-                            "geom_name": (
-                                MODULE.MOON_CONTINUOUS_SUPPORT_GEOM_NAME
-                            ),
-                            "collision_enabled_initial": False,
-                            "collision_enabled_after_handoff": False,
-                            "observation_hfield_only": True,
-                            "handoff": {
-                                "trigger": "initial_spawn_clearance_passed",
-                                "contract": "exactly-one-active-ground-v1",
-                                "mujoco_forward_after_mask_swap": True,
-                            },
-                            "grid_shape": [33, 33],
-                            "half_extent_m": 1.6,
-                            "height_range_m": 64.0,
-                            "base_depth_m": 1.0,
-                            "source_tile_count": 2,
-                            "source_tile_compiled_collision_mask": [1, 1],
-                            "source_tile_collision_enabled_initial": False,
-                            "source_tile_collision_enabled_after_handoff": True,
-                            "friction": MODULE.MOON_COLLISION_FRICTION,
-                            "solref": MODULE.MOON_COLLISION_SOLREF,
-                            "solimp": MODULE.MOON_COLLISION_SOLIMP,
-                            "spawn_pad": {
-                                "mode": "finite-collision-only-box-v1",
-                                "collision_enabled_initial": True,
-                                "collision_enabled_after_handoff": False,
-                                "geom_name": MODULE.MOON_SPAWN_PAD_GEOM_NAME,
-                                "center_m": list(MODULE.MOON_SPAWN_PAD_CENTER_M),
-                                "half_size_m": list(
-                                    MODULE.MOON_SPAWN_PAD_HALF_SIZE_M
-                                ),
-                                "top_z_m": (
-                                    MODULE.MOON_SPAWN_PAD_CENTER_M[2]
-                                    + MODULE.MOON_SPAWN_PAD_HALF_SIZE_M[2]
-                                ),
-                                "top_offset_above_native_floor_m": 0.0,
-                                "locked_footprint": {
-                                    "map_sha256": MODULE.MOON_DYNAMIC_MAP_SHA256,
-                                    "pixel_x_range": list(
-                                        MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE
-                                    ),
-                                    "pixel_y_range": list(
-                                        MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE
-                                    ),
-                                    "native_height_range_m": list(
-                                        MODULE.MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M
-                                    ),
-                                },
-                                "rgba": [0.0, 0.0, 0.0, 0.0],
-                            },
-                        },
-                    }
-                },
+                manifest["staticized_freejoint_bodies"][0],
+                "gb_0_0",
             )
-            self.assertEqual(manifest["removed_environment_geoms"], [])
+            contract = manifest["scene_transform_contract"]["dynamic_ground"]
+            self.assertEqual(contract["body_count"], 256)
             self.assertEqual(
-                manifest["staticized_freejoint_bodies"],
-                ["gb_0_0", "gb_0_1"],
+                contract["collision"]["mode"],
+                MODULE.MOON_DYNAMIC_GROUND_COLLISION_TILES,
             )
 
-            scene.write_text(
-                f"""<mujoco><include file="xgb.xml" /><worldbody>
-<geom name="{MODULE.MOON_SPAWN_PAD_GEOM_NAME}" type="box" size="1 1 1" />
-<body name="gb_0_0" pos="-0.75 -0.75 0" gravcomp="1">
-  <joint type="free" name="gb_joint_0_0" />
-  <geom name="soil_0_0" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
-</body>
-<body name="gb_0_1" pos="-0.75 -0.65 0" gravcomp="1">
-  <joint type="free" name="gb_joint_0_1" />
-  <geom name="soil_0_1" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
-</body>
-</worldbody></mujoco>""",
+            xml = ET.parse(output_scene).getroot()
+            tile_bodies = [
+                body
+                for body in xml.iter("body")
+                if (body.get("name") or "").startswith("gb_")
+            ]
+            self.assertEqual(len(tile_bodies), 256)
+            self.assertTrue(all(body.get("mocap") == "true" for body in tile_bodies))
+            self.assertFalse(list(xml.iter("joint")))
+            soil = next(geom for geom in xml.iter("geom") if geom.get("name") == "soil_7_8")
+            self.assertEqual(soil.get("contype"), "1")
+            self.assertEqual(soil.get("conaffinity"), "1")
+            self.assertEqual(
+                contract["collision"]["source_tile_compiled_collision_mask"],
+                [1, 1],
+            )
+            self.assertTrue(
+                contract["collision"]["source_tile_collision_enabled_after_handoff"]
+            )
+            self.assertIsNotNone(
+                next(
+                    geom
+                    for geom in xml.iter("geom")
+                    if geom.get("name") == MODULE.MOON_SPAWN_PAD_GEOM_NAME
+                )
+            )
+
+    def test_moon_dynamic_ground_transform_defaults_to_mainline_rolling_tiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            canonical = root / "canonical.xml"
+            meshes = root / "canonical_meshes"
+            native = root / "xgb"
+            output = root / "output"
+            meshes.mkdir()
+            native.mkdir()
+            canonical.write_text(
+                """<mujoco><worldbody><body name="pelvis">
+<freejoint name="floating" /><joint name="joint_a" />
+</body></worldbody><actuator><motor name="a" joint="joint_a" />
+</actuator></mujoco>""",
                 encoding="utf-8",
             )
-            with (
-                mock.patch.object(
-                    MODULE,
-                    "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
-                    MODULE._file_sha256(scene),
-                ),
-                mock.patch.object(
-                    MODULE,
-                    "MOON_DYNAMIC_GROUND_FREEJOINT_BODY_COUNT",
-                    2,
-                ),
-                self.assertRaisesRegex(
-                    MODULE.SonicPhysicsModelError,
-                    "already contains Matrix dynamic-ground support",
-                ),
+            scene = native / MODULE.MOON_DYNAMIC_GROUND_SCENE_NAME
+            bodies = []
+            for i in range(16):
+                for j in range(16):
+                    bodies.append(
+                        f"""<body name="gb_{i}_{j}" pos="{i * 0.1:.1f} {j * 0.1:.1f} 0" gravcomp="1">
+  <joint type="free" name="gb_joint_{i}_{j}" />
+  <geom name="soil_{i}_{j}" type="box" size="0.049 0.049 0.5" pos="0 0 -0.5" mass="100000000" />
+</body>"""
+                    )
+            scene.write_text(
+                "<mujoco><include file=\"xgb.xml\" /><worldbody>\n"
+                + "\n".join(bodies)
+                + "\n</worldbody></mujoco>",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                MODULE,
+                "MOON_DYNAMIC_GROUND_SOURCE_SCENE_SHA256",
+                MODULE._file_sha256(scene),
             ):
                 MODULE.prepare_sonic_physics_model(
                     canonical,
                     meshes,
                     scene,
-                    root / "collision-output",
+                    output,
                     body_joint_names=("joint_a",),
                     scene_transform=MODULE.MOON_DYNAMIC_GROUND_MOCAP_TRANSFORM,
                 )
 
-    def test_moon_spawn_pad_locked_footprint_matches_asset_when_present(self) -> None:
-        map_path = REPO_ROOT / "dynamicmaps/moonworld.bin"
-        if not map_path.is_file():
-            self.skipTest("locked MoonWorld height map asset is not installed")
-
-        self.assertEqual(map_path.stat().st_size, MODULE.MOON_DYNAMIC_MAP_SIZE_BYTES)
-        digest = hashlib.sha256()
-        with map_path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        self.assertEqual(digest.hexdigest(), MODULE.MOON_DYNAMIC_MAP_SHA256)
-
-        x0, x1 = MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_X_RANGE
-        y0, y1 = MODULE.MOON_SPAWN_PAD_FOOTPRINT_PIXEL_Y_RANGE
-        expected_min, expected_max = MODULE.MOON_SPAWN_PAD_NATIVE_HEIGHT_RANGE_M
-        observed_min = math.inf
-        observed_max = -math.inf
-        with map_path.open("rb") as stream:
-            for y in range(y0, y1 + 1):
-                for x in range(x0, x1 + 1):
-                    stream.seek(
-                        (
-                            y * MODULE.MOON_DYNAMIC_MAP_SIDE_SAMPLES
-                            + x
-                        )
-                        * 4
-                    )
-                    (height,) = struct.unpack("<f", stream.read(4))
-                    observed_min = min(observed_min, height)
-                    observed_max = max(observed_max, height)
-        self.assertEqual(observed_min, expected_min)
-        self.assertEqual(observed_max, expected_max)
+            manifest = json.loads((output / "manifest.json").read_text())
+            contract = manifest["scene_transform_contract"]["dynamic_ground"]
+            self.assertEqual(
+                contract["collision"]["mode"],
+                MODULE.MOON_DYNAMIC_GROUND_COLLISION_TILES,
+            )
+            self.assertEqual(
+                contract["collision"]["source_tile_compiled_collision_mask"],
+                [1, 1],
+            )
+            self.assertTrue(
+                contract["collision"]["source_tile_collision_enabled_after_handoff"]
+            )
 
 
 if __name__ == "__main__":

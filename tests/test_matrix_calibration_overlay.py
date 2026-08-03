@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -27,228 +28,52 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
-def celestial_navigation_state() -> dict[str, object]:
-    def destination(
-        destination_id: str,
-        body_id: str,
-        body_name: str,
-        display_name: str,
-        tag: str,
-        *,
-        runtime_status: str,
-        status: str,
-        enabled: bool,
-        position: list[float] | None = None,
-        gravity: float,
-        atmosphere: str,
-    ) -> dict[str, object]:
-        return {
-            "id": destination_id,
-            "body_id": body_id,
-            "body_name": body_name,
-            "display_name": display_name,
-            "teleport_tag": tag,
-            "runtime_status": runtime_status,
-            "status": status,
-            "enabled": enabled,
-            "surface_coordinates_deg_m": [22.5, 114.0, 20.0],
-            "surface_heading_deg": 0.0,
-            "local_position_m": position,
-            "site_universe_position_m": [1.0e11, 2.0e10, 3.0e9],
-            "universe_position_m": position,
-            "gravity_m_s2": gravity,
-            "atmosphere": atmosphere,
-        }
-
-    return {
-        "celestial_navigation": {
-            "version": 2,
-            "available": True,
-            "status": "ready",
-            "universe_id": "sol-2080",
-            "display_name": "SOL-2080",
-            "reference_epoch_utc": "2080-01-01T00:00:00Z",
-            "time_scale": "TAI",
-            "frame": "sol_heliocentric_icrf",
-            "ephemeris": {
-                "provider": "matrix-analytical-v1",
-                "accuracy_class": "visual-navigation",
-                "upgrade_target": "naif-spice-de440",
-            },
-            "simulation_time": {
-                "elapsed_tai_ns": 0,
-                "scenario_tai_ns": 3471292837000000000,
-                "scenario_utc": "2080-01-01T00:00:00Z",
-                "rate_numerator": 1,
-                "rate_denominator": 1,
-                "utc_assumption": "frozen-tai-minus-utc-at-scenario-epoch",
-            },
-            "origin_rebasing": True,
-            "simulation_local_bound_m": 100_000.0,
-            "current_body_id": "earth",
-            "bodies": [
-                {
-                    "id": "sun",
-                    "display_name": "Sun",
-                    "naif_id": 10,
-                    "runtime_status": "reference",
-                    "center_inertial_m": [0.0, 0.0, 0.0],
-                    "solar_distance_m": 0.0,
-                },
-                {
-                    "id": "earth",
-                    "display_name": "Earth",
-                    "naif_id": 399,
-                    "runtime_status": "active",
-                    "center_inertial_m": [1.0e11, 2.0e10, 3.0e9],
-                    "solar_distance_m": 1.02e11,
-                },
-                {
-                    "id": "moon",
-                    "display_name": "Moon",
-                    "naif_id": 301,
-                    "runtime_status": "active",
-                    "center_inertial_m": [1.003e11, 2.0e10, 3.0e9],
-                    "solar_distance_m": 1.023e11,
-                },
-                {
-                    "id": "mars",
-                    "display_name": "Mars",
-                    "naif_id": 499,
-                    "runtime_status": "planned",
-                    "center_inertial_m": [2.0e11, 4.0e10, 5.0e9],
-                    "solar_distance_m": 2.04e11,
-                },
-            ],
-            "lighting": {
-                "body_id": "earth",
-                "atmosphere": "earth_nitrogen_oxygen",
-                "sun_direction_local": [1.0, 0.0, 0.0],
-                "directional_light_direction_local": [-1.0, 0.0, 0.0],
-                "sun_altitude_deg": 10.0,
-                "sun_azimuth_deg": 120.0,
-                "solar_distance_m": 1.47e11,
-                "solar_irradiance_w_m2": 1400.0,
-                "sun_angular_radius_deg": 0.27,
-                "eclipse_fraction": 0.0,
-                "eclipse_occluder_id": None,
-                "starfield_visibility": 0.0,
-                "visual_profile": {
-                    "schema": "matrix-celestial-visual-profile/v1",
-                    "id": "earth-wet-cloudy-v1",
-                    "sha256": "a" * 64,
-                    "display_name": "Earth Wet Cloudy",
-                    "body_id": "earth",
-                    "atmosphere": "earth_nitrogen_oxygen",
-                    "renderer": "carla-weather-v1",
-                    "weather_parameters": {
-                        "cloudiness": 60.0,
-                        "precipitation": 0.0,
-                        "precipitation_deposits": 50.0,
-                        "wind_intensity": 10.0,
-                        "sun_azimuth_angle": 120.0,
-                        "sun_altitude_angle": 10.0,
-                        "fog_density": 3.0,
-                        "fog_distance": 0.75,
-                        "fog_falloff": 0.1,
-                        "wetness": 0.0,
-                        "scattering_intensity": 1.0,
-                        "mie_scattering_scale": 0.03,
-                        "rayleigh_scattering_scale": 0.0331,
-                        "dust_storm": 0.0,
-                    },
-                },
-                "render_authority": "state-only",
-                "render_status": "not-applied",
-                "render_error": None,
-                "visible_camera_verified": False,
-            },
-            "destinations": [
-                destination(
-                    "earth-overworld-home",
-                    "earth",
-                    "Earth",
-                    "Overworld Home",
-                    "home",
-                    runtime_status="active",
-                    status="ready",
-                    enabled=True,
-                    position=[160.0, 117.0, 1.2],
-                    gravity=9.80665,
-                    atmosphere="nitrogen_oxygen",
-                ),
-                destination(
-                    "moon-tranquility-outpost",
-                    "moon",
-                    "Moon",
-                    "Tranquility Outpost",
-                    "moon.tranquility",
-                    runtime_status="active",
-                    status="ready",
-                    enabled=True,
-                    position=[-94.7, -65.6, -5.251562023162842],
-                    gravity=1.62,
-                    atmosphere="vacuum",
-                ),
-                destination(
-                    "mars-utopia-outpost",
-                    "mars",
-                    "Mars",
-                    "Utopia Outpost",
-                    "mars.utopia",
-                    runtime_status="planned",
-                    status="world_unavailable",
-                    enabled=False,
-                    gravity=3.72076,
-                    atmosphere="carbon_dioxide_thin",
-                ),
-            ],
-        }
-    }
-
-
-def build_info_state() -> dict[str, object]:
-    return {
-        "build_info": {
-            "schema": "matrix-build-info/v1",
-            "available": True,
-            "launch_available": True,
-            "profile": "heyuan",
-            "scene_id": 2,
-            "scene_name": "Town10World",
-            "control_source": "game",
-            "branch": "feature/desktop-launcher",
-            "commit": "a" * 40,
-            "short_commit": "a" * 7,
-            "subject": "show launch provenance in ESC",
-            "body": "Display the latest commit and changed files.",
-            "author": "Matrix Test",
-            "authored_at": "2026-07-25T12:00:00Z",
-            "changed_files": 2,
-            "additions": 24,
-            "deletions": 3,
-            "files": [
-                {
-                    "status": "M",
-                    "path": "scripts/matrix_calibration_overlay.py",
-                    "additions": 20,
-                    "deletions": 3,
-                },
-                {
-                    "status": "A",
-                    "path": "scripts/matrix_build_info.py",
-                    "additions": 4,
-                    "deletions": 0,
-                },
-            ],
-            "files_truncated": False,
-            "dirty": False,
-            "dirty_files": 0,
-            "dirty_paths": [],
-            "dirty_paths_truncated": False,
-            "error": None,
-        }
-    }
+class LockedSonicStrategyViewTest(unittest.TestCase):
+    def test_locked_single_sonic_loadout_has_no_recovery_choices(self) -> None:
+        model = MODULE.strategy_loadout_model(
+            {
+                "strategy_loadout": {
+                    "version": 1,
+                    "available": True,
+                    "status": "locked",
+                    "active_slot": "locomotion",
+                    "pending": None,
+                    "slots": [
+                        {
+                            "slot": "locomotion",
+                            "selected_policy_id": "sonic",
+                            "locked": True,
+                            "candidates": [
+                                {
+                                    "policy_id": "sonic",
+                                    "name": "SONIC",
+                                    "resident": True,
+                                    "available": True,
+                                    "switch_mode": "disabled",
+                                }
+                            ],
+                        },
+                        {
+                            "slot": "recovery",
+                            "selected_policy_id": "off",
+                            "locked": True,
+                            "candidates": [],
+                        },
+                    ],
+                }
+            }
+        )
+        self.assertEqual(model.status, "locked")
+        self.assertEqual(model.locomotion_policy_id, "sonic")
+        self.assertEqual(
+            [candidate.policy_id for candidate in model.locomotion_candidates],
+            ["sonic"],
+        )
+        self.assertTrue(model.locomotion_locked)
+        self.assertEqual(model.recovery_policy_id, "off")
+        self.assertEqual(model.recovery_candidates, ())
+        self.assertTrue(model.recovery_locked)
+        self.assertFalse(model.policy_enabled("sonic", slot="locomotion"))
 
 
 class OverlayLayoutTest(unittest.TestCase):
@@ -303,7 +128,7 @@ class OverlayLayoutTest(unittest.TestCase):
         )
         for action in MODULE._PANEL_ACTIONS:
             x, y, width, height = layout[action]
-            self.assertGreaterEqual(width, 100)
+            self.assertGreaterEqual(width, 80)
             self.assertGreaterEqual(height, 60)
             self.assertTrue(MODULE.point_in_rectangle((x, y), panel))
             self.assertTrue(
@@ -315,9 +140,6 @@ class OverlayLayoutTest(unittest.TestCase):
             "speed_down",
             "speed_value",
             "speed_up",
-            "font_down",
-            "font_value",
-            "font_up",
             "command_input",
             "apply_return",
         ):
@@ -332,69 +154,69 @@ class OverlayLayoutTest(unittest.TestCase):
                 MODULE.WindowGeometry(1, 0, 0, width, height)
             )
             panel = layout["panel"]
-            self.assertGreaterEqual(panel[2], 1100)
-            self.assertLessEqual(panel[2], 1200)
-            self.assertGreaterEqual(panel[3], 760)
-            self.assertLessEqual(panel[3], 800)
+            self.assertEqual(panel[2], 1500)
+            self.assertEqual(panel[3], 900)
 
-    def test_startup_loading_model_accepts_media_metadata(self) -> None:
-        model = MODULE.startup_loading_model(
-            {
-                "startup_loading": {
-                    "active": True,
-                    "message": "加载月球视频背景",
-                    "progress": 0.45,
-                    "media_frames_dir": "/tmp/matrix-moon-frames",
-                    "media_frame_rate_hz": 3.5,
-                }
-            }
-        )
+    def test_settings_page_control_rows_have_readable_height(self) -> None:
+        for width, height, minimum_row_height in (
+            (2560, 1600, 30),
+            (1280, 800, 24),
+        ):
+            with self.subTest(width=width, height=height):
+                layout = MODULE.overlay_layout(
+                    MODULE.WindowGeometry(1, 0, 0, width, height)
+                )
+                motion_rows = [
+                    layout[f"motion_{gear}_{field}_value"]
+                    for gear, field in MODULE._MOTION_CONTROL_SPECS
+                ] + [
+                    layout["motion_turn_rate_value"],
+                    layout["motion_keyboard_turn_rate_value"],
+                    layout["motion_keyboard_turn_boost_rate_value"],
+                    layout["motion_bfm_turn_command_yaw_limit_value"],
+                    layout["motion_camera_look_rate_value"],
+                    layout["motion_camera_heading_snap_error_value"],
+                    layout["motion_gait_start_heading_error_value"],
+                    layout["motion_gait_stop_heading_error_value"],
+                ]
+                for rectangle in motion_rows:
+                    self.assertGreaterEqual(
+                        rectangle[3],
+                        minimum_row_height,
+                        msg=f"{rectangle} is too short for the UI font",
+                    )
+                self.assertLess(
+                    layout["movement_mode_camera_face"][1]
+                    + layout["movement_mode_camera_face"][3],
+                    min(row[1] for row in motion_rows),
+                )
+                self.assertLess(
+                    max(row[1] + row[3] for row in motion_rows),
+                    layout["speed_value"][1],
+                )
 
-        self.assertTrue(model.active)
-        self.assertEqual(model.message, "加载月球视频背景")
-        self.assertEqual(model.progress, 0.45)
-        self.assertEqual(model.media_frames_dir, "/tmp/matrix-moon-frames")
-        self.assertEqual(model.media_frame_rate_hz, 3.5)
-
-    def test_startup_loading_model_rejects_invalid_media_metadata(self) -> None:
-        model = MODULE.startup_loading_model(
-            {
-                "startup_loading": {
-                    "active": True,
-                    "media_frames_dir": True,
-                    "media_frame_rate_hz": True,
-                }
-            }
-        )
-
-        self.assertTrue(model.active)
-        self.assertIsNone(model.media_frames_dir)
-        self.assertEqual(model.media_frame_rate_hz, MODULE._STARTUP_MEDIA_FRAME_RATE_HZ)
-
-    def test_read_startup_media_ppm_accepts_binary_rgb_frame(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "moon.ppm"
-            path.write_bytes(
-                b"P6\n# generated from Feishu startup video\n2 1\n255\n"
-                + bytes([1, 2, 3, 250, 251, 252])
-            )
-
-            frame = MODULE.read_startup_media_ppm(path)
-
-        self.assertEqual(frame.width, 2)
-        self.assertEqual(frame.height, 1)
-        self.assertEqual(frame.pixels, bytes([1, 2, 3, 250, 251, 252]))
+    def test_function_home_menu_starts_below_header_copy(self) -> None:
+        for width, height, minimum_gap in (
+            (2560, 1600, 100),
+            (1280, 800, 90),
+            (480, 360, 56),
+        ):
+            with self.subTest(width=width, height=height):
+                layout = MODULE.overlay_layout(
+                    MODULE.WindowGeometry(1, 0, 0, width, height)
+                )
+                content = layout["system_content"]
+                self.assertGreaterEqual(
+                    layout["function_nav_files"][1],
+                    content[1] + minimum_gap,
+                )
 
     def test_compact_layout_is_bounded_and_too_small_client_hides_safely(self) -> None:
         geometry = MODULE.WindowGeometry(1, 20, 30, 640, 420)
         self.assertTrue(MODULE.overlay_supported(geometry))
         layout = MODULE.overlay_layout(geometry)
         panel = layout["panel"]
-        for name in MODULE._PANEL_ACTIONS + (
-            "speed_value",
-            "font_value",
-            "crosshair_safe",
-        ):
+        for name in MODULE._PANEL_ACTIONS + ("speed_value", "crosshair_safe"):
             rectangle = layout[name]
             self.assertTrue(MODULE.point_in_rectangle(rectangle[:2], panel))
             self.assertTrue(
@@ -412,9 +234,6 @@ class OverlayLayoutTest(unittest.TestCase):
             "speed_down",
             "speed_value",
             "speed_up",
-            "font_down",
-            "font_value",
-            "font_up",
             "command_input",
             "apply_return",
         ):
@@ -434,275 +253,14 @@ class OverlayLayoutTest(unittest.TestCase):
             command_input[0] + command_input[2] // 2,
             command_input[1] + command_input[3] // 2,
         )
-        self.assertEqual(MODULE.panel_action_at(layout, *point), "command_input")
+        self.assertEqual(
+            MODULE.panel_action_at(layout, *point, page="console"),
+            "command_input",
+        )
         self.assertFalse(self.intersects(command_input, layout["crosshair_safe"]))
         self.assertGreaterEqual(layout["command_result"][3], 14)
         self.assertFalse(self.intersects(layout["title"], layout["profile_local"]))
         self.assertFalse(self.intersects(layout["title"], layout["profile_remote"]))
-
-    def test_movement_mode_selector_is_bounded_and_settings_page_only(self) -> None:
-        for geometry in (
-            MODULE.WindowGeometry(1, 0, 0, 480, 360),
-            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
-        ):
-            layout = MODULE.overlay_layout(geometry)
-            controls = [layout[action] for action in MODULE._MOVEMENT_MODE_ACTIONS]
-            for index, rectangle in enumerate(controls):
-                point = (
-                    rectangle[0] + rectangle[2] // 2,
-                    rectangle[1] + rectangle[3] // 2,
-                )
-                self.assertEqual(
-                    MODULE.panel_action_at(layout, *point, page="settings"),
-                    MODULE._MOVEMENT_MODE_ACTIONS[index],
-                )
-                self.assertNotEqual(
-                    MODULE.panel_action_at(layout, *point, page="loadout"),
-                    MODULE._MOVEMENT_MODE_ACTIONS[index],
-                )
-                self.assertFalse(
-                    self.intersects(rectangle, layout["crosshair_safe"])
-                )
-            for left, right in zip(controls, controls[1:]):
-                self.assertFalse(self.intersects(left, right))
-
-    def test_footer_actions_are_bounded_distinct_and_on_every_page(self) -> None:
-        for geometry in (
-            MODULE.WindowGeometry(1, 0, 0, 480, 360),
-            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
-        ):
-            with self.subTest(geometry=geometry):
-                layout = MODULE.overlay_layout(geometry)
-                panel = layout["panel"]
-                pause = layout["runtime_pause"]
-                quit_game = layout["quit_game"]
-                apply = layout["apply_return"]
-                self.assertFalse(self.intersects(pause, quit_game))
-                self.assertFalse(self.intersects(quit_game, apply))
-                self.assertFalse(self.intersects(pause, apply))
-                for rectangle in (pause, quit_game, apply):
-                    self.assertTrue(
-                        MODULE.point_in_rectangle(rectangle[:2], panel)
-                    )
-                    self.assertTrue(
-                        MODULE.point_in_rectangle(
-                            (
-                                rectangle[0] + rectangle[2] - 1,
-                                rectangle[1] + rectangle[3] - 1,
-                            ),
-                            panel,
-                        )
-                    )
-                centre = (
-                    pause[0] + pause[2] // 2,
-                    pause[1] + pause[3] // 2,
-                )
-                quit_centre = (
-                    quit_game[0] + quit_game[2] // 2,
-                    quit_game[1] + quit_game[3] // 2,
-                )
-                for page in (
-                    "loadout",
-                    "settings",
-                    "console",
-                    "inventory",
-                    "navigation",
-                    "video",
-                    "system",
-                ):
-                    self.assertEqual(
-                        MODULE.panel_action_at(layout, *centre, page=page),
-                        "runtime_pause",
-                    )
-                    self.assertEqual(
-                        MODULE.panel_action_at(layout, *quit_centre, page=page),
-                        "quit_game",
-                    )
-
-    def test_motion_speed_grid_is_bounded_page_scoped_and_avoids_crosshair(self) -> None:
-        for geometry in (
-            MODULE.WindowGeometry(1, 0, 0, 480, 360),
-            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
-        ):
-            with self.subTest(geometry=geometry):
-                layout = MODULE.overlay_layout(geometry)
-                panel = layout["panel"]
-                for action in MODULE._MOTION_STEP_ACTIONS:
-                    rectangle = layout[action]
-                    point = (
-                        rectangle[0] + rectangle[2] // 2,
-                        rectangle[1] + rectangle[3] // 2,
-                    )
-                    self.assertTrue(MODULE.point_in_rectangle(rectangle[:2], panel))
-                    self.assertTrue(
-                        MODULE.point_in_rectangle(
-                            (
-                                rectangle[0] + rectangle[2] - 1,
-                                rectangle[1] + rectangle[3] - 1,
-                            ),
-                            panel,
-                        )
-                    )
-                    self.assertFalse(
-                        self.intersects(rectangle, layout["crosshair_safe"])
-                    )
-                    self.assertEqual(
-                        MODULE.panel_action_at(
-                            layout,
-                            *point,
-                            page="settings",
-                        ),
-                        action,
-                    )
-                    self.assertNotEqual(
-                        MODULE.panel_action_at(layout, *point, page="loadout"),
-                        action,
-                    )
-                for gear, field in MODULE._MOTION_CONTROL_SPECS:
-                    value = layout[f"motion_{gear}_{field}_value"]
-                    self.assertTrue(MODULE.point_in_rectangle(value[:2], panel))
-                    self.assertFalse(
-                        self.intersects(value, layout["crosshair_safe"])
-                    )
-                    for reserved in (
-                        "profile_local",
-                        "profile_remote",
-                        "speed_down",
-                        "speed_value",
-                        "speed_up",
-                        "apply_return",
-                    ):
-                        self.assertFalse(self.intersects(value, layout[reserved]))
-
-    def test_strategy_targets_are_page_scoped_and_outside_crosshair(self) -> None:
-        geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
-        layout = MODULE.overlay_layout(geometry)
-        for slot, count in (
-            ("locomotion", MODULE._MAX_LOCOMOTION_POLICY_BUTTONS),
-            ("recovery", MODULE._MAX_RECOVERY_POLICY_BUTTONS),
-        ):
-            rectangles = []
-            for index in range(count):
-                name = f"{slot}_policy_{index}"
-                x, y, width, height = layout[name]
-                rectangles.append(layout[name])
-                self.assertEqual(
-                    MODULE.panel_action_at(
-                        layout,
-                        x + width // 2,
-                        y + height // 2,
-                        page="loadout",
-                    ),
-                    name,
-                )
-                self.assertFalse(
-                    self.intersects(layout[name], layout["crosshair_safe"])
-                )
-            for index, rectangle in enumerate(rectangles):
-                for other in rectangles[index + 1 :]:
-                    self.assertFalse(self.intersects(rectangle, other))
-
-    def test_navigation_targets_are_page_scoped_and_outside_crosshair(self) -> None:
-        for geometry in (
-            MODULE.WindowGeometry(1, 0, 0, 480, 360),
-            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
-        ):
-            with self.subTest(geometry=geometry):
-                layout = MODULE.overlay_layout(geometry)
-                targets = ("navigation_refresh",) + tuple(
-                    f"navigation_destination_{index}" for index in range(3)
-                )
-                for name in targets:
-                    x, y, width, height = layout[name]
-                    self.assertEqual(
-                        MODULE.panel_action_at(
-                            layout,
-                            x + width // 2,
-                            y + height // 2,
-                            page="navigation",
-                        ),
-                        name,
-                    )
-                    self.assertFalse(
-                        self.intersects(layout[name], layout["crosshair_safe"])
-                    )
-                refresh = layout["navigation_refresh"]
-                self.assertIsNone(
-                    MODULE.panel_action_at(
-                        layout,
-                        refresh[0] + refresh[2] // 2,
-                        refresh[1] + refresh[3] // 2,
-                        page="console",
-                    )
-                )
-
-    def test_font_slider_is_bounded_page_scoped_and_maps_the_full_range(self) -> None:
-        for geometry in (
-            MODULE.WindowGeometry(1, 0, 0, 480, 360),
-            MODULE.WindowGeometry(1, 40, 60, 1280, 800),
-        ):
-            with self.subTest(geometry=geometry):
-                layout = MODULE.overlay_layout(geometry)
-                panel = layout["panel"]
-                slider = layout["font_size_slider"]
-                track = MODULE.font_slider_track(slider)
-                self.assertTrue(MODULE.point_in_rectangle(slider[:2], panel))
-                self.assertTrue(
-                    MODULE.point_in_rectangle(
-                        (slider[0] + slider[2] - 1, slider[1] + slider[3] - 1),
-                        panel,
-                    )
-                )
-                self.assertTrue(MODULE.point_in_rectangle(track[:2], slider))
-                point = (track[0] + track[2] // 2, track[1] + track[3] // 2)
-                self.assertEqual(
-                    MODULE.panel_action_at(layout, *point, page="settings"),
-                    "font_size_slider",
-                )
-                self.assertIsNone(
-                    MODULE.panel_action_at(layout, *point, page="loadout")
-                )
-                self.assertEqual(
-                    MODULE.font_size_from_slider(slider, track[0] - 100),
-                    MODULE._MIN_OVERLAY_FONT_SIZE,
-                )
-                self.assertEqual(
-                    MODULE.font_size_from_slider(
-                        slider,
-                        track[0] + track[2] + 100,
-                    ),
-                    MODULE._MAX_OVERLAY_FONT_SIZE,
-                )
-                sizes = [
-                    MODULE.font_size_from_slider(
-                        slider,
-                        track[0] + offset,
-                    )
-                    for offset in range(track[2])
-                ]
-                self.assertEqual(sizes, sorted(sizes))
-                self.assertEqual(set(sizes), set(range(1, 23)))
-
-    def test_inventory_targets_are_page_scoped_and_bounded(self) -> None:
-        geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
-        layout = MODULE.overlay_layout(geometry)
-        panel = layout["panel"]
-        for index in range(4):
-            name = f"creative_item_{index}"
-            x, y, width, height = layout[name]
-            point = (x + width // 2, y + height // 2)
-            self.assertEqual(
-                MODULE.panel_action_at(layout, *point, page="inventory"),
-                name,
-            )
-            self.assertNotEqual(
-                MODULE.panel_action_at(layout, *point, page="settings"),
-                name,
-            )
-            self.assertTrue(MODULE.point_in_rectangle((x, y), panel))
-            self.assertTrue(
-                MODULE.point_in_rectangle((x + width - 1, y + height - 1), panel)
-            )
 
     def test_root_coordinate_hit_test_handles_offset_remote_desktop_client(self) -> None:
         geometry = MODULE.WindowGeometry(1, -640, 120, 1600, 900)
@@ -710,10 +268,265 @@ class OverlayLayoutTest(unittest.TestCase):
         for action in MODULE._PANEL_ACTIONS:
             x, y, width, height = layout[action]
             self.assertEqual(
-                MODULE.panel_action_at(layout, x + width // 2, y + height // 2),
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="settings",
+                ),
                 action,
             )
         self.assertIsNone(MODULE.panel_action_at(layout, geometry.x + 3, geometry.y + 3))
+
+    def test_directory_page_is_the_only_top_level_navigation_surface(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+
+        x, y, width, height = layout["tab_settings"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="directory",
+            ),
+            "tab_settings",
+        )
+        self.assertEqual(
+            MODULE.panel_action_at(layout, x + width // 2, y + height // 2),
+            "tab_settings",
+        )
+        x, y, width, height = layout["back_to_directory"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="settings",
+            ),
+            "back_to_directory",
+        )
+        self.assertIsNone(
+            MODULE.panel_action_at(
+                layout,
+                x + width + 24,
+                y + height // 2,
+                page="settings",
+            )
+        )
+
+        x, y, width, height = layout["movement_mode_body_relative"]
+        self.assertNotEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="directory",
+            ),
+            "movement_mode_body_relative",
+        )
+
+    def test_functions_page_hit_test_exposes_nested_menu_presets_and_native_modes(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        for action in ("function_nav_files", "function_nav_sonic", "functions_open_dir"):
+            x, y, width, height = layout[action]
+            self.assertEqual(
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="functions",
+                ),
+                action,
+            )
+        for action, subpage in (
+            ("function_preset_0", "presets"),
+            ("native_mode_auto", "sonic"),
+            ("native_mode_4", "sonic"),
+            ("native_mode_7", "sonic"),
+            ("function_file_0", "files"),
+            ("function_file_1", "files"),
+            ("function_run_selected", "detail"),
+        ):
+            x, y, width, height = layout[action]
+            self.assertEqual(
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="functions",
+                    function_subpage=subpage,
+                ),
+                action,
+            )
+        self.assertNotIn("native_mode_1", layout)
+        for action in ("native_mode_auto", "native_mode_4", "native_mode_7"):
+            x, y, width, height = layout[action]
+            self.assertEqual(
+                MODULE.panel_action_at(
+                    layout,
+                    x + width // 2,
+                    y + height // 2,
+                    page="sonic_modes",
+                ),
+                action,
+            )
+        self.assertEqual(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("function_preset_0"),
+            "/function recover_here",
+        )
+        self.assertEqual(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_auto"),
+            "/sonic mode auto",
+        )
+        self.assertEqual(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_7"),
+            "/sonic mode 7",
+        )
+        self.assertIsNone(
+            MODULE.X11CalibrationOverlay._quick_command_for_action("native_mode_1")
+        )
+        self.assertIn("蹲姿", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[4])
+        self.assertIn("俯卧", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[7])
+        self.assertIn("受伤", MODULE._NATIVE_MODE_BUTTON_LABELS_ZH[19])
+        self.assertTrue(
+            any("AUTO 自动负责" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
+        )
+        self.assertTrue(
+            any("4 蹲姿" in line for line in MODULE._NATIVE_MODE_LEGEND_LINES_ZH)
+        )
+
+    def test_hover_hit_test_includes_read_only_value_cells(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        x, y, width, height = layout["motion_gait_start_heading_error_value"]
+        point = (x + width // 2, y + height // 2)
+        self.assertIsNone(MODULE.panel_action_at(layout, *point, page="settings"))
+        self.assertEqual(
+            MODULE.panel_hover_action_at(layout, *point, page="settings"),
+            "motion_gait_start_heading_error_value",
+        )
+
+    def test_function_detail_run_uses_selected_mcfunction(self) -> None:
+        overlay = MODULE.X11CalibrationOverlay.__new__(MODULE.X11CalibrationOverlay)
+        overlay._selected_function_name = "pose/right_90"
+        overlay._last_function_model = MODULE.FunctionLibraryModel(
+            directory="/tmp/matrix-functions",
+            available=True,
+            open_available=True,
+            files=("recover_here", "pose/right_90"),
+            open_error=None,
+            open_count=0,
+        )
+        self.assertEqual(
+            overlay._quick_command_for_current_action("function_run_selected"),
+            "/function pose/right_90",
+        )
+        overlay._selected_function_name = "missing"
+        self.assertIsNone(
+            overlay._quick_command_for_current_action("function_run_selected")
+        )
+
+    def test_keybindings_page_exposes_hot_movement_mode_switches(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        x, y, width, height = layout["movement_mode_body_relative"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="keybindings",
+            ),
+            "movement_mode_body_relative",
+        )
+        x, y, width, height = layout["tab_keybindings"]
+        self.assertEqual(
+            MODULE.panel_action_at(
+                layout,
+                x + width // 2,
+                y + height // 2,
+                page="directory",
+            ),
+            "tab_keybindings",
+        )
+
+    def test_polled_navigation_destination_click_submits_world_command(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        x, y, width, height = layout["navigation_destination_0"]
+        pointer = (x + width // 2, y + height // 2)
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._visible = True
+        overlay._last_layout = layout
+        overlay._last_pointer = pointer
+        overlay._active_page = "navigation"
+        overlay._functions_subpage = "home"
+        overlay._polled_pointer_valid = True
+        overlay._polled_left_initialized = False
+        overlay._polled_left_was_down = False
+        overlay._polled_pressed_action = None
+        overlay._polled_pressed_runtime_pause_target = None
+        overlay._polled_pressed_runtime_pause_epoch = None
+        overlay._last_startup_loading_model = MODULE.startup_loading_model({})
+        overlay._last_command_status = MODULE.command_console_status(
+            {"command_console": {"available": True, "status": "idle"}}
+        )
+        overlay._last_navigation_model = MODULE.CelestialNavigationModel(
+            available=True,
+            status="ready",
+            universe_id="sol",
+            display_name="SOL",
+            reference_epoch_utc=None,
+            time_scale=None,
+            frame=None,
+            ephemeris_provider=None,
+            ephemeris_accuracy=None,
+            ephemeris_upgrade_target=None,
+            simulation_time=None,
+            origin_rebasing=False,
+            simulation_local_bound_m=100.0,
+            current_body_id="earth",
+            bodies=(),
+            lighting=None,
+            destinations=(
+                MODULE.CelestialDestinationModel(
+                    destination_id="moon",
+                    body_id="moon",
+                    body_name="月球",
+                    display_name="MoonWorld 月面",
+                    teleport_tag="moon",
+                    runtime_status="ready",
+                    status="ready",
+                    enabled=True,
+                    surface_coordinates_deg_m=(0.0, 0.0, 0.0),
+                    surface_heading_deg=0.0,
+                    local_position_m=(0.0, 0.0, 0.8),
+                    site_universe_position_m=(0.0, 0.0, 0.0),
+                    universe_position_m=(0.0, 0.0, 0.0),
+                    gravity_m_s2=1.62,
+                    atmosphere="none",
+                ),
+            ),
+        )
+        published: list[str] = []
+        publisher = mock.Mock()
+        publisher.publish_command_quick_submit.side_effect = published.append
+
+        overlay._polled_left_pressed = True
+        self.assertEqual(
+            overlay._queue_polled_left_transition(
+                publisher,
+                cooked_button_seen=False,
+            ),
+            0,
+        )
+        overlay._polled_left_pressed = False
+        self.assertEqual(
+            overlay._queue_polled_left_transition(
+                publisher,
+                cooked_button_seen=False,
+            ),
+            1,
+        )
+
+        self.assertEqual(published, ["/world moon"])
 
 
 class CursorShapeTest(unittest.TestCase):
@@ -755,6 +568,40 @@ class CursorShapeTest(unittest.TestCase):
 
 
 class OverlayStateTest(unittest.TestCase):
+    @staticmethod
+    def bare_overlay(page: str):
+        overlay = object.__new__(MODULE.X11CalibrationOverlay)
+        overlay._x11 = mock.Mock()
+        overlay._display = 1
+        overlay._windows = {"panel": 2}
+        overlay._panel_gc = 3
+        overlay._colours = {
+            name: index
+            for index, name in enumerate(
+                (
+                    "white",
+                    "muted",
+                    "selected",
+                    "button",
+                    "disabled",
+                    "pending",
+                    "error",
+                    "apply",
+                    "outline",
+                    "cyan",
+                ),
+                10,
+            )
+        }
+        overlay._command_editor = MODULE.CommandLineEditor()
+        overlay._last_command_status = MODULE.command_console_status({})
+        overlay._active_page = page
+        overlay._draw_text = mock.Mock()
+        overlay._draw_button = mock.Mock()
+        overlay._draw_font_size_slider = mock.Mock()
+        overlay._draw_tabs = mock.Mock()
+        return overlay
+
     def test_state_is_visible_only_for_exact_versioned_true(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.json"
@@ -767,6 +614,62 @@ class OverlayStateTest(unittest.TestCase):
             self.assertFalse(MODULE.read_active_state(path))
             path.write_text(json.dumps({"version": 1, "active": True}))
             self.assertTrue(MODULE.read_active_state(path))
+
+    def test_panel_draws_directory_page_then_isolated_child_page(self) -> None:
+        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
+        model = MODULE.settings_panel_model(
+            {"restart": {"available": True, "requested": False}}
+        )
+
+        directory_overlay = self.bare_overlay("directory")
+        directory_overlay._draw_panel(layout, model)
+        directory_labels = [
+            call.args[2] for call in directory_overlay._draw_button.call_args_list
+        ]
+        self.assertIn("策略装配", directory_labels)
+        self.assertIn("SONIC模式", directory_labels)
+        self.assertIn("运行信息", directory_labels)
+        self.assertNotIn("返回目录", directory_labels)
+        directory_overlay._draw_tabs.assert_not_called()
+
+        settings_overlay = self.bare_overlay("settings")
+        settings_overlay._draw_panel(layout, model)
+        settings_labels = [
+            call.args[2] for call in settings_overlay._draw_button.call_args_list
+        ]
+        self.assertIn("返回目录", settings_labels)
+        self.assertNotIn("策略装配", settings_labels)
+        settings_overlay._draw_tabs.assert_not_called()
+
+    def test_hover_tooltips_explain_buttons_without_inline_comments(self) -> None:
+        self.assertIn(
+            "边走转向",
+            MODULE.tooltip_lines_for_action("motion_gait_start_heading_error_up")[0],
+        )
+        self.assertIn(
+            "原地转向",
+            MODULE.tooltip_lines_for_action("motion_gait_stop_heading_error_down")[0],
+        )
+        snap_lines = MODULE.tooltip_lines_for_action(
+            "motion_camera_heading_snap_error_value"
+        )
+        self.assertIn("对齐精度", snap_lines[0])
+        self.assertIn("2-3°", snap_lines[1])
+        self.assertIn(
+            "相机朝向",
+            MODULE.tooltip_lines_for_action("movement_mode_camera_face")[0],
+        )
+        self.assertIn("AUTO", MODULE.tooltip_lines_for_action("native_mode_auto")[0])
+        self.assertIn(
+            "4-19",
+            MODULE.tooltip_lines_for_action("tab_sonic_modes")[0],
+        )
+        self.assertEqual(MODULE.tooltip_lines_for_action("native_mode_1"), ())
+        self.assertIn(
+            "安全重载",
+            MODULE.tooltip_lines_for_action("navigation_destination_0")[0],
+        )
+        self.assertEqual(MODULE.tooltip_lines_for_action("unknown_action"), ())
 
     def test_settings_panel_distinguishes_current_next_and_pending(self) -> None:
         lines = MODULE.settings_hint_lines(
@@ -837,386 +740,60 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn("unavailable", unavailable.error)
         self.assertFalse(unavailable.action_enabled("apply_return"))
 
-    def test_runtime_pause_model_is_strict_and_disables_busy_or_fault(self) -> None:
-        def model(
-            phase: str,
-            epoch: int,
-            can_pause: bool,
-            can_resume: bool,
-            last_error=None,
-        ):
-            return MODULE.runtime_pause_panel_model(
-                {
-                    "command_console": {
-                        "runtime_pause": {
-                            "state": phase,
-                            "epoch": epoch,
-                            "can_pause": can_pause,
-                            "can_resume": can_resume,
-                            "last_error": last_error,
-                        }
-                    }
-                }
-            )
-
-        running = model("running", 4, True, False)
-        self.assertTrue(running.enabled)
-        self.assertEqual(running.pause_target, "paused")
-        self.assertIn("Pause", running.label)
-        paused = model("paused", 5, False, True)
-        self.assertTrue(paused.enabled)
-        self.assertEqual(paused.pause_target, "running")
-        self.assertIn("Continue", paused.label)
-        for phase in ("pausing", "resuming", "busy"):
-            with self.subTest(phase=phase):
-                busy = model(phase, 5, False, False)
-                self.assertFalse(busy.enabled)
-                self.assertIsNone(busy.pause_target)
-        fault = model("fault", 5, False, False, "MuJoCo pause failed")
-        self.assertFalse(fault.enabled)
-        self.assertEqual(fault.last_error, "MuJoCo pause failed")
-        malformed = MODULE.runtime_pause_panel_model(
-            {
-                "command_console": {
-                    "runtime_pause": {
-                        "state": "running",
-                        "epoch": True,
-                        "can_pause": True,
-                        "can_resume": False,
-                        "last_error": None,
-                        "shell": "pause",
-                    }
-                }
-            }
-        )
-        self.assertFalse(malformed.available)
-        self.assertFalse(malformed.enabled)
-
-    def test_runtime_pause_model_accepts_game_commands_runtime_status(self) -> None:
-        running = MODULE.runtime_pause_panel_model(
-            {
-                "game_commands": {
-                    "runtime_pause": {
-                        "available": True,
-                        "phase": "running",
-                        "epoch": 4,
-                        "last_error": None,
-                    }
-                }
-            }
-        )
-        self.assertTrue(running.enabled)
-        self.assertEqual(running.pause_target, "paused")
-        self.assertEqual(running.epoch, 4)
-
-        paused = MODULE.runtime_pause_panel_model(
-            {
-                "game_commands": {
-                    "runtime_pause": {
-                        "available": True,
-                        "phase": "paused",
-                        "epoch": 5,
-                        "last_error": None,
-                    }
-                }
-            }
-        )
-        self.assertTrue(paused.enabled)
-        self.assertEqual(paused.pause_target, "running")
-
-        pausing = MODULE.runtime_pause_panel_model(
-            {
-                "game_commands": {
-                    "runtime_pause": {
-                        "available": True,
-                        "phase": "pause_requested",
-                        "epoch": 5,
-                        "last_error": None,
-                    }
-                }
-            }
-        )
-        self.assertFalse(pausing.enabled)
-        self.assertEqual(pausing.state, "pausing")
-
-    def test_runtime_pause_button_draws_visible_state_semantics(self) -> None:
+    def test_control_motion_buttons_ignore_command_console_pending(self) -> None:
         layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        panel_model = MODULE.settings_panel_model(
+        model = MODULE.settings_panel_model(
             {"restart": {"available": True, "requested": False}}
         )
-
-        def runtime_pause_state(state: str, *, epoch: int = 7):
-            return MODULE.runtime_pause_panel_model(
-                {
-                    "command_console": {
-                        "runtime_pause": {
-                            "state": state,
-                            "epoch": epoch,
-                            "can_pause": state == "running",
-                            "can_resume": state == "paused",
-                            "last_error": "pause bridge fault"
-                            if state == "fault"
-                            else None,
-                        }
-                    }
-                }
-            )
-
-        def command_status(*, busy: bool = False):
-            return MODULE.command_console_status(
-                {
-                    "command_console": {
-                        "available": True,
-                        "editing": False,
-                        "in_flight": busy,
-                        "status": "pending" if busy else "idle",
-                    }
-                }
-            )
-
-        def draw_runtime_button(state: str, *, busy: bool = False):
-            overlay = object.__new__(MODULE.X11CalibrationOverlay)
-            overlay._x11 = mock.Mock()
-            overlay._display = 1
-            overlay._windows = {"panel": 2}
-            overlay._panel_gc = 3
-            overlay._xft = None
-            overlay._xft_draw = None
-            overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
-            overlay._active_page = "settings"
-            overlay._colours = {
-                name: index
-                for index, name in enumerate(
-                    (
-                        "white",
-                        "muted",
-                        "selected",
-                        "button",
-                        "disabled",
-                        "pending",
-                        "error",
-                        "apply",
-                        "outline",
-                        "cyan",
-                    ),
-                    10,
-                )
-            }
-            overlay._command_editor = MODULE.CommandLineEditor()
-            status = command_status(busy=busy)
-            overlay._last_command_status = status
-            overlay._draw_text = mock.Mock()
-            overlay._draw_button = mock.Mock()
-
-            overlay._draw_panel(
-                layout,
-                panel_model,
-                status,
-                runtime_pause_model=runtime_pause_state(state),
-            )
-
-            return next(
-                call
-                for call in overlay._draw_button.call_args_list
-                if call.args[1] == "runtime_pause"
-            ), overlay._colours
-
-        cases = (
-            ("running", False, "暂停 / Pause", False, "button"),
-            ("paused", False, "继续 / Continue", False, "selected"),
-            ("running", True, "处理中 / Busy", True, "pending"),
-            ("pausing", False, "暂停中 / Pausing", True, "pending"),
-            ("fault", False, "暂停故障 / Fault", True, "error"),
-            ("unavailable", False, "暂停不可用", True, "disabled"),
+        motion_model = MODULE.MotionSettingsPanelModel(
+            settings=MODULE.MotionSettings(),
+            available=True,
+            load_status="loaded",
+            error=None,
+            camera_control_available=True,
+            camera_control_error=None,
         )
-        for state, busy, label, disabled, fill_name in cases:
-            with self.subTest(state=state, busy=busy):
-                button, colours = draw_runtime_button(state, busy=busy)
-                self.assertEqual(button.args[2], label)
-                self.assertIs(button.kwargs["disabled"], disabled)
-                self.assertEqual(button.kwargs["fill"], colours[fill_name])
+        command_status = MODULE.CommandConsoleStatus(
+            available=True,
+            provider_editing=True,
+            in_flight=True,
+            status="pending",
+            request_id="request-1",
+            sequence=1,
+            result_revision=0,
+            ok=None,
+            code=None,
+            message=None,
+            warning=None,
+            restart_required=True,
+            outcome_unknown=True,
+        )
+        overlay = self.bare_overlay("settings")
+        overlay._command_editor.begin()
 
-    def test_creative_inventory_visual_blocker_disables_every_item(self) -> None:
-        model = MODULE.creative_inventory_model(
-            {
-                "creative_inventory": {
-                    "version": 1,
-                    "available": False,
-                    "unavailable_reason": (
-                        "packaged_ue_creative_prop_consumer_missing"
-                    ),
-                    "spawn_count": 0,
-                    "items": [
-                        {
-                            "item_id": "training_blaster",
-                            "label": "Training Blaster",
-                            "pool_size": 8,
-                            "remaining": 8,
-                        }
-                    ],
-                }
-            }
+        overlay._draw_control_settings_page(
+            layout,
+            model,
+            motion_model,
+            command_status,
         )
 
-        self.assertFalse(model.available)
-        self.assertEqual(
-            model.unavailable_reason,
-            "packaged_ue_creative_prop_consumer_missing",
-        )
-        self.assertEqual(len(model.items), 1)
-        self.assertFalse(model.item_enabled(0))
-
-    def test_motion_panel_model_reads_strict_telemetry_and_builds_set_commands(
-        self,
-    ) -> None:
-        settings = MODULE.MotionSettings(
-            revision=7,
-            slow_speed_mps=0.15,
-            slow_double_tap_speed_mps=0.25,
-            walk_speed_mps=1.10,
-            walk_double_tap_speed_mps=1.30,
-            run_speed_mps=3.00,
-            run_double_tap_speed_mps=3.50,
-        )
-        model = MODULE.motion_settings_panel_model(
-            {
-                "motion_settings": {
-                    "settings_file": "/host/motion-control.json",
-                    "load_status": "loaded",
-                    "load_error": None,
-                    "settings": settings.to_mapping(),
-                }
-            }
-        )
-
-        self.assertTrue(model.available)
-        self.assertEqual(model.settings.revision, 7)
-        self.assertEqual(model.settings.movement_mode, "camera_face")
-        self.assertEqual(model.value("walk", "double_tap_speed_mps"), 1.30)
-        self.assertEqual(
-            model.value("camera", MODULE.KEYBOARD_LOOK_RATE_FIELD),
-            120.0,
-        )
-        self.assertEqual(
-            MODULE.motion_step_command(model, "motion_slow_speed_mps_up"),
-            (
-                "/data modify entity @s control.motion.gears.slow.speed_mps "
-                "set value 0.20"
-            ),
-        )
-        self.assertEqual(
-            MODULE.motion_step_command(
-                model,
-                "motion_run_double_tap_speed_mps_down",
-            ),
-            (
-                "/data modify entity @s "
-                "control.motion.gears.run.double_tap_speed_mps set value 3.25"
-            ),
-        )
-        self.assertEqual(
-            MODULE.motion_step_command(
-                model,
-                "motion_camera_look_rate_up",
-            ),
-            (
-                "/data modify entity @s control.camera.keyboard_look_rate_deg_s "
-                "set value 150.00"
-            ),
-        )
-        with self.assertRaisesRegex(ValueError, "unsupported motion panel action"):
-            MODULE.motion_step_command(model, "motion_walk_speed_mps_step")
-
-    def test_motion_panel_uses_command_ack_fallback_and_fails_closed(self) -> None:
-        settings = MODULE.MotionSettings(revision=4, walk_speed_mps=0.90)
-        ack_model = MODULE.motion_settings_panel_model(
-            {
-                "command_console": {
-                    "data": {
-                        "motion_settings": {
-                            "settings_file": "/host/motion-control.json",
-                            "load_status": "saved",
-                            "load_error": None,
-                            "settings": settings.to_mapping(),
-                        }
-                    }
-                }
-            }
-        )
-        self.assertTrue(ack_model.available)
-        self.assertEqual(ack_model.load_status, "saved")
-        self.assertEqual(ack_model.value("walk", "speed_mps"), 0.90)
-
-        missing = MODULE.motion_settings_panel_model({})
-        malformed = MODULE.motion_settings_panel_model(
-            {
-                "motion_settings": {
-                    "version": 1,
-                    "revision": 0,
-                    "gears": {"slow": {}},
-                }
-            }
-        )
-        for model in (missing, malformed):
-            with self.subTest(error=model.error):
-                self.assertFalse(model.available)
-                self.assertIsNone(
-                    MODULE.motion_step_command(model, "motion_walk_speed_mps_up")
-                )
-                self.assertFalse(model.action_enabled("motion_walk_speed_mps_up"))
-
-    def test_motion_panel_disables_native_and_pair_order_boundaries(self) -> None:
-        settings = MODULE.MotionSettings(
-            slow_speed_mps=0.75,
-            slow_double_tap_speed_mps=0.80,
-            walk_speed_mps=0.80,
-            walk_double_tap_speed_mps=0.90,
-            run_speed_mps=7.25,
-            run_double_tap_speed_mps=7.50,
-        )
-        model = MODULE.motion_settings_panel_model(
-            {"motion_settings": settings.to_mapping()}
-        )
+        disabled_by_action = {
+            call.args[1]: call.kwargs.get("disabled")
+            for call in overlay._draw_button.call_args_list
+        }
         for action in (
-            "motion_slow_speed_mps_up",
-            "motion_slow_double_tap_speed_mps_up",
-            "motion_walk_speed_mps_down",
-            "motion_walk_double_tap_speed_mps_down",
-            "motion_run_speed_mps_up",
-            "motion_run_double_tap_speed_mps_up",
+            "movement_mode_camera_face",
+            "movement_mode_camera_strafe",
+            "movement_mode_body_relative",
+            "motion_gait_start_heading_error_down",
+            "motion_gait_start_heading_error_up",
+            "motion_gait_stop_heading_error_down",
+            "motion_gait_stop_heading_error_up",
+            "motion_camera_heading_snap_error_down",
+            "motion_camera_heading_snap_error_up",
         ):
-            with self.subTest(action=action):
-                self.assertFalse(model.action_enabled(action))
-                self.assertIsNone(MODULE.motion_step_command(model, action))
-
-    def test_camera_rate_controls_fail_closed_when_uinput_bridge_is_missing(
-        self,
-    ) -> None:
-        model = MODULE.motion_settings_panel_model(
-            {
-                "motion_settings": MODULE.MotionSettings().to_mapping(),
-                "keyboard_camera": {
-                    "available": False,
-                    "last_error": "bridge unavailable",
-                },
-            }
-        )
-        self.assertTrue(model.available)
-        self.assertFalse(model.camera_control_available)
-        self.assertEqual(model.camera_control_error, "bridge unavailable")
-        self.assertFalse(model.action_enabled("motion_camera_look_rate_up"))
-        self.assertIsNone(
-            MODULE.motion_step_command(model, "motion_camera_look_rate_up")
-        )
-        self.assertIn(
-            "不可用",
-            MODULE.motion_value_label(
-                model,
-                "camera",
-                MODULE.KEYBOARD_LOOK_RATE_FIELD,
-                compact=False,
-            ),
-        )
+            self.assertIs(disabled_by_action[action], False)
 
     def test_command_state_is_strict_and_alias_warning_is_ascii_readable(self) -> None:
         status = MODULE.command_console_status(
@@ -1228,7 +805,6 @@ class OverlayStateTest(unittest.TestCase):
                     "status": "success",
                     "sequence": 4,
                     "result_revision": 7,
-                    "result_age_s": 1.25,
                     "ok": True,
                     "warning": "已兼容执行；标准命令是 /summon",
                 }
@@ -1237,7 +813,6 @@ class OverlayStateTest(unittest.TestCase):
         self.assertTrue(status.available)
         self.assertFalse(status.provider_editing)
         self.assertEqual(status.result_revision, 7)
-        self.assertEqual(status.result_age_s, 1.25)
         self.assertEqual(status.warning, "Accepted /summom alias; standard command is /summon")
         malformed = MODULE.command_console_status(
             {
@@ -1245,902 +820,12 @@ class OverlayStateTest(unittest.TestCase):
                     "status": {},
                     "sequence": True,
                     "result_revision": True,
-                    "result_age_s": True,
                 }
             }
         )
         self.assertEqual(malformed.status, "unavailable")
         self.assertIsNone(malformed.sequence)
         self.assertEqual(malformed.result_revision, 0)
-        self.assertIsNone(malformed.result_age_s)
-
-    def test_command_state_accepts_game_commands_runtime_status(self) -> None:
-        status = MODULE.command_console_status(
-            {
-                "game_commands": {
-                    "enabled": True,
-                    "last_sequence": 4,
-                    "policy_change_pending": False,
-                    "runtime_pause_pending": False,
-                    "last_response": {
-                        "ok": True,
-                        "code": "OK_POLICY_SLOT_ASSIGNED",
-                        "message": "Assigned bfm-sonic-teacher50k to locomotion",
-                        "restart_required": False,
-                    },
-                }
-            }
-        )
-
-        self.assertTrue(status.available)
-        self.assertFalse(status.in_flight)
-        self.assertEqual(status.status, "success")
-        self.assertEqual(status.sequence, 4)
-        self.assertEqual(status.result_revision, 4)
-        self.assertTrue(status.ok)
-        self.assertEqual(status.code, "OK_POLICY_SLOT_ASSIGNED")
-
-    def test_strategy_loadout_model_exposes_two_slots_and_pending_selection(self) -> None:
-        model = MODULE.strategy_loadout_model(
-            {
-                "strategy_loadout": {
-                    "version": 1,
-                    "available": True,
-                    "status": "switching",
-                    "active_slot": "locomotion",
-                    "pending": {"policy_id": "host"},
-                    "slots": [
-                        {
-                            "slot": "locomotion",
-                            "selected_policy_id": "sonic",
-                            "candidates": [
-                                {
-                                    "policy_id": "sonic",
-                                    "name": "SONIC",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                                {
-                                    "policy_id": "bfm-sonic-teacher50k",
-                                    "name": "BFM SONIC Teacher50k",
-                                    "resident": False,
-                                    "available": False,
-                                    "unavailable_reason": (
-                                        "artifact_sha256_unlocked:runtime_adapter"
-                                    ),
-                                },
-                            ],
-                        },
-                        {
-                            "slot": "recovery",
-                            "selected_policy_id": "kungfu",
-                            "candidates": [
-                                {
-                                    "policy_id": "kungfu",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                                {
-                                    "policy_id": "host",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                                {
-                                    "policy_id": "amp",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                                {
-                                    "policy_id": "amp-flat-v3",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                            ],
-                        },
-                    ],
-                }
-            }
-        )
-        self.assertEqual(model.locomotion_policy_id, "sonic")
-        self.assertEqual(model.recovery_policy_id, "kungfu")
-        self.assertEqual(model.pending_policy_id, "host")
-        self.assertEqual(
-            [candidate.policy_id for candidate in model.locomotion_candidates],
-            ["sonic", "bfm-sonic-teacher50k"],
-        )
-        self.assertEqual(
-            model.locomotion_candidates[1].unavailable_reason,
-            "artifact_sha256_unlocked:runtime_adapter",
-        )
-        self.assertFalse(
-            model.policy_enabled("bfm-sonic-teacher50k", slot="locomotion")
-        )
-        self.assertEqual(
-            [candidate.policy_id for candidate in model.recovery_candidates],
-            ["kungfu", "host", "amp", "amp-flat-v3"],
-        )
-        self.assertFalse(model.policy_enabled("host"))
-
-    def test_strategy_loadout_model_accepts_game_commands_status(self) -> None:
-        model = MODULE.strategy_loadout_model(
-            {
-                "game_commands": {
-                    "strategy_loadout": {
-                        "version": 1,
-                        "available": True,
-                        "status": "ready",
-                        "active_slot": "locomotion",
-                        "pending": None,
-                        "slots": [
-                            {
-                                "slot": "locomotion",
-                                "locked": False,
-                                "selected_policy_id": "bfm-sonic-teacher50k",
-                                "candidates": [
-                                    {
-                                        "policy_id": "sonic",
-                                        "name": "SONIC",
-                                        "resident": True,
-                                        "available": True,
-                                    },
-                                    {
-                                        "policy_id": "bfm-sonic-teacher50k",
-                                        "name": "BFM SONIC Teacher50k",
-                                        "resident": True,
-                                        "available": True,
-                                    },
-                                ],
-                            }
-                        ],
-                    }
-                }
-            }
-        )
-
-        self.assertTrue(model.available)
-        self.assertEqual(model.locomotion_policy_id, "bfm-sonic-teacher50k")
-        self.assertEqual(
-            [candidate.policy_id for candidate in model.locomotion_candidates],
-            ["sonic", "bfm-sonic-teacher50k"],
-        )
-
-    def test_loading_loadout_allows_only_an_explicitly_unlocked_slot(self) -> None:
-        model = MODULE.strategy_loadout_model(
-            {
-                "strategy_loadout": {
-                    "version": 1,
-                    "available": True,
-                    "status": "loading",
-                    "active_slot": "locomotion",
-                    "slots": [
-                        {
-                            "slot": "locomotion",
-                            "selected_policy_id": "sonic",
-                            "locked": True,
-                            "candidates": [
-                                {
-                                    "policy_id": "sonic",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                                {
-                                    "policy_id": "bfm-sonic-teacher50k",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                            ],
-                        },
-                        {
-                            "slot": "recovery",
-                            "selected_policy_id": "kungfu",
-                            "locked": False,
-                            "candidates": [
-                                {
-                                    "policy_id": "kungfu",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                                {
-                                    "policy_id": "host",
-                                    "resident": True,
-                                    "available": True,
-                                },
-                            ],
-                        },
-                    ],
-                }
-            }
-        )
-
-        self.assertTrue(model.locomotion_locked)
-        self.assertFalse(model.recovery_locked)
-        self.assertFalse(
-            model.policy_enabled("bfm-sonic-teacher50k", slot="locomotion")
-        )
-        self.assertTrue(model.policy_enabled("host", slot="recovery"))
-
-    def test_celestial_navigation_model_is_strict_and_honest(self) -> None:
-        model = MODULE.celestial_navigation_model(celestial_navigation_state())
-
-        self.assertTrue(model.available)
-        self.assertEqual(model.universe_id, "sol-2080")
-        self.assertTrue(model.origin_rebasing)
-        self.assertTrue(model.refresh_enabled)
-        self.assertEqual(
-            model.lighting.visual_profile.profile_id,
-            "earth-wet-cloudy-v1",
-        )
-        self.assertEqual(
-            [destination.status for destination in model.destinations],
-            ["ready", "ready", "world_unavailable"],
-        )
-        self.assertTrue(model.destination_enabled("earth-overworld-home"))
-        self.assertTrue(model.destination_enabled("moon-tranquility-outpost"))
-
-        malformed = json.loads(json.dumps(celestial_navigation_state()))
-        malformed["celestial_navigation"]["destinations"][1]["enabled"] = "yes"
-        rejected = MODULE.celestial_navigation_model(malformed)
-        self.assertFalse(rejected.available)
-        self.assertEqual(rejected.destinations, ())
-
-        extra_field = json.loads(json.dumps(celestial_navigation_state()))
-        extra_field["celestial_navigation"]["shell_command"] = "rm -rf /"
-        rejected = MODULE.celestial_navigation_model(extra_field)
-        self.assertFalse(rejected.available)
-
-        overflowing = json.loads(json.dumps(celestial_navigation_state()))
-        overflowing["celestial_navigation"]["simulation_local_bound_m"] = 10**1000
-        rejected = MODULE.celestial_navigation_model(overflowing)
-        self.assertFalse(rejected.available)
-
-        mismatched_weather = json.loads(json.dumps(celestial_navigation_state()))
-        mismatched_weather["celestial_navigation"]["lighting"]["visual_profile"][
-            "weather_parameters"
-        ]["sun_altitude_angle"] = -45.0
-        rejected = MODULE.celestial_navigation_model(mismatched_weather)
-        self.assertFalse(rejected.available)
-
-    def test_navigation_clicks_emit_refresh_and_only_ready_destination(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._x11 = mock.Mock()
-        overlay._display = 1
-        overlay._last_layout = layout
-        overlay._active_page = "navigation"
-        overlay._last_navigation_model = MODULE.celestial_navigation_model(
-            celestial_navigation_state()
-        )
-        overlay._last_command_status = MODULE.CommandConsoleStatus(
-            available=True,
-            provider_editing=False,
-            in_flight=False,
-            status="idle",
-            request_id=None,
-            sequence=None,
-            result_revision=0,
-            ok=None,
-            code=None,
-            message=None,
-            warning=None,
-            restart_required=False,
-            outcome_unknown=False,
-        )
-        overlay._pressed_action = None
-        overlay._pressed_window = None
-        overlay._visible = True
-        overlay._font_slider_dragging = False
-        publisher = mock.Mock()
-        events = []
-        for target in (
-            "navigation_refresh",
-            "navigation_destination_0",
-            "navigation_destination_1",
-        ):
-            x, y, width, height = layout[target]
-            for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
-                event = MODULE.XEvent()
-                event.type = event_type
-                event.xbutton.button = 1
-                event.xbutton.window = 2
-                event.xbutton.x_root = x + width // 2
-                event.xbutton.y_root = y + height // 2
-                events.append(event)
-
-        overlay._x11.XPending.side_effect = lambda _display: len(events)
-
-        def next_event(_display, destination):
-            event = events.pop(0)
-            MODULE.ctypes.memmove(
-                destination,
-                MODULE.ctypes.byref(event),
-                MODULE.ctypes.sizeof(event),
-            )
-
-        overlay._x11.XNextEvent.side_effect = next_event
-
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 3)
-        publisher.publish_navigation_refresh.assert_called_once_with()
-        self.assertEqual(
-            publisher.publish_navigation_select.call_args_list,
-            [
-                mock.call("earth-overworld-home"),
-                mock.call("moon-tranquility-outpost"),
-            ],
-        )
-
-    def test_polled_button_edges_recover_a_missing_cooked_strategy_click(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        x, y, width, height = layout["recovery_policy_1"]
-        events = []
-
-        class FakeX11:
-            @staticmethod
-            def XPending(_display):
-                return len(events)
-
-            @staticmethod
-            def XNextEvent(_display, destination):
-                event = events.pop(0)
-                MODULE.ctypes.memmove(
-                    destination,
-                    MODULE.ctypes.byref(event),
-                    MODULE.ctypes.sizeof(event),
-                )
-
-            @staticmethod
-            def XSendEvent(_display, _window, _propagate, _mask, source):
-                event = MODULE.XEvent.from_buffer_copy(
-                    MODULE.ctypes.string_at(
-                        source,
-                        MODULE.ctypes.sizeof(MODULE.XEvent),
-                    )
-                )
-                events.append(event)
-                return 1
-
-            @staticmethod
-            def XFlush(_display):
-                return 1
-
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._x11 = FakeX11()
-        overlay._display = 1
-        overlay._root = 10
-        overlay._windows = {"panel": 2}
-        overlay._last_layout = layout
-        overlay._last_pointer = (x + width // 2, y + height // 2)
-        overlay._active_page = "loadout"
-        overlay._last_strategy_model = MODULE.StrategyLoadoutModel(
-            available=True,
-            status="loading",
-            active_slot="locomotion",
-            locomotion_policy_id="sonic",
-            recovery_policy_id="kungfu",
-            locomotion_candidates=(),
-            recovery_candidates=(
-                MODULE.StrategyPolicyModel("kungfu", True, True),
-                MODULE.StrategyPolicyModel("host", True, True),
-            ),
-            pending_policy_id=None,
-            locomotion_locked=True,
-            recovery_locked=False,
-        )
-        overlay._pressed_action = None
-        overlay._pressed_window = None
-        overlay._visible = True
-        overlay._font_slider_dragging = False
-        overlay._polled_pointer_valid = True
-        overlay._polled_left_pressed = False
-        overlay._polled_left_initialized = False
-        overlay._polled_left_was_down = False
-        overlay._polled_left_transition_count = 0
-        overlay._polled_left_fallback_events = 0
-        publisher = mock.Mock()
-
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
-        overlay._polled_left_pressed = True
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].type, MODULE._BUTTON_PRESS)
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
-        overlay._polled_left_pressed = False
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].type, MODULE._BUTTON_RELEASE)
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
-
-        publisher.publish_strategy_select.assert_called_once_with(
-            "recovery",
-            "host",
-        )
-        self.assertEqual(overlay._polled_left_transition_count, 2)
-        self.assertEqual(overlay._polled_left_fallback_events, 2)
-
-    def test_navigation_page_draws_ready_earth_moon_and_disabled_mars(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        model = MODULE.celestial_navigation_model(celestial_navigation_state())
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._colours = {
-            name: index
-            for index, name in enumerate(
-                (
-                    "white",
-                    "muted",
-                    "button",
-                    "outline",
-                    "disabled",
-                    "selected",
-                    "pending",
-                    "apply",
-                    "cyan",
-                ),
-                10,
-            )
-        }
-        overlay._fill_panel_band = mock.Mock(
-            return_value=overlay._panel_rectangle(layout, "navigation_summary")
-        )
-        overlay._draw_text = mock.Mock()
-        overlay._draw_button = mock.Mock()
-
-        overlay._draw_navigation_page(layout, model)
-
-        buttons = {
-            call.args[1]: call for call in overlay._draw_button.call_args_list
-        }
-        self.assertFalse(buttons["navigation_refresh"].kwargs["disabled"])
-        self.assertFalse(buttons["navigation_destination_0"].kwargs["disabled"])
-        self.assertFalse(buttons["navigation_destination_1"].kwargs["disabled"])
-        self.assertTrue(buttons["navigation_destination_2"].kwargs["disabled"])
-        self.assertIn("可传送", buttons["navigation_destination_0"].args[2])
-        self.assertIn("可传送", buttons["navigation_destination_1"].args[2])
-
-    def test_navigation_undiscovered_draws_disabled_not_pending(self) -> None:
-        state = celestial_navigation_state()
-        state["celestial_navigation"]["bodies"][3] = {
-            **state["celestial_navigation"]["bodies"][3],
-            "runtime_status": "active",
-        }
-        destinations = state["celestial_navigation"]["destinations"]
-        destinations[1] = {
-            **destinations[1],
-            "status": "unknown",
-            "enabled": False,
-            "local_position_m": None,
-            "universe_position_m": None,
-        }
-        destinations[2] = {
-            **destinations[2],
-            "runtime_status": "active",
-            "status": "undiscovered",
-            "local_position_m": None,
-            "universe_position_m": None,
-        }
-        model = MODULE.celestial_navigation_model(state)
-        self.assertEqual(model.destinations[1].status, "unknown")
-        self.assertEqual(model.destinations[2].status, "undiscovered")
-        self.assertFalse(model.destination_enabled("moon-tranquility-outpost"))
-        self.assertFalse(model.destination_enabled("mars-utopia-outpost"))
-
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._colours = {
-            name: index
-            for index, name in enumerate(
-                (
-                    "white",
-                    "muted",
-                    "button",
-                    "outline",
-                    "disabled",
-                    "selected",
-                    "pending",
-                    "apply",
-                    "cyan",
-                ),
-                10,
-            )
-        }
-        overlay._fill_panel_band = mock.Mock(
-            return_value=overlay._panel_rectangle(layout, "navigation_summary")
-        )
-        overlay._draw_text = mock.Mock()
-        overlay._draw_button = mock.Mock()
-
-        overlay._draw_navigation_page(layout, model)
-
-        buttons = {
-            call.args[1]: call for call in overlay._draw_button.call_args_list
-        }
-        self.assertEqual(
-            buttons["navigation_destination_1"].kwargs["fill"],
-            overlay._colours["pending"],
-        )
-        self.assertTrue(buttons["navigation_destination_1"].kwargs["disabled"])
-        self.assertEqual(
-            buttons["navigation_destination_2"].kwargs["fill"],
-            overlay._colours["disabled"],
-        )
-        self.assertTrue(buttons["navigation_destination_2"].kwargs["disabled"])
-        self.assertIn("待同步", buttons["navigation_destination_1"].args[2])
-        self.assertIn("未发现", buttons["navigation_destination_2"].args[2])
-
-    def test_disabled_locomotion_candidate_emits_no_selection_intent(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        model = MODULE.StrategyLoadoutModel(
-            available=True,
-            status="ready",
-            active_slot="locomotion",
-            locomotion_policy_id="sonic",
-            recovery_policy_id="kungfu",
-            locomotion_candidates=(
-                MODULE.StrategyPolicyModel("sonic", True, True, "SONIC"),
-                MODULE.StrategyPolicyModel(
-                    "bfm-sonic-teacher50k",
-                    False,
-                    False,
-                    "BFM SONIC Teacher50k",
-                    "artifact_sha256_unlocked:runtime_adapter",
-                ),
-            ),
-            recovery_candidates=(),
-            pending_policy_id=None,
-        )
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._x11 = mock.Mock()
-        overlay._display = 1
-        overlay._last_layout = layout
-        overlay._active_page = "loadout"
-        overlay._last_strategy_model = model
-        overlay._pressed_action = None
-        overlay._pressed_window = None
-        overlay._visible = True
-        overlay._font_slider_dragging = False
-        publisher = mock.Mock()
-        x, y, width, height = layout["locomotion_policy_1"]
-        events = []
-        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
-            event = MODULE.XEvent()
-            event.type = event_type
-            event.xbutton.button = 1
-            event.xbutton.window = 2
-            event.xbutton.x_root = x + width // 2
-            event.xbutton.y_root = y + height // 2
-            events.append(event)
-
-        overlay._x11.XPending.side_effect = lambda _display: len(events)
-
-        def next_event(_display, destination):
-            event = events.pop(0)
-            MODULE.ctypes.memmove(
-                destination,
-                MODULE.ctypes.byref(event),
-                MODULE.ctypes.sizeof(event),
-            )
-
-        overlay._x11.XNextEvent.side_effect = next_event
-
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
-        publisher.publish_strategy_select.assert_not_called()
-
-    def test_fourth_recovery_candidate_is_drawn_and_selectable(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        recovery_candidates = tuple(
-            MODULE.StrategyPolicyModel(policy_id, True, True)
-            for policy_id in ("kungfu", "host", "amp", "amp-flat-v3")
-        )
-        model = MODULE.StrategyLoadoutModel(
-            available=True,
-            status="ready",
-            active_slot="recovery",
-            locomotion_policy_id="sonic",
-            recovery_policy_id="kungfu",
-            locomotion_candidates=(),
-            recovery_candidates=recovery_candidates,
-            pending_policy_id=None,
-        )
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._colours = {
-            name: index
-            for index, name in enumerate(
-                (
-                    "white",
-                    "muted",
-                    "button",
-                    "outline",
-                    "disabled",
-                    "selected",
-                    "pending",
-                    "apply",
-                    "cyan",
-                ),
-                10,
-            )
-        }
-        overlay._fill_panel_band = mock.Mock(
-            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
-        )
-        overlay._draw_text = mock.Mock()
-        overlay._draw_button = mock.Mock()
-
-        overlay._draw_loadout_page(layout, model)
-
-        fourth = next(
-            call
-            for call in overlay._draw_button.call_args_list
-            if call.args[1] == "recovery_policy_3"
-        )
-        self.assertEqual(fourth.args[2], "AMP flat_v3")
-        self.assertFalse(fourth.kwargs["disabled"])
-
-        overlay._x11 = mock.Mock()
-        overlay._display = 1
-        overlay._last_layout = layout
-        overlay._active_page = "loadout"
-        overlay._last_strategy_model = model
-        overlay._pressed_action = None
-        overlay._pressed_window = None
-        overlay._visible = True
-        overlay._font_slider_dragging = False
-        publisher = mock.Mock()
-        x, y, width, height = layout["recovery_policy_3"]
-        events = []
-        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
-            event = MODULE.XEvent()
-            event.type = event_type
-            event.xbutton.button = 1
-            event.xbutton.window = 2
-            event.xbutton.x_root = x + width // 2
-            event.xbutton.y_root = y + height // 2
-            events.append(event)
-
-        overlay._x11.XPending.side_effect = lambda _display: len(events)
-
-        def next_event(_display, destination):
-            event = events.pop(0)
-            MODULE.ctypes.memmove(
-                destination,
-                MODULE.ctypes.byref(event),
-                MODULE.ctypes.sizeof(event),
-            )
-
-        overlay._x11.XNextEvent.side_effect = next_event
-
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
-        publisher.publish_strategy_select.assert_called_once_with(
-            "recovery",
-            "amp-flat-v3",
-        )
-
-    def test_loadout_draws_locomotion_progress_for_strategy_switch(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        model = MODULE.StrategyLoadoutModel(
-            available=True,
-            status="switching",
-            active_slot="locomotion",
-            locomotion_policy_id="sonic",
-            recovery_policy_id="kungfu",
-            locomotion_candidates=(
-                MODULE.StrategyPolicyModel("sonic", True, True, "SONIC"),
-                MODULE.StrategyPolicyModel(
-                    "bfm-sonic-teacher50k",
-                    True,
-                    True,
-                    "BFM SONIC Teacher50k",
-                ),
-            ),
-            recovery_candidates=(),
-            pending_policy_id="bfm-sonic-teacher50k",
-        )
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._colours = {
-            name: index
-            for index, name in enumerate(
-                (
-                    "white",
-                    "muted",
-                    "button",
-                    "outline",
-                    "disabled",
-                    "selected",
-                    "pending",
-                    "apply",
-                    "cyan",
-                ),
-                10,
-            )
-        }
-        overlay._fill_panel_band = mock.Mock(
-            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
-        )
-        overlay._draw_text = mock.Mock()
-        overlay._draw_button = mock.Mock()
-        overlay._draw_progress_bar = mock.Mock()
-
-        overlay._draw_loadout_page(layout, model)
-
-        overlay._draw_progress_bar.assert_called_once()
-        self.assertIn("BFM", overlay._draw_progress_bar.call_args.kwargs["label"])
-
-    def test_loadout_draws_policy_rejection_status(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        model = MODULE.strategy_loadout_model(
-            {
-                "strategy_loadout": {
-                    "version": 1,
-                    "available": True,
-                    "status": "ready",
-                    "active_slot": "locomotion",
-                    "pending": None,
-                    "slots": [
-                        {
-                            "slot": "locomotion",
-                            "selected_policy_id": "sonic",
-                            "locked": False,
-                            "candidates": [
-                                {
-                                    "policy_id": "sonic",
-                                    "name": "SONIC",
-                                    "available": True,
-                                    "resident": True,
-                                },
-                                {
-                                    "policy_id": "bfm-sonic-teacher50k",
-                                    "name": "BFM SONIC Teacher50k",
-                                    "available": True,
-                                    "resident": True,
-                                },
-                            ],
-                        },
-                        {
-                            "slot": "recovery",
-                            "selected_policy_id": "kungfu",
-                            "locked": False,
-                            "candidates": [],
-                        },
-                    ],
-                }
-            }
-        )
-        status = MODULE.CommandConsoleStatus(
-            available=True,
-            provider_editing=False,
-            in_flight=False,
-            status="error",
-            request_id="cmd-test",
-            sequence=1,
-            result_revision=1,
-            ok=False,
-            code="E_POLICY_SWITCH_REJECTED",
-            message="BFM hot switch reference buffer was not swapped",
-            warning=None,
-            restart_required=False,
-            outcome_unknown=False,
-            result_age_s=1.0,
-        )
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._colours = {
-            name: index
-            for index, name in enumerate(
-                (
-                    "white",
-                    "muted",
-                    "button",
-                    "outline",
-                    "disabled",
-                    "selected",
-                    "pending",
-                    "apply",
-                    "cyan",
-                    "error",
-                ),
-                10,
-            )
-        }
-        overlay._fill_panel_band = mock.Mock(
-            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
-        )
-        overlay._draw_text = mock.Mock()
-        overlay._draw_button = mock.Mock()
-        overlay._draw_progress_bar = mock.Mock()
-
-        overlay._draw_loadout_page(layout, model, status)
-
-        overlay._draw_progress_bar.assert_called_once()
-        self.assertEqual(
-            overlay._draw_progress_bar.call_args.kwargs["colour_name"],
-            "error",
-        )
-        self.assertIn(
-            "策略切换失败",
-            overlay._draw_progress_bar.call_args.kwargs["label"],
-        )
-
-    def test_loadout_hides_stale_policy_rejection_status(self) -> None:
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        model = MODULE.strategy_loadout_model(
-            {
-                "strategy_loadout": {
-                    "version": 1,
-                    "available": True,
-                    "status": "ready",
-                    "active_slot": "locomotion",
-                    "pending": None,
-                    "slots": [
-                        {
-                            "slot": "locomotion",
-                            "selected_policy_id": "sonic",
-                            "locked": False,
-                            "candidates": [
-                                {
-                                    "policy_id": "sonic",
-                                    "name": "SONIC",
-                                    "available": True,
-                                    "resident": True,
-                                },
-                                {
-                                    "policy_id": "bfm-sonic-teacher50k",
-                                    "name": "BFM SONIC Teacher50k",
-                                    "available": True,
-                                    "resident": True,
-                                },
-                            ],
-                        },
-                        {
-                            "slot": "recovery",
-                            "selected_policy_id": "kungfu",
-                            "locked": False,
-                            "candidates": [],
-                        },
-                    ],
-                }
-            }
-        )
-        status = MODULE.CommandConsoleStatus(
-            available=True,
-            provider_editing=False,
-            in_flight=False,
-            status="error",
-            request_id="cmd-test",
-            sequence=1,
-            result_revision=1,
-            ok=False,
-            code="E_POLICY_SWITCH_REJECTED",
-            message="BFM hot switch reference buffer was not swapped",
-            warning=None,
-            restart_required=False,
-            outcome_unknown=False,
-            result_age_s=10.0,
-        )
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._colours = {
-            name: index
-            for index, name in enumerate(
-                (
-                    "white",
-                    "muted",
-                    "button",
-                    "outline",
-                    "disabled",
-                    "selected",
-                    "pending",
-                    "apply",
-                    "cyan",
-                    "error",
-                ),
-                10,
-            )
-        }
-        overlay._fill_panel_band = mock.Mock(
-            return_value=overlay._panel_rectangle(layout, "locomotion_slot")
-        )
-        overlay._draw_text = mock.Mock()
-        overlay._draw_button = mock.Mock()
-        overlay._draw_progress_bar = mock.Mock()
-
-        overlay._draw_loadout_page(layout, model, status)
-
-        overlay._draw_progress_bar.assert_not_called()
 
     def test_remote_speed_boundary_buttons_are_independently_disabled(self) -> None:
         def model(scale: float):
@@ -2183,7 +868,67 @@ class OverlayStateTest(unittest.TestCase):
         self.assertEqual(model.current_scale, 1.0)
         self.assertEqual(model.next_scale, 1.0)
 
-    def test_low_remote_scale_is_rendered_with_discrete_step_hint(self) -> None:
+    def test_motion_panel_exposes_adjustable_gait_heading_thresholds(self) -> None:
+        model = MODULE.MotionSettingsPanelModel(
+            settings=MODULE.MotionSettings(),
+            available=True,
+            load_status="loaded",
+            error=None,
+            camera_control_available=True,
+            camera_control_error=None,
+        )
+
+        self.assertEqual(
+            MODULE.motion_value_label(
+                model,
+                "gait",
+                MODULE.GAIT_START_HEADING_ERROR_FIELD,
+                compact=False,
+            ),
+            "边走≤45°",
+        )
+        self.assertEqual(
+            MODULE.motion_value_label(
+                model,
+                "gait",
+                MODULE.GAIT_STOP_HEADING_ERROR_FIELD,
+                compact=False,
+            ),
+            "原地≥90°",
+        )
+        self.assertEqual(
+            MODULE.motion_value_label(
+                model,
+                "camera",
+                MODULE.CAMERA_HEADING_SNAP_ERROR_FIELD,
+                compact=False,
+            ),
+            "对齐精度 2°",
+        )
+
+        start_command = MODULE.motion_step_command(
+            model,
+            "motion_gait_start_heading_error_up",
+        )
+        stop_command = MODULE.motion_step_command(
+            model,
+            "motion_gait_stop_heading_error_down",
+        )
+        snap_command = MODULE.motion_step_command(
+            model,
+            "motion_camera_heading_snap_error_up",
+        )
+        self.assertIsNotNone(start_command)
+        self.assertIsNotNone(stop_command)
+        self.assertIsNotNone(snap_command)
+        self.assertIn(MODULE.GAIT_START_HEADING_ERROR_PATH, start_command)
+        self.assertIn(MODULE.GAIT_STOP_HEADING_ERROR_PATH, stop_command)
+        self.assertIn(MODULE.CAMERA_HEADING_SNAP_ERROR_PATH, snap_command)
+        self.assertIn(f"set value {math.radians(46.0):.10f}", start_command)
+        self.assertIn(f"set value {math.radians(89.0):.10f}", stop_command)
+        self.assertIn(f"set value {math.radians(3.0):.10f}", snap_command)
+
+    def test_low_remote_scale_step_hint_is_hover_only(self) -> None:
         geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 800)
         layout = MODULE.overlay_layout(geometry)
         model = MODULE.settings_panel_model(
@@ -2225,6 +970,7 @@ class OverlayStateTest(unittest.TestCase):
         }
         overlay._command_editor = MODULE.CommandLineEditor()
         overlay._last_command_status = MODULE.command_console_status({})
+        overlay._active_page = "settings"
         overlay._draw_text = mock.Mock()
         overlay._draw_button = mock.Mock()
 
@@ -2233,8 +979,11 @@ class OverlayStateTest(unittest.TestCase):
         labels = [call.args[0] for call in overlay._draw_text.call_args_list]
         self.assertIn("0.01x", labels)
         combined = " | ".join(labels)
-        self.assertIn("0.01-0.10", combined)
-        self.assertIn("0.20-1.00", combined)
+        self.assertNotIn("0.01-0.10", combined)
+        self.assertNotIn("0.20-1.00", combined)
+        tooltip = " | ".join(MODULE.tooltip_lines_for_action("speed_value"))
+        self.assertIn("0.01-0.10", tooltip)
+        self.assertIn("0.20-1.00", tooltip)
 
         overlay._draw_text.reset_mock()
         compact_layout = MODULE.overlay_layout(
@@ -2247,701 +996,12 @@ class OverlayStateTest(unittest.TestCase):
         self.assertNotIn("0.01-0.10", " | ".join(compact_labels))
         self.assertNotIn("0.20-1.00", " | ".join(compact_labels))
 
-    def test_all_six_motion_values_and_step_buttons_are_drawn(self) -> None:
-        layout = MODULE.overlay_layout(
-            MODULE.WindowGeometry(1, 0, 0, 1280, 800)
-        )
-        panel_model = MODULE.settings_panel_model(
-            {"restart": {"available": True, "requested": False}}
-        )
-        motion_model = MODULE.motion_settings_panel_model(
-            {
-                "motion_settings": MODULE.MotionSettings(
-                    revision=3,
-                    slow_speed_mps=0.15,
-                    slow_double_tap_speed_mps=0.25,
-                    walk_speed_mps=1.10,
-                    walk_double_tap_speed_mps=1.30,
-                    run_speed_mps=3.00,
-                    run_double_tap_speed_mps=3.50,
-                ).to_mapping()
-            }
-        )
-        command_status = MODULE.command_console_status(
-            {
-                "command_console": {
-                    "available": True,
-                    "editing": False,
-                    "in_flight": False,
-                    "status": "idle",
-                }
-            }
-        )
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._x11 = mock.Mock()
-        overlay._display = 1
-        overlay._windows = {"panel": 2}
-        overlay._panel_gc = 3
-        overlay._xft = None
-        overlay._xft_draw = None
-        overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
-        overlay._active_page = "settings"
-        overlay._colours = {
-            name: index
-            for index, name in enumerate(
-                (
-                    "white",
-                    "muted",
-                    "selected",
-                    "button",
-                    "disabled",
-                    "pending",
-                    "error",
-                    "apply",
-                    "outline",
-                    "cyan",
-                ),
-                10,
-            )
-        }
-        overlay._command_editor = MODULE.CommandLineEditor()
-        overlay._last_command_status = command_status
-        overlay._draw_text = mock.Mock()
-        overlay._draw_button = mock.Mock()
-
-        overlay._draw_panel(
-            layout,
-            panel_model,
-            command_status,
-            motion_model=motion_model,
-        )
-
-        labels = {call.args[0] for call in overlay._draw_text.call_args_list}
-        self.assertTrue(
-            {
-                "慢速基础 0.15 m/s",
-                "慢速双击 0.25 m/s",
-                "行走基础 1.10 m/s",
-                "行走双击 1.30 m/s",
-                "奔跑基础 3.00 m/s",
-                "奔跑双击 3.50 m/s",
-            }.issubset(labels)
-        )
-        drawn_buttons = {call.args[1] for call in overlay._draw_button.call_args_list}
-        self.assertTrue(set(MODULE._MOTION_STEP_ACTIONS).issubset(drawn_buttons))
-
     def test_font_fallbacks_match_heyuan_xlsfonts_probe(self) -> None:
         self.assertEqual(MODULE._LARGE_FONT_CANDIDATES[0], b"12x24")
         self.assertEqual(MODULE._BODY_FONT_CANDIDATES[:2], (b"10x20", b"9x15"))
-        self.assertIn(b"size=13", MODULE.xft_font_candidates(1.0, large=False)[0])
-        self.assertIn(b"size=27", MODULE.xft_font_candidates(1.5, large=True)[0])
-        self.assertIn(b":size=13", MODULE._XFT_BODY_FONT_CANDIDATES[0])
-        self.assertIn(b":size=18", MODULE._XFT_LARGE_FONT_CANDIDATES[0])
-
-    def test_persisted_font_size_controls_are_bounded(self) -> None:
-        def model(font_size: object, *, scale: object = 1.0):
-            return MODULE.settings_panel_model(
-                {
-                    "ui_settings": {"font_scale": scale, "font_size": font_size},
-                    "restart": {"available": True, "requested": False},
-                }
-            )
-
-        minimum = model(1)
-        self.assertEqual(minimum.font_size, 1)
-        self.assertFalse(minimum.action_enabled("font_down"))
-        self.assertTrue(minimum.action_enabled("font_up"))
-        maximum = model(22)
-        self.assertTrue(maximum.action_enabled("font_down"))
-        self.assertFalse(maximum.action_enabled("font_up"))
-        self.assertEqual(model(99, scale=1.3).font_size, 17)
-
-
-class BuildInfoPanelTest(unittest.TestCase):
-    def test_strict_model_exposes_launch_and_last_commit(self) -> None:
-        model = MODULE.build_info_panel_model(build_info_state())
-        self.assertTrue(model.available)
-        self.assertEqual(model.profile, "heyuan")
-        self.assertEqual(model.scene_name, "Town10World")
-        self.assertEqual(model.branch, "feature/desktop-launcher")
-        self.assertEqual(model.short_commit, "a" * 7)
-        self.assertEqual(model.changed_files, 2)
-        self.assertEqual(model.files[0].status, "M")
-
-    def test_invalid_model_fails_to_render_only_unavailable(self) -> None:
-        state = build_info_state()
-        state["build_info"]["control_source"] = "game;touch /tmp/no"
-        model = MODULE.build_info_panel_model(state)
-        self.assertFalse(model.available)
-        self.assertIn("不可用", model.error)
-
-    def test_missing_payload_does_not_claim_fake_launch_parameters(self) -> None:
-        model = MODULE.build_info_panel_model({})
-        self.assertFalse(model.available)
-        self.assertFalse(model.launch_available)
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._font_size = 13
-        overlay._colours = {
-            "button": 1,
-            "outline": 2,
-            "cyan": 3,
-            "white": 4,
-            "muted": 5,
-            "error": 6,
-            "selected": 7,
-        }
-        overlay._fill_panel_band = mock.Mock(return_value=(20, 90, 1000, 440))
-        overlay._draw_text = mock.Mock()
-        overlay._draw_system_page(
-            MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800)),
-            model,
-        )
-        labels = [call.args[0] for call in overlay._draw_text.call_args_list]
-        self.assertFalse(any("启动参数" in label for label in labels))
-        self.assertTrue(any("不可用" in label for label in labels))
-
-    def test_system_tab_is_bounded_clickable_and_draws_provenance(self) -> None:
-        layout = MODULE.overlay_layout(
-            MODULE.WindowGeometry(1, 0, 0, 1280, 800)
-        )
-        panel = layout["panel"]
-        previous_right = panel[0]
-        for name in MODULE._PANEL_TABS:
-            rectangle = layout[name]
-            self.assertGreaterEqual(rectangle[0], previous_right)
-            self.assertLessEqual(rectangle[0] + rectangle[2], panel[0] + panel[2])
-            previous_right = rectangle[0] + rectangle[2]
-        x, y, width, height = layout["tab_system"]
-        self.assertEqual(
-            MODULE.panel_action_at(
-                layout,
-                x + width // 2,
-                y + height // 2,
-                page="system",
-            ),
-            "tab_system",
-        )
-
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._font_size = 13
-        overlay._colours = {
-            "button": 1,
-            "outline": 2,
-            "cyan": 3,
-            "white": 4,
-            "muted": 5,
-            "error": 6,
-            "selected": 7,
-        }
-        overlay._fill_panel_band = mock.Mock(return_value=(20, 90, 1000, 440))
-        overlay._draw_text = mock.Mock()
-        overlay._draw_system_page(
-            layout,
-            MODULE.build_info_panel_model(build_info_state()),
-        )
-        labels = [call.args[0] for call in overlay._draw_text.call_args_list]
-        self.assertTrue(any("heyuan" in label and "scene 2" in label for label in labels))
-        self.assertTrue(any("feature/desktop-launcher" in label for label in labels))
-        self.assertTrue(any("aaaaaaa" in label for label in labels))
-        self.assertTrue(any("+24 / -3" in label for label in labels))
-
-        compact = MODULE.overlay_layout(
-            MODULE.WindowGeometry(1, 0, 0, 480, 360)
-        )
-        overlay._draw_button = mock.Mock()
-        overlay._draw_tabs(compact, "system")
-        compact_labels = [
-            call.args[2] for call in overlay._draw_button.call_args_list
-        ]
-        self.assertEqual(
-            compact_labels,
-            ["策略", "控制", "命令", "物品", "导航", "视频", "运行"],
-        )
-
-
-class HotFontSizeTest(unittest.TestCase):
-    @staticmethod
-    def overlay():
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._display = 1
-        overlay._screen = 0
-        overlay._xft = mock.Mock()
-        overlay._xft_draw = 2
-        overlay._xft_body_font = 11
-        overlay._xft_large_font = 12
-        overlay._xft_body_font_name = "old-body"
-        overlay._xft_large_font_name = "old-large"
-        overlay._body_font_name = "core-body"
-        overlay._large_font_name = "core-large"
-        overlay._font_scale = MODULE.DEFAULT_FONT_SCALE
-        overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
-        return overlay
-
-    def test_xft_body_and_large_fonts_swap_atomically_without_restart(self) -> None:
-        overlay = self.overlay()
-        overlay._load_xft_font = mock.Mock(
-            side_effect=[(21, "new-body"), (22, "new-large")]
-        )
-
-        self.assertTrue(overlay._set_font_size(20))
-
-        self.assertEqual(overlay._font_size, 20)
-        self.assertEqual(overlay._xft_body_font, 21)
-        self.assertEqual(overlay._xft_large_font, 22)
-        self.assertEqual(
-            overlay._load_xft_font.call_args_list,
-            [
-                mock.call(MODULE._xft_font_candidates(20, bold=False)),
-                mock.call(
-                    MODULE._xft_font_candidates(
-                        20 + MODULE._LARGE_FONT_SIZE_DELTA,
-                        bold=True,
-                    )
-                ),
-            ],
-        )
-        closed = [call.args[1].value for call in overlay._xft.XftFontClose.call_args_list]
-        self.assertEqual(closed, [11, 12])
-        self.assertEqual(overlay.font_diagnostics["size"], 20)
-        self.assertTrue(overlay.font_diagnostics["adjustable"])
-
-    def test_single_pixel_body_font_is_supported(self) -> None:
-        overlay = self.overlay()
-        overlay._load_xft_font = mock.Mock(
-            side_effect=[(31, "tiny-body"), (32, "tiny-large")]
-        )
-
-        self.assertTrue(overlay._set_font_size(1))
-
-        self.assertEqual(overlay._font_size, 1)
-        self.assertEqual(
-            overlay._load_xft_font.call_args_list,
-            [
-                mock.call(MODULE._xft_font_candidates(1, bold=False)),
-                mock.call(
-                    MODULE._xft_font_candidates(
-                        1 + MODULE._LARGE_FONT_SIZE_DELTA,
-                        bold=True,
-                    )
-                ),
-            ],
-        )
-
-    def test_font_size_range_rejects_values_outside_one_to_twenty_two(self) -> None:
-        overlay = self.overlay()
-
-        for font_size in (0, 23):
-            with self.subTest(font_size=font_size), self.assertRaises(ValueError):
-                overlay._set_font_size(font_size)
-
-    def test_failed_large_font_load_keeps_the_live_pair_unchanged(self) -> None:
-        overlay = self.overlay()
-        overlay._load_xft_font = mock.Mock(
-            side_effect=[(21, "candidate-body"), RuntimeError("missing")]
-        )
-
-        self.assertFalse(overlay._set_font_size(20))
-
-        self.assertEqual(overlay._font_size, MODULE._DEFAULT_OVERLAY_FONT_SIZE)
-        self.assertEqual(overlay._xft_body_font, 11)
-        self.assertEqual(overlay._xft_large_font, 12)
-        closed = [call.args[1].value for call in overlay._xft.XftFontClose.call_args_list]
-        self.assertEqual(closed, [21])
-
-    def test_slider_position_is_local_and_page_scoped(self) -> None:
-        overlay = self.overlay()
-        overlay._last_layout = MODULE.overlay_layout(
-            MODULE.WindowGeometry(1, 0, 0, 1280, 800)
-        )
-        overlay._set_font_size = mock.Mock(
-            side_effect=AssertionError("font changed before provider ACK")
-        )
-        track = MODULE.font_slider_track(
-            overlay._last_layout["font_size_slider"]
-        )
-        overlay._active_page = "loadout"
-        self.assertFalse(overlay._set_font_size_from_root_x(track[0] + track[2]))
-        overlay._set_font_size.assert_not_called()
-
-        overlay._active_page = "settings"
-        self.assertTrue(overlay._set_font_size_from_root_x(track[0] + track[2]))
-        overlay._set_font_size.assert_not_called()
-        self.assertEqual(overlay._font_size, MODULE._DEFAULT_OVERLAY_FONT_SIZE)
-        self.assertEqual(
-            overlay._pending_font_slider_size,
-            MODULE._MAX_OVERLAY_FONT_SIZE,
-        )
-
-
-class RuntimePausePointerTest(unittest.TestCase):
-    @staticmethod
-    def overlay(
-        state: str,
-        *,
-        page: str = "settings",
-        release_point: tuple[int, int] | None = None,
-        release_window: int = 2,
-        release_state: str | None = None,
-    ):
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 1280, 800))
-        pause_state = {
-            "command_console": {
-                "runtime_pause": {
-                    "state": state,
-                    "epoch": 3,
-                    "can_pause": state == "running",
-                    "can_resume": state == "paused",
-                    "last_error": "runtime fault" if state == "fault" else None,
-                }
-            }
-        }
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._x11 = mock.Mock()
-        overlay._display = 1
-        overlay._last_layout = layout
-        overlay._active_page = page
-        overlay._last_panel_model = MODULE.settings_panel_model(
-            {"restart": {"available": True, "requested": False}}
-        )
-        overlay._last_runtime_pause_model = MODULE.runtime_pause_panel_model(
-            pause_state
-        )
-        overlay._last_command_status = MODULE.command_console_status(
-            {
-                "command_console": {
-                    "available": True,
-                    "editing": False,
-                    "in_flight": False,
-                    "status": "idle",
-                }
-            }
-        )
-        overlay._command_editor = MODULE.CommandLineEditor()
-        overlay._pressed_action = None
-        overlay._pressed_window = None
-        overlay._pressed_runtime_pause_target = None
-        overlay._pressed_runtime_pause_epoch = None
-        overlay._recovered_pause_release_count = 0
-        overlay._visible = True
-        overlay._font_slider_dragging = False
-        x, y, width, height = layout["runtime_pause"]
-        events = []
-        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
-            event = MODULE.XEvent()
-            event.type = event_type
-            event.xbutton.button = 1
-            event.xbutton.window = (
-                release_window if event_type == MODULE._BUTTON_RELEASE else 2
-            )
-            point = (
-                release_point
-                if event_type == MODULE._BUTTON_RELEASE
-                and release_point is not None
-                else (x + width // 2, y + height // 2)
-            )
-            event.xbutton.x_root, event.xbutton.y_root = point
-            events.append(event)
-        overlay._x11.XPending.side_effect = lambda _display: len(events)
-
-        def next_event(_display, destination):
-            event = events.pop(0)
-            if (
-                event.type == MODULE._BUTTON_RELEASE
-                and release_state is not None
-            ):
-                release_pause_state = {
-                    "command_console": {
-                        "runtime_pause": {
-                            "state": release_state,
-                            "epoch": 4,
-                            "can_pause": release_state == "running",
-                            "can_resume": release_state == "paused",
-                            "last_error": None,
-                        }
-                    }
-                }
-                overlay._last_runtime_pause_model = (
-                    MODULE.runtime_pause_panel_model(release_pause_state)
-                )
-            MODULE.ctypes.memmove(
-                destination,
-                MODULE.ctypes.byref(event),
-                MODULE.ctypes.sizeof(event),
-            )
-
-        overlay._x11.XNextEvent.side_effect = next_event
-        return overlay
-
-    def test_running_and_paused_clicks_emit_exact_transition_intents(self) -> None:
-        for state, target in (("running", "paused"), ("paused", "running")):
-            with self.subTest(state=state):
-                overlay = self.overlay(state, page="inventory")
-                publisher = mock.Mock()
-                self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
-                publisher.publish_runtime_pause.assert_called_once_with(
-                    target, expected_epoch=3
-                )
-                publisher.publish.assert_not_called()
-
-    def test_pause_click_uses_press_time_target_when_release_model_flips(
-        self,
-    ) -> None:
-        overlay = self.overlay("running", release_state="paused")
-        publisher = mock.Mock()
-
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
-
-        publisher.publish_runtime_pause.assert_called_once_with(
-            "paused", expected_epoch=3
-        )
-
-    def test_busy_and_fault_clicks_emit_nothing(self) -> None:
-        for state in ("pausing", "resuming", "busy", "fault", "unavailable"):
-            with self.subTest(state=state):
-                overlay = self.overlay(state)
-                publisher = mock.Mock()
-                self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
-                publisher.publish_runtime_pause.assert_not_called()
-
-    def test_pause_release_survives_remote_pointer_warp(self) -> None:
-        overlay = self.overlay(
-            "running",
-            release_point=(30, 10),
-            release_window=3,
-        )
-        publisher = mock.Mock()
-
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
-
-        publisher.publish_runtime_pause.assert_called_once_with(
-            "paused", expected_epoch=3
-        )
-        self.assertEqual(overlay._recovered_pause_release_count, 1)
 
 
 class PointerActionPublisherTest(unittest.TestCase):
-    def test_game_quit_intent_is_typed(self) -> None:
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(), session="known-session"
-        )
-        try:
-            publisher.publish_game_quit()
-            self.assertEqual(
-                json.loads(receiver.recv(1024).decode("ascii")),
-                {
-                    "version": 1,
-                    "session": "known-session",
-                    "sequence": 1,
-                    "kind": "game_quit",
-                },
-            )
-        finally:
-            publisher.close()
-            receiver.close()
-
-    def test_runtime_pause_intent_is_typed_and_epoch_guarded(self) -> None:
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(), session="known-session"
-        )
-        try:
-            publisher.publish_runtime_pause("paused", expected_epoch=9)
-            self.assertEqual(
-                json.loads(receiver.recv(1024).decode("ascii")),
-                {
-                    "version": 1,
-                    "session": "known-session",
-                    "sequence": 1,
-                    "kind": "runtime_pause",
-                    "pause_target": "paused",
-                    "expected_epoch": 9,
-                },
-            )
-            for target, epoch in (
-                ("toggle", 9),
-                ([], 9),
-                ("running", True),
-                ("paused", -1),
-            ):
-                with self.subTest(target=target, epoch=epoch), self.assertRaisesRegex(
-                    ValueError, "invalid"
-                ):
-                    publisher.publish_runtime_pause(target, expected_epoch=epoch)
-        finally:
-            publisher.close()
-            receiver.close()
-
-    def test_video_settings_model_and_intent_are_revision_guarded(self) -> None:
-        model = MODULE.video_settings_panel_model(
-            {
-                "video_settings": {
-                    "available": True,
-                    "revision": 4,
-                    "current": {
-                        "resolution": "1920x1080",
-                        "window_mode": "borderless",
-                        "fps_limit": 60,
-                        "quality": "high",
-                        "camera_smoothing": "medium",
-                        "camera_distance_cm": 150,
-                        "camera_distance_min_cm": 80,
-                        "camera_distance_max_cm": 500,
-                    },
-                    "next_launch": {
-                        "resolution": "1920x1080",
-                        "window_mode": "borderless",
-                        "fps_limit": 60,
-                        "quality": "high",
-                        "camera_smoothing": "medium",
-                        "camera_distance_cm": 150,
-                        "camera_distance_min_cm": 80,
-                        "camera_distance_max_cm": 500,
-                    },
-                    "pending_restart": False,
-                    "persistence_error": None,
-                }
-            }
-        )
-        self.assertTrue(model.available)
-        self.assertEqual(model.stepped_value("video_fps_limit_up"), 90)
-        self.assertEqual(model.stepped_value("video_camera_distance_min_cm_up"), 90)
-        geometry = MODULE.WindowGeometry(1, 0, 0, 1280, 720)
-        layout = MODULE.overlay_layout(geometry)
-        self.assertIn("tab_video", layout)
-        x, y, width, height = layout["video_fps_limit_up"]
-        self.assertEqual(
-            MODULE.panel_action_at(
-                layout,
-                x + width // 2,
-                y + height // 2,
-                page="video",
-            ),
-            "video_fps_limit_up",
-        )
-        x, y, width, height = layout["video_camera_distance_cm_slider"]
-        self.assertEqual(
-            MODULE.panel_action_at(
-                layout,
-                x + width // 2,
-                y + height // 2,
-                page="video",
-            ),
-            "video_camera_distance_cm_slider",
-        )
-
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(),
-            session="known-session",
-        )
-        try:
-            publisher.publish_video_setting(
-                "fps_limit",
-                90,
-                expected_revision=model.revision,
-            )
-            packet = json.loads(receiver.recv(1024).decode("ascii"))
-            self.assertEqual(
-                packet,
-                {
-                    "version": 1,
-                    "session": "known-session",
-                    "sequence": 1,
-                    "kind": "video_setting",
-                    "field": "fps_limit",
-                    "value": 90,
-                    "expected_revision": 4,
-                },
-            )
-            publisher.publish_video_setting(
-                "camera_distance_cm",
-                200,
-                expected_revision=model.revision,
-            )
-            packet = json.loads(receiver.recv(1024).decode("ascii"))
-            self.assertEqual(packet["field"], "camera_distance_cm")
-            self.assertEqual(packet["value"], 200)
-            self.assertEqual(packet["expected_revision"], 4)
-            with self.assertRaisesRegex(ValueError, "invalid"):
-                publisher.publish_video_setting(
-                    "fps_limit",
-                    "90;quit",
-                    expected_revision=4,
-                )
-            with self.assertRaisesRegex(ValueError, "invalid"):
-                publisher.publish_video_setting(
-                    "camera_distance_cm",
-                    501,
-                    expected_revision=4,
-                )
-        finally:
-            publisher.close()
-            receiver.close()
-
-    def test_navigation_intents_are_strict_and_typed(self) -> None:
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(),
-            session="known-session",
-        )
-        try:
-            publisher.publish_navigation_refresh()
-            publisher.publish_navigation_select("earth-overworld-home")
-            refresh = json.loads(receiver.recv(1024).decode("ascii"))
-            select = json.loads(receiver.recv(1024).decode("ascii"))
-            self.assertEqual(
-                set(refresh),
-                {"version", "session", "sequence", "kind"},
-            )
-            self.assertEqual(refresh["kind"], "navigation_refresh")
-            self.assertEqual(select["kind"], "navigation_select")
-            self.assertEqual(select["destination_id"], "earth-overworld-home")
-            with self.assertRaisesRegex(ValueError, "invalid"):
-                publisher.publish_navigation_select("Earth Home")
-        finally:
-            publisher.close()
-            receiver.close()
-
-    def test_strategy_selection_is_a_strict_typed_intent(self) -> None:
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(),
-            session="known-session",
-        )
-        try:
-            publisher.publish_strategy_select("recovery", "KungFu")
-            packet = json.loads(receiver.recv(1024).decode("ascii"))
-            self.assertEqual(packet["kind"], "strategy_select")
-            self.assertEqual(packet["slot"], "recovery")
-            self.assertEqual(packet["policy_id"], "kungfu")
-            with self.assertRaisesRegex(ValueError, "invalid"):
-                publisher.publish_strategy_select("recovery", "bad policy")
-        finally:
-            publisher.close()
-            receiver.close()
-
-    def test_movement_mode_selection_is_a_strict_typed_intent(self) -> None:
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(),
-            session="known-session",
-        )
-        try:
-            publisher.publish_movement_mode_select("body_relative")
-            packet = json.loads(receiver.recv(1024).decode("ascii"))
-            self.assertEqual(
-                set(packet),
-                {"version", "session", "sequence", "kind", "movement_mode"},
-            )
-            self.assertEqual(packet["kind"], "movement_mode_select")
-            self.assertEqual(packet["movement_mode"], "body_relative")
-            with self.assertRaisesRegex(ValueError, "movement mode"):
-                publisher.publish_movement_mode_select("unknown")
-        finally:
-            publisher.close()
-            receiver.close()
-
     def test_packets_are_bounded_ordered_and_session_bound(self) -> None:
         receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         publisher = MODULE.PointerActionPublisher(
@@ -2951,14 +1011,45 @@ class PointerActionPublisherTest(unittest.TestCase):
         try:
             publisher.publish("profile_remote")
             publisher.publish("speed_down")
+            publisher.publish("movement_mode_body_relative")
+            publisher.publish_navigation_refresh()
             first = json.loads(receiver.recv(1024).decode("ascii"))
             second = json.loads(receiver.recv(1024).decode("ascii"))
+            third = json.loads(receiver.recv(1024).decode("ascii"))
+            fourth = json.loads(receiver.recv(1024).decode("ascii"))
             self.assertEqual(first["session"], "known-session")
-            self.assertEqual((first["sequence"], second["sequence"]), (1, 2))
+            self.assertEqual(
+                (
+                    first["sequence"],
+                    second["sequence"],
+                    third["sequence"],
+                    fourth["sequence"],
+                ),
+                (1, 2, 3, 4),
+            )
             self.assertEqual(first["kind"], "action")
             self.assertEqual(second["action"], "speed_down")
+            self.assertEqual(third["action"], "movement_mode_body_relative")
+            self.assertEqual(fourth["kind"], "action")
+            self.assertEqual(fourth["action"], "navigation_refresh")
             with self.assertRaisesRegex(ValueError, "unsupported"):
                 publisher.publish("restart_directly")
+        finally:
+            publisher.close()
+            receiver.close()
+
+    def test_motion_panel_actions_are_direct_actions_not_command_text(self) -> None:
+        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        publisher = MODULE.PointerActionPublisher(
+            file_descriptor=sender.detach(),
+            session="known-session",
+        )
+        try:
+            publisher.publish("motion_gait_start_heading_error_down")
+            packet = json.loads(receiver.recv(1024).decode("ascii"))
+            self.assertEqual(packet["kind"], "action")
+            self.assertEqual(packet["action"], "motion_gait_start_heading_error_down")
+            self.assertNotIn("command", packet)
         finally:
             publisher.close()
             receiver.close()
@@ -2972,10 +1063,11 @@ class PointerActionPublisherTest(unittest.TestCase):
         try:
             publisher.publish_command_edit(True)
             publisher.publish_command_submit("/tp @s ~ ~ ~")
+            publisher.publish_command_quick_submit("/sonic mode 7")
             publisher.publish_command_edit(False)
             packets = [
                 json.loads(receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES).decode("ascii"))
-                for _ in range(3)
+                for _ in range(4)
             ]
             self.assertEqual(
                 set(packets[0]),
@@ -2989,175 +1081,24 @@ class PointerActionPublisherTest(unittest.TestCase):
             )
             self.assertEqual(packets[1]["kind"], "command_submit")
             self.assertEqual(packets[1]["command"], "/tp @s ~ ~ ~")
-            self.assertEqual([packet["sequence"] for packet in packets], [1, 2, 3])
+            self.assertEqual(
+                set(packets[2]),
+                {"version", "session", "sequence", "kind", "command"},
+            )
+            self.assertEqual(packets[2]["kind"], "command_quick_submit")
+            self.assertEqual(packets[2]["command"], "/sonic mode 7")
+            self.assertEqual([packet["sequence"] for packet in packets], [1, 2, 3, 4])
             with self.assertRaisesRegex(ValueError, "printable ASCII"):
                 publisher.publish_command_submit("/tp @s 1 2 3\n")
             with self.assertRaisesRegex(ValueError, "printable ASCII"):
                 publisher.publish_command_submit("x" * (MODULE.MAX_COMMAND_CHARS + 1))
+            with self.assertRaisesRegex(ValueError, "printable ASCII"):
+                publisher.publish_command_quick_submit("/sonic mode 7\n")
             with self.assertRaisesRegex(ValueError, "boolean"):
                 publisher.publish_command_edit(1)
         finally:
             publisher.close()
             receiver.close()
-
-    def test_creative_spawn_is_a_strict_typed_intent(self) -> None:
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(),
-            session="known-session",
-        )
-        try:
-            publisher.publish_creative_spawn("training_blaster")
-            packet = json.loads(receiver.recv(1024).decode("ascii"))
-            self.assertEqual(
-                packet,
-                {
-                    "version": 1,
-                    "session": "known-session",
-                    "sequence": 1,
-                    "kind": "creative_spawn",
-                    "item_id": "training_blaster",
-                },
-            )
-            with self.assertRaisesRegex(ValueError, "invalid"):
-                publisher.publish_creative_spawn("../../bad")
-        finally:
-            publisher.close()
-            receiver.close()
-
-    def test_motion_step_reuses_the_strict_command_submit_packet(self) -> None:
-        model = MODULE.motion_settings_panel_model(
-            {"motion_settings": MODULE.MotionSettings().to_mapping()}
-        )
-        command = MODULE.motion_step_command(model, "motion_walk_speed_mps_up")
-        self.assertIsNotNone(command)
-        receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        publisher = MODULE.PointerActionPublisher(
-            file_descriptor=sender.detach(),
-            session="known-session",
-        )
-        try:
-            publisher.publish_command_submit(command)
-            packet = json.loads(
-                receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES).decode("ascii")
-            )
-            self.assertEqual(
-                packet,
-                {
-                    "version": 1,
-                    "session": "known-session",
-                    "sequence": 1,
-                    "kind": "command_submit",
-                    "command": (
-                        "/data modify entity @s "
-                        "control.motion.gears.walk.speed_mps set value 0.90"
-                    ),
-                },
-            )
-        finally:
-            publisher.close()
-            receiver.close()
-
-
-class MotionPanelActionTest(unittest.TestCase):
-    @staticmethod
-    def command_status(*, in_flight: bool = False):
-        return MODULE.command_console_status(
-            {
-                "command_console": {
-                    "available": True,
-                    "editing": False,
-                    "in_flight": in_flight,
-                    "status": "pending" if in_flight else "idle",
-                }
-            }
-        )
-
-    @staticmethod
-    def overlay(
-        action: str,
-        *,
-        in_flight: bool = False,
-        motion_settings: MODULE.MotionSettings | None = None,
-    ):
-        layout = MODULE.overlay_layout(MODULE.WindowGeometry(1, 0, 0, 480, 360))
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._x11 = mock.Mock()
-        overlay._display = 1
-        overlay._last_layout = layout
-        overlay._active_page = "settings"
-        overlay._last_panel_model = MODULE.settings_panel_model(
-            {"restart": {"available": True, "requested": False}}
-        )
-        overlay._last_motion_model = MODULE.motion_settings_panel_model(
-            {
-                "motion_settings": (
-                    motion_settings or MODULE.MotionSettings()
-                ).to_mapping()
-            }
-        )
-        overlay._last_command_status = MotionPanelActionTest.command_status(
-            in_flight=in_flight
-        )
-        overlay._command_editor = MODULE.CommandLineEditor()
-        overlay._pressed_action = None
-        overlay._pressed_window = None
-        overlay._visible = True
-        overlay._font_slider_dragging = False
-        rectangle = layout[action]
-        events = []
-        for event_type in (MODULE._BUTTON_PRESS, MODULE._BUTTON_RELEASE):
-            event = MODULE.XEvent()
-            event.type = event_type
-            event.xbutton.button = 1
-            event.xbutton.window = 2
-            event.xbutton.x_root = rectangle[0] + rectangle[2] // 2
-            event.xbutton.y_root = rectangle[1] + rectangle[3] // 2
-            events.append(event)
-        overlay._x11.XPending.side_effect = lambda _display: len(events)
-
-        def next_event(_display, destination):
-            event = events.pop(0)
-            MODULE.ctypes.memmove(
-                destination,
-                MODULE.ctypes.byref(event),
-                MODULE.ctypes.sizeof(event),
-            )
-
-        overlay._x11.XNextEvent.side_effect = next_event
-        return overlay
-
-    def test_click_publishes_adjacent_set_value_command(self) -> None:
-        overlay = self.overlay("motion_walk_speed_mps_up")
-        publisher = mock.Mock()
-
-        self.assertEqual(overlay.drain_pointer_actions(publisher), 1)
-
-        publisher.publish_command_submit.assert_called_once_with(
-            "/data modify entity @s "
-            "control.motion.gears.walk.speed_mps set value 0.90"
-        )
-        publisher.publish.assert_not_called()
-
-    def test_boundary_and_in_flight_clicks_publish_nothing(self) -> None:
-        for action, in_flight in (
-            ("motion_slow_speed_mps_down", False),
-            ("motion_walk_speed_mps_up", True),
-        ):
-            with self.subTest(action=action, in_flight=in_flight):
-                motion_settings = (
-                    MODULE.MotionSettings(slow_speed_mps=0.10)
-                    if action == "motion_slow_speed_mps_down"
-                    else None
-                )
-                overlay = self.overlay(
-                    action,
-                    in_flight=in_flight,
-                    motion_settings=motion_settings,
-                )
-                publisher = mock.Mock()
-                self.assertEqual(overlay.drain_pointer_actions(publisher), 0)
-                publisher.publish_command_submit.assert_not_called()
 
 
 class CommandLineEditorTest(unittest.TestCase):
@@ -3269,74 +1210,6 @@ class CommandLineEditorTest(unittest.TestCase):
         self.assertFalse(editor.pending)
 
 
-class CameraDistanceBoundEditorTest(unittest.TestCase):
-    @staticmethod
-    def model(**overrides):
-        next_launch = {
-            "resolution": "1920x1080",
-            "window_mode": "borderless",
-            "fps_limit": 60,
-            "quality": "high",
-            "camera_smoothing": "medium",
-            "camera_distance_cm": 150,
-            "camera_distance_min_cm": 80,
-            "camera_distance_max_cm": 500,
-        }
-        next_launch.update(overrides)
-        return MODULE.video_settings_panel_model(
-            {
-                "video_settings": {
-                    "available": True,
-                    "revision": 7,
-                    "current": dict(next_launch),
-                    "next_launch": next_launch,
-                    "pending_restart": False,
-                    "persistence_error": None,
-                }
-            }
-        )
-
-    @staticmethod
-    def key(editor, keysym=0, printable="", model=None):
-        return editor.handle_key(
-            keysym=keysym,
-            printable=printable,
-            model=model or CameraDistanceBoundEditorTest.model(),
-        )
-
-    def test_digits_submit_and_escape_are_bounded(self) -> None:
-        editor = MODULE.CameraDistanceBoundEditor()
-        self.assertTrue(editor.begin("camera_distance_max_cm", 500))
-        self.assertEqual(editor.display_text("camera_distance_max_cm", 500), "500|")
-        self.key(editor, MODULE._XK_BACK_SPACE)
-        self.key(editor, MODULE._XK_BACK_SPACE)
-        self.key(editor, MODULE._XK_BACK_SPACE)
-        self.key(editor, printable="4509")
-        self.assertEqual(editor.text, "450")
-        outcome = self.key(editor, MODULE._XK_RETURN)
-        self.assertEqual(outcome.action, "submit")
-        self.assertEqual(outcome.field, "camera_distance_max_cm")
-        self.assertEqual(outcome.value, 450)
-        self.assertFalse(editor.editing)
-
-        self.assertTrue(editor.begin("camera_distance_min_cm", 80))
-        self.assertEqual(self.key(editor, MODULE._XK_ESCAPE).action, "end")
-        self.assertFalse(editor.editing)
-
-    def test_rejects_values_outside_hard_or_slider_bounds(self) -> None:
-        editor = MODULE.CameraDistanceBoundEditor()
-        self.assertTrue(editor.begin("camera_distance_max_cm", 500))
-        editor.text = "149"
-        self.assertIsNone(self.key(editor, MODULE._XK_RETURN).action)
-        self.assertTrue(editor.editing)
-        editor.text = "501"
-        self.assertIsNone(self.key(editor, MODULE._XK_RETURN).action)
-        self.assertTrue(editor.editing)
-
-        self.assertFalse(editor.begin("resolution", 80))
-        self.assertFalse(editor.begin("camera_distance_min_cm", "80"))
-
-
 class KeyboardGrabLifecycleTest(unittest.TestCase):
     @staticmethod
     def overlay(*, visible=True, grab_result=MODULE._GRAB_SUCCESS):
@@ -3350,7 +1223,6 @@ class KeyboardGrabLifecycleTest(unittest.TestCase):
         overlay._keyboard_grabbed = False
         overlay._deferred_ungrab_keycode = None
         overlay._command_editor = MODULE.CommandLineEditor()
-        overlay._video_distance_bound_editor = MODULE.CameraDistanceBoundEditor()
         overlay._last_command_status = CommandLineEditorTest.status()
         overlay._last_layout = None
         overlay._last_geometry = None
@@ -3397,23 +1269,12 @@ class KeyboardGrabLifecycleTest(unittest.TestCase):
         closing._panel_gc = None
         closing._body_font = None
         closing._large_font = None
-        closing._x_error_handler_callback = mock.sentinel.x_error_handler
-        closing._previous_x_error_handler_address = None
-        closing._previous_x_error_handler = None
         closing.close()
         self.assertFalse(closing._keyboard_grabbed)
         self.assertIsNone(closing._deferred_ungrab_keycode)
         calls = closing._x11.method_calls
         self.assertLess(
             calls.index(mock.call.XUngrabKeyboard(1, MODULE._CURRENT_TIME)),
-            calls.index(mock.call.XCloseDisplay(1)),
-        )
-        self.assertLess(
-            calls.index(mock.call.XSync(1, 0)),
-            calls.index(mock.call.XSetErrorHandler(None)),
-        )
-        self.assertLess(
-            calls.index(mock.call.XSetErrorHandler(None)),
             calls.index(mock.call.XCloseDisplay(1)),
         )
 
@@ -3473,41 +1334,6 @@ class KeyboardGrabLifecycleTest(unittest.TestCase):
             [mock.call(True), mock.call(False), mock.call(True)],
         )
 
-    def test_video_distance_bound_edit_grabs_keyboard_and_publishes_setting(self) -> None:
-        overlay = self.overlay()
-        overlay._active_page = "video"
-        overlay._last_video_model = CameraDistanceBoundEditorTest.model()
-        self.assertTrue(
-            overlay._begin_video_distance_bound_editing(
-                "video_camera_distance_max_cm_value"
-            )
-        )
-        self.assertTrue(overlay._keyboard_grabbed)
-        overlay._lookup_key = mock.Mock(
-            side_effect=[
-                (MODULE._XK_BACK_SPACE, ""),
-                (MODULE._XK_BACK_SPACE, ""),
-                (MODULE._XK_BACK_SPACE, ""),
-                (0, "450"),
-                (MODULE._XK_RETURN, ""),
-            ]
-        )
-        publisher = mock.Mock()
-        event = MODULE.XKeyEvent()
-        event.keycode = 42
-        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
-        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
-        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
-        self.assertEqual(overlay._handle_key_press(event, publisher), 0)
-        self.assertEqual(overlay._handle_key_press(event, publisher), 1)
-        publisher.publish_video_setting.assert_called_once_with(
-            "camera_distance_max_cm",
-            450,
-            expected_revision=7,
-        )
-        self.assertFalse(overlay._keyboard_grabbed)
-        self.assertFalse(overlay._video_distance_bound_editor.editing)
-
     def test_pending_or_restart_provider_state_blocks_click_reentry(self) -> None:
         publisher = mock.Mock()
         blocked_states = (
@@ -3558,27 +1384,13 @@ class OverlayRenderCacheTest(unittest.TestCase):
                 "editing": False,
                 "in_flight": False,
                 "status": "idle",
-                "runtime_pause": {
-                    "state": "running",
-                    "epoch": 0,
-                    "can_pause": True,
-                    "can_resume": False,
-                    "last_error": None,
-                },
             },
         }
 
-    def make_overlay(
-        self,
-        *,
-        modal_shield: bool = True,
-        pointer_recenter: bool = True,
-        keep_raised: bool = True,
-    ):
+    def make_overlay(self):
         overlay = object.__new__(MODULE.X11CalibrationOverlay)
         overlay._x11 = mock.Mock()
         overlay._display = 1
-        overlay._root = 2
         overlay._windows = {
             name: index
             for index, name in enumerate(MODULE.X11CalibrationOverlay._WINDOW_ORDER, 10)
@@ -3591,85 +1403,15 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay._command_editor = MODULE.CommandLineEditor()
         overlay._last_command_status = MODULE.command_console_status({})
         overlay._last_command_revision = -1
+        overlay._last_video_distance_bound_revision = -1
         overlay._last_pointer = None
+        overlay._last_hover_action = None
         overlay._last_raise_s = None
         overlay._pressed_action = None
         overlay._pressed_window = None
-        overlay._pointer_recenter_count = 0
-        overlay._modal_shield = modal_shield
-        overlay._pointer_recenter = pointer_recenter
-        overlay._keep_raised = keep_raised
-        overlay._font_size = MODULE._DEFAULT_OVERLAY_FONT_SIZE
-        overlay._last_rendered_font_size = None
-        overlay._font_slider_dragging = False
         overlay._keyboard_grabbed = False
         overlay._draw_panel = mock.Mock()
         return overlay
-
-    def test_pointer_outside_modal_game_window_recenters_to_safe_area(self) -> None:
-        overlay = self.make_overlay()
-        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
-        layout = MODULE.overlay_layout(geometry)
-        safe_x, safe_y, safe_width, safe_height = layout["crosshair_safe"]
-        expected = (safe_x + safe_width // 2, safe_y + safe_height // 2)
-
-        overlay.show(geometry, (30, 10), self.state(), now_s=10.0)
-
-        overlay._x11.XWarpPointer.assert_called_once_with(
-            1,
-            0,
-            2,
-            0,
-            0,
-            0,
-            0,
-            expected[0],
-            expected[1],
-        )
-        self.assertEqual(overlay._last_pointer, expected)
-        self.assertEqual(overlay._pointer_recenter_count, 1)
-
-        overlay.show(geometry, expected, self.state(), now_s=10.02)
-        overlay._x11.XWarpPointer.assert_called_once()
-
-    def test_pointer_clamped_to_modal_edge_recenters_to_safe_area(self) -> None:
-        overlay = self.make_overlay()
-        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
-        layout = MODULE.overlay_layout(geometry)
-        safe_x, safe_y, safe_width, safe_height = layout["crosshair_safe"]
-        expected = (safe_x + safe_width // 2, safe_y + safe_height // 2)
-
-        overlay.show(geometry, (100, 80), self.state(), now_s=10.0)
-
-        overlay._x11.XWarpPointer.assert_called_once_with(
-            1,
-            0,
-            2,
-            0,
-            0,
-            0,
-            0,
-            expected[0],
-            expected[1],
-        )
-        self.assertEqual(overlay._last_pointer, expected)
-        self.assertEqual(overlay._pointer_recenter_count, 1)
-
-    def test_desktop_overlay_can_skip_shield_and_pointer_recenter(self) -> None:
-        overlay = self.make_overlay(modal_shield=False, pointer_recenter=False)
-        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
-        pointer = (100, 80)
-
-        overlay.show(geometry, pointer, self.state(), now_s=10.0)
-
-        overlay._x11.XWarpPointer.assert_not_called()
-        self.assertEqual(overlay._last_pointer, pointer)
-        self.assertEqual(overlay._pointer_recenter_count, 0)
-        shield = overlay._windows["shield"]
-        for call in overlay._x11.XMoveResizeWindow.call_args_list:
-            self.assertNotEqual(call.args[1], shield)
-        for call in overlay._x11.XMapRaised.call_args_list:
-            self.assertNotEqual(call.args[1], shield)
 
     def test_steady_30hz_frames_only_move_cursor_and_do_not_redraw(self) -> None:
         overlay = self.make_overlay()
@@ -3693,12 +1435,12 @@ class OverlayRenderCacheTest(unittest.TestCase):
         overlay.show(geometry, (301, 302), heartbeat, now_s=10.06)
         self.assertEqual(overlay._draw_panel.call_count, 1)
         self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
-        self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises)
-
-        # A low-frequency stack repair raises all eight windows without
-        # clearing/redrawing the 1180x736 panel.
-        overlay.show(geometry, (301, 302), heartbeat, now_s=11.1)
         self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises + 8)
+
+        # Main's full ESC keeps all eight overlay windows above UE each frame
+        # without clearing/redrawing the 1216x736 panel.
+        overlay.show(geometry, (301, 302), heartbeat, now_s=11.1)
+        self.assertEqual(overlay._x11.XRaiseWindow.call_count, raises + 16)
         self.assertEqual(overlay._draw_panel.call_count, 1)
 
         changed = self.state(scale=0.4)
@@ -3706,286 +1448,44 @@ class OverlayRenderCacheTest(unittest.TestCase):
         self.assertEqual(overlay._draw_panel.call_count, 2)
         self.assertEqual(overlay._x11.XMoveResizeWindow.call_count, initial_static_moves + 2)
 
-    def test_desktop_overlay_can_avoid_periodic_top_raise(self) -> None:
-        overlay = self.make_overlay(keep_raised=False)
-        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
-        state = self.state()
-
-        overlay.show(geometry, (300, 300), state, now_s=10.0)
-        overlay.show(geometry, (300, 300), state, now_s=11.2)
-
-        overlay._x11.XRaiseWindow.assert_not_called()
-
-    def test_local_font_change_invalidates_the_static_panel_render_key(self) -> None:
+    def test_hover_target_changes_redraw_panel_but_same_target_does_not(self) -> None:
         overlay = self.make_overlay()
         geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
+        layout = MODULE.overlay_layout(geometry)
         state = self.state()
-        overlay.show(geometry, (300, 300), state, now_s=10.0)
+        outside_panel = (geometry.x + 5, geometry.y + 5)
+        overlay.show(geometry, outside_panel, state, now_s=20.0)
         self.assertEqual(overlay._draw_panel.call_count, 1)
 
-        overlay._font_size = MODULE._MAX_OVERLAY_FONT_SIZE
-        overlay.show(geometry, (300, 300), state, now_s=10.02)
+        x, y, width, height = layout["tab_settings"]
+        overlay.show(
+            geometry,
+            (x + width // 2, y + height // 2),
+            {**state, "updated_monotonic_s": 1.0},
+            now_s=20.03,
+        )
+        self.assertEqual(overlay._draw_panel.call_count, 2)
+        self.assertEqual(
+            overlay._draw_panel.call_args.args[-2],
+            "tab_settings",
+        )
+
+        overlay.show(
+            geometry,
+            (x + width // 2 + 1, y + height // 2),
+            {**state, "updated_monotonic_s": 2.0},
+            now_s=20.06,
+        )
         self.assertEqual(overlay._draw_panel.call_count, 2)
 
-    def test_authoritative_ui_telemetry_drives_the_live_font_commit(self) -> None:
-        overlay = self.make_overlay()
-        overlay._set_font_size = mock.Mock(return_value=True)
-        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
-        state = self.state()
-        state["ui_settings"] = {
-            "font_scale": 1.0,
-            "font_size": 9,
-            "load_status": "saved",
-            "persistence_error": None,
-            "change_count": 1,
-        }
-
-        overlay.show(geometry, (300, 300), state, now_s=10.0)
-
-        overlay._set_font_size.assert_called_once_with(9)
-
-    def test_runtime_pause_state_or_epoch_invalidates_static_render_key(self) -> None:
-        overlay = self.make_overlay()
-        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
-        state = self.state()
-        overlay.show(geometry, (300, 300), state, now_s=10.0)
-        self.assertEqual(overlay._draw_panel.call_count, 1)
-
-        changed = json.loads(json.dumps(state))
-        changed["command_console"]["runtime_pause"] = {
-            "state": "paused",
-            "epoch": 1,
-            "can_pause": False,
-            "can_resume": True,
-            "last_error": None,
-        }
-        overlay.show(geometry, (300, 300), changed, now_s=10.02)
-        self.assertEqual(overlay._draw_panel.call_count, 2)
-
-    def test_motion_telemetry_change_invalidates_the_static_panel_render_key(
-        self,
-    ) -> None:
-        overlay = self.make_overlay()
-        geometry = MODULE.WindowGeometry(41, 100, 80, 1280, 800)
-        state = self.state()
-        state["motion_settings"] = MODULE.MotionSettings().to_mapping()
-        overlay.show(geometry, (300, 300), state, now_s=10.0)
-        self.assertEqual(overlay._draw_panel.call_count, 1)
-
-        changed = dict(state)
-        changed["motion_settings"] = MODULE.MotionSettings(
-            revision=1,
-            walk_speed_mps=0.90,
-        ).to_mapping()
-        overlay.show(geometry, (300, 300), changed, now_s=10.02)
-        self.assertEqual(overlay._draw_panel.call_count, 2)
-
-
-class X11WindowProbeTest(unittest.TestCase):
-    @staticmethod
-    def trapped_overlay():
-        overlay = object.__new__(MODULE.X11CalibrationOverlay)
-        overlay._display = 1
-        overlay._window_error_trap = None
-        overlay._trapped_window_error = None
-        overlay._recoverable_window_error_count = 0
-        overlay._bad_window_count = 0
-        overlay._bad_drawable_count = 0
-        overlay._last_recoverable_window_error = None
-        overlay._last_bad_window = None
-        overlay._previous_x_error_handler = mock.Mock(return_value=17)
-        return overlay
-
-    @staticmethod
-    def x_error(
-        *,
-        resource_id: int,
-        error_code: int,
-        request_code: int,
-    ) -> MODULE.XErrorEvent:
-        event = MODULE.XErrorEvent()
-        event.resourceid = resource_id
-        event.serial = 123
-        event.error_code = error_code
-        event.request_code = request_code
-        event.minor_code = 0
-        return event
-
-    def test_precise_window_probe_swallows_only_its_bad_window(self) -> None:
-        overlay = self.trapped_overlay()
-        event = self.x_error(
-            resource_id=99,
-            error_code=MODULE._BAD_WINDOW,
-            request_code=MODULE._X_REQUEST_GET_PROPERTY,
+        overlay.show(
+            geometry,
+            outside_panel,
+            {**state, "updated_monotonic_s": 3.0},
+            now_s=20.09,
         )
-
-        def operation():
-            self.assertEqual(
-                overlay._handle_x_error(
-                    MODULE.ctypes.c_void_p(1),
-                    MODULE.ctypes.pointer(event),
-                ),
-                0,
-            )
-            return 42
-
-        with mock.patch("builtins.print") as warning:
-            result, bad_window = overlay._window_probe(
-                "XGetWindowProperty",
-                99,
-                MODULE._X_REQUEST_GET_PROPERTY,
-                operation,
-            )
-
-        self.assertEqual(result, 42)
-        self.assertTrue(bad_window)
-        overlay._previous_x_error_handler.assert_not_called()
-        warning.assert_called_once()
-        self.assertEqual(
-            overlay.x11_diagnostics,
-            {
-                "recoverable_window_error_count": 1,
-                "bad_window_count": 1,
-                "bad_drawable_count": 0,
-                "last_recoverable_window_error": {
-                    "operation": "XGetWindowProperty",
-                    "resource_id": 99,
-                    "serial": 123,
-                    "error_code": MODULE._BAD_WINDOW,
-                    "request_code": MODULE._X_REQUEST_GET_PROPERTY,
-                    "minor_code": 0,
-                },
-                "last_bad_window": {
-                    "operation": "XGetWindowProperty",
-                    "resource_id": 99,
-                    "serial": 123,
-                    "error_code": MODULE._BAD_WINDOW,
-                    "request_code": MODULE._X_REQUEST_GET_PROPERTY,
-                    "minor_code": 0,
-                },
-                "polled_left_transition_count": 0,
-                "polled_left_fallback_events": 0,
-                "recovered_pause_release_count": 0,
-                "pointer_recenter_count": 0,
-            },
-        )
-
-    def test_get_window_attributes_recovers_only_its_internal_geometry_race(
-        self,
-    ) -> None:
-        overlay = self.trapped_overlay()
-        event = self.x_error(
-            resource_id=99,
-            error_code=MODULE._BAD_DRAWABLE,
-            request_code=MODULE._X_REQUEST_GET_GEOMETRY,
-        )
-
-        def operation():
-            self.assertEqual(
-                overlay._handle_x_error(
-                    MODULE.ctypes.c_void_p(1),
-                    MODULE.ctypes.pointer(event),
-                ),
-                0,
-            )
-            return 0
-
-        with mock.patch("builtins.print") as warning:
-            result, stale_window = overlay._window_probe(
-                "XGetWindowAttributes",
-                99,
-                MODULE._X_REQUEST_GET_WINDOW_ATTRIBUTES,
-                operation,
-                additional_error_signatures=((
-                    MODULE._BAD_DRAWABLE,
-                    MODULE._X_REQUEST_GET_GEOMETRY,
-                ),),
-            )
-
-        self.assertEqual(result, 0)
-        self.assertTrue(stale_window)
-        overlay._previous_x_error_handler.assert_not_called()
-        self.assertIn("ignored BadDrawable", warning.call_args.args[0])
-        self.assertEqual(
-            overlay.x11_diagnostics,
-            {
-                "recoverable_window_error_count": 1,
-                "bad_window_count": 0,
-                "bad_drawable_count": 1,
-                "last_recoverable_window_error": {
-                    "operation": "XGetWindowAttributes",
-                    "resource_id": 99,
-                    "serial": 123,
-                    "error_code": MODULE._BAD_DRAWABLE,
-                    "request_code": MODULE._X_REQUEST_GET_GEOMETRY,
-                    "minor_code": 0,
-                },
-                "last_bad_window": None,
-                "polled_left_transition_count": 0,
-                "polled_left_fallback_events": 0,
-                "recovered_pause_release_count": 0,
-                "pointer_recenter_count": 0,
-            },
-        )
-
-    def test_non_bad_window_and_mismatched_bad_window_delegate_to_xlib(self) -> None:
-        overlay = self.trapped_overlay()
-        trap = MODULE._RecoverableWindowErrorTrap(
-            operation="XGetWindowProperty",
-            resource_id=99,
-            error_signatures=((
-                MODULE._BAD_WINDOW,
-                MODULE._X_REQUEST_GET_PROPERTY,
-            ),),
-        )
-        overlay._window_error_trap = trap
-        events = (
-            self.x_error(
-                resource_id=99,
-                error_code=2,
-                request_code=MODULE._X_REQUEST_GET_PROPERTY,
-            ),
-            self.x_error(
-                resource_id=100,
-                error_code=MODULE._BAD_WINDOW,
-                request_code=MODULE._X_REQUEST_GET_PROPERTY,
-            ),
-            self.x_error(
-                resource_id=99,
-                error_code=MODULE._BAD_WINDOW,
-                request_code=MODULE._X_REQUEST_QUERY_TREE,
-            ),
-            self.x_error(
-                resource_id=99,
-                error_code=MODULE._BAD_DRAWABLE,
-                request_code=MODULE._X_REQUEST_GET_GEOMETRY,
-            ),
-        )
-
-        for event in events:
-            self.assertEqual(
-                overlay._handle_x_error(
-                    MODULE.ctypes.c_void_p(1),
-                    MODULE.ctypes.pointer(event),
-                ),
-                17,
-            )
-
-        same_request_other_display = self.x_error(
-            resource_id=99,
-            error_code=MODULE._BAD_WINDOW,
-            request_code=MODULE._X_REQUEST_GET_PROPERTY,
-        )
-        self.assertEqual(
-            overlay._handle_x_error(
-                MODULE.ctypes.c_void_p(2),
-                MODULE.ctypes.pointer(same_request_other_display),
-            ),
-            17,
-        )
-
-        self.assertEqual(overlay._previous_x_error_handler.call_count, 5)
-        self.assertIsNone(overlay._trapped_window_error)
+        self.assertEqual(overlay._draw_panel.call_count, 3)
+        self.assertIsNone(overlay._draw_panel.call_args.args[-2])
 
 
 class TargetCacheTest(unittest.TestCase):
@@ -4306,15 +1806,9 @@ class X11IntegrationTest(unittest.TestCase):
                     is True
                     and value
                 )
-                font_backend = ready_status["fonts"]["backend"]
-                expected_fonts = (
-                    MODULE._XFT_LARGE_FONT_CANDIDATES
-                    if font_backend == "xft-utf8"
-                    else MODULE._LARGE_FONT_CANDIDATES
-                )
                 self.assertIn(
                     ready_status["fonts"]["large"],
-                    [name.decode("ascii") for name in expected_fonts],
+                    [name.decode("ascii") for name in MODULE._LARGE_FONT_CANDIDATES],
                 )
                 horizontal = self.wait_until(
                     lambda: self.run_x11(
@@ -4380,63 +1874,6 @@ class X11IntegrationTest(unittest.TestCase):
                         target_geometry["HEIGHT"],
                     )
                 )
-                settings_tab = layout["tab_settings"]
-                self.run_x11(
-                    environment,
-                    "xdotool",
-                    "mousemove",
-                    "--sync",
-                    str(settings_tab[0] + settings_tab[2] // 2),
-                    str(settings_tab[1] + settings_tab[3] // 2),
-                    "click",
-                    "1",
-                )
-                time.sleep(0.08)
-
-                def assert_no_pointer_action() -> None:
-                    assert action_receiver is not None
-                    with self.assertRaises(BlockingIOError):
-                        action_receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES)
-
-                # Font sizing is overlay-local: a live Xft swap must not emit a
-                # game-control action or disturb the focused UE window; it now
-                # emits a dedicated UI-settings persistence intent.
-                if font_backend == "xft-utf8":
-                    slider_track = MODULE.font_slider_track(
-                        layout["font_size_slider"]
-                    )
-                    self.run_x11(
-                        environment,
-                        "xdotool",
-                        "mousemove",
-                        "--sync",
-                        str(slider_track[0] + slider_track[2] - 1),
-                        str(slider_track[1] + slider_track[3] // 2),
-                        "click",
-                        "1",
-                    )
-                    time.sleep(0.08)
-                    self.assertIsNone(overlay.poll())
-                    assert action_receiver is not None
-                    payload = json.loads(
-                        action_receiver.recv(
-                            MODULE._MAX_INTENT_PACKET_BYTES
-                        ).decode("ascii")
-                    )
-                    self.assertEqual(payload["kind"], "font_size")
-                    self.assertEqual(
-                        payload["font_size"],
-                        MODULE._MAX_OVERLAY_FONT_SIZE,
-                    )
-                    self.assertEqual(
-                        self.run_x11(
-                            environment,
-                            "xdotool",
-                            "getwindowfocus",
-                        ).strip(),
-                        focus_before,
-                    )
-
                 remote_button = layout["profile_remote"]
                 remote_point = (
                     remote_button[0] + remote_button[2] // 2,
@@ -4473,23 +1910,16 @@ class X11IntegrationTest(unittest.TestCase):
                 time.sleep(0.08)
                 self.assertNotIn(b"ButtonPress event", read_target_events())
 
+                def assert_no_pointer_action() -> None:
+                    assert action_receiver is not None
+                    with self.assertRaises(BlockingIOError):
+                        action_receiver.recv(MODULE._MAX_INTENT_PACKET_BYTES)
+
                 # Clicking the command line is the only keyboard-grab entry.
                 # Focus remains on UE, but all typed keys are delivered to the
                 # overlay until its first Escape ends editing.
                 read_target_events()
                 target_events.clear()
-                console_tab = layout["tab_console"]
-                self.run_x11(
-                    environment,
-                    "xdotool",
-                    "mousemove",
-                    "--sync",
-                    str(console_tab[0] + console_tab[2] // 2),
-                    str(console_tab[1] + console_tab[3] // 2),
-                    "click",
-                    "1",
-                )
-                time.sleep(0.08)
                 command_input = layout["command_input"]
                 command_point = (
                     command_input[0] + command_input[2] // 2,
@@ -4564,6 +1994,10 @@ class X11IntegrationTest(unittest.TestCase):
                 self.run_x11(
                     environment,
                     "xdotool",
+                    "mousemove",
+                    "--sync",
+                    str(command_point[0]),
+                    str(command_point[1]),
                     "click",
                     "1",
                 )
@@ -4732,102 +2166,6 @@ class X11IntegrationTest(unittest.TestCase):
                     )
 
                 self.wait_until(moved_and_followed)
-
-                # Destroy the cached UE target between provider polls.  The next
-                # XGetWindowProperty sees BadWindow; the overlay must hide, keep
-                # running, and discover a replacement window with the same
-                # advertised UE PID.
-                expected_ue_pid = target.pid
-                destroyed_target_window = int(target_window)
-                target.terminate()
-                target.wait(timeout=2.0)
-                assert target.stdout is not None
-                target.stdout.close()
-                target = None
-
-                def target_loss_is_nonfatal():
-                    if overlay.poll() is not None:
-                        return None
-                    panel_info = self.run_x11(
-                        environment,
-                        "xwininfo",
-                        "-id",
-                        str(overlay_windows["panel"]),
-                    )
-                    return "Map State: IsUnMapped" in panel_info
-
-                self.wait_until(target_loss_is_nonfatal)
-                self.assertIsNone(overlay.poll())
-
-                target = subprocess.Popen(
-                    [
-                        "stdbuf",
-                        "-oL",
-                        "xev",
-                        "-name",
-                        "MatrixSmokeReplacement",
-                        "-geometry",
-                        "720x520+45+35",
-                        "-event",
-                        "button",
-                        "-event",
-                        "keyboard",
-                    ],
-                    env=environment,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                assert target.stdout is not None
-                os.set_blocking(target.stdout.fileno(), False)
-                target_window = self.wait_until(
-                    lambda: self.run_x11(
-                        environment,
-                        "xdotool",
-                        "search",
-                        "--name",
-                        "^MatrixSmokeReplacement$",
-                    ).splitlines()[0]
-                )
-                self.run_x11(
-                    environment,
-                    "xprop",
-                    "-id",
-                    target_window,
-                    "-f",
-                    "_NET_WM_PID",
-                    "32c",
-                    "-set",
-                    "_NET_WM_PID",
-                    str(expected_ue_pid),
-                )
-                self.run_x11(environment, "xdotool", "windowfocus", target_window)
-                focus_before = self.run_x11(
-                    environment,
-                    "xdotool",
-                    "getwindowfocus",
-                ).strip()
-                target_geometry = self.client_geometry(environment, target_window)
-                target_events.clear()
-
-                def replacement_is_followed():
-                    replacement_cross = self.geometry(environment, horizontal)
-                    return (
-                        replacement_cross
-                        if (
-                            replacement_cross["X"]
-                            == target_geometry["X"]
-                            + target_geometry["WIDTH"] // 2
-                            - 32
-                            and replacement_cross["Y"]
-                            == target_geometry["Y"]
-                            + target_geometry["HEIGHT"] // 2
-                            - 1
-                        )
-                        else None
-                    )
-
-                self.wait_until(replacement_is_followed)
-                self.assertIsNone(overlay.poll())
                 MODULE.atomic_json(state, {"version": 1, "active": False})
 
                 def all_are_unmapped():
@@ -4854,52 +2192,6 @@ class X11IntegrationTest(unittest.TestCase):
                 )
                 self.wait_until(
                     lambda: b"ButtonPress event" in read_target_events()
-                )
-                overlay.terminate()
-                self.assertEqual(overlay.wait(timeout=2.0), 0)
-                final_status = self.wait_until(
-                    lambda: (
-                        value
-                        if (
-                            (value := json.loads(status.read_text(encoding="utf-8")))[
-                                "ready"
-                            ]
-                            is False
-                        )
-                        else None
-                    )
-                )
-                self.assertGreaterEqual(
-                    final_status["x11"]["bad_window_count"],
-                    1,
-                )
-                self.assertEqual(
-                    final_status["x11"]["last_bad_window"]["error_code"],
-                    MODULE._BAD_WINDOW,
-                )
-                self.assertEqual(
-                    final_status["x11"]["last_recoverable_window_error"],
-                    {
-                        "operation": "XGetWindowProperty",
-                        "resource_id": destroyed_target_window,
-                        "serial": mock.ANY,
-                        "error_code": MODULE._BAD_WINDOW,
-                        "request_code": MODULE._X_REQUEST_GET_PROPERTY,
-                        "minor_code": 0,
-                    },
-                )
-                self.assertEqual(
-                    final_status["fonts"]["size"],
-                    (
-                        MODULE._MAX_OVERLAY_FONT_SIZE
-                        if font_backend == "xft-utf8"
-                        else MODULE._DEFAULT_OVERLAY_FONT_SIZE
-                    ),
-                )
-                assert overlay.stderr is not None
-                self.assertIn(
-                    b"ignored BadWindow",
-                    overlay.stderr.read(),
                 )
         finally:
             for connection in (action_receiver, action_sender):

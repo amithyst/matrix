@@ -34,7 +34,7 @@ from matrix_movement_modes import (
 )
 
 
-PROTOCOL_NAME = "matrix-game-input/v3"
+PROTOCOL_NAME = "matrix-game-input/v2"
 MAX_PACKET_BYTES = 4096
 _UNSET_SOCKET_TIMEOUT = object()
 _KEY_NAMES = frozenset(
@@ -48,7 +48,6 @@ _TOP_LEVEL_NAMES = frozenset(
         "timestamp_monotonic_s",
         "focused",
         "camera_yaw_rad",
-        "keyboard_boost",
         "keys",
         "move_stick",
     )
@@ -101,9 +100,10 @@ def _require_exact_keys(
 class KeySnapshot:
     """Current key state, including keyboard-only speed modifiers.
 
-    Q/E request stationary body-yaw changes and never contribute to translation.
-    Ctrl/Alt/Shift select a digital-WASD speed tier; they do not quantize
-    gamepad input, whose magnitude remains continuous.
+    Q/E are keyboard aliases for Pico's right-stick yaw.  They continuously
+    accumulate a facing target while leaving translation neutral.
+    Ctrl/Shift select a digital-WASD speed tier; they do not quantize gamepad
+    input, whose magnitude remains continuous.
     """
 
     w: bool
@@ -169,7 +169,6 @@ class InputSnapshot:
     camera_yaw_rad: float
     keys: KeySnapshot
     move_stick: MoveStickSnapshot
-    keyboard_boost: bool = False
     protocol: str = PROTOCOL_NAME
 
     def __post_init__(self) -> None:
@@ -189,18 +188,10 @@ class InputSnapshot:
         if type(self.focused) is not bool:
             raise InputProtocolError("focused must be a boolean")
         yaw = _finite_number(self.camera_yaw_rad, name="camera_yaw_rad")
-        if type(self.keyboard_boost) is not bool:
-            raise InputProtocolError("keyboard_boost must be a boolean")
         if not isinstance(self.keys, KeySnapshot):
             raise InputProtocolError("keys must be a KeySnapshot")
         if not isinstance(self.move_stick, MoveStickSnapshot):
             raise InputProtocolError("move_stick must be a MoveStickSnapshot")
-        if self.keyboard_boost and not any(
-            (self.keys.w, self.keys.a, self.keys.s, self.keys.d, self.keys.q, self.keys.e)
-        ):
-            raise InputProtocolError(
-                "keyboard_boost requires at least one pressed WASD or Q/E key"
-            )
         object.__setattr__(self, "timestamp_monotonic_s", timestamp)
         object.__setattr__(self, "camera_yaw_rad", yaw)
 
@@ -214,7 +205,6 @@ class InputSnapshot:
             timestamp_monotonic_s=mapping["timestamp_monotonic_s"],
             focused=mapping["focused"],
             camera_yaw_rad=mapping["camera_yaw_rad"],
-            keyboard_boost=mapping["keyboard_boost"],
             keys=KeySnapshot.from_mapping(mapping["keys"]),
             move_stick=MoveStickSnapshot.from_mapping(mapping["move_stick"]),
         )
@@ -226,7 +216,6 @@ class InputSnapshot:
             "timestamp_monotonic_s": self.timestamp_monotonic_s,
             "focused": self.focused,
             "camera_yaw_rad": self.camera_yaw_rad,
-            "keyboard_boost": self.keyboard_boost,
             "keys": self.keys.to_mapping(),
             "move_stick": self.move_stick.to_mapping(),
         }
@@ -350,11 +339,118 @@ SONIC_IDLE_MODE = 0
 SONIC_SLOW_WALK_MODE = 1
 SONIC_WALK_MODE = 2
 SONIC_RUN_MODE = 3
+SONIC_STATIONARY_TURN_MODE = SONIC_SLOW_WALK_MODE
+SONIC_NATIVE_MODE_MIN = 0
+SONIC_NATIVE_MODE_MAX = 19
+SONIC_NATIVE_MANUAL_MODE_MIN = 4
+SONIC_NATIVE_MANUAL_MODE_MAX = SONIC_NATIVE_MODE_MAX
 SONIC_GAIT_NAMES = {
     SONIC_IDLE_MODE: "IDLE",
     SONIC_SLOW_WALK_MODE: "SLOW_WALK",
     SONIC_WALK_MODE: "WALK",
     SONIC_RUN_MODE: "RUN",
+    4: "IDEL_SQUAT",
+    5: "IDEL_KNEEL_TWO_LEGS",
+    6: "IDEL_KNEEL",
+    7: "IDEL_LYING_FACE_DOWN",
+    8: "CRAWLING",
+    9: "IDEL_BOXING",
+    10: "WALK_BOXING",
+    11: "LEFT_PUNCH",
+    12: "RIGHT_PUNCH",
+    13: "RANDOM_PUNCH",
+    14: "ELBOW_CRAWLING",
+    15: "LEFT_HOOK",
+    16: "RIGHT_HOOK",
+    17: "FORWARD_JUMP",
+    18: "STEALTH_WALK",
+    19: "INJURED_WALK",
+}
+SONIC_NATIVE_MODE_DESCRIPTIONS_ZH: dict[int | None, tuple[str, str]] = {
+    None: (
+        "AUTO 自动稳定",
+        "按当前速度/转向自动选择 0 空闲、1 慢走、2 行走、3 跑步。",
+    ),
+    SONIC_IDLE_MODE: (
+        "0 空闲/原地",
+        "SONIC 空闲档；用于站立、低速原地调整和自动档的静止段。",
+    ),
+    SONIC_SLOW_WALK_MODE: (
+        "1 慢走",
+        "SONIC 慢走档；适合小速度 WASD 和细微位置调整。",
+    ),
+    SONIC_WALK_MODE: (
+        "2 行走",
+        "SONIC 行走档；适合常规 WASD 前后左右移动。",
+    ),
+    SONIC_RUN_MODE: (
+        "3 跑步",
+        "SONIC 跑步档；适合 Shift/高速输入，速度上限更高。",
+    ),
+    4: (
+        "4 蹲姿待机",
+        "SONIC 蹲姿静态档；用于低姿态原地保持，不是行走档。",
+    ),
+    5: (
+        "5 双膝跪姿",
+        "SONIC 双膝跪姿静态档；用于原地双膝跪姿保持。",
+    ),
+    6: (
+        "6 单膝跪姿",
+        "SONIC 单膝跪姿静态档；用于原地单膝跪姿保持。",
+    ),
+    7: (
+        "7 俯卧待机",
+        "SONIC 俯卧静态档；原生侧注释提示该动作仍需谨慎使用。",
+    ),
+    8: (
+        "8 爬行",
+        "SONIC 爬行动作档；用于低姿态爬行，不是站立行走。",
+    ),
+    9: (
+        "9 拳击待机",
+        "SONIC 拳击姿态静态档；用于原地拳击准备姿态。",
+    ),
+    10: (
+        "10 拳击行走",
+        "SONIC 拳击行走档；边移动边保持拳击风格。",
+    ),
+    11: (
+        "11 左直拳",
+        "SONIC 左手直拳动作档；偏动作/风格控制，不是常规移动档。",
+    ),
+    12: (
+        "12 右直拳",
+        "SONIC 右手直拳动作档；偏动作/风格控制，不是常规移动档。",
+    ),
+    13: (
+        "13 随机出拳",
+        "SONIC 随机出拳动作档；由原生策略选择拳击动作组合。",
+    ),
+    14: (
+        "14 肘部爬行",
+        "SONIC 肘部爬行动作档；用于更低姿态爬行。",
+    ),
+    15: (
+        "15 左勾拳",
+        "SONIC 左勾拳动作档；偏动作/风格控制。",
+    ),
+    16: (
+        "16 右勾拳",
+        "SONIC 右勾拳动作档；偏动作/风格控制。",
+    ),
+    17: (
+        "17 向前跳跃",
+        "SONIC 向前跳跃动作档；动态幅度较大，测试时应留安全空间。",
+    ),
+    18: (
+        "18 隐蔽行走",
+        "SONIC 隐蔽/潜行风格行走档；仍属于站立移动风格。",
+    ),
+    19: (
+        "19 受伤行走",
+        "SONIC 受伤风格行走档；步态会刻意表现为不对称/跛行。",
+    ),
 }
 SONIC_GAIT_SPEED_RANGES_MPS = {
     SONIC_SLOW_WALK_MODE: (0.10, 0.80),
@@ -362,39 +458,84 @@ SONIC_GAIT_SPEED_RANGES_MPS = {
     SONIC_RUN_MODE: (2.50, 7.50),
 }
 KEYBOARD_GAIT_TARGETS_MPS = {
-    SONIC_SLOW_WALK_MODE: 0.20,
+    SONIC_SLOW_WALK_MODE: 0.10,
     SONIC_WALK_MODE: 0.80,
     SONIC_RUN_MODE: 2.50,
 }
-KEYBOARD_GAIT_BOOST_TARGETS_MPS = {
-    SONIC_SLOW_WALK_MODE: 0.30,
-    SONIC_WALK_MODE: 1.00,
-    SONIC_RUN_MODE: 2.75,
-}
 DEFAULT_ANALOG_MAX_SPEED_MPS = 0.30
+PICO_RIGHT_STICK_YAW_GAIN_RAD_S = 1.50
 # A feedback-backed facing target may lead the measured body by at most one
 # normal 50 Hz step at the default 2.5 rad/s turn rate.  This remains a hard
 # per-command cap even if a caller supplies a larger dt or tuning rate.
 MAX_MEASURED_FACING_LEAD_RAD = 0.05
-# Manual Q/E turns are intentionally faster than movement-alignment facing.
-# At the normal 50 Hz command cadence this preserves distinct single/double Q/E
-# rates up to the 4.0 rad/s panel maximum, while still bounding a delayed frame.
-MAX_MANUAL_TURN_MEASURED_FACING_LEAD_RAD = 0.08
-PURE_FORWARD_CRAWL_MAX_ERROR_RAD = math.pi / 2.0
-PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD = 0.005
-PURE_FORWARD_CRAWL_STALL_GRACE_S = 0.40
-CAMERA_FACE_MOVE_ENTRY_HOLD_S = 0.06
-CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S = 0.35
-# BFM Teacher50k can develop large yaw-rate spikes while walking on MoonWorld.
-# Camera-face movement uses this only as an entry gate before gait starts;
-# hard braking an already-walking BFM policy can destabilize the plant.
-CAMERA_FACE_STABILITY_BRAKE_MAX_ROOT_ANGULAR_SPEED_RAD_S = 0.85
-# A fresh camera-facing W can legitimately request an approximately 180 degree
-# turn before any translation.  On MoonWorld, continuously feeding that turn can
-# spin the BFM root faster than the policy can stabilize.  Pulse the automatic
-# alignment turn and let the root settle before issuing the next turn command.
-CAMERA_FACE_TURN_BRAKE_ENTER_ROOT_ANGULAR_SPEED_RAD_S = 0.60
-CAMERA_FACE_TURN_BRAKE_EXIT_ROOT_ANGULAR_SPEED_RAD_S = 0.25
+
+
+def validate_native_mode_value(value: object) -> int:
+    if (
+        type(value) is not int
+        or not SONIC_NATIVE_MODE_MIN <= value <= SONIC_NATIVE_MODE_MAX
+    ):
+        raise ValueError("native SONIC mode must be an integer in [0, 19]")
+    return value
+
+
+def validate_native_mode_override(value: object) -> int | None:
+    """Validate a manual native SONIC mode override.
+
+    ``None`` means the proven automatic gait selector is active.  Manual
+    override intentionally starts at mode 4: modes 0-3 are the ordinary
+    idle/slow/walk/run gait family and are owned by AUTO so Shift/Ctrl speed
+    modifiers can keep selecting the matching native gait instead of pinning an
+    incompatible speed range.
+    """
+
+    if value is None:
+        return None
+    mode = validate_native_mode_value(value)
+    if mode < SONIC_NATIVE_MANUAL_MODE_MIN:
+        raise ValueError(
+            "native SONIC mode override must be auto or an integer in [4, 19]; "
+            "use auto for modes 0-3"
+        )
+    return mode
+
+
+def native_mode_label(value: int | None) -> str:
+    if value is None:
+        return "AUTO"
+    return SONIC_GAIT_NAMES.get(value, f"MODE_{value:02d}")
+
+
+def native_mode_label_zh(value: int | None) -> str:
+    """User-facing Chinese label for the ESC/native-mode surfaces."""
+
+    if value is None:
+        mode = None
+    else:
+        try:
+            mode = validate_native_mode_value(value)
+        except ValueError:
+            return "未知模式"
+    if mode in SONIC_NATIVE_MODE_DESCRIPTIONS_ZH:
+        return SONIC_NATIVE_MODE_DESCRIPTIONS_ZH[mode][0]
+    assert mode is not None
+    return f"{mode} 原生单档"
+
+
+def native_mode_description_zh(value: int | None) -> str:
+    """Concise Chinese description without inventing unknown SONIC semantics."""
+
+    if value is None:
+        mode = None
+    else:
+        try:
+            mode = validate_native_mode_value(value)
+        except ValueError:
+            return "无效 SONIC 模式。"
+    if mode in SONIC_NATIVE_MODE_DESCRIPTIONS_ZH:
+        return SONIC_NATIVE_MODE_DESCRIPTIONS_ZH[mode][1]
+    assert mode is not None
+    return f"SONIC 原生模式 {mode}；Matrix 只透传编号，具体语义待 SONIC 侧确认。"
 
 
 def native_locomotion_mode_for_speed(
@@ -441,51 +582,43 @@ def native_locomotion_mode_for_speed(
 class ControlConfig:
     """Tuning and safety limits for :class:`GameControlCore`."""
 
-    # This is the analog cap; keyboard targets are the fixed native gait
-    # boundaries in KEYBOARD_GAIT_TARGETS_MPS.
+    # This is the analog cap; keyboard targets default to the native gait
+    # boundaries in KEYBOARD_GAIT_TARGETS_MPS and may be overridden by
+    # host-scoped motion settings.
     max_speed_mps: float = DEFAULT_ANALOG_MAX_SPEED_MPS
     max_acceleration_mps2: float = 1.20
     max_deceleration_mps2: float = 2.40
     max_turn_rate_rad_s: float = 2.50
-    keyboard_turn_rate_rad_s: float = 2.50
+    keyboard_turn_rate_rad_s: float = PICO_RIGHT_STICK_YAW_GAIN_RAD_S
     keyboard_turn_boost_rate_rad_s: float = 3.00
-    movement_mode: str = DEFAULT_MOVEMENT_MODE
     keyboard_slow_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[
         SONIC_SLOW_WALK_MODE
     ]
-    keyboard_slow_boost_speed_mps: float = KEYBOARD_GAIT_BOOST_TARGETS_MPS[
-        SONIC_SLOW_WALK_MODE
-    ]
     keyboard_walk_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[SONIC_WALK_MODE]
-    keyboard_walk_boost_speed_mps: float = KEYBOARD_GAIT_BOOST_TARGETS_MPS[
-        SONIC_WALK_MODE
-    ]
     keyboard_run_speed_mps: float = KEYBOARD_GAIT_TARGETS_MPS[SONIC_RUN_MODE]
-    keyboard_run_boost_speed_mps: float = KEYBOARD_GAIT_BOOST_TARGETS_MPS[
-        SONIC_RUN_MODE
-    ]
-    keyboard_speed_cap_mps: float | None = None
+    movement_mode: str = DEFAULT_MOVEMENT_MODE
     min_gait_speed_mps: float = 0.10
     gait_start_speed_mps: float = 0.10
-    gait_stop_speed_mps: float = 0.08
-    gait_start_heading_error_rad: float = math.radians(15.0)
-    gait_stop_heading_error_rad: float = math.radians(30.0)
+    gait_stop_speed_mps: float = 0.05
+    # Camera-face movement should feel like Pico left-stick + right-stick:
+    # ordinary camera-relative W/A/S/D keeps walking while the body yaws toward
+    # the requested facing.  The gait thresholds are motion gates, not final
+    # alignment tolerances: medium camera turns such as 15 degrees should keep
+    # moving while yaw catches up, while near-reversals may stop and turn first.
+    gait_start_heading_error_rad: float = math.radians(45.0)
+    gait_stop_heading_error_rad: float = math.radians(90.0)
+    # Separate final-facing precision.  Once the rate-limited facing target is
+    # within this error of the camera/movement yaw, publish the exact requested
+    # yaw so the target does not hover inside a broad gait gate.
+    camera_heading_snap_error_rad: float = math.radians(2.0)
     stick_deadzone: float = 0.15
-    input_timeout_s: float = 0.15
+    input_timeout_s: float = 0.50
     max_snapshot_age_s: float = 0.15
     max_future_skew_s: float = 0.05
     max_step_s: float = 0.10
     speed_epsilon_mps: float = 1e-4
-    pure_forward_alignment_crawl_enabled: bool = True
 
     def __post_init__(self) -> None:
-        try:
-            movement_mode = validate_movement_mode(self.movement_mode)
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
-        object.__setattr__(self, "movement_mode", movement_mode)
-        if type(self.pure_forward_alignment_crawl_enabled) is not bool:
-            raise ValueError("pure_forward_alignment_crawl_enabled must be boolean")
         positive = (
             "max_speed_mps",
             "max_acceleration_mps2",
@@ -494,16 +627,14 @@ class ControlConfig:
             "keyboard_turn_rate_rad_s",
             "keyboard_turn_boost_rate_rad_s",
             "keyboard_slow_speed_mps",
-            "keyboard_slow_boost_speed_mps",
             "keyboard_walk_speed_mps",
-            "keyboard_walk_boost_speed_mps",
             "keyboard_run_speed_mps",
-            "keyboard_run_boost_speed_mps",
             "min_gait_speed_mps",
             "gait_start_speed_mps",
             "gait_stop_speed_mps",
             "gait_start_heading_error_rad",
             "gait_stop_heading_error_rad",
+            "camera_heading_snap_error_rad",
             "input_timeout_s",
             "max_snapshot_age_s",
             "max_step_s",
@@ -522,54 +653,27 @@ class ControlConfig:
         )
         if deadzone >= 1.0:
             raise ValueError("stick_deadzone must be less than 1")
-        if self.keyboard_speed_cap_mps is not None:
-            keyboard_speed_cap = _finite_number(
-                self.keyboard_speed_cap_mps,
-                name="keyboard_speed_cap_mps",
-            )
-            if (
-                keyboard_speed_cap <= 0.0
-                or keyboard_speed_cap
-                > SONIC_GAIT_SPEED_RANGES_MPS[SONIC_RUN_MODE][1]
-            ):
-                raise ValueError(
-                    "keyboard_speed_cap_mps must be positive and no greater "
-                    "than native RUN maximum"
-                )
-            object.__setattr__(
-                self, "keyboard_speed_cap_mps", keyboard_speed_cap
-            )
         slow_walk_max = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][1]
         if self.max_speed_mps > slow_walk_max:
             raise ValueError(
                 "max_speed_mps cannot exceed native SLOW_WALK maximum 0.80"
             )
-        keyboard_tiers = (
+        keyboard_speed_specs = (
             (
-                "slow",
-                self.keyboard_slow_speed_mps,
-                self.keyboard_slow_boost_speed_mps,
+                "keyboard_slow_speed_mps",
                 SONIC_SLOW_WALK_MODE,
             ),
-            (
-                "walk",
-                self.keyboard_walk_speed_mps,
-                self.keyboard_walk_boost_speed_mps,
-                SONIC_WALK_MODE,
-            ),
-            (
-                "run",
-                self.keyboard_run_speed_mps,
-                self.keyboard_run_boost_speed_mps,
-                SONIC_RUN_MODE,
-            ),
+            ("keyboard_walk_speed_mps", SONIC_WALK_MODE),
+            ("keyboard_run_speed_mps", SONIC_RUN_MODE),
         )
-        for label, base, boost, mode in keyboard_tiers:
-            minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[mode]
-            if not minimum <= base < boost <= maximum:
+        for name, native_mode in keyboard_speed_specs:
+            value = getattr(self, name)
+            minimum, maximum = SONIC_GAIT_SPEED_RANGES_MPS[native_mode]
+            if not minimum <= value <= maximum:
                 raise ValueError(
-                    f"keyboard {label} speeds must satisfy native minimum "
-                    "<= base < boost <= native maximum"
+                    f"{name} must be inside native "
+                    f"{SONIC_GAIT_NAMES[native_mode]} range "
+                    f"[{minimum:.2f}, {maximum:.2f}]"
                 )
         slow_walk_min = SONIC_GAIT_SPEED_RANGES_MPS[SONIC_SLOW_WALK_MODE][0]
         if not (
@@ -599,10 +703,11 @@ class ControlConfig:
             )
         object.__setattr__(self, "max_future_skew_s", future_skew)
         object.__setattr__(self, "stick_deadzone", deadzone)
-        if self.keyboard_turn_boost_rate_rad_s < self.keyboard_turn_rate_rad_s:
-            raise ValueError(
-                "keyboard turn boost rate must be greater than or equal to base turn rate"
-            )
+        try:
+            movement_mode = validate_movement_mode(self.movement_mode)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        object.__setattr__(self, "movement_mode", movement_mode)
 
 
 @dataclass(frozen=True)
@@ -622,16 +727,14 @@ class RobotMotionCommand:
     # SONIC serialization ignores this metadata.  Keeping it optional preserves
     # compatibility with external/test commands that only provide wire fields.
     desired_facing: tuple[float, float, float] | None = None
-    # Native locomotion can be downgraded by alignment gates or a moon-safe
-    # keyboard speed cap.  Keep the operator-requested tier as metadata so
-    # adapters such as BFM RealScan can still distinguish Shift/Jog from a
-    # capped walk without loosening the global safety cap.
-    requested_locomotion_mode: int | None = None
-    requested_speed_mps: float | None = None
+    # Absolute native heading-state override in the normalized SONIC frame.
+    # Matrix uses this to mirror Pico/native Q/E heading control while planner
+    # movement/facing are serialized in the matching local frame.
+    delta_heading_rad: float | None = None
 
 
 class GameControlCore:
-    """Stateful third-person locomotion with deterministic safety stops."""
+    """Stateful camera-relative locomotion with deterministic safety stops."""
 
     def __init__(
         self,
@@ -642,9 +745,10 @@ class GameControlCore:
         self.config = config or ControlConfig()
         self._command_heading_rad = wrap_angle_rad(initial_heading_rad)
         self._measured_heading_rad: float | None = None
-        self._measured_root_angular_speed_rad_s: float | None = None
         self._speed_mps = 0.0
         self._gait_active = False
+        self._gait_heading_interlocked = False
+        self._native_mode_override: int | None = None
         self._snapshot: InputSnapshot | None = None
         self._last_received_at_s: float | None = None
         self._last_sequence: int | None = None
@@ -652,27 +756,27 @@ class GameControlCore:
         self._v_was_down = False
         self._turn_sign = 1.0
         self._requires_neutral_rearm = True
-        self._neutral_rearm_pending = False
-        self._neutral_rearm_frame_required = False
-        self._rearm_completed_sequence: int | None = None
         self._invalid_reason: str | None = None
         self._stopped_heading_latched = False
-        self._observed_movement_chord: tuple[bool, bool, bool, bool] = (
-            False,
-            False,
-            False,
-            False,
-        )
-        self._movement_chord_epoch = 0
-        self._consumed_movement_chord_epoch = 0
-        self._locked_movement_chord: tuple[bool, bool, bool, bool] | None = None
-        self._locked_movement_heading_rad: float | None = None
-        self._pure_forward_crawl_error_rad: float | None = None
-        self._pure_forward_crawl_stall_s = 0.0
-        self._camera_face_move_entry_hold_s = 0.0
-        self._camera_face_move_entry_ready = False
-        self._camera_face_move_entry_reason = "not_requested"
-        self._camera_face_turn_brake_active = False
+
+    @property
+    def movement_mode(self) -> str:
+        return self.config.movement_mode
+
+    def movement_mode_mapping(self) -> dict[str, str]:
+        return movement_mode_metadata(self.movement_mode)
+
+    @property
+    def native_mode_override(self) -> int | None:
+        return self._native_mode_override
+
+    def set_native_mode_override(self, value: object) -> bool:
+        mode = validate_native_mode_override(value)
+        changed = mode != self._native_mode_override
+        self._native_mode_override = mode
+        if changed:
+            self.invalidate_input("native_mode_changed")
+        return changed
 
     @property
     def free_camera(self) -> bool:
@@ -690,39 +794,65 @@ class GameControlCore:
 
         return self._measured_heading_rad
 
-    @property
-    def measured_root_angular_speed_rad_s(self) -> float | None:
-        """Latest physical root angular speed, or ``None`` before feedback."""
+    def synchronize_heading(self, heading_rad: float) -> None:
+        """Update physical yaw feedback without overwriting the facing target."""
 
-        return self._measured_root_angular_speed_rad_s
+        self._measured_heading_rad = wrap_angle_rad(heading_rad)
 
-    def camera_face_move_gate_telemetry(self) -> dict[str, object]:
-        return {
-            "ready": self._camera_face_move_entry_ready,
-            "reason": self._camera_face_move_entry_reason,
-            "hold_s": round(self._camera_face_move_entry_hold_s, 6),
-            "required_hold_s": CAMERA_FACE_MOVE_ENTRY_HOLD_S,
-            "max_root_angular_speed_rad_s": (
-                CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S
-            ),
-            "stability_brake_max_root_angular_speed_rad_s": (
-                CAMERA_FACE_STABILITY_BRAKE_MAX_ROOT_ANGULAR_SPEED_RAD_S
-            ),
-            "turn_brake_active": bool(self._camera_face_turn_brake_active),
-            "turn_brake_enter_root_angular_speed_rad_s": (
-                CAMERA_FACE_TURN_BRAKE_ENTER_ROOT_ANGULAR_SPEED_RAD_S
-            ),
-            "turn_brake_exit_root_angular_speed_rad_s": (
-                CAMERA_FACE_TURN_BRAKE_EXIT_ROOT_ANGULAR_SPEED_RAD_S
-            ),
-        }
+    def reanchor_heading(self, heading_rad: float) -> None:
+        """One-shot reset into a newly created SONIC deploy yaw frame.
 
-    @property
-    def movement_mode(self) -> str:
-        return self.config.movement_mode
+        A replacement native deploy defines its normalized yaw zero from the
+        physical pose present at startup.  Normal feedback must not chase body
+        drift while stopped, but this lifecycle boundary is different: both
+        the measured and commanded world headings must be reseeded to the same
+        physical yaw before the new frame transform is published.
+        """
 
-    def movement_mode_mapping(self) -> dict[str, str]:
-        return movement_mode_metadata(self.movement_mode)
+        heading = wrap_angle_rad(heading_rad)
+        self._measured_heading_rad = heading
+        self._command_heading_rad = heading
+        self._speed_mps = 0.0
+        self._gait_active = False
+        self._gait_heading_interlocked = False
+        self._stopped_heading_latched = True
+
+    def invalidate_input(
+        self,
+        reason: str = "input_invalidated",
+        *,
+        require_neutral: bool = True,
+    ) -> None:
+        """Stop immediately, optionally requiring neutral before re-arming."""
+
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("input invalidation reason must be a non-empty string")
+        if type(require_neutral) is not bool:
+            raise TypeError("require_neutral must be a boolean")
+        self._snapshot = None
+        self._last_received_at_s = None
+        self._speed_mps = 0.0
+        self._gait_active = False
+        self._gait_heading_interlocked = False
+        if require_neutral:
+            self._requires_neutral_rearm = True
+        self._invalid_reason = reason
+
+    def _snapshot_is_neutral(self) -> bool:
+        """Return whether every movement/turn input is released."""
+
+        snapshot = self._snapshot
+        if snapshot is None:
+            return False
+        keys = snapshot.keys
+        digital_neutral = not any(
+            (keys.w, keys.a, keys.s, keys.d, keys.q, keys.e)
+        )
+        analog_neutral = (
+            math.hypot(snapshot.move_stick.right, snapshot.move_stick.forward)
+            <= self.config.stick_deadzone
+        )
+        return bool(digital_neutral and analog_neutral)
 
     def movement_mode_change_allowed(self) -> bool:
         """Return whether a mode change can cross the live motion boundary."""
@@ -757,179 +887,6 @@ class GameControlCore:
         self.config = replace(self.config, movement_mode=mode)
         self.invalidate_input("movement_mode_changed")
         return True
-
-    def synchronize_heading(
-        self,
-        heading_rad: float,
-        *,
-        root_angular_speed_rad_s: float | None = None,
-    ) -> None:
-        """Update physical yaw feedback without overwriting the facing target."""
-
-        self._measured_heading_rad = wrap_angle_rad(heading_rad)
-        if root_angular_speed_rad_s is None:
-            self._measured_root_angular_speed_rad_s = None
-            return
-        self._measured_root_angular_speed_rad_s = _finite_number(
-            root_angular_speed_rad_s,
-            name="root_angular_speed_rad_s",
-            nonnegative=True,
-        )
-
-    def reanchor_heading(self, heading_rad: float) -> None:
-        """One-shot reset into a newly created SONIC deploy yaw frame.
-
-        A replacement native deploy defines its normalized yaw zero from the
-        physical pose present at startup.  Normal feedback must not chase body
-        drift while stopped, but this lifecycle boundary is different: both
-        the measured and commanded world headings must be reseeded to the same
-        physical yaw before the new frame transform is published.
-        """
-
-        heading = wrap_angle_rad(heading_rad)
-        self._measured_heading_rad = heading
-        self._command_heading_rad = heading
-        self._speed_mps = 0.0
-        self._gait_active = False
-        self._stopped_heading_latched = True
-        self._reset_pure_forward_crawl_tracker()
-        self._reset_camera_face_move_entry_gate()
-
-    def invalidate_input(self, reason: str = "input_invalidated") -> None:
-        """Stop immediately and require neutral input before re-arming."""
-
-        if not isinstance(reason, str) or not reason:
-            raise ValueError("input invalidation reason must be a non-empty string")
-        self._snapshot = None
-        self._last_received_at_s = None
-        self._speed_mps = 0.0
-        self._gait_active = False
-        self._require_neutral_rearm()
-        self._invalid_reason = reason
-        self._clear_movement_chord_lock()
-        self._reset_camera_face_move_entry_gate()
-
-    def _require_neutral_rearm(self) -> None:
-        self._requires_neutral_rearm = True
-        self._neutral_rearm_pending = False
-        self._neutral_rearm_frame_required = True
-        self._rearm_completed_sequence = None
-        self._reset_pure_forward_crawl_tracker()
-
-    def _snapshot_is_neutral(self) -> bool:
-        if self._snapshot is None:
-            return False
-        return bool(
-            not any(
-                (
-                    self._snapshot.keys.w,
-                    self._snapshot.keys.a,
-                    self._snapshot.keys.s,
-                    self._snapshot.keys.d,
-                    self._snapshot.keys.q,
-                    self._snapshot.keys.e,
-                )
-            )
-            and math.hypot(
-                self._snapshot.move_stick.right,
-                self._snapshot.move_stick.forward,
-            )
-            <= self.config.stick_deadzone
-        )
-
-    def _complete_neutral_rearm_frame(self) -> None:
-        if not self._neutral_rearm_pending or self._last_sequence is None:
-            raise RuntimeError("neutral re-arm frame was not pending")
-        self._requires_neutral_rearm = False
-        self._neutral_rearm_pending = False
-        self._neutral_rearm_frame_required = False
-        # Packets already consumed in this control frame cannot drive a later
-        # frame. A strictly newer snapshot is required after this boundary.
-        self._rearm_completed_sequence = self._last_sequence
-
-    def _clear_movement_chord_lock(self) -> None:
-        self._locked_movement_chord = None
-        self._locked_movement_heading_rad = None
-        self._reset_pure_forward_crawl_tracker()
-        self._reset_camera_face_move_entry_gate()
-        self._camera_face_turn_brake_active = False
-
-    def _reset_pure_forward_crawl_tracker(self) -> None:
-        self._pure_forward_crawl_error_rad = None
-        self._pure_forward_crawl_stall_s = 0.0
-
-    def _reset_camera_face_move_entry_gate(
-        self, reason: str = "not_requested"
-    ) -> None:
-        self._camera_face_move_entry_hold_s = 0.0
-        self._camera_face_move_entry_ready = False
-        self._camera_face_move_entry_reason = reason
-
-    def _update_camera_face_move_entry_gate(
-        self,
-        *,
-        requested_speed: float,
-        alignment: float,
-        hidden_speed_mps: float,
-        dt_s: float,
-    ) -> bool:
-        """Return whether camera-face movement may enter gait this frame."""
-
-        if (
-            requested_speed + self.config.speed_epsilon_mps
-            < self.config.gait_start_speed_mps
-        ):
-            self._reset_camera_face_move_entry_gate("speed_below_start")
-            return False
-        if alignment + self.config.speed_epsilon_mps < math.cos(
-            self.config.gait_start_heading_error_rad
-        ):
-            self._reset_camera_face_move_entry_gate("heading_error")
-            return False
-        if hidden_speed_mps + self.config.speed_epsilon_mps < (
-            self.config.min_gait_speed_mps
-            * math.cos(self.config.gait_start_heading_error_rad)
-        ):
-            self._reset_camera_face_move_entry_gate("speed_ramp")
-            return False
-        root_angular_speed = self._measured_root_angular_speed_rad_s
-        if (
-            root_angular_speed is not None
-            and root_angular_speed
-            > CAMERA_FACE_MOVE_ENTRY_MAX_ROOT_ANGULAR_SPEED_RAD_S
-        ):
-            self._reset_camera_face_move_entry_gate("root_angular_speed")
-            return False
-        self._camera_face_move_entry_hold_s += dt_s
-        self._camera_face_move_entry_ready = (
-            self._camera_face_move_entry_hold_s + self.config.speed_epsilon_mps
-            >= CAMERA_FACE_MOVE_ENTRY_HOLD_S
-        )
-        self._camera_face_move_entry_reason = (
-            "ready" if self._camera_face_move_entry_ready else "stability_hold"
-        )
-        return self._camera_face_move_entry_ready
-
-    def _pure_forward_crawl_progress_allows(
-        self, measured_error_abs_rad: float, *, dt_s: float
-    ) -> bool:
-        if measured_error_abs_rad >= PURE_FORWARD_CRAWL_MAX_ERROR_RAD:
-            self._reset_pure_forward_crawl_tracker()
-            return False
-        previous_error = self._pure_forward_crawl_error_rad
-        progressed = (
-            previous_error is not None
-            and measured_error_abs_rad
-            <= previous_error - PURE_FORWARD_CRAWL_PROGRESS_EPS_RAD
-        )
-        if previous_error is None or progressed:
-            self._pure_forward_crawl_stall_s = 0.0
-            self._pure_forward_crawl_error_rad = measured_error_abs_rad
-        else:
-            self._pure_forward_crawl_stall_s += dt_s
-        return progressed or self._pure_forward_crawl_stall_s < (
-            PURE_FORWARD_CRAWL_STALL_GRACE_S - 1e-12
-        )
 
     def _latch_stopped_heading(self) -> None:
         """Hold one physical heading for the complete stopped interval.
@@ -984,55 +941,23 @@ class GameControlCore:
         # edge, and holding V across refocus cannot toggle the mode by accident.
         if snapshot.focused and snapshot.keys.v and not self._v_was_down:
             self._free_camera = not self._free_camera
-            self._require_neutral_rearm()
+            self._requires_neutral_rearm = True
         self._v_was_down = snapshot.keys.v
         if not snapshot.focused:
-            self._require_neutral_rearm()
-        movement_chord = (
-            snapshot.keys.w,
-            snapshot.keys.a,
-            snapshot.keys.s,
-            snapshot.keys.d,
-        )
-        if movement_chord != self._observed_movement_chord:
-            # Runtime drains can contain W -> W+D -> W before command() runs.
-            # Preserve that boundary even though the final chord matches the
-            # existing lock, while ordinary held-key snapshots leave the epoch
-            # unchanged as final-POV yaw follows the body.
-            self._observed_movement_chord = movement_chord
-            self._movement_chord_epoch += 1
+            self._requires_neutral_rearm = True
         digital_neutral = not any(
-            (*movement_chord, snapshot.keys.q, snapshot.keys.e)
+            (snapshot.keys.w, snapshot.keys.a, snapshot.keys.s, snapshot.keys.d)
         )
         analog_neutral = math.hypot(
             snapshot.move_stick.right, snapshot.move_stick.forward
         ) <= self.config.stick_deadzone
-        digital_right = int(snapshot.keys.d) - int(snapshot.keys.a)
-        digital_forward = int(snapshot.keys.w) - int(snapshot.keys.s)
-        if digital_right == 0 and digital_forward == 0:
-            # A release or an opposing-key chord ends the current digital
-            # movement interval even if no command is sampled for this packet.
-            self._clear_movement_chord_lock()
         if (
             snapshot.focused
             and not self._free_camera
             and digital_neutral
             and analog_neutral
-            and self._requires_neutral_rearm
         ):
-            if self._neutral_rearm_frame_required:
-                self._neutral_rearm_pending = True
-            else:
-                # Startup has no prior unsafe command generation to fence. Keep
-                # its long-standing synchronous neutral initialization while
-                # every post-invalidation re-arm uses a full control frame.
-                self._requires_neutral_rearm = False
-        elif (
-            not self._requires_neutral_rearm
-            and self._rearm_completed_sequence is not None
-            and snapshot.sequence > self._rearm_completed_sequence
-        ):
-            self._rearm_completed_sequence = None
+            self._requires_neutral_rearm = False
         self._snapshot = snapshot
         self._last_received_at_s = received_at
         self._last_sequence = snapshot.sequence
@@ -1043,7 +968,7 @@ class GameControlCore:
         # focus loss, and free-camera mode can never leave residual velocity.
         self._speed_mps = 0.0
         self._gait_active = False
-        self._camera_face_turn_brake_active = False
+        self._gait_heading_interlocked = False
         # ``facing`` remains an active orientation target even in SONIC IDLE.
         # If the rate-limited command is ahead of the physical body, preserving
         # it here would let the robot keep turning after focus loss, EOF, or a
@@ -1065,31 +990,27 @@ class GameControlCore:
             safe_stop=True,
             reason=reason,
             desired_facing=facing,
-            requested_locomotion_mode=SONIC_IDLE_MODE,
-            requested_speed_mps=0.0,
+            delta_heading_rad=None,
         )
 
     def _safety_reason(self, now_s: float) -> tuple[str, bool] | None:
         if self._snapshot is None or self._last_received_at_s is None:
             return (self._invalid_reason or "no_input", True)
         if now_s < self._last_received_at_s:
-            self._require_neutral_rearm()
+            self._requires_neutral_rearm = True
             return ("clock_regression", True)
         if (
             now_s - self._last_received_at_s >= self.config.input_timeout_s
             or now_s - self._snapshot.timestamp_monotonic_s
             >= self.config.input_timeout_s
         ):
-            self._require_neutral_rearm()
             return ("input_timeout", True)
         if not self._snapshot.focused:
-            self._require_neutral_rearm()
+            self._requires_neutral_rearm = True
             return ("focus_lost", True)
         if self._free_camera:
             return ("free_camera", False)
-        if self._requires_neutral_rearm and not self._neutral_rearm_pending:
-            return ("awaiting_neutral", True)
-        if self._rearm_completed_sequence is not None:
+        if self._requires_neutral_rearm:
             return ("awaiting_neutral", True)
         return None
 
@@ -1117,42 +1038,27 @@ class GameControlCore:
     def _requested_locomotion(self, input_magnitude: float) -> tuple[float, int]:
         """Map keyboard tiers or analog travel onto a speed and native gait.
 
-        Keyboard movement follows the usual third-person convention: Ctrl or
-        Alt is held for a precise slow walk, unmodified WASD is ordinary
-        walking, and Shift is held to run. A provider-confirmed same-key double
-        tap selects that tier's separately validated boost target. Slow-walk
-        modifiers win conflicts so an accidental overlap can only reduce the
-        selected gait. Gamepad magnitude stays continuous in native SLOW_WALK.
+        Keyboard movement follows the usual third-person convention: Ctrl is
+        held for a precise slow walk, unmodified WASD is ordinary walking, and
+        Shift is held to run. These map to SONIC modes 1, 2, and 3 at the lower
+        boundary of each native speed interval. Ctrl wins a Ctrl+Shift conflict
+        so an accidental overlap can only reduce speed. Gamepad magnitude stays
+        continuous in native SLOW_WALK and is never quantized into keyboard
+        tiers.
         """
 
         assert self._snapshot is not None
         keys = self._snapshot.keys
         digital_movement = any((keys.w, keys.a, keys.s, keys.d))
         if digital_movement:
-            boosted = self._snapshot.keyboard_boost
             if keys.ctrl or keys.alt:
                 requested_mode = SONIC_SLOW_WALK_MODE
-                target = (
-                    self.config.keyboard_slow_boost_speed_mps
-                    if boosted
-                    else self.config.keyboard_slow_speed_mps
-                )
-                return (target, requested_mode)
+                return (self.config.keyboard_slow_speed_mps, requested_mode)
             if keys.shift:
                 requested_mode = SONIC_RUN_MODE
-                target = (
-                    self.config.keyboard_run_boost_speed_mps
-                    if boosted
-                    else self.config.keyboard_run_speed_mps
-                )
-                return (target, requested_mode)
+                return (self.config.keyboard_run_speed_mps, requested_mode)
             requested_mode = SONIC_WALK_MODE
-            target = (
-                self.config.keyboard_walk_boost_speed_mps
-                if boosted
-                else self.config.keyboard_walk_speed_mps
-            )
-            return (target, requested_mode)
+            return (self.config.keyboard_walk_speed_mps, requested_mode)
         # Treat the deadzone-remapped stick magnitude like a native analog
         # gait command: the first non-zero intent starts at SONIC's minimum
         # feasible gait, then the rest of the stick travel spans the full
@@ -1180,33 +1086,17 @@ class GameControlCore:
             return self._safe_stop(reason=reason, deadman=deadman)
 
         assert self._snapshot is not None
-        completing_neutral_rearm = (
-            self._requires_neutral_rearm and self._neutral_rearm_pending
-        )
-        if completing_neutral_rearm and not self._snapshot_is_neutral():
-            command = self._safe_stop(reason="awaiting_neutral", deadman=True)
-            self._complete_neutral_rearm_frame()
-            return command
         local_right, local_forward = self._local_movement()
         input_magnitude = min(1.0, math.hypot(local_right, local_forward))
         keys = self._snapshot.keys
         digital_movement = any((keys.w, keys.a, keys.s, keys.d))
-        movement_chord_boundary = (
-            self._movement_chord_epoch != self._consumed_movement_chord_epoch
-        )
-        self._consumed_movement_chord_epoch = self._movement_chord_epoch
         movement_mode = self.movement_mode
         alignment = 0.0
         requested_speed = 0.0
         requested_locomotion_mode = SONIC_IDLE_MODE
-        user_requested_speed = 0.0
-        user_requested_locomotion_mode = SONIC_IDLE_MODE
         desired_heading = self._command_heading_rad
         movement_heading = self._command_heading_rad
-        pure_forward_alignment_crawl = False
-        camera_face_move_entry_allowed = True
-        camera_face_alignment_brake = False
-        camera_face_measured_error_rad: float | None = None
+        camera_auto_turn_needs_native_motion = False
         manual_turn = bool(
             not digital_movement
             and input_magnitude <= 1e-12
@@ -1229,186 +1119,140 @@ class GameControlCore:
                 forward=local_forward,
                 camera_yaw_rad=translation_frame_heading,
             )
-            projected_heading = math.atan2(world_y, world_x)
-            if movement_mode == CAMERA_FACE and digital_movement:
-                movement_chord = (keys.w, keys.a, keys.s, keys.d)
-                if (
-                    movement_chord_boundary
-                    or movement_chord != self._locked_movement_chord
-                ):
-                    self._reset_pure_forward_crawl_tracker()
-                    self._locked_movement_chord = movement_chord
-                    self._locked_movement_heading_rad = projected_heading
-                assert self._locked_movement_heading_rad is not None
-                movement_heading = self._locked_movement_heading_rad
-            else:
-                # Strafing/body-relative modes track their selected translation
-                # frame continuously. Legacy face-movement keeps its digital
-                # chord lock, while analog input also remains continuous.
-                self._clear_movement_chord_lock()
-                movement_heading = projected_heading
-
-            if movement_mode == CAMERA_FACE:
-                desired_heading = movement_heading
-                # Keep the planner-facing setpoint close to the physical body.
-                # Feedback prevents recovery holds from accumulating a distant
-                # open-loop turn target before translation is allowed.
-                heading_origin = (
-                    self._measured_heading_rad
-                    if self._measured_heading_rad is not None
-                    else self._command_heading_rad
-                )
-                heading_error = wrap_angle_rad(desired_heading - heading_origin)
-                if abs(abs(heading_error) - math.pi) <= 0.05:
-                    heading_error = self._turn_sign * abs(heading_error)
-                elif abs(heading_error) > 1e-6:
-                    self._turn_sign = math.copysign(1.0, heading_error)
-                max_heading_delta = self.config.max_turn_rate_rad_s * dt
-                if self._measured_heading_rad is not None:
-                    max_heading_delta = min(
-                        max_heading_delta, MAX_MEASURED_FACING_LEAD_RAD
-                    )
-                heading_delta = max(
-                    -max_heading_delta,
-                    min(max_heading_delta, heading_error),
-                )
-                self._command_heading_rad = wrap_angle_rad(
-                    heading_origin + heading_delta
-                )
-
-                command_error = wrap_angle_rad(
-                    desired_heading - self._command_heading_rad
-                )
-                command_alignment = max(0.0, math.cos(command_error))
-                if self._measured_heading_rad is None:
-                    alignment = command_alignment
-                else:
-                    measured_error = wrap_angle_rad(
-                        desired_heading - self._measured_heading_rad
-                    )
-                    camera_face_measured_error_rad = measured_error
-                    measured_alignment = max(0.0, math.cos(measured_error))
-                    alignment = min(command_alignment, measured_alignment)
-                    root_angular_speed = self._measured_root_angular_speed_rad_s
-                    if not self._gait_active and root_angular_speed is not None:
-                        if self._camera_face_turn_brake_active:
-                            camera_face_alignment_brake = (
-                                root_angular_speed
-                                > CAMERA_FACE_TURN_BRAKE_EXIT_ROOT_ANGULAR_SPEED_RAD_S
-                            )
-                        else:
-                            camera_face_alignment_brake = (
-                                root_angular_speed
-                                > CAMERA_FACE_TURN_BRAKE_ENTER_ROOT_ANGULAR_SPEED_RAD_S
-                            )
-                        self._camera_face_turn_brake_active = (
-                            camera_face_alignment_brake
-                        )
-                    else:
-                        self._camera_face_turn_brake_active = False
-            else:
-                # These modes deliberately decouple translation and facing.
-                # Keep the facing command anchored to the physical body so a
-                # stale target from a previous camera-facing/manual turn does
-                # not become an unintended auto-turn while strafing or moving
-                # in the body frame.
+            movement_heading = math.atan2(world_y, world_x)
+            desired_heading = movement_heading
+            if movement_mode != CAMERA_FACE:
                 alignment = 1.0
                 if self._measured_heading_rad is not None:
                     self._command_heading_rad = self._measured_heading_rad
                 desired_heading = self._command_heading_rad
-                self._reset_pure_forward_crawl_tracker()
-                self._camera_face_turn_brake_active = False
+            else:
+                measured_error = (
+                    wrap_angle_rad(desired_heading - self._measured_heading_rad)
+                    if self._measured_heading_rad is not None
+                    else None
+                )
+                turn_before_translation = bool(
+                    measured_error is not None
+                    and abs(measured_error) > self.config.gait_start_heading_error_rad
+                )
+                camera_auto_turn_needs_native_motion = turn_before_translation
+                if turn_before_translation:
+                    # A large camera-face request is the same physical yaw
+                    # intent as Pico's right stick while the left stick is
+                    # already held forward: accumulate a real facing target in
+                    # native IDLE, then release translation only after measured
+                    # yaw enters the gait gate.  Keeping the target only one
+                    # feedback tick ahead of measured yaw can stall the native
+                    # planner far outside that gate.
+                    heading_origin = self._command_heading_rad
+                    max_heading_delta = self.config.max_turn_rate_rad_s * dt
+                else:
+                    # Once feedback says the body is near the requested
+                    # heading, keep the planner-facing setpoint close to the
+                    # physical body so a small residual error cannot create an
+                    # angular spike right as translation starts.
+                    heading_origin = (
+                        self._measured_heading_rad
+                        if self._measured_heading_rad is not None
+                        else self._command_heading_rad
+                    )
+                    max_heading_delta = self.config.max_turn_rate_rad_s * dt
+                    if self._measured_heading_rad is not None:
+                        max_heading_delta = min(
+                            max_heading_delta, MAX_MEASURED_FACING_LEAD_RAD
+                        )
+                heading_error = wrap_angle_rad(desired_heading - heading_origin)
+                # At the antipode, tiny camera-yaw noise can represent the same
+                # direction as either +pi or -pi.  Latch the prior turn side so an
+                # exact reversal never chatters between left and right.
+                if abs(abs(heading_error) - math.pi) <= 0.05:
+                    heading_error = self._turn_sign * abs(heading_error)
+                elif abs(heading_error) > 1e-6:
+                    self._turn_sign = math.copysign(1.0, heading_error)
+                if abs(heading_error) <= self.config.camera_heading_snap_error_rad:
+                    heading_delta = heading_error
+                else:
+                    heading_delta = max(
+                        -max_heading_delta, min(max_heading_delta, heading_error)
+                    )
+                self._command_heading_rad = wrap_angle_rad(
+                    heading_origin + heading_delta
+                )
 
+                # Reduce translation while making a large turn. This produces a
+                # natural turn-in-place for reversals rather than walking
+                # sideways. Native SONIC replans IDLE when facing changes, so a
+                # zero target speed still preserves this rate-limited
+                # orientation command. If physics feedback is available,
+                # translation waits for the body -- not merely the command
+                # target -- to align with the request.
+                command_error = wrap_angle_rad(
+                    desired_heading - self._command_heading_rad
+                )
+                if (
+                    measured_error is None
+                    and abs(command_error) > self.config.gait_start_heading_error_rad
+                ):
+                    camera_auto_turn_needs_native_motion = True
+                command_alignment = max(0.0, math.cos(command_error))
+                if self._measured_heading_rad is None:
+                    alignment = command_alignment
+                else:
+                    assert measured_error is not None
+                    measured_alignment = max(0.0, math.cos(measured_error))
+                    # A mid-turn retarget can make the body already face the new
+                    # request while the rate-limited planner target still points in
+                    # the old direction (or vice versa).  Translation must wait for
+                    # both frames; otherwise movement/facing would be published in
+                    # a direction that the alignment gate did not actually check.
+                    alignment = min(command_alignment, measured_alignment)
+            # Digital WASD requests native SLOW_WALK/WALK/RUN. Analog stick
+            # travel stays continuous within SLOW_WALK; ``max(minimum,
+            # maximum * magnitude)`` would flatten roughly the first third of
+            # a 0.30 m/s stick into one speed and make gentle control digital.
             requested_speed, requested_locomotion_mode = (
                 self._requested_locomotion(input_magnitude)
             )
-            user_requested_speed = requested_speed
-            user_requested_locomotion_mode = requested_locomotion_mode
-            if (
-                digital_movement
-                and self.config.keyboard_speed_cap_mps is not None
-            ):
-                requested_speed = min(
-                    requested_speed,
-                    self.config.keyboard_speed_cap_mps,
-                )
             target_speed = requested_speed * alignment
-            pure_forward_alignment_crawl_eligible = (
-                self.config.pure_forward_alignment_crawl_enabled
-                and movement_mode == CAMERA_FACE
-                and
-                digital_movement
-                and keys.w
-                and not any((keys.a, keys.s, keys.d))
-                and self._measured_heading_rad is not None
-                and alignment < math.cos(self.config.gait_start_heading_error_rad)
-            )
-            if pure_forward_alignment_crawl_eligible:
-                assert self._measured_heading_rad is not None
-                measured_error_abs = abs(
-                    wrap_angle_rad(desired_heading - self._measured_heading_rad)
-                )
-                pure_forward_alignment_crawl = (
-                    self._pure_forward_crawl_progress_allows(
-                        measured_error_abs,
-                        dt_s=dt,
-                    )
-                )
-                if pure_forward_alignment_crawl:
-                    target_speed = min(self.config.gait_start_speed_mps, requested_speed)
-                    requested_locomotion_mode = SONIC_SLOW_WALK_MODE
-                else:
-                    target_speed = 0.0
-            else:
-                self._reset_pure_forward_crawl_tracker()
             if (
                 digital_movement
+                and movement_mode == CAMERA_FACE
+                and (
+                    self._measured_heading_rad is not None
+                    or not camera_auto_turn_needs_native_motion
+                )
                 and alignment
-                >= math.cos(self.config.gait_start_heading_error_rad)
+                > math.cos(self.config.gait_stop_heading_error_rad) + 1e-12
             ):
                 # Keyboard targets sit exactly on native gait boundaries.
                 # Cosine attenuation at a harmless residual heading error
                 # would otherwise make WALK/RUN mathematically unreachable.
-                # The translation gate already supplies turn-before-move, so
-                # preserve the exact tier target once the body is inside it.
+                # For WASD, the wider stop edge is the user's "原地转向"
+                # boundary: below it, keep translation live and yaw toward the
+                # camera; at/above it, use the native turn-capable manifold
+                # before resuming movement.
                 target_speed = requested_speed
-            if camera_face_alignment_brake:
-                target_speed = 0.0
-                requested_locomotion_mode = SONIC_IDLE_MODE
         elif manual_turn:
-            self._clear_movement_chord_lock()
-            self._camera_face_turn_brake_active = False
             self._stopped_heading_latched = False
             turn_sign = 1.0 if keys.q else -1.0
             self._turn_sign = turn_sign
             turn_rate = (
                 self.config.keyboard_turn_boost_rate_rad_s
-                if self._snapshot.keyboard_boost
+                if keys.shift
                 else self.config.keyboard_turn_rate_rad_s
             )
-            maximum_delta = turn_rate * dt
-            if self._measured_heading_rad is None:
-                self._command_heading_rad = wrap_angle_rad(
-                    self._command_heading_rad + turn_sign * maximum_delta
-                )
-            else:
-                requested_heading = wrap_angle_rad(
-                    self._command_heading_rad + turn_sign * maximum_delta
-                )
-                requested_error = wrap_angle_rad(
-                    requested_heading - self._measured_heading_rad
-                )
-                maximum_delta = min(
-                    maximum_delta,
-                    MAX_MANUAL_TURN_MEASURED_FACING_LEAD_RAD,
-                )
-                bounded_error = max(
-                    -maximum_delta,
-                    min(maximum_delta, requested_error),
-                )
-                self._command_heading_rad = wrap_angle_rad(
-                    self._measured_heading_rad + bounded_error
-                )
+            # Match Pico's right-stick planner loop: accumulate yaw from the
+            # operator input itself (dyaw = yaw_gain * axis * dt) and publish the
+            # resulting facing even when there is no translational movement.
+            # Feedback-limiting this path makes an unresponsive body keep
+            # re-sending only a tiny measured-yaw lead, which feels like Q/E did
+            # not turn at all.  Releasing Q/E still latches back to measured yaw
+            # through the neutral/idle path below, so stale open-loop targets do
+            # not survive key-up.
+            self._command_heading_rad = wrap_angle_rad(
+                self._command_heading_rad + turn_sign * turn_rate * dt
+            )
             desired_heading = self._command_heading_rad
             target_speed = 0.0
         else:
@@ -1421,6 +1265,7 @@ class GameControlCore:
             # measured yaw as well instead of finishing a stale turn target.
             self._speed_mps = 0.0
             self._gait_active = False
+            self._gait_heading_interlocked = False
             if not manual_turn:
                 self._latch_stopped_heading()
         else:
@@ -1440,8 +1285,6 @@ class GameControlCore:
             self._speed_mps = _move_toward(
                 self._speed_mps, target_speed, rate * dt
             )
-            if pure_forward_alignment_crawl:
-                self._speed_mps = min(self._speed_mps, target_speed)
             if math.isclose(
                 self._speed_mps, target_speed, rel_tol=0.0, abs_tol=1e-12
             ):
@@ -1461,78 +1304,68 @@ class GameControlCore:
         if self._speed_mps < self.config.speed_epsilon_mps:
             self._speed_mps = 0.0
 
-        if (
-            input_magnitude > 1e-12
-            and not camera_face_alignment_brake
-            and movement_mode == CAMERA_FACE
-            and not self._gait_active
-            and not pure_forward_alignment_crawl
-        ):
-            camera_face_move_entry_allowed = (
-                self._update_camera_face_move_entry_gate(
-                    requested_speed=requested_speed,
-                    alignment=alignment,
-                    hidden_speed_mps=self._speed_mps,
-                    dt_s=dt,
-                )
-            )
-        elif camera_face_alignment_brake:
-            camera_face_move_entry_allowed = False
-            self._reset_camera_face_move_entry_gate("root_angular_brake")
-        elif movement_mode != CAMERA_FACE:
-            self._reset_camera_face_move_entry_gate("not_camera_face")
-        elif self._gait_active:
-            self._reset_camera_face_move_entry_gate("already_moving")
-        elif input_magnitude <= 1e-12:
-            self._reset_camera_face_move_entry_gate("not_requested")
-        elif pure_forward_alignment_crawl:
-            self._reset_camera_face_move_entry_gate("alignment_crawl")
-
         # Native locomotion starts at SLOW_WALK's 0.10 m/s floor. Keep distinct
         # start/stop thresholds so measured-heading noise cannot chatter between
         # IDLE and locomotion. A deliberate direction release is IDLE above.
+        gait_stop_alignment = math.cos(self.config.gait_stop_heading_error_rad)
+        gait_start_alignment = math.cos(self.config.gait_start_heading_error_rad)
+        digital_entry_aligned = (
+            alignment + self.config.speed_epsilon_mps >= gait_start_alignment
+            if self._gait_heading_interlocked
+            else (
+                (
+                    self._measured_heading_rad is not None
+                    or not camera_auto_turn_needs_native_motion
+                )
+                and alignment > gait_stop_alignment + 1e-12
+            )
+        )
+
         if (
             input_magnitude > 1e-12
             and self._gait_active
-            and not pure_forward_alignment_crawl
+            and movement_mode == CAMERA_FACE
             and (
                 target_speed + self.config.speed_epsilon_mps
                 < self.config.gait_stop_speed_mps
                 or alignment
-                < math.cos(self.config.gait_stop_heading_error_rad)
+                <= gait_stop_alignment + 1e-12
             )
         ):
             # Keep turning in native IDLE until physical alignment can support
             # the minimum gait; never hold a 0.10 m/s floor in a wrong heading.
             self._gait_active = False
+            if alignment <= gait_stop_alignment + 1e-12:
+                self._gait_heading_interlocked = True
         elif (
             input_magnitude > 1e-12
             and not self._gait_active
             and requested_speed + self.config.speed_epsilon_mps
             >= self.config.gait_start_speed_mps
-            and camera_face_move_entry_allowed
-            and alignment + self.config.speed_epsilon_mps
-            >= math.cos(self.config.gait_start_heading_error_rad)
+            and (
+                movement_mode != CAMERA_FACE
+                or (
+                    digital_movement
+                    and digital_entry_aligned
+                )
+                or (
+                    not digital_movement
+                    and alignment + self.config.speed_epsilon_mps
+                    >= gait_start_alignment
+                )
+            )
             and self._speed_mps + self.config.speed_epsilon_mps
             >= (
                 self.config.min_gait_speed_mps
-                * math.cos(self.config.gait_start_heading_error_rad)
+                * gait_start_alignment
             )
         ):
             self._gait_active = True
+            self._gait_heading_interlocked = False
             # The native manifold cannot publish a speed below its gait floor.
             # Snap the hidden ramp back to that exact floor on entry so the
             # first non-zero frame is 0.10 m/s, then subsequent frames obey the
             # configured acceleration from that boundary.
-            self._speed_mps = self.config.gait_start_speed_mps
-        elif (
-            input_magnitude > 1e-12
-            and pure_forward_alignment_crawl
-            and not self._gait_active
-            and self._speed_mps + self.config.speed_epsilon_mps
-            >= self.config.gait_start_speed_mps
-        ):
-            self._gait_active = True
             self._speed_mps = self.config.gait_start_speed_mps
         if self._speed_mps == 0.0:
             self._gait_active = False
@@ -1558,11 +1391,7 @@ class GameControlCore:
         movement_direction = (
             facing_direction
             if movement_mode == CAMERA_FACE
-            else (
-                math.cos(movement_heading),
-                math.sin(movement_heading),
-                0.0,
-            )
+            else (math.cos(movement_heading), math.sin(movement_heading), 0.0)
         )
         desired_direction = (
             math.cos(desired_heading),
@@ -1572,42 +1401,55 @@ class GameControlCore:
         moving = output_speed > 0.0
         turning_to_heading = bool(
             manual_turn
-            or (
-                movement_mode == CAMERA_FACE
-                and input_magnitude > 1e-12
-                and not moving
-                and not camera_face_alignment_brake
-            )
+            or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
-        # SONIC's own controller sends IDLE whenever translational stick input
-        # is inside the deadzone, while continuing to update ``facing`` from
-        # the look stick.  Keep turn-before-translation on that native
-        # contract: SLOW_WALK has a non-zero 0.10 m/s floor and must never be
-        # paired with zero speed/movement.
-        command = RobotMotionCommand(
+        native_override = self._native_mode_override
+        if turning_to_heading:
+            # Match the stable pre-Moon desktop branch and native Pico control
+            # path: pure heading changes are sent as an IDLE planner update
+            # with a new facing vector, not as a synthetic low-speed gait.
+            # Injecting a fake 0.10 m/s stationary gait made Town10 drift into
+            # a different body heading frame after camera-face W, so the robot
+            # translated one way while visually facing diagonally.
+            locomotion_mode = SONIC_IDLE_MODE
+        if native_override is not None:
+            if native_override == SONIC_IDLE_MODE:
+                output_speed = 0.0
+                moving = False
+                locomotion_mode = SONIC_IDLE_MODE
+                movement_direction = (0.0, 0.0, 0.0)
+            elif moving or turning_to_heading:
+                locomotion_mode = native_override
+        return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=movement_direction if moving else (0.0, 0.0, 0.0),
             facing=facing_direction,
             speed_mps=output_speed,
             locomotion_mode=locomotion_mode,
-            mode=("move" if moving else "turn" if turning_to_heading else "idle"),
+            mode=(
+                "turn"
+                if turning_to_heading
+                else "move"
+                if moving
+                else "idle"
+            ),
             safe_stop=False,
             reason=(
                 "manual_yaw"
                 if manual_turn
                 else "aligning_heading"
                 if turning_to_heading
-                else "root_angular_brake"
-                if camera_face_alignment_brake
                 else None
             ),
             desired_facing=desired_direction,
-            requested_locomotion_mode=user_requested_locomotion_mode,
-            requested_speed_mps=user_requested_speed,
+            # Ordinary Matrix camera-face WASD already publishes absolute
+            # world-frame movement/facing vectors.  Do not also drive SONIC's
+            # native HeadingState.delta_heading for those moving frames: that
+            # path belongs to native/Pico-style heading-control transitions and
+            # can make the deploy layer rotate the reference frame a second
+            # time, producing diagonal/over-rotated walking after camera turns.
+            delta_heading_rad=None,
         )
-        if completing_neutral_rearm:
-            self._complete_neutral_rearm_frame()
-        return command
 
 
 @dataclass(frozen=True)

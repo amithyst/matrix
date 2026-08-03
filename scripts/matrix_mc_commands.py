@@ -14,23 +14,25 @@ import math
 import re
 from typing import Any, Mapping, TypeAlias
 
+from matrix_game_control import (
+    SONIC_NATIVE_MANUAL_MODE_MAX,
+    SONIC_NATIVE_MANUAL_MODE_MIN,
+    validate_native_mode_override,
+)
+from matrix_movement_modes import validate_movement_mode
+from matrix_motion_settings import MOTION_SETTING_PATHS
 from matrix_world_state import (
     MatrixWorldState,
     TELEPORT_POINT_TYPE,
     WorldPose,
     WorldStateError,
     validate_tag,
-    validate_world_id,
 )
-from matrix_motion_settings import MAX_REVISION, MOTION_SETTING_PATHS
-from matrix_movement_modes import validate_movement_mode
 
 
 COMMAND_PROTOCOL = "matrix-game-command/v1"
 MAX_COMMAND_CHARS = 512
 MAX_COMMAND_PACKET_BYTES = 4096
-MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
-MAX_TELEPORT_QUERY_TAGS = 8
 _SESSION_RE = re.compile(r"[0-9a-f]{32}\Z")
 _REQUEST_ID_RE = re.compile(r"cmd-[0-9a-f]{32}\Z")
 _ERROR_CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{1,63}\Z")
@@ -44,68 +46,78 @@ _SUMMON_RE = re.compile(
     r"\{Tags:\[(?P<tags>.*)\]\}\s*\Z"
 )
 _TP_RE = re.compile(r"/?tp\s+@s\s+(?P<target>.+?)\s*\Z")
-_TELEPORT_LIST_RE = re.compile(
-    r"/?teleport\s+list(?P<tags>(?:\s+\S+)*)\s*\Z",
-    re.IGNORECASE,
-)
-_POLICY_RE = re.compile(
-    r"/?policy\s+(?P<slot>locomotion|recovery)\s+"
-    r"(?P<policy>[a-z0-9][a-z0-9._-]{0,63})\s*\Z",
-    re.IGNORECASE,
-)
-_POLICY_QUERY_RE = re.compile(
-    r"/?policy\s+(?:list|status)\s*\Z",
-    re.IGNORECASE,
-)
-_ITEM_RE = re.compile(
-    r"/?item\s+spawn\s+(?P<item>[a-z0-9][a-z0-9_-]{0,47})\s*\Z",
-    re.IGNORECASE,
+_POSE_YAW_RE = re.compile(r"/?(?:pose|rot)\s+@s\s+yaw\s+(?P<angle>\S+)\s*\Z")
+_RECOVER_RE = re.compile(r"/?(?:recover|tpstand)(?:\s+@s)?\s*\Z")
+_MODE_RE = re.compile(r"/?mode\s+(?P<mode>[A-Za-z0-9_+-]+)\s*\Z")
+_SONIC_MODE_RE = re.compile(
+    r"/?(?:sonic|native)\s+mode\s+(?P<mode>auto|[0-9]{1,2})\s*\Z"
 )
 _RUNTIME_PAUSE_RE = re.compile(
-    r"/?runtime\s+pause\s+(?P<target>paused|running)\s+"
-    r"(?P<epoch>0|[1-9][0-9]{0,9})\s*\Z",
-    re.IGNORECASE,
+    r"/?(?P<action>pause|resume|continue|unpause)(?:\s+runtime)?\s*\Z"
 )
-_GAME_QUIT_RE = re.compile(r"/?(?:game\s+)?quit\s*\Z", re.IGNORECASE)
+_WORLD_SCENE_RE = re.compile(
+    r"/?(?:world|scene|planet)\s+(?P<destination>[A-Za-z0-9_.:-]+)\s*\Z"
+)
 _DATA_MODIFY_RE = re.compile(
     r"/?data\s+modify\s+entity\s+@s\s+"
-    r"(?P<path>[A-Za-z0-9_.:-]+)\s+set\s+value\s+"
-    r"(?P<value>\S+)\s*\Z",
-    re.IGNORECASE,
+    r"(?P<path>[A-Za-z0-9_.]+)\s+set\s+value\s+(?P<value>\S+)\s*\Z"
+)
+_FUNCTION_RE = re.compile(r"/?function\s+(?P<body>.+?)\s*\Z")
+_FUNCTION_NAME_RE = re.compile(
+    r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z"
 )
 _SELECTOR_RE = re.compile(r"@e\[(?P<body>[^\]]+)\]\Z")
-_POLICY_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
-_KEYBOARD_INPUT_PATHS = frozenset(
-    f"control.input.keyboard.{key}"
-    for key in ("w", "a", "s", "d", "q", "e", "v", "ctrl", "alt", "shift")
-)
-_MOUSE_BUTTON_INPUT_PATHS = frozenset(
-    f"control.input.mouse.{button}" for button in ("left", "right", "middle")
-)
-_BOOLEAN_INPUT_PATHS = _KEYBOARD_INPUT_PATHS | _MOUSE_BUTTON_INPUT_PATHS
-_NUMBER_INPUT_RANGES = {
-    **{
-        f"control.input.gamepad.{axis}": (-1.0, 1.0)
-        for axis in ("forward", "right", "look_yaw", "look_pitch")
+
+WORLD_SCENE_TARGETS: Mapping[str, Mapping[str, object]] = {
+    "town10": {
+        "destination_id": "town10",
+        "scene_id": 2,
+        "scene_name": "Town10World",
+        "scene_xml": "scene_terrain_t10.xml",
+        "map_name": "/Game/Maps/Town10World",
+        "body_id": "earth",
+        "body_name": "地球",
+        "display_name": "Town10 城市",
+        "teleport_tag": "world:town10",
+        "surface_coordinates_deg_m": [31.2304, 121.4737, 4.0],
+        "surface_heading_deg": 0.0,
+        "local_position_m": [0.0, 0.0, 0.8],
+        "site_universe_position_m": [0.0, 0.0, 0.0],
+        "universe_position_m": [0.0, 0.0, 0.0],
+        "gravity_m_s2": 9.80665,
+        "atmosphere": "terrestrial",
     },
-    "control.input.mouse.dx": (-4096.0, 4096.0),
-    "control.input.mouse.dy": (-4096.0, 4096.0),
+    "moon": {
+        "destination_id": "moon",
+        "scene_id": 15,
+        "scene_name": "MoonWorld",
+        "scene_xml": "scene_terrain_moon_dynamic.xml",
+        "map_name": "/Game/Maps/MoonWorld",
+        "body_id": "moon",
+        "body_name": "月球",
+        "display_name": "MoonWorld 月面",
+        "teleport_tag": "world:moon",
+        "surface_coordinates_deg_m": [0.67408, 23.47297, 0.0],
+        "surface_heading_deg": 0.0,
+        "local_position_m": [-94.7, -65.6, 0.8],
+        "site_universe_position_m": [384_400_000.0, 0.0, 0.0],
+        "universe_position_m": [384_399_905.3, -65.6, 0.8],
+        "gravity_m_s2": 1.62,
+        "atmosphere": "vacuum",
+    },
 }
-_INPUT_PATHS = _BOOLEAN_INPUT_PATHS | frozenset(_NUMBER_INPUT_RANGES)
-_NONFINITE_NUMBER_TOKENS = frozenset(
-    {
-        "nan",
-        "+nan",
-        "-nan",
-        "inf",
-        "+inf",
-        "-inf",
-        "infinity",
-        "+infinity",
-        "-infinity",
-    }
-)
-CAMERA_DISTANCE_CM_RANGE = (80, 500)
+_WORLD_SCENE_ALIASES = {
+    "earth": "town10",
+    "terra": "town10",
+    "town10": "town10",
+    "town10world": "town10",
+    "moon": "moon",
+    "moonworld": "moon",
+    "luna": "moon",
+}
+DEFAULT_RECOVER_ROOT_Z_M = 0.793
+RECOVER_ROOT_LIFT_M = 0.50
+MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 
 
 class CommandParseError(ValueError):
@@ -164,6 +176,44 @@ class Coordinate:
 
 
 @dataclass(frozen=True)
+class Angle:
+    value_rad: float
+    relative: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.value_rad, bool) or not isinstance(
+            self.value_rad, (int, float)
+        ):
+            raise CommandParseError("E_ANGLE_INVALID", "angle must be numeric")
+        value = float(self.value_rad)
+        if not math.isfinite(value):
+            raise CommandParseError("E_ANGLE_NONFINITE", "angle must be finite")
+        if type(self.relative) is not bool:
+            raise CommandParseError("E_ANGLE_INVALID", "relative flag must be boolean")
+        object.__setattr__(self, "value_rad", value)
+
+    def resolve(self, origin_rad: float) -> float:
+        result = self.value_rad + float(origin_rad) if self.relative else self.value_rad
+        if not math.isfinite(result):
+            raise CommandExecutionError(
+                "E_ANGLE_NONFINITE", "resolved angle is not finite"
+            )
+        return math.atan2(math.sin(result), math.cos(result))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {"relative": self.relative, "value_rad": self.value_rad}
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "Angle":
+        if not isinstance(value, dict) or set(value) != {"relative", "value_rad"}:
+            raise CommandProtocolError("angle has an invalid schema")
+        try:
+            return cls(value_rad=value.get("value_rad"), relative=value.get("relative"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+
+
+@dataclass(frozen=True)
 class SummonTeleportPoint:
     coordinates: tuple[Coordinate, Coordinate, Coordinate]
     tags: tuple[str, ...]
@@ -206,34 +256,6 @@ class TeleportCoordinates:
 
 
 @dataclass(frozen=True)
-class TeleportLocalCoordinates:
-    """Minecraft-style ``^left ^up ^forward`` coordinates.
-
-    Matrix currently has an authoritative robot yaw but no command-facing
-    pitch observation.  Local coordinates therefore use the robot's yaw-only
-    horizontal frame while preserving its current yaw.
-    """
-
-    left: float
-    up: float
-    forward: float
-
-    def __post_init__(self) -> None:
-        for name in ("left", "up", "forward"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise CommandParseError(
-                    "E_LOCAL_COORD_INVALID", "local coordinate must be numeric"
-                )
-            value = float(value)
-            if not math.isfinite(value):
-                raise CommandParseError(
-                    "E_LOCAL_COORD_NONFINITE", "local coordinate must be finite"
-                )
-            object.__setattr__(self, name, value)
-
-
-@dataclass(frozen=True)
 class TeleportSelector:
     tag: str
     limit: int = 1
@@ -256,204 +278,85 @@ class TeleportSelector:
 
 
 @dataclass(frozen=True)
-class TeleportList:
-    tags: tuple[str, ...]
+class PoseYawSet:
+    angle: Angle
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.tags, tuple)
-            or not 1 <= len(self.tags) <= MAX_TELEPORT_QUERY_TAGS
-        ):
-            raise CommandParseError(
-                "E_TELEPORT_LIST_LIMIT",
-                f"teleport list requires 1-{MAX_TELEPORT_QUERY_TAGS} tags",
-            )
-        try:
-            validated = tuple(validate_tag(tag) for tag in self.tags)
-        except WorldStateError as exc:
-            raise CommandParseError("E_TAG_INVALID", str(exc)) from exc
-        if len(validated) != len(set(validated)):
-            raise CommandParseError(
-                "E_TAG_DUPLICATE", "teleport list tags must be unique"
-            )
-        object.__setattr__(self, "tags", validated)
+        if not isinstance(self.angle, Angle):
+            raise CommandParseError("E_ANGLE_INVALID", "pose yaw requires an angle")
 
 
 @dataclass(frozen=True)
-class TeleportRoute:
-    tag: str
-    target_scene_id: int
-    target_world_id: str
-    entry_pose: WorldPose
-    entity_id: str
-    destination_id: str
-
-    def __post_init__(self) -> None:
-        try:
-            tag = validate_tag(self.tag)
-            validate_world_id(self.target_world_id)
-        except WorldStateError as exc:
-            raise CommandParseError("E_ROUTE_INVALID", str(exc)) from exc
-        if (
-            isinstance(self.target_scene_id, bool)
-            or not isinstance(self.target_scene_id, int)
-            or not 0 <= self.target_scene_id <= 99
-        ):
-            raise CommandParseError(
-                "E_ROUTE_INVALID", "route target scene id is invalid"
-            )
-        if not isinstance(self.entry_pose, WorldPose):
-            raise CommandParseError("E_ROUTE_INVALID", "route entry pose is invalid")
-        if (
-            not isinstance(self.entity_id, str)
-            or re.fullmatch(r"tp-[0-9a-f]{32}", self.entity_id) is None
-        ):
-            raise CommandParseError("E_ROUTE_INVALID", "route entity id is invalid")
-        if (
-            not isinstance(self.destination_id, str)
-            or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", self.destination_id)
-            is None
-        ):
-            raise CommandParseError(
-                "E_ROUTE_INVALID", "route destination id is invalid"
-            )
-        object.__setattr__(self, "tag", tag)
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "schema": "matrix-celestial-launch-route/v1",
-            "destination_id": self.destination_id,
-            "teleport_tag": self.tag,
-            "target_scene_id": self.target_scene_id,
-            "target_world_id": self.target_world_id,
-            "entry_pose": self.entry_pose.to_mapping(),
-            "entity_id": self.entity_id,
-        }
-
-
-@dataclass(frozen=True)
-class PolicySlotAssignment:
-    """Select one already-resident policy for a gameplay strategy slot."""
-
-    slot: str
-    policy_id: str
-
-    def __post_init__(self) -> None:
-        slot = str(self.slot).strip().lower()
-        policy_id = str(self.policy_id).strip().lower()
-        if slot not in {"locomotion", "recovery"}:
-            raise CommandParseError(
-                "E_POLICY_SLOT", "policy slot must be locomotion or recovery"
-            )
-        if _POLICY_ID_RE.fullmatch(policy_id) is None:
-            raise CommandParseError("E_POLICY_ID", "policy id is invalid")
-        object.__setattr__(self, "slot", slot)
-        object.__setattr__(self, "policy_id", policy_id)
-
-
-@dataclass(frozen=True)
-class PolicySlotQuery:
-    """Read the authoritative resident-policy loadout without mutating it."""
-
-
-@dataclass(frozen=True)
-class CreativeSpawnItem:
-    """Take one standalone physical prop from the creative inventory pool."""
-
-    item_id: str
-
-    def __post_init__(self) -> None:
-        item_id = str(self.item_id).strip().lower()
-        if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", item_id) is None:
-            raise CommandParseError("E_INVENTORY_ITEM", "creative item id is invalid")
-        object.__setattr__(self, "item_id", item_id)
-
-
-@dataclass(frozen=True)
-class RuntimePause:
-    """Request a fenced physics pause transition at one known epoch."""
-
-    target: str
-    expected_epoch: int
-
-    def __post_init__(self) -> None:
-        target = str(self.target).strip().lower()
-        if target not in {"paused", "running"}:
-            raise CommandParseError(
-                "E_RUNTIME_PAUSE_TARGET",
-                "runtime pause target must be paused or running",
-            )
-        if (
-            type(self.expected_epoch) is not int
-            or not 0 <= self.expected_epoch <= MAX_RUNTIME_PAUSE_EPOCH
-        ):
-            raise CommandParseError(
-                "E_RUNTIME_PAUSE_EPOCH",
-                "runtime pause epoch must be an integer in [0, 2147483647]",
-            )
-        object.__setattr__(self, "target", target)
-
-
-@dataclass(frozen=True)
-class GameQuit:
-    """Request a normal operator-initiated Matrix runtime shutdown."""
-
-    reason: str = "operator"
-
-    def __post_init__(self) -> None:
-        reason = str(self.reason).strip().lower()
-        if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", reason) is None:
-            raise CommandParseError("E_GAME_QUIT_REASON", "game quit reason is invalid")
-        object.__setattr__(self, "reason", reason)
+class RecoverHere:
+    """Reload at the current XY using the last known safe upright pose."""
 
 
 @dataclass(frozen=True)
 class MovementModeSet:
-    """Select one persisted movement mode at a known settings revision."""
-
     movement_mode: str
-    expected_revision: int
 
     def __post_init__(self) -> None:
         try:
-            movement_mode = validate_movement_mode(self.movement_mode)
+            mode = validate_movement_mode(self.movement_mode)
         except ValueError as exc:
             raise CommandParseError("E_MOVEMENT_MODE", str(exc)) from exc
-        if (
-            type(self.expected_revision) is not int
-            or not 0 <= self.expected_revision <= MAX_REVISION
-        ):
-            raise CommandParseError(
-                "E_DATA_REVISION",
-                f"movement mode revision must be an integer in [0, {MAX_REVISION}]",
-            )
-        object.__setattr__(self, "movement_mode", movement_mode)
+        object.__setattr__(self, "movement_mode", mode)
 
 
 @dataclass(frozen=True)
-class CameraDistanceSet:
-    """Set the live native UE spring-arm distance in centimetres."""
-
-    distance_cm: int
+class NativeModeSet:
+    native_mode: int | None
 
     def __post_init__(self) -> None:
-        if isinstance(self.distance_cm, bool) or not isinstance(self.distance_cm, int):
+        try:
+            mode = validate_native_mode_override(self.native_mode)
+        except ValueError as exc:
             raise CommandParseError(
-                "E_CAMERA_DISTANCE",
-                "camera distance must be an integer centimetre value",
+                "E_NATIVE_MODE",
+                "native SONIC mode must be auto or an integer in "
+                f"[{SONIC_NATIVE_MANUAL_MODE_MIN}, {SONIC_NATIVE_MANUAL_MODE_MAX}]; "
+                "use auto for modes 0-3",
+            ) from exc
+        object.__setattr__(self, "native_mode", mode)
+
+
+@dataclass(frozen=True)
+class RuntimePauseSet:
+    target: str
+    expected_epoch: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.target not in {"paused", "running"}:
+            raise CommandParseError(
+                "E_RUNTIME_PAUSE_TARGET",
+                "runtime pause target must be paused or running",
             )
-        lower, upper = CAMERA_DISTANCE_CM_RANGE
-        if not lower <= self.distance_cm <= upper:
+        epoch = self.expected_epoch
+        if epoch is not None and (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or not 0 <= epoch <= MAX_RUNTIME_PAUSE_EPOCH
+        ):
             raise CommandParseError(
-                "E_CAMERA_DISTANCE",
-                f"camera distance must be in [{lower}, {upper}] cm",
+                "E_RUNTIME_PAUSE_EPOCH",
+                "runtime pause epoch is invalid",
             )
 
 
 @dataclass(frozen=True)
-class DataModifyNumber:
-    """Set one whitelisted numeric Matrix entity-data path."""
+class WorldSceneSet:
+    destination_id: str
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "destination_id",
+            validate_world_scene_destination(self.destination_id),
+        )
+
+
+@dataclass(frozen=True)
+class MotionSettingSet:
     path: str
     value: float
 
@@ -461,7 +364,7 @@ class DataModifyNumber:
         if not isinstance(self.path, str) or self.path not in MOTION_SETTING_PATHS:
             raise CommandParseError(
                 "E_DATA_PATH_UNKNOWN",
-                f"unsupported entity data path {self.path!r}",
+                f"unsupported motion settings path: {self.path!r}",
             )
         if (
             isinstance(self.value, bool)
@@ -469,66 +372,51 @@ class DataModifyNumber:
             or not math.isfinite(float(self.value))
         ):
             raise CommandParseError(
-                "E_DATA_VALUE", "entity data value must be a finite number"
+                "E_DATA_VALUE",
+                "data modify value must be a finite JSON number",
             )
         object.__setattr__(self, "value", float(self.value))
 
 
 @dataclass(frozen=True)
-class DataModifyInput:
-    """Set one whitelisted external keyboard, gamepad, or mouse input."""
-
-    path: str
-    value: bool | float
+class CommandFunctionRun:
+    commands: tuple["AtomicMcCommand", ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.path, str) or self.path not in _INPUT_PATHS:
+        if (
+            not isinstance(self.commands, tuple)
+            or not self.commands
+            or len(self.commands) > 8
+            or any(not _is_atomic_command(command) for command in self.commands)
+        ):
             raise CommandParseError(
-                "E_DATA_PATH_UNKNOWN",
-                f"unsupported entity data path {self.path!r}",
+                "E_FUNCTION_INVALID",
+                "function requires 1-8 non-nested Matrix commands",
             )
-        if self.path in _BOOLEAN_INPUT_PATHS:
-            if type(self.value) is not bool:
-                raise CommandParseError(
-                    "E_DATA_INPUT_TYPE",
-                    f"entity data path {self.path!r} requires true or false",
-                )
-            return
-        if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
-            raise CommandParseError(
-                "E_DATA_INPUT_TYPE",
-                f"entity data path {self.path!r} requires a number",
-            )
-        value = float(self.value)
-        if not math.isfinite(value):
-            raise CommandParseError(
-                "E_DATA_INPUT_NONFINITE", "input value must be finite"
-            )
-        minimum, maximum = _NUMBER_INPUT_RANGES[self.path]
-        if not minimum <= value <= maximum:
-            raise CommandParseError(
-                "E_DATA_INPUT_RANGE",
-                f"entity data path {self.path!r} requires a value in "
-                f"[{minimum:g}, {maximum:g}]",
-            )
-        object.__setattr__(self, "value", value)
 
 
-McCommand: TypeAlias = (
+@dataclass(frozen=True)
+class CommandFunctionCall:
+    name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", validate_function_name(self.name))
+
+
+AtomicMcCommand: TypeAlias = (
     SummonTeleportPoint
     | TeleportCoordinates
-    | TeleportLocalCoordinates
     | TeleportSelector
-    | TeleportList
-    | PolicySlotQuery
-    | PolicySlotAssignment
-    | CreativeSpawnItem
-    | RuntimePause
-    | GameQuit
+    | PoseYawSet
+    | RecoverHere
     | MovementModeSet
-    | CameraDistanceSet
-    | DataModifyNumber
-    | DataModifyInput
+    | NativeModeSet
+    | RuntimePauseSet
+    | WorldSceneSet
+    | MotionSettingSet
+)
+McCommand: TypeAlias = (
+    AtomicMcCommand | CommandFunctionRun | CommandFunctionCall
 )
 
 
@@ -555,6 +443,67 @@ def _validate_text(text: object) -> str:
     return text.strip()
 
 
+def validate_function_name(value: object) -> str:
+    """Validate a Minecraft-like function resource id under one root directory."""
+
+    if not isinstance(value, str):
+        raise CommandParseError("E_FUNCTION_NAME", "function name must be text")
+    name = value.strip().removeprefix("/")
+    if not name or len(name) > 160:
+        raise CommandParseError(
+            "E_FUNCTION_NAME",
+            "function name must be 1-160 characters",
+        )
+    if (
+        _FUNCTION_NAME_RE.fullmatch(name) is None
+        or name.startswith(".")
+        or name.endswith(".")
+        or "/." in name
+        or "./" in name
+        or ".." in name.split("/")
+    ):
+        raise CommandParseError(
+            "E_FUNCTION_NAME",
+            "function name must use safe segments like recover_here or sonic/mode_07",
+        )
+    return name
+
+
+def validate_world_scene_destination(value: object) -> str:
+    if not isinstance(value, str):
+        raise CommandParseError("E_WORLD_DESTINATION", "world destination must be text")
+    key = value.strip().lower()
+    canonical = _WORLD_SCENE_ALIASES.get(key)
+    if canonical is None:
+        supported = ", ".join(sorted(WORLD_SCENE_TARGETS))
+        raise CommandParseError(
+            "E_WORLD_DESTINATION",
+            f"world destination must be one of: {supported}",
+        )
+    return canonical
+
+
+def world_scene_target(destination_id: object) -> Mapping[str, object]:
+    canonical = validate_world_scene_destination(destination_id)
+    return WORLD_SCENE_TARGETS[canonical]
+
+
+def _recover_root_z(state: MatrixWorldState, current_pose: WorldPose) -> float:
+    if state.last_safe is None:
+        raise CommandExecutionError(
+            "E_RECOVER_NO_SAFE_POSE",
+            "No upright checkpoint is available for recover-here",
+        )
+    candidates = [
+        state.last_safe.z,
+        current_pose.z + RECOVER_ROOT_LIFT_M,
+    ]
+    world_id = state.world_id.lower()
+    if "moon" not in world_id and "luna" not in world_id:
+        candidates.append(DEFAULT_RECOVER_ROOT_Z_M)
+    return max(candidates)
+
+
 def parse_coordinate(token: str) -> Coordinate:
     if token.startswith("^"):
         raise CommandParseError(
@@ -577,30 +526,48 @@ def parse_coordinate(token: str) -> Coordinate:
     return Coordinate(value, relative=relative)
 
 
-def parse_local_coordinate(token: str) -> float:
-    if not token.startswith("^"):
+def parse_angle(token: str) -> Angle:
+    relative = token.startswith("~")
+    body = token[1:] if relative else token
+    if not body:
         raise CommandParseError(
-            "E_COORD_MIXED",
-            "local ^ coordinates cannot mix with absolute or ~ coordinates",
+            "E_ANGLE_INVALID", "yaw angle requires a value and unit, e.g. 90deg"
         )
-    number = token[1:]
-    if number == "":
-        return 0.0
-    if _NUMBER_RE.fullmatch(number) is None:
-        raise CommandParseError(
-            "E_LOCAL_COORD_INVALID", f"invalid local coordinate {token!r}"
-        )
+    unit = None
+    for suffix in ("deg", "rad"):
+        if body.endswith(suffix):
+            unit = suffix
+            body = body[: -len(suffix)]
+            break
+    if unit is None:
+        raise CommandParseError("E_ANGLE_UNIT", "yaw angle must end in deg or rad")
+    if _NUMBER_RE.fullmatch(body) is None:
+        raise CommandParseError("E_ANGLE_INVALID", f"invalid angle {token!r}")
     try:
-        value = float(number)
+        value = float(body)
     except ValueError as exc:  # pragma: no cover - guarded by the regex.
-        raise CommandParseError(
-            "E_LOCAL_COORD_INVALID", f"invalid local coordinate {token!r}"
-        ) from exc
-    if not math.isfinite(value):
-        raise CommandParseError(
-            "E_LOCAL_COORD_NONFINITE", "local coordinate must be finite"
-        )
-    return value
+        raise CommandParseError("E_ANGLE_INVALID", f"invalid angle {token!r}") from exc
+    if unit == "deg":
+        value = math.radians(value)
+    return Angle(value, relative=relative)
+
+
+def _is_atomic_command(command: object) -> bool:
+    return isinstance(
+        command,
+        (
+            SummonTeleportPoint,
+            TeleportCoordinates,
+            TeleportSelector,
+            PoseYawSet,
+            RecoverHere,
+            MovementModeSet,
+            NativeModeSet,
+            RuntimePauseSet,
+            WorldSceneSet,
+            MotionSettingSet,
+        ),
+    )
 
 
 def _parse_tags(body: str) -> tuple[str, ...]:
@@ -663,89 +630,39 @@ def _parse_selector(text: str) -> TeleportSelector:
     return TeleportSelector(tag=entries["tag"], limit=1, sort=sort)
 
 
-def _parse_data_modify(path: str, raw_value: str) -> DataModifyNumber | DataModifyInput:
-    if path in MOTION_SETTING_PATHS:
-        if _NUMBER_RE.fullmatch(raw_value) is None:
-            raise CommandParseError(
-                "E_DATA_VALUE", "entity data value must be a finite number"
-            )
-        try:
-            value = float(raw_value)
-        except ValueError as exc:  # pragma: no cover - guarded by the regex.
-            raise CommandParseError(
-                "E_DATA_VALUE", "entity data value must be a finite number"
-            ) from exc
-        return DataModifyNumber(path=path, value=value)
-
-    if path not in _INPUT_PATHS:
-        raise CommandParseError(
-            "E_DATA_PATH_UNKNOWN", f"unsupported entity data path {path!r}"
-        )
-    if path in _BOOLEAN_INPUT_PATHS:
-        if raw_value not in {"true", "false"}:
-            raise CommandParseError(
-                "E_DATA_INPUT_TYPE",
-                f"entity data path {path!r} requires true or false",
-            )
-        return DataModifyInput(path=path, value=raw_value == "true")
-
-    if raw_value.lower() in _NONFINITE_NUMBER_TOKENS:
-        raise CommandParseError(
-            "E_DATA_INPUT_NONFINITE", "input value must be finite"
-        )
-    if _NUMBER_RE.fullmatch(raw_value) is None:
-        raise CommandParseError(
-            "E_DATA_INPUT_TYPE", f"entity data path {path!r} requires a number"
-        )
-    try:
-        value = float(raw_value)
-    except ValueError as exc:  # pragma: no cover - guarded by the regex.
-        raise CommandParseError(
-            "E_DATA_INPUT_TYPE", f"entity data path {path!r} requires a number"
-        ) from exc
-    return DataModifyInput(path=path, value=value)
+def _parse_function_body(body: str) -> CommandFunctionRun:
+    named = body.strip()
+    presets = {
+        "recover_here": (RecoverHere(),),
+        "tpstand": (RecoverHere(),),
+        "sonic_auto": (NativeModeSet(None),),
+    }
+    if named in presets:
+        return CommandFunctionRun(presets[named])
+    parts = tuple(part.strip() for part in body.split(";") if part.strip())
+    if not parts:
+        raise CommandParseError("E_FUNCTION_EMPTY", "function command is empty")
+    if len(parts) > 8:
+        raise CommandParseError("E_FUNCTION_TOO_LONG", "function supports at most 8 steps")
+    commands: list[AtomicMcCommand] = []
+    for part in parts:
+        parsed = _parse_mc_command(part, allow_function=False).command
+        if not _is_atomic_command(parsed):
+            raise CommandParseError("E_FUNCTION_NESTED", "nested functions are not supported")
+        commands.append(parsed)
+    return CommandFunctionRun(tuple(commands))
 
 
-def parse_mc_command(text: object) -> ParsedCommand:
+def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
     command_text = _validate_text(text)
-    game_quit = _GAME_QUIT_RE.fullmatch(command_text)
-    if game_quit is not None:
-        return ParsedCommand(GameQuit())
-    runtime_pause = _RUNTIME_PAUSE_RE.fullmatch(command_text)
-    if runtime_pause is not None:
-        return ParsedCommand(
-            RuntimePause(
-                target=runtime_pause.group("target"),
-                expected_epoch=int(runtime_pause.group("epoch")),
-            )
-        )
-    item = _ITEM_RE.fullmatch(command_text)
-    if item is not None:
-        return ParsedCommand(CreativeSpawnItem(item.group("item")))
-    data_modify = _DATA_MODIFY_RE.fullmatch(command_text)
-    if data_modify is not None:
-        return ParsedCommand(
-            _parse_data_modify(
-                path=data_modify.group("path"),
-                raw_value=data_modify.group("value"),
-            )
-        )
-    policy_query = _POLICY_QUERY_RE.fullmatch(command_text)
-    if policy_query is not None:
-        return ParsedCommand(PolicySlotQuery())
-    policy = _POLICY_RE.fullmatch(command_text)
-    if policy is not None:
-        return ParsedCommand(
-            PolicySlotAssignment(
-                slot=policy.group("slot"),
-                policy_id=policy.group("policy"),
-            )
-        )
-    teleport_list = _TELEPORT_LIST_RE.fullmatch(command_text)
-    if teleport_list is not None:
-        return ParsedCommand(
-            TeleportList(tuple(teleport_list.group("tags").split()))
-        )
+    function = _FUNCTION_RE.fullmatch(command_text)
+    if function is not None:
+        if not allow_function:
+            raise CommandParseError("E_FUNCTION_NESTED", "nested functions are not supported")
+        body = function.group("body").strip()
+        if ";" not in body and not body.lstrip().startswith("/"):
+            return ParsedCommand(CommandFunctionCall(validate_function_name(body)))
+        return ParsedCommand(_parse_function_body(body))
     summon = _SUMMON_RE.fullmatch(command_text)
     if summon is not None:
         if summon.group("entity") != TELEPORT_POINT_TYPE:
@@ -777,80 +694,73 @@ def parse_mc_command(text: object) -> ParsedCommand:
             raise CommandParseError(
                 "E_COORD_ARITY", "tp @s requires three coordinates or one selector"
             )
-        if any(token.startswith("^") for token in tokens):
-            if not all(token.startswith("^") for token in tokens):
-                raise CommandParseError(
-                    "E_COORD_MIXED",
-                    "local ^ coordinates cannot mix with absolute or ~ coordinates",
-                )
-            left, up, forward = (
-                parse_local_coordinate(token) for token in tokens
-            )
-            return ParsedCommand(TeleportLocalCoordinates(left, up, forward))
         return ParsedCommand(
             TeleportCoordinates(tuple(parse_coordinate(token) for token in tokens))
         )
 
-    command_without_slash = command_text.lstrip("/")
-    first = command_without_slash.split(maxsplit=1)[0]
-    if re.match(r"data(?:\s|\Z)", command_without_slash, re.IGNORECASE):
-        raise CommandParseError(
-            "E_DATA_SYNTAX",
-            "data modify must use: /data modify entity @s <path> set value <value>",
+    pose_yaw = _POSE_YAW_RE.fullmatch(command_text)
+    if pose_yaw is not None:
+        return ParsedCommand(PoseYawSet(parse_angle(pose_yaw.group("angle"))))
+
+    if _RECOVER_RE.fullmatch(command_text) is not None:
+        return ParsedCommand(RecoverHere())
+
+    runtime_pause = _RUNTIME_PAUSE_RE.fullmatch(command_text)
+    if runtime_pause is not None:
+        action = runtime_pause.group("action")
+        return ParsedCommand(
+            RuntimePauseSet(
+                "paused" if action == "pause" else "running",
+                expected_epoch=None,
+            )
         )
+
+    mode = _MODE_RE.fullmatch(command_text)
+    if mode is not None:
+        return ParsedCommand(MovementModeSet(mode.group("mode")))
+
+    sonic_mode = _SONIC_MODE_RE.fullmatch(command_text)
+    if sonic_mode is not None:
+        value = sonic_mode.group("mode")
+        return ParsedCommand(
+            NativeModeSet(None if value == "auto" else int(value, 10))
+        )
+
+    world_scene = _WORLD_SCENE_RE.fullmatch(command_text)
+    if world_scene is not None:
+        return ParsedCommand(WorldSceneSet(world_scene.group("destination")))
+
+    data_modify = _DATA_MODIFY_RE.fullmatch(command_text)
+    if data_modify is not None:
+        raw_value = data_modify.group("value")
+        if _NUMBER_RE.fullmatch(raw_value) is None:
+            raise CommandParseError(
+                "E_DATA_VALUE",
+                f"invalid data modify value {raw_value!r}",
+            )
+        return ParsedCommand(
+            MotionSettingSet(
+                data_modify.group("path"),
+                float(raw_value),
+            )
+        )
+
+    first = command_text.lstrip("/").split(maxsplit=1)[0]
     if first in {"sumon", "summonn", "summom"}:
         raise CommandParseError(
             "E_COMMAND_UNKNOWN", f"unknown command {first!r}; did you mean /summon?"
         )
     raise CommandParseError(
         "E_COMMAND_UNKNOWN",
-        "supported commands are /summon, /tp, /teleport list, /policy, "
-        "/item spawn, /runtime pause, /game quit, and /data modify",
+        "supported commands are /summon, /tp, /pose, /recover, /mode, /sonic mode, /world, /data modify, and /function",
     )
 
 
+def parse_mc_command(text: object) -> ParsedCommand:
+    return _parse_mc_command(text, allow_function=True)
+
+
 def command_to_mapping(command: McCommand) -> dict[str, object]:
-    if isinstance(command, CameraDistanceSet):
-        return {
-            "name": "camera_distance_set",
-            "distance_cm": command.distance_cm,
-        }
-    if isinstance(command, MovementModeSet):
-        return {
-            "name": "movement_mode_set",
-            "movement_mode": command.movement_mode,
-            "expected_revision": command.expected_revision,
-        }
-    if isinstance(command, RuntimePause):
-        return {
-            "name": "runtime_pause",
-            "target": command.target,
-            "expected_epoch": command.expected_epoch,
-        }
-    if isinstance(command, GameQuit):
-        return {"name": "game_quit", "reason": command.reason}
-    if isinstance(command, CreativeSpawnItem):
-        return {"name": "creative_spawn_item", "item_id": command.item_id}
-    if isinstance(command, DataModifyInput):
-        return {
-            "name": "data_modify_input",
-            "path": command.path,
-            "value": command.value,
-        }
-    if isinstance(command, DataModifyNumber):
-        return {
-            "name": "data_modify_number",
-            "path": command.path,
-            "value": command.value,
-        }
-    if isinstance(command, PolicySlotAssignment):
-        return {
-            "name": "policy_slot_assignment",
-            "slot": command.slot,
-            "policy_id": command.policy_id,
-        }
-    if isinstance(command, PolicySlotQuery):
-        return {"name": "policy_slot_query"}
     if isinstance(command, SummonTeleportPoint):
         return {
             "name": "summon_teleport_point",
@@ -862,13 +772,6 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "name": "teleport_coordinates",
             "coordinates": [coordinate.to_mapping() for coordinate in command.coordinates],
         }
-    if isinstance(command, TeleportLocalCoordinates):
-        return {
-            "name": "teleport_local_coordinates",
-            "left": command.left,
-            "up": command.up,
-            "forward": command.forward,
-        }
     if isinstance(command, TeleportSelector):
         return {
             "name": "teleport_selector",
@@ -877,10 +780,46 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "sort": command.sort,
             "type": TELEPORT_POINT_TYPE,
         }
-    if isinstance(command, TeleportList):
+    if isinstance(command, PoseYawSet):
+        return {"name": "pose_yaw_set", "angle": command.angle.to_mapping()}
+    if isinstance(command, RecoverHere):
+        return {"name": "recover_here"}
+    if isinstance(command, MovementModeSet):
         return {
-            "name": "teleport_list",
-            "tags": list(command.tags),
+            "name": "movement_mode_set",
+            "movement_mode": command.movement_mode,
+        }
+    if isinstance(command, NativeModeSet):
+        return {
+            "name": "native_mode_set",
+            "native_mode": command.native_mode,
+        }
+    if isinstance(command, RuntimePauseSet):
+        return {
+            "name": "runtime_pause_set",
+            "target": command.target,
+            "expected_epoch": command.expected_epoch,
+        }
+    if isinstance(command, WorldSceneSet):
+        return {
+            "name": "world_scene_set",
+            "destination_id": command.destination_id,
+        }
+    if isinstance(command, MotionSettingSet):
+        return {
+            "name": "motion_setting_set",
+            "path": command.path,
+            "value": command.value,
+        }
+    if isinstance(command, CommandFunctionRun):
+        return {
+            "name": "function_run",
+            "commands": [command_to_mapping(item) for item in command.commands],
+        }
+    if isinstance(command, CommandFunctionCall):
+        return {
+            "name": "function_call",
+            "function": command.name,
         }
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
@@ -889,83 +828,6 @@ def command_from_mapping(value: object) -> McCommand:
     if not isinstance(value, dict) or not isinstance(value.get("name"), str):
         raise CommandProtocolError("command AST has an invalid schema")
     name = value["name"]
-    if name == "camera_distance_set":
-        if set(value) != {"name", "distance_cm"}:
-            raise CommandProtocolError("camera distance set has an invalid schema")
-        try:
-            return CameraDistanceSet(distance_cm=value.get("distance_cm"))
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "movement_mode_set":
-        if set(value) != {"name", "movement_mode", "expected_revision"}:
-            raise CommandProtocolError("movement mode set has an invalid schema")
-        try:
-            return MovementModeSet(
-                movement_mode=value.get("movement_mode"),
-                expected_revision=value.get("expected_revision"),
-            )
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "runtime_pause":
-        if set(value) != {"name", "target", "expected_epoch"}:
-            raise CommandProtocolError("runtime pause has an invalid schema")
-        try:
-            return RuntimePause(
-                target=value.get("target"),
-                expected_epoch=value.get("expected_epoch"),
-            )
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "game_quit":
-        if set(value) != {"name", "reason"}:
-            raise CommandProtocolError("game quit has an invalid schema")
-        try:
-            return GameQuit(reason=value.get("reason"))
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "creative_spawn_item":
-        if set(value) != {"name", "item_id"}:
-            raise CommandProtocolError("creative spawn item has an invalid schema")
-        try:
-            return CreativeSpawnItem(item_id=value.get("item_id"))
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "data_modify_input":
-        if set(value) != {"name", "path", "value"}:
-            raise CommandProtocolError("data modify input has an invalid schema")
-        try:
-            return DataModifyInput(
-                path=value.get("path"),
-                value=value.get("value"),
-            )
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "data_modify_number":
-        if set(value) != {"name", "path", "value"}:
-            raise CommandProtocolError("data modify number has an invalid schema")
-        try:
-            return DataModifyNumber(
-                path=value.get("path"),
-                value=value.get("value"),
-            )
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "policy_slot_assignment":
-        if set(value) != {"name", "slot", "policy_id"}:
-            raise CommandProtocolError(
-                "policy slot assignment has an invalid schema"
-            )
-        try:
-            return PolicySlotAssignment(
-                slot=value.get("slot"),
-                policy_id=value.get("policy_id"),
-            )
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
-    if name == "policy_slot_query":
-        if set(value) != {"name"}:
-            raise CommandProtocolError("policy slot query has an invalid schema")
-        return PolicySlotQuery()
     if name in {"summon_teleport_point", "teleport_coordinates"}:
         required = {"name", "coordinates"}
         if name == "summon_teleport_point":
@@ -988,19 +850,6 @@ def command_from_mapping(value: object) -> McCommand:
             return TeleportCoordinates(parsed_coordinates)
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
-    if name == "teleport_local_coordinates":
-        if set(value) != {"name", "left", "up", "forward"}:
-            raise CommandProtocolError(
-                "teleport local coordinates have an invalid schema"
-            )
-        try:
-            return TeleportLocalCoordinates(
-                left=value.get("left"),
-                up=value.get("up"),
-                forward=value.get("forward"),
-            )
-        except CommandParseError as exc:
-            raise CommandProtocolError(str(exc)) from exc
     if name == "teleport_selector":
         if set(value) != {"name", "type", "tag", "limit", "sort"}:
             raise CommandProtocolError("teleport selector has an invalid schema")
@@ -1014,11 +863,73 @@ def command_from_mapping(value: object) -> McCommand:
             )
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
-    if name == "teleport_list":
-        if set(value) != {"name", "tags"} or not isinstance(value.get("tags"), list):
-            raise CommandProtocolError("teleport list has an invalid schema")
+    if name == "movement_mode_set":
+        if set(value) != {"name", "movement_mode"}:
+            raise CommandProtocolError("movement mode command has an invalid schema")
         try:
-            return TeleportList(tuple(value["tags"]))
+            return MovementModeSet(value.get("movement_mode"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "native_mode_set":
+        if set(value) != {"name", "native_mode"}:
+            raise CommandProtocolError("native mode command has an invalid schema")
+        try:
+            return NativeModeSet(value.get("native_mode"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "runtime_pause_set":
+        if set(value) != {"name", "target", "expected_epoch"}:
+            raise CommandProtocolError("runtime pause command has an invalid schema")
+        try:
+            return RuntimePauseSet(
+                value.get("target"),
+                value.get("expected_epoch"),
+            )
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "world_scene_set":
+        if set(value) != {"name", "destination_id"}:
+            raise CommandProtocolError("world scene command has an invalid schema")
+        try:
+            return WorldSceneSet(value.get("destination_id"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "motion_setting_set":
+        if set(value) != {"name", "path", "value"}:
+            raise CommandProtocolError("motion setting command has an invalid schema")
+        try:
+            return MotionSettingSet(value.get("path"), value.get("value"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "pose_yaw_set":
+        if set(value) != {"name", "angle"}:
+            raise CommandProtocolError("pose yaw command has an invalid schema")
+        try:
+            return PoseYawSet(Angle.from_mapping(value.get("angle")))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "recover_here":
+        if set(value) != {"name"}:
+            raise CommandProtocolError("recover command has an invalid schema")
+        return RecoverHere()
+    if name == "function_run":
+        if set(value) != {"name", "commands"}:
+            raise CommandProtocolError("function command has an invalid schema")
+        commands = value.get("commands")
+        if not isinstance(commands, list) or not 1 <= len(commands) <= 8:
+            raise CommandProtocolError("function command requires 1-8 steps")
+        parsed_commands = tuple(command_from_mapping(item) for item in commands)
+        if any(not _is_atomic_command(item) for item in parsed_commands):
+            raise CommandProtocolError("function command cannot contain nested functions")
+        try:
+            return CommandFunctionRun(parsed_commands)
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "function_call":
+        if set(value) != {"name", "function"}:
+            raise CommandProtocolError("function call command has an invalid schema")
+        try:
+            return CommandFunctionCall(value.get("function"))
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     raise CommandProtocolError(f"unsupported typed command {name!r}")
@@ -1240,35 +1151,13 @@ def _resolve_pose(
         raise CommandExecutionError("E_OUT_OF_WORLD", str(exc)) from exc
 
 
-def _resolve_local_pose(
-    coordinates: TeleportLocalCoordinates, origin: WorldPose
-) -> WorldPose:
-    cosine = math.cos(origin.yaw_rad)
-    sine = math.sin(origin.yaw_rad)
-    try:
-        return WorldPose(
-            origin.x
-            + coordinates.forward * cosine
-            - coordinates.left * sine,
-            origin.y
-            + coordinates.forward * sine
-            + coordinates.left * cosine,
-            origin.z + coordinates.up,
-            origin.yaw_rad,
-        )
-    except WorldStateError as exc:
-        raise CommandExecutionError("E_OUT_OF_WORLD", str(exc)) from exc
-
-
 def execute_command(
     command: McCommand,
     *,
     state: MatrixWorldState,
     current_pose: WorldPose,
     now_unix_ns: int | None = None,
-    teleport_routes: Mapping[str, TeleportRoute] | None = None,
 ) -> CommandEffect:
-    routes = teleport_routes or {}
     if isinstance(command, SummonTeleportPoint):
         pose = _resolve_pose(command.coordinates, current_pose)
         try:
@@ -1295,47 +1184,56 @@ def execute_command(
         )
         return CommandEffect(
             state=next_state,
-            code="OK_TELEPORT_RESTART",
-            message="Teleport saved; reloading Matrix at the destination",
-            restart_required=True,
-            data={"position": [pose.x, pose.y, pose.z]},
+            code="OK_TELEPORT",
+            message="Teleported Matrix at the destination",
+            restart_required=False,
+            data={
+                "position": [pose.x, pose.y, pose.z],
+                "yaw_rad": pose.yaw_rad,
+                "hot_pose": True,
+            },
         )
-    if isinstance(command, TeleportLocalCoordinates):
-        pose = _resolve_local_pose(command, current_pose)
+    if isinstance(command, PoseYawSet):
+        yaw_rad = command.angle.resolve(current_pose.yaw_rad)
+        pose = WorldPose(current_pose.x, current_pose.y, current_pose.z, yaw_rad)
         next_state = state.set_resume_pose(
-            pose, source="teleport_command", now_unix_ns=now_unix_ns
+            pose, source="pose_command", now_unix_ns=now_unix_ns
         )
         return CommandEffect(
             state=next_state,
-            code="OK_TELEPORT_RESTART",
-            message="Local teleport saved; reloading Matrix at the destination",
-            restart_required=True,
-            data={"position": [pose.x, pose.y, pose.z]},
+            code="OK_POSE",
+            message="Pose applied with the requested yaw",
+            restart_required=False,
+            data={
+                "position": [pose.x, pose.y, pose.z],
+                "yaw_rad": pose.yaw_rad,
+                "hot_pose": True,
+            },
+        )
+    if isinstance(command, RecoverHere):
+        pose = WorldPose(
+            current_pose.x,
+            current_pose.y,
+            _recover_root_z(state, current_pose),
+            # ``_recover_root_z`` already proves ``last_safe`` is present.
+            state.last_safe.yaw_rad,
+        )
+        next_state = state.set_resume_pose(
+            pose, source="recover_here", now_unix_ns=now_unix_ns
+        )
+        return CommandEffect(
+            state=next_state,
+            code="OK_RECOVER",
+            message="Recovered Matrix upright at current XY",
+            restart_required=False,
+            data={
+                "position": [pose.x, pose.y, pose.z],
+                "yaw_rad": pose.yaw_rad,
+                "source": "last_safe",
+                "hot_pose": True,
+            },
         )
     if isinstance(command, TeleportSelector):
-        route = routes.get(command.tag)
-        if route is not None and route.target_world_id != state.world_id:
-            next_state = state.set_resume_pose(
-                current_pose,
-                source="teleport_command",
-                now_unix_ns=now_unix_ns,
-            )
-            return CommandEffect(
-                state=next_state,
-                code="OK_TELEPORT_ROUTE_RESTART",
-                message=f"Routing to {command.tag}; reloading Matrix",
-                restart_required=True,
-                data={
-                    "entity_id": route.entity_id,
-                    "position": [
-                        route.entry_pose.x,
-                        route.entry_pose.y,
-                        route.entry_pose.z,
-                    ],
-                    "tags": [route.tag],
-                    "launch_route": route.to_mapping(),
-                },
-            )
         try:
             matches = state.select_teleport_points(
                 tag=command.tag,
@@ -1358,102 +1256,118 @@ def execute_command(
         )
         return CommandEffect(
             state=next_state,
-            code="OK_TELEPORT_RESTART",
-            message=f"Teleporting to {command.tag}; reloading Matrix",
-            restart_required=True,
+            code="OK_TELEPORT",
+            message=f"Teleported to {command.tag}",
+            restart_required=False,
             data={
                 "entity_id": point.entity_id,
                 "position": [point.pose.x, point.pose.y, point.pose.z],
+                "yaw_rad": point.pose.yaw_rad,
                 "tags": list(point.tags),
+                "hot_pose": True,
             },
         )
-    if isinstance(command, TeleportList):
-        requested_tags = command.tags
+    if isinstance(command, WorldSceneSet):
+        target = world_scene_target(command.destination_id)
+        next_state = state.set_resume_pose(
+            current_pose,
+            source="teleport_command",
+            now_unix_ns=now_unix_ns,
+        )
+        return CommandEffect(
+            state=next_state,
+            code="OK_WORLD_RESTART",
+            message=(
+                f"World target {target['scene_name']} saved; "
+                "reloading Matrix"
+            ),
+            restart_required=True,
+            data={
+                "destination_id": command.destination_id,
+                "target_scene_id": target["scene_id"],
+                "target_scene_name": target["scene_name"],
+                "target_scene_xml": target["scene_xml"],
+                "target_map_name": target["map_name"],
+                "target_body_id": target["body_id"],
+            },
+        )
+    if isinstance(command, CommandFunctionRun):
+        next_state = state
+        working_pose = current_pose
+        restart_required = False
         results: list[dict[str, object]] = []
-        found_count = 0
-        for tag in requested_tags:
-            route = routes.get(tag)
-            if route is not None and route.target_world_id != state.world_id:
-                results.append(
-                    {
-                        "tag": tag,
-                        "found": True,
-                        "entity_id": route.entity_id,
-                        "position": [
-                            route.entry_pose.x,
-                            route.entry_pose.y,
-                            route.entry_pose.z,
-                        ],
-                        "yaw_rad": route.entry_pose.yaw_rad,
-                    }
+        for item in command.commands:
+            if isinstance(item, (MovementModeSet, NativeModeSet, MotionSettingSet)):
+                raise CommandExecutionError(
+                    "E_FUNCTION_RUNTIME_COMMAND",
+                    "movement/native/motion setting function steps require runtime support",
                 )
-                found_count += 1
-                continue
-            try:
-                matches = state.select_teleport_points(
-                    tag=tag,
-                    origin=current_pose,
-                    sort="nearest",
-                    limit=1,
-                )
-            except WorldStateError as exc:
-                raise CommandExecutionError("E_SELECTOR_INVALID", str(exc)) from exc
-            if not matches:
-                results.append({"tag": tag, "found": False})
-                continue
-            point = matches[0]
-            found_count += 1
+            effect = execute_command(
+                item,
+                state=next_state,
+                current_pose=working_pose,
+                now_unix_ns=now_unix_ns,
+            )
+            next_state = effect.state
+            if effect.state.last_exit is not None:
+                working_pose = effect.state.last_exit
+            restart_required = restart_required or effect.restart_required
             results.append(
                 {
-                    "tag": tag,
-                    "found": True,
-                    "entity_id": point.entity_id,
-                    "position": [point.pose.x, point.pose.y, point.pose.z],
-                    "yaw_rad": point.pose.yaw_rad,
+                    "code": effect.code,
+                    "message": effect.message,
+                    "restart_required": effect.restart_required,
+                    "data": dict(effect.data),
                 }
             )
         return CommandEffect(
-            state=state,
-            code="OK_TELEPORT_LIST",
-            message=(
-                f"Found {found_count}/{len(requested_tags)} requested teleport points"
-            ),
-            restart_required=False,
-            data={
-                "world_id": state.world_id,
-                "teleport_points": results,
-            },
+            state=next_state,
+            code="OK_FUNCTION_RESTART" if restart_required else "OK_FUNCTION",
+            message=f"Function executed {len(results)} step(s)",
+            restart_required=restart_required,
+            data={"steps": results},
+        )
+    if isinstance(command, CommandFunctionCall):
+        raise CommandExecutionError(
+            "E_FUNCTION_RUNTIME_ONLY",
+            "file-backed functions require runtime support",
+        )
+    if isinstance(command, MotionSettingSet):
+        raise CommandExecutionError(
+            "E_MOTION_SETTING_RUNTIME_ONLY",
+            "motion setting commands require runtime support",
+        )
+    if isinstance(command, RuntimePauseSet):
+        raise CommandExecutionError(
+            "E_RUNTIME_PAUSE_RUNTIME_ONLY",
+            "runtime pause commands require runtime support",
         )
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
 __all__ = [
-    "CAMERA_DISTANCE_CM_RANGE",
-    "CameraDistanceSet",
     "COMMAND_PROTOCOL",
+    "Angle",
     "CommandEffect",
+    "CommandFunctionCall",
     "CommandExecutionError",
     "CommandParseError",
     "CommandProtocolError",
     "Coordinate",
-    "CreativeSpawnItem",
-    "DataModifyInput",
-    "DataModifyNumber",
-    "GameQuit",
     "GameCommandRequest",
     "GameCommandResponse",
-    "MAX_TELEPORT_QUERY_TAGS",
     "MovementModeSet",
+    "MotionSettingSet",
+    "NativeModeSet",
     "ParsedCommand",
-    "PolicySlotAssignment",
-    "PolicySlotQuery",
-    "RuntimePause",
+    "PoseYawSet",
+    "RecoverHere",
+    "RuntimePauseSet",
+    "MAX_RUNTIME_PAUSE_EPOCH",
     "SummonTeleportPoint",
     "TeleportCoordinates",
-    "TeleportLocalCoordinates",
-    "TeleportList",
-    "TeleportRoute",
     "TeleportSelector",
+    "CommandFunctionRun",
     "command_from_mapping",
     "command_to_mapping",
     "decode_command_request",
@@ -1462,5 +1376,5 @@ __all__ = [
     "encode_command_response",
     "execute_command",
     "parse_mc_command",
-    "parse_local_coordinate",
+    "validate_function_name",
 ]
