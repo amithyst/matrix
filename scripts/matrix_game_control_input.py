@@ -270,6 +270,12 @@ class KeyboardMouseSample:
     q: bool = False
     e: bool = False
     v: bool = False
+    j: bool = False
+    k: bool = False
+    l: bool = False
+    u: bool = False
+    i: bool = False
+    o: bool = False
     arrow_left: bool = False
     arrow_up: bool = False
     arrow_right: bool = False
@@ -301,6 +307,12 @@ class KeyboardMouseSample:
             q=self.q,
             e=self.e,
             v=self.v,
+            j=self.j and movement_enabled,
+            k=self.k and movement_enabled,
+            l=self.l and movement_enabled,
+            u=self.u and movement_enabled,
+            i=self.i and movement_enabled,
+            o=self.o and movement_enabled,
             ctrl=self.ctrl and movement_enabled,
             alt=self.alt and movement_enabled,
             shift=self.shift and movement_enabled,
@@ -2990,6 +3002,12 @@ class X11KeyboardMouse:
         "q": 0x0071,
         "e": 0x0065,
         "v": 0x0076,
+        "j": 0x006A,
+        "k": 0x006B,
+        "l": 0x006C,
+        "u": 0x0075,
+        "i": 0x0069,
+        "o": 0x006F,
         "arrow_left": 0xFF51,
         "arrow_up": 0xFF52,
         "arrow_right": 0xFF53,
@@ -3633,6 +3651,12 @@ class X11KeyboardMouse:
                     "q",
                     "e",
                     "v",
+                    "j",
+                    "k",
+                    "l",
+                    "u",
+                    "i",
+                    "o",
                     "arrow_left",
                     "arrow_up",
                     "arrow_right",

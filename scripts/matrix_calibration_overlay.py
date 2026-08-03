@@ -7836,10 +7836,13 @@ class X11CalibrationOverlay:
             motion_model.settings.movement_mode,
         )
         lines = (
-            f"当前 WASD 坐标模式：{current_mode}",
-            "WASD 移动 | Shift/Ctrl/Alt 速度档",
-            "Q/E 左右转向 | 方向键/鼠标 调相机",
-            "V 切 WASD 模式 | ESC 面板 | F6 重启",
+            f"移动：当前 WASD 坐标模式 {current_mode}",
+            "移动：WASD 移动 | Shift 跑步 | Ctrl/Alt 精细慢走",
+            "相机：Q/E 左右转向 | 方向键/鼠标 调相机 | V 切 WASD 模式",
+            "拳击：按住 J=10 拳击态；松开回普通 AUTO",
+            "拳击：按住 K=11 左直拳 | L=12 右直拳 | U=13 随机出拳",
+            "拳击：按住 I=15 左勾拳 | O=16 右勾拳；兼容 Shift/Ctrl/Alt+WASD",
+            "系统：ESC 面板 | F6 安全重启 | 回车/按钮提交命令",
         )
         for offset, line in enumerate(lines):
             self._draw_text(

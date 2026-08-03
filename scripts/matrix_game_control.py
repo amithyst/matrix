@@ -38,7 +38,24 @@ PROTOCOL_NAME = "matrix-game-input/v2"
 MAX_PACKET_BYTES = 4096
 _UNSET_SOCKET_TIMEOUT = object()
 _KEY_NAMES = frozenset(
-    ("w", "a", "s", "d", "q", "e", "v", "ctrl", "alt", "shift")
+    (
+        "w",
+        "a",
+        "s",
+        "d",
+        "q",
+        "e",
+        "v",
+        "j",
+        "k",
+        "l",
+        "u",
+        "i",
+        "o",
+        "ctrl",
+        "alt",
+        "shift",
+    )
 )
 _STICK_NAMES = frozenset(("right", "forward"))
 _TOP_LEVEL_NAMES = frozenset(
@@ -113,6 +130,12 @@ class KeySnapshot:
     q: bool
     e: bool
     v: bool
+    j: bool = False
+    k: bool = False
+    l: bool = False
+    u: bool = False
+    i: bool = False
+    o: bool = False
     ctrl: bool = False
     alt: bool = False
     shift: bool = False
@@ -121,6 +144,26 @@ class KeySnapshot:
         for name in _KEY_NAMES:
             if type(getattr(self, name)) is not bool:
                 raise InputProtocolError(f"keys.{name} must be a boolean")
+
+    def boxing_native_mode(self) -> int | None:
+        """Return the held transient boxing/action mode, if any.
+
+        These keys are intentionally not persisted as a native-mode override:
+        they are a momentary AUTO action layer.  More specific punch keys win
+        over the broad J boxing stance while they are held.
+        """
+
+        for key_name, native_mode in (
+            ("o", 16),
+            ("i", 15),
+            ("u", 13),
+            ("l", 12),
+            ("k", 11),
+            ("j", 10),
+        ):
+            if getattr(self, key_name):
+                return native_mode
+        return None
 
     @classmethod
     def from_mapping(cls, value: Any) -> "KeySnapshot":
@@ -846,7 +889,20 @@ class GameControlCore:
             return False
         keys = snapshot.keys
         digital_neutral = not any(
-            (keys.w, keys.a, keys.s, keys.d, keys.q, keys.e)
+            (
+                keys.w,
+                keys.a,
+                keys.s,
+                keys.d,
+                keys.q,
+                keys.e,
+                keys.j,
+                keys.k,
+                keys.l,
+                keys.u,
+                keys.i,
+                keys.o,
+            )
         )
         analog_neutral = (
             math.hypot(snapshot.move_stick.right, snapshot.move_stick.forward)
@@ -1420,6 +1476,9 @@ class GameControlCore:
                 movement_direction = (0.0, 0.0, 0.0)
             elif moving or turning_to_heading:
                 locomotion_mode = native_override
+        boxing_native_mode = keys.boxing_native_mode()
+        if boxing_native_mode is not None:
+            locomotion_mode = boxing_native_mode
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=movement_direction if moving else (0.0, 0.0, 0.0),

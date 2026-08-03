@@ -34,7 +34,24 @@ def snapshot(
     stick: tuple[float, float] = (0.0, 0.0),
     speed_modifiers: tuple[str, ...] = (),
 ):
-    keys = {name: name in pressed for name in ("w", "a", "s", "d", "q", "e", "v")}
+    keys = {
+        name: name in pressed
+        for name in (
+            "w",
+            "a",
+            "s",
+            "d",
+            "q",
+            "e",
+            "v",
+            "j",
+            "k",
+            "l",
+            "u",
+            "i",
+            "o",
+        )
+    }
     keys.update(
         ctrl="ctrl" in speed_modifiers,
         alt="alt" in speed_modifiers,
@@ -102,7 +119,7 @@ class InputProtocolTest(unittest.TestCase):
         self.assertEqual(decoded, original)
         self.assertLessEqual(len(payload), MODULE.MAX_PACKET_BYTES)
 
-    def test_v2_requires_both_keyboard_speed_modifiers(self) -> None:
+    def test_v2_requires_keyboard_modifiers_and_boxing_keys(self) -> None:
         value = snapshot().to_mapping()
         self.assertEqual(value["protocol"], "matrix-game-input/v2")
         del value["keys"]["ctrl"]
@@ -112,6 +129,11 @@ class InputProtocolTest(unittest.TestCase):
         value = snapshot().to_mapping()
         del value["keys"]["alt"]
         with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: alt"):
+            MODULE.InputSnapshot.from_mapping(value)
+
+        value = snapshot().to_mapping()
+        del value["keys"]["j"]
+        with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: j"):
             MODULE.InputSnapshot.from_mapping(value)
 
         value = snapshot().to_mapping()
@@ -359,6 +381,90 @@ class GameControlCoreTest(unittest.TestCase):
         precise_boxing = core.command(now_s=10.2, dt_s=0.1)
         self.assertEqual(precise_boxing.locomotion_mode, 10)
         self.assertAlmostEqual(precise_boxing.speed_mps, 0.1)
+
+    def test_boxing_keys_are_momentary_auto_native_modes(self) -> None:
+        key_modes = {
+            "j": 10,
+            "k": 11,
+            "l": 12,
+            "u": 13,
+            "i": 15,
+            "o": 16,
+        }
+        for key, expected_mode in key_modes.items():
+            with self.subTest(key=key):
+                core = armed_core(immediate_config(max_speed_mps=0.3))
+                core.accept_snapshot(
+                    snapshot(
+                        sequence=1,
+                        timestamp=10.0,
+                        pressed=(key,),
+                    ),
+                    received_at_s=10.0,
+                )
+                held = core.command(now_s=10.0, dt_s=0.1)
+                self.assertFalse(held.safe_stop)
+                self.assertEqual(held.locomotion_mode, expected_mode)
+                self.assertEqual(held.speed_mps, 0.0)
+                self.assertEqual(held.movement, (0.0, 0.0, 0.0))
+
+                core.accept_snapshot(
+                    snapshot(sequence=2, timestamp=10.1),
+                    received_at_s=10.1,
+                )
+                released = core.command(now_s=10.1, dt_s=0.1)
+                self.assertFalse(released.safe_stop)
+                self.assertEqual(
+                    released.locomotion_mode,
+                    MODULE.SONIC_IDLE_MODE,
+                )
+
+    def test_boxing_keys_keep_shift_ctrl_alt_and_movement(self) -> None:
+        for modifiers, expected_speed in (
+            (("shift",), 2.5),
+            (("ctrl",), 0.1),
+            (("alt",), 0.1),
+            (("shift", "alt"), 0.1),
+        ):
+            with self.subTest(modifiers=modifiers):
+                core = armed_core(immediate_config(max_speed_mps=0.3))
+                core.accept_snapshot(
+                    snapshot(
+                        sequence=1,
+                        timestamp=10.0,
+                        pressed=("w", "j"),
+                        speed_modifiers=modifiers,
+                    ),
+                    received_at_s=10.0,
+                )
+                core.command(now_s=10.0, dt_s=0.1)
+                command = core.command(now_s=10.0, dt_s=0.1)
+                self.assertFalse(command.safe_stop)
+                self.assertEqual(command.locomotion_mode, 10)
+                self.assertAlmostEqual(command.speed_mps, expected_speed)
+                self.assertNotEqual(command.movement, (0.0, 0.0, 0.0))
+
+    def test_specific_boxing_punch_keys_override_j_stance(self) -> None:
+        for key, expected_mode in (
+            ("k", 11),
+            ("l", 12),
+            ("u", 13),
+            ("i", 15),
+            ("o", 16),
+        ):
+            with self.subTest(key=key):
+                core = armed_core(immediate_config(max_speed_mps=0.3))
+                core.accept_snapshot(
+                    snapshot(
+                        sequence=1,
+                        timestamp=10.0,
+                        pressed=("w", "j", key),
+                    ),
+                    received_at_s=10.0,
+                )
+                core.command(now_s=10.0, dt_s=0.1)
+                command = core.command(now_s=10.0, dt_s=0.1)
+                self.assertEqual(command.locomotion_mode, expected_mode)
 
     def test_modifiers_without_direction_are_native_idle(self) -> None:
         for modifiers in (("ctrl",), ("shift",), ("ctrl", "shift")):

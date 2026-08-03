@@ -3490,6 +3490,34 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             self.assertEqual(resumed.locomotion_mode, expected_mode)
             self.assertAlmostEqual(resumed.speed_mps, expected_speed)
 
+    def test_raw_keyboard_poll_exposes_boxing_keys_and_modifiers(self) -> None:
+        backend = self._raw_backend(
+            focus_results=iter(((True, "Matrix", frozenset({1234})),)),
+            raw_deltas=((0.0, 0.0, False),),
+            pointer_values=((10, 0),),
+            pressed_names=("w", "j", "k", "shift_left", "alt_left"),
+        )
+
+        sample = backend.poll()
+
+        self.assertTrue(sample.w)
+        self.assertTrue(sample.j)
+        self.assertTrue(sample.k)
+        self.assertTrue(sample.shift)
+        self.assertTrue(sample.alt)
+        snapshot = MODULE.build_snapshot(
+            sequence=8,
+            timestamp_monotonic_s=1.08,
+            keyboard=sample,
+            gamepad=MODULE.GamepadSample(),
+            input_source="keyboard",
+            camera_yaw_rad=0.1,
+            camera_available=True,
+        )
+        self.assertTrue(snapshot.keys.j)
+        self.assertTrue(snapshot.keys.k)
+        self.assertEqual(snapshot.keys.boxing_native_mode(), 11)
+
     def test_completed_raw_click_without_motion_still_interlocks(self) -> None:
         backend = self._raw_backend(
             focus_results=iter(((True, "Matrix", frozenset({1234})),)),
