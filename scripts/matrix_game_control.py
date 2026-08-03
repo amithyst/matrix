@@ -1404,30 +1404,18 @@ class GameControlCore:
             or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
         )
         native_override = self._native_mode_override
-        low_speed_turn_step = False
         if turning_to_heading:
-            # Pure facing changes must enter a native turn-capable motion
-            # manifold.  Updating only HeadingState.delta_heading leaves the
-            # packaged MoonWorld body nearly inert because the native planner
-            # does not see a locomotion/facing transition to execute.
-            locomotion_mode = SONIC_STATIONARY_TURN_MODE
-            if native_override is None and (
-                manual_turn or camera_auto_turn_needs_native_motion
-            ):
-                # Native SONIC's planner turns reliably when it is given a real
-                # low-speed gait target.  A zero-speed planner update changes
-                # the facing tensor but leaves the MoonWorld body nearly static.
-                # Apply the same trigger to keyboard Q/E and to camera-face
-                # auto-align turns, so pressing W after a large camera yaw does
-                # not stand frozen while waiting for an unexecuted heading.
-                output_speed = self.config.gait_start_speed_mps
-                moving = True
-                low_speed_turn_step = True
+            # Match the stable pre-Moon desktop branch and native Pico control
+            # path: pure heading changes are sent as an IDLE planner update
+            # with a new facing vector, not as a synthetic low-speed gait.
+            # Injecting a fake 0.10 m/s stationary gait made Town10 drift into
+            # a different body heading frame after camera-face W, so the robot
+            # translated one way while visually facing diagonally.
+            locomotion_mode = SONIC_IDLE_MODE
         if native_override is not None:
             if native_override == SONIC_IDLE_MODE:
                 output_speed = 0.0
                 moving = False
-                low_speed_turn_step = False
                 locomotion_mode = SONIC_IDLE_MODE
                 movement_direction = (0.0, 0.0, 0.0)
             elif moving or turning_to_heading:
