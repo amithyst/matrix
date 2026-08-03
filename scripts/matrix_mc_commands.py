@@ -112,6 +112,8 @@ _WORLD_SCENE_ALIASES = {
     "moonworld": "moon",
     "luna": "moon",
 }
+DEFAULT_RECOVER_ROOT_Z_M = 0.793
+RECOVER_ROOT_LIFT_M = 0.50
 
 
 class CommandParseError(ValueError):
@@ -456,6 +458,22 @@ def validate_world_scene_destination(value: object) -> str:
 def world_scene_target(destination_id: object) -> Mapping[str, object]:
     canonical = validate_world_scene_destination(destination_id)
     return WORLD_SCENE_TARGETS[canonical]
+
+
+def _recover_root_z(state: MatrixWorldState, current_pose: WorldPose) -> float:
+    if state.last_safe is None:
+        raise CommandExecutionError(
+            "E_RECOVER_NO_SAFE_POSE",
+            "No upright checkpoint is available for recover-here",
+        )
+    candidates = [
+        state.last_safe.z,
+        current_pose.z + RECOVER_ROOT_LIFT_M,
+    ]
+    world_id = state.world_id.lower()
+    if "moon" not in world_id and "luna" not in world_id:
+        candidates.append(DEFAULT_RECOVER_ROOT_Z_M)
+    return max(candidates)
 
 
 def parse_coordinate(token: str) -> Coordinate:
@@ -1138,15 +1156,11 @@ def execute_command(
             },
         )
     if isinstance(command, RecoverHere):
-        if state.last_safe is None:
-            raise CommandExecutionError(
-                "E_RECOVER_NO_SAFE_POSE",
-                "No upright checkpoint is available for recover-here",
-            )
         pose = WorldPose(
             current_pose.x,
             current_pose.y,
-            state.last_safe.z,
+            _recover_root_z(state, current_pose),
+            # ``_recover_root_z`` already proves ``last_safe`` is present.
             state.last_safe.yaw_rad,
         )
         next_state = state.set_resume_pose(

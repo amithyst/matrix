@@ -3031,9 +3031,11 @@ class GameCommandRuntime:
                 "This runtime cannot apply same-world pose changes without a reload",
             )
         applied = applier(pose)
+        self.core.invalidate_input("hot_pose_recover", require_neutral=True)
         data["position"] = [applied.x, applied.y, applied.z]
         data["yaw_rad"] = applied.yaw_rad
         data["hot_pose_applied"] = True
+        data["input_rearm_required"] = True
         return data, applied
 
     def _apply_hot_pose_effect(

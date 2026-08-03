@@ -1,2 +1,3 @@
-# 原地站立恢复：保留当前位置 XY，使用最近安全站立高度和 yaw 重载。
+# 原地站立恢复：先回到 SONIC AUTO 空闲链路，再保留当前位置 XY 并抬高到安全站立姿态。
+/sonic mode auto
 /recover

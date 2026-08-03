@@ -355,6 +355,29 @@ class McCommandExecutionTest(unittest.TestCase):
         self.assertEqual(recover_effect.state.last_exit, WorldPose(12.0, 24.0, 0.8, 0.5))
         self.assertEqual(recover_effect.state.resume_source, "recover_here")
 
+    def test_recover_here_lifts_contaminated_low_town10_safe_pose(self) -> None:
+        contaminated = WorldPose(3.0, 4.0, 0.30, 0.25)
+        state = MatrixWorldState.empty(
+            world_id="g1_29dof:scene_terrain_t10",
+            world_revision="revision",
+        ).checkpoint(contaminated, upright=True, now_unix_ns=1)
+        recover_command = MODULE.parse_mc_command("/recover").command
+        recover_effect = MODULE.execute_command(
+            recover_command,
+            state=state,
+            current_pose=contaminated,
+            now_unix_ns=2,
+        )
+
+        self.assertGreaterEqual(
+            recover_effect.state.last_exit.z,
+            MODULE.DEFAULT_RECOVER_ROOT_Z_M,
+        )
+        self.assertEqual(
+            recover_effect.state.last_exit,
+            WorldPose(3.0, 4.0, 0.80, 0.25),
+        )
+
     def test_function_world_commands_apply_sequential_resume_pose(self) -> None:
         command = MODULE.parse_mc_command(
             "/function /tp @s ~1 ~2 1.25; /pose @s yaw 180deg"

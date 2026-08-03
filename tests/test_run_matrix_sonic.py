@@ -2635,6 +2635,55 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             self.assertEqual(reloaded.last_exit, pose)
             self.assertEqual(reloaded.resume_source, "recover_here")
 
+    def test_hot_pose_command_requires_neutral_rearm_after_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            core = GAME_CONTROL.GameControlCore()
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                world,
+                core,
+                pose_applier=lambda pose: pose,
+            )
+            request = self.game_command_request(
+                "/tp @s ~ ~ 0.8",
+                sequence=1,
+                request_character="a",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(
+                        current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.2, 0.0),
+                        command_allowed=True,
+                    )
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_TELEPORT")
+                self.assertTrue(response.data["hot_pose_applied"])
+                self.assertTrue(response.data["input_rearm_required"])
+
+                stopped = core.command(now_s=10.0, dt_s=0.0)
+                self.assertTrue(stopped.safe_stop)
+                self.assertEqual(stopped.reason, "hot_pose_recover")
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_game_command_runtime_rejects_commands_until_panel_safe_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"
