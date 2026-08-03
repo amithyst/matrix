@@ -776,7 +776,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(held_after_recovery.mode, "move")
         self.assertGreater(held_after_recovery.speed_mps, 0.0)
 
-    def test_game_control_lowcmd_dropout_requires_neutral_after_recovery(
+    def test_game_control_lowcmd_dropout_soft_stops_and_resumes_held_w(
         self,
     ) -> None:
         core = GAME_CONTROL.GameControlCore(
@@ -825,16 +825,20 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             dropped = command_for(stale, 3, 20.02, w=True)
         self.assertEqual(
             invalidate_input.call_args_list,
-            [mock.call("low_cmd_stale"), mock.call("sonic_not_ready")],
+            [
+                mock.call("low_cmd_stale", require_neutral=False),
+                mock.call("sonic_not_ready", require_neutral=False),
+            ],
         )
         self.assertEqual(dropped.reason, "sonic_not_ready")
         self.assertEqual(dropped.speed_mps, 0.0)
 
-        # The provider keeps reporting W, but fresh LowCmd recovery alone must
-        # not restart locomotion. A neutral frame is required first.
+        # The provider keeps reporting W. After startup has succeeded once, a
+        # LowCmd freshness gap is a soft runtime pause: it should not force a
+        # visible stop-until-keyup cycle when fresh LowCmd recovers.
         held_after_recovery = command_for(ready, 4, 20.03, w=True)
-        self.assertEqual(held_after_recovery.reason, "awaiting_neutral")
-        self.assertEqual(held_after_recovery.speed_mps, 0.0)
+        self.assertEqual(held_after_recovery.mode, "move")
+        self.assertGreater(held_after_recovery.speed_mps, 0.0)
         self.assertEqual(command_for(ready, 5, 20.04, w=False).mode, "idle")
         resumed = command_for(ready, 6, 20.05, w=True)
         self.assertEqual(resumed.mode, "move")

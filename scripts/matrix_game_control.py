@@ -817,17 +817,25 @@ class GameControlCore:
         self._gait_heading_interlocked = False
         self._stopped_heading_latched = True
 
-    def invalidate_input(self, reason: str = "input_invalidated") -> None:
-        """Stop immediately and require neutral input before re-arming."""
+    def invalidate_input(
+        self,
+        reason: str = "input_invalidated",
+        *,
+        require_neutral: bool = True,
+    ) -> None:
+        """Stop immediately, optionally requiring neutral before re-arming."""
 
         if not isinstance(reason, str) or not reason:
             raise ValueError("input invalidation reason must be a non-empty string")
+        if type(require_neutral) is not bool:
+            raise TypeError("require_neutral must be a boolean")
         self._snapshot = None
         self._last_received_at_s = None
         self._speed_mps = 0.0
         self._gait_active = False
         self._gait_heading_interlocked = False
-        self._requires_neutral_rearm = True
+        if require_neutral:
+            self._requires_neutral_rearm = True
         self._invalid_reason = reason
 
     def _snapshot_is_neutral(self) -> bool:

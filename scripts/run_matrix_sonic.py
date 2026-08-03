@@ -1692,6 +1692,7 @@ class _GameSonicReadinessGate:
         self._low_cmd_stale_since_s: float | None = None
         self._low_cmd_stale_frames = 0
         self._stop_facing = (1.0, 0.0, 0.0)
+        self._blocked_requires_neutral = True
 
     @classmethod
     def snapshot_ready(
@@ -1813,19 +1814,27 @@ class _GameSonicReadinessGate:
         if not self._ready:
             reason = (
                 "low_cmd_stale"
-                if self._previous_low_cmd_fresh and not fresh
+                if self._has_been_ready and not fresh
                 else "sonic_not_ready"
+            )
+            self._blocked_requires_neutral = not (
+                self._has_been_ready and reason == "low_cmd_stale"
             )
             # Repeat invalidation while SONIC is unavailable.  This prevents a
             # neutral packet observed during startup from arming a key that is
             # pressed before the elastic band has fully released.
-            core.invalidate_input(reason)
+            core.invalidate_input(
+                reason,
+                require_neutral=self._blocked_requires_neutral,
+            )
             # Materialize the core's safety stop before a newly drained
             # neutral packet can clear the re-arm latch. Besides hard-zeroing
             # speed, this absorbs measured yaw so IDLE cannot finish an old
             # turn while LowCmd or the startup restraint is unavailable.
             stopped = core.command(now_s=0.0, dt_s=0.0)
             self._stop_facing = stopped.facing
+        else:
+            self._blocked_requires_neutral = True
         self._previous_low_cmd_fresh = fresh
         return self._ready
 
@@ -1848,7 +1857,10 @@ class _GameSonicReadinessGate:
             raise TypeError("core must be a GameControlCore")
         if self._ready:
             return command
-        core.invalidate_input("sonic_not_ready")
+        core.invalidate_input(
+            "sonic_not_ready",
+            require_neutral=self._blocked_requires_neutral,
+        )
         stopped = core.command(now_s=0.0, dt_s=0.0)
         self._stop_facing = stopped.facing
         return RobotMotionCommand(
