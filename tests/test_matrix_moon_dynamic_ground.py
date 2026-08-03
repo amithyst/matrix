@@ -174,7 +174,7 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
             ):
                 resolved = MODULE.resolve_spawn_pose_for_moon_dynamic_ground(
                     map_path=path,
-                    pose_xyz=(5.0, 4.0, 0.8),
+                    pose_xyz=(0.0, 0.0, 0.8),
                     yaw_rad=0.25,
                     source="last_exit",
                 )
@@ -185,3 +185,30 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
         self.assertAlmostEqual(resolved["z"], -1.0 + MODULE.DEFAULT_ROOT_CLEARANCE_M)
         self.assertEqual(resolved["yaw_rad"], MODULE.DEFAULT_SPAWN_YAW_RAD)
         self.assertAlmostEqual(resolved["input_clearance_m"], 1.8)
+
+    def test_moon_spawn_rejects_out_of_bounds_resume_to_safe_default(self) -> None:
+        values = np.full((4, 4), -1.0, dtype=MODULE.MAP_DTYPE)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fake_height_map(Path(temporary), values)
+            with (
+                mock.patch.object(MODULE, "MAP_SIDE_SAMPLES", 4),
+                mock.patch.object(MODULE, "MAP_SAMPLE_COUNT", 16),
+                mock.patch.object(MODULE, "MAP_SIZE_BYTES", values.nbytes),
+                mock.patch.object(MODULE, "MAP_HALF_EXTENT_M", 0.2),
+            ):
+                resolved = MODULE.resolve_spawn_pose_for_moon_dynamic_ground(
+                    map_path=path,
+                    pose_xyz=(0.0, -0.45, -0.15),
+                    yaw_rad=0.25,
+                    source="last_exit",
+                )
+
+        self.assertEqual(resolved["source"], "moon_rejected_last_exit_bounds")
+        self.assertEqual(resolved["x"], MODULE.DEFAULT_SPAWN_X_M)
+        self.assertEqual(resolved["y"], MODULE.DEFAULT_SPAWN_Y_M)
+        self.assertAlmostEqual(resolved["z"], -1.0 + MODULE.DEFAULT_ROOT_CLEARANCE_M)
+        self.assertEqual(resolved["yaw_rad"], MODULE.DEFAULT_SPAWN_YAW_RAD)
+        self.assertIsNone(resolved["raw_ground_height_m"])
+        self.assertIsNone(resolved["input_clearance_m"])
+        self.assertEqual(resolved["input_xy_m"], [0.0, -0.45])
+        self.assertAlmostEqual(resolved["map_half_extent_m"], 0.2)

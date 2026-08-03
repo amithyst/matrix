@@ -232,6 +232,15 @@ def _sample_raw_height_from_array(
     return height
 
 
+def _is_within_moon_map_bounds(x_m: object, y_m: object) -> bool:
+    x = _finite_float(x_m, label="world x")
+    y = _finite_float(y_m, label="world y")
+    return (
+        -MAP_HALF_EXTENT_M <= x <= MAP_HALF_EXTENT_M
+        and -MAP_HALF_EXTENT_M <= y <= MAP_HALF_EXTENT_M
+    )
+
+
 def sample_raw_height_from_map(
     path: str | os.PathLike[str],
     x_m: object,
@@ -365,6 +374,20 @@ def resolve_spawn_pose_for_moon_dynamic_ground(
         if yaw_rad is not None
         else fallback_yaw
     )
+    if not _is_within_moon_map_bounds(x, y):
+        return {
+            "x": fallback_x,
+            "y": fallback_y,
+            "z": fallback_z,
+            "yaw_rad": fallback_yaw,
+            "source": f"moon_rejected_{source}_bounds",
+            "input_source": source,
+            "raw_ground_height_m": None,
+            "input_clearance_m": None,
+            "fallback_ground_height_m": fallback_ground_height,
+            "input_xy_m": [x, y],
+            "map_half_extent_m": MAP_HALF_EXTENT_M,
+        }
     raw_ground_height = sample_raw_height_from_map(
         map_path,
         x,
