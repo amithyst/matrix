@@ -1519,9 +1519,10 @@ _NATIVE_MODE_BUTTON_LABELS_ZH = {
     **{index: native_mode_label_zh(index) for index in _NATIVE_MODE_BUTTON_INDICES},
 }
 _NATIVE_MODE_LEGEND_LINES_ZH = (
-    "AUTO 自动负责 0 空闲 / 1 慢走 / 2 行走 / 3 跑步。",
-    "手动单档从 4 开始：4 蹲姿；5 双膝跪；6 单膝跪；7 俯卧",
-    "8 爬行；9 拳击待机；10 拳击行走；11 左直拳；12 右直拳",
+    "AUTO 自动负责 0 空闲 / 1 慢走 / 2 行走 / 3 跑步；按住 X 进入趴下AUTO。",
+    "趴下AUTO：X 空闲=7 俯卧；X+WASD=8 爬行；松开 X 回普通 AUTO。",
+    "手动单档从 4 开始：4 蹲姿；5 双膝跪；6 单膝跪；7 俯卧；8 爬行",
+    "9 拳击待机；10 拳击行走；11 左直拳；12 右直拳",
     "13 随机出拳；14 肘部爬行；15 左勾拳；16 右勾拳；17-19 风格动作",
 )
 _OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider", "video_camera_distance_cm_slider")
@@ -1888,6 +1889,16 @@ def tooltip_lines_for_action(action: str | None) -> tuple[str, ...]:
             return ()
         if index not in _NATIVE_MODE_BUTTON_INDICES:
             return ()
+        if index == 7:
+            return (
+                "SONIC 7：静态俯卧；也可按住 X 临时进入。",
+                "趴下AUTO：X 空闲=7，X+WASD=8 爬行。",
+            )
+        if index == 8:
+            return (
+                "SONIC 8：趴下前进/爬行；也可按住 X+WASD 临时进入。",
+                "松开 X 会回到普通 AUTO。",
+            )
         return (
             f"SONIC {index}：{native_mode_description_zh(index)}",
             f"点击提交 /sonic mode {index}。",
@@ -7839,6 +7850,7 @@ class X11CalibrationOverlay:
             f"移动：当前 WASD 坐标模式 {current_mode}",
             "移动：WASD 移动 | Shift 跑步 | Ctrl/Alt 精细慢走",
             "相机：Q/E 左右转向 | 方向键/鼠标 调相机 | V 切 WASD 模式",
+            "趴下：按住 X=7 俯卧 | X+WASD=8 爬行 | 松开回普通 AUTO",
             "拳击：按住 J=10 拳击态；松开回普通 AUTO",
             "拳击：按住 K=11 左直拳 | L=12 右直拳 | U=13 随机出拳",
             "拳击：按住 I=15 左勾拳 | O=16 右勾拳；兼容 Shift/Ctrl/Alt+WASD",

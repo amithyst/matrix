@@ -46,6 +46,7 @@ _KEY_NAMES = frozenset(
         "q",
         "e",
         "v",
+        "x",
         "j",
         "k",
         "l",
@@ -130,6 +131,7 @@ class KeySnapshot:
     q: bool
     e: bool
     v: bool
+    x: bool = False
     j: bool = False
     k: bool = False
     l: bool = False
@@ -164,6 +166,19 @@ class KeySnapshot:
             if getattr(self, key_name):
                 return native_mode
         return None
+
+    def prone_native_mode(self, *, moving: bool) -> int | None:
+        """Return the held transient prone/crawl mode, if any.
+
+        X is a momentary AUTO action layer rather than a persistent native-mode
+        override.  Holding X with no movement requests the static prone pose;
+        holding X with movement requests forward/side crawling through the same
+        camera-relative movement vector.
+        """
+
+        if not self.x:
+            return None
+        return SONIC_PRONE_CRAWL_MODE if moving else SONIC_PRONE_IDLE_MODE
 
     @classmethod
     def from_mapping(cls, value: Any) -> "KeySnapshot":
@@ -383,10 +398,16 @@ SONIC_SLOW_WALK_MODE = 1
 SONIC_WALK_MODE = 2
 SONIC_RUN_MODE = 3
 SONIC_STATIONARY_TURN_MODE = SONIC_SLOW_WALK_MODE
+SONIC_PRONE_IDLE_MODE = 7
+SONIC_PRONE_CRAWL_MODE = 8
+SONIC_ELBOW_CRAWL_MODE = 14
 SONIC_NATIVE_MODE_MIN = 0
 SONIC_NATIVE_MODE_MAX = 19
 SONIC_NATIVE_MANUAL_MODE_MIN = 4
 SONIC_NATIVE_MANUAL_MODE_MAX = SONIC_NATIVE_MODE_MAX
+SONIC_PRONE_AUTO_MODES = frozenset(
+    (SONIC_PRONE_IDLE_MODE, SONIC_PRONE_CRAWL_MODE, SONIC_ELBOW_CRAWL_MODE)
+)
 SONIC_GAIT_NAMES = {
     SONIC_IDLE_MODE: "IDLE",
     SONIC_SLOW_WALK_MODE: "SLOW_WALK",
@@ -444,11 +465,11 @@ SONIC_NATIVE_MODE_DESCRIPTIONS_ZH: dict[int | None, tuple[str, str]] = {
     ),
     7: (
         "7 俯卧待机",
-        "SONIC 俯卧静态档；原生侧注释提示该动作仍需谨慎使用。",
+        "SONIC 俯卧静态档；Matrix 趴下AUTO空闲用 7，移动时切到 8 爬行。",
     ),
     8: (
         "8 爬行",
-        "SONIC 爬行动作档；用于低姿态爬行，不是站立行走。",
+        "SONIC 爬行动作档；用于低姿态爬行，无移动输入时保持 7 俯卧。",
     ),
     9: (
         "9 拳击待机",
@@ -472,7 +493,7 @@ SONIC_NATIVE_MODE_DESCRIPTIONS_ZH: dict[int | None, tuple[str, str]] = {
     ),
     14: (
         "14 肘部爬行",
-        "SONIC 肘部爬行动作档；用于更低姿态爬行。",
+        "SONIC 肘部爬行动作档；用于更低姿态爬行，无移动输入时保持 7 俯卧。",
     ),
     15: (
         "15 左勾拳",
@@ -896,6 +917,7 @@ class GameControlCore:
                 keys.d,
                 keys.q,
                 keys.e,
+                keys.x,
                 keys.j,
                 keys.k,
                 keys.l,
@@ -1474,11 +1496,26 @@ class GameControlCore:
                 moving = False
                 locomotion_mode = SONIC_IDLE_MODE
                 movement_direction = (0.0, 0.0, 0.0)
+            elif native_override in SONIC_PRONE_AUTO_MODES:
+                if moving or turning_to_heading:
+                    locomotion_mode = (
+                        SONIC_PRONE_CRAWL_MODE
+                        if native_override == SONIC_PRONE_IDLE_MODE
+                        else native_override
+                    )
+                else:
+                    output_speed = 0.0
+                    moving = False
+                    locomotion_mode = SONIC_PRONE_IDLE_MODE
+                    movement_direction = (0.0, 0.0, 0.0)
             elif moving or turning_to_heading:
                 locomotion_mode = native_override
         boxing_native_mode = keys.boxing_native_mode()
         if boxing_native_mode is not None:
             locomotion_mode = boxing_native_mode
+        prone_native_mode = keys.prone_native_mode(moving=moving)
+        if prone_native_mode is not None:
+            locomotion_mode = prone_native_mode
         return RobotMotionCommand(
             sequence=self._last_sequence,
             movement=movement_direction if moving else (0.0, 0.0, 0.0),

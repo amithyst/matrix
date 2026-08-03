@@ -44,6 +44,7 @@ def snapshot(
             "q",
             "e",
             "v",
+            "x",
             "j",
             "k",
             "l",
@@ -134,6 +135,11 @@ class InputProtocolTest(unittest.TestCase):
         value = snapshot().to_mapping()
         del value["keys"]["j"]
         with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: j"):
+            MODULE.InputSnapshot.from_mapping(value)
+
+        value = snapshot().to_mapping()
+        del value["keys"]["x"]
+        with self.assertRaisesRegex(MODULE.InputProtocolError, "missing fields: x"):
             MODULE.InputSnapshot.from_mapping(value)
 
         value = snapshot().to_mapping()
@@ -443,6 +449,55 @@ class GameControlCoreTest(unittest.TestCase):
                 self.assertEqual(command.locomotion_mode, 10)
                 self.assertAlmostEqual(command.speed_mps, expected_speed)
                 self.assertNotEqual(command.movement, (0.0, 0.0, 0.0))
+
+    def test_x_key_is_momentary_prone_auto_layer(self) -> None:
+        core = armed_core(immediate_config(max_speed_mps=0.3))
+        core.accept_snapshot(
+            snapshot(sequence=1, timestamp=10.0, pressed=("x",)),
+            received_at_s=10.0,
+        )
+        prone_idle = core.command(now_s=10.0, dt_s=0.1)
+        self.assertFalse(prone_idle.safe_stop)
+        self.assertEqual(prone_idle.locomotion_mode, MODULE.SONIC_PRONE_IDLE_MODE)
+        self.assertEqual(prone_idle.speed_mps, 0.0)
+        self.assertEqual(prone_idle.movement, (0.0, 0.0, 0.0))
+
+        core.accept_snapshot(
+            snapshot(sequence=2, timestamp=10.1, pressed=("x", "w")),
+            received_at_s=10.1,
+        )
+        core.command(now_s=10.1, dt_s=0.1)
+        prone_crawl = core.command(now_s=10.1, dt_s=0.1)
+        self.assertFalse(prone_crawl.safe_stop)
+        self.assertEqual(prone_crawl.locomotion_mode, MODULE.SONIC_PRONE_CRAWL_MODE)
+        self.assertGreater(prone_crawl.speed_mps, 0.0)
+        self.assertNotEqual(prone_crawl.movement, (0.0, 0.0, 0.0))
+
+        core.accept_snapshot(
+            snapshot(sequence=3, timestamp=10.2),
+            received_at_s=10.2,
+        )
+        released = core.command(now_s=10.2, dt_s=0.1)
+        self.assertFalse(released.safe_stop)
+        self.assertEqual(released.locomotion_mode, MODULE.SONIC_IDLE_MODE)
+
+    def test_manual_prone_override_outputs_static_pose_without_movement(self) -> None:
+        core = armed_core(immediate_config(max_speed_mps=0.3))
+        self.assertTrue(core.set_native_mode_override(MODULE.SONIC_PRONE_IDLE_MODE))
+        core.accept_snapshot(snapshot(sequence=1, timestamp=10.0), received_at_s=10.0)
+        prone_idle = core.command(now_s=10.0, dt_s=0.1)
+        self.assertFalse(prone_idle.safe_stop)
+        self.assertEqual(prone_idle.locomotion_mode, MODULE.SONIC_PRONE_IDLE_MODE)
+        self.assertEqual(prone_idle.speed_mps, 0.0)
+
+        core.accept_snapshot(
+            snapshot(sequence=2, timestamp=10.1, pressed=("w",)),
+            received_at_s=10.1,
+        )
+        core.command(now_s=10.1, dt_s=0.1)
+        prone_crawl = core.command(now_s=10.1, dt_s=0.1)
+        self.assertFalse(prone_crawl.safe_stop)
+        self.assertEqual(prone_crawl.locomotion_mode, MODULE.SONIC_PRONE_CRAWL_MODE)
 
     def test_specific_boxing_punch_keys_override_j_stance(self) -> None:
         for key, expected_mode in (

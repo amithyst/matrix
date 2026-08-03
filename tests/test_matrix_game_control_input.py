@@ -3490,17 +3490,18 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             self.assertEqual(resumed.locomotion_mode, expected_mode)
             self.assertAlmostEqual(resumed.speed_mps, expected_speed)
 
-    def test_raw_keyboard_poll_exposes_boxing_keys_and_modifiers(self) -> None:
+    def test_raw_keyboard_poll_exposes_action_keys_and_modifiers(self) -> None:
         backend = self._raw_backend(
             focus_results=iter(((True, "Matrix", frozenset({1234})),)),
             raw_deltas=((0.0, 0.0, False),),
             pointer_values=((10, 0),),
-            pressed_names=("w", "j", "k", "shift_left", "alt_left"),
+            pressed_names=("w", "x", "j", "k", "shift_left", "alt_left"),
         )
 
         sample = backend.poll()
 
         self.assertTrue(sample.w)
+        self.assertTrue(sample.x)
         self.assertTrue(sample.j)
         self.assertTrue(sample.k)
         self.assertTrue(sample.shift)
@@ -3514,9 +3515,11 @@ class X11KeyboardMouseSafetyTest(unittest.TestCase):
             camera_yaw_rad=0.1,
             camera_available=True,
         )
+        self.assertTrue(snapshot.keys.x)
         self.assertTrue(snapshot.keys.j)
         self.assertTrue(snapshot.keys.k)
         self.assertEqual(snapshot.keys.boxing_native_mode(), 11)
+        self.assertEqual(snapshot.keys.prone_native_mode(moving=True), 8)
 
     def test_completed_raw_click_without_motion_still_interlocks(self) -> None:
         backend = self._raw_backend(

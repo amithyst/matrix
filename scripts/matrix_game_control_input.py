@@ -270,6 +270,7 @@ class KeyboardMouseSample:
     q: bool = False
     e: bool = False
     v: bool = False
+    x: bool = False
     j: bool = False
     k: bool = False
     l: bool = False
@@ -307,6 +308,7 @@ class KeyboardMouseSample:
             q=self.q,
             e=self.e,
             v=self.v,
+            x=self.x and movement_enabled,
             j=self.j and movement_enabled,
             k=self.k and movement_enabled,
             l=self.l and movement_enabled,
@@ -3002,6 +3004,7 @@ class X11KeyboardMouse:
         "q": 0x0071,
         "e": 0x0065,
         "v": 0x0076,
+        "x": 0x0078,
         "j": 0x006A,
         "k": 0x006B,
         "l": 0x006C,
@@ -3651,6 +3654,7 @@ class X11KeyboardMouse:
                     "q",
                     "e",
                     "v",
+                    "x",
                     "j",
                     "k",
                     "l",
@@ -6365,6 +6369,7 @@ def main() -> int:
                     q=False,
                     e=False,
                     v=False,
+                    x=False,
                     ctrl=False,
                     alt=False,
                     shift=False,
