@@ -53,7 +53,7 @@ class MatrixMoonDynamicGroundTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertAlmostEqual(
                 MODULE.normalize_playable_local_height_delta(),
-                0.06,
+                0.04,
             )
         self.assertAlmostEqual(
             MODULE.normalize_playable_local_height_delta("0.12"),

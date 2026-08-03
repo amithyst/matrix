@@ -2557,6 +2557,42 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(pose.z, -8.2 + 0.85)
         self.assertAlmostEqual(pose.yaw_rad, yaw_rad)
 
+    def test_moon_recoverable_pose_error_detects_airborne_root(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.qpos[0] = -37.69
+        snapshot.qpos[1] = -104.73
+        snapshot.qpos[2] = 426.60
+        snapshot.qpos[3] = 1.0
+
+        class Ground:
+            @staticmethod
+            def sample_height(x: float, y: float) -> float:
+                self.assertAlmostEqual(x, -37.69)
+                self.assertAlmostEqual(y, -104.73)
+                return -9.99
+
+        error = MODULE._moon_recoverable_pose_error(snapshot, Ground())
+        self.assertIsNotNone(error)
+        reason, diagnostics = error
+        self.assertEqual(reason, "moon_airborne_clearance")
+        self.assertGreater(diagnostics["root_clearance_m"], 400.0)
+
+    def test_moon_recoverable_pose_error_allows_normal_clearance(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.qpos[0] = -94.7
+        snapshot.qpos[1] = -65.6
+        snapshot.qpos[2] = -5.25
+        snapshot.qpos[3] = 1.0
+
+        class Ground:
+            @staticmethod
+            def sample_height(x: float, y: float) -> float:
+                self.assertAlmostEqual(x, -94.7)
+                self.assertAlmostEqual(y, -65.6)
+                return -6.10
+
+        self.assertIsNone(MODULE._moon_recoverable_pose_error(snapshot, Ground()))
+
     def test_world_runtime_set_resume_pose_publishes_last_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"

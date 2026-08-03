@@ -92,6 +92,8 @@ _WORLD_SAFE_MIN_ROOT_Z = 0.55
 _WORLD_SAFE_MIN_ROOT_UP_Z = 0.85
 _MOON_RELATIVE_FALL_ROOT_UP_Z = 0.5
 _MOON_FALL_RESPAWN_ROOT_CLEARANCE_M = 0.85
+_MOON_FALL_RESPAWN_MIN_ROOT_CLEARANCE_M = 0.15
+_MOON_FALL_RESPAWN_MAX_ROOT_CLEARANCE_M = 2.0
 _MOON_COLLISION_HANDOFF_ELASTIC_BAND_SCALE_EPS = 1.0e-6
 _WORLD_SAFE_MAX_VERTICAL_SPEED_M_S = 0.35
 _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
@@ -1407,6 +1409,38 @@ def _moon_fall_respawn_pose(snapshot: Any, dynamic_ground: Any) -> WorldPose:
         ground_z + _MOON_FALL_RESPAWN_ROOT_CLEARANCE_M,
         pose.yaw_rad,
     )
+
+
+def _moon_recoverable_pose_error(
+    snapshot: Any,
+    dynamic_ground: Any,
+) -> tuple[str, dict[str, float]] | None:
+    try:
+        qpos = snapshot.qpos
+        root_x = float(qpos[0])
+        root_y = float(qpos[1])
+        root_z = float(qpos[2])
+        ground_z = float(dynamic_ground.sample_height(root_x, root_y))
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        raise WorldStateError(f"cannot inspect MoonWorld root clearance: {exc}") from exc
+    root_clearance_m = root_z - ground_z
+    root_up_z = _root_up_z(qpos)
+    diagnostics = {
+        "root_z": root_z,
+        "ground_z": ground_z,
+        "root_clearance_m": root_clearance_m,
+        "root_up_z": root_up_z,
+    }
+    if not all(math.isfinite(value) for value in diagnostics.values()):
+        return "moon_nonfinite_pose", diagnostics
+    if root_clearance_m > _MOON_FALL_RESPAWN_MAX_ROOT_CLEARANCE_M:
+        return "moon_airborne_clearance", diagnostics
+    if (
+        root_clearance_m < _MOON_FALL_RESPAWN_MIN_ROOT_CLEARANCE_M
+        and root_up_z < _MOON_RELATIVE_FALL_ROOT_UP_Z
+    ):
+        return "moon_low_tilt_clearance", diagnostics
+    return None
 
 
 class _GameWorldStateRuntime:
@@ -5004,7 +5038,27 @@ def main() -> int:
                         )
                         break
                 instability_resets = int(snapshot.reset_count)
-                if bool(snapshot.fall_detected):
+                moon_recoverable_pose_error = None
+                if moon_dynamic_ground is not None:
+                    try:
+                        moon_recoverable_pose_error = _moon_recoverable_pose_error(
+                            snapshot,
+                            moon_dynamic_ground,
+                        )
+                    except WorldStateError as exc:
+                        unstable = True
+                        running = False
+                        termination_reason = "numerical_instability"
+                        numerical_error = f"moon_pose_check:{exc}"
+                        print(
+                            "matrix-sonic-runtime ERROR MoonWorld pose check: "
+                            f"{exc}",
+                            flush=True,
+                        )
+                        break
+                if bool(snapshot.fall_detected) or (
+                    moon_recoverable_pose_error is not None
+                ):
                     fall_detected = True
                     if args.game_auto_respawn:
                         assert game_world is not None
@@ -5047,11 +5101,21 @@ def main() -> int:
                             break
                         running = False
                         termination_reason = "game_fall_respawn"
-                        print(
-                            "matrix-sonic-runtime fall detected; saved an "
-                            "upright cold-respawn checkpoint",
-                            flush=True,
-                        )
+                        if moon_recoverable_pose_error is None:
+                            print(
+                                "matrix-sonic-runtime fall detected; saved an "
+                                "upright cold-respawn checkpoint",
+                                flush=True,
+                            )
+                        else:
+                            moon_reason, moon_diagnostics = moon_recoverable_pose_error
+                            print(
+                                "matrix-sonic-runtime MoonWorld recoverable "
+                                f"pose error {moon_reason}; saved an upright "
+                                "cold-respawn checkpoint "
+                                f"{json.dumps(moon_diagnostics, sort_keys=True)}",
+                                flush=True,
+                            )
                         break
                     if args.fail_on_fall:
                         running = False
