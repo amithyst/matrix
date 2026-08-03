@@ -2628,7 +2628,13 @@ class NativePlannerClient:
             if not math.isfinite(delta_heading_value):
                 raise ValueError("delta_heading must be finite")
             self._delta_heading_rad = self._wrap_angle(delta_heading_value)
+            # ``delta_heading`` rotates SONIC's native heading state.  Planner
+            # directions must therefore be expressed in that same pre-rotated
+            # frame.  Rotating only movement while leaving facing in Matrix
+            # world space makes camera-face WASD translate correctly but leaves
+            # the torso looking diagonally relative to the travel direction.
             movement_values = self._rotate_xy(movement_values, -self._delta_heading_rad)
+            facing_values = self._rotate_xy(facing_values, -self._delta_heading_rad)
         stationary_locomotion = bool(
             allow_stationary_locomotion
             and not moving

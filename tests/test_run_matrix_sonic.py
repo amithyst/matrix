@@ -2200,8 +2200,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(commands[-1]["delta_heading"], math.pi / 2.0)
         self.assertEqual(planners[-1]["mode"], MODULE.SONIC_IDLE_MODE)
         self.assertEqual(planners[-1]["movement"], [0.0, 0.0, 0.0])
-        self.assertAlmostEqual(planners[-1]["facing"][0], 0.0)
-        self.assertAlmostEqual(planners[-1]["facing"][1], 1.0)
+        self.assertAlmostEqual(planners[-1]["facing"][0], 1.0)
+        self.assertAlmostEqual(planners[-1]["facing"][1], 0.0)
         self.assertEqual(planners[-1]["speed"], -1.0)
 
         client.send_game_command(
@@ -2236,8 +2236,8 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
         self.assertEqual(planners[-1]["mode"], MODULE.SONIC_WALK_MODE)
         self.assertAlmostEqual(planners[-1]["movement"][0], 1.0)
         self.assertAlmostEqual(planners[-1]["movement"][1], 0.0)
-        self.assertAlmostEqual(planners[-1]["facing"][0], 0.0)
-        self.assertAlmostEqual(planners[-1]["facing"][1], 1.0)
+        self.assertAlmostEqual(planners[-1]["facing"][0], 1.0)
+        self.assertAlmostEqual(planners[-1]["facing"][1], 0.0)
         self.assertEqual(planners[-1]["speed"], 0.8)
 
         for sequence, native_mode, speed, clamped in (
