@@ -3084,6 +3084,8 @@ class GameCommandRuntime:
         self.restart_requested = False
         self.restart_target: dict[str, object] | None = None
         self.last_response: dict[str, object] | None = None
+        self.hot_pose_applied_this_poll = False
+        self.hot_pose_reset_to_standing_this_poll = False
 
     @staticmethod
     def _hot_pose_requested(data: Mapping[str, object]) -> bool:
@@ -3117,12 +3119,22 @@ class GameCommandRuntime:
         reset_to_standing = reset_pose == "standing"
         applied = applier(pose, reset_to_standing)
         self.core.invalidate_input("hot_pose_recover", require_neutral=True)
+        self.hot_pose_applied_this_poll = True
+        self.hot_pose_reset_to_standing_this_poll = (
+            self.hot_pose_reset_to_standing_this_poll or reset_to_standing
+        )
         data["position"] = [applied.x, applied.y, applied.z]
         data["yaw_rad"] = applied.yaw_rad
         data["hot_pose_applied"] = True
         data["input_rearm_required"] = True
         if reset_to_standing:
             data["reset_pose_applied"] = "standing"
+            if self.runtime_pause is not None:
+                _changed, pause_mapping = self.runtime_pause.set_target(
+                    "paused",
+                    None,
+                )
+                data["runtime_pause"] = pause_mapping
         return data, applied
 
     def _apply_hot_pose_effect(
@@ -3711,6 +3723,8 @@ class GameCommandRuntime:
         command_allowed: bool,
         movement_mode_allowed: bool = False,
     ) -> bool:
+        self.hot_pose_applied_this_poll = False
+        self.hot_pose_reset_to_standing_this_poll = False
         if self.restart_requested:
             return True
         for _ in range(16):
@@ -5339,6 +5353,21 @@ def main() -> int:
                                 walking = False
                                 running = False
                                 termination_reason = "game_teleport"
+                            elif game_commands.hot_pose_applied_this_poll or (
+                                runtime_pause_state is not None
+                                and runtime_pause_state.paused
+                                and not game_command.safe_stop
+                            ):
+                                game_command = game_input.emergency_stop(
+                                    now_s=time.perf_counter(),
+                                    reason=(
+                                        "hot_pose_recover"
+                                        if game_commands.hot_pose_applied_this_poll
+                                        else "runtime_pause"
+                                    ),
+                                )
+                                planner.send_game_command(game_command)
+                                walking = False
                 else:
                     planner.send_velocity(
                         args.vx if walking else 0.0,

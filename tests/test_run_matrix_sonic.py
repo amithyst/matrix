@@ -2712,10 +2712,76 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertEqual(response.code, "OK_TELEPORT")
                 self.assertTrue(response.data["hot_pose_applied"])
                 self.assertTrue(response.data["input_rearm_required"])
+                self.assertTrue(runtime.hot_pose_applied_this_poll)
+                self.assertFalse(runtime.hot_pose_reset_to_standing_this_poll)
 
                 stopped = core.command(now_s=10.0, dt_s=0.0)
                 self.assertTrue(stopped.safe_stop)
                 self.assertEqual(stopped.reason, "hot_pose_recover")
+            finally:
+                provider_socket.close()
+                runtime.close()
+
+    def test_recover_command_forces_pause_and_standing_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            world.state = world.state.checkpoint(
+                WORLD_STATE.WorldPose(3.0, 4.0, 0.86, 0.75),
+                upright=True,
+                now_unix_ns=1,
+            )
+            runtime_pause = MODULE.RuntimePauseState()
+            applied_poses: list[tuple[WORLD_STATE.WorldPose, bool]] = []
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                world,
+                pose_applier=lambda pose, reset_to_standing: applied_poses.append(
+                    (pose, reset_to_standing)
+                )
+                or pose,
+                runtime_pause=runtime_pause,
+            )
+            request = self.game_command_request(
+                "/recover",
+                sequence=1,
+                request_character="e",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(
+                        current_pose=WORLD_STATE.WorldPose(10.0, 20.0, 0.25, 0.1),
+                        command_allowed=True,
+                    )
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_RECOVER")
+                self.assertTrue(response.data["hot_pose_applied"])
+                self.assertEqual(response.data["reset_pose_applied"], "standing")
+                self.assertEqual(response.data["runtime_pause"]["state"], "paused")
+                self.assertTrue(runtime_pause.paused)
+                self.assertTrue(runtime.hot_pose_applied_this_poll)
+                self.assertTrue(runtime.hot_pose_reset_to_standing_this_poll)
+                self.assertEqual(
+                    applied_poses,
+                    [(WORLD_STATE.WorldPose(10.0, 20.0, 0.86, 0.75), True)],
+                )
+                self.assertEqual(world.state.resume_source, "recover_here")
             finally:
                 provider_socket.close()
                 runtime.close()
@@ -2954,6 +3020,9 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertTrue(response.data["hot_pose_applied"])
                 self.assertTrue(response.data["input_rearm_required"])
                 self.assertEqual(response.data["reset_pose_applied"], "standing")
+                self.assertEqual(response.data["runtime_pause"]["state"], "paused")
+                self.assertTrue(runtime.hot_pose_applied_this_poll)
+                self.assertTrue(runtime.hot_pose_reset_to_standing_this_poll)
                 self.assertEqual(response.data["position"], [10.0, 20.0, 0.85])
                 self.assertAlmostEqual(response.data["yaw_rad"], 1.2)
                 self.assertEqual(
