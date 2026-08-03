@@ -127,6 +127,14 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                     "kind": "action",
                     "action": "navigation_refresh",
                 },
+                {
+                    "version": 1,
+                    "session": supervisor._action_session,
+                    "sequence": 7,
+                    "kind": "runtime_pause",
+                    "pause_target": "paused",
+                    "expected_epoch": 0,
+                },
             )
             try:
                 for packet in packets:
@@ -148,6 +156,11 @@ class CalibrationOverlaySupervisorTest(unittest.TestCase):
                             action="motion_camera_heading_snap_error_up",
                         ),
                         MODULE.OverlayIntent(kind="action", action="navigation_refresh"),
+                        MODULE.OverlayIntent(
+                            kind="runtime_pause",
+                            pause_target="paused",
+                            expected_epoch=0,
+                        ),
                     ),
                 )
                 self.assertEqual(supervisor.drain_intents(), ())
@@ -562,8 +575,52 @@ class GameCommandClientTest(unittest.TestCase):
                 "restart_required": True,
                 "outcome_unknown": False,
                 "data": {"position": [1.0, 2.0, 3.0]},
+                "runtime_pause": {
+                    "state": "running",
+                    "epoch": 0,
+                    "can_pause": True,
+                    "can_resume": False,
+                    "last_error": None,
+                },
             },
         )
+
+    def test_runtime_pause_panel_action_sends_typed_hot_command(self) -> None:
+        client, runtime = self.make_client()
+
+        self.assertTrue(client.set_runtime_pause("paused", expected_epoch=0))
+        payload = runtime.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+        request = MC_COMMANDS.decode_command_request(payload)
+        self.assertEqual(request.command, MC_COMMANDS.RuntimePauseSet("paused", 0))
+        self.assertEqual(client.mapping()["runtime_pause"]["state"], "pausing")
+
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_RUNTIME_PAUSE_CHANGED",
+                    message="Matrix runtime controls paused",
+                    restart_required=False,
+                    data={
+                        "runtime_pause": {
+                            "state": "paused",
+                            "epoch": 1,
+                            "can_pause": False,
+                            "can_resume": True,
+                            "last_error": None,
+                        }
+                    },
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.status, "success")
+        self.assertEqual(client.mapping()["runtime_pause"]["state"], "paused")
+        self.assertEqual(client.mapping()["runtime_pause"]["epoch"], 1)
 
     def test_motion_setting_panel_action_sends_typed_hot_command(self) -> None:
         client, runtime = self.make_client()

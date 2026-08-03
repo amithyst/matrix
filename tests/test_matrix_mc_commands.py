@@ -70,6 +70,8 @@ class McCommandParserTest(unittest.TestCase):
         movement = MODULE.parse_mc_command("/mode camera_strafe").command
         native = MODULE.parse_mc_command("/sonic mode 7").command
         auto = MODULE.parse_mc_command("/sonic mode auto").command
+        pause = MODULE.parse_mc_command("/pause").command
+        resume = MODULE.parse_mc_command("/continue").command
         world = MODULE.parse_mc_command("/world moon").command
         scene_alias = MODULE.parse_mc_command("/scene MoonWorld").command
         gait_threshold = MODULE.parse_mc_command(
@@ -89,6 +91,8 @@ class McCommandParserTest(unittest.TestCase):
         self.assertEqual(movement, MODULE.MovementModeSet("camera_strafe"))
         self.assertEqual(native, MODULE.NativeModeSet(7))
         self.assertEqual(auto, MODULE.NativeModeSet(None))
+        self.assertEqual(pause, MODULE.RuntimePauseSet("paused", expected_epoch=None))
+        self.assertEqual(resume, MODULE.RuntimePauseSet("running", expected_epoch=None))
         self.assertEqual(world, MODULE.WorldSceneSet("moon"))
         self.assertEqual(scene_alias, MODULE.WorldSceneSet("moon"))
         self.assertEqual(
@@ -255,6 +259,18 @@ class McCommandProtocolTest(unittest.TestCase):
             MODULE.decode_command_response(MODULE.encode_command_response(response)),
             response,
         )
+
+    def test_runtime_pause_command_round_trip_is_strict(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=4,
+            request_id=REQUEST_ID,
+            command=MODULE.RuntimePauseSet("paused", expected_epoch=3),
+        )
+
+        decoded = MODULE.decode_command_request(MODULE.encode_command_request(request))
+
+        self.assertEqual(decoded, request)
 
 
 class McCommandExecutionTest(unittest.TestCase):

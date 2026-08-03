@@ -57,10 +57,12 @@ from matrix_mc_commands import (
     CommandProtocolError,
     GameCommandRequest,
     GameCommandResponse,
+    MAX_RUNTIME_PAUSE_EPOCH,
     MAX_COMMAND_PACKET_BYTES,
     MovementModeSet,
     MotionSettingSet,
     NativeModeSet,
+    RuntimePauseSet,
     decode_command_request,
     encode_command_response,
     execute_command,
@@ -100,6 +102,72 @@ _WORLD_SAFE_MAX_TILT_RATE_RAD_S = 0.75
 _MAX_FUNCTION_FILE_BYTES = 16 * 1024
 _MAX_FUNCTION_STEPS = 64
 _MAX_FUNCTION_DEPTH = 4
+
+
+class RuntimePauseState:
+    """Runtime-confirmed soft pause for game controls.
+
+    This intentionally does not stop the MuJoCo/SONIC clock.  While paused the
+    runtime keeps publishing a neutral idle command so same-world functions and
+    hot-pose recovery remain safe and do not need a process restart.
+    """
+
+    def __init__(self) -> None:
+        self.paused = False
+        self.epoch = 0
+        self.last_error: str | None = None
+
+    def _state_name(self) -> str:
+        return "paused" if self.paused else "running"
+
+    def panel_mapping(self) -> dict[str, object]:
+        state = self._state_name()
+        return {
+            "state": state,
+            "epoch": self.epoch,
+            "can_pause": state == "running",
+            "can_resume": state == "paused",
+            "last_error": self.last_error,
+        }
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "available": True,
+            "phase": self._state_name(),
+            "epoch": self.epoch,
+            "last_error": self.last_error,
+        }
+
+    def set_target(self, target: str, expected_epoch: int | None) -> tuple[bool, dict[str, object]]:
+        if target not in {"paused", "running"}:
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_TARGET",
+                "runtime pause target must be paused or running",
+            )
+        if expected_epoch is not None and (
+            isinstance(expected_epoch, bool)
+            or not isinstance(expected_epoch, int)
+            or not 0 <= expected_epoch <= MAX_RUNTIME_PAUSE_EPOCH
+        ):
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_EPOCH",
+                "runtime pause epoch is invalid",
+            )
+        if expected_epoch is not None and expected_epoch != self.epoch:
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_STALE",
+                (
+                    "runtime pause state changed; refresh ESC and try again "
+                    f"(expected {expected_epoch}, current {self.epoch})"
+                ),
+            )
+        next_paused = target == "paused"
+        changed = self.paused != next_paused
+        if changed:
+            self.paused = next_paused
+            self.epoch += 1
+        self.last_error = None
+        return changed, self.panel_mapping()
 
 
 def _moon_keep_startup_band_active() -> bool:
@@ -2985,6 +3053,7 @@ class GameCommandRuntime:
         function_directory: Path | None = None,
         motion_settings: MotionSettingsStore | None = None,
         pose_applier: Callable[[WorldPose], WorldPose] | None = None,
+        runtime_pause: RuntimePauseState | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -2995,6 +3064,7 @@ class GameCommandRuntime:
         )
         self.motion_settings = motion_settings
         self.pose_applier = pose_applier
+        self.runtime_pause = runtime_pause
         self.session: str | None = None
         self.last_sequence = 0
         self.request_ids: set[str] = set()
@@ -3205,6 +3275,38 @@ class GameCommandRuntime:
             },
         )
 
+    def _apply_runtime_pause_command(
+        self,
+        command: RuntimePauseSet,
+    ) -> tuple[str, str, dict[str, object]]:
+        if self.runtime_pause is None:
+            raise CommandExecutionError(
+                "E_RUNTIME_PAUSE_UNAVAILABLE",
+                "Runtime pause is unavailable for this run",
+            )
+        changed, pause_mapping = self.runtime_pause.set_target(
+            command.target,
+            command.expected_epoch,
+        )
+        self.core.invalidate_input(
+            "runtime_pause" if command.target == "paused" else "runtime_resume",
+            require_neutral=True,
+        )
+        code = (
+            "OK_RUNTIME_PAUSE_CHANGED"
+            if changed
+            else "OK_RUNTIME_PAUSE_UNCHANGED"
+        )
+        return (
+            code,
+            (
+                "Matrix runtime controls paused"
+                if command.target == "paused"
+                else "Matrix runtime controls resumed"
+            ),
+            {"runtime_pause": pause_mapping},
+        )
+
     def _function_library_root(self) -> Path:
         root = self.function_directory
         if root is None:
@@ -3331,6 +3433,17 @@ class GameCommandRuntime:
                 continue
             if isinstance(step, NativeModeSet):
                 code, message, data = self._apply_native_mode_command(step)
+                steps.append(
+                    {
+                        "code": code,
+                        "message": message,
+                        "restart_required": False,
+                        "data": data,
+                    }
+                )
+                continue
+            if isinstance(step, RuntimePauseSet):
+                code, message, data = self._apply_runtime_pause_command(step)
                 steps.append(
                     {
                         "code": code,
@@ -3710,6 +3823,44 @@ class GameCommandRuntime:
                     )
                 )
                 continue
+            if isinstance(request.command, RuntimePauseSet):
+                if not command_allowed:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code="E_NOT_PAUSED",
+                            message="Open ESC and wait for a neutral frame before pause",
+                        )
+                    )
+                    continue
+                try:
+                    code, message, data = self._apply_runtime_pause_command(
+                        request.command
+                    )
+                except CommandExecutionError as exc:
+                    self.rejected_commands += 1
+                    self._send(
+                        self._response(
+                            request,
+                            ok=False,
+                            code=exc.code,
+                            message=exc.message,
+                        )
+                    )
+                    continue
+                self.commands_executed += 1
+                self._send(
+                    self._response(
+                        request,
+                        ok=True,
+                        code=code,
+                        message=message,
+                        data=data,
+                    )
+                )
+                continue
             if isinstance(request.command, (CommandFunctionRun, CommandFunctionCall)):
                 if not command_allowed:
                     self.rejected_commands += 1
@@ -3868,6 +4019,11 @@ class GameCommandRuntime:
                 self.core.native_mode_override
             ),
             "motion_settings": self._motion_settings_telemetry(),
+            "runtime_pause": (
+                self.runtime_pause.telemetry()
+                if self.runtime_pause is not None
+                else {"available": False, "phase": "unavailable", "epoch": 0, "last_error": None}
+            ),
             "function_library": self._function_library_telemetry(),
             "world_available": self.world is not None,
             "restart_target": self.restart_target,
@@ -4636,6 +4792,7 @@ def main() -> int:
     game_world = None
     game_commands = None
     game_command_child_socket = None
+    runtime_pause_state = None
     moon_dynamic_ground = None
     moon_dynamic_ground_disabled_startup_band = False
     moon_dynamic_ground_anchored_startup_band = False
@@ -4877,6 +5034,7 @@ def main() -> int:
                     args.game_input_socket,
                     GameControlCore(game_config),
                 )
+                runtime_pause_state = RuntimePauseState()
                 game_readiness = _GameSonicReadinessGate(
                     snapshot,
                     allow_active_elastic_band=(
@@ -4895,6 +5053,7 @@ def main() -> int:
                         args.game_function_directory,
                         motion_settings_store,
                         pose_applier=apply_hot_world_pose,
+                        runtime_pause=runtime_pause_state,
                     )
                 try:
                     game_input.open()
@@ -5067,10 +5226,19 @@ def main() -> int:
                         now_s=frame_wall,
                         dt_s=1.0 / args.control_hz,
                     )
-                    game_command = game_readiness.apply(
-                        candidate_game_command,
-                        game_input.core,
-                    )
+                    if (
+                        runtime_pause_state is not None
+                        and runtime_pause_state.paused
+                    ):
+                        game_command = game_input.emergency_stop(
+                            now_s=frame_wall,
+                            reason="runtime_pause",
+                        )
+                    else:
+                        game_command = game_readiness.apply(
+                            candidate_game_command,
+                            game_input.core,
+                        )
                     # Telemetry must describe the command actually published,
                     # not the pre-readiness candidate returned by the core.
                     game_input.last_command = game_command

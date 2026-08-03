@@ -52,6 +52,9 @@ _MODE_RE = re.compile(r"/?mode\s+(?P<mode>[A-Za-z0-9_+-]+)\s*\Z")
 _SONIC_MODE_RE = re.compile(
     r"/?(?:sonic|native)\s+mode\s+(?P<mode>auto|[0-9]{1,2})\s*\Z"
 )
+_RUNTIME_PAUSE_RE = re.compile(
+    r"/?(?P<action>pause|resume|continue|unpause)(?:\s+runtime)?\s*\Z"
+)
 _WORLD_SCENE_RE = re.compile(
     r"/?(?:world|scene|planet)\s+(?P<destination>[A-Za-z0-9_.:-]+)\s*\Z"
 )
@@ -114,6 +117,7 @@ _WORLD_SCENE_ALIASES = {
 }
 DEFAULT_RECOVER_ROOT_Z_M = 0.793
 RECOVER_ROOT_LIFT_M = 0.50
+MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 
 
 class CommandParseError(ValueError):
@@ -317,6 +321,29 @@ class NativeModeSet:
 
 
 @dataclass(frozen=True)
+class RuntimePauseSet:
+    target: str
+    expected_epoch: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.target not in {"paused", "running"}:
+            raise CommandParseError(
+                "E_RUNTIME_PAUSE_TARGET",
+                "runtime pause target must be paused or running",
+            )
+        epoch = self.expected_epoch
+        if epoch is not None and (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or not 0 <= epoch <= MAX_RUNTIME_PAUSE_EPOCH
+        ):
+            raise CommandParseError(
+                "E_RUNTIME_PAUSE_EPOCH",
+                "runtime pause epoch is invalid",
+            )
+
+
+@dataclass(frozen=True)
 class WorldSceneSet:
     destination_id: str
 
@@ -384,6 +411,7 @@ AtomicMcCommand: TypeAlias = (
     | RecoverHere
     | MovementModeSet
     | NativeModeSet
+    | RuntimePauseSet
     | WorldSceneSet
     | MotionSettingSet
 )
@@ -535,6 +563,7 @@ def _is_atomic_command(command: object) -> bool:
             RecoverHere,
             MovementModeSet,
             NativeModeSet,
+            RuntimePauseSet,
             WorldSceneSet,
             MotionSettingSet,
         ),
@@ -676,6 +705,16 @@ def _parse_mc_command(text: object, *, allow_function: bool) -> ParsedCommand:
     if _RECOVER_RE.fullmatch(command_text) is not None:
         return ParsedCommand(RecoverHere())
 
+    runtime_pause = _RUNTIME_PAUSE_RE.fullmatch(command_text)
+    if runtime_pause is not None:
+        action = runtime_pause.group("action")
+        return ParsedCommand(
+            RuntimePauseSet(
+                "paused" if action == "pause" else "running",
+                expected_epoch=None,
+            )
+        )
+
     mode = _MODE_RE.fullmatch(command_text)
     if mode is not None:
         return ParsedCommand(MovementModeSet(mode.group("mode")))
@@ -755,6 +794,12 @@ def command_to_mapping(command: McCommand) -> dict[str, object]:
             "name": "native_mode_set",
             "native_mode": command.native_mode,
         }
+    if isinstance(command, RuntimePauseSet):
+        return {
+            "name": "runtime_pause_set",
+            "target": command.target,
+            "expected_epoch": command.expected_epoch,
+        }
     if isinstance(command, WorldSceneSet):
         return {
             "name": "world_scene_set",
@@ -830,6 +875,16 @@ def command_from_mapping(value: object) -> McCommand:
             raise CommandProtocolError("native mode command has an invalid schema")
         try:
             return NativeModeSet(value.get("native_mode"))
+        except CommandParseError as exc:
+            raise CommandProtocolError(str(exc)) from exc
+    if name == "runtime_pause_set":
+        if set(value) != {"name", "target", "expected_epoch"}:
+            raise CommandProtocolError("runtime pause command has an invalid schema")
+        try:
+            return RuntimePauseSet(
+                value.get("target"),
+                value.get("expected_epoch"),
+            )
         except CommandParseError as exc:
             raise CommandProtocolError(str(exc)) from exc
     if name == "world_scene_set":
@@ -1282,6 +1337,11 @@ def execute_command(
             "E_MOTION_SETTING_RUNTIME_ONLY",
             "motion setting commands require runtime support",
         )
+    if isinstance(command, RuntimePauseSet):
+        raise CommandExecutionError(
+            "E_RUNTIME_PAUSE_RUNTIME_ONLY",
+            "runtime pause commands require runtime support",
+        )
     raise TypeError(f"unsupported command AST: {type(command).__name__}")
 
 
@@ -1302,6 +1362,8 @@ __all__ = [
     "ParsedCommand",
     "PoseYawSet",
     "RecoverHere",
+    "RuntimePauseSet",
+    "MAX_RUNTIME_PAUSE_EPOCH",
     "SummonTeleportPoint",
     "TeleportCoordinates",
     "TeleportSelector",

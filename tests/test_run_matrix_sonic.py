@@ -2798,6 +2798,130 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             provider_socket.close()
             runtime.close()
 
+    def test_game_command_runtime_runtime_pause_is_confirmed_and_rearms(self) -> None:
+        runtime_socket, provider_socket = socket.socketpair(
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+        )
+        provider_socket.settimeout(1.0)
+        core = GAME_CONTROL.GameControlCore()
+        core.accept_snapshot(
+            self.game_input_snapshot(1, 10.0, w=True),
+            received_at_s=10.0,
+        )
+        runtime_pause = MODULE.RuntimePauseState()
+        runtime = MODULE.GameCommandRuntime(
+            runtime_socket,
+            None,
+            core,
+            runtime_pause=runtime_pause,
+        )
+        request = MC_COMMANDS.GameCommandRequest(
+            session="a" * 32,
+            sequence=1,
+            request_id="cmd-" + "1" * 32,
+            command=MC_COMMANDS.RuntimePauseSet("paused", expected_epoch=0),
+        )
+        try:
+            provider_socket.send(MC_COMMANDS.encode_command_request(request))
+            self.assertFalse(
+                runtime.poll(
+                    current_pose=WORLD_STATE.WorldPose(1.0, 2.0, 0.8, 0.0),
+                    command_allowed=True,
+                )
+            )
+            response = MC_COMMANDS.decode_command_response(
+                provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+            )
+
+            self.assertTrue(response.ok)
+            self.assertEqual(response.code, "OK_RUNTIME_PAUSE_CHANGED")
+            self.assertTrue(runtime_pause.paused)
+            self.assertEqual(response.data["runtime_pause"]["state"], "paused")
+            stopped = core.command(now_s=10.02, dt_s=0.02)
+            self.assertTrue(stopped.safe_stop)
+            self.assertEqual(stopped.reason, "runtime_pause")
+        finally:
+            provider_socket.close()
+            runtime.close()
+
+    def test_recover_here_file_pauses_resets_native_mode_and_hot_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            function_dir = Path(temporary) / "functions"
+            function_dir.mkdir()
+            (function_dir / "recover_here.mcfunction").write_text(
+                "# 原地站立恢复\n/pause\n/sonic mode auto\n/recover\n",
+                encoding="utf-8",
+            )
+            state_path = Path(temporary) / "world-state.json"
+            runtime_socket, provider_socket = socket.socketpair(
+                socket.AF_UNIX,
+                socket.SOCK_SEQPACKET,
+            )
+            provider_socket.settimeout(1.0)
+            world = MODULE._GameWorldStateRuntime(
+                path=state_path,
+                world_id="town10:test",
+                world_revision="a" * 64,
+                checkpoint_seconds=0.75,
+            )
+            world.state = world.state.checkpoint(
+                WORLD_STATE.WorldPose(1.0, 2.0, 0.85, 1.2),
+                upright=True,
+                now_unix_ns=1,
+            )
+            core = GAME_CONTROL.GameControlCore()
+            core.set_native_mode_override(8)
+            runtime_pause = MODULE.RuntimePauseState()
+            applied_poses: list[WORLD_STATE.WorldPose] = []
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                world,
+                core,
+                function_dir,
+                pose_applier=lambda pose: applied_poses.append(pose) or pose,
+                runtime_pause=runtime_pause,
+            )
+            request = self.game_command_request(
+                "/function recover_here",
+                sequence=1,
+                request_character="2",
+            )
+            try:
+                provider_socket.send(MC_COMMANDS.encode_command_request(request))
+                self.assertFalse(
+                    runtime.poll(
+                        current_pose=WORLD_STATE.WorldPose(10.0, 20.0, 0.29, 0.4),
+                        command_allowed=True,
+                    )
+                )
+                response = MC_COMMANDS.decode_command_response(
+                    provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
+                )
+
+                self.assertTrue(response.ok)
+                self.assertEqual(response.code, "OK_FUNCTION")
+                self.assertFalse(response.restart_required)
+                self.assertTrue(runtime_pause.paused)
+                self.assertIsNone(core.native_mode_override)
+                self.assertEqual(
+                    [step["code"] for step in response.data["steps"]],
+                    [
+                        "OK_RUNTIME_PAUSE_CHANGED",
+                        "OK_NATIVE_MODE_CHANGED",
+                        "OK_RECOVER",
+                    ],
+                )
+                self.assertTrue(response.data["hot_pose_applied"])
+                self.assertTrue(response.data["input_rearm_required"])
+                self.assertEqual(response.data["position"], [10.0, 20.0, 0.85])
+                self.assertAlmostEqual(response.data["yaw_rad"], 1.2)
+                self.assertEqual(applied_poses, [WORLD_STATE.WorldPose(10.0, 20.0, 0.85, 1.2)])
+                self.assertEqual(world.state.resume_source, "recover_here")
+            finally:
+                provider_socket.close()
+                runtime.close()
+
     def test_game_command_runtime_function_can_set_native_mode(self) -> None:
         runtime_socket, provider_socket = socket.socketpair(
             socket.AF_UNIX,

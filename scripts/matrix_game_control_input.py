@@ -106,10 +106,12 @@ from matrix_mc_commands import (
     CommandParseError,
     CommandProtocolError,
     GameCommandRequest,
+    MAX_RUNTIME_PAUSE_EPOCH,
     MovementModeSet,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
     MotionSettingSet,
+    RuntimePauseSet,
     WORLD_SCENE_TARGETS,
     decode_command_response,
     encode_command_request,
@@ -3907,6 +3909,8 @@ class OverlayIntent:
     command: str | None = None
     active: bool | None = None
     font_size: int | None = None
+    pause_target: str | None = None
+    expected_epoch: int | None = None
 
 
 def function_library_mapping(
@@ -4211,6 +4215,7 @@ class GameCommandClient:
         self.restart_required = False
         self.data: dict[str, object] | None = None
         self.last_request_id: str | None = None
+        self._runtime_pause = self._runtime_pause_unavailable()
         if file_descriptor is None:
             return
         if (
@@ -4235,6 +4240,70 @@ class GameCommandClient:
                 connection.close()
             raise
         self._connection = connection
+        self._runtime_pause = self._runtime_pause_running(epoch=0)
+
+    @staticmethod
+    def _runtime_pause_unavailable() -> dict[str, object]:
+        return {
+            "state": "unavailable",
+            "epoch": 0,
+            "can_pause": False,
+            "can_resume": False,
+            "last_error": None,
+        }
+
+    @staticmethod
+    def _runtime_pause_running(*, epoch: int) -> dict[str, object]:
+        return {
+            "state": "running",
+            "epoch": epoch,
+            "can_pause": True,
+            "can_resume": False,
+            "last_error": None,
+        }
+
+    @staticmethod
+    def _runtime_pause_pending(target: str, *, epoch: int) -> dict[str, object]:
+        return {
+            "state": "pausing" if target == "paused" else "resuming",
+            "epoch": epoch,
+            "can_pause": False,
+            "can_resume": False,
+            "last_error": None,
+        }
+
+    @staticmethod
+    def _coerce_runtime_pause(value: object) -> dict[str, object] | None:
+        if not isinstance(value, dict) or set(value) != {
+            "state",
+            "epoch",
+            "can_pause",
+            "can_resume",
+            "last_error",
+        }:
+            return None
+        state = value.get("state")
+        epoch = value.get("epoch")
+        can_pause = value.get("can_pause")
+        can_resume = value.get("can_resume")
+        last_error = value.get("last_error")
+        if (
+            state
+            not in {"running", "paused", "pausing", "resuming", "busy", "fault", "unavailable"}
+            or type(epoch) is not int
+            or not 0 <= epoch <= MAX_RUNTIME_PAUSE_EPOCH
+            or type(can_pause) is not bool
+            or type(can_resume) is not bool
+            or (last_error is not None and not isinstance(last_error, str))
+        ):
+            return None
+        return {
+            "state": state,
+            "epoch": epoch,
+            "can_pause": can_pause,
+            "can_resume": can_resume,
+            "last_error": last_error,
+        }
 
     @property
     def available(self) -> bool:
@@ -4259,6 +4328,17 @@ class GameCommandClient:
         self.restart_required = False
         self.data = None
         self.last_request_id = None
+
+    def _mark_runtime_pause_fault(self, message: str) -> None:
+        current = self._runtime_pause
+        epoch = current.get("epoch") if isinstance(current, dict) else 0
+        self._runtime_pause = {
+            "state": "fault",
+            "epoch": epoch if type(epoch) is int else 0,
+            "can_pause": False,
+            "can_resume": False,
+            "last_error": message[:256],
+        }
 
     def _close_channel(self) -> None:
         connection = self._connection
@@ -4567,6 +4647,73 @@ class GameCommandClient:
         self.last_request_id = request.request_id
         return True
 
+    def set_runtime_pause(self, target: object, *, expected_epoch: object) -> bool:
+        """Send one runtime-confirmed control pause/resume request."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        connection = self._connection
+        if connection is None:
+            self._local_error(
+                "E_COMMAND_UNAVAILABLE", "Game commands are unavailable for this run"
+            )
+            self._runtime_pause = self._runtime_pause_unavailable()
+            return False
+        try:
+            command = RuntimePauseSet(target, expected_epoch)
+        except CommandParseError as exc:
+            self._local_error(exc.code, exc.message)
+            self._mark_runtime_pause_fault(exc.message)
+            return False
+        self._sequence += 1
+        request = GameCommandRequest(
+            session=self._session,
+            sequence=self._sequence,
+            request_id=f"cmd-{os.urandom(16).hex()}",
+            command=command,
+        )
+        payload = encode_command_request(request)
+        try:
+            sent = connection.send(payload)
+        except BlockingIOError as exc:
+            self._local_error("E_COMMAND_SEND", f"Could not send pause command: {exc}")
+            self._mark_runtime_pause_fault(str(exc))
+            return False
+        except OSError as exc:
+            self._close_channel()
+            self._local_error("E_COMMAND_SEND", f"Could not send pause command: {exc}")
+            self._mark_runtime_pause_fault(str(exc))
+            return False
+        if sent != len(payload):
+            self._close_channel()
+            self._local_error(
+                "E_COMMAND_SEND",
+                f"Partial pause command packet write: sent {sent}/{len(payload)}",
+            )
+            self._mark_runtime_pause_fault("partial pause command packet write")
+            return False
+        self._pending = request
+        self._pending_warning = None
+        self._result_revision += 1
+        self.status = "pending"
+        self.ok = None
+        self.code = None
+        self.message = (
+            "Pausing Matrix runtime controls"
+            if command.target == "paused"
+            else "Resuming Matrix runtime controls"
+        )
+        self.warning = None
+        self.restart_required = False
+        self.data = None
+        self.last_request_id = request.request_id
+        assert command.expected_epoch is not None
+        self._runtime_pause = self._runtime_pause_pending(
+            command.target,
+            epoch=command.expected_epoch,
+        )
+        return True
+
     def poll(self) -> bool:
         """Receive at most one exact response; never resend a pending request."""
 
@@ -4614,6 +4761,16 @@ class GameCommandClient:
         self.restart_required = response.restart_required
         self.data = dict(response.data) if response.data is not None else None
         self.last_request_id = response.request_id
+        runtime_pause = (
+            self.data.get("runtime_pause")
+            if isinstance(self.data, dict)
+            else None
+        )
+        coerced_pause = self._coerce_runtime_pause(runtime_pause)
+        if coerced_pause is not None:
+            self._runtime_pause = coerced_pause
+        elif isinstance(pending.command, RuntimePauseSet):
+            self._mark_runtime_pause_fault(response.message)
         if response.ok and response.restart_required:
             self.status = "restarting"
         else:
@@ -4636,6 +4793,7 @@ class GameCommandClient:
             "restart_required": self.restart_required,
             "outcome_unknown": self.outcome_unknown,
             "data": self.data,
+            "runtime_pause": dict(self._runtime_pause),
         }
 
     def close(self) -> None:
@@ -4907,6 +5065,29 @@ class CalibrationOverlaySupervisor:
                         "invalid calibration overlay font-size intent"
                     ) from exc
                 intent = OverlayIntent(kind="font_size", font_size=font_size)
+            elif kind == "runtime_pause":
+                pause_target = value.get("pause_target")
+                expected_epoch = value.get("expected_epoch")
+                if (
+                    set(value)
+                    != {
+                        "version",
+                        "session",
+                        "sequence",
+                        "kind",
+                        "pause_target",
+                        "expected_epoch",
+                    }
+                    or pause_target not in {"paused", "running"}
+                    or type(expected_epoch) is not int
+                    or not 0 <= expected_epoch <= MAX_RUNTIME_PAUSE_EPOCH
+                ):
+                    raise RuntimeError("invalid calibration overlay runtime-pause intent")
+                intent = OverlayIntent(
+                    kind="runtime_pause",
+                    pause_target=pause_target,
+                    expected_epoch=expected_epoch,
+                )
             else:
                 raise RuntimeError("invalid calibration overlay intent kind")
             self._last_action_sequence = sequence
@@ -5670,6 +5851,18 @@ def main() -> int:
                     assert intent.font_size is not None
                     panel_font_sizes.append(intent.font_size)
                     continue
+                if intent.kind == "runtime_pause":
+                    assert intent.pause_target is not None
+                    assert intent.expected_epoch is not None
+                    command_state_changed = bool(
+                        game_command_client.set_runtime_pause(
+                            intent.pause_target,
+                            expected_epoch=intent.expected_epoch,
+                        )
+                        or command_state_changed
+                    )
+                    apply_return.cancel_pending()
+                    continue
                 if intent.kind == "command_edit":
                     assert intent.active is not None
                     command_state_changed = bool(
@@ -5708,7 +5901,12 @@ def main() -> int:
                 # settings edge even though the overlay still owned it.
                 or any(
                     intent.kind
-                    in {"command_edit", "command_submit", "command_quick_submit"}
+                    in {
+                        "command_edit",
+                        "command_submit",
+                        "command_quick_submit",
+                        "runtime_pause",
+                    }
                     for intent in panel_intents
                 )
             )
