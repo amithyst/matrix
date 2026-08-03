@@ -495,7 +495,7 @@ def _recover_root_z(state: MatrixWorldState, current_pose: WorldPose) -> float:
             "No upright checkpoint is available for recover-here",
         )
     candidates = [
-        state.last_safe.z,
+        state.last_safe.z + RECOVER_ROOT_LIFT_M,
         current_pose.z + RECOVER_ROOT_LIFT_M,
     ]
     world_id = state.world_id.lower()

@@ -368,7 +368,7 @@ class McCommandExecutionTest(unittest.TestCase):
             current_pose=fallen,
             now_unix_ns=3,
         )
-        self.assertEqual(recover_effect.state.last_exit, WorldPose(12.0, 24.0, 0.8, 0.5))
+        self.assertEqual(recover_effect.state.last_exit, WorldPose(12.0, 24.0, 1.3, 0.5))
         self.assertEqual(recover_effect.state.resume_source, "recover_here")
         self.assertEqual(recover_effect.data["reset_pose"], "standing")
 
@@ -388,7 +388,7 @@ class McCommandExecutionTest(unittest.TestCase):
 
         self.assertGreaterEqual(
             recover_effect.state.last_exit.z,
-            MODULE.DEFAULT_RECOVER_ROOT_Z_M,
+            contaminated.z + MODULE.RECOVER_ROOT_LIFT_M,
         )
         self.assertEqual(
             recover_effect.state.last_exit,

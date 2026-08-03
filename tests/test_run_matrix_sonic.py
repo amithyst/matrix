@@ -2811,10 +2811,13 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertTrue(runtime_pause.paused)
                 self.assertTrue(runtime.hot_pose_applied_this_poll)
                 self.assertTrue(runtime.hot_pose_reset_to_standing_this_poll)
-                self.assertEqual(
-                    applied_poses,
-                    [(WORLD_STATE.WorldPose(10.0, 20.0, 0.86, 0.75), True)],
-                )
+                self.assertEqual(len(applied_poses), 1)
+                applied_pose, reset_to_standing = applied_poses[0]
+                self.assertEqual(reset_to_standing, True)
+                self.assertEqual(applied_pose.x, 10.0)
+                self.assertEqual(applied_pose.y, 20.0)
+                self.assertAlmostEqual(applied_pose.z, 1.36)
+                self.assertEqual(applied_pose.yaw_rad, 0.75)
                 self.assertEqual(world.state.resume_source, "recover_here")
             finally:
                 provider_socket.close()
@@ -3057,12 +3060,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 self.assertEqual(response.data["runtime_pause"]["state"], "paused")
                 self.assertTrue(runtime.hot_pose_applied_this_poll)
                 self.assertTrue(runtime.hot_pose_reset_to_standing_this_poll)
-                self.assertEqual(response.data["position"], [10.0, 20.0, 0.85])
+                self.assertEqual(response.data["position"], [10.0, 20.0, 1.35])
                 self.assertAlmostEqual(response.data["yaw_rad"], 1.2)
-                self.assertEqual(
-                    applied_poses,
-                    [(WORLD_STATE.WorldPose(10.0, 20.0, 0.85, 1.2), True)],
-                )
+                self.assertEqual(len(applied_poses), 1)
+                applied_pose, reset_to_standing = applied_poses[0]
+                self.assertEqual(reset_to_standing, True)
+                self.assertEqual(applied_pose.x, 10.0)
+                self.assertEqual(applied_pose.y, 20.0)
+                self.assertAlmostEqual(applied_pose.z, 1.35)
+                self.assertEqual(applied_pose.yaw_rad, 1.2)
                 self.assertEqual(world.state.resume_source, "recover_here")
             finally:
                 provider_socket.close()
