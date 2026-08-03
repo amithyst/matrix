@@ -622,6 +622,68 @@ class GameCommandClientTest(unittest.TestCase):
         self.assertEqual(client.mapping()["runtime_pause"]["state"], "paused")
         self.assertEqual(client.mapping()["runtime_pause"]["epoch"], 1)
 
+    def test_function_response_updates_nested_runtime_pause_epoch(self) -> None:
+        client, runtime = self.make_client()
+
+        self.assertTrue(
+            client.submit(
+                "/function pose/north",
+                calibration_active=True,
+                neutral_frame_ready=True,
+                restart_requested=False,
+                require_editing=False,
+            )
+        )
+        payload = runtime.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+        request = MC_COMMANDS.decode_command_request(payload)
+        self.assertEqual(request.command, MC_COMMANDS.CommandFunctionCall("pose/north"))
+        self.assertEqual(client.mapping()["runtime_pause"]["epoch"], 0)
+
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_FUNCTION",
+                    message="Function pose/north executed 4 step(s)",
+                    restart_required=False,
+                    data={
+                        "function": "pose/north",
+                        "steps": [
+                            {
+                                "code": "OK_RUNTIME_PAUSE_CHANGED",
+                                "message": "Matrix runtime controls paused",
+                                "restart_required": False,
+                                "data": {
+                                    "runtime_pause": {
+                                        "state": "paused",
+                                        "epoch": 3,
+                                        "can_pause": False,
+                                        "can_resume": True,
+                                        "last_error": None,
+                                    }
+                                },
+                            },
+                            {
+                                "code": "OK_RECOVER",
+                                "message": "Recovered Matrix upright at current XY",
+                                "restart_required": False,
+                                "data": {"hot_pose": True},
+                            },
+                        ],
+                    },
+                )
+            )
+        )
+
+        self.assertTrue(client.poll())
+        self.assertEqual(client.status, "success")
+        self.assertEqual(client.mapping()["runtime_pause"]["state"], "paused")
+        self.assertEqual(client.mapping()["runtime_pause"]["epoch"], 3)
+        self.assertEqual(client.mapping()["runtime_pause"]["can_resume"], True)
+
     def test_motion_setting_panel_action_sends_typed_hot_command(self) -> None:
         client, runtime = self.make_client()
 

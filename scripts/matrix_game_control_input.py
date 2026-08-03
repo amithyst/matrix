@@ -4305,6 +4305,29 @@ class GameCommandClient:
             "last_error": last_error,
         }
 
+    @classmethod
+    def _coerce_runtime_pause_from_response_data(
+        cls,
+        value: object,
+    ) -> dict[str, object] | None:
+        """Return the latest runtime-pause state from direct or function data."""
+
+        if not isinstance(value, dict):
+            return None
+        latest = cls._coerce_runtime_pause(value.get("runtime_pause"))
+        steps = value.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                step_data = step.get("data")
+                if not isinstance(step_data, dict):
+                    continue
+                nested = cls._coerce_runtime_pause(step_data.get("runtime_pause"))
+                if nested is not None:
+                    latest = nested
+        return latest
+
     @property
     def available(self) -> bool:
         return self._connection is not None
@@ -4761,12 +4784,7 @@ class GameCommandClient:
         self.restart_required = response.restart_required
         self.data = dict(response.data) if response.data is not None else None
         self.last_request_id = response.request_id
-        runtime_pause = (
-            self.data.get("runtime_pause")
-            if isinstance(self.data, dict)
-            else None
-        )
-        coerced_pause = self._coerce_runtime_pause(runtime_pause)
+        coerced_pause = self._coerce_runtime_pause_from_response_data(self.data)
         if coerced_pause is not None:
             self._runtime_pause = coerced_pause
         elif isinstance(pending.command, RuntimePauseSet):
