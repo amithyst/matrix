@@ -2846,6 +2846,34 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_motion_settings_file_change_hot_updates_game_core(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_path = Path(temporary) / "motion.json"
+            original = MOTION_SETTINGS.MotionSettings()
+            MOTION_SETTINGS.atomic_save_settings(settings_path, original)
+            motion_store = MOTION_SETTINGS.MotionSettingsStore(settings_path)
+            core = GAME_CONTROL.GameControlCore()
+
+            replacement = MOTION_SETTINGS.MotionSettings(
+                revision=1,
+                gait_start_heading_error_rad=math.radians(35.0),
+                gait_stop_heading_error_rad=math.radians(75.0),
+            )
+            MOTION_SETTINGS.atomic_save_settings(settings_path, replacement)
+
+            self.assertTrue(
+                MODULE._reload_motion_settings_into_game_core(motion_store, core)
+            )
+            self.assertAlmostEqual(
+                core.config.gait_start_heading_error_rad,
+                math.radians(35.0),
+            )
+            self.assertAlmostEqual(
+                core.config.gait_stop_heading_error_rad,
+                math.radians(75.0),
+            )
+            self.assertEqual(motion_store.settings.revision, 1)
+
     def test_game_command_runtime_rejects_motion_settings_outside_esc_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings_path = Path(temporary) / "motion.json"

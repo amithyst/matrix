@@ -2311,6 +2311,23 @@ def _control_config_with_motion_settings(
     )
 
 
+def _reload_motion_settings_into_game_core(
+    motion_settings: MotionSettingsStore | None,
+    core: GameControlCore | None,
+) -> bool:
+    """Hot-apply changed motion settings to the already-running game core."""
+
+    if motion_settings is None or core is None:
+        return False
+    changed = motion_settings.reload_if_changed()
+    if changed:
+        core.config = _control_config_with_motion_settings(
+            core.config,
+            motion_settings.settings,
+        )
+    return changed
+
+
 _EXPECTED_SNAPSHOT_DIMS = {
     "qpos": 36,
     "qvel": 35,
@@ -5039,6 +5056,10 @@ def main() -> int:
                         )
                         break
                     game_input.core.synchronize_heading(measured_heading)
+                    _reload_motion_settings_into_game_core(
+                        motion_settings_store,
+                        game_input.core,
+                    )
                     game_readiness.begin_frame(snapshot, game_input.core)
                     candidate_game_command = game_input.poll(
                         now_s=frame_wall,
