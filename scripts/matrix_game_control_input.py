@@ -109,6 +109,7 @@ from matrix_mc_commands import (
     MovementModeSet,
     MAX_COMMAND_CHARS,
     MAX_COMMAND_PACKET_BYTES,
+    MotionSettingSet,
     WORLD_SCENE_TARGETS,
     decode_command_response,
     encode_command_request,
@@ -4509,6 +4510,63 @@ class GameCommandClient:
         self.last_request_id = request.request_id
         return True
 
+    def set_motion_setting(self, path: object, value: object) -> bool:
+        """Send one hot motion-setting request without entering text edit mode."""
+
+        if self.in_flight or self.restart_required or self._outcome_unknown:
+            return False
+        connection = self._connection
+        if connection is None:
+            self._local_error(
+                "E_COMMAND_UNAVAILABLE", "Game commands are unavailable for this run"
+            )
+            return False
+        try:
+            command = MotionSettingSet(path, value)
+        except CommandParseError as exc:
+            self._local_error(exc.code, exc.message)
+            return False
+        self._sequence += 1
+        request = GameCommandRequest(
+            session=self._session,
+            sequence=self._sequence,
+            request_id=f"cmd-{os.urandom(16).hex()}",
+            command=command,
+        )
+        payload = encode_command_request(request)
+        try:
+            sent = connection.send(payload)
+        except BlockingIOError as exc:
+            self._local_error(
+                "E_COMMAND_SEND", f"Could not send motion setting: {exc}"
+            )
+            return False
+        except OSError as exc:
+            self._close_channel()
+            self._local_error(
+                "E_COMMAND_SEND", f"Could not send motion setting: {exc}"
+            )
+            return False
+        if sent != len(payload):
+            self._close_channel()
+            self._local_error(
+                "E_COMMAND_SEND",
+                f"Partial motion-setting packet write: sent {sent}/{len(payload)}",
+            )
+            return False
+        self._pending = request
+        self._pending_warning = None
+        self._result_revision += 1
+        self.status = "pending"
+        self.ok = None
+        self.code = None
+        self.message = f"Applying motion setting {command.path}"
+        self.warning = None
+        self.restart_required = False
+        self.data = None
+        self.last_request_id = request.request_id
+        return True
+
     def poll(self) -> bool:
         """Receive at most one exact response; never resend a pending request."""
 
@@ -5537,6 +5595,19 @@ def main() -> int:
 
             command_state_changed = game_command_client.poll()
             if (
+                command_state_changed
+                and game_command_client.ok is True
+                and isinstance(game_command_client.code, str)
+                and game_command_client.code.startswith("OK_MOTION_SETTING")
+                and motion_store is not None
+            ):
+                try:
+                    motion_store.reload_if_changed()
+                    applied_motion = motion_store.settings
+                    motion_settings_error = None
+                except (MotionSettingsError, OSError, ValueError) as exc:
+                    motion_settings_error = str(exc)
+            if (
                 game_command_client.data is not None
                 and isinstance(game_command_client.data.get("movement_mode"), str)
             ):
@@ -5692,6 +5763,13 @@ def main() -> int:
                             motion_settings_error = None
                             if modification.changed:
                                 motion_settings_change_count += 1
+                                if game_command_client.set_motion_setting(
+                                    modification.path,
+                                    modification.value,
+                                ):
+                                    applied_motion = modification.settings
+                                    command_state_changed = True
+                                    apply_return.cancel_pending()
                             motion_settings_changed = True
                         except (
                             MotionSettingsError,

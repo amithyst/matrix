@@ -2425,7 +2425,12 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 world_revision="a" * 64,
                 checkpoint_seconds=0.75,
             )
-            runtime = MODULE.GameCommandRuntime(runtime_socket, world)
+            applied_poses: list[WORLD_STATE.WorldPose] = []
+            runtime = MODULE.GameCommandRuntime(
+                runtime_socket,
+                world,
+                pose_applier=lambda pose: applied_poses.append(pose) or pose,
+            )
             current_pose = WORLD_STATE.WorldPose(10.0, 20.0, 0.8, 0.5)
             try:
                 summon = self.game_command_request(
@@ -2464,18 +2469,22 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 )
                 provider_socket.send(MC_COMMANDS.encode_command_request(teleport))
 
-                # The successful response must be queued before poll asks the
-                # supervisor to cold-restart the complete runtime generation.
-                self.assertTrue(
+                # Same-world teleport now applies directly inside the live
+                # runtime instead of asking the launcher to cold-restart.
+                self.assertFalse(
                     runtime.poll(current_pose=current_pose, command_allowed=True)
                 )
                 teleport_response = MC_COMMANDS.decode_command_response(
                     provider_socket.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES)
                 )
                 self.assertTrue(teleport_response.ok)
-                self.assertEqual(teleport_response.code, "OK_TELEPORT_RESTART")
-                self.assertTrue(teleport_response.restart_required)
-                self.assertTrue(runtime.restart_requested)
+                self.assertEqual(teleport_response.code, "OK_TELEPORT")
+                self.assertFalse(teleport_response.restart_required)
+                self.assertFalse(runtime.restart_requested)
+                self.assertEqual(
+                    applied_poses,
+                    [WORLD_STATE.WorldPose(11.0, 18.0, 0.8, 0.5)],
+                )
 
                 reloaded = WORLD_STATE.WorldStateStore(
                     state_path,

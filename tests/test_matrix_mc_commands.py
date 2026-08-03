@@ -291,7 +291,9 @@ class McCommandExecutionTest(unittest.TestCase):
             now_unix_ns=3,
         )
 
-        self.assertTrue(effect.restart_required)
+        self.assertFalse(effect.restart_required)
+        self.assertEqual(effect.code, "OK_TELEPORT")
+        self.assertIs(effect.data["hot_pose"], True)
         self.assertEqual(effect.state.last_exit, point.pose)
         self.assertEqual(effect.state.resume_source, "teleport_command")
 
@@ -306,7 +308,10 @@ class McCommandExecutionTest(unittest.TestCase):
         )
 
         self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, 0.5))
-        self.assertTrue(effect.restart_required)
+        self.assertFalse(effect.restart_required)
+        self.assertEqual(effect.code, "OK_TELEPORT")
+        self.assertIs(effect.data["hot_pose"], True)
+        self.assertEqual(effect.data["yaw_rad"], 0.5)
 
     def test_world_scene_command_requests_bounded_internal_reload(self) -> None:
         command = MODULE.parse_mc_command("/world moon").command
@@ -362,8 +367,8 @@ class McCommandExecutionTest(unittest.TestCase):
             now_unix_ns=4,
         )
 
-        self.assertTrue(effect.restart_required)
-        self.assertEqual(effect.code, "OK_FUNCTION_RESTART")
+        self.assertFalse(effect.restart_required)
+        self.assertEqual(effect.code, "OK_FUNCTION")
         self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, math.pi))
 
     def test_file_function_requires_runtime_support(self) -> None:

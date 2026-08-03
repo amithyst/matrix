@@ -565,6 +565,39 @@ class GameCommandClientTest(unittest.TestCase):
             },
         )
 
+    def test_motion_setting_panel_action_sends_typed_hot_command(self) -> None:
+        client, runtime = self.make_client()
+
+        self.assertTrue(
+            client.set_motion_setting(
+                MODULE.CAMERA_HEADING_SNAP_ERROR_PATH,
+                math.radians(3.0),
+            )
+        )
+        payload = runtime.recv(MC_COMMANDS.MAX_COMMAND_PACKET_BYTES + 1)
+        self.assertNotIn(b"data modify", payload)
+        request = MC_COMMANDS.decode_command_request(payload)
+        self.assertIsInstance(request.command, MC_COMMANDS.MotionSettingSet)
+        self.assertEqual(request.command.path, MODULE.CAMERA_HEADING_SNAP_ERROR_PATH)
+        self.assertAlmostEqual(request.command.value, math.radians(3.0))
+
+        runtime.send(
+            MC_COMMANDS.encode_command_response(
+                MC_COMMANDS.GameCommandResponse(
+                    session=request.session,
+                    sequence=request.sequence,
+                    request_id=request.request_id,
+                    ok=True,
+                    code="OK_MOTION_SETTING_CHANGED",
+                    message="Motion setting applied",
+                    restart_required=False,
+                )
+            )
+        )
+        self.assertTrue(client.poll())
+        self.assertEqual(client.status, "success")
+        self.assertFalse(client.restart_required)
+
     def test_only_one_request_is_in_flight_and_restart_response_is_terminal(self) -> None:
         client, runtime = self.make_client()
         self.enable_editor(client)

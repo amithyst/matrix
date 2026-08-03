@@ -1332,6 +1332,14 @@ def _root_yaw_rad(qpos) -> float:
     return math.atan2(sine, cosine)
 
 
+def _yaw_quat_wxyz(yaw_rad: float) -> tuple[float, float, float, float]:
+    yaw = float(yaw_rad)
+    if not math.isfinite(yaw):
+        raise WorldStateError("hot pose yaw is not finite")
+    half = 0.5 * yaw
+    return (math.cos(half), 0.0, 0.0, math.sin(half))
+
+
 def _snapshot_world_pose(snapshot: Any) -> WorldPose:
     try:
         qpos = snapshot.qpos
@@ -2953,6 +2961,7 @@ class GameCommandRuntime:
         core: GameControlCore | None = None,
         function_directory: Path | None = None,
         motion_settings: MotionSettingsStore | None = None,
+        pose_applier: Callable[[WorldPose], WorldPose] | None = None,
     ) -> None:
         self.connection = connection
         self.connection.setblocking(False)
@@ -2962,6 +2971,7 @@ class GameCommandRuntime:
             function_directory.resolve() if function_directory is not None else None
         )
         self.motion_settings = motion_settings
+        self.pose_applier = pose_applier
         self.session: str | None = None
         self.last_sequence = 0
         self.request_ids: set[str] = set()
@@ -2973,6 +2983,44 @@ class GameCommandRuntime:
         self.restart_requested = False
         self.restart_target: dict[str, object] | None = None
         self.last_response: dict[str, object] | None = None
+
+    @staticmethod
+    def _hot_pose_requested(data: Mapping[str, object]) -> bool:
+        return data.get("hot_pose") is True
+
+    def _apply_hot_pose(
+        self,
+        pose: WorldPose,
+        data: Mapping[str, object],
+    ) -> tuple[dict[str, object], WorldPose | None]:
+        data = dict(data)
+        if not self._hot_pose_requested(data):
+            return data, None
+        if not isinstance(pose, WorldPose):
+            raise CommandExecutionError(
+                "E_HOT_POSE_MISSING",
+                "hot pose command did not produce a valid target pose",
+            )
+        applier = self.pose_applier
+        if applier is None:
+            raise CommandExecutionError(
+                "E_HOT_POSE_UNAVAILABLE",
+                "This runtime cannot apply same-world pose changes without a reload",
+            )
+        applied = applier(pose)
+        data["position"] = [applied.x, applied.y, applied.z]
+        data["yaw_rad"] = applied.yaw_rad
+        data["hot_pose_applied"] = True
+        return data, applied
+
+    def _apply_hot_pose_effect(
+        self,
+        effect: Any,
+    ) -> tuple[dict[str, object], WorldPose | None]:
+        data = dict(getattr(effect, "data", {}) or {})
+        state = getattr(effect, "state", None)
+        pose = getattr(state, "last_exit", None)
+        return self._apply_hot_pose(pose, data)
 
     def _send(self, response: GameCommandResponse) -> None:
         payload = encode_command_response(response)
@@ -3235,9 +3283,10 @@ class GameCommandRuntime:
         current_pose: WorldPose,
         state: object,
         stack: tuple[str, ...],
-    ) -> tuple[object, WorldPose, bool, list[dict[str, object]]]:
+    ) -> tuple[object, WorldPose, bool, WorldPose | None, list[dict[str, object]]]:
         working_pose = current_pose
         restart_required = False
+        hot_pose: WorldPose | None = None
         steps: list[dict[str, object]] = []
         next_state = state
         for step in commands:
@@ -3278,7 +3327,15 @@ class GameCommandRuntime:
                 )
                 continue
             if isinstance(step, CommandFunctionCall):
-                code, message, nested_restart, data, next_state, working_pose = (
+                (
+                    code,
+                    message,
+                    nested_restart,
+                    data,
+                    next_state,
+                    working_pose,
+                    nested_hot_pose,
+                ) = (
                     self._execute_function_call(
                         step,
                         current_pose=working_pose,
@@ -3286,6 +3343,8 @@ class GameCommandRuntime:
                         stack=stack,
                     )
                 )
+                if nested_hot_pose is not None:
+                    hot_pose = nested_hot_pose
                 restart_required = restart_required or nested_restart
                 steps.append(
                     {
@@ -3310,6 +3369,8 @@ class GameCommandRuntime:
             next_state = effect.state
             if effect.state.last_exit is not None:
                 working_pose = effect.state.last_exit
+                if self._hot_pose_requested(effect.data):
+                    hot_pose = working_pose
             self._record_restart_target(effect.data)
             restart_required = restart_required or effect.restart_required
             steps.append(
@@ -3320,7 +3381,7 @@ class GameCommandRuntime:
                     "data": dict(effect.data),
                 }
             )
-        return next_state, working_pose, restart_required, steps
+        return next_state, working_pose, restart_required, hot_pose, steps
 
     @staticmethod
     def _restart_target_from_data(data: Mapping[str, object]) -> dict[str, object] | None:
@@ -3352,7 +3413,7 @@ class GameCommandRuntime:
         current_pose: WorldPose,
         state: object,
         stack: tuple[str, ...] = (),
-    ) -> tuple[str, str, bool, dict[str, object], object, WorldPose]:
+    ) -> tuple[str, str, bool, dict[str, object], object, WorldPose, WorldPose | None]:
         if command.name in stack:
             cycle = " -> ".join((*stack, command.name))
             raise CommandExecutionError(
@@ -3365,7 +3426,7 @@ class GameCommandRuntime:
                 f"Matrix function nesting exceeds {_MAX_FUNCTION_DEPTH}",
             )
         path, commands = self._load_function_file(command)
-        next_state, working_pose, restart_required, steps = (
+        next_state, working_pose, restart_required, hot_pose, steps = (
             self._execute_function_steps(
                 commands,
                 current_pose=current_pose,
@@ -3384,6 +3445,7 @@ class GameCommandRuntime:
             },
             next_state,
             working_pose,
+            hot_pose,
         )
 
     def _save_function_state(self, state: object) -> None:
@@ -3428,7 +3490,7 @@ class GameCommandRuntime:
     ) -> tuple[str, str, bool, dict[str, object]]:
         state = self.world.state if self.world is not None else None
         if isinstance(command, CommandFunctionCall):
-            code, message, restart_required, data, state, _working_pose = (
+            code, message, restart_required, data, state, _working_pose, hot_pose = (
                 self._execute_function_call(
                     command,
                     current_pose=current_pose,
@@ -3437,19 +3499,24 @@ class GameCommandRuntime:
                 )
             )
             self._save_function_state(state)
+            if hot_pose is not None and not restart_required:
+                data, _applied = self._apply_hot_pose(hot_pose, {"hot_pose": True, **data})
             return code, message, restart_required, data
-        state, _working_pose, restart_required, steps = self._execute_function_steps(
+        state, _working_pose, restart_required, hot_pose, steps = self._execute_function_steps(
             command.commands,
             current_pose=current_pose,
             state=state,
             stack=(),
         )
         self._save_function_state(state)
+        data: dict[str, object] = {"steps": steps}
+        if hot_pose is not None and not restart_required:
+            data, _applied = self._apply_hot_pose(hot_pose, {"hot_pose": True, **data})
         return (
             "OK_FUNCTION_RESTART" if restart_required else "OK_FUNCTION",
             f"Function executed {len(steps)} step(s)",
             restart_required,
-            {"steps": steps},
+            data,
         )
 
     def poll(
@@ -3708,6 +3775,7 @@ class GameCommandRuntime:
                     current_pose=current_pose,
                     now_unix_ns=time.time_ns(),
                 )
+                effect_data, _applied_pose = self._apply_hot_pose_effect(effect)
                 self.world.store.save(effect.state)
             except CommandExecutionError as exc:
                 self.rejected_commands += 1
@@ -3734,7 +3802,7 @@ class GameCommandRuntime:
                 continue
             self.world.state = effect.state
             self.world.last_error = None
-            self._record_restart_target(effect.data)
+            self._record_restart_target(effect_data)
             self.commands_executed += 1
             self._send(
                 self._response(
@@ -3743,7 +3811,7 @@ class GameCommandRuntime:
                     code=effect.code,
                     message=effect.message,
                     restart_required=effect.restart_required,
-                    data=dict(effect.data),
+                    data=effect_data,
                 )
             )
             if effect.restart_required:
@@ -4677,6 +4745,52 @@ def main() -> int:
             )
         except ValueError as exc:
             raise SystemExit(f"invalid native SONIC initial root heading: {exc}") from exc
+
+        def apply_hot_world_pose(pose: WorldPose) -> WorldPose:
+            nonlocal snapshot, fall_detected, min_root_z, instability_resets
+            if not isinstance(pose, WorldPose):
+                raise WorldStateError("hot pose target must be a WorldPose")
+            environment = getattr(simulator, "sim_env", None)
+            model = getattr(environment, "mj_model", None)
+            data = getattr(environment, "mj_data", None)
+            if model is None or data is None:
+                raise WorldStateError("hot pose requires live MuJoCo model/data")
+            try:
+                import mujoco as hot_pose_mujoco
+
+                qpos_live = data.qpos
+                qvel_live = data.qvel
+                qpos_live[0] = pose.x
+                qpos_live[1] = pose.y
+                qpos_live[2] = pose.z
+                qpos_live[3:7] = _yaw_quat_wxyz(pose.yaw_rad)
+                qvel_live[:] = 0.0
+                if hasattr(data, "ctrl"):
+                    data.ctrl[:] = 0.0
+                if hasattr(environment, "fall"):
+                    environment.fall = False
+                if hasattr(environment, "fall_detected"):
+                    environment.fall_detected = False
+                if moon_dynamic_ground is not None:
+                    moon_dynamic_ground.update_mocap(data)
+                hot_pose_mujoco.mj_forward(model, data)
+                snapshot = simulator.get_state_snapshot()
+            except (
+                AttributeError,
+                ImportError,
+                IndexError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise WorldStateError(f"cannot apply hot pose: {exc}") from exc
+            step_error = _snapshot_validation_error(snapshot)
+            if step_error is not None:
+                raise WorldStateError(f"hot pose produced invalid snapshot: {step_error}")
+            fall_detected = bool(snapshot.fall_detected)
+            instability_resets = int(snapshot.reset_count)
+            min_root_z = min(min_root_z, float(snapshot.qpos[2]))
+            return _snapshot_world_pose(snapshot)
+
         applied_game_camera_yaw_offset_deg = float(
             getattr(args, "game_camera_yaw_offset_deg", 0.0)
         )
@@ -4755,6 +4869,7 @@ def main() -> int:
                         game_input.core,
                         args.game_function_directory,
                         motion_settings_store,
+                        pose_applier=apply_hot_world_pose,
                     )
                 try:
                     game_input.open()
@@ -5078,57 +5193,76 @@ def main() -> int:
                         assert planner is not None
                         game_command = game_input.emergency_stop(
                             now_s=time.perf_counter(),
-                            reason="fall_respawn_reload",
+                            reason="fall_hot_recover",
                         )
                         planner.send_game_command(game_command)
                         walking = False
                         try:
                             checkpoint_now = time.perf_counter()
                             if moon_dynamic_ground is not None:
-                                game_world.set_resume_pose(
-                                    _moon_fall_respawn_pose(
-                                        snapshot,
-                                        moon_dynamic_ground,
-                                    ),
-                                    source="recover_here",
-                                    now_s=checkpoint_now,
-                                    required=True,
+                                recovery_pose = _moon_fall_respawn_pose(
+                                    snapshot,
+                                    moon_dynamic_ground,
                                 )
                             else:
-                                game_world.checkpoint(
-                                    snapshot,
-                                    now_s=checkpoint_now,
-                                    force=True,
-                                    required=True,
+                                fallen_pose = _snapshot_world_pose(snapshot)
+                                if game_world.state.last_safe is not None:
+                                    recovery_pose = WorldPose(
+                                        fallen_pose.x,
+                                        fallen_pose.y,
+                                        game_world.state.last_safe.z,
+                                        game_world.state.last_safe.yaw_rad,
+                                    )
+                                else:
+                                    recovery_pose = WorldPose(
+                                        fallen_pose.x,
+                                        fallen_pose.y,
+                                        max(fallen_pose.z, 0.793),
+                                        fallen_pose.yaw_rad,
+                                    )
+                            game_world.set_resume_pose(
+                                recovery_pose,
+                                source="recover_here",
+                                now_s=checkpoint_now,
+                                required=True,
+                            )
+                            applied_recovery_pose = apply_hot_world_pose(
+                                recovery_pose
+                            )
+                            fall_detected = bool(snapshot.fall_detected)
+                            if fall_detected:
+                                raise WorldStateError(
+                                    "hot fall recovery still reports fallen"
                                 )
                         except WorldStateError as exc:
                             running = False
                             termination_reason = "world_state_error"
-                            numerical_error = f"fall_checkpoint:{exc}"
+                            numerical_error = f"fall_hot_recover:{exc}"
                             print(
-                                "matrix-sonic-runtime ERROR cannot save fall "
-                                f"respawn checkpoint: {exc}",
+                                "matrix-sonic-runtime ERROR cannot hot-recover "
+                                f"fall pose: {exc}",
                                 flush=True,
                             )
                             break
-                        running = False
-                        termination_reason = "game_fall_respawn"
                         if moon_recoverable_pose_error is None:
                             print(
-                                "matrix-sonic-runtime fall detected; saved an "
-                                "upright cold-respawn checkpoint",
+                                "matrix-sonic-runtime fall detected; applied "
+                                "hot upright recovery "
+                                f"x={applied_recovery_pose.x:.3f} "
+                                f"y={applied_recovery_pose.y:.3f} "
+                                f"z={applied_recovery_pose.z:.3f}",
                                 flush=True,
                             )
                         else:
                             moon_reason, moon_diagnostics = moon_recoverable_pose_error
                             print(
                                 "matrix-sonic-runtime MoonWorld recoverable "
-                                f"pose error {moon_reason}; saved an upright "
-                                "cold-respawn checkpoint "
+                                f"pose error {moon_reason}; applied hot "
+                                "upright recovery "
                                 f"{json.dumps(moon_diagnostics, sort_keys=True)}",
                                 flush=True,
                             )
-                        break
+                        continue
                     if args.fail_on_fall:
                         running = False
                         termination_reason = "fall_detected"

@@ -1111,10 +1111,14 @@ def execute_command(
         )
         return CommandEffect(
             state=next_state,
-            code="OK_TELEPORT_RESTART",
-            message="Teleport saved; reloading Matrix at the destination",
-            restart_required=True,
-            data={"position": [pose.x, pose.y, pose.z]},
+            code="OK_TELEPORT",
+            message="Teleported Matrix at the destination",
+            restart_required=False,
+            data={
+                "position": [pose.x, pose.y, pose.z],
+                "yaw_rad": pose.yaw_rad,
+                "hot_pose": True,
+            },
         )
     if isinstance(command, PoseYawSet):
         yaw_rad = command.angle.resolve(current_pose.yaw_rad)
@@ -1124,12 +1128,13 @@ def execute_command(
         )
         return CommandEffect(
             state=next_state,
-            code="OK_POSE_RESTART",
-            message="Pose saved; reloading Matrix with the requested yaw",
-            restart_required=True,
+            code="OK_POSE",
+            message="Pose applied with the requested yaw",
+            restart_required=False,
             data={
                 "position": [pose.x, pose.y, pose.z],
                 "yaw_rad": pose.yaw_rad,
+                "hot_pose": True,
             },
         )
     if isinstance(command, RecoverHere):
@@ -1149,13 +1154,14 @@ def execute_command(
         )
         return CommandEffect(
             state=next_state,
-            code="OK_RECOVER_RESTART",
-            message="Recover pose saved; reloading Matrix upright at current XY",
-            restart_required=True,
+            code="OK_RECOVER",
+            message="Recovered Matrix upright at current XY",
+            restart_required=False,
             data={
                 "position": [pose.x, pose.y, pose.z],
                 "yaw_rad": pose.yaw_rad,
                 "source": "last_safe",
+                "hot_pose": True,
             },
         )
     if isinstance(command, TeleportSelector):
@@ -1181,13 +1187,15 @@ def execute_command(
         )
         return CommandEffect(
             state=next_state,
-            code="OK_TELEPORT_RESTART",
-            message=f"Teleporting to {command.tag}; reloading Matrix",
-            restart_required=True,
+            code="OK_TELEPORT",
+            message=f"Teleported to {command.tag}",
+            restart_required=False,
             data={
                 "entity_id": point.entity_id,
                 "position": [point.pose.x, point.pose.y, point.pose.z],
+                "yaw_rad": point.pose.yaw_rad,
                 "tags": list(point.tags),
+                "hot_pose": True,
             },
         )
     if isinstance(command, WorldSceneSet):
