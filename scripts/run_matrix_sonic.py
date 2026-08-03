@@ -1408,6 +1408,27 @@ def _yaw_quat_wxyz(yaw_rad: float) -> tuple[float, float, float, float]:
     return (math.cos(half), 0.0, 0.0, math.sin(half))
 
 
+def _standing_qpos_template(model: Any, fallback_qpos: Any) -> Any:
+    """Return a clean standing qpos template for manual recovery.
+
+    Startup qpos can be polluted by a persisted fallen ``last_exit`` pose.  Manual
+    standing recovery therefore uses the model reset pose when available, and only
+    falls back to the live startup snapshot when the model does not expose a
+    compatible finite ``qpos0``.
+    """
+
+    import numpy as np
+
+    fallback = np.asarray(fallback_qpos, dtype=np.float64).copy()
+    qpos0 = getattr(model, "qpos0", None)
+    if qpos0 is None:
+        return fallback
+    candidate = np.asarray(qpos0, dtype=np.float64)
+    if candidate.shape != fallback.shape or not np.all(np.isfinite(candidate)):
+        return fallback
+    return candidate.copy()
+
+
 def _snapshot_world_pose(snapshot: Any) -> WorldPose:
     try:
         qpos = snapshot.qpos
@@ -4989,7 +5010,10 @@ def main() -> int:
         except ValueError as exc:
             raise SystemExit(f"invalid native SONIC initial root heading: {exc}") from exc
 
-        initial_qpos = np.asarray(qpos, dtype=np.float64).copy()
+        standing_qpos = _standing_qpos_template(
+            getattr(getattr(simulator, "sim_env", None), "mj_model", None),
+            qpos,
+        )
 
         def apply_hot_world_pose(
             pose: WorldPose,
@@ -5013,12 +5037,18 @@ def main() -> int:
                 qpos_live[2] = pose.z
                 qpos_live[3:7] = _yaw_quat_wxyz(pose.yaw_rad)
                 if reset_to_standing:
-                    if len(qpos_live) != len(initial_qpos):
+                    if len(qpos_live) != len(standing_qpos):
                         raise WorldStateError(
                             "standing pose qpos size does not match live model"
                         )
-                    qpos_live[7:] = initial_qpos[7:]
+                    qpos_live[7:] = standing_qpos[7:]
                 qvel_live[:] = 0.0
+                if hasattr(data, "qacc"):
+                    data.qacc[:] = 0.0
+                if hasattr(data, "qacc_warmstart"):
+                    data.qacc_warmstart[:] = 0.0
+                if hasattr(data, "act") and data.act is not None:
+                    data.act[:] = 0.0
                 if hasattr(data, "ctrl"):
                     data.ctrl[:] = 0.0
                 if hasattr(environment, "fall"):

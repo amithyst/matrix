@@ -2722,6 +2722,40 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                 provider_socket.close()
                 runtime.close()
 
+    def test_standing_qpos_template_prefers_model_qpos0_over_polluted_startup(
+        self,
+    ) -> None:
+        polluted_startup = np.array(
+            [10.0, 20.0, 0.2, 1.0, 0.0, 0.0, 0.0, 9.0, 8.0, 7.0],
+            dtype=np.float64,
+        )
+        clean_model_qpos0 = np.array(
+            [1.0, 2.0, 0.71, 1.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.3],
+            dtype=np.float64,
+        )
+
+        template = MODULE._standing_qpos_template(
+            SimpleNamespace(qpos0=clean_model_qpos0),
+            polluted_startup,
+        )
+
+        np.testing.assert_allclose(template[7:], [0.1, 0.2, 0.3])
+        np.testing.assert_allclose(template[:7], clean_model_qpos0[:7])
+        self.assertIsNot(template, clean_model_qpos0)
+
+    def test_standing_qpos_template_falls_back_without_compatible_qpos0(self) -> None:
+        polluted_startup = np.array([0.0, 0.0, 0.2, 1.0, 0.0, 0.0, 0.0, 9.0])
+
+        for model in (
+            SimpleNamespace(),
+            SimpleNamespace(qpos0=np.array([0.0, 1.0])),
+            SimpleNamespace(qpos0=np.array([0.0] * 7 + [float("nan")])),
+        ):
+            with self.subTest(model=model):
+                template = MODULE._standing_qpos_template(model, polluted_startup)
+                np.testing.assert_allclose(template, polluted_startup)
+                self.assertIsNot(template, polluted_startup)
+
     def test_recover_command_forces_pause_and_standing_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "world-state.json"
