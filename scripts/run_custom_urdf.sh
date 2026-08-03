@@ -1232,6 +1232,17 @@ if urdf_root is not None:
         for link in urdf_root.findall("link")
         if link.get("name")
     }
+    urdf_child_links = {
+        child.get("link")
+        for ujoint in urdf_root.findall("joint")
+        for child in [ujoint.find("child")]
+        if child is not None and child.get("link")
+    }
+    urdf_root_links = [
+        name
+        for name in urdf_links
+        if name not in urdf_child_links
+    ]
     for ujoint in urdf_root.findall("joint"):
         jname = ujoint.get("name")
         limit_elem = ujoint.find("limit")
@@ -1240,6 +1251,8 @@ if urdf_root is not None:
                 urdf_joint_effort[jname] = float(limit_elem.get("effort", "0"))
             except (ValueError, TypeError):
                 pass
+else:
+    urdf_root_links = []
 
 def rpy_to_quat(roll: float, pitch: float, yaw: float) -> str:
     cr = math.cos(roll * 0.5)
@@ -1336,6 +1349,15 @@ def ensure_site(body: ET.Element, attrib: dict) -> None:
                 elem.set(key, value)
             return
     insert_before_child_bodies(body, ET.Element("site", attrib=attrib))
+
+def find_body_by_name(body_name: str) -> ET.Element | None:
+    for body in worldbody.iter("body"):
+        if body.get("name") == body_name:
+            return body
+    return None
+
+def has_descendant_joint(body: ET.Element) -> bool:
+    return any(child.tag == "joint" for child in body.iter())
 
 def replace_inertial_from_urdf(body: ET.Element, link_name: str) -> bool:
     link = urdf_links.get(link_name)
@@ -1480,9 +1502,22 @@ for body in worldbody.findall("body"):
         root_body = body
         break
 if root_body is None:
+    for root_link_name_candidate in urdf_root_links:
+        candidate = find_body_by_name(root_link_name_candidate)
+        if candidate is not None:
+            root_body = candidate
+            break
+if root_body is None:
+    for body in worldbody.findall("body"):
+        if body.find("freejoint") is not None and has_descendant_joint(body):
+            root_body = body
+            break
+if root_body is None:
     root_body = ET.SubElement(worldbody, "body", attrib={"name": "BASE_LINK", "pos": "0 0 0", "quat": "1 0 0 0"})
 
-root_link_name = next((name for name in ("BASE_LINK", "base_link", "ROOT_LINK") if name in urdf_links), root_body.get("name", "BASE_LINK"))
+root_link_name = root_body.get("name", "BASE_LINK")
+if root_link_name not in urdf_links:
+    root_link_name = next((name for name in ("BASE_LINK", "base_link", "ROOT_LINK") if name in urdf_links), root_link_name)
 root_body.set("name", root_link_name)
 root_body.set("childclass", "robot")
 
