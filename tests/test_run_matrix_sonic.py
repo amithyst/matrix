@@ -2218,6 +2218,23 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         client.send_game_command(
             MODULE.RobotMotionCommand(
+                sequence=142,
+                movement=(0.0, 0.0, 0.0),
+                facing=(0.0, 1.0, 0.0),
+                speed_mps=0.0,
+                locomotion_mode=10,
+                mode="idle",
+                safe_stop=False,
+                reason=None,
+            )
+        )
+        self.assertEqual(planners[-1]["mode"], 10)
+        self.assertEqual(planners[-1]["movement"], [0.0, 0.0, 0.0])
+        self.assertEqual(planners[-1]["facing"], [0.0, 1.0, 0.0])
+        self.assertEqual(planners[-1]["speed"], -1.0)
+
+        client.send_game_command(
+            MODULE.RobotMotionCommand(
                 sequence=15,
                 movement=(1.0, 0.0, 0.0),
                 facing=(1.0, 0.0, 0.0),

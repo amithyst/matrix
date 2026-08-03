@@ -2765,8 +2765,16 @@ class NativePlannerClient:
             and command.mode == "turn"
             and command.locomotion_mode != SONIC_IDLE_MODE
         )
+        stationary_native_action = bool(
+            not moving
+            and command.locomotion_mode >= SONIC_NATIVE_MANUAL_MODE_MIN
+        )
         if not moving:
-            if command.locomotion_mode != SONIC_IDLE_MODE and not stationary_turn:
+            if (
+                command.locomotion_mode != SONIC_IDLE_MODE
+                and not stationary_turn
+                and not stationary_native_action
+            ):
                 raise ValueError("stationary game command must use native IDLE")
         else:
             if command.locomotion_mode == SONIC_IDLE_MODE:
@@ -2784,7 +2792,7 @@ class NativePlannerClient:
             facing=command.facing,
             speed=speed_mps,
             locomotion_mode=command.locomotion_mode,
-            allow_stationary_locomotion=stationary_turn,
+            allow_stationary_locomotion=stationary_turn or stationary_native_action,
             delta_heading=command.delta_heading_rad,
         )
 
