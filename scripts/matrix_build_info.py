@@ -40,6 +40,7 @@ SCENE_NAMES = {
     13: "OfficeWorld",
     14: "3DGSWorld",
     15: "MoonWorld",
+    18: "RobotTrainingGround",
     20: "CalibrationRoom",
     21: "ApartmentWorld",
     22: "Laboratory",

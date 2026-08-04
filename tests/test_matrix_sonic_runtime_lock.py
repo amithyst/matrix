@@ -10,7 +10,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import py_compile
 import shutil
 import shlex
 import subprocess
@@ -66,26 +65,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.lock_path = REPO_ROOT / "config/runtime/matrix-sonic.lock.json"
         self.lock = MODULE.load_lock(self.lock_path)
 
-    def test_policy_slot_manifest_is_schema_checked_and_content_locked(self) -> None:
-        MODULE.validate_schema(self.lock)
-        MODULE.validate_policy_manifest_files(self.lock, REPO_ROOT)
-        entry = self.lock["policy_slots"]["manifests"][0]
-        manifest = REPO_ROOT / entry["path"]
-        self.assertEqual(
-            hashlib.sha256(manifest.read_bytes()).hexdigest(),
-            entry["sha256"],
-        )
-
-        bad_hash = copy.deepcopy(self.lock)
-        bad_hash["policy_slots"]["manifests"][0]["sha256"] = "0" * 64
-        with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
-            MODULE.validate_policy_manifest_files(bad_hash, REPO_ROOT)
-
-        unsafe = copy.deepcopy(self.lock)
-        unsafe["policy_slots"]["manifests"][0]["path"] = "../candidate.json"
-        with self.assertRaisesRegex(ValueError, "invalid or duplicate"):
-            MODULE.validate_schema(unsafe)
-
     def test_release_packages_match_urban_contract(self) -> None:
         urban = json.loads(
             (REPO_ROOT / "research/urban_v1/scene.json").read_text(encoding="utf-8")
@@ -98,17 +77,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             packages["Town10World"]["sha256"],
             urban["visual_source"]["release_sha256"],
         )
-        self.assertEqual(
-            packages["MoonWorld"]["sha256"],
-            "c4e3dee47ffa434712b0238d08b0b68067f1b1c9820e2ddb455f996f04e364b1",
-        )
-        self.assertEqual(packages["MoonWorld"]["size"], 633678813)
-        self.assertEqual(
-            packages["HouseWorld"]["sha256"],
-            "489d8db9c8471bc652bbebb5f0555c1bf50ea5854a90490cecc157667e150822",
-        )
-        self.assertEqual(packages["HouseWorld"]["size"], 402917615)
-        self.assertEqual(sum(item["size"] for item in packages.values()), 8794258987)
+        self.assertEqual(sum(item["size"] for item in packages.values()), 8391341372)
         installed = {
             entry["path"]: entry
             for entry in self.lock["matrix_release"]["installed_files"]
@@ -124,34 +93,8 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "7784452106dc0bce57588d3c148a6117798c583a7675b6414ca9d40139ee7df6",
         )
         self.assertEqual(
-            installed[
-                "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_moon_dynamic.xml"
-            ]["sha256"],
-            "9d292ba519427547a7bdff6056d3d55b32165879ec2cc3e058b27213209e6da5",
-        )
-        self.assertEqual(
-            installed[
-                "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_house.xml"
-            ]["sha256"],
-            "2586d8a5f7263eaa31fd1347202b3767888a181c7aad56e0a4a21838ed250a64",
-        )
-        self.assertEqual(
-            installed[
-                "src/robot_mujoco/zsibot_robots/xgb/scene_terrain_house.xml"
-            ]["size"],
-            13118,
-        )
-        self.assertEqual(
-            installed["dynamicmaps/moonworld.bin"]["sha256"],
-            "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df",
-        )
-        self.assertEqual(
             self.lock["matrix_release"]["installed_trees"][0]["sha256"],
             "9ebc024fa07ddf2deb6a9939bb276dea03b1c6d9e5dfee932b181800b7811232",
-        )
-        self.assertEqual(
-            self.lock["matrix_release"]["installed_trees"][1]["sha256"],
-            "6063433987ed51cb566e421acf41daf9ef9bacd767c9d7a9abdc88e4034ef2ac",
         )
         for required in (
             "src/UeSim/Linux/Engine/Binaries/Linux/libEOSSDK-Linux-Shipping.so",
@@ -355,7 +298,7 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertEqual(self.lock["runtime_id"], "matrix-sonic-native-v2")
         self.assertEqual(
             self.lock["source_revisions"]["gr00t_whole_body_control"]["commit"],
-            "e19b627f544b2f57bd245800d0e8e91c5a678bbd",
+            "de083d71af8346b0124ab1ae79fd3623b52c3c9b",
         )
 
     def test_host_profiles_use_repo_local_runtime(self) -> None:
@@ -372,45 +315,25 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
 
         self.assertEqual(MODULE.HOST_PROFILES, ("heyuan", "trna", "zza"))
         trna = (REPO_ROOT / "config/hosts/trna.env").read_text(encoding="utf-8")
-        self.assertIn("worktrees/sonic-matrix-recovery-v77", trna)
+        self.assertIn("worktrees/sonic-matrix-native-final", trna)
         self.assertNotIn("code_bryce", trna)
+        self.assertIn(
+            'MATRIX_GAME_CAMERA_YAW_SOURCE="${MATRIX_GAME_CAMERA_YAW_SOURCE:-ue-final-pov}"',
+            trna,
+        )
+        self.assertIn(
+            'MATRIX_GAME_CAMERA_YAW_SIGN="${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"',
+            trna,
+        )
+        self.assertIn(
+            'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG="${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"',
+            trna,
+        )
         zza = (REPO_ROOT / "config/hosts/zza.env").read_text(encoding="utf-8")
         self.assertIn('DISPLAY="${DISPLAY:-:1}"', zza)
         self.assertIn("MATRIX_RUNTIME_ROOT/ros2-humble-prefix", zza)
         self.assertIn("MATRIX_CUDA_ROOT", zza)
         self.assertIn('PATH="$MATRIX_TOOLS_ROOT/bin:$PATH"', zza)
-
-    def test_trna_item_inventory_preserves_the_legacy_host_override(self) -> None:
-        profile = REPO_ROOT / "config/hosts/trna.env"
-        legacy_catalog = "/tmp/matrix-legacy-inventory.json"
-        command = (
-            'set -euo pipefail; '
-            f'export MATRIX_PROJECT_ROOT={shlex.quote(os.fspath(REPO_ROOT))}; '
-            "unset MATRIX_ITEM_INVENTORY_CATALOG; "
-            f'export MATRIX_CREATIVE_INVENTORY_CATALOG={legacy_catalog}; '
-            f'source {shlex.quote(os.fspath(profile))}; '
-            'printf "%s\\n" "$MATRIX_ITEM_INVENTORY_CATALOG"'
-        )
-        result = subprocess.run(
-            ["/bin/bash", "-c", command],
-            env={
-                "HOME": "/tmp/matrix-profile-test-home",
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            },
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, msg=result.stderr)
-        self.assertEqual(result.stdout.strip(), legacy_catalog)
-
-        for launcher in ("run_sim.sh", "run_custom_urdf.sh"):
-            text = (REPO_ROOT / "scripts" / launcher).read_text(encoding="utf-8")
-            self.assertIn("MATRIX_ITEM_INVENTORY_CATALOG", text)
-            self.assertIn(
-                "conflicts with the legacy",
-                text,
-            )
 
     def test_release_installs_do_not_dirty_the_checkout(self) -> None:
         text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -491,274 +414,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "Matrix motion controller: disabled by selected runtime topology",
             check_env,
         )
-
-    def test_physical_recovery_launch_contract_is_fail_closed(self) -> None:
-        launcher = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
-            encoding="utf-8"
-        )
-        run_sim = (REPO_ROOT / "scripts/run_sim.sh").read_text(encoding="utf-8")
-        heyuan = (REPO_ROOT / "config/hosts/heyuan.env").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            'MATRIX_ENGINE_INPUT_BRIDGE="${MATRIX_ENGINE_INPUT_BRIDGE:-1}"',
-            heyuan,
-        )
-        self.assertIn(
-            "MATRIX_ENGINE_CAMERA_LOOK_BACKEND="
-            '"${MATRIX_ENGINE_CAMERA_LOOK_BACKEND:-xtest}"',
-            heyuan,
-        )
-
-        self.assertIn('GAME_FALL_RECOVERY="physical"', launcher)
-        self.assertIn('GAME_FALL_RECOVERY="off"', launcher)
-        self.assertIn("select_physical_recovery_python", launcher)
-        self.assertIn("import numpy, onnxruntime", launcher)
-        self.assertIn("ChannelPublisher, ChannelSubscriber", launcher)
-        self.assertIn("LowCmd_, LowState_", launcher)
-        self.assertIn("MATRIX_PHYSICAL_RECOVERY_PYTHON", launcher)
-        self.assertIn("MATRIX_SONIC_FAIL_ON_FALL=0", launcher)
-        for argument in (
-            "--physical-recovery-worker",
-            "--physical-recovery-python",
-            "--physical-recovery-model",
-            "--physical-recovery-fallback-model",
-            "--physical-recovery-fallback-after-seconds",
-            "--physical-recovery-stable-hold-seconds",
-            "--physical-recovery-control-socket",
-            "--physical-recovery-kungfu-model",
-            "--physical-recovery-kungfu-motion",
-            "--physical-recovery-kungfu-reference-frame",
-            "--physical-recovery-kungfu-gain-scale",
-        ):
-            self.assertIn(argument, launcher)
-            self.assertIn(argument, run_sim)
-        for argument in (
-            "--physical-recovery-kungfu-model-sha256",
-            "--physical-recovery-kungfu-model-data-sha256",
-            "--physical-recovery-kungfu-motion-sha256",
-        ):
-            self.assertIn(argument, run_sim)
-        self.assertIn("import numpy, onnxruntime", run_sim)
-        self.assertIn("ChannelPublisher, ChannelSubscriber", run_sim)
-        self.assertIn("MATRIX_GAME_FALL_RECOVERY=physical", run_sim)
-        self.assertIn("host|amp|amp-flat-v3|kungfu", run_sim)
-        self.assertIn(
-            'MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-kungfu',
-            heyuan,
-        )
-        self.assertIn("MATRIX_PHYSICAL_RECOVERY_HANDOFF:-amp", heyuan)
-        self.assertIn("1307-sonic-default-frame15689.npz", heyuan)
-        self.assertIn(
-            "164fb1be98102a6e0ca45ecf9aaf5fd1dedcd28e0cd53bc3bdbd80c9b94ee863",
-            heyuan,
-        )
-        self.assertIn("MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME:-15689", heyuan)
-        self.assertIn("MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-0.2", heyuan)
-        self.assertIn("host_prone_v1_0322.onnx", heyuan)
-        self.assertIn(
-            "62abf58c9a3d50dbe22ba1f950f288795fb3ae54bd3ca6221cc12cb1d45de155",
-            heyuan,
-        )
-        self.assertIn("Fallback stays opt-in", heyuan)
-        self.assertIn(
-            "/home/kaijie/matrix-artifacts/g1-host-getup-v1", heyuan
-        )
-        self.assertIn("$MATRIX_PHYSICAL_RECOVERY_ARTIFACT_ROOT/venv/bin/python", heyuan)
-        self.assertIn(
-            "$MATRIX_RUNTIME_ROOT/GR00T-WholeBodyControl",
-            heyuan,
-        )
-        trna = (REPO_ROOT / "config/hosts/trna.env").read_text(encoding="utf-8")
-        self.assertIn('MATRIX_GAME_AUTO_RESPAWN:-off', trna)
-        self.assertIn('miniconda3/envs/sonic-h2-sim/bin/python', trna)
-        self.assertIn('MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-kungfu', trna)
-        self.assertIn('MATRIX_PHYSICAL_RECOVERY_HANDOFF:-sonic', trna)
-        self.assertIn('MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES:-1', trna)
-        self.assertIn('MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER:-cuda', trna)
-        self.assertIn('SONIC_DEPLOY_REENTRY_PROBE_DISABLE:-1', trna)
-        self.assertIn('1307-sonic-default-frame15689.npz', trna)
-        self.assertIn('MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME:-15689', trna)
-        self.assertIn('MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-1.5', trna)
-        self.assertIn('"$PROFILE" == "trna"', launcher)
-
-    def test_trna_short_game_launch_defaults_are_profile_driven(self) -> None:
-        launcher = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
-            encoding="utf-8"
-        )
-        profile = REPO_ROOT / "config/hosts/trna.env"
-        profile_text = profile.read_text(encoding="utf-8")
-        expected_profile_defaults = (
-            'MATRIX_PICO_INPUT_ENABLED:-0',
-            'MATRIX_SONIC_CONTROL_SOURCE:-game',
-            'MATRIX_GAME_INPUT_SOURCE:-auto',
-            'MATRIX_INITIAL_LOCOMOTION_POLICY:-bfm-sonic-teacher50k',
-            "MATRIX_BFM_ISAAC_RUNTIME_ROOT:-$MATRIX_PROJECT_ROOT/outputs/"
-            "runtime/matrix-bfm-isaac-sync-world16-v1/bfm_runtime",
-            "MATRIX_BFM_ISAAC_PYTHON:-$HOME/"
-            "matrix-bfm-sonic-clean-env/bin/python",
-            "MATRIX_BFM_ISAAC_CONFIG:-$MATRIX_BFM_ISAAC_RUNTIME_ROOT/"
-            "configs/alienware/moon-matrix.toml",
-            "MATRIX_BFM_ISAAC_TEACHER_PROFILE:-$HOME/matrix-artifacts/"
-            "bfm-teacher-world16-latest/current/teacher-profile.toml",
-            "MATRIX_BFM_ISAAC_PHYSICS_ASSET_ROOT:-$HOME/"
-            "matrix-bfm-sonic-clean-assets/g1-usd-20260725",
-            "MATRIX_BFM_ISAAC_COLLISION_ROOT:-$HOME/"
-            "matrix-bfm-sonic-clean-assets/moonworld-heightfield-v1",
-            "MATRIX_BFM_ISAAC_SOURCE_ROOT:-$HOME/"
-            "matrix-bfm-sonic-clean-assets/bfm-sonic-teacher50k-src",
-            "MATRIX_BFM_ISAAC_VISUAL_ROOT:-$HOME/matrix-artifacts/"
-            "matrix-sonic-native-v2-trna/g1-visual",
-            "MATRIX_BFM_ISAAC_VISUAL_URDF:-$MATRIX_BFM_ISAAC_VISUAL_ROOT/"
-            "g1_29dof.urdf",
-            'MATRIX_GAME_CAMERA_YAW_SOURCE:-ue-final-pov',
-            'MATRIX_GAME_LOOK_BUTTON:-left',
-            'MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12',
-            'MATRIX_GAME_CAMERA_YAW_SIGN:-1',
-            'MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0',
-            "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE-$HOME/"
-            "matrix-artifacts/matrix-centered-camera-custom-v1",
-            "MATRIX_PROFILE_VERIFY_RUNTIME_DEFAULT:-0",
-        )
-        for default in expected_profile_defaults:
-            self.assertIn(default, profile_text)
-        self.assertNotIn("export MATRIX_VERIFY_RUNTIME=", profile_text)
-        self.assertIn("unset LD_LIBRARY_PATH PYTHONPATH", profile_text)
-        self.assertIn(
-            'if [[ -n "$PROFILE" && "${MATRIX_VERIFY_RUNTIME:-1}" != "0" ]]',
-            launcher,
-        )
-        self.assertIn(
-            'MATRIX_PROFILE_VERIFY_RUNTIME_DEFAULT:-1',
-            launcher,
-        )
-
-        control_default = 'CONTROL_SOURCE="${MATRIX_SONIC_CONTROL_SOURCE:-planner}"'
-        self.assertIn(control_default, launcher)
-        self.assertIn('--control-source) CONTROL_SOURCE="$2"', launcher)
-        self.assertLess(
-            launcher.index('source "$PROFILE_FILE"'),
-            launcher.index(control_default),
-        )
-        self.assertLess(
-            launcher.index(control_default),
-            launcher.index('while [[ $# -gt 0 ]]'),
-        )
-
-        names = (
-            "MATRIX_PICO_INPUT_ENABLED",
-            "MATRIX_SONIC_CONTROL_SOURCE",
-            "MATRIX_GAME_INPUT_SOURCE",
-            "MATRIX_INITIAL_LOCOMOTION_POLICY",
-            "MATRIX_GAME_CAMERA_YAW_SOURCE",
-            "MATRIX_GAME_LOOK_BUTTON",
-            "MATRIX_GAME_MOUSE_SENSITIVITY_DEG",
-            "MATRIX_GAME_CAMERA_YAW_SIGN",
-            "MATRIX_GAME_CAMERA_YAW_OFFSET_DEG",
-            "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE",
-            "MATRIX_VERIFY_RUNTIME",
-            "LD_LIBRARY_PATH",
-            "PYTHONPATH",
-        )
-        emit = " ".join(f'"${{{name}-}}"' for name in names)
-        command = (
-            'set -euo pipefail; source "$1"; '
-            f"printf '%s\\0' {emit}"
-        )
-
-        def load_profile(overrides: dict[str, str]) -> list[str]:
-            environment = {
-                "HOME": "/home/trna",
-                "MATRIX_PROJECT_ROOT": "/matrix",
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                **overrides,
-            }
-            result = subprocess.run(
-                ["bash", "-c", command, "bash", os.fspath(profile)],
-                env=environment,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr.decode())
-            return [
-                field.decode("utf-8")
-                for field in result.stdout.removesuffix(b"\0").split(b"\0")
-            ]
-
-        self.assertEqual(
-            load_profile({}),
-            [
-                "0",
-                "game",
-                "auto",
-                "bfm-sonic-teacher50k",
-                "ue-final-pov",
-                "left",
-                "0.12",
-                "1",
-                "0.0",
-                "/home/trna/matrix-artifacts/"
-                "matrix-centered-camera-custom-v1",
-                "",
-                "",
-                "",
-            ],
-        )
-        overrides = {
-            "MATRIX_PICO_INPUT_ENABLED": "1",
-            "MATRIX_SONIC_CONTROL_SOURCE": "planner",
-            "MATRIX_GAME_INPUT_SOURCE": "keyboard",
-            "MATRIX_INITIAL_LOCOMOTION_POLICY": "sonic",
-            "MATRIX_GAME_CAMERA_YAW_SOURCE": "fixed",
-            "MATRIX_GAME_LOOK_BUTTON": "right",
-            "MATRIX_GAME_MOUSE_SENSITIVITY_DEG": "0.25",
-            "MATRIX_GAME_CAMERA_YAW_SIGN": "-1",
-            "MATRIX_GAME_CAMERA_YAW_OFFSET_DEG": "90.0",
-            "MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE": "",
-            "MATRIX_VERIFY_RUNTIME": "0",
-            "LD_LIBRARY_PATH": "/tmp/host-libraries",
-            "PYTHONPATH": "/tmp/host-python",
-        }
-        self.assertEqual(
-            load_profile(overrides),
-            [*list(overrides.values())[:-2], "", ""],
-        )
-
-    def test_initial_locomotion_default_is_scoped_to_trna(self) -> None:
-        command = (
-            'set -euo pipefail; source "$1"; '
-            'printf "%s" "${MATRIX_INITIAL_LOCOMOTION_POLICY-}"'
-        )
-
-        def policy(profile_name: str, override: str | None = None) -> str:
-            environment = {
-                "HOME": f"/home/{profile_name}",
-                "MATRIX_PROJECT_ROOT": "/matrix",
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            }
-            if override is not None:
-                environment["MATRIX_INITIAL_LOCOMOTION_POLICY"] = override
-            result = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    command,
-                    "bash",
-                    os.fspath(REPO_ROOT / "config/hosts" / f"{profile_name}.env"),
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            return result.stdout
-
-        self.assertEqual(policy("trna"), "bfm-sonic-teacher50k")
-        self.assertEqual(policy("heyuan"), "")
-        self.assertEqual(policy("zza"), "")
-        for profile_name in ("trna", "heyuan", "zza"):
-            self.assertEqual(policy(profile_name, "sonic"), "sonic")
 
     def test_env_check_skips_mc_only_for_external_control_topology(self) -> None:
         command = [
@@ -890,10 +545,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn("--write-local-env", text)
         self.assertIn(".matrix/local.env", text)
         self.assertIn("update_matrix_local_env.py", text)
-        self.assertIn('MATRIX_SONIC_ROOT "$MATRIX_SONIC_ROOT"', text)
-        self.assertIn('INVOCATION_SONIC_ROOT_SET="${MATRIX_SONIC_ROOT+x}"', text)
-        self.assertIn('elif [[ -n "$RUNTIME_OVERRIDE" ]]', text)
-        self.assertIn("unset MATRIX_SONIC_ROOT", text)
         self.assertIn("--no-index", text)
         self.assertIn("--only-binary=:all:", text)
         self.assertIn("--no-compile", text)
@@ -913,10 +564,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertIn('PROFILE_FILE="$PROJECT_ROOT/config/hosts/$PROFILE.env"', text)
         self.assertIn(
             'deploy="$MATRIX_SONIC_ROOT/gear_sonic_deploy/target/release/g1_deploy_onnx_ref"',
-            text,
-        )
-        self.assertIn(
-            'bash "$SCRIPT_DIR/build_matrix_ue_material_fix.sh"',
             text,
         )
 
@@ -944,13 +591,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             "git_checkout_root",
         ):
             self.assertIn(value, verifier)
-        for invocation in (
-            '[python_executable, "-B", "-c"',
-            '[python_executable, "-B", "-m", "pip", "check"]',
-            '[pico_python, "-B", "-c"',
-            '[pico_python, "-B", "-m", "pip", "check"]',
-        ):
-            self.assertIn(invocation, verifier)
 
     def test_wheelhouse_inventory_rejects_unlisted_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1127,96 +767,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
             results = {name: ok for name, ok, _ in checks}
             self.assertFalse(
                 results["native runtime Python site-packages inventory"]
-            )
-
-    def test_record_owned_pep3147_caches_are_derived_owned(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            wheelhouse = root / "wheelhouse"
-            site_packages = root / "site-packages"
-            runtime_python = root / "venv/bin/python"
-            wheelhouse.mkdir()
-            site_packages.mkdir()
-
-            cmeel_wheel, _, cmeel_installed = write_test_wheel(
-                wheelhouse,
-                "cmeel-0.60.1-py3-none-any.whl",
-                {"cmeel_pth.py": b"VALUE = 'cmeel'\n"},
-            )
-            setuptools_wheel, _, setuptools_installed = write_test_wheel(
-                wheelhouse,
-                "setuptools-81.0.0-py3-none-any.whl",
-                {"_distutils_hack/__init__.py": b"VALUE = 'setuptools'\n"},
-            )
-            (wheelhouse / "SHA256SUMS").write_text(
-                "\n".join(
-                    f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}"
-                    for wheel in (cmeel_wheel, setuptools_wheel)
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            for installed in (cmeel_installed, setuptools_installed):
-                for relative, content in installed.items():
-                    path = site_packages / relative
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(content)
-
-            for source in (
-                site_packages / "cmeel_pth.py",
-                site_packages / "_distutils_hack/__init__.py",
-            ):
-                cache = Path(importlib.util.cache_from_source(os.fspath(source)))
-                cache.parent.mkdir(parents=True, exist_ok=True)
-                py_compile.compile(
-                    os.fspath(source),
-                    cfile=os.fspath(cache),
-                    doraise=True,
-                    invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
-                )
-
-            checks = MODULE.verify_python_wheel_records(
-                wheelhouse,
-                site_packages,
-                {
-                    "cmeel": ("cmeel", "0.60.1"),
-                    "setuptools": ("setuptools", "81.0.0"),
-                },
-                runtime_python,
-            )
-            self.assertTrue(all(ok for _, ok, _ in checks), checks)
-            inventory_detail = {
-                name: detail for name, _, detail in checks
-            }["native runtime Python site-packages inventory"]
-            self.assertIn("derived-pyc=2", inventory_detail)
-
-            no_source = site_packages / "orphan.py"
-            no_source.write_text("VALUE = 'orphan'\n", encoding="utf-8")
-            orphan_cache = Path(importlib.util.cache_from_source(os.fspath(no_source)))
-            orphan_cache.parent.mkdir(parents=True, exist_ok=True)
-            py_compile.compile(
-                os.fspath(no_source),
-                cfile=os.fspath(orphan_cache),
-                doraise=True,
-                invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
-            )
-            no_source.unlink()
-            checks = MODULE.verify_python_wheel_records(
-                wheelhouse,
-                site_packages,
-                {
-                    "cmeel": ("cmeel", "0.60.1"),
-                    "setuptools": ("setuptools", "81.0.0"),
-                },
-                runtime_python,
-            )
-            results = {name: (ok, detail) for name, ok, detail in checks}
-            ok, detail = results["native runtime Python site-packages inventory"]
-            self.assertFalse(ok)
-            self.assertIn(
-                "unowned-loadable:__pycache__/orphan."
-                f"{sys.implementation.cache_tag}.pyc",
-                detail,
             )
 
     def test_target_wheel_records_map_scripts_data_and_owned_cache(self) -> None:
@@ -2056,50 +1606,8 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         self.assertNotIn('ln -sfn "$source_path"', bootstrap)
         self.assertIn("MATRIX_OFFLINE=1", bootstrap)
         self.assertIn('/usr/bin/env "${INSTALL_ENV[@]}"', bootstrap)
-        self.assertIn('if item["name"] not in {"assets", "base", "shared"}', bootstrap)
-        self.assertIn('MATRIX_MAPS="$LOCKED_MATRIX_MAPS"', bootstrap)
-        self.assertNotIn("MATRIX_MAPS=Town10World", bootstrap)
         self.assertIn('MATRIX_OFFLINE="${MATRIX_OFFLINE:-0}"', installer)
         self.assertIn("离线模式下禁止下载", installer)
-
-    def test_moon_launcher_leaves_policy_selection_to_the_host_profile(self) -> None:
-        moon = (
-            REPO_ROOT / "scripts/run_matrix_sonic_moon_v1.sh"
-        ).read_text(encoding="utf-8")
-        generic = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("MoonWorld (scene 15)", moon)
-        self.assertNotIn(
-            "MATRIX_INITIAL_LOCOMOTION_POLICY=\"bfm-sonic-teacher50k\"",
-            moon,
-        )
-        self.assertNotIn("moon-v1 locomotion policy override", moon)
-        self.assertNotIn("--game-max-acceleration 90.0", moon)
-        self.assertIn(
-            'exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 15 "$@"',
-            moon,
-        )
-        self.assertIn("visual MoonWorld does not by itself prove", moon)
-        self.assertNotIn("run_sim.sh", moon)
-        self.assertNotIn("androidtwin", moon.lower())
-        self.assertIn(
-            '"$INITIAL_LOCOMOTION_POLICY" == "bfm-sonic-teacher50k"',
-            generic,
-        )
-        self.assertIn("GAME_MAX_ACCELERATION=90.0", generic)
-        self.assertIn("GAME_MAX_DECELERATION=90.0", generic)
-        self.assertIn("GAME_MAX_TURN_RATE=2.40", generic)
-
-    def test_house_launcher_is_a_thin_primary_launcher_wrapper(self) -> None:
-        house = (
-            REPO_ROOT / "scripts/run_matrix_sonic_house_v1.sh"
-        ).read_text(encoding="utf-8")
-        self.assertIn("HouseWorld (scene 6)", house)
-        self.assertIn('exec bash "$SCRIPT_DIR/run_matrix_sonic.sh" --scene 6 "$@"', house)
-        self.assertIn("static MuJoCo collision proxy", house)
-        self.assertNotIn("run_sim.sh", house)
-        self.assertNotIn("androidtwin", house.lower())
 
     def test_local_runtime_override_precedes_profile_derived_paths(self) -> None:
         for script_name in ("bootstrap_matrix_sonic.sh", "run_matrix_sonic.sh"):
@@ -2121,27 +1629,15 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
         override_assignment = bootstrap.index(
             'export MATRIX_RUNTIME_ROOT="$RUNTIME_OVERRIDE"'
         )
-        invocation_capture = bootstrap.index(
-            'INVOCATION_SONIC_ROOT_SET="${MATRIX_SONIC_ROOT+x}"'
-        )
-        bootstrap_local_env_source = bootstrap.index(
-            'load_matrix_local_env "$PROJECT_ROOT"'
-        )
-        sonic_runtime_rebind = bootstrap.index("unset MATRIX_SONIC_ROOT")
         profile_source = bootstrap.index(
             'source "$PROFILE_FILE"'
         )
-        self.assertLess(invocation_capture, bootstrap_local_env_source)
         self.assertLess(override_assignment, profile_source)
-        self.assertLess(bootstrap_local_env_source, sonic_runtime_rebind)
-        self.assertLess(sonic_runtime_rebind, profile_source)
 
     def test_active_launch_path_has_no_androidtwin_dependency(self) -> None:
         for relative in (
             "scripts/run_matrix_sonic.py",
             "scripts/run_matrix_sonic.sh",
-            "scripts/run_matrix_sonic_house_v1.sh",
-            "scripts/run_matrix_sonic_moon_v1.sh",
             "scripts/run_matrix_sonic_overworld_v1.sh",
             "scripts/run_sim.sh",
             "scripts/bootstrap_matrix_sonic.sh",
@@ -2333,9 +1829,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                 with self.subTest(overrides=overrides):
                     environment = os.environ.copy()
                     environment.update(overrides)
-                    # This test owns root/skip validation, not the optional
-                    # host-private centered-camera bundle provisioned on TRNA.
-                    environment["MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE"] = ""
                     environment["MATRIX_SONIC_HOST_LOCK"] = str(
                         root / f"{next(iter(overrides))}.lock"
                     )
@@ -2347,8 +1840,6 @@ class MatrixSonicRuntimeLockTest(unittest.TestCase):
                             str(launcher),
                             "--profile",
                             "trna",
-                            "--control-source",
-                            "planner",
                             "--max-seconds",
                             "1",
                         ],

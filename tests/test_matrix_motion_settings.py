@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -38,9 +39,14 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(settings.run_speed_mps, 2.50)
         self.assertEqual(settings.run_double_tap_speed_mps, 2.75)
         self.assertEqual(settings.max_turn_rate_rad_s, 2.50)
+        self.assertEqual(settings.keyboard_turn_rate_rad_s, 1.50)
+        self.assertEqual(settings.keyboard_turn_boost_rate_rad_s, 3.00)
+        self.assertAlmostEqual(settings.gait_start_heading_error_rad, math.radians(10.0))
+        self.assertAlmostEqual(settings.gait_stop_heading_error_rad, math.radians(90.0))
+        self.assertAlmostEqual(settings.camera_heading_snap_error_rad, math.radians(2.0))
         self.assertEqual(settings.keyboard_look_rate_deg_s, 120.0)
         self.assertEqual(settings.movement_mode, "camera_face")
-        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 8)
+        self.assertEqual(len(MODULE.MOTION_SETTING_PATHS), 13)
 
     def test_strict_mapping_round_trip(self) -> None:
         settings = MODULE.MotionSettings(
@@ -60,6 +66,11 @@ class MotionSettingsValueTest(unittest.TestCase):
                 "revision",
                 "gears",
                 "max_turn_rate_rad_s",
+                "keyboard_turn_rate_rad_s",
+                "keyboard_turn_boost_rate_rad_s",
+                "gait_start_heading_error_rad",
+                "gait_stop_heading_error_rad",
+                "camera_heading_snap_error_rad",
                 "camera",
                 "movement",
             },
@@ -142,6 +153,17 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(
             MODULE.MotionSettings.from_mapping(settings.to_mapping()), settings
         )
+        camera_face_strafe = MODULE.MotionSettings(
+            movement_mode="camera_face_strafe"
+        )
+        self.assertEqual(
+            camera_face_strafe.to_mapping()["movement"],
+            {
+                "mode": "camera_face_strafe",
+                "translation_frame": "camera",
+                "facing_policy": "face_camera_forward",
+            },
+        )
         for mode in ("unknown", "CAMERA_FACE", "", True, None):
             with self.subTest(mode=mode), self.assertRaises(
                 MODULE.MotionSettingsError
@@ -166,6 +188,17 @@ class MotionSettingsValueTest(unittest.TestCase):
             {"run_speed_mps": float("inf")},
             {"max_turn_rate_rad_s": 2.75},
             {"max_turn_rate_rad_s": True},
+            {"keyboard_turn_rate_rad_s": 0.24},
+            {"keyboard_turn_boost_rate_rad_s": 4.01},
+            {"keyboard_turn_rate_rad_s": True},
+            {"keyboard_turn_boost_rate_rad_s": True},
+            {"gait_start_heading_error_rad": math.radians(0.5)},
+            {"gait_stop_heading_error_rad": math.radians(91.0)},
+            {"gait_start_heading_error_rad": True},
+            {"gait_stop_heading_error_rad": float("nan")},
+            {"camera_heading_snap_error_rad": math.radians(0.5)},
+            {"camera_heading_snap_error_rad": math.radians(16.0)},
+            {"camera_heading_snap_error_rad": True},
             {"keyboard_look_rate_deg_s": 29.0},
             {"keyboard_look_rate_deg_s": 361.0},
             {"keyboard_look_rate_deg_s": True},
@@ -190,6 +223,25 @@ class MotionSettingsValueTest(unittest.TestCase):
             ):
                 MODULE.MotionSettings(**values)
 
+    def test_keyboard_turn_boost_must_not_be_below_base(self) -> None:
+        with self.assertRaisesRegex(MODULE.MotionSettingsError, ">="):
+            MODULE.MotionSettings(
+                keyboard_turn_rate_rad_s=3.00,
+                keyboard_turn_boost_rate_rad_s=2.75,
+            )
+
+    def test_gait_heading_thresholds_keep_hysteresis_gap(self) -> None:
+        with self.assertRaisesRegex(MODULE.MotionSettingsError, "at least"):
+            MODULE.MotionSettings(
+                gait_start_heading_error_rad=math.radians(64.5),
+                gait_stop_heading_error_rad=math.radians(65.0),
+            )
+        with self.assertRaisesRegex(MODULE.MotionSettingsError, "at least"):
+            MODULE.MotionSettings(
+                gait_start_heading_error_rad=math.radians(65.0),
+                gait_stop_heading_error_rad=math.radians(65.0),
+            )
+
     def test_value_lookup_and_replacement_accept_only_whitelisted_paths(self) -> None:
         settings = MODULE.MotionSettings()
         slow = path("slow", "speed_mps")
@@ -210,9 +262,71 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(turn_replacement.max_turn_rate_rad_s, 2.25)
         self.assertEqual(turn_replacement.revision, 4)
         self.assertEqual(
+            settings.value_for_path(MODULE.KEYBOARD_TURN_RATE_PATH),
+            MODULE.DEFAULT_KEYBOARD_TURN_RATE_RAD_S,
+        )
+        keyboard_turn_replacement = settings.with_value(
+            MODULE.KEYBOARD_TURN_RATE_PATH,
+            2.75,
+            revision=5,
+        )
+        self.assertEqual(keyboard_turn_replacement.keyboard_turn_rate_rad_s, 2.75)
+        self.assertEqual(keyboard_turn_replacement.revision, 5)
+        keyboard_turn_boost_replacement = settings.with_value(
+            MODULE.KEYBOARD_TURN_BOOST_RATE_PATH,
+            3.50,
+            revision=6,
+        )
+        self.assertEqual(
+            keyboard_turn_boost_replacement.keyboard_turn_boost_rate_rad_s, 3.50
+        )
+        self.assertEqual(keyboard_turn_boost_replacement.revision, 6)
+        self.assertEqual(
             settings.value_for_path(MODULE.KEYBOARD_LOOK_RATE_PATH),
             MODULE.DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
         )
+        self.assertAlmostEqual(
+            settings.value_for_path(MODULE.GAIT_START_HEADING_ERROR_PATH),
+            math.radians(10.0),
+        )
+        self.assertAlmostEqual(
+            settings.value_for_path(MODULE.GAIT_STOP_HEADING_ERROR_PATH),
+            math.radians(90.0),
+        )
+        self.assertAlmostEqual(
+            settings.value_for_path(MODULE.CAMERA_HEADING_SNAP_ERROR_PATH),
+            math.radians(2.0),
+        )
+        start_replacement = settings.with_value(
+            MODULE.GAIT_START_HEADING_ERROR_PATH,
+            math.radians(50.0),
+            revision=7,
+        )
+        self.assertAlmostEqual(
+            start_replacement.gait_start_heading_error_rad,
+            math.radians(50.0),
+        )
+        self.assertEqual(start_replacement.revision, 7)
+        stop_replacement = settings.with_value(
+            MODULE.GAIT_STOP_HEADING_ERROR_PATH,
+            math.radians(70.0),
+            revision=8,
+        )
+        self.assertAlmostEqual(
+            stop_replacement.gait_stop_heading_error_rad,
+            math.radians(70.0),
+        )
+        self.assertEqual(stop_replacement.revision, 8)
+        snap_replacement = settings.with_value(
+            MODULE.CAMERA_HEADING_SNAP_ERROR_PATH,
+            math.radians(3.0),
+            revision=9,
+        )
+        self.assertAlmostEqual(
+            snap_replacement.camera_heading_snap_error_rad,
+            math.radians(3.0),
+        )
+        self.assertEqual(snap_replacement.revision, 9)
         look_replacement = settings.with_value(
             MODULE.KEYBOARD_LOOK_RATE_PATH,
             180.0,
@@ -365,6 +479,15 @@ class MotionSettingsStepTest(unittest.TestCase):
             (path("run", "speed_mps"), 1, 2.50),
             (path("run", "double_tap_speed_mps"), 1, 3.00),
             (MODULE.MAX_TURN_RATE_PATH, -1, 2.25),
+            (MODULE.KEYBOARD_TURN_RATE_PATH, 1, 1.75),
+            (MODULE.KEYBOARD_TURN_BOOST_RATE_PATH, -1, 2.75),
+            (MODULE.GAIT_START_HEADING_ERROR_PATH, 1, round(math.radians(11.0), 10)),
+            (MODULE.GAIT_STOP_HEADING_ERROR_PATH, -1, round(math.radians(89.0), 10)),
+            (
+                MODULE.CAMERA_HEADING_SNAP_ERROR_PATH,
+                1,
+                round(math.radians(3.0), 10),
+            ),
             (MODULE.KEYBOARD_LOOK_RATE_PATH, 1, 150.0),
         )
         for setting_path, direction, expected in cases:
@@ -440,6 +563,47 @@ class MotionSettingsStepTest(unittest.TestCase):
                 1,
             ),
             360.0,
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(
+                MODULE.MotionSettings(
+                    keyboard_turn_rate_rad_s=4.0,
+                    keyboard_turn_boost_rate_rad_s=4.0,
+                ),
+                MODULE.KEYBOARD_TURN_RATE_PATH,
+                1,
+            ),
+            4.0,
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(
+                MODULE.MotionSettings(keyboard_turn_rate_rad_s=3.0),
+                MODULE.KEYBOARD_TURN_BOOST_RATE_PATH,
+                -1,
+            ),
+            3.0,
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(
+                MODULE.MotionSettings(
+                    gait_start_heading_error_rad=math.radians(60.0),
+                    gait_stop_heading_error_rad=math.radians(61.0),
+                ),
+                MODULE.GAIT_START_HEADING_ERROR_PATH,
+                1,
+            ),
+            round(math.radians(60.0), 10),
+        )
+        self.assertEqual(
+            MODULE.step_motion_speed(
+                MODULE.MotionSettings(
+                    gait_start_heading_error_rad=math.radians(60.0),
+                    gait_stop_heading_error_rad=math.radians(61.0),
+                ),
+                MODULE.GAIT_STOP_HEADING_ERROR_PATH,
+                -1,
+            ),
+            round(math.radians(61.0), 10),
         )
 
         sub_step_gap = MODULE.MotionSettings(
@@ -619,18 +783,29 @@ class MotionSettingsStoreTest(unittest.TestCase):
                 MODULE.load_settings(file_path).settings.max_turn_rate_rad_s,
                 2.50,
             )
+            keyboard_turn = store.step(
+                MODULE.KEYBOARD_TURN_BOOST_RATE_PATH,
+                1,
+                expected_revision=1,
+            )
+            self.assertTrue(keyboard_turn.changed)
+            self.assertEqual(keyboard_turn.value, 3.25)
+            self.assertEqual(
+                MODULE.load_settings(file_path).settings.keyboard_turn_boost_rate_rad_s,
+                3.25,
+            )
             self.assertFalse(
                 store.step(
                     MODULE.MAX_TURN_RATE_PATH,
                     1,
-                    expected_revision=1,
+                    expected_revision=2,
                 ).changed
             )
             with self.assertRaises(MODULE.MotionSettingsError):
                 store.modify(
                     MODULE.MAX_TURN_RATE_PATH,
                     2.75,
-                    expected_revision=1,
+                    expected_revision=2,
                 )
 
     def test_store_loads_missing_or_invalid_state_safely(self) -> None:

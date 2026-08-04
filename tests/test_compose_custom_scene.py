@@ -88,7 +88,74 @@ class ComposeCustomSceneTest(unittest.TestCase):
                     remove_geoms=("perimeter", "perimeter"),
                 )
 
-    def test_staticizes_freejoint_bodies_without_removing_geometry(self) -> None:
+    def test_freejoint_scene_preserves_dynamic_bodies_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            native = root / "xgb"
+            native.mkdir()
+            source = native / MODULE.MOON_DYNAMIC_SCENE_NAME
+            source.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<body name="gb_0_0" pos="0 0 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_0" />
+  <geom name="soil_0_0" type="box" size="0.05 0.05 0.5" mass="100000000" />
+</body>
+<body name="gb_0_1" pos="0.1 0 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_1" />
+  <geom name="soil_0_1" type="box" size="0.05 0.05 0.5" mass="100000000" />
+</body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+            output = root / "custom" / MODULE.MOON_DYNAMIC_SCENE_NAME
+
+            MODULE.compose_custom_scene(source, output)
+
+            scene = ET.parse(output).getroot()
+            self.assertEqual(scene.find("include").get("file"), "current.xml")
+            self.assertEqual(
+                [item.get("name") for item in scene.iter("joint")],
+                ["gb_joint_0_0", "gb_joint_0_1"],
+            )
+
+    def test_can_staticize_freejoint_bodies_for_body_only_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            native = root / "xgb"
+            native.mkdir()
+            source = native / MODULE.MOON_DYNAMIC_SCENE_NAME
+            source.write_text(
+                """<mujoco><include file="xgb.xml" /><worldbody>
+<body name="gb_0_0" pos="0 0 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_0" />
+  <geom name="soil_0_0" type="box" size="0.05 0.05 0.5" mass="100000000" />
+</body>
+<body name="gb_0_1" pos="0.1 0 0" gravcomp="1">
+  <joint type="free" name="gb_joint_0_1" />
+  <geom name="soil_0_1" type="box" size="0.05 0.05 0.5" mass="100000000" />
+</body>
+</worldbody></mujoco>""",
+                encoding="utf-8",
+            )
+            output = root / "custom" / MODULE.MOON_DYNAMIC_SCENE_NAME
+
+            MODULE.compose_custom_scene(
+                source,
+                output,
+                staticize_freejoint_bodies=True,
+            )
+
+            scene = ET.parse(output).getroot()
+            self.assertEqual(
+                [item.get("name") for item in scene.iter("joint")],
+                [],
+            )
+            self.assertIn(
+                "staticized freejoint bodies: 2",
+                output.read_text(encoding="utf-8"),
+            )
+
+    def test_staticize_removes_all_freejoints_without_touching_hinges(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             native = root / "xgb"
@@ -96,18 +163,8 @@ class ComposeCustomSceneTest(unittest.TestCase):
             source = native / "scene.xml"
             source.write_text(
                 """<mujoco><include file="xgb.xml" /><worldbody>
-<body name="dynamic_tile" pos="1 2 0">
-  <joint name="tile_free" type="free" />
-  <geom name="tile_collision" type="box" size="1 1 0.1" />
-</body>
-<body name="legacy_tile" pos="3 4 0">
-  <freejoint name="legacy_free" />
-  <geom name="legacy_collision" type="box" size="1 1 0.1" />
-</body>
-<body name="hinged_prop">
-  <joint name="hinge" type="hinge" />
-  <geom name="hinged_collision" type="box" size="1 1 1" />
-</body>
+<body name="dynamic"><freejoint name="free" /></body>
+<body name="decor"><joint type="hinge" name="decor_joint" /></body>
 </worldbody></mujoco>""",
                 encoding="utf-8",
             )
@@ -121,20 +178,8 @@ class ComposeCustomSceneTest(unittest.TestCase):
 
             scene = ET.parse(output).getroot()
             self.assertEqual(
-                [body.get("name") for body in scene.iter("body")],
-                ["dynamic_tile", "legacy_tile", "hinged_prop"],
-            )
-            self.assertEqual(
-                [geom.get("name") for geom in scene.iter("geom")],
-                ["tile_collision", "legacy_collision", "hinged_collision"],
-            )
-            self.assertEqual(
-                [(joint.get("name"), joint.get("type")) for joint in scene.iter("joint")],
-                [("hinge", "hinge")],
-            )
-            self.assertEqual(
-                MODULE.freejoint_body_names(ET.parse(source).getroot()),
-                ("dynamic_tile", "legacy_tile"),
+                [item.get("name") for item in scene.iter("joint")],
+                ["decor_joint"],
             )
 
     def test_rejects_asset_collision_with_custom_robot(self) -> None:

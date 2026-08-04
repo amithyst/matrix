@@ -1,9 +1,0 @@
-{
-  "schema": "matrix_bfm_isaac_video_settings.v1",
-  "resolution": "1280x720",
-  "window_mode": "borderless",
-  "fps_limit": 30,
-  "quality": "low",
-  "camera_smoothing": "medium",
-  "screen_percentage": 100
-}

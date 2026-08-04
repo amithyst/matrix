@@ -2,7 +2,6 @@ import json
 import math
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 
 
@@ -11,7 +10,8 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import matrix_mc_commands as MODULE  # noqa: E402
-from matrix_world_state import MatrixWorldState, WorldPose, WorldStateStore  # noqa: E402
+import matrix_motion_settings as MOTION_SETTINGS  # noqa: E402
+from matrix_world_state import MatrixWorldState, WorldPose  # noqa: E402
 
 
 SESSION = "a" * 32
@@ -19,185 +19,6 @@ REQUEST_ID = "cmd-" + "b" * 32
 
 
 class McCommandParserTest(unittest.TestCase):
-    def test_parses_game_quit(self) -> None:
-        self.assertEqual(
-            MODULE.parse_mc_command("/game quit").command,
-            MODULE.GameQuit(),
-        )
-        self.assertEqual(
-            MODULE.parse_mc_command("quit").command,
-            MODULE.GameQuit(),
-        )
-
-    def test_parses_runtime_pause_with_expected_epoch(self) -> None:
-        self.assertEqual(
-            MODULE.parse_mc_command("/runtime pause paused 0").command,
-            MODULE.RuntimePause(target="paused", expected_epoch=0),
-        )
-        self.assertEqual(
-            MODULE.parse_mc_command("runtime pause RUNNING 12").command,
-            MODULE.RuntimePause(target="running", expected_epoch=12),
-        )
-        self.assertEqual(
-            MODULE.parse_mc_command(
-                f"/runtime pause paused {MODULE.MAX_RUNTIME_PAUSE_EPOCH}"
-            ).command,
-            MODULE.RuntimePause(
-                target="paused",
-                expected_epoch=MODULE.MAX_RUNTIME_PAUSE_EPOCH,
-            ),
-        )
-        for text in (
-            "/runtime pause paused",
-            "/runtime pause toggle 0",
-            "/runtime pause running -1",
-            "/runtime pause paused 2147483648",
-        ):
-            with self.subTest(text=text), self.assertRaises(
-                MODULE.CommandParseError
-            ):
-                MODULE.parse_mc_command(text)
-
-    def test_parses_creative_inventory_spawn(self) -> None:
-        parsed = MODULE.parse_mc_command("/item spawn Training_Blaster")
-
-        self.assertEqual(
-            parsed.command,
-            MODULE.CreativeSpawnItem(item_id="training_blaster"),
-        )
-
-    def test_parses_whitelisted_data_modify_inputs(self) -> None:
-        boolean_paths = (
-            *(f"control.input.keyboard.{key}" for key in (
-                "w", "a", "s", "d", "q", "e", "v", "ctrl", "alt", "shift"
-            )),
-            "control.input.mouse.left",
-            "control.input.mouse.right",
-            "control.input.mouse.middle",
-        )
-        for path in boolean_paths:
-            with self.subTest(path=path):
-                parsed = MODULE.parse_mc_command(
-                    f"/data modify entity @s {path} set value true"
-                )
-                self.assertEqual(parsed.command, MODULE.DataModifyInput(path, True))
-
-        numeric_cases = {
-            "control.input.gamepad.forward": -1.0,
-            "control.input.gamepad.right": 1.0,
-            "control.input.gamepad.look_yaw": -0.25,
-            "control.input.gamepad.look_pitch": 0.25,
-            "control.input.mouse.dx": -4096.0,
-            "control.input.mouse.dy": 4096.0,
-        }
-        for path, value in numeric_cases.items():
-            with self.subTest(path=path):
-                parsed = MODULE.parse_mc_command(
-                    f"/data modify entity @s {path} set value {value}"
-                )
-                self.assertEqual(parsed.command, MODULE.DataModifyInput(path, value))
-
-    def test_data_modify_input_rejects_unknown_type_nonfinite_and_range(self) -> None:
-        invalid = (
-            (
-                "/data modify entity @s control.input.keyboard.space set value true",
-                "E_DATA_PATH_UNKNOWN",
-            ),
-            (
-                "/data modify entity @s control.input.gamepad.throttle set value 0",
-                "E_DATA_PATH_UNKNOWN",
-            ),
-            (
-                "/data modify entity @s control.input.mouse.wheel set value 0",
-                "E_DATA_PATH_UNKNOWN",
-            ),
-            (
-                "/data modify entity @s control.input.keyboard.w set value 1",
-                "E_DATA_INPUT_TYPE",
-            ),
-            (
-                "/data modify entity @s control.input.gamepad.forward set value true",
-                "E_DATA_INPUT_TYPE",
-            ),
-            (
-                "/data modify entity @s control.input.mouse.left set value falsey",
-                "E_DATA_INPUT_TYPE",
-            ),
-            (
-                "/data modify entity @s control.input.gamepad.forward set value NaN",
-                "E_DATA_INPUT_NONFINITE",
-            ),
-            (
-                "/data modify entity @s control.input.gamepad.forward set value 1e999",
-                "E_DATA_INPUT_NONFINITE",
-            ),
-            (
-                "/data modify entity @s control.input.gamepad.look_yaw set value 1.01",
-                "E_DATA_INPUT_RANGE",
-            ),
-            (
-                "/data modify entity @s control.input.mouse.dx set value -4096.01",
-                "E_DATA_INPUT_RANGE",
-            ),
-        )
-        for text, code in invalid:
-            with self.subTest(text=text), self.assertRaises(
-                MODULE.CommandParseError
-            ) as context:
-                MODULE.parse_mc_command(text)
-            self.assertEqual(context.exception.code, code)
-
-    def test_data_modify_input_rejects_noncanonical_syntax(self) -> None:
-        invalid = (
-            "/data modify entity @e control.input.keyboard.w set value true",
-            "/data modify entity @s control.input.keyboard.w merge value true",
-            "/data modify entity @s control.input.keyboard.w set true",
-        )
-        for text in invalid:
-            with self.subTest(text=text), self.assertRaises(
-                MODULE.CommandParseError
-            ) as context:
-                MODULE.parse_mc_command(text)
-            self.assertEqual(context.exception.code, "E_DATA_SYNTAX")
-
-    def test_parses_whitelisted_data_modify_number(self) -> None:
-        parsed = MODULE.parse_mc_command(
-            "/data modify entity @s "
-            "control.motion.gears.walk.double_tap_speed_mps set value 1.2"
-        )
-
-        self.assertEqual(
-            parsed.command,
-            MODULE.DataModifyNumber(
-                "control.motion.gears.walk.double_tap_speed_mps", 1.2
-            ),
-        )
-
-    def test_data_modify_rejects_unknown_path_operation_and_nonfinite_value(self) -> None:
-        invalid = (
-            "/data modify entity @s control.motion.unknown set value 1",
-            "/data modify entity @e control.motion.gears.walk.speed_mps set value 1",
-            "/data modify entity @s control.motion.gears.walk.speed_mps merge value 1",
-            "/data modify entity @s control.motion.gears.walk.speed_mps set value NaN",
-            "/data modify entity @s control.motion.gears.walk.speed_mps set value 1e999",
-        )
-        for text in invalid:
-            with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
-                MODULE.parse_mc_command(text)
-
-    def test_parses_policy_slot_assignment(self) -> None:
-        parsed = MODULE.parse_mc_command("/policy recovery KungFu")
-
-        self.assertEqual(
-            parsed.command,
-            MODULE.PolicySlotAssignment(slot="recovery", policy_id="kungfu"),
-        )
-
-    def test_parses_policy_slot_query(self) -> None:
-        parsed = MODULE.parse_mc_command("/policy status")
-
-        self.assertEqual(parsed.command, MODULE.PolicySlotQuery())
-
     def test_parses_canonical_summon_with_relative_coordinates_and_tags(self) -> None:
         parsed = MODULE.parse_mc_command(
             '/summon matrix:teleport_point ~ ~1.5 -2 {Tags:["XX","home"]}'
@@ -243,31 +64,124 @@ class McCommandParserTest(unittest.TestCase):
         self.assertIsInstance(selector, MODULE.TeleportSelector)
         self.assertEqual(selector.tag, "XX")
 
-    def test_parses_minecraft_local_tp_coordinates(self) -> None:
-        command = MODULE.parse_mc_command("/tp @s ^-1.5 ^ ^2").command
+    def test_parses_pose_recover_mode_native_and_function_commands(self) -> None:
+        pose = MODULE.parse_mc_command("/pose @s yaw ~90deg").command
+        recover = MODULE.parse_mc_command("/recover").command
+        movement = MODULE.parse_mc_command("/mode camera_strafe").command
+        face_strafe = MODULE.parse_mc_command("/mode camera_face_strafe").command
+        native = MODULE.parse_mc_command("/sonic mode 7").command
+        auto = MODULE.parse_mc_command("/sonic mode auto").command
+        pause = MODULE.parse_mc_command("/pause").command
+        resume = MODULE.parse_mc_command("/continue").command
+        world = MODULE.parse_mc_command("/world moon").command
+        scene_alias = MODULE.parse_mc_command("/scene MoonWorld").command
+        gait_threshold = MODULE.parse_mc_command(
+            (
+                "/data modify entity @s "
+                "control.motion.gait_start_heading_error_rad "
+                f"set value {math.radians(50.0):.10f}"
+            )
+        ).command
+        file_function = MODULE.parse_mc_command("/function recover_here").command
+        function = MODULE.parse_mc_command(
+            "/function /tp @s ~1 ~ ~; /pose @s yaw 180deg"
+        ).command
 
+        self.assertEqual(pose, MODULE.PoseYawSet(MODULE.Angle(math.pi / 2.0, True)))
+        self.assertIsInstance(recover, MODULE.RecoverHere)
+        self.assertEqual(movement, MODULE.MovementModeSet("camera_strafe"))
+        self.assertEqual(face_strafe, MODULE.MovementModeSet("camera_face_strafe"))
+        self.assertEqual(native, MODULE.NativeModeSet(7))
+        self.assertEqual(auto, MODULE.NativeModeSet(None))
+        self.assertEqual(pause, MODULE.RuntimePauseSet("paused", expected_epoch=None))
+        self.assertEqual(resume, MODULE.RuntimePauseSet("running", expected_epoch=None))
+        self.assertEqual(world, MODULE.WorldSceneSet("moon"))
+        self.assertEqual(scene_alias, MODULE.WorldSceneSet("moon"))
         self.assertEqual(
-            command,
-            MODULE.TeleportLocalCoordinates(left=-1.5, up=0.0, forward=2.0),
+            gait_threshold,
+            MODULE.MotionSettingSet(
+                MOTION_SETTINGS.GAIT_START_HEADING_ERROR_PATH,
+                float(f"{math.radians(50.0):.10f}"),
+            ),
         )
+        self.assertEqual(file_function, MODULE.CommandFunctionCall("recover_here"))
+        self.assertIsInstance(function, MODULE.CommandFunctionRun)
+        self.assertEqual(len(function.commands), 2)
 
-    def test_teleport_list_is_bounded_unique_and_typed(self) -> None:
-        parsed = MODULE.parse_mc_command(
-            "/teleport list home moon.tranquility mars.utopia"
+    def test_native_mode_manual_commands_exclude_auto_gait_family(self) -> None:
+        self.assertEqual(
+            MODULE.parse_mc_command("/sonic mode 4").command,
+            MODULE.NativeModeSet(4),
         )
         self.assertEqual(
-            parsed.command,
-            MODULE.TeleportList(("home", "moon.tranquility", "mars.utopia")),
+            MODULE.parse_mc_command("/sonic mode 19").command,
+            MODULE.NativeModeSet(19),
         )
-        for command in (
-            "/teleport list",
-            "/teleport list home home",
-            "/teleport list " + " ".join(f"tag{index}" for index in range(9)),
-        ):
-            with self.subTest(command=command), self.assertRaises(
-                MODULE.CommandParseError
+        for mode in range(4):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                MODULE.CommandParseError, "use auto for modes 0-3"
             ):
-                MODULE.parse_mc_command(command)
+                MODULE.parse_mc_command(f"/sonic mode {mode}")
+
+    def test_data_modify_motion_setting_command_is_whitelisted_and_strict(self) -> None:
+        command = MODULE.MotionSettingSet(
+            MOTION_SETTINGS.GAIT_STOP_HEADING_ERROR_PATH,
+            math.radians(70.0),
+        )
+        self.assertEqual(
+            MODULE.command_from_mapping(MODULE.command_to_mapping(command)),
+            command,
+        )
+
+        for text in (
+            "/data modify entity @s control.motion.unknown set value 1.0",
+            "/data modify entity @s control.motion.gait_stop_heading_error_rad set value true",
+            "/data modify entity @s control.motion.gait_stop_heading_error_rad set value nan",
+            "/data modify entity @s control.motion.gait_stop_heading_error_rad set value 1e999",
+        ):
+            with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
+                MODULE.parse_mc_command(text)
+
+        for payload in (
+            {
+                "name": "motion_setting_set",
+                "path": "control.motion.unknown",
+                "value": 1.0,
+            },
+            {
+                "name": "motion_setting_set",
+                "path": MOTION_SETTINGS.GAIT_STOP_HEADING_ERROR_PATH,
+                "value": float("nan"),
+            },
+        ):
+            with self.subTest(payload=payload), self.assertRaises(
+                MODULE.CommandProtocolError
+            ):
+                MODULE.command_from_mapping(payload)
+
+    def test_world_scene_command_is_whitelisted_and_strict(self) -> None:
+        command = MODULE.WorldSceneSet("luna")
+        self.assertEqual(command.destination_id, "moon")
+        self.assertEqual(
+            MODULE.command_from_mapping(MODULE.command_to_mapping(command)),
+            MODULE.WorldSceneSet("moon"),
+        )
+        self.assertEqual(MODULE.world_scene_target("earth")["scene_id"], 2)
+        self.assertEqual(MODULE.world_scene_target("moon")["scene_id"], 15)
+        self.assertEqual(MODULE.world_scene_target("realscan")["scene_id"], 18)
+        self.assertEqual(
+            MODULE.world_scene_target("robot-training-ground")["map_name"],
+            "/Game/Maps/RobotTrainingGround",
+        )
+
+        for text in ("/world mars", "/scene 999", "/planet ../../moon"):
+            with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
+                MODULE.parse_mc_command(text)
+
+        with self.assertRaises(MODULE.CommandProtocolError):
+            MODULE.command_from_mapping(
+                {"name": "world_scene_set", "destination_id": "mars"}
+            )
 
     def test_selector_order_is_irrelevant_but_contract_is_strict(self) -> None:
         selector = MODULE.parse_mc_command(
@@ -286,11 +200,9 @@ class McCommandParserTest(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(MODULE.CommandParseError):
                 MODULE.parse_mc_command(text)
 
-    def test_rejects_mixed_nonfinite_control_and_oversized_input(self) -> None:
+    def test_rejects_local_nonfinite_control_and_oversized_input(self) -> None:
         invalid = (
             "/tp @s ^1 2 3",
-            "/tp @s ^1 ^2 ~3",
-            "/tp @s ^1e999 ^ ^",
             "/tp @s 1e999 2 3",
             "/tp @s 1 2\n3",
             "/tp @s 1 2",
@@ -304,230 +216,11 @@ class McCommandParserTest(unittest.TestCase):
 
 
 class McCommandProtocolTest(unittest.TestCase):
-    def test_game_quit_round_trip_is_typed(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=2,
-            request_id=REQUEST_ID,
-            command=MODULE.GameQuit(),
-        )
-        payload = MODULE.encode_command_request(request)
-
-        self.assertNotIn(b"/quit", payload)
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-        for mapping in (
-            {"name": "game_quit"},
-            {"name": "game_quit", "reason": "operator", "extra": 1},
-            {"name": "game_quit", "reason": "../shell"},
-        ):
-            with self.subTest(mapping=mapping), self.assertRaises(
-                MODULE.CommandProtocolError
-            ):
-                MODULE.command_from_mapping(mapping)
-
-    def test_runtime_pause_round_trip_is_typed_and_strict(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=3,
-            request_id=REQUEST_ID,
-            command=MODULE.RuntimePause("paused", 7),
-        )
-        payload = MODULE.encode_command_request(request)
-
-        self.assertNotIn(b"/runtime", payload)
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-        for mapping in (
-            {"name": "runtime_pause", "target": "paused"},
-            {
-                "name": "runtime_pause",
-                "target": "paused",
-                "expected_epoch": True,
-            },
-            {
-                "name": "runtime_pause",
-                "target": "toggle",
-                "expected_epoch": 0,
-            },
-            {
-                "name": "runtime_pause",
-                "target": "paused",
-                "expected_epoch": 0,
-                "extra": 1,
-            },
-        ):
-            with self.subTest(mapping=mapping), self.assertRaises(
-                MODULE.CommandProtocolError
-            ):
-                MODULE.command_from_mapping(mapping)
-
-    def test_creative_spawn_round_trip_is_typed(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=5,
-            request_id=REQUEST_ID,
-            command=MODULE.CreativeSpawnItem("training_blaster"),
-        )
-
-        payload = MODULE.encode_command_request(request)
-
-        self.assertNotIn(b"/item", payload)
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-
-    def test_data_modify_input_round_trip_is_typed(self) -> None:
-        commands = (
-            MODULE.DataModifyInput("control.input.keyboard.ctrl", True),
-            MODULE.DataModifyInput("control.input.gamepad.look_pitch", -0.5),
-            MODULE.DataModifyInput("control.input.mouse.dy", 12.5),
-            MODULE.DataModifyInput("control.input.mouse.middle", False),
-        )
-        for sequence, command in enumerate(commands, start=10):
-            with self.subTest(command=command):
-                request = MODULE.GameCommandRequest(
-                    session=SESSION,
-                    sequence=sequence,
-                    request_id=REQUEST_ID,
-                    command=command,
-                )
-                payload = MODULE.encode_command_request(request)
-
-                self.assertNotIn(b"/data", payload)
-                self.assertIn(b'"name":"data_modify_input"', payload)
-                self.assertEqual(MODULE.decode_command_request(payload), request)
-
-    def test_data_modify_input_mapping_schema_is_strict(self) -> None:
-        valid = {
-            "name": "data_modify_input",
-            "path": "control.input.gamepad.forward",
-            "value": 0.5,
-        }
-        invalid = (
-            {**valid, "unknown": True},
-            {"name": "data_modify_input", "path": valid["path"]},
-            {**valid, "path": "control.input.gamepad.unknown"},
-            {**valid, "value": True},
-            {**valid, "value": math.inf},
-            {**valid, "value": 1.001},
-            {
-                **valid,
-                "path": "control.input.keyboard.w",
-                "value": 1,
-            },
-        )
-        for mapping in invalid:
-            with self.subTest(mapping=mapping), self.assertRaises(
-                MODULE.CommandProtocolError
-            ):
-                MODULE.command_from_mapping(mapping)
-
-    def test_data_modify_round_trip_is_typed(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=5,
-            request_id=REQUEST_ID,
-            command=MODULE.parse_mc_command(
-                "/data modify entity @s "
-                "control.motion.gears.slow.speed_mps set value 0.15"
-            ).command,
-        )
-
-        payload = MODULE.encode_command_request(request)
-
-        self.assertNotIn(b"/data", payload)
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-
-    def test_movement_mode_set_round_trip_is_typed_and_strict(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=6,
-            request_id=REQUEST_ID,
-            command=MODULE.MovementModeSet("body_relative", 4),
-        )
-        payload = MODULE.encode_command_request(request)
-
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-        self.assertIn(b'"name":"movement_mode_set"', payload)
-        for mapping in (
-            {
-                "name": "movement_mode_set",
-                "movement_mode": "unknown",
-                "expected_revision": 4,
-            },
-            {
-                "name": "movement_mode_set",
-                "movement_mode": "camera_face",
-                "expected_revision": -1,
-            },
-            {
-                "name": "movement_mode_set",
-                "movement_mode": "camera_face",
-                "expected_revision": 4,
-                "extra": True,
-            },
-        ):
-            with self.subTest(mapping=mapping), self.assertRaises(
-                MODULE.CommandProtocolError
-            ):
-                MODULE.command_from_mapping(mapping)
-
-    def test_teleport_list_round_trip_contains_only_typed_tags(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=6,
-            request_id=REQUEST_ID,
-            command=MODULE.TeleportList(("home", "moon.tranquility")),
-        )
-
-        payload = MODULE.encode_command_request(request)
-
-        self.assertNotIn(b"/teleport", payload)
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-
-    def test_policy_slot_assignment_round_trip_is_typed(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=4,
-            request_id=REQUEST_ID,
-            command=MODULE.PolicySlotAssignment("recovery", "host"),
-        )
-
-        payload = MODULE.encode_command_request(request)
-        decoded = MODULE.decode_command_request(payload)
-
-        self.assertEqual(decoded, request)
-        self.assertNotIn(b"/policy", payload)
-
-    def test_policy_slot_query_round_trip_is_typed(self) -> None:
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=5,
-            request_id=REQUEST_ID,
-            command=MODULE.PolicySlotQuery(),
-        )
-
-        payload = MODULE.encode_command_request(request)
-
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-        self.assertNotIn(b"/policy", payload)
-
     def test_request_round_trip_carries_typed_ast_not_command_text(self) -> None:
         command = MODULE.parse_mc_command("/tp @s ~1 2 ~-3").command
         request = MODULE.GameCommandRequest(
             session=SESSION,
             sequence=7,
-            request_id=REQUEST_ID,
-            command=command,
-        )
-
-        payload = MODULE.encode_command_request(request)
-
-        self.assertNotIn(b"/tp", payload)
-        self.assertEqual(MODULE.decode_command_request(payload), request)
-
-    def test_local_coordinate_request_round_trip_is_typed(self) -> None:
-        command = MODULE.parse_mc_command("/tp @s ^ ^1 ^2").command
-        request = MODULE.GameCommandRequest(
-            session=SESSION,
-            sequence=8,
             request_id=REQUEST_ID,
             command=command,
         )
@@ -574,6 +267,18 @@ class McCommandProtocolTest(unittest.TestCase):
             response,
         )
 
+    def test_runtime_pause_command_round_trip_is_strict(self) -> None:
+        request = MODULE.GameCommandRequest(
+            session=SESSION,
+            sequence=4,
+            request_id=REQUEST_ID,
+            command=MODULE.RuntimePauseSet("paused", expected_epoch=3),
+        )
+
+        decoded = MODULE.decode_command_request(MODULE.encode_command_request(request))
+
+        self.assertEqual(decoded, request)
+
 
 class McCommandExecutionTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -609,7 +314,9 @@ class McCommandExecutionTest(unittest.TestCase):
             now_unix_ns=3,
         )
 
-        self.assertTrue(effect.restart_required)
+        self.assertFalse(effect.restart_required)
+        self.assertEqual(effect.code, "OK_TELEPORT")
+        self.assertIs(effect.data["hot_pose"], True)
         self.assertEqual(effect.state.last_exit, point.pose)
         self.assertEqual(effect.state.resume_source, "teleport_command")
 
@@ -624,25 +331,125 @@ class McCommandExecutionTest(unittest.TestCase):
         )
 
         self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, 0.5))
-        self.assertTrue(effect.restart_required)
+        self.assertFalse(effect.restart_required)
+        self.assertEqual(effect.code, "OK_TELEPORT")
+        self.assertIs(effect.data["hot_pose"], True)
+        self.assertEqual(effect.data["yaw_rad"], 0.5)
 
-    def test_local_coordinate_tp_uses_yaw_left_up_forward_basis(self) -> None:
-        origin = WorldPose(10.0, 20.0, 0.8, math.pi / 2.0)
-        command = MODULE.parse_mc_command("/tp @s ^1 ^2 ^3").command
+    def test_world_scene_command_requests_bounded_internal_reload(self) -> None:
+        command = MODULE.parse_mc_command("/world moon").command
+        effect = MODULE.execute_command(
+            command,
+            state=self.state,
+            current_pose=self.origin,
+            now_unix_ns=2,
+        )
+
+        self.assertTrue(effect.restart_required)
+        self.assertEqual(effect.code, "OK_WORLD_RESTART")
+        self.assertEqual(effect.state.last_exit, self.origin)
+        self.assertEqual(effect.state.resume_source, "teleport_command")
+        self.assertEqual(effect.data["destination_id"], "moon")
+        self.assertEqual(effect.data["target_scene_id"], 15)
+        self.assertEqual(effect.data["target_scene_name"], "MoonWorld")
+
+    def test_pose_yaw_and_recover_here_write_resume_pose(self) -> None:
+        pose_command = MODULE.parse_mc_command("/pose @s yaw ~90deg").command
+        pose_effect = MODULE.execute_command(
+            pose_command,
+            state=self.state,
+            current_pose=self.origin,
+            now_unix_ns=2,
+        )
+        self.assertEqual(
+            pose_effect.state.last_exit,
+            WorldPose(10.0, 20.0, 0.8, 0.5 + math.pi / 2.0),
+        )
+        self.assertEqual(pose_effect.state.resume_source, "pose_command")
+
+        fallen = WorldPose(12.0, 24.0, 0.2, -2.0)
+        recover_command = MODULE.parse_mc_command("/tpstand @s").command
+        recover_effect = MODULE.execute_command(
+            recover_command,
+            state=self.state,
+            current_pose=fallen,
+            now_unix_ns=3,
+        )
+        self.assertEqual(recover_effect.state.last_exit, WorldPose(12.0, 24.0, 1.3, 0.5))
+        self.assertEqual(recover_effect.state.resume_source, "recover_here")
+        self.assertEqual(recover_effect.data["reset_pose"], "standing")
+
+    def test_recover_here_lifts_contaminated_low_town10_safe_pose(self) -> None:
+        contaminated = WorldPose(3.0, 4.0, 0.30, 0.25)
+        state = MatrixWorldState.empty(
+            world_id="g1_29dof:scene_terrain_t10",
+            world_revision="revision",
+        ).checkpoint(contaminated, upright=True, now_unix_ns=1)
+        recover_command = MODULE.parse_mc_command("/recover").command
+        recover_effect = MODULE.execute_command(
+            recover_command,
+            state=state,
+            current_pose=contaminated,
+            now_unix_ns=2,
+        )
+
+        self.assertGreaterEqual(
+            recover_effect.state.last_exit.z,
+            contaminated.z + MODULE.RECOVER_ROOT_LIFT_M,
+        )
+        self.assertEqual(
+            recover_effect.state.last_exit,
+            WorldPose(3.0, 4.0, 0.80, 0.25),
+        )
+        self.assertEqual(recover_effect.data["reset_pose"], "standing")
+
+    def test_function_world_commands_apply_sequential_resume_pose(self) -> None:
+        command = MODULE.parse_mc_command(
+            "/function /tp @s ~1 ~2 1.25; /pose @s yaw 180deg"
+        ).command
 
         effect = MODULE.execute_command(
             command,
             state=self.state,
-            current_pose=origin,
-            now_unix_ns=2,
+            current_pose=self.origin,
+            now_unix_ns=4,
         )
 
-        assert effect.state.last_exit is not None
-        self.assertAlmostEqual(effect.state.last_exit.x, 9.0)
-        self.assertAlmostEqual(effect.state.last_exit.y, 23.0)
-        self.assertAlmostEqual(effect.state.last_exit.z, 2.8)
-        self.assertAlmostEqual(effect.state.last_exit.yaw_rad, math.pi / 2.0)
-        self.assertTrue(effect.restart_required)
+        self.assertFalse(effect.restart_required)
+        self.assertEqual(effect.code, "OK_FUNCTION")
+        self.assertEqual(effect.state.last_exit, WorldPose(11.0, 22.0, 1.25, math.pi))
+
+    def test_file_function_requires_runtime_support(self) -> None:
+        command = MODULE.parse_mc_command("/function recover_here").command
+
+        with self.assertRaises(MODULE.CommandExecutionError) as context:
+            MODULE.execute_command(
+                command,
+                state=self.state,
+                current_pose=self.origin,
+                now_unix_ns=4,
+            )
+
+        self.assertEqual(context.exception.code, "E_FUNCTION_RUNTIME_ONLY")
+
+    def test_motion_settings_command_requires_runtime_support(self) -> None:
+        command = MODULE.parse_mc_command(
+            (
+                "/data modify entity @s "
+                "control.motion.gait_start_heading_error_rad "
+                f"set value {math.radians(50.0):.10f}"
+            )
+        ).command
+
+        with self.assertRaises(MODULE.CommandExecutionError) as context:
+            MODULE.execute_command(
+                command,
+                state=self.state,
+                current_pose=self.origin,
+                now_unix_ns=4,
+            )
+
+        self.assertEqual(context.exception.code, "E_MOTION_SETTING_RUNTIME_ONLY")
 
     def test_missing_selector_target_does_not_mutate_state(self) -> None:
         command = MODULE.parse_mc_command(
@@ -658,235 +465,6 @@ class McCommandExecutionTest(unittest.TestCase):
 
         self.assertEqual(context.exception.code, "E_SELECTOR_NO_TARGET")
         self.assertEqual(self.state.teleport_points, ())
-
-    def test_teleport_list_returns_requested_snapshot_without_mutation(self) -> None:
-        state, point = self.state.add_teleport_point(
-            WorldPose(12.0, 18.0, 0.8, 0.25),
-            ("home",),
-            entity_id="tp-" + "c" * 32,
-            now_unix_ns=2,
-        )
-
-        effect = MODULE.execute_command(
-            MODULE.TeleportList(("home", "moon.tranquility")),
-            state=state,
-            current_pose=self.origin,
-            now_unix_ns=3,
-        )
-
-        self.assertIs(effect.state, state)
-        self.assertFalse(effect.restart_required)
-        self.assertEqual(effect.code, "OK_TELEPORT_LIST")
-        self.assertEqual(
-            effect.data,
-            {
-                "world_id": "town10",
-                "teleport_points": [
-                    {
-                        "tag": "home",
-                        "found": True,
-                        "entity_id": point.entity_id,
-                        "position": [12.0, 18.0, 0.8],
-                        "yaw_rad": 0.25,
-                    },
-                    {"tag": "moon.tranquility", "found": False},
-                ],
-            },
-        )
-
-    def test_cross_world_route_is_authoritative_over_local_points(self) -> None:
-        route = MODULE.TeleportRoute(
-            tag="moon.tranquility",
-            target_scene_id=15,
-            target_world_id="g1_29dof:scene_terrain_moon_dynamic",
-            entry_pose=WorldPose(-94.7, -65.6, -5.251562023162842, 0.0),
-            entity_id="tp-" + "d" * 32,
-            destination_id="moon-tranquility-outpost",
-        )
-
-        listed = MODULE.execute_command(
-            MODULE.TeleportList(("moon.tranquility",)),
-            state=self.state,
-            current_pose=self.origin,
-            teleport_routes={route.tag: route},
-        )
-
-        self.assertFalse(listed.restart_required)
-        self.assertEqual(
-            listed.data["teleport_points"],
-            [
-                {
-                    "tag": "moon.tranquility",
-                    "found": True,
-                    "entity_id": route.entity_id,
-                    "position": [-94.7, -65.6, -5.251562023162842],
-                    "yaw_rad": 0.0,
-                }
-            ],
-        )
-
-        effect = MODULE.execute_command(
-            MODULE.TeleportSelector("moon.tranquility"),
-            state=self.state,
-            current_pose=self.origin,
-            now_unix_ns=4,
-            teleport_routes={route.tag: route},
-        )
-
-        self.assertTrue(effect.restart_required)
-        self.assertEqual(effect.code, "OK_TELEPORT_ROUTE_RESTART")
-        self.assertEqual(effect.state.last_exit, self.origin)
-        self.assertNotEqual(effect.state.last_exit, route.entry_pose)
-        self.assertEqual(effect.data["launch_route"], route.to_mapping())
-
-        shadowed_state, _point = self.state.add_teleport_point(
-            WorldPose(12.0, 34.0, 1.0, 0.0),
-            ("moon.tranquility",),
-            now_unix_ns=3,
-        )
-        routed = MODULE.execute_command(
-            MODULE.TeleportSelector("moon.tranquility"),
-            state=shadowed_state,
-            current_pose=self.origin,
-            now_unix_ns=4,
-            teleport_routes={route.tag: route},
-        )
-        listed = MODULE.execute_command(
-            MODULE.TeleportList(("moon.tranquility",)),
-            state=shadowed_state,
-            current_pose=self.origin,
-            teleport_routes={route.tag: route},
-        )
-        self.assertEqual(routed.code, "OK_TELEPORT_ROUTE_RESTART")
-        self.assertEqual(routed.data["entity_id"], route.entity_id)
-        self.assertEqual(
-            listed.data["teleport_points"][0]["entity_id"],
-            route.entity_id,
-        )
-
-    def test_same_world_route_uses_local_point_and_never_relaunches(self) -> None:
-        route = MODULE.TeleportRoute(
-            tag="home",
-            target_scene_id=2,
-            target_world_id="town10",
-            entry_pose=WorldPose(0.0, 0.0, 0.793, 0.0),
-            entity_id="tp-" + "e" * 32,
-            destination_id="earth-overworld-home",
-        )
-        state, point = self.state.add_teleport_point(
-            WorldPose(12.0, 18.0, 0.8, 0.25),
-            ("home",),
-            entity_id="tp-" + "f" * 32,
-            now_unix_ns=2,
-        )
-
-        listed = MODULE.execute_command(
-            MODULE.TeleportList(("home",)),
-            state=state,
-            current_pose=self.origin,
-            teleport_routes={route.tag: route},
-        )
-        effect = MODULE.execute_command(
-            MODULE.TeleportSelector("home"),
-            state=state,
-            current_pose=self.origin,
-            now_unix_ns=3,
-            teleport_routes={route.tag: route},
-        )
-
-        self.assertEqual(
-            listed.data["teleport_points"][0]["entity_id"], point.entity_id
-        )
-        self.assertEqual(effect.code, "OK_TELEPORT_RESTART")
-        self.assertNotIn("launch_route", effect.data)
-        self.assertEqual(effect.state.last_exit, point.pose)
-
-        missing = MODULE.execute_command(
-            MODULE.TeleportList(("home",)),
-            state=self.state,
-            current_pose=self.origin,
-            teleport_routes={route.tag: route},
-        )
-        self.assertEqual(
-            missing.data["teleport_points"],
-            [{"tag": "home", "found": False}],
-        )
-        with self.assertRaises(MODULE.CommandExecutionError) as context:
-            MODULE.execute_command(
-                MODULE.TeleportSelector("home"),
-                state=self.state,
-                current_pose=self.origin,
-                teleport_routes={route.tag: route},
-            )
-        self.assertEqual(context.exception.code, "E_SELECTOR_NO_TARGET")
-
-    def test_reciprocal_routes_preserve_independent_world_state_files(self) -> None:
-        earth_world = "g1_29dof:scene_terrain_t10"
-        moon_world = "g1_29dof:scene_terrain_moon_dynamic"
-        earth_route = MODULE.TeleportRoute(
-            tag="home",
-            target_scene_id=2,
-            target_world_id=earth_world,
-            entry_pose=WorldPose(0.0, 0.0, 0.793, 0.0),
-            entity_id="tp-" + "1" * 32,
-            destination_id="earth-overworld-home",
-        )
-        moon_route = MODULE.TeleportRoute(
-            tag="moon.tranquility",
-            target_scene_id=15,
-            target_world_id=moon_world,
-            entry_pose=WorldPose(-94.7, -65.6, -5.251562023162842, 0.0),
-            entity_id="tp-" + "2" * 32,
-            destination_id="moon-tranquility-outpost",
-        )
-        routes = {earth_route.tag: earth_route, moon_route.tag: moon_route}
-        earth_pose = WorldPose(13.0, -3.0, 0.79, 0.4)
-        moon_pose = WorldPose(6.0, -48.0, -17.3, -0.7)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            earth_store = WorldStateStore(
-                root / "earth.json",
-                world_id=earth_world,
-                world_revision="earth-v1",
-            )
-            moon_store = WorldStateStore(
-                root / "moon.json",
-                world_id=moon_world,
-                world_revision="moon-v1",
-            )
-            earth_store.save(earth_store.state.checkpoint(
-                earth_pose, upright=True, now_unix_ns=1
-            ))
-            moon_store.save(moon_store.state.checkpoint(
-                moon_pose, upright=True, now_unix_ns=1
-            ))
-
-            to_moon = MODULE.execute_command(
-                MODULE.TeleportSelector("moon.tranquility"),
-                state=earth_store.load(),
-                current_pose=earth_pose,
-                now_unix_ns=2,
-                teleport_routes=routes,
-            )
-            earth_store.save(to_moon.state)
-            self.assertEqual(to_moon.data["launch_route"]["target_world_id"], moon_world)
-            self.assertEqual(moon_store.load().last_exit, moon_pose)
-
-            to_earth = MODULE.execute_command(
-                MODULE.TeleportSelector("home"),
-                state=moon_store.load(),
-                current_pose=moon_pose,
-                now_unix_ns=2,
-                teleport_routes=routes,
-            )
-            moon_store.save(to_earth.state)
-
-            self.assertEqual(to_earth.data["launch_route"]["target_world_id"], earth_world)
-            self.assertEqual(earth_store.load().world_id, earth_world)
-            self.assertEqual(moon_store.load().world_id, moon_world)
-            self.assertEqual(earth_store.load().last_exit, earth_pose)
-            self.assertEqual(moon_store.load().last_exit, moon_pose)
 
     def test_resolved_out_of_world_coordinate_fails_before_mutation(self) -> None:
         command = MODULE.parse_mc_command("/tp @s 100001 0 1").command

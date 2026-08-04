@@ -6,15 +6,12 @@ import json
 import math
 import os
 from pathlib import Path
-import shlex
 import shutil
-import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -28,9 +25,6 @@ if os.fspath(SCRIPTS) not in sys.path:
 CORE = importlib.import_module("matrix_game_control")
 PROVIDER = importlib.import_module("matrix_game_control_input")
 OVERLAY = importlib.import_module("matrix_ue_overlay")
-WORLD_STATE = importlib.import_module("matrix_world_state")
-CELESTIAL = importlib.import_module("matrix_celestial_navigation")
-ROUTE_ENTRY = importlib.import_module("matrix_route_entry")
 RUNTIME_SPEC = importlib.util.spec_from_file_location(
     "matrix_game_control_integration_runtime",
     SCRIPTS / "run_matrix_sonic.py",
@@ -55,21 +49,12 @@ def provider_snapshot(
     sequence: int,
     timestamp: float,
     w: bool = False,
-    a: bool = False,
-    s: bool = False,
-    d: bool = False,
     camera_yaw_rad: float = 0.0,
 ) -> object:
     return PROVIDER.build_snapshot(
         sequence=sequence,
         timestamp_monotonic_s=timestamp,
-        keyboard=PROVIDER.KeyboardMouseSample(
-            w=w,
-            a=a,
-            s=s,
-            d=d,
-            focused=True,
-        ),
+        keyboard=PROVIDER.KeyboardMouseSample(w=w, focused=True),
         gamepad=PROVIDER.GamepadSample(),
         input_source="keyboard",
         camera_yaw_rad=camera_yaw_rad,
@@ -176,6 +161,12 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
                 self.assertEqual(planner_frames[-1]["mode"], 2)
                 # Unmodified keyboard WASD reaches native WALK's lower bound.
                 self.assertAlmostEqual(planner_frames[-1]["speed"], 0.8)
+                # Matrix's ordinary camera-face WASD publishes absolute
+                # world-frame movement/facing vectors.  It must not also drive
+                # SONIC native HeadingState.delta_heading; otherwise the
+                # deploy layer can rotate the reference frame a second time and
+                # make the body face diagonally relative to the travel vector.
+                self.assertIsNone(moving.delta_heading_rad)
                 self.assertAlmostEqual(
                     planner_frames[-1]["movement"][0], 0.0, places=7
                 )
@@ -283,206 +274,6 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
                 second.close()
                 runtime.close()
 
-    def test_runtime_drain_preserves_transient_chord_boundary(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            socket_path = Path(temporary) / "game.sock"
-            runtime = RUNTIME.GameInputRuntime(
-                socket_path,
-                CORE.GameControlCore(immediate_config()),
-            )
-            runtime.open()
-            publisher = PROVIDER.UnixSeqpacketPublisher(socket_path)
-            try:
-                self.assertTrue(
-                    publisher.send(
-                        provider_snapshot(sequence=100, timestamp=10.0),
-                        now=10.0,
-                    )
-                )
-                self.assertEqual(runtime.poll(now_s=10.0, dt_s=0.1).mode, "idle")
-
-                runtime.core.synchronize_heading(0.0)
-                self.assertTrue(
-                    publisher.send(
-                        provider_snapshot(
-                            sequence=101,
-                            timestamp=10.01,
-                            w=True,
-                            camera_yaw_rad=0.0,
-                        ),
-                        now=10.01,
-                    )
-                )
-                initial = runtime.poll(now_s=10.01, dt_s=0.1)
-                self.assertAlmostEqual(
-                    math.atan2(
-                        initial.desired_facing[1],
-                        initial.desired_facing[0],
-                    ),
-                    0.0,
-                )
-
-                # Both snapshots are drained before the next command frame. The
-                # final W must begin a new movement interval at the new camera.
-                runtime.core.synchronize_heading(1.0)
-                self.assertTrue(
-                    publisher.send(
-                        provider_snapshot(
-                            sequence=102,
-                            timestamp=10.02,
-                            w=True,
-                            d=True,
-                            camera_yaw_rad=1.0,
-                        ),
-                        now=10.02,
-                    )
-                )
-                self.assertTrue(
-                    publisher.send(
-                        provider_snapshot(
-                            sequence=103,
-                            timestamp=10.021,
-                            w=True,
-                            camera_yaw_rad=1.0,
-                        ),
-                        now=10.021,
-                    )
-                )
-                relocked = runtime.poll(now_s=10.021, dt_s=0.1)
-                self.assertEqual(relocked.mode, "move")
-                self.assertAlmostEqual(
-                    math.atan2(
-                        relocked.desired_facing[1],
-                        relocked.desired_facing[0],
-                    ),
-                    1.0,
-                )
-
-                self.assertTrue(
-                    publisher.send(
-                        provider_snapshot(
-                            sequence=104,
-                            timestamp=10.03,
-                            w=True,
-                            camera_yaw_rad=1.6,
-                        ),
-                        now=10.03,
-                    )
-                )
-                held = runtime.poll(now_s=10.03, dt_s=0.1)
-                self.assertAlmostEqual(
-                    math.atan2(held.desired_facing[1], held.desired_facing[0]),
-                    1.0,
-                )
-            finally:
-                publisher.close()
-                runtime.close()
-
-    def test_runtime_drain_rearm_needs_neutral_frame_and_fresh_w(self) -> None:
-        reasons = (
-            "runtime_resume_awaiting_neutral",
-            "fall_recovered_awaiting_neutral",
-            "physical_fall_recovery",
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            socket_path = Path(temporary) / "game.sock"
-            runtime = RUNTIME.GameInputRuntime(
-                socket_path,
-                CORE.GameControlCore(immediate_config()),
-            )
-            runtime.open()
-            publisher = PROVIDER.UnixSeqpacketPublisher(socket_path)
-            sequence = 100
-            now = 10.0
-            try:
-                self.assertTrue(
-                    publisher.send(
-                        provider_snapshot(sequence=sequence, timestamp=now),
-                        now=now,
-                    )
-                )
-                self.assertEqual(runtime.poll(now_s=now, dt_s=0.1).mode, "idle")
-
-                sequence += 1
-                now += 0.01
-                self.assertTrue(
-                    publisher.send(
-                        provider_snapshot(sequence=sequence, timestamp=now, w=True),
-                        now=now,
-                    )
-                )
-                self.assertEqual(runtime.poll(now_s=now, dt_s=0.1).mode, "move")
-
-                for reason in reasons:
-                    with self.subTest(reason=reason):
-                        runtime.core.invalidate_input(reason)
-
-                        sequence += 1
-                        now += 0.01
-                        self.assertTrue(
-                            publisher.send(
-                                provider_snapshot(
-                                    sequence=sequence,
-                                    timestamp=now,
-                                    w=True,
-                                ),
-                                now=now,
-                            )
-                        )
-                        held = runtime.poll(now_s=now, dt_s=0.01)
-                        self.assertEqual(held.reason, "awaiting_neutral")
-
-                        sequence += 1
-                        now += 0.01
-                        self.assertTrue(
-                            publisher.send(
-                                provider_snapshot(sequence=sequence, timestamp=now),
-                                now=now,
-                            )
-                        )
-                        sequence += 1
-                        now += 0.001
-                        self.assertTrue(
-                            publisher.send(
-                                provider_snapshot(
-                                    sequence=sequence,
-                                    timestamp=now,
-                                    w=True,
-                                ),
-                                now=now,
-                            )
-                        )
-                        queued = runtime.poll(now_s=now, dt_s=0.01)
-                        self.assertEqual(queued.reason, "awaiting_neutral")
-                        self.assertEqual(
-                            queued.locomotion_mode,
-                            CORE.SONIC_IDLE_MODE,
-                        )
-                        self.assertEqual(queued.speed_mps, 0.0)
-
-                        fenced = runtime.poll(now_s=now + 0.001, dt_s=0.01)
-                        self.assertEqual(fenced.reason, "awaiting_neutral")
-                        self.assertEqual(fenced.speed_mps, 0.0)
-
-                        sequence += 1
-                        now += 0.01
-                        self.assertTrue(
-                            publisher.send(
-                                provider_snapshot(
-                                    sequence=sequence,
-                                    timestamp=now,
-                                    w=True,
-                                ),
-                                now=now,
-                            )
-                        )
-                        resumed = runtime.poll(now_s=now, dt_s=0.1)
-                        self.assertEqual(resumed.mode, "move")
-                        self.assertGreater(resumed.speed_mps, 0.0)
-            finally:
-                publisher.close()
-                runtime.close()
-
     def test_faulty_packet_batch_cannot_rearm_with_later_neutral_and_w(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             socket_path = Path(temporary) / "game.sock"
@@ -568,24 +359,12 @@ class GameControlPipelineIntegrationTest(unittest.TestCase):
 
 class LauncherArgumentChainIntegrationTest(unittest.TestCase):
     GAME_CONTROL_DEPENDENCIES = (
-        "scripts/matrix_build_info.py",
-        "scripts/matrix_game_control_input.py",
-        "scripts/matrix_external_control.py",
-        "scripts/matrix_calibration_overlay.py",
-        "scripts/matrix_celestial_navigation.py",
-        "scripts/matrix_celestial_ephemeris.py",
-        "scripts/matrix_celestial_visuals.py",
-        "scripts/bootstrap_matrix_celestial.sh",
-        "scripts/matrix_mc_commands.py",
-        "scripts/matrix_motion_settings.py",
-        "scripts/matrix_route_entry.py",
-        "scripts/matrix_spawn_clearance.py",
-        "scripts/matrix_world_state.py",
-        "config/universe/sol-2080.json",
-        "config/universe/de440s-2080.lock.json",
-        "config/universe/celestial-visual-profiles-v1.json",
-        "scripts/prepare_sonic_physics_model.py",
-        "scripts/compose_custom_scene.py",
+        "matrix_game_control_input.py",
+        "matrix_calibration_overlay.py",
+        "matrix_mc_commands.py",
+        "matrix_world_state.py",
+        "prepare_sonic_physics_model.py",
+        "compose_custom_scene.py",
     )
 
     @staticmethod
@@ -595,247 +374,6 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         if executable:
             path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
-    def controlled_route(
-        self,
-        project: Path,
-        destination_id: str,
-        *,
-        install_assets: bool,
-    ) -> dict[str, object]:
-        catalog = CELESTIAL.load_catalog(
-            project / "config/universe/sol-2080.json"
-        )
-        try:
-            destination = catalog.destination(destination_id)
-            route = destination.launch_route
-            self.assertIsNotNone(route)
-            assert route is not None
-            if install_assets:
-                for relative in route.required_assets:
-                    self.write(project / relative, "fixture asset\n")
-            return route.runtime_mapping(
-                destination_id=destination.destination_id,
-                teleport_tag=destination.teleport_tag,
-            )
-        finally:
-            catalog.ephemeris.close()
-
-    @staticmethod
-    def route_restart_status(
-        route: dict[str, object],
-        *,
-        source_world_id: str | None = None,
-    ) -> dict[str, object]:
-        if source_world_id is None:
-            source_world_id = (
-                "g1_29dof:scene_terrain_moon_dynamic"
-                if route["target_world_id"] == "g1_29dof:scene_terrain_t10"
-                else "g1_29dof:scene_terrain_t10"
-            )
-        return {
-            "failed_child_exit_code": None,
-            "failed_child_name": None,
-            "game_auto_respawn": True,
-            "game_world_state": {
-                "world_id": source_world_id,
-                "has_last_exit": True,
-                "last_error": None,
-            },
-            "internal_restart": {
-                "requested": True,
-                "reason": "game_teleport",
-                "target_scene_id": route["target_scene_id"],
-                "launch_route": route,
-            },
-            "termination_reason": "game_teleport",
-            "termination_signal": None,
-        }
-
-    @staticmethod
-    def rollback_proposal_status(
-        *,
-        state_file: Path,
-        world_id: str,
-        world_revision: str,
-        checkpoint_id: str,
-        generation: int,
-        source: str,
-        run_id: str,
-        fall_detected: bool = False,
-        spawn_clearance_reason: str | None = None,
-        dynamic_resume_clearance: bool = False,
-    ) -> dict[str, object]:
-        if dynamic_resume_clearance and spawn_clearance_reason is None:
-            raise ValueError("dynamic resume clearance requires a clearance reason")
-        status: dict[str, object] = {
-            "acceptance_failures": [
-                "spawn_clearance_failed"
-                if spawn_clearance_reason is not None
-                else "numerical_instability"
-            ],
-            "active_elapsed_s": 0.0,
-            "active_frames": 0,
-            "active_lowcmd": False,
-            "active_lowcmd_longest_s": 0.0,
-            "completed": False,
-            "elapsed_wall_s": 0.5,
-            "failed_child_exit_code": None,
-            "failed_child_name": None,
-            "fall_detected": fall_detected,
-            "game_auto_respawn": False,
-            "game_world_state": {
-                "has_last_exit": True,
-                "last_error": None,
-                "path": os.fspath(state_file),
-                "world_id": world_id,
-                "world_revision": world_revision,
-                "generation": generation,
-                "active_resume_checkpoint_id": checkpoint_id,
-                "active_resume_source": source,
-                "selected_resume_checkpoint_id": checkpoint_id,
-                "selected_resume_generation": generation,
-                "resume_rollback_ineligibility": None,
-                "resume_rollback": {
-                    "requested": True,
-                    "applied": False,
-                    "rejected_checkpoint_id": checkpoint_id,
-                    "rejected_generation": generation,
-                    "reason": (
-                        f"spawn_clearance:{spawn_clearance_reason}"
-                        if spawn_clearance_reason is not None
-                        else "startup_numerical_instability"
-                    ),
-                    "run_id": run_id,
-                },
-            },
-            "instability_resets": 0,
-            "internal_restart": {"requested": False, "reason": None},
-            "interrupted": False,
-            "last_reset_reason": None,
-            "low_cmd_received": False,
-            "numerical_error": (
-                f"spawn_clearance:{spawn_clearance_reason}"
-                if spawn_clearance_reason is not None
-                else "snapshot_sim_time_not_increasing:0.0<=0.0"
-            ),
-            "passed": False,
-            "run_id": run_id,
-            "termination_reason": (
-                "spawn_clearance_failed"
-                if spawn_clearance_reason is not None
-                else "numerical_instability"
-            ),
-            "termination_signal": None,
-        }
-        if spawn_clearance_reason is not None:
-            if spawn_clearance_reason == "no_ground_support":
-                status["spawn_clearance"] = {
-                    "schema": "matrix-spawn-clearance-audit/v1",
-                    "safe": False,
-                    "reason": "no_ground_support",
-                    "error": None,
-                    "rejected_contact_count": 0,
-                    "worst": None,
-                    "support": {
-                        "schema": "matrix-ground-support-probe/v1",
-                        "supported": False,
-                        "method": "downward_foot_geom_rays",
-                        "required_hits": 1,
-                        "accepted_hits": 0,
-                        "required_distinct_feet": 1,
-                        "supported_foot_names": [],
-                        "maximum_drop_m": 0.12,
-                        "minimum_normal_z": 0.8,
-                        "height_delta_m": None,
-                        "maximum_height_delta_m": None,
-                        "height_delta_safe": True,
-                        "rejection_reason": "insufficient_distinct_foot_support",
-                        "moon_spawn_gate": False,
-                        "ray_direction": [0.0, 0.0, -1.0],
-                        "probes": [
-                            {
-                                "foot_body": {
-                                    "id": body_id,
-                                    "name": name,
-                                },
-                                "origins": [
-                                    {
-                                        "geom_id": body_id + 100,
-                                        "geom_name": f"foot_{body_id}",
-                                        "position_m": [
-                                            float(body_id),
-                                            0.0,
-                                            0.5,
-                                        ],
-                                    }
-                                ],
-                                "accepted": False,
-                                "distance_m": None,
-                                "normal": None,
-                                "probe_geom": None,
-                                "ray_origin_m": None,
-                                "scene_geom": None,
-                                "support_height_m": None,
-                            }
-                            for body_id, name in (
-                                (7, "left_ankle_roll_link"),
-                                (13, "right_ankle_roll_link"),
-                            )
-                        ],
-                    },
-                }
-            else:
-                classification = (
-                    "scene_penetration"
-                    if spawn_clearance_reason == "scene_penetration"
-                    else "unsafe_foot_penetration"
-                )
-                status["spawn_clearance"] = {
-                    "schema": "matrix-spawn-clearance-audit/v1",
-                    "safe": False,
-                    "reason": spawn_clearance_reason,
-                    "error": None,
-                    "rejected_contact_count": 1,
-                    "worst": {
-                        "allowed": False,
-                        "classification": classification,
-                    },
-                }
-            if dynamic_resume_clearance:
-                status.update(
-                    {
-                        "active_elapsed_s": 1.25,
-                        "active_frames": 250,
-                        "active_lowcmd": True,
-                        "active_lowcmd_longest_s": 1.25,
-                        "elapsed_wall_s": 21.5,
-                        "low_cmd_received": True,
-                    }
-                )
-                status["resume_probation"] = {
-                    "enabled": True,
-                    "selected_checkpoint_id": checkpoint_id,
-                    "active": True,
-                    "completed": False,
-                    "failed": True,
-                    "phase": "failed",
-                    "checkpoint_writes_blocked": True,
-                    "stable_idle_required_s": 1.5,
-                    "stable_idle_elapsed_s": 1.25,
-                    "stable_idle_clock": "sim_time",
-                    "stable_idle_sim_elapsed_s": 1.25,
-                    "current_sim_time_s": 21.25,
-                    "sim_time_sample_valid": True,
-                    "max_sim_sample_gap_s": 0.05,
-                    "audit_interval_s": 0.1,
-                    "audit_count": 216,
-                    "failure_reason": spawn_clearance_reason,
-                    "first_fresh_lowcmd_observed": True,
-                    "startup_band_released": True,
-                    "last_clearance_audit": status["spawn_clearance"],
-                }
-        return status
-
     def make_project(self, project: Path) -> dict[str, Path]:
         scripts = project / "scripts"
         scripts.mkdir(parents=True)
@@ -844,25 +382,13 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
             "run_sim.sh",
             "matrix_mouse_settings.py",
             "matrix_build_info.py",
-            "matrix_ui_settings.py",
-            "matrix_video_settings.py",
-            "matrix_external_control.py",
-            "matrix_motion_settings.py",
-            "matrix_spawn_clearance.py",
             "matrix_restart_request.py",
             "matrix_ue_overlay.py",
             "matrix_calibration_overlay.py",
-            "matrix_celestial_navigation.py",
-            "matrix_celestial_ephemeris.py",
-            "matrix_celestial_visuals.py",
-            "matrix_route_entry.py",
-            "bootstrap_matrix_celestial.sh",
             "matrix_mc_commands.py",
-            "matrix_item_asset_pack.py",
             "matrix_world_state.py",
             "compose_custom_scene.py",
             "prepare_sonic_physics_model.py",
-            "inject_creative_inventory.py",
         ):
             shutil.copy2(SCRIPTS / name, scripts / name)
         self.write(
@@ -872,17 +398,10 @@ class LauncherArgumentChainIntegrationTest(unittest.TestCase):
         for name in (
             "matrix_game_control.py",
             "matrix_game_control_input.py",
+            "run_matrix_sonic.py",
             "supervise_matrix_ue.py",
         ):
             self.write(scripts / name, "# integration fixture\n")
-        self.write(
-            scripts / "run_matrix_sonic.py",
-            f"""from runpy import run_path
-
-_runtime = run_path({os.fspath(SCRIPTS / 'run_matrix_sonic.py')!r}, run_name="_matrix_runtime_validator")
-_spawn_clearance_rollback_reason = _runtime["_spawn_clearance_rollback_reason"]
-""",
-        )
 
         lock = project / "config/runtime/matrix-sonic.lock.json"
         lock.parent.mkdir(parents=True)
@@ -890,20 +409,6 @@ _spawn_clearance_rollback_reason = _runtime["_spawn_clearance_rollback_reason"]
         shutil.copy2(
             REPO_ROOT / "config/runtime/matrix-centered-camera-overlay-v3.json",
             project / "config/runtime/matrix-centered-camera-overlay-v3.json",
-        )
-        universe_catalog = project / "config/universe/sol-2080.json"
-        universe_catalog.parent.mkdir(parents=True)
-        shutil.copy2(
-            REPO_ROOT / "config/universe/sol-2080.json",
-            universe_catalog,
-        )
-        shutil.copy2(
-            REPO_ROOT / "config/universe/de440s-2080.lock.json",
-            universe_catalog.parent / "de440s-2080.lock.json",
-        )
-        shutil.copy2(
-            REPO_ROOT / "config/universe/celestial-visual-profiles-v1.json",
-            universe_catalog.parent / "celestial-visual-profiles-v1.json",
         )
         self.write(
             project / "config/config.json",
@@ -1002,15 +507,7 @@ _spawn_clearance_rollback_reason = _runtime["_spawn_clearance_rollback_reason"]
         fake_bin.mkdir()
         self.write(
             fake_bin / "pkill",
-            """#!/usr/bin/env bash
-set -euo pipefail
-arm_file="${FAKE_PKILL_CLEANUP_ARM_FILE:-}"
-marker_file="${FAKE_PKILL_CLEANUP_MARKER_FILE:-}"
-if [[ -n "$arm_file" && -e "$arm_file" && -n "$marker_file" ]]; then
-    printf 'cleanup-advanced\n' > "$marker_file"
-fi
-exit 0
-""",
+            "#!/usr/bin/env bash\nexit 0\n",
             executable=True,
         )
         self.write(
@@ -1092,9 +589,7 @@ import time
 script = Path(sys.argv[1]).name
 args = sys.argv[2:]
 
-if script == "-I":
-    os.execv("/usr/bin/python3", ["/usr/bin/python3", *sys.argv[1:]])
-elif script == "-":
+if script == "-":
     # run_sim uses the locked runtime Python to merge a late UE failure into
     # the already-written SONIC status.  The fixture mirrors that narrow helper
     # without importing the placeholder runtime module.
@@ -1114,9 +609,6 @@ elif script == "-":
     payload["completed"] = False
     status_path.write_text(json.dumps(payload), encoding="utf-8")
 elif script == "matrix_world_state.py":
-    if args and args[0] == "revision" and os.environ.get("FAKE_WORLD_REVISION"):
-        print(os.environ["FAKE_WORLD_REVISION"])
-        raise SystemExit(0)
     os.execv(
         "/usr/bin/python3",
         ["/usr/bin/python3", "-I", sys.argv[1], *args],
@@ -1126,19 +618,6 @@ elif script == "compose_custom_scene.py":
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args[0], target)
 elif script == "prepare_sonic_physics_model.py":
-    prepare_capture = os.environ.get("PREPARE_CAPTURE_PATH")
-    if prepare_capture:
-        Path(prepare_capture).write_text(
-            json.dumps(
-                {
-                    "argv": args,
-                    "route_entry_env": os.environ.get(
-                        "MATRIX_GAME_ROUTE_ENTRY_JSON"
-                    ),
-                }
-            ),
-            encoding="utf-8",
-        )
     output = Path(args[args.index("--output-dir") + 1])
     native = Path(args[args.index("--native-scene") + 1])
     output.mkdir(parents=True, exist_ok=True)
@@ -1200,16 +679,6 @@ elif script == "supervise_matrix_ue.py":
     pid_file.write_text(str(os.getpid()), encoding="utf-8")
     for line in sys.stdin:
         if line.strip() == "stop":
-            stop_started = os.environ.get("FAKE_UE_STOP_STARTED_MARKER")
-            if stop_started:
-                Path(stop_started).write_text("stopping", encoding="utf-8")
-            stop_release = os.environ.get("FAKE_UE_STOP_RELEASE_FILE")
-            if stop_release:
-                while not Path(stop_release).exists():
-                    time.sleep(0.01)
-            stop_finished = os.environ.get("FAKE_UE_STOP_FINISHED_MARKER")
-            if stop_finished:
-                Path(stop_finished).write_text("finished", encoding="utf-8")
             break
     late_ue_exit = os.environ.get("FAKE_UE_LATE_FAILURE_EXIT_CODE")
     if late_ue_exit:
@@ -1221,11 +690,6 @@ elif script == "supervise_matrix_ue.py":
         raise SystemExit(int(late_ue_exit))
 elif script == "run_matrix_sonic.py":
     socket_path = Path(args[args.index("--game-input-socket") + 1])
-    external_socket_path = (
-        Path(args[args.index("--game-external-control-socket") + 1])
-        if "--game-external-control-socket" in args
-        else None
-    )
     status_path = Path(os.environ["MATRIX_GAME_INPUT_STATUS_FILE"])
     capture = {
         "argv": args,
@@ -1233,72 +697,19 @@ elif script == "run_matrix_sonic.py":
         "input_source_env": os.environ.get("MATRIX_GAME_INPUT_SOURCE"),
         "yaw_source_env": os.environ.get("MATRIX_GAME_CAMERA_YAW_SOURCE"),
         "socket_env": os.environ.get("MATRIX_GAME_INPUT_SOCKET"),
-        "external_socket_env": os.environ.get(
-            "MATRIX_GAME_EXTERNAL_CONTROL_SOCKET"
-        ),
-        "external_capability_env": os.environ.get(
-            "MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE"
-        ),
-        "external_deadman_env": os.environ.get(
-            "MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS"
-        ),
         "world_persistence_env": os.environ.get("MATRIX_GAME_WORLD_PERSISTENCE"),
         "auto_respawn_env": os.environ.get("MATRIX_GAME_AUTO_RESPAWN"),
-        "route_entry_env": os.environ.get("MATRIX_GAME_ROUTE_ENTRY_JSON"),
         "socket_parent_mode": oct(socket_path.parent.stat().st_mode & 0o777),
-        "external_parent_mode": (
-            oct(external_socket_path.parent.stat().st_mode & 0o777)
-            if external_socket_path is not None
-            else None
-        ),
         "stale_status_existed": status_path.exists(),
     }
     Path(os.environ["CAPTURE_PATH"]).write_text(
         json.dumps(capture), encoding="utf-8"
     )
-    generation = None
     generation_file = os.environ.get("GENERATION_FILE")
     if generation_file:
         generation_path = Path(generation_file)
         generation = int(generation_path.read_text()) + 1 if generation_path.exists() else 1
         generation_path.write_text(str(generation), encoding="utf-8")
-    rollback_trace_file = os.environ.get("ROLLBACK_TRACE_FILE")
-    if rollback_trace_file:
-        with Path(rollback_trace_file).open("a", encoding="utf-8") as stream:
-            stream.write(
-                os.environ.get("MATRIX_GAME_RESUME_ROLLBACK_COUNT", "missing")
-                + "\\n"
-            )
-    rollback_status_map_file = os.environ.get(
-        "FAKE_RESUME_ROLLBACK_STATUS_MAP_FILE"
-    )
-    if rollback_status_map_file and generation is not None:
-        status_map = json.loads(
-            Path(rollback_status_map_file).read_text(encoding="utf-8")
-        )
-        rollback_status = status_map.get(str(generation))
-        if rollback_status is not None:
-            sonic_status = Path(args[args.index("--status-file") + 1])
-            sonic_status.write_text(json.dumps(rollback_status), encoding="utf-8")
-            raise SystemExit(76)
-    if os.environ.get("FAKE_RESUME_ROLLBACK_PROPOSAL") == "1":
-        sonic_status = Path(args[args.index("--status-file") + 1])
-        sonic_status.write_text(
-            json.dumps(
-                {
-                    "acceptance_failures": ["snapshot_sim_time_not_increasing"],
-                    "completed": False,
-                    "failed_child_exit_code": None,
-                    "failed_child_name": None,
-                    "internal_restart": {"requested": False, "reason": None},
-                    "passed": False,
-                    "termination_reason": "numerical_instability",
-                    "termination_signal": None,
-                }
-            ),
-            encoding="utf-8",
-        )
-        raise SystemExit(76)
     internal_reason = os.environ.get("FAKE_WORLD_INTERNAL_RESTART")
     if internal_reason:
         sonic_status = Path(args[args.index("--status-file") + 1])
@@ -1348,27 +759,6 @@ elif script == "run_matrix_sonic.py":
                 args[args.index("--game-restart-launcher-pid") + 1],
             ],
         )
-    if os.environ.get("FAKE_SONIC_WAIT_FOR_TERM") == "1":
-        def stop_sonic(*_args):
-            raise SystemExit(0)
-
-        signal.signal(signal.SIGTERM, stop_sonic)
-        while True:
-            time.sleep(0.1)
-    exit_gate = os.environ.get("FAKE_SONIC_EXIT_GATE")
-    if exit_gate:
-        while not Path(exit_gate).exists():
-            time.sleep(0.01)
-elif script == "matrix_celestial_navigation.py":
-    os.execv(
-        "/usr/bin/python3",
-        ["/usr/bin/python3", "-I", sys.argv[1], *args],
-    )
-elif script == "matrix_celestial_visuals.py":
-    os.execv(
-        "/usr/bin/python3",
-        ["/usr/bin/python3", "-I", sys.argv[1], *args],
-    )
 elif script == "matrix_game_control_input.py":
     request = Path(args[args.index("--restart-request-file") + 1])
     capability = Path(args[args.index("--restart-capability-file") + 1])
@@ -1400,109 +790,30 @@ elif script == "matrix_game_control_input.py":
         sonic_status_file = os.environ.get("FAKE_SONIC_STATUS_FILE")
         if sonic_status_file:
             checkpoint_error = os.environ.get("FAKE_FINAL_CHECKPOINT_ERROR")
-            reuse_selected = (
-                os.environ.get("FAKE_REUSED_SELECTED_CHECKPOINT") == "1"
-            )
-            reuse_corruption = os.environ.get(
-                "FAKE_REUSED_SELECTED_CHECKPOINT_CORRUPTION"
-            )
-            run_id = "1" * 32
-            checkpoint_id = "cp-" + ("2" * 32)
-            status = {
-                "acceptance_failures": (
-                    ["world_state_checkpoint_failed"]
-                    if checkpoint_error
-                    else []
-                ),
-                "completed": False,
-                "failed_child_exit_code": None,
-                "failed_child_name": None,
-                "fall_detected": False,
-                "final_checkpoint": (
-                    None
-                    if checkpoint_error or reuse_selected
-                    else {
-                        "schema": "matrix-final-world-checkpoint/v1",
-                        "run_id": run_id,
-                        "checkpoint_id": checkpoint_id,
-                        "generation": 1,
-                    }
-                ),
-                "game_world_state": {
-                    "active_resume_checkpoint_id": checkpoint_id,
-                    "generation": 1,
-                    "has_last_exit": True,
-                    "last_error": checkpoint_error,
-                },
-                "internal_restart": {
-                    "requested": False,
-                    "reason": None,
-                },
-                "numerical_error": None,
-                "passed": False,
-                "run_id": run_id,
-                "termination_reason": "signal",
-                "termination_signal": signal.SIGTERM,
-            }
-            if reuse_selected:
-                status["current_fall_detected"] = False
-                status["reused_resume_checkpoint"] = {
-                    "schema": "matrix-reused-selected-world-checkpoint/v1",
-                    "run_id": run_id,
-                    "checkpoint_id": checkpoint_id,
-                    "generation": 1,
-                    "disposition": "reused_selected_resume",
-                }
-                status["game_world_state"].update(
-                    {
-                        "selected_resume_checkpoint_id": checkpoint_id,
-                        "selected_resume_generation": 1,
-                        "load_error": None,
-                        "checkpoint_count": 0,
-                        "last_checkpoint_monotonic_s": None,
-                        "resume_rollback": {
-                            "requested": False,
-                            "applied": False,
-                        },
-                    }
-                )
-                status["resume_probation"] = {
-                    "enabled": True,
-                    "selected_checkpoint_id": checkpoint_id,
-                    "active": False,
-                    "completed": True,
-                    "failed": False,
-                    "phase": "completed",
-                    "checkpoint_writes_blocked": True,
-                    "checkpoint_write_arming": {
-                        "required": True,
-                        "armed": False,
-                        "phase": "waiting_user_motion",
-                        "waiting_for_user_motion": True,
-                        "armed_by_mode": None,
-                        "armed_by_sequence": None,
-                    },
-                    "audit_count": 1,
-                    "last_clearance_audit": {"safe": True},
-                }
-                if reuse_corruption == "identity":
-                    status["reused_resume_checkpoint"]["checkpoint_id"] = (
-                        "cp-" + ("3" * 32)
-                    )
-                elif reuse_corruption == "generation":
-                    status["reused_resume_checkpoint"]["generation"] = 2
-                elif reuse_corruption == "probation_failed":
-                    status["resume_probation"]["failed"] = True
-                    status["resume_probation"]["phase"] = "failed"
-                elif reuse_corruption == "fall":
-                    status["fall_detected"] = True
-                elif reuse_corruption == "child_failure":
-                    status["failed_child_name"] = "ue"
-                    status["failed_child_exit_code"] = 2
-                elif reuse_corruption == "checkpoint_count":
-                    status["game_world_state"]["checkpoint_count"] = 1
             Path(sonic_status_file).write_text(
-                json.dumps(status),
+                json.dumps(
+                    {
+                        "acceptance_failures": (
+                            ["world_state_checkpoint_failed"]
+                            if checkpoint_error
+                            else []
+                        ),
+                        "completed": False,
+                        "failed_child_exit_code": None,
+                        "failed_child_name": None,
+                        "game_world_state": {
+                            "has_last_exit": True,
+                            "last_error": checkpoint_error,
+                        },
+                        "internal_restart": {
+                            "requested": False,
+                            "reason": None,
+                        },
+                        "passed": False,
+                        "termination_reason": "signal",
+                        "termination_signal": signal.SIGTERM,
+                    }
+                ),
                 encoding="utf-8",
             )
         raise SystemExit(0)
@@ -1561,7 +872,7 @@ else:
 
             for dependency in self.GAME_CONTROL_DEPENDENCIES:
                 with self.subTest(dependency=dependency):
-                    path = project / dependency
+                    path = project / "scripts" / dependency
                     held = path.with_name(f".{path.name}.missing")
                     path.rename(held)
                     fixture["capture"].unlink(missing_ok=True)
@@ -1571,8 +882,7 @@ else:
                             env={
                                 **environment,
                                 "MATRIX_SONIC_HOST_LOCK": os.fspath(
-                                    project
-                                    / f"launcher-missing-{Path(dependency).name}.lock"
+                                    project / f"launcher-missing-{dependency}.lock"
                                 ),
                             },
                             text=True,
@@ -1592,80 +902,6 @@ else:
                         result.stderr,
                     )
                     self.assertFalse(fixture["capture"].exists())
-
-    def test_outer_launcher_preserves_custom_external_control_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            custom_root = runtime_dir / "operator-api"
-            custom_root.mkdir(mode=0o700)
-            custom_socket = custom_root / "control.sock"
-            custom_capability = custom_root / "control.cap"
-            external_capture = project / "external-paths.txt"
-            self.write(
-                project / "scripts/run_sim.sh",
-                """#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n%s\n%s\n' \
-    "${MATRIX_GAME_EXTERNAL_CONTROL_SOCKET:?}" \
-    "${MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE:?}" \
-    "${MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS:?}" \
-    > "${EXTERNAL_CAPTURE:?}"
-""",
-                executable=True,
-            )
-            environment = {
-                "EXTERNAL_CAPTURE": os.fspath(external_capture),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_GAME_CENTERED_CAMERA": "off",
-                "MATRIX_GAME_EXTERNAL_CONTROL_SOCKET": os.fspath(custom_socket),
-                "MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE": os.fspath(
-                    custom_capability
-                ),
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                    "--game-world-persistence",
-                    "off",
-                    "--game-auto-respawn",
-                    "off",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertEqual(
-                external_capture.read_text(encoding="utf-8").splitlines(),
-                [os.fspath(custom_socket), os.fspath(custom_capability), "0.15"],
-            )
 
     def test_run_sim_game_dependency_preflight_applies_with_persistence_off(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1712,7 +948,7 @@ printf '%s\n%s\n%s\n' \
 
             for dependency in self.GAME_CONTROL_DEPENDENCIES:
                 with self.subTest(dependency=dependency):
-                    path = project / dependency
+                    path = project / "scripts" / dependency
                     held = path.with_name(f".{path.name}.missing")
                     path.rename(held)
                     fixture["capture"].unlink(missing_ok=True)
@@ -1907,32 +1143,13 @@ printf '%s\n%s\n%s\n' \
             runtime_dir = project / "runtime"
             runtime_dir.mkdir()
             mouse_settings = project / "home/.config/matrix/mouse-control.json"
-            video_settings = (
-                project
-                / "home/.config/matrix/hosts/local/video-settings.json"
-            )
             xset_log = project / "xset.log"
             xset_state = project / "xset.state"
-            material_fix = project / "outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
-            prepare_capture = project / "prepare-physics.json"
+            material_fix = project / "libmatrix_ue_material_fix.so"
             self.write(
                 mouse_settings,
                 json.dumps(
                     {"version": 1, "profile": "remote", "speed_scale": 0.01}
-                ),
-            )
-            self.write(
-                video_settings,
-                json.dumps(
-                    {
-                        "version": 1,
-                        "revision": 7,
-                        "resolution": "1600x900",
-                        "window_mode": "windowed",
-                        "fps_limit": 90,
-                        "quality": "epic",
-                        "camera_smoothing": "off",
-                    }
                 ),
             )
             self.write(xset_log)
@@ -1946,9 +1163,7 @@ printf '%s\n%s\n%s\n' \
                 "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
                     fixture["stale_status"]
                 ),
-                "MATRIX_GAME_GRAB_ESCAPE": "1",
                 "MATRIX_MOUSE_SETTINGS_FILE": os.fspath(mouse_settings),
-                "MATRIX_VIDEO_SETTINGS_FILE": os.fspath(video_settings),
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
                 "MATRIX_G1_MATERIAL_PALETTE": (
                     "0.018,0.024,0.035;0.055,0.075,0.11;"
@@ -1965,12 +1180,12 @@ printf '%s\n%s\n%s\n' \
                     "set Engine.SpringArmComponent bEnableCameraLag True,"
                     "viewclass OperatorCamera_C"
                 ),
+                "MATRIX_UE_MATERIAL_FIX_PRELOAD": os.fspath(material_fix),
                 "MATRIX_UE_STARTUP_SECONDS": "0",
                 "MATRIX_VERIFY_RUNTIME": "0",
                 "PATH": os.fspath(fixture["fake_bin"])
                 + os.pathsep
                 + os.environ.get("PATH", "/usr/bin:/bin"),
-                "PREPARE_CAPTURE_PATH": os.fspath(prepare_capture),
                 "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
                 "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
                 "XSET_LOG": os.fspath(xset_log),
@@ -2039,7 +1254,6 @@ printf '%s\n%s\n%s\n' \
             self.assertEqual(capture["world_persistence_env"], "1")
             self.assertEqual(capture["auto_respawn_env"], "1")
             self.assertEqual(capture["socket_parent_mode"], "0o700")
-            self.assertEqual(capture["external_parent_mode"], "0o700")
             self.assertFalse(capture["stale_status_existed"])
             ue_capture = json.loads(
                 fixture["ue_capture"].read_text(encoding="utf-8")
@@ -2084,34 +1298,16 @@ printf '%s\n%s\n%s\n' \
                 "bEnableFOVScaling=False",
                 ue_capture["command"],
             )
-            self.assertIn("-ResX=1600", ue_capture["command"])
-            self.assertIn("-ResY=900", ue_capture["command"])
-            self.assertIn("-windowed", ue_capture["command"])
-            self.assertNotIn("-borderless", ue_capture["command"])
-            exec_commands = next(
-                argument
-                for argument in ue_capture["command"]
-                if argument.startswith("-ExecCmds=")
-            )
-            self.assertIn("t.MaxFPS 90,r.MotionBlurQuality 0", exec_commands)
-            self.assertIn("sg.ViewDistanceQuality 3", exec_commands)
             self.assertIn(
-                "set Engine.SpringArmComponent bEnableCameraLag false",
-                exec_commands,
+                "-ExecCmds=t.MaxFPS 30,r.MotionBlurQuality 0,"
+                "set Engine.SpringArmComponent bEnableCameraLag False,"
+                "set Engine.SpringArmComponent bEnableCameraRotationLag False,"
+                "set Engine.SpringArmComponent bDoCollisionTest True,"
+                "viewclass MujocoSim_Custom_C,"
+                "set Engine.SpringArmComponent bEnableCameraLag True,"
+                "viewclass OperatorCamera_C",
+                ue_capture["command"],
             )
-            self.assertIn(
-                "set Engine.SpringArmComponent CameraLagSpeed 12",
-                exec_commands,
-            )
-            self.assertLess(
-                exec_commands.index(
-                    "set Engine.SpringArmComponent bEnableCameraLag false"
-                ),
-                exec_commands.rindex(
-                    "set Engine.SpringArmComponent bEnableCameraLag True"
-                ),
-            )
-            self.assertTrue(exec_commands.endswith("viewclass OperatorCamera_C"))
 
             with mock.patch.object(
                 sys,
@@ -2128,20 +1324,6 @@ printf '%s\n%s\n%s\n' \
             self.assertEqual(parsed.game_applied_mouse_profile, "remote")
             self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.01)
             self.assertEqual(parsed.game_mouse_settings_file, mouse_settings)
-            self.assertEqual(parsed.game_video_settings_file, video_settings)
-            self.assertEqual(
-                json.loads(parsed.game_applied_video_settings_json),
-                {
-                    "camera_smoothing": "off",
-                    "fps_limit": 90,
-                    "quality": "epic",
-                    "resolution": "1600x900",
-                    "resolution_height": 900,
-                    "resolution_width": 1600,
-                    "revision": 7,
-                    "window_mode": "windowed",
-                },
-            )
             self.assertIsNotNone(parsed.game_restart_request_file)
             self.assertIsNotNone(parsed.game_restart_capability_file)
             self.assertGreater(parsed.game_restart_launcher_pid, 1)
@@ -2156,7 +1338,6 @@ printf '%s\n%s\n%s\n' \
             self.assertEqual(parsed.gamepad_look_max_pitch_deg, 50.0)
             self.assertEqual(parsed.game_max_speed, 0.27)
             self.assertEqual(parsed.game_input_timeout, 0.14)
-            self.assertTrue(parsed.game_grab_escape)
             self.assertEqual(
                 parsed.game_world_id,
                 "g1_29dof:scene_terrain_apart2",
@@ -2185,95 +1366,7 @@ printf '%s\n%s\n%s\n' \
             )
             self.assertEqual(parsed.game_input_status_file, fixture["stale_status"])
             self.assertEqual(os.fspath(parsed.game_input_socket), capture["socket_env"])
-            self.assertEqual(
-                os.fspath(parsed.game_external_control_socket),
-                capture["external_socket_env"],
-            )
-            self.assertEqual(
-                os.fspath(parsed.game_external_control_capability_file),
-                capture["external_capability_env"],
-            )
-            self.assertEqual(
-                parsed.game_external_control_deadman_seconds,
-                float(capture["external_deadman_env"]),
-            )
-            self.assertEqual(parsed.game_external_control_socket.name, "local.sock")
-            self.assertEqual(
-                parsed.game_external_control_capability_file.name,
-                "local.cap",
-            )
-            ipc_paths = {
-                path.resolve(strict=False)
-                for path in (
-                    parsed.game_input_socket,
-                    parsed.game_external_control_socket,
-                    parsed.game_external_control_capability_file,
-                    parsed.game_restart_request_file,
-                    parsed.game_restart_capability_file,
-                )
-            }
-            self.assertEqual(len(ipc_paths), 5)
             self.assertFalse(parsed.game_input_socket.parent.exists())
-            self.assertTrue(parsed.game_external_control_socket.parent.is_dir())
-
-            # A populated slot must carry the exact selected checkpoint ID and
-            # generation through run_sim into the runtime. Coordinates alone
-            # are insufficient authority for an automatic rejection.
-            world_store = WORLD_STATE.WorldStateStore(
-                parsed.game_world_state_file,
-                world_id=parsed.game_world_id,
-                world_revision=parsed.game_world_revision,
-            )
-            selected_state = world_store.state.set_resume_pose(
-                WORLD_STATE.WorldPose(4.0, 5.0, 0.81, -1.25e-05),
-                now_unix_ns=1,
-            )
-            world_store.save(selected_state)
-            selected = selected_state.resolve_start()
-            resumed_environment = dict(environment)
-            resumed_environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
-                project / "launcher-resume.lock"
-            )
-
-            resumed = subprocess.run(
-                command,
-                env=resumed_environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-            self.assertEqual(
-                resumed.returncode,
-                0,
-                msg=f"stdout:\n{resumed.stdout}\nstderr:\n{resumed.stderr}",
-            )
-            resumed_capture = json.loads(
-                fixture["capture"].read_text(encoding="utf-8")
-            )
-            with mock.patch.object(
-                sys,
-                "argv",
-                ["run_matrix_sonic.py", *resumed_capture["argv"]],
-            ):
-                resumed_args = RUNTIME._parse_args()
-            self.assertEqual(
-                resumed_args.game_world_resume_checkpoint_id,
-                selected.checkpoint_id,
-            )
-            self.assertEqual(
-                resumed_args.game_world_resume_generation,
-                selected.generation,
-            )
-            self.assertEqual(resumed_args.game_resume_rollback_count, 0)
-            prepared = json.loads(prepare_capture.read_text(encoding="utf-8"))
-            spawn_yaw = next(
-                argument
-                for argument in prepared["argv"]
-                if argument.startswith("--spawn-yaw=")
-            )
-            self.assertEqual(float(spawn_yaw.split("=", 1)[1]), -1.25e-05)
-            self.assertNotIn("--spawn-yaw", prepared["argv"])
 
             # X11 setup is an experience improvement, never a launch gate.
             # A headless launch and an unreachable X server both continue with
@@ -2330,28 +1423,19 @@ printf '%s\n%s\n%s\n' \
             self.assertEqual(xset_log.read_text(encoding="utf-8"), "")
             self.assertEqual(xset_state.read_text(encoding="utf-8"), "2/1 4\n")
 
-    def test_launcher_accepts_preserved_legacy_mouse_settings(self) -> None:
+    def test_unbounded_game_launch_does_not_exit_on_fall_when_auto_respawn_off(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
             fixture = self.make_project(project)
             runtime_dir = project / "runtime"
             runtime_dir.mkdir()
-            self.write(project / "config/hosts/test.env", "\n")
-            legacy = project / "home/.config/matrix/mouse-control.json"
-            self.write(
-                legacy,
-                json.dumps(
-                    {"version": 1, "profile": "remote", "speed_scale": 0.02}
-                ),
-            )
-            host_settings = (
-                project
-                / "home/.config/matrix/hosts/test/mouse-control.json"
-            )
             environment = {
                 "CAPTURE_PATH": os.fspath(fixture["capture"]),
                 "HOME": os.fspath(project / "home"),
                 "LANG": "C.UTF-8",
+                "MATRIX_GAME_CENTERED_CAMERA": "off",
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
                 "MATRIX_SKIP_ENV_CHECK": "1",
                 "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
@@ -2370,12 +1454,14 @@ printf '%s\n%s\n%s\n' \
                 [
                     "/bin/bash",
                     os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--profile",
-                    "test",
                     "--scene",
                     "21",
                     "--control-source",
                     "game",
+                    "--game-world-persistence",
+                    "off",
+                    "--game-auto-respawn",
+                    "off",
                 ],
                 env=environment,
                 text=True,
@@ -2388,20 +1474,17 @@ printf '%s\n%s\n%s\n' \
                 0,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertIn("status=loaded_legacy", result.stdout)
             capture = json.loads(fixture["capture"].read_text(encoding="utf-8"))
+            self.assertEqual(capture["world_persistence_env"], "0")
+            self.assertEqual(capture["auto_respawn_env"], "0")
+            self.assertNotIn("--fail-on-fall", capture["argv"])
             with mock.patch.object(
                 sys, "argv", ["run_matrix_sonic.py", *capture["argv"]]
             ):
                 parsed = RUNTIME._parse_args()
-            self.assertEqual(parsed.game_applied_mouse_profile, "remote")
-            self.assertEqual(parsed.game_applied_mouse_speed_scale, 0.02)
-            self.assertEqual(parsed.game_mouse_settings_file, host_settings)
-            self.assertFalse(host_settings.exists())
-            self.assertEqual(
-                json.loads(legacy.read_text(encoding="utf-8")),
-                {"version": 1, "profile": "remote", "speed_scale": 0.02},
-            )
+            self.assertFalse(parsed.game_auto_respawn)
+            self.assertFalse(parsed.fail_on_fall)
+            self.assertEqual(parsed.max_resets, 100000)
 
     def test_corrupt_mouse_settings_fall_back_to_explicit_local_one_x(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2626,37 +1709,6 @@ print(json.dumps(payload, sort_keys=True))
             self.assertLess(ue_index, mounted_index)
             self.assertLess(mounted_index, remove_index)
 
-            environment["MATRIX_G1_SKIN"] = "unitree-stock"
-            environment["MATRIX_G1_MATERIAL_PALETTE"] = (
-                "0.018,0.024,0.035;0.055,0.075,0.11;"
-                "0.9,0.94,1;0.42,0.42,0.42"
-            )
-            environment["MATRIX_G1_MATERIAL_SCOPE_ALPHA"] = "0.99609375"
-            environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
-                project / "launcher-missing-default-material.lock"
-            )
-            missing_default_material = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-            self.assertEqual(missing_default_material.returncode, 1)
-            self.assertIn(
-                "requires the audited UE material bridge",
-                missing_default_material.stderr,
-            )
-            self.assertFalse(active.exists())
-
             material_fix = project / "libmatrix_ue_material_fix.so"
             self.write(material_fix, "invalid fixture library\n")
             with ue_log.open("a", encoding="utf-8") as stream:
@@ -2678,7 +1730,6 @@ print(json.dumps(payload, sort_keys=True))
             environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
                 project / "launcher-missing-material-marker.lock"
             )
-            environment["MATRIX_UE_MATERIAL_FIX_PRELOAD"] = os.fspath(material_fix)
             missing_material_marker = subprocess.run(
                 [
                     "/bin/bash",
@@ -2810,57 +1861,9 @@ print(json.dumps(payload, sort_keys=True))
                 timeout=20.0,
                 check=False,
             )
-            self.assertEqual(failed_remove.returncode, 2)
+            self.assertEqual(failed_remove.returncode, 1)
             self.assertIn("Matrix cleanup failed", failed_remove.stderr)
             self.assertTrue(active.exists())
-
-            for label, failure_environment in (
-                ("exit75", {"FAKE_WORLD_INTERNAL_RESTART": "game_teleport"}),
-                ("exit76", {"FAKE_RESUME_ROLLBACK_PROPOSAL": "1"}),
-            ):
-                with self.subTest(privileged_exit=label):
-                    fixture["ue_capture"].unlink(missing_ok=True)
-                    generation_file = project / f"{label}-generations.txt"
-                    environment.update(failure_environment)
-                    environment["GENERATION_FILE"] = os.fspath(generation_file)
-                    environment["MATRIX_SONIC_HOST_LOCK"] = os.fspath(
-                        project / f"launcher-remove-failure-{label}.lock"
-                    )
-                    cleanup_rejected = subprocess.run(
-                        [
-                            "/bin/bash",
-                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                            "--scene",
-                            "21",
-                            "--control-source",
-                            "game",
-                        ],
-                        env=environment,
-                        text=True,
-                        capture_output=True,
-                        timeout=20.0,
-                        check=False,
-                    )
-                    self.assertEqual(
-                        cleanup_rejected.returncode,
-                        2,
-                        msg=(
-                            f"stdout:\n{cleanup_rejected.stdout}\n"
-                            f"stderr:\n{cleanup_rejected.stderr}"
-                        ),
-                    )
-                    self.assertEqual(
-                        generation_file.read_text(encoding="utf-8"),
-                        "1",
-                    )
-                    self.assertIn("Matrix cleanup failed", cleanup_rejected.stderr)
-                    self.assertNotIn(
-                        "Validated Matrix world reload",
-                        cleanup_rejected.stdout,
-                    )
-                    for name in failure_environment:
-                        environment.pop(name)
-                    environment.pop("GENERATION_FILE")
 
             fixture["ue_capture"].unlink()
             environment.pop("FAKE_OVERLAY_REMOVE_FAIL")
@@ -2968,15 +1971,8 @@ print(json.dumps(payload, sort_keys=True))
             disabled_ue = json.loads(
                 fixture["ue_capture"].read_text(encoding="utf-8")
             )["command"]
-            disabled_exec_commands = next(
-                argument
-                for argument in disabled_ue
-                if argument.startswith("-ExecCmds=")
-            )
             self.assertIn(
-                "-ExecCmds=t.MaxFPS 60,r.MotionBlurQuality 0,"
-                "sg.ViewDistanceQuality 2",
-                disabled_exec_commands,
+                "-ExecCmds=t.MaxFPS 30,r.MotionBlurQuality 0", disabled_ue
             )
             self.assertFalse(any("SpringArmComponent" in arg for arg in disabled_ue))
             self.assertFalse(any("viewclass" in arg for arg in disabled_ue))
@@ -3168,14 +2164,8 @@ print(json.dumps(payload, sort_keys=True))
                     )
                     self.assertEqual(runtime_capture["world_persistence_env"], "0")
                     self.assertEqual(runtime_capture["auto_respawn_env"], "0")
-                    world_id_index = runtime_capture["argv"].index(
-                        "--game-world-id"
-                    )
-                    self.assertEqual(
-                        runtime_capture["argv"][world_id_index + 1],
-                        f"{robot_type}:scene_terrain_apart2",
-                    )
                     for flag in (
+                        "--game-world-id",
                         "--game-world-revision",
                         "--game-world-state-file",
                         "--game-world-checkpoint-seconds",
@@ -3257,75 +2247,6 @@ print(json.dumps(payload, sort_keys=True))
             )
             status = json.loads(status_file.read_text(encoding="utf-8"))
             self.assertEqual(status["pre_external_termination_reason"], "game_teleport")
-            self.assertEqual(status["termination_reason"], "child_exit")
-            self.assertEqual(status["failed_child_name"], "ue")
-            self.assertEqual(status["failed_child_exit_code"], 42)
-
-    def test_late_ue_failure_invalidates_resume_rollback_proposal_exit_76(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            status_file = project / "outputs/matrix-sonic-status.json"
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "FAKE_RESUME_ROLLBACK_PROPOSAL": "1",
-                "FAKE_UE_LATE_FAILURE_EXIT_CODE": "42",
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_DISABLE_MC": "1",
-                "MATRIX_GAME_AUTO_RESPAWN": "0",
-                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
-                    project / "outputs/game-input.json"
-                ),
-                "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
-                "MATRIX_GAME_WORLD_PERSISTENCE": "0",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC": "1",
-                "MATRIX_SONIC_CONTROL_SOURCE": "game",
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_SONIC_STATUS_FILE": os.fspath(status_file),
-                "MATRIX_UNITREE_SDK2_ROOT": os.fspath(
-                    fixture["sonic"]
-                    / "gear_sonic_deploy/thirdparty/unitree_sdk2"
-                ),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_sim.sh"),
-                    "xgb",
-                    "21",
-                    "0",
-                    "0",
-                    "1",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                2,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            status = json.loads(status_file.read_text(encoding="utf-8"))
-            self.assertEqual(
-                status["pre_external_termination_reason"],
-                "numerical_instability",
-            )
             self.assertEqual(status["termination_reason"], "child_exit")
             self.assertEqual(status["failed_child_name"], "ue")
             self.assertEqual(status["failed_child_exit_code"], 42)
@@ -3533,9 +2454,9 @@ exit 0
             self.assertRegex(window, r"^[0-9]+$")
             self.assertGreater(int(window), 0)
             self.assertIn("Validated Matrix world reload", result.stdout)
-            self.assertIn("count=1/16", result.stdout)
+            self.assertIn("count=1/6", result.stdout)
 
-    def test_outer_launcher_routes_earth_moon_earth_round_trip(self) -> None:
+    def test_outer_launcher_restarts_with_internal_target_scene_arg(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "matrix"
             fixture = self.make_project(project)
@@ -3543,28 +2464,6 @@ exit 0
             runtime_dir.mkdir()
             generations = project / "generations.txt"
             scene_trace = project / "scene-trace.txt"
-            world_trace = project / "world-trace.txt"
-            route_entry_trace = project / "route-entry-trace.txt"
-            moon_status = project / "moon-route-status.json"
-            earth_status = project / "earth-route-status.json"
-            moon_route = self.controlled_route(
-                project,
-                "moon-tranquility-outpost",
-                install_assets=True,
-            )
-            earth_route = self.controlled_route(
-                project,
-                "earth-overworld-home",
-                install_assets=True,
-            )
-            moon_status.write_text(
-                json.dumps(self.route_restart_status(moon_route)),
-                encoding="utf-8",
-            )
-            earth_status.write_text(
-                json.dumps(self.route_restart_status(earth_route)),
-                encoding="utf-8",
-            )
             self.write(
                 project / "scripts/run_sim.sh",
                 """#!/usr/bin/env bash
@@ -3574,49 +2473,31 @@ if [[ -f "${GENERATION_FILE:?}" ]]; then
     generation=$(( $(<"$GENERATION_FILE") + 1 ))
 fi
 printf '%s' "$generation" > "$GENERATION_FILE"
-printf '%s\\n' "$2" >> "${SCENE_TRACE_FILE:?}"
-printf '%s\\n' "${MATRIX_GAME_WORLD_ID:-missing}" >> "${WORLD_TRACE_FILE:?}"
-printf '%s\\t%s\\n' \
-    "${MATRIX_SONIC_RESTART_ROUTE_JSON:-missing}" \
-    "${MATRIX_GAME_ROUTE_ENTRY_JSON:-missing}" \
-    >> "${ROUTE_ENTRY_TRACE_FILE:?}"
-mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
-case "$generation" in
-    1)
-        cp "${MOON_ROUTE_STATUS_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-        exit 75
-        ;;
-    2)
-        cp "${EARTH_ROUTE_STATUS_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-        exit 75
-        ;;
-    *)
-        exit 0
-        ;;
-esac
+printf '%s\\n' "${2:-missing}" >> "${SCENE_TRACE_FILE:?}"
+if [[ "$generation" == "1" ]]; then
+    mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
+    printf '%s\\n' '{"internal_restart":{"requested":true,"reason":"game_teleport","target_scene_id":15},"game_world_state":{"has_last_exit":true,"last_error":null},"game_auto_respawn":true,"termination_reason":"game_teleport","termination_signal":null,"failed_child_name":null,"failed_child_exit_code":null}' > "$MATRIX_SONIC_STATUS_FILE"
+    exit 75
+fi
+exit 0
 """,
                 executable=True,
             )
             environment = {
-                "EARTH_ROUTE_STATUS_FILE": os.fspath(earth_status),
                 "GENERATION_FILE": os.fspath(generations),
                 "HOME": os.fspath(project / "home"),
                 "LANG": "C.UTF-8",
                 "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_GAME_WORLD_ID": "g1_29dof:scene_terrain_t10",
                 "MATRIX_SKIP_ENV_CHECK": "1",
                 "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
                 "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
                 "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
                 "MATRIX_VERIFY_RUNTIME": "0",
-                "MOON_ROUTE_STATUS_FILE": os.fspath(moon_status),
                 "PATH": os.fspath(fixture["fake_bin"])
                 + os.pathsep
                 + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROUTE_ENTRY_TRACE_FILE": os.fspath(route_entry_trace),
                 "SCENE_TRACE_FILE": os.fspath(scene_trace),
                 "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "WORLD_TRACE_FILE": os.fspath(world_trace),
                 "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
             }
 
@@ -3641,1751 +2522,13 @@ esac
                 0,
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "3")
+            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
             self.assertEqual(
                 scene_trace.read_text(encoding="utf-8").splitlines(),
-                ["2", "15", "2"],
+                ["2", "15"],
             )
-            self.assertEqual(
-                world_trace.read_text(encoding="utf-8").splitlines(),
-                [
-                    "g1_29dof:scene_terrain_t10",
-                    "g1_29dof:scene_terrain_moon_dynamic",
-                    "g1_29dof:scene_terrain_t10",
-                ],
-            )
-            route_entry_lines = [
-                line.split("\t", 1)
-                for line in route_entry_trace.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(
-                [private for private, _ in route_entry_lines],
-                ["missing"] * 3,
-            )
-            self.assertEqual(route_entry_lines[0][1], "missing")
-            moon_entry = json.loads(route_entry_lines[1][1])
-            earth_entry = json.loads(route_entry_lines[2][1])
-            self.assertEqual(
-                moon_entry,
-                {
-                    "destination_id": "moon-tranquility-outpost",
-                    "entity_id": moon_route["entity_id"],
-                    "entry_x": moon_route["entry_pose"]["position"][0],
-                    "entry_y": moon_route["entry_pose"]["position"][1],
-                    "entry_z": moon_route["entry_pose"]["position"][2],
-                    "entry_yaw_rad": moon_route["entry_pose"]["yaw_rad"],
-                    "schema": "matrix-route-entry/v1",
-                    "target_scene_id": 15,
-                    "target_world_id": "g1_29dof:scene_terrain_moon_dynamic",
-                    "teleport_tag": "moon.tranquility",
-                },
-            )
-            self.assertEqual(
-                earth_entry,
-                {
-                    "destination_id": "earth-overworld-home",
-                    "entity_id": earth_route["entity_id"],
-                    "entry_x": earth_route["entry_pose"]["position"][0],
-                    "entry_y": earth_route["entry_pose"]["position"][1],
-                    "entry_z": earth_route["entry_pose"]["position"][2],
-                    "entry_yaw_rad": earth_route["entry_pose"]["yaw_rad"],
-                    "schema": "matrix-route-entry/v1",
-                    "target_scene_id": 2,
-                    "target_world_id": "g1_29dof:scene_terrain_t10",
-                    "teleport_tag": "home",
-                },
-            )
-            self.assertIn("next_scene=15", result.stdout)
-            self.assertIn("next_scene=2", result.stdout)
-            self.assertEqual(result.stdout.count("Validated Matrix world reload"), 2)
-
-    def test_run_sim_route_entry_overrides_old_target_resume_once(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            route = self.controlled_route(
-                project,
-                "moon-tranquility-outpost",
-                install_assets=True,
-            )
-            self.write(
-                project
-                / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb"
-                / "scene_terrain_moon_dynamic.xml",
-                '<mujoco model="fixture-moon"/>\n',
-            )
-
-            world_id = "g1_29dof:scene_terrain_moon_dynamic"
-            world_revision = "route-entry-target-revision-v1"
-            state_file = project / "state/moon.json"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            old_state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(12.0, -7.0, -0.46045, 0.75),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(old_state)
-            old_bytes = state_file.read_bytes()
-            old_resume = old_state.resolve_start()
-            self.assertIsNotNone(old_resume.checkpoint_id)
-
-            canonical_route = ROUTE_ENTRY.encode_route_entry_line(
-                ROUTE_ENTRY.parse_route_entry(
-                    route,
-                    expected_world_id=world_id,
-                    expected_scene_id=15,
-                )
-            )
-            prepare_capture = project / "prepare-route.json"
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "FAKE_WORLD_REVISION": world_revision,
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_DISABLE_MC": "1",
-                "MATRIX_GAME_AUTO_RESPAWN": "0",
-                "MATRIX_GAME_CENTERED_CAMERA": "off",
-                "MATRIX_GAME_FALL_RECOVERY": "off",
-                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
-                    project / "outputs/game-input.json"
-                ),
-                "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
-                "MATRIX_GAME_ROUTE_ENTRY_JSON": canonical_route,
-                "MATRIX_GAME_WORLD_ID": world_id,
-                "MATRIX_GAME_WORLD_PERSISTENCE": "1",
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC": "1",
-                "MATRIX_SONIC_CONTROL_SOURCE": "game",
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "MATRIX_UNITREE_SDK2_ROOT": os.fspath(
-                    fixture["sonic"]
-                    / "gear_sonic_deploy/thirdparty/unitree_sdk2"
-                ),
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "PREPARE_CAPTURE_PATH": os.fspath(prepare_capture),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_sim.sh"),
-                    "custom",
-                    "15",
-                    "0",
-                    "0",
-                    "1",
-                    os.fspath(fixture["custom_urdf"]),
-                    "g1_29dof",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            prepared = json.loads(prepare_capture.read_text(encoding="utf-8"))
-            prepared_args = prepared["argv"]
-            for option, expected in (
-                ("--spawn-x", "-94.7"),
-                ("--spawn-y", "-65.6"),
-                ("--spawn-z", "-5.251562023162842"),
-                ("--spawn-yaw", "0.0"),
-            ):
-                self.assertIn(f"{option}={expected}", prepared_args)
-            self.assertNotIn(f"--spawn-z={old_resume.pose.z}", prepared_args)
-            self.assertIsNone(prepared["route_entry_env"])
-
-            runtime = json.loads(fixture["capture"].read_text(encoding="utf-8"))
-            self.assertNotIn("--game-world-resume-checkpoint-id", runtime["argv"])
-            self.assertNotIn("--game-world-resume-generation", runtime["argv"])
-            self.assertIsNone(runtime["route_entry_env"])
-            self.assertEqual(state_file.read_bytes(), old_bytes)
-            self.assertIn("Matrix route entry:", result.stdout)
-
-    def test_run_sim_route_entry_survives_custom_wrapper_once(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            route = self.controlled_route(
-                project,
-                "moon-tranquility-outpost",
-                install_assets=True,
-            )
-            self.write(
-                project
-                / "src/UeSim/Linux/zsibot_mujoco_ue/Content/model/xgb"
-                / "scene_terrain_moon_dynamic.xml",
-                '<mujoco model="fixture-moon"/>\n',
-            )
-            world_id = "g1_29dof:scene_terrain_moon_dynamic"
-            world_revision = "route-entry-wrapper-revision-v1"
-            state_file = project / "state/moon.json"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            old_state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(12.0, -7.0, -0.46045, 0.75),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(old_state)
-            canonical_route = ROUTE_ENTRY.encode_route_entry_line(
-                ROUTE_ENTRY.parse_route_entry(
-                    route,
-                    expected_world_id=world_id,
-                    expected_scene_id=15,
-                )
-            )
-            wrapper_trace = project / "wrapper-route-env.txt"
-            prepare_capture = project / "prepare-route-wrapper.json"
-            self.write(
-                project / "scripts/run_custom_urdf.sh",
-                """#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\\n' "${MATRIX_GAME_ROUTE_ENTRY_JSON:-missing}" \
-    > "${WRAPPER_ROUTE_TRACE:?}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER=1 \
-    exec "$SCRIPT_DIR/run_sim.sh" "custom" "${2:?}" "${3:?}" \
-        "${4:?}" "${5:?}" "" "${7:?}"
-""",
-                executable=True,
-            )
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "FAKE_WORLD_REVISION": world_revision,
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_DISABLE_MC": "1",
-                "MATRIX_GAME_AUTO_RESPAWN": "0",
-                "MATRIX_GAME_CENTERED_CAMERA": "off",
-                "MATRIX_GAME_FALL_RECOVERY": "off",
-                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
-                    project / "outputs/game-input.json"
-                ),
-                "MATRIX_GAME_NO_INPUT_PROVIDER": "1",
-                "MATRIX_GAME_ROUTE_ENTRY_JSON": canonical_route,
-                "MATRIX_GAME_WORLD_ID": world_id,
-                "MATRIX_GAME_WORLD_PERSISTENCE": "1",
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC": "1",
-                "MATRIX_SONIC_CONTROL_SOURCE": "game",
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "MATRIX_UNITREE_SDK2_ROOT": os.fspath(
-                    fixture["sonic"]
-                    / "gear_sonic_deploy/thirdparty/unitree_sdk2"
-                ),
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "PREPARE_CAPTURE_PATH": os.fspath(prepare_capture),
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "WRAPPER_ROUTE_TRACE": os.fspath(wrapper_trace),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_sim.sh"),
-                    "custom",
-                    "15",
-                    "0",
-                    "0",
-                    "1",
-                    os.fspath(fixture["custom_urdf"]),
-                    "g1_29dof",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertIn("Delegating custom URDF setup", result.stdout)
-            self.assertEqual(
-                wrapper_trace.read_text(encoding="utf-8").strip(),
-                canonical_route,
-            )
-            prepared = json.loads(prepare_capture.read_text(encoding="utf-8"))
-            prepared_args = prepared["argv"]
-            for option, expected in (
-                ("--spawn-x", "-94.7"),
-                ("--spawn-y", "-65.6"),
-                ("--spawn-z", "-5.251562023162842"),
-                ("--spawn-yaw", "0.0"),
-            ):
-                self.assertIn(f"{option}={expected}", prepared_args)
-            self.assertIsNone(prepared["route_entry_env"])
-            runtime = json.loads(fixture["capture"].read_text(encoding="utf-8"))
-            self.assertIsNone(runtime["route_entry_env"])
-            self.assertNotIn("--game-world-resume-checkpoint-id", runtime["argv"])
-            self.assertNotIn("--game-world-resume-generation", runtime["argv"])
-            self.assertIn("Matrix route entry:", result.stdout)
-
-    def test_outer_launcher_does_not_leak_route_entry_to_plain_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            generations = project / "generations.txt"
-            route_entry_trace = project / "route-entry-trace.txt"
-            moon_status = project / "moon-route-status.json"
-            fall_status = project / "fall-status.json"
-            moon_route = self.controlled_route(
-                project,
-                "moon-tranquility-outpost",
-                install_assets=True,
-            )
-            moon_status.write_text(
-                json.dumps(self.route_restart_status(moon_route)),
-                encoding="utf-8",
-            )
-            fall_status.write_text(
-                json.dumps(
-                    {
-                        "failed_child_exit_code": None,
-                        "failed_child_name": None,
-                        "game_auto_respawn": True,
-                        "game_world_state": {
-                            "has_last_exit": True,
-                            "last_error": None,
-                        },
-                        "internal_restart": {
-                            "requested": True,
-                            "reason": "game_fall_respawn",
-                        },
-                        "termination_reason": "game_fall_respawn",
-                        "termination_signal": None,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                """#!/usr/bin/env bash
-set -euo pipefail
-generation=1
-if [[ -f "${GENERATION_FILE:?}" ]]; then
-    generation=$(( $(<"$GENERATION_FILE") + 1 ))
-fi
-printf '%s' "$generation" > "$GENERATION_FILE"
-printf '%s\\t%s\\n' \
-    "${MATRIX_SONIC_RESTART_ROUTE_JSON:-missing}" \
-    "${MATRIX_GAME_ROUTE_ENTRY_JSON:-missing}" \
-    >> "${ROUTE_ENTRY_TRACE_FILE:?}"
-mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
-case "$generation" in
-    1)
-        cp "${MOON_ROUTE_STATUS_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-        exit 75
-        ;;
-    2)
-        cp "${FALL_STATUS_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-        exit 75
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-""",
-                executable=True,
-            )
-            environment = {
-                "FALL_STATUS_FILE": os.fspath(fall_status),
-                "GENERATION_FILE": os.fspath(generations),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_GAME_WORLD_ID": "g1_29dof:scene_terrain_t10",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "MOON_ROUTE_STATUS_FILE": os.fspath(moon_status),
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROUTE_ENTRY_TRACE_FILE": os.fspath(route_entry_trace),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "2",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            route_entry_lines = [
-                line.split("\t", 1)
-                for line in route_entry_trace.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(
-                [private for private, _ in route_entry_lines],
-                ["missing"] * 3,
-            )
-            self.assertEqual(route_entry_lines[0][1], "missing")
-            self.assertEqual(
-                json.loads(route_entry_lines[1][1])["destination_id"],
-                "moon-tranquility-outpost",
-            )
-            self.assertEqual(route_entry_lines[2][1], "missing")
-            self.assertEqual(result.stdout.count("Validated Matrix world reload"), 2)
-
-    def test_outer_launcher_rejects_private_route_without_inherited_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            generation_file = project / "generations.txt"
-            route = self.controlled_route(
-                project,
-                "moon-tranquility-outpost",
-                install_assets=True,
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                """#!/usr/bin/env bash
-set -euo pipefail
-printf 'x' > "${GENERATION_FILE:?}"
-""",
-                executable=True,
-            )
-            environment = {
-                "GENERATION_FILE": os.fspath(generation_file),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_GAME_WORLD_ID": "g1_29dof:scene_terrain_t10",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_RESTART_ROUTE_JSON": json.dumps(
-                    route,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "2",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 2)
-            self.assertIn(
-                "Matrix restart route requires the inherited host lock",
-                result.stderr,
-            )
-            self.assertFalse(generation_file.exists())
-
-    def test_outer_launcher_rejects_same_world_route_and_fixed_state_file(self) -> None:
-        cases = (
-            (
-                "same-world",
-                "g1_29dof:scene_terrain_moon_dynamic",
-                "g1_29dof:scene_terrain_moon_dynamic",
-                "15",
-                False,
-            ),
-            (
-                "fixed-state-file",
-                "g1_29dof:scene_terrain_t10",
-                "g1_29dof:scene_terrain_t10",
-                "2",
-                True,
-            ),
-        )
-        for name, source_world, initial_world, scene_id, fixed_file in cases:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
-                project = Path(temporary) / "matrix"
-                fixture = self.make_project(project)
-                runtime_dir = project / "runtime"
-                runtime_dir.mkdir()
-                route = self.controlled_route(
-                    project,
-                    "moon-tranquility-outpost",
-                    install_assets=True,
-                )
-                status_file = project / "route-status.json"
-                status_file.write_text(
-                    json.dumps(
-                        self.route_restart_status(
-                            route,
-                            source_world_id=source_world,
-                        )
-                    ),
-                    encoding="utf-8",
-                )
-                self.write(
-                    project / "scripts/run_sim.sh",
-                    """#!/usr/bin/env bash
-set -euo pipefail
-printf 'x' >> "${GENERATION_FILE:?}"
-mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
-cp "${ROUTE_STATUS_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-exit 75
-""",
-                    executable=True,
-                )
-                environment = {
-                    "GENERATION_FILE": os.fspath(project / "generations.txt"),
-                    "HOME": os.fspath(project / "home"),
-                    "LANG": "C.UTF-8",
-                    "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                    "MATRIX_GAME_WORLD_ID": initial_world,
-                    "MATRIX_SKIP_ENV_CHECK": "1",
-                    "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                    "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                    "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                    "MATRIX_VERIFY_RUNTIME": "0",
-                    "PATH": os.fspath(fixture["fake_bin"])
-                    + os.pathsep
-                    + os.environ.get("PATH", "/usr/bin:/bin"),
-                    "ROUTE_STATUS_FILE": os.fspath(status_file),
-                    "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                    "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-                }
-                if fixed_file:
-                    environment["MATRIX_GAME_WORLD_STATE_FILE"] = os.fspath(
-                        project / "fixed-world.json"
-                    )
-
-                result = subprocess.run(
-                    [
-                        "/bin/bash",
-                        os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                        "--scene",
-                        scene_id,
-                        "--control-source",
-                        "game",
-                    ],
-                    env=environment,
-                    text=True,
-                    capture_output=True,
-                    timeout=20.0,
-                    check=False,
-                )
-
-                self.assertEqual(result.returncode, 75)
-                self.assertIn(
-                    "Refusing unverified Matrix world reload request",
-                    result.stderr,
-                )
-                self.assertNotIn("Validated Matrix world reload", result.stdout)
-
-    def test_outer_launcher_rejects_catalog_route_with_missing_asset(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            route = self.controlled_route(
-                project,
-                "earth-overworld-home",
-                install_assets=False,
-            )
-            catalog = CELESTIAL.load_catalog(
-                project / "config/universe/sol-2080.json"
-            )
-            try:
-                destination = catalog.destination("earth-overworld-home")
-                assert destination.launch_route is not None
-                for relative in destination.launch_route.required_assets[1:]:
-                    self.write(project / relative, "fixture asset\n")
-            finally:
-                catalog.ephemeris.close()
-            status_file = project / "route-status.json"
-            status_file.write_text(
-                json.dumps(self.route_restart_status(route)),
-                encoding="utf-8",
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                """#!/usr/bin/env bash
-set -euo pipefail
-printf 'x' >> "${GENERATION_FILE:?}"
-mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
-cp "${ROUTE_STATUS_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-exit 75
-""",
-                executable=True,
-            )
-            environment = {
-                "GENERATION_FILE": os.fspath(project / "generations.txt"),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_GAME_WORLD_ID": "g1_29dof:scene_terrain_moon_dynamic",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROUTE_STATUS_FILE": os.fspath(status_file),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "15",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 75)
-            self.assertIn(
-                "Refusing unverified Matrix world reload request",
-                result.stderr,
-            )
-            self.assertNotIn("Validated Matrix world reload", result.stdout)
-
-    def test_outer_launcher_rejects_forged_catalog_route(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            route = self.controlled_route(
-                project,
-                "earth-overworld-home",
-                install_assets=True,
-            )
-            route["entity_id"] = "tp-" + "f" * 32
-            status_file = project / "forged-route-status.json"
-            status_file.write_text(
-                json.dumps(self.route_restart_status(route)),
-                encoding="utf-8",
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                """#!/usr/bin/env bash
-set -euo pipefail
-printf 'x' >> "${GENERATION_FILE:?}"
-mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
-cp "${ROUTE_STATUS_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-exit 75
-""",
-                executable=True,
-            )
-            environment = {
-                "GENERATION_FILE": os.fspath(project / "generations.txt"),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_GAME_WORLD_ID": "g1_29dof:scene_terrain_moon_dynamic",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROUTE_STATUS_FILE": os.fspath(status_file),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "15",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 75)
-            self.assertIn(
-                "Refusing unverified Matrix world reload request",
-                result.stderr,
-            )
-            self.assertNotIn("Validated Matrix world reload", result.stdout)
-
-    def test_outer_launcher_quarantines_two_consecutive_candidates_then_succeeds(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            generations = project / "generations.txt"
-            rollback_trace = project / "rollback-trace.txt"
-            state_file = project / "state/world.json"
-            world_id = "g1_29dof:rollback-test"
-            world_revision = "rollback-revision-v1"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            older_state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(1.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(older_state)
-            middle_state = older_state.checkpoint(
-                WORLD_STATE.WorldPose(2.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=2,
-            )
-            store.save(middle_state)
-            latest_state = middle_state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=3,
-            )
-            store.save(latest_state)
-            latest = latest_state.resolve_start()
-            middle = middle_state.resolve_start()
-            older = older_state.resolve_start()
-            assert latest.checkpoint_id is not None
-            assert middle.checkpoint_id is not None
-            assert older.checkpoint_id is not None
-            first_status = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=latest.checkpoint_id,
-                generation=latest.generation,
-                source=latest.source,
-                run_id="a" * 32,
-                spawn_clearance_reason="no_ground_support",
-                dynamic_resume_clearance=True,
-            )
-            second_status = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=middle.checkpoint_id,
-                generation=latest.generation + 1,
-                source=middle.source,
-                run_id="b" * 32,
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                f"""#!/usr/bin/env bash
-set -euo pipefail
-generation=1
-if [[ -f "${{GENERATION_FILE:?}}" ]]; then
-    generation=$(( $(<"$GENERATION_FILE") + 1 ))
-fi
-printf '%s' "$generation" > "$GENERATION_FILE"
-printf '%s\n' "${{MATRIX_GAME_RESUME_ROLLBACK_COUNT:-missing}}" >> "${{ROLLBACK_TRACE_FILE:?}}"
-mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
-case "$generation" in
-    1)
-        printf '%s\n' {shlex.quote(json.dumps(first_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-        exit 76
-        ;;
-    2)
-        printf '%s\n' {shlex.quote(json.dumps(second_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-        exit 76
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-""",
-                executable=True,
-            )
-            environment = {
-                "GENERATION_FILE": os.fspath(generations),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_SONIC_STATUS_FILE": os.fspath(
-                    project / "outputs/matrix-sonic-status.json"
-                ),
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                # A saturated ordinary restart budget must not consume the
-                # separately bounded checkpoint-rollback chain.
-                "MATRIX_GAME_INTERNAL_RESTART_COUNT": "16",
-                "MATRIX_GAME_INTERNAL_RESTART_WINDOW_EPOCH": str(
-                    int(time.time())
-                ),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROLLBACK_TRACE_FILE": os.fspath(rollback_trace),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "3")
-            self.assertEqual(
-                rollback_trace.read_text(encoding="utf-8").splitlines(),
-                ["missing", "1", "2"],
-            )
-            committed = store.load()
-            self.assertEqual(committed.generation, latest.generation + 2)
-            self.assertEqual(
-                committed.resolve_start().checkpoint_id,
-                older.checkpoint_id,
-            )
-            self.assertEqual(
-                [item.checkpoint_id for item in committed.invalid_checkpoints],
-                [latest.checkpoint_id, middle.checkpoint_id],
-            )
-            self.assertEqual(
-                result.stdout.count(
-                    "Quarantined failed Matrix resume checkpoint"
-                ),
-                2,
-            )
-            self.assertIn(
-                f"id={latest.checkpoint_id} generation={latest.generation}",
-                result.stdout,
-            )
-            self.assertIn(
-                f"id={middle.checkpoint_id} generation={latest.generation + 1}",
-                result.stdout,
-            )
-
-    def test_outer_launcher_rejects_non_boolean_resume_rollback_fall_status(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            proposal_file = project / "proposal.json"
-            state_file = project / "state/world.json"
-            world_id = "g1_29dof:rollback-fall-type"
-            world_revision = "rollback-fall-type-revision-v1"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(state)
-            selected = state.resolve_start()
-            assert selected.checkpoint_id is not None
-            status = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="d" * 32,
-            )
-            primary_before = state_file.read_bytes()
-            backup_before = (
-                store.backup_path.read_bytes()
-                if store.backup_path.exists()
-                else None
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                """#!/usr/bin/env bash
-set -euo pipefail
-mkdir -p "$(dirname "${MATRIX_SONIC_STATUS_FILE:?}")"
-cp "${ROLLBACK_PROPOSAL_FILE:?}" "$MATRIX_SONIC_STATUS_FILE"
-exit 76
-""",
-                executable=True,
-            )
-            environment = {
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_SONIC_STATUS_FILE": os.fspath(
-                    project / "outputs/matrix-sonic-status.json"
-                ),
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROLLBACK_PROPOSAL_FILE": os.fspath(proposal_file),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            malformed_statuses = [
-                (
-                    f"fall_detected={invalid_fall!r}",
-                    {**status, "fall_detected": invalid_fall},
-                )
-                for invalid_fall in (None, 0, 1, "true")
-            ]
-            audit_error = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="e" * 32,
-                spawn_clearance_reason="scene_penetration",
-            )
-            audit_error["numerical_error"] = "spawn_clearance:audit_error"
-            audit_error["spawn_clearance"] = {
-                "schema": "matrix-spawn-clearance-audit/v1",
-                "safe": False,
-                "reason": "audit_error",
-                "error": {"type": "RuntimeError", "message": "no model"},
-                "rejected_contact_count": 0,
-                "worst": None,
-            }
-            audit_error["game_world_state"]["resume_rollback"][
-                "reason"
-            ] = "spawn_clearance:audit_error"
-            malformed_statuses.append(("spawn_clearance_audit_error", audit_error))
-            malformed_no_ground = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="9" * 32,
-                spawn_clearance_reason="no_ground_support",
-            )
-            malformed_no_ground["spawn_clearance"]["support"]["probes"][0][
-                "accepted"
-            ] = True
-            malformed_statuses.append(
-                ("malformed_no_ground_support", malformed_no_ground)
-            )
-            for suffix, field, value in (
-                ("required_hits_bool", "required_hits", True),
-                ("accepted_hits_bool", "accepted_hits", False),
-                ("ray_direction_bool", "ray_direction", [False, False, -1.0]),
-                (
-                    "ray_direction_numeric",
-                    "ray_direction",
-                    [0.0, 0.0, 1.0],
-                ),
-            ):
-                malformed_counter = self.rollback_proposal_status(
-                    state_file=state_file,
-                    world_id=world_id,
-                    world_revision=world_revision,
-                    checkpoint_id=selected.checkpoint_id,
-                    generation=selected.generation,
-                    source=selected.source,
-                    run_id=("6" if field == "required_hits" else "7") * 32,
-                    spawn_clearance_reason="no_ground_support",
-                )
-                malformed_counter["spawn_clearance"]["support"][field] = value
-                malformed_statuses.append((suffix, malformed_counter))
-            completed_probation = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="f" * 32,
-                spawn_clearance_reason="scene_penetration",
-                dynamic_resume_clearance=True,
-            )
-            completed_probation["resume_probation"]["active"] = False
-            completed_probation["resume_probation"]["completed"] = True
-            completed_probation["resume_probation"][
-                "checkpoint_writes_blocked"
-            ] = False
-            malformed_statuses.append(
-                ("completed_dynamic_probation", completed_probation)
-            )
-            falling_dynamic_probation = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="1" * 32,
-                fall_detected=True,
-                spawn_clearance_reason="scene_penetration",
-                dynamic_resume_clearance=True,
-            )
-            malformed_statuses.append(
-                ("falling_dynamic_probation", falling_dynamic_probation)
-            )
-            mismatched_probation_checkpoint = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="2" * 32,
-                spawn_clearance_reason="scene_penetration",
-                dynamic_resume_clearance=True,
-            )
-            mismatched_probation_checkpoint["resume_probation"][
-                "selected_checkpoint_id"
-            ] = "cp-" + ("f" * 32)
-            malformed_statuses.append(
-                (
-                    "mismatched_dynamic_probation_checkpoint",
-                    mismatched_probation_checkpoint,
-                )
-            )
-            wall_clock_probation = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="3" * 32,
-                spawn_clearance_reason="scene_penetration",
-                dynamic_resume_clearance=True,
-            )
-            wall_clock_probation["resume_probation"][
-                "stable_idle_clock"
-            ] = "wall_time"
-            malformed_statuses.append(
-                ("wall_clock_dynamic_probation", wall_clock_probation)
-            )
-
-            for label, malformed in malformed_statuses:
-                with self.subTest(case=label):
-                    proposal_file.write_text(
-                        json.dumps(malformed, separators=(",", ":")) + "\n",
-                        encoding="utf-8",
-                    )
-                    result = subprocess.run(
-                        [
-                            "/bin/bash",
-                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                            "--scene",
-                            "21",
-                            "--control-source",
-                            "game",
-                        ],
-                        env=environment,
-                        text=True,
-                        capture_output=True,
-                        timeout=20.0,
-                        check=False,
-                    )
-
-                    self.assertEqual(
-                        result.returncode,
-                        2,
-                        msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-                    )
-                    self.assertIn(
-                        "Refusing unverified Matrix resume rollback proposal",
-                        result.stderr,
-                    )
-                    self.assertEqual(state_file.read_bytes(), primary_before)
-                    if backup_before is None:
-                        self.assertFalse(store.backup_path.exists())
-                    else:
-                        self.assertEqual(store.backup_path.read_bytes(), backup_before)
-
-    def test_outer_launcher_stops_at_resume_rollback_limit_sixteen(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            generations = project / "generations.txt"
-            state_file = project / "state/world.json"
-            world_id = "g1_29dof:rollback-test"
-            world_revision = "rollback-revision-v1"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(state)
-            selected = state.resolve_start()
-            self.assertIsNotNone(selected.checkpoint_id)
-            rejected_id = selected.checkpoint_id
-            assert rejected_id is not None
-            run_id = "b" * 32
-            status = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=rejected_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id=run_id,
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                f"""#!/usr/bin/env bash
-set -euo pipefail
-generation=1
-if [[ -f "${{GENERATION_FILE:?}}" ]]; then
-    generation=$(( $(<"$GENERATION_FILE") + 1 ))
-fi
-printf '%s' "$generation" > "$GENERATION_FILE"
-mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
-printf '%s\n' {shlex.quote(json.dumps(status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-exit 76
-""",
-                executable=True,
-            )
-            environment = {
-                "GENERATION_FILE": os.fspath(generations),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_SONIC_STATUS_FILE": os.fspath(
-                    project / "outputs/matrix-sonic-status.json"
-                ),
-                "MATRIX_GAME_RESUME_ROLLBACK_COUNT": "16",
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=20.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                2,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
-            unchanged = store.load()
-            self.assertEqual(unchanged.generation, selected.generation)
-            self.assertEqual(unchanged.resolve_start().checkpoint_id, rejected_id)
-            self.assertEqual(unchanged.invalid_checkpoints, ())
-            self.assertIn("Matrix resume rollback limit reached", result.stderr)
-
-    def test_signal_during_authorizer_window_keeps_state_byte_exact(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            # Deterministically hold the copied launcher's exact authorizer job
-            # after it starts but before it execs the atomic marker publisher.
-            # This exercises the narrow signal window that a ready-file-only
-            # test cannot reliably reach without adding a production test hook.
-            launcher = project / "scripts/run_matrix_sonic.sh"
-            launcher_source = launcher.read_text(encoding="utf-8")
-            publisher_exec = (
-                '    exec /usr/bin/python3 -I - "$marker_path" '
-                '"$marker_payload" <<\'PY\'\n'
-            )
-            held_publisher_exec = (
-                '    if [[ "$marker_payload" == '
-                '"matrix-world-state-reject-authorize/v1" ]]; then\n'
-                '        printf \'started\\n\' > '
-                '"${MATRIX_TEST_AUTHORIZER_STARTED_FILE:?}"\n'
-                '        while [[ ! -e '
-                '"${MATRIX_TEST_AUTHORIZER_RELEASE_FILE:?}" ]]; do\n'
-                '            sleep 0.01\n'
-                '        done\n'
-                '    fi\n'
-                + publisher_exec
-            )
-            self.assertEqual(launcher_source.count(publisher_exec), 1)
-            launcher.write_text(
-                launcher_source.replace(publisher_exec, held_publisher_exec),
-                encoding="utf-8",
-            )
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            authorizer_started = project / "authorizer-started"
-            authorizer_release = project / "authorizer-release"
-            generations = project / "generations.txt"
-            state_file = project / "state/world.json"
-            world_id = "g1_29dof:rollback-signal"
-            world_revision = "rollback-signal-revision-v1"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(state)
-            selected = state.resolve_start()
-            assert selected.checkpoint_id is not None
-            primary_before = state_file.read_bytes()
-            backup_before = (
-                store.backup_path.read_bytes()
-                if store.backup_path.exists()
-                else None
-            )
-            status = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=selected.checkpoint_id,
-                generation=selected.generation,
-                source=selected.source,
-                run_id="9" * 32,
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                f"""#!/usr/bin/env bash
-set -euo pipefail
-printf '1' > "${{GENERATION_FILE:?}}"
-mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
-printf '%s\n' {shlex.quote(json.dumps(status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-exit 76
-""",
-                executable=True,
-            )
-            environment = {
-                "GENERATION_FILE": os.fspath(generations),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_SONIC_STATUS_FILE": os.fspath(
-                    project / "outputs/matrix-sonic-status.json"
-                ),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "MATRIX_TEST_AUTHORIZER_RELEASE_FILE": os.fspath(
-                    authorizer_release
-                ),
-                "MATRIX_TEST_AUTHORIZER_STARTED_FILE": os.fspath(
-                    authorizer_started
-                ),
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-            process = subprocess.Popen(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            deadline = time.monotonic() + 10.0
-            authorizer_observed = False
-            while time.monotonic() < deadline:
-                if authorizer_started.is_file():
-                    authorizer_observed = True
-                    break
-                if process.poll() is not None:
-                    break
-                time.sleep(0.002)
-            if not authorizer_observed:
-                stdout, stderr = process.communicate(timeout=5.0)
-                self.fail(
-                    "rollback authorizer never entered the held window\n"
-                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
-                )
-            process.send_signal(signal.SIGTERM)
-            stdout, stderr = process.communicate(timeout=20.0)
-
-            self.assertEqual(
-                process.returncode,
-                143,
-                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
-            )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "1")
-            self.assertEqual(state_file.read_bytes(), primary_before)
-            if backup_before is None:
-                self.assertFalse(store.backup_path.exists())
-            else:
-                self.assertEqual(store.backup_path.read_bytes(), backup_before)
-            unchanged = store.load()
-            self.assertEqual(unchanged.generation, selected.generation)
-            self.assertEqual(
-                unchanged.resolve_start().checkpoint_id,
-                selected.checkpoint_id,
-            )
-            self.assertEqual(unchanged.invalid_checkpoints, ())
-            self.assertNotIn("Quarantined failed", stdout)
-
-    def test_resume_rollback_count_survives_exit_75_reload_chain(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            generations = project / "generations.txt"
-            rollback_trace = project / "rollback-trace.txt"
-            state_file = project / "state/world.json"
-            world_id = "g1_29dof:rollback-chain"
-            world_revision = "rollback-chain-revision-v1"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            older_state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(1.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(older_state)
-            middle_state = older_state.checkpoint(
-                WORLD_STATE.WorldPose(2.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=2,
-            )
-            store.save(middle_state)
-            latest_state = middle_state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=3,
-            )
-            store.save(latest_state)
-            latest = latest_state.resolve_start()
-            middle = middle_state.resolve_start()
-            older = older_state.resolve_start()
-            assert latest.checkpoint_id is not None
-            assert middle.checkpoint_id is not None
-            assert older.checkpoint_id is not None
-            first_status = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=latest.checkpoint_id,
-                generation=latest.generation,
-                source=latest.source,
-                run_id="c" * 32,
-            )
-            reload_status = {
-                "failed_child_exit_code": None,
-                "failed_child_name": None,
-                "game_auto_respawn": False,
-                "game_world_state": {"has_last_exit": True, "last_error": None},
-                "internal_restart": {
-                    "requested": True,
-                    "reason": "game_teleport",
-                },
-                "termination_reason": "game_teleport",
-                "termination_signal": None,
-            }
-            second_status = self.rollback_proposal_status(
-                state_file=state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-                checkpoint_id=middle.checkpoint_id,
-                generation=latest.generation + 1,
-                source=middle.source,
-                run_id="d" * 32,
-            )
-            self.write(
-                project / "scripts/run_sim.sh",
-                f"""#!/usr/bin/env bash
-set -euo pipefail
-generation=1
-if [[ -f "${{GENERATION_FILE:?}}" ]]; then
-    generation=$(( $(<"$GENERATION_FILE") + 1 ))
-fi
-printf '%s' "$generation" > "$GENERATION_FILE"
-printf '%s\n' "${{MATRIX_GAME_RESUME_ROLLBACK_COUNT:-missing}}" >> "${{ROLLBACK_TRACE_FILE:?}}"
-mkdir -p "$(dirname "${{MATRIX_SONIC_STATUS_FILE:?}}")"
-case "$generation" in
-    1)
-        printf '%s\n' {shlex.quote(json.dumps(first_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-        exit 76
-        ;;
-    2)
-        printf '%s\n' {shlex.quote(json.dumps(reload_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-        exit 75
-        ;;
-    3)
-        printf '%s\n' {shlex.quote(json.dumps(second_status, separators=(",", ":")))} > "$MATRIX_SONIC_STATUS_FILE"
-        exit 76
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-""",
-                executable=True,
-            )
-            environment = {
-                "GENERATION_FILE": os.fspath(generations),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_SONIC_STATUS_FILE": os.fspath(
-                    project / "outputs/matrix-sonic-status.json"
-                ),
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROLLBACK_TRACE_FILE": os.fspath(rollback_trace),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=30.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "4")
-            self.assertEqual(
-                rollback_trace.read_text(encoding="utf-8").splitlines(),
-                ["missing", "1", "1", "2"],
-            )
-            committed = store.load()
-            self.assertEqual(committed.generation, latest.generation + 2)
-            self.assertEqual(
-                committed.resolve_start().checkpoint_id,
-                older.checkpoint_id,
-            )
-            self.assertEqual(
-                [item.checkpoint_id for item in committed.invalid_checkpoints],
-                [latest.checkpoint_id, middle.checkpoint_id],
-            )
-            self.assertEqual(
-                result.stdout.count(
-                    "Quarantined failed Matrix resume checkpoint"
-                ),
-                2,
-            )
-            self.assertIn(
-                f"id={latest.checkpoint_id} generation={latest.generation}",
-                result.stdout,
-            )
-            self.assertIn(
-                f"id={middle.checkpoint_id} generation={latest.generation + 1}",
-                result.stdout,
-            )
-
-    def test_resume_rollback_count_survives_f9_reload_chain(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            generations = project / "generations.txt"
-            rollback_trace = project / "rollback-trace.txt"
-            restart_marker = project / "restart-once.marker"
-            status_map_file = project / "rollback-status-map.json"
-            state_file = project / "state/world.json"
-            world_id = "g1_29dof:rollback-f9-chain"
-            world_revision = "rollback-f9-chain-revision-v1"
-            store = WORLD_STATE.WorldStateStore(
-                state_file,
-                world_id=world_id,
-                world_revision=world_revision,
-            )
-            older_state = store.state.checkpoint(
-                WORLD_STATE.WorldPose(1.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=1,
-            )
-            store.save(older_state)
-            middle_state = older_state.checkpoint(
-                WORLD_STATE.WorldPose(2.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=2,
-            )
-            store.save(middle_state)
-            latest_state = middle_state.checkpoint(
-                WORLD_STATE.WorldPose(3.0, 2.0, 0.81, 0.0),
-                upright=True,
-                now_unix_ns=3,
-            )
-            store.save(latest_state)
-            latest = latest_state.resolve_start()
-            middle = middle_state.resolve_start()
-            older = older_state.resolve_start()
-            assert latest.checkpoint_id is not None
-            assert middle.checkpoint_id is not None
-            assert older.checkpoint_id is not None
-            status_map_file.write_text(
-                json.dumps(
-                    {
-                        "1": self.rollback_proposal_status(
-                            state_file=state_file,
-                            world_id=world_id,
-                            world_revision=world_revision,
-                            checkpoint_id=latest.checkpoint_id,
-                            generation=latest.generation,
-                            source=latest.source,
-                            run_id="e" * 32,
-                        ),
-                        "3": self.rollback_proposal_status(
-                            state_file=state_file,
-                            world_id=world_id,
-                            world_revision=world_revision,
-                            checkpoint_id=middle.checkpoint_id,
-                            generation=latest.generation + 1,
-                            source=middle.source,
-                            run_id="f" * 32,
-                        ),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "FAKE_RESUME_ROLLBACK_STATUS_MAP_FILE": os.fspath(
-                    status_map_file
-                ),
-                "GENERATION_FILE": os.fspath(generations),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_GAME_INPUT_STATUS_FILE": os.fspath(
-                    project / "outputs/game-input.json"
-                ),
-                "MATRIX_GAME_WORLD_STATE_FILE": os.fspath(state_file),
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_SONIC_STATUS_FILE": os.fspath(
-                    project / "outputs/matrix-sonic-status.json"
-                ),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "ROLLBACK_TRACE_FILE": os.fspath(rollback_trace),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "TRIGGER_RESTART_MARKER": os.fspath(restart_marker),
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=40.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "4")
-            self.assertEqual(
-                rollback_trace.read_text(encoding="utf-8").splitlines(),
-                ["missing", "1", "1", "2"],
-            )
-            committed = store.load()
-            self.assertEqual(committed.generation, latest.generation + 2)
-            self.assertEqual(
-                committed.resolve_start().checkpoint_id,
-                older.checkpoint_id,
-            )
-            self.assertEqual(
-                [item.checkpoint_id for item in committed.invalid_checkpoints],
-                [latest.checkpoint_id, middle.checkpoint_id],
-            )
-            self.assertEqual(
-                result.stdout.count(
-                    "Quarantined failed Matrix resume checkpoint"
-                ),
-                2,
-            )
-            self.assertIn(
-                f"id={latest.checkpoint_id} generation={latest.generation}",
-                result.stdout,
-            )
-            self.assertIn(
-                f"id={middle.checkpoint_id} generation={latest.generation + 1}",
-                result.stdout,
-            )
+            self.assertIn("Validated Matrix world reload", result.stdout)
+            self.assertIn("target scene 15", result.stdout)
 
     def test_private_request_restarts_whole_runtime_after_clean_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5450,154 +2593,6 @@ esac
             )
             for path, expected in originals.items():
                 self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
-
-    def test_private_request_reuses_unchanged_selected_resume_checkpoint(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            temporary_dir = project / "tmp"
-            temporary_dir.mkdir()
-            marker = project / "restart-once.marker"
-            generations = project / "generations.txt"
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "FAKE_REUSED_SELECTED_CHECKPOINT": "1",
-                "GENERATION_FILE": os.fspath(generations),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "TRIGGER_RESTART_MARKER": os.fspath(marker),
-                "TMPDIR": os.fspath(temporary_dir),
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-
-            result = subprocess.run(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                capture_output=True,
-                timeout=30.0,
-                check=False,
-            )
-
-            self.assertEqual(
-                result.returncode,
-                0,
-                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertEqual(generations.read_text(encoding="utf-8"), "2")
-            self.assertIn(
-                "Verified unchanged selected Matrix world checkpoint",
-                result.stdout,
-            )
-            self.assertNotIn(
-                "Verified final Matrix world checkpoint",
-                result.stdout,
-            )
-
-    def test_private_request_rejects_ambiguous_selected_resume_reuse(self) -> None:
-        corruptions = (
-            "identity",
-            "generation",
-            "probation_failed",
-            "fall",
-            "child_failure",
-            "checkpoint_count",
-        )
-        for corruption in corruptions:
-            with self.subTest(corruption=corruption):
-                with tempfile.TemporaryDirectory() as temporary:
-                    project = Path(temporary) / "matrix"
-                    fixture = self.make_project(project)
-                    runtime_dir = project / "runtime"
-                    runtime_dir.mkdir()
-                    temporary_dir = project / "tmp"
-                    temporary_dir.mkdir()
-                    marker = project / "restart-once.marker"
-                    generations = project / "generations.txt"
-                    environment = {
-                        "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                        "FAKE_REUSED_SELECTED_CHECKPOINT": "1",
-                        "FAKE_REUSED_SELECTED_CHECKPOINT_CORRUPTION": corruption,
-                        "GENERATION_FILE": os.fspath(generations),
-                        "HOME": os.fspath(project / "home"),
-                        "LANG": "C.UTF-8",
-                        "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                        "MATRIX_SKIP_ENV_CHECK": "1",
-                        "MATRIX_SONIC_HOST_LOCK": os.fspath(
-                            project / "launcher.lock"
-                        ),
-                        "MATRIX_SONIC_PYTHON": os.fspath(
-                            fixture["fake_python"]
-                        ),
-                        "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                        "MATRIX_UE_STARTUP_SECONDS": "0",
-                        "MATRIX_VERIFY_RUNTIME": "0",
-                        "PATH": os.fspath(fixture["fake_bin"])
-                        + os.pathsep
-                        + os.environ.get("PATH", "/usr/bin:/bin"),
-                        "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                        "TRIGGER_RESTART_MARKER": os.fspath(marker),
-                        "TMPDIR": os.fspath(temporary_dir),
-                        "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                        "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-                    }
-
-                    result = subprocess.run(
-                        [
-                            "/bin/bash",
-                            os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                            "--scene",
-                            "21",
-                            "--control-source",
-                            "game",
-                        ],
-                        env=environment,
-                        text=True,
-                        capture_output=True,
-                        timeout=30.0,
-                        check=False,
-                    )
-
-                    self.assertEqual(
-                        result.returncode,
-                        143,
-                        msg=(
-                            f"corruption={corruption}\nstdout:\n{result.stdout}"
-                            f"\nstderr:\n{result.stderr}"
-                        ),
-                    )
-                    self.assertEqual(
-                        generations.read_text(encoding="utf-8"),
-                        "1",
-                    )
-                    self.assertIn(
-                        "Refusing Matrix restart without a verified final "
-                        "world checkpoint",
-                        result.stderr,
-                    )
 
     def test_private_request_refuses_restart_when_final_checkpoint_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5738,319 +2733,6 @@ esac
             self.assertNotIn("external-signal cleanup", result.stderr)
             for path, expected in originals.items():
                 self.assertEqual(path.read_bytes(), expected, msg=os.fspath(path))
-
-    def test_external_sigint_uses_run_sim_term_cleanup_without_orphans(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            temporary_dir = project / "tmp"
-            temporary_dir.mkdir()
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "5",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "TMPDIR": os.fspath(temporary_dir),
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-            process = subprocess.Popen(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            deadline = time.monotonic() + 10.0
-            while (
-                time.monotonic() < deadline
-                and not fixture["capture"].is_file()
-                and process.poll() is None
-            ):
-                time.sleep(0.01)
-            if not fixture["capture"].is_file():
-                stdout, stderr = process.communicate(timeout=5.0)
-                self.fail(
-                    "fixture runtime never became ready\n"
-                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
-                )
-
-            process.send_signal(signal.SIGINT)
-            stdout, stderr = process.communicate(timeout=10.0)
-
-            self.assertEqual(
-                process.returncode,
-                130,
-                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
-            )
-            self.assertNotIn(
-                "external-signal cleanup",
-                stderr,
-                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
-            )
-            self.assertIn("Cleanup finished", stdout)
-
-    def test_external_sigint_does_not_interrupt_cleanup_already_in_progress(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            temporary_dir = project / "tmp"
-            temporary_dir.mkdir()
-            sonic_exit_gate = project / "sonic-exit.gate"
-            watchdog_stop_started = project / "watchdog-stop-started.marker"
-            watchdog_stop_finished = project / "watchdog-stop-finished.marker"
-            run_sim = project / "scripts/run_sim.sh"
-            run_sim_source = run_sim.read_text(encoding="utf-8")
-            watchdog_trap = "trap 'exit 0' TERM INT\n        trap '' HUP"
-            delayed_watchdog_trap = (
-                "trap 'printf \"stopping\\n\" > "
-                '"${FAKE_WATCHDOG_STOP_STARTED_MARKER:?}"; '
-                'sleep "${FAKE_WATCHDOG_STOP_DELAY_SECONDS:-0}"; '
-                'printf "finished\\n" > '
-                '"${FAKE_WATCHDOG_STOP_FINISHED_MARKER:?}"; '
-                "exit 0' TERM INT\n        trap '' HUP"
-            )
-            self.assertEqual(run_sim_source.count(watchdog_trap), 1)
-            run_sim.write_text(
-                run_sim_source.replace(watchdog_trap, delayed_watchdog_trap),
-                encoding="utf-8",
-            )
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "FAKE_SONIC_EXIT_GATE": os.fspath(sonic_exit_gate),
-                "FAKE_WATCHDOG_STOP_DELAY_SECONDS": "1",
-                "FAKE_WATCHDOG_STOP_FINISHED_MARKER": os.fspath(
-                    watchdog_stop_finished
-                ),
-                "FAKE_WATCHDOG_STOP_STARTED_MARKER": os.fspath(
-                    watchdog_stop_started
-                ),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "5",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "TMPDIR": os.fspath(temporary_dir),
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-            process = subprocess.Popen(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            deadline = time.monotonic() + 10.0
-            while (
-                time.monotonic() < deadline
-                and not fixture["capture"].is_file()
-                and process.poll() is None
-            ):
-                time.sleep(0.01)
-            if not fixture["capture"].is_file():
-                stdout, stderr = process.communicate(timeout=5.0)
-                self.fail(
-                    "fixture runtime never reached the controlled exit gate\n"
-                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
-                )
-
-            sonic_exit_gate.write_text("exit\n", encoding="utf-8")
-            deadline = time.monotonic() + 10.0
-            while (
-                time.monotonic() < deadline
-                and not watchdog_stop_started.is_file()
-                and process.poll() is None
-            ):
-                time.sleep(0.01)
-            if not watchdog_stop_started.is_file():
-                stdout, stderr = process.communicate(timeout=5.0)
-                self.fail(
-                    "fixture cleanup never entered the watchdog wait\n"
-                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
-                )
-
-            process.send_signal(signal.SIGINT)
-            stdout, stderr = process.communicate(timeout=10.0)
-
-            self.assertEqual(
-                process.returncode,
-                130,
-                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
-            )
-            self.assertNotIn(
-                "external-signal cleanup",
-                stderr,
-                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
-            )
-            self.assertIn(
-                "Deferred signal observed while cleanup was in progress",
-                stdout,
-            )
-            self.assertIn("Cleanup finished", stdout)
-            self.assertTrue(watchdog_stop_finished.is_file())
-
-    def test_repeated_sigint_preserves_supervised_ue_cleanup_barrier(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "matrix"
-            fixture = self.make_project(project)
-            runtime_dir = project / "runtime"
-            runtime_dir.mkdir()
-            temporary_dir = project / "tmp"
-            temporary_dir.mkdir()
-            cleanup_advanced = project / "cleanup-advanced.marker"
-            cleanup_arm = project / "cleanup.arm"
-            ue_stop_started = project / "ue-stop-started.marker"
-            ue_stop_finished = project / "ue-stop-finished.marker"
-            ue_stop_release = project / "ue-stop.release"
-            environment = {
-                "CAPTURE_PATH": os.fspath(fixture["capture"]),
-                "FAKE_PKILL_CLEANUP_ARM_FILE": os.fspath(cleanup_arm),
-                "FAKE_PKILL_CLEANUP_MARKER_FILE": os.fspath(cleanup_advanced),
-                "FAKE_SONIC_WAIT_FOR_TERM": "1",
-                "FAKE_UE_STOP_FINISHED_MARKER": os.fspath(ue_stop_finished),
-                "FAKE_UE_STOP_RELEASE_FILE": os.fspath(ue_stop_release),
-                "FAKE_UE_STOP_STARTED_MARKER": os.fspath(ue_stop_started),
-                "HOME": os.fspath(project / "home"),
-                "LANG": "C.UTF-8",
-                "MATRIX_G1_URDF": os.fspath(fixture["custom_urdf"]),
-                "MATRIX_RUN_SIM_STOP_TIMEOUT_SECONDS": "10",
-                "MATRIX_SKIP_ENV_CHECK": "1",
-                "MATRIX_SONIC_HOST_LOCK": os.fspath(project / "launcher.lock"),
-                "MATRIX_SONIC_PYTHON": os.fspath(fixture["fake_python"]),
-                "MATRIX_SONIC_ROOT": os.fspath(fixture["sonic"]),
-                "MATRIX_UE_STARTUP_SECONDS": "0",
-                "MATRIX_VERIFY_RUNTIME": "0",
-                "PATH": os.fspath(fixture["fake_bin"])
-                + os.pathsep
-                + os.environ.get("PATH", "/usr/bin:/bin"),
-                "SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER": "1",
-                "TMPDIR": os.fspath(temporary_dir),
-                "UE_CAPTURE_PATH": os.fspath(fixture["ue_capture"]),
-                "XDG_RUNTIME_DIR": os.fspath(runtime_dir),
-            }
-            process = subprocess.Popen(
-                [
-                    "/bin/bash",
-                    os.fspath(project / "scripts/run_matrix_sonic.sh"),
-                    "--scene",
-                    "21",
-                    "--control-source",
-                    "game",
-                ],
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            deadline = time.monotonic() + 10.0
-            while (
-                time.monotonic() < deadline
-                and not fixture["capture"].is_file()
-                and process.poll() is None
-            ):
-                time.sleep(0.01)
-            if not fixture["capture"].is_file():
-                stdout, stderr = process.communicate(timeout=5.0)
-                self.fail(
-                    "fixture runtime never became ready\n"
-                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
-                )
-
-            cleanup_arm.write_text("armed\n", encoding="utf-8")
-            process.send_signal(signal.SIGINT)
-            deadline = time.monotonic() + 10.0
-            while (
-                time.monotonic() < deadline
-                and not ue_stop_started.is_file()
-                and process.poll() is None
-            ):
-                time.sleep(0.01)
-            if not ue_stop_started.is_file():
-                stdout, stderr = process.communicate(timeout=5.0)
-                self.fail(
-                    "cleanup never entered the supervised UE wait\n"
-                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
-                )
-
-            process.send_signal(signal.SIGINT)
-            ordering_deadline = time.monotonic() + 0.5
-            while (
-                time.monotonic() < ordering_deadline
-                and not cleanup_advanced.is_file()
-                and process.poll() is None
-            ):
-                time.sleep(0.01)
-            cleanup_advanced_early = cleanup_advanced.is_file()
-            process_exited_early = process.poll() is not None
-            ue_stop_release.write_text("release\n", encoding="utf-8")
-            stdout, stderr = process.communicate(timeout=10.0)
-
-            self.assertFalse(
-                cleanup_advanced_early,
-                msg="cleanup advanced before the supervised UE was released",
-            )
-            self.assertFalse(
-                process_exited_early,
-                msg="launcher exited before the supervised UE was released",
-            )
-            self.assertEqual(
-                process.returncode,
-                130,
-                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
-            )
-            self.assertNotIn(
-                "external-signal cleanup",
-                stderr,
-                msg=f"stdout:\n{stdout}\nstderr:\n{stderr}",
-            )
-            self.assertIn(
-                "Deferred signal observed while cleanup was in progress",
-                stdout,
-            )
-            self.assertIn("Cleanup finished", stdout)
-            self.assertTrue(ue_stop_finished.is_file())
-            self.assertTrue(cleanup_advanced.is_file())
 
     def test_restore_verification_failure_never_execs_next_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

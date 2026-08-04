@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
-import json
+import os
 from pathlib import Path
-import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -11,792 +10,205 @@ from unittest import mock
 import numpy as np
 
 
-SCRIPT = (
-    Path(__file__).resolve().parents[1]
-    / "scripts"
-    / "matrix_moon_dynamic_ground.py"
-)
-SPEC = importlib.util.spec_from_file_location("matrix_moon_dynamic_ground", SCRIPT)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = REPO_ROOT / "scripts" / "matrix_moon_dynamic_ground.py"
+SPEC = importlib.util.spec_from_file_location("matrix_moon_dynamic_ground", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-class FakeBody:
-    def __init__(self, body_id: int, name: str | None) -> None:
-        self.id = body_id
-        self.name = name
-
-
-class FakeModel:
-    def __init__(
+class MatrixMoonDynamicGroundTest(unittest.TestCase):
+    def _write_fake_height_map(
         self,
-        *,
-        missing: tuple[int, int] | None = None,
-        extra_name: str | None = None,
-        unmapped: tuple[int, int] | None = None,
-        duplicate_mocap: tuple[tuple[int, int], tuple[int, int]] | None = None,
-        continuous_support: bool = True,
-        tile_collision_enabled: bool = True,
-    ) -> None:
-        names: list[str | None] = ["world", "pelvis"]
-        keys: list[tuple[int, int] | None] = [None, None]
-        for i in range(MODULE.TILE_SIDE_COUNT):
-            for j in range(MODULE.TILE_SIDE_COUNT):
-                if (i, j) == missing:
-                    continue
-                names.append(f"gb_{i}_{j}")
-                keys.append((i, j))
-        if extra_name is not None:
-            names.append(extra_name)
-            keys.append(None)
+        directory: Path,
+        values: np.ndarray,
+    ) -> Path:
+        path = directory / "moonworld.bin"
+        path.write_bytes(np.asarray(values, dtype=MODULE.MAP_DTYPE).tobytes(order="C"))
+        return path
 
-        self.nbody = len(names)
-        self.nmocap = MODULE.TILE_COUNT
-        self._names = names
-        self.body_mocapid = np.full(self.nbody, -1, dtype=np.int64)
-        body_id_by_key: dict[tuple[int, int], int] = {}
-        for body_id, key in enumerate(keys):
-            if key is None:
-                continue
-            body_id_by_key[key] = body_id
-            self.body_mocapid[body_id] = key[0] * MODULE.TILE_SIDE_COUNT + key[1]
-        if unmapped is not None and unmapped in body_id_by_key:
-            self.body_mocapid[body_id_by_key[unmapped]] = -1
-        if duplicate_mocap is not None:
-            first, second = duplicate_mocap
-            self.body_mocapid[body_id_by_key[second]] = self.body_mocapid[
-                body_id_by_key[first]
-            ]
-        self._geom_names: list[str] = []
-        geom_body_ids: list[int] = []
-        geom_data_ids: list[int] = []
-        geom_types: list[int] = []
-        geom_contype: list[int] = []
-        geom_conaffinity: list[int] = []
-        if continuous_support:
-            self._geom_names.append(MODULE.CONTINUOUS_SUPPORT_GEOM_NAME)
-            geom_body_ids.append(0)
-            geom_data_ids.append(0)
-            geom_types.append(1)
-            geom_contype.append(0)
-            geom_conaffinity.append(0)
-            self._geom_names.append(MODULE.SPAWN_PAD_GEOM_NAME)
-            geom_body_ids.append(0)
-            geom_data_ids.append(-1)
-            geom_types.append(6)
-            geom_contype.append(1)
-            geom_conaffinity.append(1)
-        for i, j in MODULE._EXPECTED_TILE_KEYS:
-            self._geom_names.append(f"soil_{i}_{j}")
-            geom_body_ids.append(body_id_by_key.get((i, j), 0))
-            geom_data_ids.append(-1)
-            geom_types.append(6)
-            geom_contype.append(1 if tile_collision_enabled else 0)
-            geom_conaffinity.append(1 if tile_collision_enabled else 0)
-        self.ngeom = len(self._geom_names)
-        self.geom_bodyid = np.asarray(geom_body_ids, dtype=np.int64)
-        self.geom_dataid = np.asarray(geom_data_ids, dtype=np.int64)
-        self.geom_type = np.asarray(geom_types, dtype=np.int64)
-        self.geom_contype = np.asarray(geom_contype, dtype=np.int64)
-        self.geom_conaffinity = np.asarray(geom_conaffinity, dtype=np.int64)
-        self.geom_pos = np.zeros((self.ngeom, 3), dtype=np.float64)
-        self.nhfield = 1 if continuous_support else 0
-        self._hfield_names = (
-            [MODULE.CONTINUOUS_SUPPORT_ASSET_NAME]
-            if continuous_support
-            else []
-        )
-        self.hfield_nrow = np.asarray(
-            [MODULE.CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES]
-            if continuous_support
-            else [],
-            dtype=np.int64,
-        )
-        self.hfield_ncol = self.hfield_nrow.copy()
-        self.hfield_adr = np.asarray(
-            [0] if continuous_support else [],
-            dtype=np.int64,
-        )
-        self.hfield_size = np.asarray(
-            [
-                [
-                    MODULE.CONTINUOUS_SUPPORT_HALF_EXTENT_M,
-                    MODULE.CONTINUOUS_SUPPORT_HALF_EXTENT_M,
-                    MODULE.CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
-                    MODULE.CONTINUOUS_SUPPORT_BASE_DEPTH_M,
-                ]
-            ]
-            if continuous_support
-            else [],
-            dtype=np.float64,
-        ).reshape((-1, 4))
-        self.hfield_data = np.zeros(
-            MODULE.CONTINUOUS_SUPPORT_SAMPLE_COUNT if continuous_support else 0,
-            dtype=np.float32,
-        )
+    def test_height_filter_default_preserves_raw_moon_terrain(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(MODULE.normalize_height_filter(), "raw")
 
-    def body(self, key: int | str) -> FakeBody:
-        if isinstance(key, str):
-            try:
-                body_id = self._names.index(key)
-            except ValueError as exc:
-                raise KeyError(key) from exc
-            return FakeBody(body_id, self._names[body_id])
-        if key < 0 or key >= self.nbody:
-            raise KeyError(key)
-        return FakeBody(key, self._names[key])
-
-    def geom(self, key: int | str) -> FakeBody:
-        if isinstance(key, str):
-            try:
-                geom_id = self._geom_names.index(key)
-            except ValueError as exc:
-                raise KeyError(key) from exc
-        else:
-            geom_id = key
-        if geom_id < 0 or geom_id >= self.ngeom:
-            raise KeyError(key)
-        return FakeBody(geom_id, self._geom_names[geom_id])
-
-    def hfield(self, key: int | str) -> FakeBody:
-        if isinstance(key, str):
-            try:
-                hfield_id = self._hfield_names.index(key)
-            except ValueError as exc:
-                raise KeyError(key) from exc
-        else:
-            hfield_id = key
-        if hfield_id < 0 or hfield_id >= self.nhfield:
-            raise KeyError(key)
-        return FakeBody(hfield_id, self._hfield_names[hfield_id])
-
-
-class FakeData:
-    def __init__(self) -> None:
-        self.qpos = np.asarray([0.0, 0.0, 0.8], dtype=np.float64)
-        self.mocap_pos = np.full(
-            (MODULE.TILE_COUNT, 3),
-            np.nan,
-            dtype=np.float64,
-        )
-        self.mocap_quat = np.full(
-            (MODULE.TILE_COUNT, 4),
-            np.nan,
-            dtype=np.float64,
-        )
-
-
-class CountingMocapArray:
-    def __init__(self, shape: tuple[int, int]) -> None:
-        self.values = np.full(shape, np.nan, dtype=np.float64)
-        self.read_count = 0
-        self.write_count = 0
-
-    @property
-    def shape(self) -> tuple[int, ...]:
-        return self.values.shape
-
-    def __setitem__(self, key: object, value: object) -> None:
-        self.write_count += 1
-        self.values[key] = value
-
-    def __getitem__(self, key: object) -> object:
-        self.read_count += 1
-        return self.values[key]
-
-
-def write_sparse_map(
-    path: Path,
-    samples: dict[tuple[int, int], float] | None = None,
-) -> None:
-    with path.open("wb") as stream:
-        stream.truncate(MODULE.MAP_SIZE_BYTES)
-    if not samples:
-        return
-    with path.open("r+b") as stream:
-        for (row, column), value in samples.items():
-            offset = (
-                (row * MODULE.MAP_SIDE_SAMPLES + column)
-                * MODULE.MAP_DTYPE.itemsize
-            )
-            stream.seek(offset)
-            stream.write(struct.pack("<f", value))
-
-
-class MoonDynamicGroundTest(unittest.TestCase):
-    def test_native_rounding_quantization_and_pixels(self) -> None:
-        self.assertEqual(MODULE.CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES, 33)
-        self.assertEqual(MODULE.CONTINUOUS_SUPPORT_HALF_EXTENT_M, 1.6)
-        self.assertAlmostEqual(
-            (2.0 * MODULE.CONTINUOUS_SUPPORT_HALF_EXTENT_M)
-            / (MODULE.CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES - 1),
-            MODULE.MAP_RESOLUTION_M,
-        )
-        self.assertEqual(MODULE.round_away_from_zero(0.49), 0)
-        self.assertEqual(MODULE.round_away_from_zero(0.5), 1)
-        self.assertEqual(MODULE.round_away_from_zero(1.5), 2)
-        self.assertEqual(MODULE.round_away_from_zero(-0.49), 0)
-        self.assertEqual(MODULE.round_away_from_zero(-0.5), -1)
-        self.assertEqual(MODULE.round_away_from_zero(-1.5), -2)
-
-        self.assertAlmostEqual(MODULE.native_quantize(0.0), -0.05)
-        self.assertAlmostEqual(MODULE.native_quantize(0.049), 0.05)
-        self.assertAlmostEqual(MODULE.native_quantize(0.1), 0.15)
-        self.assertAlmostEqual(MODULE.native_quantize(-0.1), -0.15)
-        self.assertEqual(MODULE.world_to_pixel(0.0, 0.0), (3000, 3000))
+    def test_height_filter_accepts_playable_local_limited_relief(self) -> None:
         self.assertEqual(
-            MODULE.world_to_pixel(-1000.0, 1000.0),
-            (0, MODULE.MAP_SIDE_SAMPLES - 1),
+            MODULE.normalize_height_filter("playable-local"),
+            "playable-local",
+        )
+        self.assertEqual(MODULE.normalize_height_filter("limited"), "playable-local")
+
+    def test_playable_local_filter_preserves_small_relief_and_clamps_steps(self) -> None:
+        filtered = MODULE.apply_playable_local_height_filter(
+            np.asarray([-0.35, -0.05, 0.0, 0.08, 0.4], dtype=np.float32),
+            0.0,
+            max_delta_m=0.18,
         )
 
-    def test_resolves_exact_one_to_one_tile_mocap_mapping(self) -> None:
-        model = FakeModel()
-        mocap_ids = MODULE.resolve_tile_mocap_ids(model)
-        self.assertEqual(mocap_ids.shape, (MODULE.TILE_COUNT,))
-        self.assertEqual(mocap_ids.tolist(), list(range(MODULE.TILE_COUNT)))
-        self.assertFalse(mocap_ids.flags.writeable)
-        support = MODULE.resolve_continuous_support(model)
-        self.assertEqual(support["geom_id"], 0)
-        self.assertEqual(support["hfield_id"], 0)
-        self.assertEqual(support["data_adr"], 0)
-        self.assertEqual(support["spawn_pad_geom_id"], 1)
-        self.assertEqual(len(support["tile_geom_ids"]), MODULE.TILE_COUNT)
+        np.testing.assert_allclose(filtered, [-0.18, -0.05, 0.0, 0.08, 0.18])
+        self.assertGreater(float(np.max(filtered) - np.min(filtered)), 0.0)
 
-        drifted_models = (
-            FakeModel(missing=(15, 15)),
-            FakeModel(extra_name="gb_16_0"),
-            FakeModel(extra_name="gb_bad"),
-            FakeModel(unmapped=(3, 4)),
-            FakeModel(duplicate_mocap=((0, 0), (0, 1))),
-        )
-        for drifted in drifted_models:
-            with self.subTest(model=drifted):
-                with self.assertRaises(MODULE.MoonDynamicGroundError):
-                    MODULE.resolve_tile_mocap_ids(drifted)
-
-        with self.assertRaisesRegex(
-            MODULE.MoonDynamicGroundError,
-            "missing geom",
-        ):
-            MODULE.resolve_continuous_support(
-                FakeModel(continuous_support=False)
+    def test_playable_local_height_delta_validates_positive_finite_values(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertAlmostEqual(
+                MODULE.normalize_playable_local_height_delta(),
+                0.04,
             )
-        with self.assertRaisesRegex(
-            MODULE.MoonDynamicGroundError,
-            "compiled collidable",
-        ):
-            MODULE.resolve_continuous_support(
-                FakeModel(tile_collision_enabled=False)
+        self.assertAlmostEqual(
+            MODULE.normalize_playable_local_height_delta("0.12"),
+            0.12,
+        )
+        with self.assertRaisesRegex(MODULE.MoonDynamicGroundError, "must be positive"):
+            MODULE.normalize_playable_local_height_delta("0")
+
+    def test_collision_default_uses_mainline_rolling_tiles(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                MODULE.normalize_collision_mode(),
+                MODULE.COLLISION_MODE_ROLLING_TILES,
             )
 
-    def test_rejects_drifted_continuous_support_binding_and_collision(self) -> None:
-        cases = (
-            (
-                "world body",
-                {"geom_bodyid": 1},
-                "world body",
-            ),
-            (
-                "geom type",
-                {"geom_type": 0},
-                "MuJoCo hfield",
-            ),
-            (
-                "hfield binding",
-                {"geom_dataid": 1},
-                "bind the named hfield asset",
-            ),
-            (
-                "collision mask",
-                {"geom_contype": 1, "geom_conaffinity": 1},
-                "contype=0 and conaffinity=0",
-            ),
+    def test_run_sim_moon_default_does_not_flatten_height_map(self) -> None:
+        run_sim = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-raw',
+            run_sim,
         )
-        for label, replacements, message in cases:
-            with self.subTest(label=label):
-                model = FakeModel()
-                if label == "hfield binding":
-                    model.nhfield = 2
-                    model._hfield_names.append("other_hfield")
-                for attribute, value in replacements.items():
-                    table = getattr(model, attribute).copy()
-                    table[0] = value
-                    setattr(model, attribute, table)
-                with self.assertRaisesRegex(
-                    MODULE.MoonDynamicGroundError,
-                    message,
-                ):
-                    MODULE.resolve_continuous_support(model)
-
-    def test_rejects_duplicate_continuous_support_names(self) -> None:
-        duplicate_geom = FakeModel()
-        duplicate_geom._geom_names[-1] = MODULE.CONTINUOUS_SUPPORT_GEOM_NAME
-        with self.assertRaisesRegex(
-            MODULE.MoonDynamicGroundError,
-            "geom .* must be unique",
-        ):
-            MODULE.resolve_continuous_support(duplicate_geom)
-
-        duplicate_hfield = FakeModel()
-        duplicate_hfield.nhfield = 2
-        duplicate_hfield._hfield_names.append(
-            MODULE.CONTINUOUS_SUPPORT_ASSET_NAME
+        self.assertNotIn(
+            'MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-flat-anchor',
+            run_sim,
         )
-        with self.assertRaisesRegex(
-            MODULE.MoonDynamicGroundError,
-            "hfield .* must be unique",
-        ):
-            MODULE.resolve_continuous_support(duplicate_hfield)
+        self.assertIn(
+            'MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1',
+            run_sim,
+        )
+        self.assertIn(
+            "cleanup_runtime_generated_integrity_files",
+            run_sim,
+        )
+        self.assertIn(
+            "Binaries/Linux/MUJOCO_LOG.TXT",
+            run_sim,
+        )
+        self.assertIn(
+            'MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.85',
+            run_sim,
+        )
 
-    def test_collision_handoff_activates_only_populated_support(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            path = Path(temporary_dir) / "moonworld.bin"
-            write_sparse_map(path)
-            model = FakeModel()
-            data = FakeData()
-            forward_states: list[
-                tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
-            ] = []
+    def test_sonic_launcher_cleans_runtime_logs_before_preflight(self) -> None:
+        launcher = (REPO_ROOT / "scripts" / "run_matrix_sonic.sh").read_text(
+            encoding="utf-8"
+        )
 
-            def forward(_model: FakeModel, _data: FakeData) -> None:
-                forward_states.append(
-                    (
-                        (
-                            int(model.geom_contype[0]),
-                            int(model.geom_conaffinity[0]),
-                        ),
-                        (
-                            int(model.geom_contype[1]),
-                            int(model.geom_conaffinity[1]),
-                        ),
-                        (
-                            int(model.geom_contype[2]),
-                            int(model.geom_conaffinity[2]),
-                        ),
-                    )
-                )
+        cleanup_index = launcher.index("cleanup_runtime_generated_integrity_files")
+        verify_index = launcher.index("verify_matrix_sonic_runtime.py")
+        self.assertLess(cleanup_index, verify_index)
+        self.assertIn("Binaries/Linux/MUJOCO_LOG.TXT", launcher)
 
-            with MODULE.MoonDynamicGround(path, model) as ground:
-                with self.assertRaisesRegex(
-                    MODULE.MoonDynamicGroundError,
-                    "populated rolling hfield",
-                ):
-                    ground.activate_collision_handoff(data, forward=forward)
-                ground.update_mocap(data)
-                handoff = ground.activate_collision_handoff(
-                    data,
-                    forward=forward,
-                )
+    def test_run_sim_moon_default_uses_verified_mainline_plain(self) -> None:
+        run_sim = (REPO_ROOT / "scripts" / "run_sim.sh").read_text(encoding="utf-8")
 
-                self.assertTrue(handoff["active"])
-                self.assertTrue(ground.collision_handoff_active)
-                self.assertEqual(
-                    forward_states,
-                    [((0, 0), (0, 0), (1, 1))],
-                )
-                self.assertEqual(
-                    tuple(model.geom_contype[:2]),
-                    (0, 0),
-                )
-                self.assertEqual(
-                    tuple(model.geom_conaffinity[:2]),
-                    (0, 0),
-                )
-                self.assertTrue(np.all(model.geom_contype[2:] == 1))
-                self.assertTrue(np.all(model.geom_conaffinity[2:] == 1))
-                telemetry = ground.telemetry()
-                self.assertTrue(telemetry["collision_handoff"]["active"])
-                self.assertFalse(
-                    telemetry["continuous_support"]["collision_enabled"]
-                )
-                self.assertEqual(
-                    telemetry["collision_handoff"][
-                        "rolling_tile_collision_mask"
-                    ],
-                    [1, 1],
-                )
-                with self.assertRaisesRegex(
-                    MODULE.MoonDynamicGroundError,
-                    "already active",
-                ):
-                    ground.activate_collision_handoff(data, forward=forward)
+        self.assertIn("resolve_default_moon_spawn_args", run_sim)
+        self.assertIn("MoonWorld verified mainline plain spawn selected", run_sim)
+        self.assertIn("-94.7", run_sim)
+        self.assertIn("-65.6", run_sim)
+        self.assertIn("-5.251562023162842", run_sim)
+        self.assertIn("MATRIX_MOON_SPAWN_X/Y/Z/YAW are all-or-none", run_sim)
 
-    def test_collision_handoff_rolls_back_masks_when_forward_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            path = Path(temporary_dir) / "moonworld.bin"
-            write_sparse_map(path)
-            model = FakeModel()
-            data = FakeData()
-            call_count = 0
-
-            def fail_once(_model: FakeModel, _data: FakeData) -> None:
-                nonlocal call_count
-                call_count += 1
-                if call_count == 1:
-                    raise RuntimeError("injected forward failure")
-
-            with MODULE.MoonDynamicGround(path, model) as ground:
-                ground.update_mocap(data)
-                with self.assertRaisesRegex(
-                    MODULE.MoonDynamicGroundError,
-                    "collision handoff failed",
-                ):
-                    ground.activate_collision_handoff(
-                        data,
-                        forward=fail_once,
-                    )
-                self.assertFalse(ground.collision_handoff_active)
-                self.assertEqual(call_count, 2)
-                self.assertEqual(tuple(model.geom_contype[:2]), (0, 1))
-                self.assertEqual(tuple(model.geom_conaffinity[:2]), (0, 1))
-                self.assertTrue(np.all(model.geom_contype[2:] == 0))
-                self.assertTrue(np.all(model.geom_conaffinity[2:] == 0))
-
-    def test_rejects_size_hash_and_non_finite_samples(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            root = Path(temporary_dir)
-
-            wrong_size = root / "wrong-size.bin"
-            wrong_size.write_bytes(b"\0" * 16)
-            with self.assertRaisesRegex(
-                MODULE.MoonDynamicGroundError, "size mismatch"
+    def test_moon_default_spawn_samples_raw_ground_height(self) -> None:
+        values = np.full((4, 4), -2.0, dtype=MODULE.MAP_DTYPE)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fake_height_map(Path(temporary), values)
+            with (
+                mock.patch.object(MODULE, "MAP_SIDE_SAMPLES", 4),
+                mock.patch.object(MODULE, "MAP_SAMPLE_COUNT", 16),
+                mock.patch.object(MODULE, "MAP_SIZE_BYTES", values.nbytes),
+                mock.patch.object(MODULE, "MAP_HALF_EXTENT_M", 0.2),
             ):
-                MODULE.MoonDynamicGround(wrong_size, FakeModel())
+                resolved = MODULE.resolve_spawn_pose_for_moon_dynamic_ground(
+                    map_path=path,
+                    fallback_xyz=(0.0, 0.0, None),
+                    root_clearance_m=0.75,
+                )
 
-            valid = root / "valid.bin"
-            write_sparse_map(valid)
-            with self.assertRaisesRegex(
-                MODULE.MoonDynamicGroundError, "SHA256 mismatch"
+        self.assertEqual(resolved["source"], "moon_map_default")
+        self.assertAlmostEqual(resolved["raw_ground_height_m"], -2.0)
+        self.assertAlmostEqual(resolved["fallback_ground_height_m"], -2.0)
+        self.assertAlmostEqual(resolved["z"], -1.25)
+
+    def test_moon_spawn_rebases_valid_resume_z_to_raw_ground(self) -> None:
+        values = np.full((4, 4), 2.0, dtype=MODULE.MAP_DTYPE)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fake_height_map(Path(temporary), values)
+            with (
+                mock.patch.object(MODULE, "MAP_SIDE_SAMPLES", 4),
+                mock.patch.object(MODULE, "MAP_SAMPLE_COUNT", 16),
+                mock.patch.object(MODULE, "MAP_SIZE_BYTES", values.nbytes),
+                mock.patch.object(MODULE, "MAP_HALF_EXTENT_M", 0.2),
             ):
-                MODULE.MoonDynamicGround(
-                    valid,
-                    FakeModel(),
-                    expected_sha256="f" * 64,
+                resolved = MODULE.resolve_spawn_pose_for_moon_dynamic_ground(
+                    map_path=path,
+                    pose_xyz=(0.0, 0.0, 2.9),
+                    yaw_rad=0.25,
+                    source="last_exit",
                 )
 
-            non_finite = root / "non-finite.bin"
-            write_sparse_map(non_finite, {(3000, 3000): float("nan")})
-            with self.assertRaisesRegex(
-                MODULE.MoonDynamicGroundError, "non-finite sample"
+        self.assertEqual(resolved["source"], "moon_terrain_rebased_last_exit")
+        self.assertEqual(resolved["x"], 0.0)
+        self.assertEqual(resolved["y"], 0.0)
+        self.assertAlmostEqual(resolved["z"], 2.0 + MODULE.DEFAULT_ROOT_CLEARANCE_M)
+        self.assertEqual(resolved["yaw_rad"], 0.25)
+        self.assertAlmostEqual(resolved["input_clearance_m"], 0.9)
+
+    def test_moon_spawn_rejects_polluted_resume_z_to_safe_default(self) -> None:
+        values = np.full((4, 4), -1.0, dtype=MODULE.MAP_DTYPE)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fake_height_map(Path(temporary), values)
+            with (
+                mock.patch.object(MODULE, "MAP_SIDE_SAMPLES", 4),
+                mock.patch.object(MODULE, "MAP_SAMPLE_COUNT", 16),
+                mock.patch.object(MODULE, "MAP_SIZE_BYTES", values.nbytes),
+                mock.patch.object(MODULE, "MAP_HALF_EXTENT_M", 0.2),
             ):
-                MODULE.MoonDynamicGround(non_finite, FakeModel())
-
-    def test_mmap_update_writes_native_tile_poses_and_telemetry(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            path = Path(temporary_dir) / "moonworld.bin"
-            write_sparse_map(
-                path,
-                {
-                    (2984, 2984): -2.0,
-                    (2992, 2992): -2.0,
-                    (3000, 3000): 1.25,
-                    (3007, 3007): 3.5,
-                    (3016, 3016): 4.0,
-                },
-            )
-            model = FakeModel()
-            data = FakeData()
-            with MODULE.MoonDynamicGround(path, model) as ground:
-                update = ground.update_mocap(data)
-
-                tile_0_0 = 0
-                tile_8_8 = 8 * MODULE.TILE_SIDE_COUNT + 8
-                tile_15_15 = 15 * MODULE.TILE_SIDE_COUNT + 15
-                np.testing.assert_allclose(
-                    data.mocap_pos[tile_0_0],
-                    [-0.8, -0.8, -2.0],
-                    rtol=0.0,
-                    atol=1e-12,
-                )
-                np.testing.assert_allclose(
-                    data.mocap_pos[tile_8_8],
-                    [0.0, 0.0, 1.25],
-                    rtol=0.0,
-                    atol=1e-12,
-                )
-                np.testing.assert_allclose(
-                    data.mocap_pos[tile_15_15],
-                    [0.7, 0.7, 3.5],
-                    rtol=0.0,
-                    atol=1e-12,
-                )
-                expected_quaternions = np.zeros((MODULE.TILE_COUNT, 4))
-                expected_quaternions[:, 0] = 1.0
-                np.testing.assert_array_equal(
-                    data.mocap_quat, expected_quaternions
-                )
-                np.testing.assert_allclose(
-                    model.geom_pos[0],
-                    [0.0, 0.0, -2.0],
-                    rtol=0.0,
-                    atol=1e-12,
-                )
-                support = model.hfield_data.reshape(
-                    MODULE.CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
-                    MODULE.CONTINUOUS_SUPPORT_GRID_SIDE_SAMPLES,
-                )
-                self.assertAlmostEqual(float(support[0, 0]), 0.0)
-                self.assertAlmostEqual(
-                    float(support[16, 16]),
-                    (1.25 - (-2.0))
-                    / MODULE.CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
-                )
-                self.assertAlmostEqual(
-                    float(support[-1, -1]),
-                    (4.0 - (-2.0))
-                    / MODULE.CONTINUOUS_SUPPORT_HEIGHT_RANGE_M,
-                )
-                self.assertEqual(update["pixel_x_range"], [2992, 3007])
-                self.assertEqual(update["pixel_y_range"], [2992, 3007])
-                self.assertEqual(update["height_range_m"], [-2.0, 3.5])
-                self.assertEqual(update["local_ground_height_m"], 1.25)
-                self.assertFalse(update["cache_hit"])
-                self.assertFalse(update["cache_invalidated"])
-                self.assertTrue(update["tiles_updated"])
-                self.assertTrue(update["continuous_support_updated"])
-                self.assertEqual(update["support_pixel_x_range"], [2984, 3016])
-                self.assertEqual(update["support_pixel_y_range"], [2984, 3016])
-                self.assertEqual(update["support_height_range_m"], [-2.0, 4.0])
-                self.assertEqual(ground.sample_height(0.0, 0.0), 1.25)
-
-                telemetry = ground.telemetry()
-                self.assertEqual(telemetry["schema"], MODULE.TELEMETRY_SCHEMA)
-                self.assertEqual(telemetry["update_count"], 1)
-                self.assertEqual(telemetry["tile_update_count"], 1)
-                self.assertEqual(telemetry["cache_hit_count"], 0)
-                self.assertEqual(telemetry["cache_invalidation_count"], 0)
-                self.assertEqual(telemetry["tiles"]["count"], MODULE.TILE_COUNT)
-                self.assertEqual(
-                    telemetry["continuous_support"]["mode"],
-                    "rolling-heightfield-v1",
-                )
-                self.assertFalse(
-                    telemetry["continuous_support"][
-                        "source_tile_collision_enabled"
-                    ]
-                )
-                self.assertEqual(
-                    telemetry["map"]["size_bytes"], MODULE.MAP_SIZE_BYTES
-                )
-                self.assertEqual(
-                    telemetry["map"]["storage"], "read-only-mmap"
-                )
-                self.assertEqual(
-                    len(telemetry["map"]["sha256"]),
-                    64,
-                )
-                json.dumps(telemetry, sort_keys=True)
-
-            self.assertTrue(ground.closed)
-            with self.assertRaises(MODULE.MoonDynamicGroundError):
-                ground.update_mocap(data)
-
-    def test_quantized_base_cache_skips_tile_calculation_and_writes(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            path = Path(temporary_dir) / "moonworld.bin"
-            write_sparse_map(
-                path,
-                {
-                    (2999, 2999): 2.75,
-                    (3000, 3000): 1.25,
-                },
-            )
-            data = FakeData()
-            data.mocap_pos = CountingMocapArray(
-                (MODULE.TILE_COUNT, 3)
-            )
-            data.mocap_quat = CountingMocapArray(
-                (MODULE.TILE_COUNT, 4)
-            )
-
-            with MODULE.MoonDynamicGround(path, FakeModel()) as ground:
-                with mock.patch.object(
-                    MODULE,
-                    "_round_array_away_from_zero",
-                    wraps=MODULE._round_array_away_from_zero,
-                ) as tile_round:
-                    first = ground.update_mocap(data, base_xy=(0.0, 0.0))
-                    self.assertFalse(first["cache_hit"])
-                    self.assertEqual(tile_round.call_count, 4)
-                    self.assertEqual(data.mocap_pos.write_count, 1)
-                    self.assertEqual(data.mocap_quat.write_count, 1)
-
-                    for _ in range(64):
-                        cached = ground.update_mocap(
-                            data,
-                            base_xy=(-0.06, -0.06),
-                        )
-                    self.assertEqual(
-                        cached["quantized_base_xy_m"],
-                        first["quantized_base_xy_m"],
-                    )
-                    self.assertEqual(cached["base_xy_m"], [-0.06, -0.06])
-                    self.assertAlmostEqual(
-                        cached["local_ground_height_m"],
-                        2.15,
-                    )
-                    self.assertTrue(cached["cache_hit"])
-                    self.assertFalse(cached["cache_invalidated"])
-                    self.assertFalse(cached["tiles_updated"])
-                    self.assertFalse(cached["continuous_support_updated"])
-                    self.assertEqual(tile_round.call_count, 4)
-                    self.assertEqual(data.mocap_pos.write_count, 1)
-                    self.assertEqual(data.mocap_quat.write_count, 1)
-                    self.assertEqual(
-                        data.mocap_pos.read_count
-                        + data.mocap_quat.read_count,
-                        64
-                        * len(MODULE._CACHE_SENTINEL_TILE_INDICES)
-                        * 7,
-                    )
-
-                    telemetry = ground.telemetry()
-                    self.assertEqual(telemetry["update_count"], 65)
-                    self.assertEqual(telemetry["tile_update_count"], 1)
-                    self.assertEqual(telemetry["cache_hit_count"], 64)
-                    self.assertEqual(
-                        telemetry["cache_invalidation_count"],
-                        0,
-                    )
-                    self.assertAlmostEqual(
-                        telemetry["last_update"]["local_ground_height_m"],
-                        2.15,
-                    )
-
-                    for invalid_base in (
-                        (float("nan"), -0.06),
-                        (-0.06, float("inf")),
-                    ):
-                        with self.subTest(base_xy=invalid_base):
-                            with self.assertRaisesRegex(
-                                MODULE.MoonDynamicGroundError,
-                                "must be finite",
-                            ):
-                                ground.update_mocap(
-                                    data,
-                                    base_xy=invalid_base,
-                                )
-                    self.assertEqual(tile_round.call_count, 4)
-                    self.assertEqual(data.mocap_pos.write_count, 1)
-                    self.assertEqual(data.mocap_quat.write_count, 1)
-
-                    moved = ground.update_mocap(
-                        data,
-                        base_xy=(0.06, -0.06),
-                    )
-                    self.assertFalse(moved["cache_hit"])
-                    self.assertFalse(moved["cache_invalidated"])
-                    self.assertTrue(moved["tiles_updated"])
-                    self.assertNotEqual(
-                        moved["quantized_base_xy_m"],
-                        first["quantized_base_xy_m"],
-                    )
-                    self.assertEqual(tile_round.call_count, 8)
-                    self.assertEqual(data.mocap_pos.write_count, 2)
-                    self.assertEqual(data.mocap_quat.write_count, 2)
-
-                    telemetry = ground.telemetry()
-                    self.assertEqual(telemetry["update_count"], 66)
-                    self.assertEqual(telemetry["tile_update_count"], 2)
-                    self.assertEqual(telemetry["cache_hit_count"], 64)
-                    self.assertEqual(
-                        telemetry["cache_invalidation_count"],
-                        0,
-                    )
-
-    def test_same_cell_cache_rewrites_after_external_mocap_reset(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            path = Path(temporary_dir) / "moonworld.bin"
-            write_sparse_map(
-                path,
-                {
-                    (2992, 2992): -2.0,
-                    (3000, 3000): 1.25,
-                    (3007, 3007): 3.5,
-                },
-            )
-            data = FakeData()
-            with MODULE.MoonDynamicGround(path, FakeModel()) as ground:
-                first = ground.update_mocap(data, base_xy=(0.0, 0.0))
-                cached = ground.update_mocap(data, base_xy=(0.0, 0.0))
-                self.assertFalse(first["cache_hit"])
-                self.assertTrue(cached["cache_hit"])
-
-                data.mocap_pos.fill(0.0)
-                data.mocap_quat.fill(0.0)
-                restored = ground.update_mocap(data, base_xy=(0.0, 0.0))
-
-                self.assertFalse(restored["cache_hit"])
-                self.assertTrue(restored["cache_invalidated"])
-                self.assertTrue(restored["tiles_updated"])
-                np.testing.assert_allclose(
-                    data.mocap_pos[0],
-                    [-0.8, -0.8, -2.0],
-                    rtol=0.0,
-                    atol=1e-12,
-                )
-                np.testing.assert_allclose(
-                    data.mocap_pos[-1],
-                    [0.7, 0.7, 3.5],
-                    rtol=0.0,
-                    atol=1e-12,
-                )
-                expected_quaternions = np.zeros((MODULE.TILE_COUNT, 4))
-                expected_quaternions[:, 0] = 1.0
-                np.testing.assert_array_equal(
-                    data.mocap_quat,
-                    expected_quaternions,
+                resolved = MODULE.resolve_spawn_pose_for_moon_dynamic_ground(
+                    map_path=path,
+                    pose_xyz=(0.0, 0.0, 0.8),
+                    yaw_rad=0.25,
+                    source="last_exit",
                 )
 
-                telemetry = ground.telemetry()
-                self.assertEqual(telemetry["update_count"], 3)
-                self.assertEqual(telemetry["tile_update_count"], 2)
-                self.assertEqual(telemetry["cache_hit_count"], 1)
-                self.assertEqual(telemetry["cache_invalidation_count"], 1)
+        self.assertEqual(resolved["source"], "moon_rejected_last_exit_clearance")
+        self.assertEqual(resolved["x"], MODULE.DEFAULT_SPAWN_X_M)
+        self.assertEqual(resolved["y"], MODULE.DEFAULT_SPAWN_Y_M)
+        self.assertAlmostEqual(resolved["z"], -1.0 + MODULE.DEFAULT_ROOT_CLEARANCE_M)
+        self.assertEqual(resolved["yaw_rad"], MODULE.DEFAULT_SPAWN_YAW_RAD)
+        self.assertAlmostEqual(resolved["input_clearance_m"], 1.8)
 
-    def test_same_cell_cache_rewrites_after_external_support_reset(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            path = Path(temporary_dir) / "moonworld.bin"
-            write_sparse_map(
-                path,
-                {
-                    (2992, 2992): -2.0,
-                    (2992, 2993): -1.0,
-                    (3000, 3000): 1.25,
-                },
-            )
-            model = FakeModel()
-            data = FakeData()
-            with MODULE.MoonDynamicGround(path, model) as ground:
-                first = ground.update_mocap(data, base_xy=(0.0, 0.0))
-                expected_support = model.hfield_data.copy()
-                expected_position = model.geom_pos[ground.support_geom_id].copy()
-                self.assertFalse(first["cache_hit"])
-
-                # Index 1 is deliberately outside the old three-point sentinel.
-                model.hfield_data[1] = 0.75
-                model.geom_pos[ground.support_geom_id, 0] += 0.25
-                restored = ground.update_mocap(data, base_xy=(0.0, 0.0))
-
-                self.assertFalse(restored["cache_hit"])
-                self.assertTrue(restored["cache_invalidated"])
-                self.assertTrue(restored["continuous_support_updated"])
-                np.testing.assert_array_equal(
-                    model.hfield_data,
-                    expected_support,
-                )
-                np.testing.assert_array_equal(
-                    model.geom_pos[ground.support_geom_id],
-                    expected_position,
+    def test_moon_spawn_rejects_out_of_bounds_resume_to_safe_default(self) -> None:
+        values = np.full((4, 4), -1.0, dtype=MODULE.MAP_DTYPE)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fake_height_map(Path(temporary), values)
+            with (
+                mock.patch.object(MODULE, "MAP_SIDE_SAMPLES", 4),
+                mock.patch.object(MODULE, "MAP_SAMPLE_COUNT", 16),
+                mock.patch.object(MODULE, "MAP_SIZE_BYTES", values.nbytes),
+                mock.patch.object(MODULE, "MAP_HALF_EXTENT_M", 0.2),
+            ):
+                resolved = MODULE.resolve_spawn_pose_for_moon_dynamic_ground(
+                    map_path=path,
+                    pose_xyz=(0.0, -0.45, -0.15),
+                    yaw_rad=0.25,
+                    source="last_exit",
                 )
 
-                telemetry = ground.telemetry()
-                self.assertEqual(telemetry["update_count"], 2)
-                self.assertEqual(telemetry["tile_update_count"], 2)
-                self.assertEqual(telemetry["cache_hit_count"], 0)
-                self.assertEqual(telemetry["cache_invalidation_count"], 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(resolved["source"], "moon_rejected_last_exit_bounds")
+        self.assertEqual(resolved["x"], MODULE.DEFAULT_SPAWN_X_M)
+        self.assertEqual(resolved["y"], MODULE.DEFAULT_SPAWN_Y_M)
+        self.assertAlmostEqual(resolved["z"], -1.0 + MODULE.DEFAULT_ROOT_CLEARANCE_M)
+        self.assertEqual(resolved["yaw_rad"], MODULE.DEFAULT_SPAWN_YAW_RAD)
+        self.assertIsNone(resolved["raw_ground_height_m"])
+        self.assertIsNone(resolved["input_clearance_m"])
+        self.assertEqual(resolved["input_xy_m"], [0.0, -0.45])
+        self.assertAlmostEqual(resolved["map_half_extent_m"], 0.2)

@@ -1,0 +1,48 @@
+{
+  "schema": "matrix-realscan-asset-lock/v1",
+  "scene_id": "robot-training-ground_20260715-142024",
+  "matrix_scene_id": 18,
+  "coordinate_frame": {
+    "handedness": "right",
+    "meters_per_unit": 1.0,
+    "up_axis": "Z"
+  },
+  "assets": {
+    "source_usdz": {
+      "filename": "robot-training-ground_20260715-142024_merged_zup_flat_mesh_hidden.usdz",
+      "size_bytes": 888122450,
+      "sha256": "2b67231becf613036d4acdec796cffcad9ae3e2456dd311a96f8a00932df85cd"
+    },
+    "collision_mesh_source": {
+      "filename": "robot-training-ground_20260715-142024_scene_mesh_recast_no_ceiling.ply",
+      "size_bytes": 9038232,
+      "sha256": "fe92994efc4acb8cfd3e8ee77ca8d7321126daa25354685ed950a7030629c69e"
+    },
+    "navmesh": {
+      "filename": "robot-training-ground_20260715-142024.navmesh.ply",
+      "size_bytes": 547833,
+      "sha256": "bcb26378b769c5256df3246d17317f82f0dea65ced907f76d53943f92b4b75ee"
+    },
+    "matrix_3dgs_import": {
+      "filename": "robot-training-ground_3m_bounded_opacity.ply",
+      "artifact_root_env": "MATRIX_RESCAN_ARTIFACT_ROOT",
+      "size_bytes": 744001606,
+      "sha256": "911399630534fa9df8b143c2437fd89c68176ec5fe53bb1317e7d2fec03b472c",
+      "point_count": 3000000,
+      "selection": "locked_bounds_scale_then_stable_top_raw_density",
+      "minimum_selected_opacity": 0.7024280137262472,
+      "runtime_dependency": "none_after_ue_import_and_cook"
+    }
+  },
+  "spawn": {
+    "ground_xyz": [-12.43780796171463, 17.69601835686321, -1.136781353076612],
+    "root_xyz": [-12.43780796171463, 17.69601835686321, -0.343781353076612],
+    "yaw_rad": 0.0,
+    "source": "pointgoal_start_pair_samples.json index 2"
+  },
+  "runtime": {
+    "visual_backend": "matrix_ue_threedgaussians",
+    "physics_backend": "sonic_mujoco",
+    "forbidden_runtime_backends": ["isaac_nurec", "isaac_physx"]
+  }
+}

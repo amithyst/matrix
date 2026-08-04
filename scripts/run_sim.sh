@@ -4,10 +4,6 @@ set -euo pipefail
 MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT="${MATRIX_G1_MATERIAL_PALETTE:-}"
 MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT="${MATRIX_G1_MATERIAL_SCOPE_ALPHA:-}"
 unset MATRIX_G1_MATERIAL_PALETTE MATRIX_G1_MATERIAL_SCOPE_ALPHA
-# A catalog-backed cross-world route is private launcher state. Retain it only
-# long enough to validate the target spawn, and do not expose it to children.
-MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE="${MATRIX_GAME_ROUTE_ENTRY_JSON:-}"
-unset MATRIX_GAME_ROUTE_ENTRY_JSON
 
 #######################################
 # 基础
@@ -25,56 +21,86 @@ CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 MATRIX_DISABLE_MC="${MATRIX_DISABLE_MC:-0}"
 MATRIX_SONIC="${MATRIX_SONIC:-0}"
-MATRIX_EXTERNAL_STATE="${MATRIX_EXTERNAL_STATE:-0}"
-case "$MATRIX_EXTERNAL_STATE" in
-    0) MATRIX_EXTERNAL_STATE_ENABLED=false ;;
-    1) MATRIX_EXTERNAL_STATE_ENABLED=true ;;
-    *)
-        echo "[ERROR] MATRIX_EXTERNAL_STATE must be the literal 0 or 1:" \
-            "$MATRIX_EXTERNAL_STATE" >&2
-        exit 2
-        ;;
-esac
-if $MATRIX_EXTERNAL_STATE_ENABLED && [[ "$MUJOCORUNNING" != "0" ]]; then
-    echo "[ERROR] MATRIX_EXTERNAL_STATE=1 requires positional MUJOCORUNNING=0" >&2
-    exit 2
-fi
 MATRIX_GAME_CENTERED_CAMERA="${MATRIX_GAME_CENTERED_CAMERA:-1}"
 MATRIX_GAME_CAMERA_VIEW_CLASS="${MATRIX_GAME_CAMERA_VIEW_CLASS:-}"
 MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT="${MATRIX_CENTERED_CAMERA_OVERLAY_CONTRACT:-$PROJECT_ROOT/config/runtime/matrix-centered-camera-overlay-v3.json}"
-
-set_mc_motor_platform_type() {
-    local config_file="$1"
-    local platform_type="$2"
-    if $MATRIX_EXTERNAL_STATE_ENABLED; then
-        return 0
-    fi
-    if [[ ! -f "$config_file" ]]; then
-        echo "[ERROR] Matrix MC config is missing: $config_file" >&2
-        return 1
-    fi
-    sed -i "s/motor_platform_type: .*/motor_platform_type: $platform_type/" \
-        "$config_file"
-}
 MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE="${MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE:-}"
 MATRIX_UE_CAMERA_LAYOUT="${MATRIX_UE_CAMERA_LAYOUT:-$PROJECT_ROOT/config/runtime/matrix-ue-camera-layout-v1.json}"
-MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
-MATRIX_CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
-if [[ -n "$MATRIX_ITEM_INVENTORY_CATALOG" \
-    && -n "$MATRIX_CREATIVE_INVENTORY_CATALOG" \
-    && "$(realpath -m "$MATRIX_ITEM_INVENTORY_CATALOG")" \
-        != "$(realpath -m "$MATRIX_CREATIVE_INVENTORY_CATALOG")" ]]; then
-    echo "[ERROR] MATRIX_ITEM_INVENTORY_CATALOG conflicts with the legacy" \
-        "MATRIX_CREATIVE_INVENTORY_CATALOG alias" >&2
+CENTERED_CAMERA_OVERLAY_STEM="pakchunk99-MatrixCentered-Linux_P"
+MATRIX_GAME_CAMERA_DISTANCE_EXPLICIT=0
+if [[ -n "${MATRIX_GAME_CAMERA_DISTANCE_CM+x}" ]]; then
+    MATRIX_GAME_CAMERA_DISTANCE_EXPLICIT=1
+fi
+MATRIX_GAME_CAMERA_DISTANCE_CM="${MATRIX_GAME_CAMERA_DISTANCE_CM:-150}"
+MATRIX_SETTINGS_PROFILE="${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}"
+if [[ ! "$MATRIX_SETTINGS_PROFILE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+    echo "[ERROR] Matrix settings profile is invalid: $MATRIX_SETTINGS_PROFILE" >&2
     exit 1
 fi
-if [[ -z "$MATRIX_ITEM_INVENTORY_CATALOG" ]]; then
-    MATRIX_ITEM_INVENTORY_CATALOG="$MATRIX_CREATIVE_INVENTORY_CATALOG"
+MATRIX_SETTINGS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/$MATRIX_SETTINGS_PROFILE"
+MATRIX_MOUSE_SETTINGS_FILE="${MATRIX_MOUSE_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/mouse-control.json}"
+MATRIX_UI_SETTINGS_FILE="${MATRIX_UI_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/ui-settings.json}"
+MATRIX_MOTION_SETTINGS_FILE="${MATRIX_MOTION_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/motion-control.json}"
+MATRIX_VIDEO_SETTINGS_FILE="${MATRIX_VIDEO_SETTINGS_FILE:-$MATRIX_SETTINGS_DIR/video-settings.json}"
+for settings_path_name in \
+    MATRIX_MOUSE_SETTINGS_FILE \
+    MATRIX_UI_SETTINGS_FILE \
+    MATRIX_MOTION_SETTINGS_FILE \
+    MATRIX_VIDEO_SETTINGS_FILE; do
+    settings_path="${!settings_path_name}"
+    if [[ "$settings_path" != /* ]]; then
+        echo "[ERROR] $settings_path_name must be absolute" >&2
+        exit 1
+    fi
+    printf -v "$settings_path_name" '%s' "$(realpath -m "$settings_path")"
+done
+if [[ -z "${MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON:-}" ]]; then
+    if [[ -f "$PROJECT_ROOT/scripts/matrix_video_settings.py" ]]; then
+        if ! MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON="$(
+            /usr/bin/python3 -I "$PROJECT_ROOT/scripts/matrix_video_settings.py" \
+                --settings-file "$MATRIX_VIDEO_SETTINGS_FILE" \
+                launch-json
+        )"; then
+            echo "[ERROR] Invalid video settings file: $MATRIX_VIDEO_SETTINGS_FILE" >&2
+            exit 1
+        fi
+    else
+        MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON='{"camera_distance_cm":150,"camera_distance_max_cm":500,"camera_distance_min_cm":80,"camera_smoothing":"medium","fps_limit":60,"quality":"high","resolution":"1920x1080","resolution_height":1080,"resolution_width":1920,"revision":0,"window_mode":"borderless"}'
+    fi
 fi
-MATRIX_CREATIVE_INVENTORY_CATALOG="$MATRIX_ITEM_INVENTORY_CATALOG"
-export MATRIX_ITEM_INVENTORY_CATALOG MATRIX_CREATIVE_INVENTORY_CATALOG
-CENTERED_CAMERA_OVERLAY_STEM="pakchunk99-MatrixCentered-Linux_P"
-MATRIX_GAME_CAMERA_DISTANCE_CM="${MATRIX_GAME_CAMERA_DISTANCE_CM:-150}"
+if [[ "$MATRIX_GAME_CAMERA_DISTANCE_EXPLICIT" == "0" ]]; then
+    if ! MATRIX_GAME_CAMERA_DISTANCE_CM="$(
+        /usr/bin/python3 -I - "$MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON" <<'PY'
+import json
+import sys
+value = json.loads(sys.argv[1])
+distance = value.get("camera_distance_cm")
+if type(distance) is not int:
+    raise SystemExit("camera_distance_cm must be an integer")
+print(distance)
+PY
+    )"; then
+        echo "[ERROR] Invalid video camera distance from settings" >&2
+        exit 1
+    fi
+fi
+export MATRIX_HOST_PROFILE="${MATRIX_HOST_PROFILE:-$MATRIX_SETTINGS_PROFILE}"
+export MATRIX_SETTINGS_PROFILE MATRIX_MOUSE_SETTINGS_FILE MATRIX_UI_SETTINGS_FILE
+export MATRIX_MOTION_SETTINGS_FILE MATRIX_VIDEO_SETTINGS_FILE
+export MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON MATRIX_GAME_CAMERA_DISTANCE_CM
+
+case "${MATRIX_DISABLE_MC,,}" in
+    1|true|yes|on)
+        MATRIX_MC_DISABLED=true
+        ;;
+    0|false|no|off|"")
+        MATRIX_MC_DISABLED=false
+        ;;
+    *)
+        echo "[ERROR] MATRIX_DISABLE_MC must be a boolean: $MATRIX_DISABLE_MC" >&2
+        exit 1
+        ;;
+esac
 
 case "${MATRIX_GAME_CENTERED_CAMERA,,}" in
     1|true|yes|on)
@@ -119,11 +145,6 @@ join_ld_library_path() {
 }
 
 setup_runtime_environment() {
-    if $MATRIX_EXTERNAL_STATE_ENABLED; then
-        # The external BFM/Isaac runtime owns physics and its Python closure.
-        # Matrix is only a cooked UE state consumer in this topology.
-        return
-    fi
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # The native SONIC launcher already constructed and verified the
@@ -162,15 +183,22 @@ mc_ld_library_path() {
 
 setup_runtime_environment
 
+cleanup_runtime_generated_integrity_files() {
+    # UE/MuJoCo writes this diagnostic beside binaries on some crashes.  The
+    # launcher verifies Binaries/Linux as a locked runtime tree, so leaving the
+    # generated log there makes the next launch fail before Matrix can even
+    # start.  The file is runtime output, not an installed artifact.
+    rm -f -- \
+        "$PROJECT_ROOT/src/UeSim/Linux/MUJOCO_LOG.TXT" \
+        "$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Binaries/Linux/MUJOCO_LOG.TXT"
+}
+
+cleanup_runtime_generated_integrity_files
+
 if [[ "${SIM_LAUNCHER_SKIP_CUSTOM_URDF_WRAPPER:-0}" != "1" ]] && [[ "$ROBOT_ARG" == "custom" || "$ROBOT_ARG" == "7" ]] && [[ -n "$CUSTOM_URDF" ]]; then
     if [[ -f "$CUSTOM_WRAPPER" ]]; then
         echo "[INFO] Delegating custom URDF setup to $CUSTOM_WRAPPER"
-        # The wrapper re-enters this script after preparing the custom robot.
-        # Carry the one-shot route only across that trusted handoff; the second
-        # run_sim invocation consumes and unsets it before spawning children.
-        MATRIX_GAME_ROUTE_ENTRY_JSON="$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" \
-            exec "$CUSTOM_WRAPPER" "$ROBOT_ARG" "$SCENE_ID" "$OFFSCREEN" \
-                "$PIXELSTREAM" "$MUJOCORUNNING" "$CUSTOM_URDF" "$CUSTOM_NAME"
+        exec "$CUSTOM_WRAPPER" "$ROBOT_ARG" "$SCENE_ID" "$OFFSCREEN" "$PIXELSTREAM" "$MUJOCORUNNING" "$CUSTOM_URDF" "$CUSTOM_NAME"
     else
         echo "[ERROR] Custom URDF wrapper not found at: $CUSTOM_WRAPPER" >&2
         exit 1
@@ -190,9 +218,6 @@ run_env_check() {
     fi
 
     local checked_mujoco="$MUJOCORUNNING"
-    if $MATRIX_EXTERNAL_STATE_ENABLED; then
-        checked_mujoco=0
-    fi
     case "${MATRIX_SONIC,,}" in
         1|true|yes|on)
             # SONIC owns the external MuJoCo process. The bundled robot_mujoco
@@ -201,19 +226,11 @@ run_env_check() {
             ;;
     esac
 
-    if $MATRIX_EXTERNAL_STATE_ENABLED; then
-        MATRIX_DISABLE_MC=1 "$checker" runtime \
-            --robot "$ROBOT_ARG" \
-            --scene "$SCENE_ID" \
-            --mujoco "$checked_mujoco" \
-            --offscreen "$OFFSCREEN"
-    else
-        "$checker" runtime \
-            --robot "$ROBOT_ARG" \
-            --scene "$SCENE_ID" \
-            --mujoco "$checked_mujoco" \
-            --offscreen "$OFFSCREEN"
-    fi
+    "$checker" runtime \
+        --robot "$ROBOT_ARG" \
+        --scene "$SCENE_ID" \
+        --mujoco "$checked_mujoco" \
+        --offscreen "$OFFSCREEN"
 }
 
 run_env_check
@@ -233,11 +250,6 @@ PROCESS_PATTERNS=(
 
 kill_known_processes() {
     local signal="$1"
-    if $MATRIX_EXTERNAL_STATE_ENABLED; then
-        # External-state launches are instance-owned by their top-level
-        # launcher. Never pattern-kill an incumbent Matrix or robot runtime.
-        return 0
-    fi
     local pattern
     for pattern in "${PROCESS_PATTERNS[@]}"; do
         pkill "-${signal}" -f "${pattern}" 2>/dev/null || true
@@ -245,16 +257,12 @@ kill_known_processes() {
 }
 
 kill_known_processes TERM
-if $MATRIX_EXTERNAL_STATE_ENABLED; then
-    echo "[INFO] External-state mode: name-wide process cleanup is disabled"
-fi
 
 
 PIDS=()
 WATCHDOG_PID=""
 FORCED_CLEANUP_PID=""
 SONIC_PID=""
-EXTERNAL_ESC_UI_PID=""
 UE_PID=""
 UE_SUPERVISOR_PID=""
 UE_SUPERVISOR_REAPED=0
@@ -266,8 +274,6 @@ UE_CAMERA_STATE_FILE=""
 RUN_SIM_PARENT_PID="${MATRIX_SONIC_LAUNCHER_PID:-$PPID}"
 CLEANUP_STARTED=0
 CLEANUP_FAILED=0
-CLEANUP_SIGNAL_PENDING=0
-WAITED_CHILD_STATUS=127
 X_POINTER_ACCELERATION_RESTORE_NEEDED=0
 X_POINTER_ACCELERATION=""
 X_POINTER_THRESHOLD=""
@@ -295,43 +301,6 @@ remove_managed_pid() {
         fi
     done
     PIDS=("${remaining[@]}")
-}
-
-managed_child_job_is_running() {
-    local expected_pid="$1"
-    local child_pid
-    while IFS= read -r child_pid; do
-        if [[ "$child_pid" == "$expected_pid" ]]; then
-            return 0
-        fi
-    done < <(jobs -pr)
-    return 1
-}
-
-wait_for_managed_child() {
-    local child_pid="$1"
-    local last_status=127
-    local wait_status=127
-
-    # A caught cleanup signal interrupts Bash's wait builtin even though the
-    # exact child remains alive.  Retry from Bash's job table until the child
-    # is no longer running, then perform one final exact reap.
-    while managed_child_job_is_running "$child_pid"; do
-        if wait "$child_pid"; then
-            last_status=0
-        else
-            last_status=$?
-        fi
-    done
-    if wait "$child_pid" 2>/dev/null; then
-        wait_status=0
-    else
-        wait_status=$?
-    fi
-    if [[ "$wait_status" != "127" || "$last_status" == "127" ]]; then
-        last_status="$wait_status"
-    fi
-    WAITED_CHILD_STATUS="$last_status"
 }
 
 start_supervised_ue() {
@@ -409,127 +378,17 @@ stop_supervised_ue() {
         exec {UE_CONTROL_FD}>&-
         UE_CONTROL_FD=""
     fi
-    wait_for_managed_child "$UE_SUPERVISOR_PID"
-    supervisor_exit_code="$WAITED_CHILD_STATUS"
+    if wait "$UE_SUPERVISOR_PID"; then
+        supervisor_exit_code=0
+    else
+        supervisor_exit_code=$?
+    fi
     if [[ "$stop_delivered" != "1" || "$supervisor_exit_code" == "255" ]]; then
         record_ue_supervisor_failure
     elif [[ "$supervisor_exit_code" != "0" && ! -e "$UE_FAILURE_FILE" ]]; then
         record_ue_supervisor_failure
     fi
     UE_SUPERVISOR_PID=""
-}
-
-start_external_state_esc_ui_provider() {
-    if ! $MATRIX_EXTERNAL_STATE_ENABLED; then
-        return 0
-    fi
-    local enabled="${MATRIX_EXTERNAL_STATE_ESC_UI:-0}"
-    case "${enabled,,}" in
-        1|true|yes|on) ;;
-        0|false|no|off|"") return 0 ;;
-        *)
-            echo "[ERROR] MATRIX_EXTERNAL_STATE_ESC_UI must be a boolean: $enabled" >&2
-            return 1
-            ;;
-    esac
-    if [[ ! "$UE_PID" =~ ^[1-9][0-9]*$ ]]; then
-        echo "[ERROR] External-state ESC UI requires the supervised UE PID" >&2
-        return 1
-    fi
-    if [[ -z "${DISPLAY:-}" ]]; then
-        echo "[ERROR] External-state ESC UI requires DISPLAY" >&2
-        return 1
-    fi
-
-    local provider_python="${MATRIX_EXTERNAL_STATE_ESC_UI_PYTHON:-${MATRIX_SONIC_PYTHON:-$(command -v python3)}}"
-    if [[ "$provider_python" != */* ]]; then
-        provider_python="$(command -v "$provider_python" || true)"
-    fi
-    if [[ -z "$provider_python" || ! -x "$provider_python" ]]; then
-        echo "[ERROR] External-state ESC UI Python is not executable: $provider_python" >&2
-        return 1
-    fi
-    local runtime_dir="${MATRIX_EXTERNAL_STATE_ESC_UI_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/matrix-external-state-esc-ui-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}}"
-    if ! "$provider_python" -I - "$runtime_dir" <<'PY'
-import os
-from pathlib import Path
-import stat
-import sys
-
-path = Path(sys.argv[1])
-path.mkdir(mode=0o700, parents=True, exist_ok=True)
-metadata = path.stat(follow_symlinks=False)
-if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
-    raise SystemExit("runtime path is not an owned directory")
-os.chmod(path, 0o700)
-PY
-    then
-        echo "[ERROR] Could not prepare external-state ESC UI runtime directory" >&2
-        return 1
-    fi
-
-    local ui_socket="$runtime_dir/input.sock"
-    local calibration_state="$runtime_dir/calibration.json"
-    local overlay_ready="$runtime_dir/.calibration.json.overlay-status.json"
-    local status_file="$runtime_dir/status.json"
-    local log_file="$PROJECT_ROOT/outputs/logs/matrix_external_state_esc_ui.log"
-    local world_id="${MATRIX_EXTERNAL_STATE_ESC_UI_WORLD_ID:-external-state:${ROBOTTYPE}-${SCENE_ID}}"
-    local max_seconds="${MATRIX_EXTERNAL_STATE_ESC_UI_MAX_SECONDS:-0}"
-    local startup_timeout="${MATRIX_EXTERNAL_STATE_ESC_UI_STARTUP_TIMEOUT_SECONDS:-5}"
-    mkdir -p "$PROJECT_ROOT/outputs/logs"
-    rm -f -- "$ui_socket" "$overlay_ready"
-    local -a command=(
-        "$provider_python" -u "$PROJECT_ROOT/scripts/matrix_game_control_input.py"
-        --socket "$ui_socket"
-        --input-source keyboard
-        --display "$DISPLAY"
-        --expected-ue-pid "$UE_PID"
-        --focus-title "${MATRIX_GAME_FOCUS_TITLE:-(zsibot|matrix|unreal)}"
-        --look-button "${MATRIX_GAME_LOOK_BUTTON:-left}"
-        --status-file "$status_file"
-        --calibration-state-file "$calibration_state"
-        --mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/mouse-control.json}"
-        --video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/video-settings.json}"
-        --applied-video-settings-json "$VIDEO_APPLIED_JSON"
-        --applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
-        --applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
-        --game-world-id "$world_id"
-        --max-seconds "$max_seconds"
-        --ui-only
-    )
-    echo "[INFO] Starting external-state Matrix ESC UI provider"
-    "${command[@]}" > "$log_file" 2>&1 &
-    EXTERNAL_ESC_UI_PID=$!
-    PIDS+=("$EXTERNAL_ESC_UI_PID")
-
-    local attempts
-    attempts="$("$provider_python" -I - "$startup_timeout" <<'PY'
-import math
-import sys
-
-timeout = float(sys.argv[1])
-if not math.isfinite(timeout) or timeout < 0:
-    raise SystemExit("timeout must be finite and non-negative")
-print(max(1, math.ceil(timeout / 0.05) + 1))
-PY
-    )" || return 1
-    local attempt
-    for ((attempt = 0; attempt < attempts; attempt++)); do
-        if ! managed_child_job_is_running "$EXTERNAL_ESC_UI_PID"; then
-            echo "[ERROR] External-state ESC UI provider exited during startup" >&2
-            tail -80 "$log_file" >&2 || true
-            return 1
-        fi
-        if [[ -s "$overlay_ready" ]]; then
-            echo "[INFO] External-state Matrix ESC UI provider ready: $calibration_state"
-            return 0
-        fi
-        if ((attempt + 1 < attempts)); then
-            sleep 0.05
-        fi
-    done
-    echo "[ERROR] External-state ESC UI provider did not become ready: $log_file" >&2
-    return 1
 }
 
 install_centered_camera_overlay() {
@@ -709,9 +568,6 @@ PY
 }
 
 schedule_forced_cleanup() {
-    if $MATRIX_EXTERNAL_STATE_ENABLED; then
-        return 0
-    fi
     (
         trap '' HUP
         sleep 1
@@ -746,12 +602,10 @@ start_parent_watchdog() {
 }
 
 stop_parent_watchdog() {
-    if [[ -n "${WATCHDOG_PID:-}" ]] \
-        && managed_child_job_is_running "$WATCHDOG_PID"; then
+    if [[ -n "${WATCHDOG_PID:-}" ]] && kill -0 "${WATCHDOG_PID}" 2>/dev/null; then
         kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
-        wait_for_managed_child "$WATCHDOG_PID"
+        wait "${WATCHDOG_PID}" 2>/dev/null || true
     fi
-    WATCHDOG_PID=""
 }
 
 restore_remote_pointer_acceleration() {
@@ -836,12 +690,6 @@ configure_remote_pointer_acceleration() {
 }
 
 cleanup() {
-    # A normal child exit can enter cleanup just before the top-level launcher
-    # forwards an operator signal.  Do not let that later signal interrupt the
-    # one authoritative teardown; the launcher still owns the bounded KILL
-    # fallback if cleanup itself stalls.  Use caught traps rather than SIG_IGN
-    # so commands spawned during cleanup retain their default signal handling.
-    trap 'CLEANUP_SIGNAL_PENDING=1' SIGINT SIGTERM SIGHUP
     if [[ "$CLEANUP_STARTED" == "1" ]]; then
         return
     fi
@@ -853,7 +701,7 @@ cleanup() {
 
     # 1. 优雅关闭脚本启动的进程
     for pid in "${PIDS[@]:-}"; do
-        if [[ -n "$pid" ]] && managed_child_job_is_running "$pid"; then
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             echo "[INFO] SIGTERM PID $pid"
             kill -TERM "$pid" 2>/dev/null || true
         fi
@@ -880,7 +728,7 @@ cleanup() {
     for ((attempt = 0; attempt < 150; attempt++)); do
         local any_alive=0
         for pid in "${PIDS[@]:-}"; do
-            if [[ -n "$pid" ]] && managed_child_job_is_running "$pid"; then
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 any_alive=1
                 break
             fi
@@ -891,21 +739,17 @@ cleanup() {
 
     # 3. 最终兜底
     for pid in "${PIDS[@]:-}"; do
-        if [[ -n "$pid" ]] && managed_child_job_is_running "$pid"; then
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
-        if [[ -n "$pid" ]]; then
-            wait_for_managed_child "$pid"
-        fi
+        [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
     done
     kill_known_processes KILL
 
-    if [[ -n "${FORCED_CLEANUP_PID:-}" ]] \
-        && managed_child_job_is_running "$FORCED_CLEANUP_PID"; then
+    if [[ -n "${FORCED_CLEANUP_PID:-}" ]] && kill -0 "${FORCED_CLEANUP_PID}" 2>/dev/null; then
         kill -TERM "${FORCED_CLEANUP_PID}" 2>/dev/null || true
-        wait_for_managed_child "$FORCED_CLEANUP_PID"
+        wait "${FORCED_CLEANUP_PID}" 2>/dev/null || true
     fi
-    FORCED_CLEANUP_PID=""
 
     if [[ -n "${UE_LIFECYCLE_DIR:-}" ]]; then
         rm -rf -- "$UE_LIFECYCLE_DIR"
@@ -914,9 +758,6 @@ cleanup() {
     # Retry once after child teardown if the display was transiently
     # unavailable at the beginning of cleanup.
     restore_remote_pointer_acceleration || true
-    if [[ "$CLEANUP_SIGNAL_PENDING" == "1" ]]; then
-        echo "[INFO] Deferred signal observed while cleanup was in progress"
-    fi
     echo "[INFO] ===== Cleanup finished ====="
     if [[ "$CLEANUP_FAILED" == "1" ]]; then
         echo "[ERROR] Matrix cleanup failed; refusing a successful exit" >&2
@@ -948,157 +789,12 @@ USE_OFFSCREEN=""
 USE_PIXELSTREAMER=""
 [[ "$PIXELSTREAM" == "1" ]] && USE_PIXELSTREAMER="-PixelStreamingURL=ws://127.0.0.1:8888"
 
-BFM_ISAAC_RENDERER_VIDEO_LOCKED="${MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED:-0}"
-case "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" in
-    0)
-        VIDEO_WIDTH="${MATRIX_VIDEO_APPLIED_WIDTH:-1920}"
-        VIDEO_HEIGHT="${MATRIX_VIDEO_APPLIED_HEIGHT:-1080}"
-        VIDEO_WINDOW_MODE="${MATRIX_VIDEO_APPLIED_WINDOW_MODE:-borderless}"
-        VIDEO_QUALITY="${MATRIX_VIDEO_APPLIED_QUALITY:-high}"
-        VIDEO_CAMERA_SMOOTHING="${MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING:-medium}"
-        ;;
-    1)
-        # The co-resident BFM renderer has its own tracked settings contract.
-        # Generic panel state must never cross this process boundary, even as
-        # an explicitly empty variable, because it would make qualification
-        # depend on whichever ordinary Matrix session ran most recently.
-        for generic_name in \
-            MATRIX_VIDEO_APPLIED_WIDTH \
-            MATRIX_VIDEO_APPLIED_HEIGHT \
-            MATRIX_VIDEO_APPLIED_WINDOW_MODE \
-            MATRIX_VIDEO_APPLIED_FPS_LIMIT \
-            MATRIX_VIDEO_APPLIED_QUALITY \
-            MATRIX_VIDEO_APPLIED_CAMERA_SMOOTHING \
-            MATRIX_VIDEO_APPLIED_REVISION \
-            MATRIX_VIDEO_APPLIED_JSON \
-            MATRIX_UE_EXTRA_EXEC_CMDS; do
-            if [[ -v "$generic_name" ]]; then
-                echo "[ERROR] Generic video state reached the locked BFM renderer: $generic_name" >&2
-                exit 1
-            fi
-        done
-        VIDEO_WIDTH="${MATRIX_BFM_ISAAC_RENDER_WIDTH:-}"
-        VIDEO_HEIGHT="${MATRIX_BFM_ISAAC_RENDER_HEIGHT:-}"
-        VIDEO_WINDOW_MODE="${MATRIX_BFM_ISAAC_RENDER_WINDOW_MODE:-}"
-        VIDEO_QUALITY="${MATRIX_BFM_ISAAC_RENDER_QUALITY:-}"
-        VIDEO_CAMERA_SMOOTHING="${MATRIX_BFM_ISAAC_RENDER_CAMERA_SMOOTHING:-}"
-        VIDEO_SCREEN_PERCENTAGE="${MATRIX_BFM_ISAAC_RENDER_SCREEN_PERCENTAGE:-}"
-        ;;
-    *)
-        echo "[ERROR] MATRIX_BFM_ISAAC_RENDERER_VIDEO_LOCKED must be 0 or 1" >&2
-        exit 1
-        ;;
-esac
-if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
-    if [[ ! "$VIDEO_SCREEN_PERCENTAGE" =~ ^[0-9]+$ \
-        || "$VIDEO_SCREEN_PERCENTAGE" -lt 25 \
-        || "$VIDEO_SCREEN_PERCENTAGE" -gt 200 ]]; then
-        echo "[ERROR] Invalid locked BFM screen percentage: $VIDEO_SCREEN_PERCENTAGE" >&2
-        exit 1
-    fi
-fi
-case "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" in
-    1280x720|1600x900|1920x1080|2560x1440) ;;
-    *)
-    echo "[ERROR] Invalid applied Matrix video resolution:" \
-        "${VIDEO_WIDTH}x${VIDEO_HEIGHT}" >&2
-    exit 1
-        ;;
-esac
-case "$VIDEO_WINDOW_MODE" in
-    windowed) VIDEO_WINDOW_ARGS=(-windowed) ;;
-    borderless) VIDEO_WINDOW_ARGS=(-windowed -borderless) ;;
-    fullscreen) VIDEO_WINDOW_ARGS=(-fullscreen) ;;
-    *)
-        echo "[ERROR] Invalid Matrix video window mode: $VIDEO_WINDOW_MODE" >&2
-        exit 1
-        ;;
-esac
-case "$VIDEO_QUALITY" in
-    low) VIDEO_QUALITY_LEVEL=0 ;;
-    medium) VIDEO_QUALITY_LEVEL=1 ;;
-    high) VIDEO_QUALITY_LEVEL=2 ;;
-    epic) VIDEO_QUALITY_LEVEL=3 ;;
-    *)
-        echo "[ERROR] Invalid Matrix video quality preset: $VIDEO_QUALITY" >&2
-        exit 1
-        ;;
-esac
-case "$VIDEO_CAMERA_SMOOTHING" in
-    off)
-        VIDEO_CAMERA_LAG=false
-        VIDEO_CAMERA_LAG_SPEED=12
-        ;;
-    low)
-        VIDEO_CAMERA_LAG=true
-        VIDEO_CAMERA_LAG_SPEED=12
-        ;;
-    medium)
-        VIDEO_CAMERA_LAG=true
-        VIDEO_CAMERA_LAG_SPEED=8
-        ;;
-    high)
-        VIDEO_CAMERA_LAG=true
-        VIDEO_CAMERA_LAG_SPEED=4
-        ;;
-    *)
-        echo "[ERROR] Invalid Matrix camera smoothing preset:" \
-            "$VIDEO_CAMERA_SMOOTHING" >&2
-        exit 1
-        ;;
-esac
-if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
-    UE_MAX_FPS="${MATRIX_BFM_ISAAC_RENDER_FPS_LIMIT:-}"
-else
-    UE_MAX_FPS="${MATRIX_VIDEO_APPLIED_FPS_LIMIT:-${MATRIX_UE_MAX_FPS:-30}}"
-fi
+UE_MAX_FPS="${MATRIX_UE_MAX_FPS:-30}"
 if [[ ! "$UE_MAX_FPS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     echo "[ERROR] MATRIX_UE_MAX_FPS must be a non-negative number: $UE_MAX_FPS" >&2
     exit 1
 fi
-case "$UE_MAX_FPS" in
-    30|60|90|120) ;;
-    *)
-        echo "[ERROR] Matrix video FPS must be one of 30/60/90/120:" \
-            "$UE_MAX_FPS" >&2
-        exit 1
-        ;;
-esac
-if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
-    VIDEO_REVISION=0
-else
-    VIDEO_REVISION="${MATRIX_VIDEO_APPLIED_REVISION:-0}"
-fi
-if [[ ! "$VIDEO_REVISION" =~ ^[0-9]+$ ]]; then
-    echo "[ERROR] Invalid Matrix video settings revision: $VIDEO_REVISION" >&2
-    exit 1
-fi
-if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
-    VIDEO_APPLIED_JSON="$(
-        printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
-            "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
-            "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
-            "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
-    )"
-else
-    if [[ -z "${MATRIX_VIDEO_APPLIED_JSON:-}" ]]; then
-        MATRIX_VIDEO_APPLIED_JSON="$(
-            printf '{"camera_smoothing":"%s","fps_limit":%s,"quality":"%s","resolution":"%sx%s","resolution_height":%s,"resolution_width":%s,"revision":%s,"window_mode":"%s"}' \
-                "$VIDEO_CAMERA_SMOOTHING" "$UE_MAX_FPS" "$VIDEO_QUALITY" \
-                "$VIDEO_WIDTH" "$VIDEO_HEIGHT" "$VIDEO_HEIGHT" "$VIDEO_WIDTH" \
-                "$VIDEO_REVISION" "$VIDEO_WINDOW_MODE"
-        )"
-        export MATRIX_VIDEO_APPLIED_JSON
-    fi
-    VIDEO_APPLIED_JSON="$MATRIX_VIDEO_APPLIED_JSON"
-fi
 UE_EXEC_CMDS="t.MaxFPS $UE_MAX_FPS,r.MotionBlurQuality 0"
-for group in ViewDistance AntiAliasing Shadow PostProcess Texture Effects Foliage Shading; do
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},sg.${group}Quality ${VIDEO_QUALITY_LEVEL}"
-done
-if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" ]]; then
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},r.ScreenPercentage ${VIDEO_SCREEN_PERCENTAGE}"
-fi
 
 #######################################
 # 场景配置
@@ -1125,6 +821,14 @@ case "$SCENE_ID" in
     14) SCENE="3dgs.xml";                 MAPNAME="/Game/Maps/3DGSWorld" ;;
     16) SCENE="3dgs.xml";                 MAPNAME="/Game/Maps/3DGSWorld" ;;
     17) SCENE="3dgs.xml";                 MAPNAME="/Game/Maps/3DGSWorld" ;;
+    18)
+        SCENE="scene_terrain_robot_training_ground.xml"
+        MAPNAME="/Game/Maps/RobotTrainingGround"
+        if ! python3 scripts/verify_realscan_scene_install.py --project-root "$PROJECT_ROOT"; then
+            echo "[ERROR] RobotTrainingGround assets are not installed or verified" >&2
+            exit 1
+        fi
+        ;;
     15)
         SCENE="scene_terrain_moon_dynamic.xml"
         MAPNAME="/Game/Maps/MoonWorld"
@@ -1150,6 +854,28 @@ ENABLE_MUJOCO=false
 ENABLE_MC=false
 ROBOTTYPE="xgb"
 RUNTIME_ROBOTTYPE="xgb"
+
+configure_mc_robot_type() {
+    local mc_robot_type="$1"
+    if $MATRIX_MC_DISABLED; then
+        return 0
+    fi
+    sed -i "s/export ROBOT_TYPE=.*/export ROBOT_TYPE=${mc_robot_type}/" "$TARGET_FILE"
+}
+
+set_mc_motor_platform() {
+    local config_name="$1"
+    local platform_type="$2"
+    local config_path="$PROJECT_ROOT/src/robot_mc/build/export/config/$config_name"
+    if $MATRIX_MC_DISABLED; then
+        return 0
+    fi
+    if [[ ! -f "$config_path" ]]; then
+        echo "[ERROR] Matrix motion-controller config is missing: $config_path" >&2
+        exit 1
+    fi
+    sed -i "s/motor_platform_type: .*/motor_platform_type: ${platform_type}/" "$config_path"
+}
 
 # MUJOCORUNNING is 1 config/config.json中"mujoco_running": true，否则为 false
 if [[ "$MUJOCORUNNING" == "1" ]]; then
@@ -1178,45 +904,39 @@ case "$ROBOT_ARG" in
         ROBOTTYPE="xgb"
         RUNTIME_ROBOTTYPE="xgb"
         ENABLE_MC=true
-        sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
+        configure_mc_robot_type "XG"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            set_mc_motor_platform_type \
-                src/robot_mc/build/export/config/xg-user-parameters.yaml 5
+            set_mc_motor_platform "xg-user-parameters.yaml" "5"
         else
             ENABLE_MUJOCO=false
-            set_mc_motor_platform_type \
-                src/robot_mc/build/export/config/xg-user-parameters.yaml 8
+            set_mc_motor_platform "xg-user-parameters.yaml" "8"
         fi
         ;;
     2|xgw)
         ROBOTTYPE="xgw"
         RUNTIME_ROBOTTYPE="xgw"
         ENABLE_MC=true
-        sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
+        configure_mc_robot_type "XGW"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            set_mc_motor_platform_type \
-                src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 5
+            set_mc_motor_platform "xg_wheel-user-parameters.yaml" "5"
         else
             ENABLE_MUJOCO=false
-            set_mc_motor_platform_type \
-                src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 8
+            set_mc_motor_platform "xg_wheel-user-parameters.yaml" "8"
         fi
         ;;
     3|zgws)
         ROBOTTYPE="zgws"
         RUNTIME_ROBOTTYPE="zgws"
         ENABLE_MC=true
-        sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=ZGWS/' "$TARGET_FILE"
+        configure_mc_robot_type "ZGWS"
         if [[ "$MUJOCORUNNING" == "1" ]]; then
             ENABLE_MUJOCO=true
-            set_mc_motor_platform_type \
-                src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml 5
+            set_mc_motor_platform "zg_wheels-user-parameters.yaml" "5"
         else
             ENABLE_MUJOCO=false
-            set_mc_motor_platform_type \
-                src/robot_mc/build/export/config/zg_wheels-user-parameters.yaml 8
+            set_mc_motor_platform "zg_wheels-user-parameters.yaml" "8"
         fi
         ;;
     6|xxg)
@@ -1243,41 +963,35 @@ case "$ROBOT_ARG" in
         case "${_REF_PROFILE}" in
             xgw|zgw)
                 # 16-DOF wheel-leg (xgw/zgw) → XGW MC config
-                sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XGW/' "$TARGET_FILE"
+                configure_mc_robot_type "XGW"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    set_mc_motor_platform_type \
-                        src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 5
+                    set_mc_motor_platform "xg_wheel-user-parameters.yaml" "5"
                 else
                     ENABLE_MUJOCO=false
-                    set_mc_motor_platform_type \
-                        src/robot_mc/build/export/config/xg_wheel-user-parameters.yaml 8
+                    set_mc_motor_platform "xg_wheel-user-parameters.yaml" "8"
                 fi
                 ;;
             xxg)
                 # XXG family → XXG MC config
-                sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XXG/' "$TARGET_FILE"
+                configure_mc_robot_type "XXG"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    set_mc_motor_platform_type \
-                        src/robot_mc/build/export/config/xxg-user-parameters.yaml 5
+                    set_mc_motor_platform "xxg-user-parameters.yaml" "5"
                 else
                     ENABLE_MUJOCO=false
-                    set_mc_motor_platform_type \
-                        src/robot_mc/build/export/config/xxg-user-parameters.yaml 8
+                    set_mc_motor_platform "xxg-user-parameters.yaml" "8"
                 fi
                 ;;
             *)
                 # xgb / generic / unknown → XG MC config (default)
-                sed -i 's/export ROBOT_TYPE=.*/export ROBOT_TYPE=XG/' "$TARGET_FILE"
+                configure_mc_robot_type "XG"
                 if [[ "$MUJOCORUNNING" == "1" ]]; then
                     ENABLE_MUJOCO=true
-                    set_mc_motor_platform_type \
-                        src/robot_mc/build/export/config/xg-user-parameters.yaml 5
+                    set_mc_motor_platform "xg-user-parameters.yaml" "5"
                 else
                     ENABLE_MUJOCO=false
-                    set_mc_motor_platform_type \
-                        src/robot_mc/build/export/config/xg-user-parameters.yaml 8
+                    set_mc_motor_platform "xg-user-parameters.yaml" "8"
                 fi
                 ;;
         esac
@@ -1288,31 +1002,13 @@ case "$ROBOT_ARG" in
         ;;
 esac
 
-case "${MATRIX_DISABLE_MC,,}" in
-    1|true|yes|on)
-        ENABLE_MC=false
-        echo "[INFO] Matrix motion controller disabled by MATRIX_DISABLE_MC=$MATRIX_DISABLE_MC"
-        ;;
-    0|false|no|off|"")
-        ;;
-    *)
-        echo "[ERROR] MATRIX_DISABLE_MC must be a boolean: $MATRIX_DISABLE_MC" >&2
-        exit 1
-        ;;
-esac
-
-if $MATRIX_EXTERNAL_STATE_ENABLED; then
-    ENABLE_MUJOCO=false
+if $MATRIX_MC_DISABLED; then
     ENABLE_MC=false
-    echo "[INFO] External-state mode: local MuJoCo and MC are disabled"
+    echo "[INFO] Matrix motion controller disabled by MATRIX_DISABLE_MC=$MATRIX_DISABLE_MC"
 fi
 
 case "${MATRIX_SONIC,,}" in
     1|true|yes|on)
-        if $MATRIX_EXTERNAL_STATE_ENABLED; then
-            echo "[ERROR] MATRIX_EXTERNAL_STATE=1 conflicts with MATRIX_SONIC" >&2
-            exit 2
-        fi
         MATRIX_SONIC_ENABLED=true
         ENABLE_MC=false
         if ! $ENABLE_MUJOCO; then
@@ -1330,22 +1026,14 @@ case "${MATRIX_SONIC,,}" in
         ;;
 esac
 
-if [[ -n "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" ]] \
-    && { ! $MATRIX_SONIC_ENABLED \
-        || [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; }; then
-    echo "[ERROR] Matrix route entry requires native SONIC game control" >&2
-    exit 1
-fi
-
 # The stock cooked package already contains a camera-bearing SpringArm on each
 # robot Blueprint.  In interactive SONIC game mode, select the real rendered
 # robot as the UE view target and make that native arm direct/collision-aware.
 # These are startup console commands, not the Python camera-bridge contract.
 # `set Engine.SpringArmComponent` intentionally affects every live spring arm;
 # an operator can append a narrower/newer command via MATRIX_UE_EXTRA_EXEC_CMDS.
-if { $MATRIX_EXTERNAL_STATE_ENABLED \
-    || { $MATRIX_SONIC_ENABLED \
-        && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; }; } \
+if $MATRIX_SONIC_ENABLED \
+    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]] \
     && $GAME_CENTERED_CAMERA_ENABLED; then
     if [[ "$ROBOTTYPE" == "custom" \
         && -n "$MATRIX_CENTERED_CAMERA_OVERLAY_BUNDLE" ]]; then
@@ -1399,10 +1087,8 @@ PY
                 ;;
         esac
     fi
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag ${VIDEO_CAMERA_LAG}"
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag ${VIDEO_CAMERA_LAG}"
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent CameraLagSpeed ${VIDEO_CAMERA_LAG_SPEED}"
-    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent CameraRotationLagSpeed ${VIDEO_CAMERA_LAG_SPEED}"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraLag False"
+    UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bEnableCameraRotationLag False"
     UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent bDoCollisionTest True"
     if $CENTERED_CAMERA_OVERLAY_ENABLED; then
         UE_EXEC_CMDS="${UE_EXEC_CMDS},set Engine.SpringArmComponent TargetArmLength ${MATRIX_GAME_CAMERA_DISTANCE_CM}"
@@ -1414,16 +1100,14 @@ PY
     else
         echo "[INFO] Native centered game-camera startup enabled: viewclass=$GAME_CAMERA_VIEW_CLASS"
     fi
-elif $MATRIX_EXTERNAL_STATE_ENABLED \
-    || { $MATRIX_SONIC_ENABLED \
-        && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; }; then
+elif $MATRIX_SONIC_ENABLED \
+    && [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
     echo "[INFO] Native centered game-camera startup disabled"
 fi
 
 # Keep operator commands last by contract.  They can deliberately override a
 # default set/viewclass command without editing the launcher.
-if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "0" \
-    && -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
+if [[ -n "${MATRIX_UE_EXTRA_EXEC_CMDS:-}" ]]; then
     UE_EXEC_CMDS="${UE_EXEC_CMDS},${MATRIX_UE_EXTRA_EXEC_CMDS}"
 fi
 
@@ -1465,11 +1149,8 @@ sed -i "s/^robot: .*/robot: \"$ROBOTTYPE\"/" src/robot_mujoco/simulate/config.ya
 # JSON 同步
 #######################################
 MUJOCO_RUNNING_JSON=false
-if $ENABLE_MUJOCO || $MATRIX_EXTERNAL_STATE_ENABLED; then
+if $ENABLE_MUJOCO; then
     MUJOCO_RUNNING_JSON=true
-fi
-if $MATRIX_EXTERNAL_STATE_ENABLED; then
-    echo "[INFO] UE external-state consumer enabled without local MuJoCo"
 fi
 
 CONFIG_TMP="$(mktemp)"
@@ -1502,17 +1183,6 @@ cp scene/scene.json  src/UeSim/Linux/zsibot_mujoco_ue/Content/model/SceneLoder/s
 # launcher 选中的场景变体需要同步覆盖到该入口，否则 UE 会继续读取默认场景。
 compose_custom_runtime_scene() {
     if [[ "$ROBOTTYPE" != "custom" ]]; then
-        return
-    fi
-
-    if $MATRIX_EXTERNAL_STATE_ENABLED; then
-        local external_entry="$PROJECT_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model/custom/scene_terrain_custom.xml"
-        if [[ ! -f "$external_entry" ]]; then
-            echo "[ERROR] External-state custom UE entry is missing: $external_entry" >&2
-            exit 1
-        fi
-        echo "[INFO] External-state renderer uses fixed custom UE entry;" \
-            "Isaac owns the Moon collision scene"
         return
     fi
 
@@ -1605,6 +1275,7 @@ fi
 #######################################
 echo "[INFO] Starting processes..."
 
+mkdir -p src/robot_mujoco/simulate/build
 cd src/robot_mujoco/simulate/build
 if $ENABLE_MUJOCO && ! $MATRIX_SONIC_ENABLED; then
     echo "[INFO] Starting MuJoCo"
@@ -1626,40 +1297,13 @@ UE_COMMAND=(
     /usr/bin/env
     "LD_LIBRARY_PATH=$(ue_ld_library_path)"
 )
-UE_MATERIAL_FIX_PRELOAD="${MATRIX_UE_MATERIAL_FIX_PRELOAD:-auto}"
-UE_MATERIAL_FIX_DEFAULT="$PROJECT_ROOT/outputs/runtime/matrix-ue-material-fix/libmatrix_ue_material_fix.so"
+UE_MATERIAL_FIX_PRELOAD="${MATRIX_UE_MATERIAL_FIX_PRELOAD:-}"
 UE_MATERIAL_FIX_BINARY=""
 UE_G1_SKIN="${MATRIX_G1_SKIN:-}"
 UE_G1_MATERIAL_PALETTE="$MATRIX_UE_G1_MATERIAL_PALETTE_CONTRACT"
 UE_G1_MATERIAL_SCOPE_ALPHA="$MATRIX_UE_G1_SCOPE_ALPHA_CONTRACT"
 UE_G1_PALETTE_PATTERN='^[-0-9eE+.,;]+$'
 UE_G1_COMPONENT_PATTERN='^[-0-9eE+.]+$'
-case "${UE_MATERIAL_FIX_PRELOAD,,}" in
-    ""|auto)
-        if [[ -f "$UE_MATERIAL_FIX_DEFAULT" && ! -L "$UE_MATERIAL_FIX_DEFAULT" ]]; then
-            UE_MATERIAL_FIX_PRELOAD="$UE_MATERIAL_FIX_DEFAULT"
-        elif [[ -n "$UE_G1_SKIN" ]]; then
-            echo "[ERROR] Matrix G1 skin '$UE_G1_SKIN' requires the audited UE material bridge:" >&2
-            echo "[ERROR] $UE_MATERIAL_FIX_DEFAULT" >&2
-            echo "[ERROR] Run scripts/bootstrap_matrix_sonic.sh or scripts/build_matrix_ue_material_fix.sh before launch." >&2
-            exit 1
-        else
-            UE_MATERIAL_FIX_PRELOAD=""
-            echo "[INFO] Matrix UE material fix default not found; continuing without skin bridge"
-        fi
-        ;;
-    off|none|disabled|0|false|no)
-        UE_MATERIAL_FIX_PRELOAD=""
-        echo "[INFO] Matrix UE material fix disabled by MATRIX_UE_MATERIAL_FIX_PRELOAD=$MATRIX_UE_MATERIAL_FIX_PRELOAD"
-        ;;
-    *) ;;
-esac
-if [[ "$BFM_ISAAC_RENDERER_VIDEO_LOCKED" == "1" \
-    && "$UE_MATERIAL_FIX_PRELOAD" != "$UE_MATERIAL_FIX_DEFAULT" ]]; then
-    echo "[ERROR] Qualified BFM renderer requires the locked material bridge:" >&2
-    echo "[ERROR] expected=$UE_MATERIAL_FIX_DEFAULT actual=${UE_MATERIAL_FIX_PRELOAD:-disabled}" >&2
-    exit 1
-fi
 if [[ -n "$UE_MATERIAL_FIX_PRELOAD" ]]; then
     if [[ ! "$UE_G1_SKIN" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]]; then
         echo "[ERROR] MATRIX_G1_SKIN must name a registered skin" >&2
@@ -1727,9 +1371,6 @@ else
 fi
 UE_COMMAND+=(
     -game "$MAPNAME"
-    "-ResX=$VIDEO_WIDTH"
-    "-ResY=$VIDEO_HEIGHT"
-    "${VIDEO_WINDOW_ARGS[@]}"
     # The stock cooked package enables UE's legacy PlayerInput mouse
     # smoothing.  Override it in the Input config hierarchy so a released
     # drag has no interpolated tail; disabling FOV scaling also keeps one
@@ -1770,7 +1411,6 @@ fi
 if $CENTERED_CAMERA_OVERLAY_ENABLED; then
     verify_centered_camera_overlay_mount "$UE_LOG" "$UE_LOG_START_OFFSET"
 fi
-start_external_state_esc_ui_provider
 
 if $MATRIX_SONIC_ENABLED; then
     MATRIX_SONIC_PYTHON="${MATRIX_SONIC_PYTHON:-python3}"
@@ -1787,32 +1427,12 @@ if $MATRIX_SONIC_ENABLED; then
             exit 1
             ;;
     esac
-    if [[ -n "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" \
-        && "$GAME_WORLD_PERSISTENCE_ENABLED" != "1" ]]; then
-        echo "[ERROR] Matrix route entry requires persistent game world state" >&2
-        exit 1
-    fi
     if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         for required in \
             "$PROJECT_ROOT/scripts/matrix_game_control_input.py" \
-            "$PROJECT_ROOT/scripts/matrix_build_info.py" \
-            "$PROJECT_ROOT/scripts/matrix_external_control.py" \
             "$PROJECT_ROOT/scripts/matrix_calibration_overlay.py" \
-            "$PROJECT_ROOT/scripts/matrix_ui_settings.py" \
-            "$PROJECT_ROOT/scripts/matrix_video_settings.py" \
-            "$PROJECT_ROOT/scripts/matrix_item_asset_pack.py" \
-            "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
-            "$PROJECT_ROOT/scripts/matrix_celestial_ephemeris.py" \
-            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" \
-            "$PROJECT_ROOT/scripts/bootstrap_matrix_celestial.sh" \
             "$PROJECT_ROOT/scripts/matrix_mc_commands.py" \
-            "$PROJECT_ROOT/scripts/matrix_motion_settings.py" \
-            "$PROJECT_ROOT/scripts/matrix_route_entry.py" \
-            "$PROJECT_ROOT/scripts/matrix_spawn_clearance.py" \
             "$PROJECT_ROOT/scripts/matrix_world_state.py" \
-            "$PROJECT_ROOT/config/universe/sol-2080.json" \
-            "$PROJECT_ROOT/config/universe/de440s-2080.lock.json" \
-            "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
             "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
             "$PROJECT_ROOT/scripts/compose_custom_scene.py"; do
             if [[ ! -f "$required" ]]; then
@@ -1820,30 +1440,6 @@ if $MATRIX_SONIC_ENABLED; then
                 exit 1
             fi
         done
-        CELESTIAL_PREFLIGHT_ARGS=(
-            validate
-            --catalog "$PROJECT_ROOT/config/universe/sol-2080.json"
-            --asset-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
-        )
-        if [[ -n "${MATRIX_CELESTIAL_SPK:-}" \
-            || -n "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
-            if [[ -z "${MATRIX_CELESTIAL_SPK:-}" \
-                || -z "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
-                echo "[ERROR] Matrix celestial assets are all-or-none" >&2
-                exit 1
-            fi
-            CELESTIAL_PREFLIGHT_ARGS+=(
-                --de440s-kernel "$MATRIX_CELESTIAL_SPK"
-                --jplephem-wheel "$MATRIX_CELESTIAL_JPLEPHEM_WHEEL"
-            )
-        fi
-        "$MATRIX_SONIC_PYTHON" \
-            "$PROJECT_ROOT/scripts/matrix_celestial_navigation.py" \
-            "${CELESTIAL_PREFLIGHT_ARGS[@]}"
-        "$MATRIX_SONIC_PYTHON" \
-            "$PROJECT_ROOT/scripts/matrix_celestial_visuals.py" validate \
-            --catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json" \
-            --profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
     fi
     for required in \
         "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
@@ -1869,28 +1465,96 @@ if $MATRIX_SONIC_ENABLED; then
     SONIC_WORLD_ARGS=()
     SONIC_SCENE_TRANSFORM_ARGS=()
     SONIC_DYNAMIC_GROUND_ARGS=()
-    SONIC_INVENTORY_ARGS=()
-    # The game-input provider always needs a stable world identity, even when
-    # durable checkpoints are disabled.  Persistence adds revision/state
-    # arguments below; identity by itself is intentionally non-persistent.
-    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
-        GAME_WORLD_ROBOT_ID="${CUSTOM_NAME:-$ROBOT_ARG}"
-        GAME_WORLD_ID="${MATRIX_GAME_WORLD_ID:-${GAME_WORLD_ROBOT_ID}:${SCENE%.xml}}"
-        SONIC_WORLD_ARGS=(--game-world-id "$GAME_WORLD_ID")
-    fi
-    if [[ -n "${MATRIX_CREATIVE_INVENTORY_CATALOG:-}" ]]; then
-        if [[ ! -f "$MATRIX_CREATIVE_INVENTORY_CATALOG" ]]; then
-            echo "[ERROR] Creative inventory catalog is missing: $MATRIX_CREATIVE_INVENTORY_CATALOG" >&2
-            exit 1
-        fi
-        if [[ ! -f "$PROJECT_ROOT/scripts/inject_creative_inventory.py" ]]; then
-            echo "[ERROR] Creative inventory injector is missing" >&2
-            exit 1
-        fi
-        SONIC_INVENTORY_ARGS+=(
-            --creative-inventory-catalog "$MATRIX_CREATIVE_INVENTORY_CATALOG"
+    SONIC_DYNAMIC_GROUND_COLLISION_ARGS=()
+    set_sonic_spawn_args() {
+        SONIC_SPAWN_ARGS=(
+            "--spawn-x=$1"
+            "--spawn-y=$2"
+            "--spawn-z=$3"
+            "--spawn-yaw=$4"
         )
-    fi
+    }
+    resolve_moon_spawn_args() {
+        local source="$1"
+        local x="${2:-}"
+        local y="${3:-}"
+        local z="${4:-}"
+        local yaw="${5:-0}"
+        local moon_spawn_output
+        local -a resolver=(
+            "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_moon_dynamic_ground.py"
+            resolve-spawn-pose
+            --map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
+            --map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
+            --source "$source"
+            --root-clearance "${MATRIX_MOON_DYNAMIC_GROUND_ROOT_CLEARANCE:-0.85}"
+            --min-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MIN_RESUME_CLEARANCE:-0.45}"
+            --max-resume-clearance "${MATRIX_MOON_DYNAMIC_GROUND_MAX_RESUME_CLEARANCE:-1.30}"
+        )
+        if [[ -n "$x" && -n "$y" && -n "$z" ]]; then
+            resolver+=(--x "$x" --y "$y" --z "$z" --yaw "$yaw")
+        fi
+        if ! moon_spawn_output="$("${resolver[@]}")"; then
+            echo "[ERROR] Could not resolve MoonWorld raw-terrain spawn pose" >&2
+            return 1
+        fi
+        mapfile -t MOON_SPAWN_LINES <<<"$moon_spawn_output"
+        if [[ "${MOON_SPAWN_LINES[0]:-}" != "pose" \
+            || "${#MOON_SPAWN_LINES[@]}" != "7" ]]; then
+            echo "[ERROR] Invalid MoonWorld spawn resolver response" >&2
+            return 1
+        fi
+        set_sonic_spawn_args \
+            "${MOON_SPAWN_LINES[1]}" \
+            "${MOON_SPAWN_LINES[2]}" \
+            "${MOON_SPAWN_LINES[3]}" \
+            "${MOON_SPAWN_LINES[4]}"
+        echo "[INFO] Matrix MoonWorld spawn pose: ${MOON_SPAWN_LINES[5]} " \
+            "x=${MOON_SPAWN_LINES[1]} y=${MOON_SPAWN_LINES[2]} " \
+            "z=${MOON_SPAWN_LINES[3]} yaw=${MOON_SPAWN_LINES[4]} " \
+            "${MOON_SPAWN_LINES[6]}"
+    }
+    resolve_default_moon_spawn_args() {
+        local -a moon_spawn_override=(
+            "${MATRIX_MOON_SPAWN_X:-}"
+            "${MATRIX_MOON_SPAWN_Y:-}"
+            "${MATRIX_MOON_SPAWN_Z:-}"
+            "${MATRIX_MOON_SPAWN_YAW:-}"
+        )
+        local moon_spawn_override_count=0
+        local value
+        for value in "${moon_spawn_override[@]}"; do
+            [[ -n "$value" ]] && ((moon_spawn_override_count += 1))
+        done
+        if [[ "$moon_spawn_override_count" == "0" ]]; then
+            # Verified MoonWorld plain from the pre-regression mainline.  This
+            # point is a locally flat, locked-height patch with real collision;
+            # it avoids spawning into the steeper 23,13 test slope or the later
+            # 24.43,110.77 route that can destabilize native SONIC.
+            resolve_moon_spawn_args \
+                "mainline_plain" \
+                -94.7 \
+                -65.6 \
+                -5.251562023162842 \
+                0 \
+                || return 1
+            echo "[INFO] MoonWorld verified mainline plain spawn selected"
+            return 0
+        fi
+        if [[ "$moon_spawn_override_count" == "4" ]]; then
+            resolve_moon_spawn_args \
+                "explicit" \
+                "${moon_spawn_override[0]}" \
+                "${moon_spawn_override[1]}" \
+                "${moon_spawn_override[2]}" \
+                "${moon_spawn_override[3]}" \
+                || return 1
+            echo "[INFO] MoonWorld explicit spawn aligned by caller"
+            return 0
+        fi
+        echo "[ERROR] MATRIX_MOON_SPAWN_X/Y/Z/YAW are all-or-none" >&2
+        return 2
+    }
     if [[ "$SCENE" == "scene_terrain_t10.xml" ]]; then
         SONIC_SCENE_TRANSFORM_ARGS+=(
             --scene-transform town10-open-boundary-v1
@@ -1898,30 +1562,43 @@ if $MATRIX_SONIC_ENABLED; then
         echo "[INFO] Town10 perimeter collision walls removed in derived physics scene"
     fi
     if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+        MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="$(
+            printf '%s' "${MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE:-rolling-mocap-tiles-v1}" \
+                | tr '[:upper:]' '[:lower:]' \
+                | tr '_' '-'
+        )"
+        case "$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE" in
+            ""|stable|default|tiles|tile|mocap-tiles|rolling-tiles|rolling-mocap-tiles|rolling-mocap-tiles-v1|leo|official)
+                MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="rolling-mocap-tiles-v1"
+                ;;
+            hfield|heightfield|continuous|continuous-hfield|rolling-hfield|rolling-heightfield|rolling-heightfield-v2)
+                MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE="rolling-heightfield-v2"
+                ;;
+            *)
+                echo "[ERROR] MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE must be rolling-heightfield-v2 or rolling-mocap-tiles-v1" >&2
+                exit 2
+                ;;
+        esac
+        export MATRIX_MOON_DYNAMIC_GROUND_COLLISION_MODE="$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE"
+        export MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER="${MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER:-raw}"
         SONIC_SCENE_TRANSFORM_ARGS+=(
             --scene-transform moon-dynamic-ground-mocap-v3
+        )
+        SONIC_DYNAMIC_GROUND_COLLISION_ARGS=(
+            --moon-dynamic-ground-collision-mode "$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE"
         )
         SONIC_DYNAMIC_GROUND_ARGS=(
             --moon-dynamic-map "$PROJECT_ROOT/dynamicmaps/moonworld.bin"
             --moon-dynamic-map-sha256 "62e624b5feca0111033c60d0e820f3a320257acd72b565234ac79c704dbca1df"
         )
-        echo "[INFO] MoonWorld rolling collision tiles enabled from locked dynamic height map"
-    fi
-    if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
-        && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
-        SONIC_SPAWN_ARGS=(
-            "--spawn-x=-94.7"
-            "--spawn-y=-65.6"
-            "--spawn-z=-5.251562023162842"
-            "--spawn-yaw=0"
-        )
-        echo "[INFO] MoonWorld map-default spawn aligned to locked terrain height"
+        echo "[INFO] MoonWorld dynamic ground enabled from locked height map: collision=$MOON_DYNAMIC_GROUND_COLLISION_MODE_VALUE height_filter=$MATRIX_MOON_DYNAMIC_GROUND_HEIGHT_FILTER"
     fi
     if [[ "$GAME_WORLD_PERSISTENCE_ENABLED" == "1" ]]; then
         if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
             echo "[ERROR] Persistent Matrix world state requires game control" >&2
             exit 1
         fi
+        GAME_WORLD_ID="${MATRIX_GAME_WORLD_ID:-${CUSTOM_NAME}:${SCENE%.xml}}"
         GAME_WORLD_REVISION="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 revision \
@@ -1929,8 +1606,7 @@ if $MATRIX_SONIC_ENABLED; then
                 --native-scene "$NATIVE_SONIC_SCENE" \
                 --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
                 --canonical-meshes "$MATRIX_SONIC_CANONICAL_MESHES" \
-                "${SONIC_SCENE_TRANSFORM_ARGS[@]}" \
-                "${SONIC_INVENTORY_ARGS[@]}"
+                "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
         )"
         GAME_WORLD_STATE_FILE="${MATRIX_GAME_WORLD_STATE_FILE:-}"
         if [[ -z "$GAME_WORLD_STATE_FILE" ]]; then
@@ -1945,121 +1621,61 @@ if $MATRIX_SONIC_ENABLED; then
             echo "[ERROR] MATRIX_GAME_WORLD_STATE_FILE must be absolute" >&2
             exit 1
         fi
-        GAME_CELESTIAL_CLOCK_STATE_FILE="${MATRIX_CELESTIAL_CLOCK_STATE_FILE:-$(dirname "$GAME_WORLD_STATE_FILE")/universe-sol-2080-clock.json}"
-        if [[ "$GAME_CELESTIAL_CLOCK_STATE_FILE" != /* ]]; then
-            echo "[ERROR] MATRIX_CELESTIAL_CLOCK_STATE_FILE must be absolute" >&2
-            exit 1
+        GAME_WORLD_RESUME_SAFETY_ARGS=()
+        if [[ "$SCENE" != "scene_terrain_moon_dynamic.xml" ]]; then
+            GAME_WORLD_RESUME_SAFETY_ARGS+=(--min-resume-z 0.55)
         fi
-        GAME_WORLD_RESUME_CHECKPOINT_ID=""
-        GAME_WORLD_RESUME_GENERATION=""
         if ! GAME_WORLD_START_OUTPUT="$(
             "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/matrix_world_state.py" \
                 resolve-start \
                 --file "$GAME_WORLD_STATE_FILE" \
                 --world-id "$GAME_WORLD_ID" \
                 --world-revision "$GAME_WORLD_REVISION" \
-                --include-checkpoint-meta
+                "${GAME_WORLD_RESUME_SAFETY_ARGS[@]}"
         )"; then
             echo "[ERROR] Could not resolve the Matrix world resume pose" >&2
             exit 1
         fi
         mapfile -t GAME_WORLD_START_LINES <<<"$GAME_WORLD_START_OUTPUT"
         if [[ "${GAME_WORLD_START_LINES[0]:-}" == "pose" ]]; then
-            if [[ "${#GAME_WORLD_START_LINES[@]}" != "9" \
-                || ! "${GAME_WORLD_START_LINES[8]}" =~ ^[0-9]+$ ]]; then
+            if [[ "${#GAME_WORLD_START_LINES[@]}" != "7" ]]; then
                 echo "[ERROR] Invalid Matrix world-state pose response" >&2
                 exit 1
             fi
-            SONIC_SPAWN_ARGS=(
-                "--spawn-x=${GAME_WORLD_START_LINES[1]}"
-                "--spawn-y=${GAME_WORLD_START_LINES[2]}"
-                "--spawn-z=${GAME_WORLD_START_LINES[3]}"
-                "--spawn-yaw=${GAME_WORLD_START_LINES[4]}"
-            )
-            GAME_WORLD_RESUME_CHECKPOINT_ID="${GAME_WORLD_START_LINES[7]}"
-            GAME_WORLD_RESUME_GENERATION="${GAME_WORLD_START_LINES[8]}"
+            if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+                resolve_moon_spawn_args \
+                    "${GAME_WORLD_START_LINES[5]}" \
+                    "${GAME_WORLD_START_LINES[1]}" \
+                    "${GAME_WORLD_START_LINES[2]}" \
+                    "${GAME_WORLD_START_LINES[3]}" \
+                    "${GAME_WORLD_START_LINES[4]}" \
+                    || exit 1
+            else
+                set_sonic_spawn_args \
+                    "${GAME_WORLD_START_LINES[1]}" \
+                    "${GAME_WORLD_START_LINES[2]}" \
+                    "${GAME_WORLD_START_LINES[3]}" \
+                    "${GAME_WORLD_START_LINES[4]}"
+            fi
             echo "[INFO] Matrix resume pose: ${GAME_WORLD_START_LINES[5]} " \
-                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]} " \
-                "checkpoint=${GAME_WORLD_START_LINES[7]} " \
-                "generation=${GAME_WORLD_START_LINES[8]}"
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[6]}"
         elif [[ "${GAME_WORLD_START_LINES[0]:-}" == "none" \
-            && "${#GAME_WORLD_START_LINES[@]}" == "4" \
-            && "${GAME_WORLD_START_LINES[2]}" == "none" \
-            && "${GAME_WORLD_START_LINES[3]}" =~ ^[0-9]+$ ]]; then
+            && "${#GAME_WORLD_START_LINES[@]}" == "2" ]]; then
+            if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" ]]; then
+                resolve_default_moon_spawn_args || exit 1
+            fi
             echo "[INFO] Matrix resume pose: map default " \
-                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]} " \
-                "generation=${GAME_WORLD_START_LINES[3]}"
+                "world=$GAME_WORLD_ID state=${GAME_WORLD_START_LINES[1]}"
         else
             echo "[ERROR] Invalid Matrix world-state helper response" >&2
             exit 1
         fi
-        if [[ -n "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" ]]; then
-            if ! MATRIX_ROUTE_ENTRY_OUTPUT="$(
-                /usr/bin/python3 -I -S - \
-                    "$PROJECT_ROOT/scripts" \
-                    "$GAME_WORLD_ID" \
-                    "$SCENE_ID" \
-                    "$MATRIX_GAME_ROUTE_ENTRY_JSON_VALUE" <<'PY'
-import sys
-
-sys.path.insert(0, sys.argv[1])
-from matrix_route_entry import parse_route_entry_output_text
-
-entry = parse_route_entry_output_text(
-    sys.argv[4],
-    expected_world_id=sys.argv[2],
-    expected_scene_id=int(sys.argv[3]),
-)
-for value in (
-    entry.destination_id,
-    entry.teleport_tag,
-    entry.entity_id,
-    entry.entry_pose.x,
-    entry.entry_pose.y,
-    entry.entry_pose.z,
-    entry.entry_pose.yaw_rad,
-):
-    print(value)
-PY
-            )"; then
-                echo "[ERROR] Invalid one-shot Matrix route entry" >&2
-                exit 1
-            fi
-            mapfile -t MATRIX_ROUTE_ENTRY_LINES <<<"$MATRIX_ROUTE_ENTRY_OUTPUT"
-            if [[ "${#MATRIX_ROUTE_ENTRY_LINES[@]}" != "7" ]]; then
-                echo "[ERROR] Invalid Matrix route-entry helper response" >&2
-                exit 1
-            fi
-            SONIC_SPAWN_ARGS=(
-                "--spawn-x=${MATRIX_ROUTE_ENTRY_LINES[3]}"
-                "--spawn-y=${MATRIX_ROUTE_ENTRY_LINES[4]}"
-                "--spawn-z=${MATRIX_ROUTE_ENTRY_LINES[5]}"
-                "--spawn-yaw=${MATRIX_ROUTE_ENTRY_LINES[6]}"
-            )
-            # The target state was loaded and revision-checked above, but its
-            # previous resume identity must not override this route entry. A
-            # successful startup writes a new clearance-audited checkpoint.
-            GAME_WORLD_RESUME_CHECKPOINT_ID=""
-            GAME_WORLD_RESUME_GENERATION=""
-            echo "[INFO] Matrix route entry: " \
-                "destination=${MATRIX_ROUTE_ENTRY_LINES[0]} " \
-                "tag=${MATRIX_ROUTE_ENTRY_LINES[1]} " \
-                "entity=${MATRIX_ROUTE_ENTRY_LINES[2]} " \
-                "world=$GAME_WORLD_ID scene=$SCENE_ID"
-        fi
-        SONIC_WORLD_ARGS+=(
+        SONIC_WORLD_ARGS=(
+            --game-world-id "$GAME_WORLD_ID"
             --game-world-revision "$GAME_WORLD_REVISION"
             --game-world-state-file "$GAME_WORLD_STATE_FILE"
-            --game-celestial-clock-state-file "$GAME_CELESTIAL_CLOCK_STATE_FILE"
             --game-world-checkpoint-seconds "${MATRIX_GAME_WORLD_CHECKPOINT_SECONDS:-0.75}"
-            --game-resume-rollback-count "${MATRIX_GAME_RESUME_ROLLBACK_COUNT:-0}"
         )
-        if [[ -n "$GAME_WORLD_RESUME_CHECKPOINT_ID" ]]; then
-            SONIC_WORLD_ARGS+=(
-                --game-world-resume-checkpoint-id "$GAME_WORLD_RESUME_CHECKPOINT_ID"
-                --game-world-resume-generation "$GAME_WORLD_RESUME_GENERATION"
-            )
-        fi
         case "${MATRIX_GAME_AUTO_RESPAWN:-0}" in
             1|true|yes|on) SONIC_WORLD_ARGS+=(--game-auto-respawn) ;;
             0|false|no|off|"") ;;
@@ -2069,6 +1685,10 @@ PY
                 ;;
         esac
     fi
+    if [[ "$SCENE" == "scene_terrain_moon_dynamic.xml" \
+        && "${#SONIC_SPAWN_ARGS[@]}" == "0" ]]; then
+        resolve_default_moon_spawn_args || exit 1
+    fi
     SONIC_PHYSICS_DIR="${MATRIX_SONIC_PHYSICS_DIR:-$PROJECT_ROOT/outputs/runtime/matrix_sonic/$CUSTOM_NAME/${SCENE%.xml}}"
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/prepare_sonic_physics_model.py" \
         --canonical-model "$MATRIX_SONIC_CANONICAL_MODEL" \
@@ -2076,17 +1696,10 @@ PY
         --native-scene "$NATIVE_SONIC_SCENE" \
         --output-dir "$SONIC_PHYSICS_DIR" \
         "${SONIC_SPAWN_ARGS[@]}" \
-        "${SONIC_INVENTORY_ARGS[@]}" \
-        "${SONIC_SCENE_TRANSFORM_ARGS[@]}"
+        "${SONIC_SCENE_TRANSFORM_ARGS[@]}" \
+        "${SONIC_DYNAMIC_GROUND_COLLISION_ARGS[@]}"
     SONIC_STATUS_FILE="${MATRIX_SONIC_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_sonic_status.json}"
     rm -f -- "$SONIC_STATUS_FILE"
-    SONIC_STATE_TRACE_FILE="${MATRIX_SONIC_STATE_TRACE_FILE:-$PROJECT_ROOT/outputs/state-traces/matrix_sonic_state_trace_$(date -u +%Y%m%d-%H%M%S)_$$.jsonl}"
-    if [[ "$SONIC_STATE_TRACE_FILE" != /* ]]; then
-        echo "[ERROR] MATRIX_SONIC_STATE_TRACE_FILE must be absolute" >&2
-        exit 1
-    fi
-    mkdir -p "$(dirname "$SONIC_STATE_TRACE_FILE")"
-    rm -f -- "$SONIC_STATE_TRACE_FILE"
     GAME_INPUT_STATUS_FILE="${MATRIX_GAME_INPUT_STATUS_FILE:-$PROJECT_ROOT/outputs/matrix_game_control_input.json}"
     if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         rm -f -- "$GAME_INPUT_STATUS_FILE"
@@ -2102,280 +1715,18 @@ PY
             ;;
     esac
     SONIC_ACCEPTANCE_ARGS=()
-    PHYSICAL_RECOVERY_ARGS=()
-    SONIC_FAIL_ON_FALL_ENABLED=0
-    case "${MATRIX_SONIC_FAIL_ON_FALL:-1}" in
-        1|true|yes|on)
-            SONIC_FAIL_ON_FALL_ENABLED=1
-            SONIC_ACCEPTANCE_ARGS+=(--fail-on-fall)
-            ;;
+    SONIC_FAIL_ON_FALL_DEFAULT=1
+    SONIC_MAX_RESETS_DEFAULT=0
+    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" \
+        && "${MATRIX_SONIC_MAX_SECONDS:-0}" == "0" ]]; then
+        SONIC_FAIL_ON_FALL_DEFAULT=0
+        SONIC_MAX_RESETS_DEFAULT=100000
+    fi
+    case "${MATRIX_SONIC_FAIL_ON_FALL:-$SONIC_FAIL_ON_FALL_DEFAULT}" in
+        1|true|yes|on) SONIC_ACCEPTANCE_ARGS+=(--fail-on-fall) ;;
         0|false|no|off|"") ;;
         *)
             echo "[ERROR] MATRIX_SONIC_FAIL_ON_FALL must be a boolean" >&2
-            exit 1
-            ;;
-    esac
-    case "${MATRIX_GAME_FALL_RECOVERY:-off}" in
-        off|"") ;;
-        sonic)
-            if [[ "$SONIC_FAIL_ON_FALL_ENABLED" == "1" ]]; then
-                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=sonic conflicts with MATRIX_SONIC_FAIL_ON_FALL" >&2
-                exit 1
-            fi
-            if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
-                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=sonic requires game control" >&2
-                exit 1
-            fi
-            SONIC_ACCEPTANCE_ARGS+=(
-                --game-fall-recovery sonic
-                --game-fall-recovery-timeout "${MATRIX_GAME_FALL_RECOVERY_TIMEOUT:-15.0}"
-            )
-            ;;
-        physical)
-            if [[ "$SONIC_FAIL_ON_FALL_ENABLED" == "1" ]]; then
-                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=physical conflicts with MATRIX_SONIC_FAIL_ON_FALL" >&2
-                exit 1
-            fi
-            if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" != "game" ]]; then
-                echo "[ERROR] MATRIX_GAME_FALL_RECOVERY=physical requires game control" >&2
-                exit 1
-            fi
-            PHYSICAL_RECOVERY_WORKER="${MATRIX_PHYSICAL_RECOVERY_WORKER:-$PROJECT_ROOT/scripts/matrix_sonic_host_worker.py}"
-            PHYSICAL_RECOVERY_INITIAL_CONTROLLER="${MATRIX_PHYSICAL_RECOVERY_INITIAL_CONTROLLER:-host}"
-            PHYSICAL_RECOVERY_HANDOFF="${MATRIX_PHYSICAL_RECOVERY_HANDOFF:-amp}"
-            PHYSICAL_RECOVERY_RESIDENT_POLICIES="${MATRIX_PHYSICAL_RECOVERY_RESIDENT_POLICIES:-0}"
-            PHYSICAL_RECOVERY_EXECUTION_PROVIDER="${MATRIX_PHYSICAL_RECOVERY_EXECUTION_PROVIDER:-cpu}"
-            PHYSICAL_RECOVERY_PYTHON="${MATRIX_PHYSICAL_RECOVERY_PYTHON:-}"
-            PHYSICAL_RECOVERY_MODEL="${MATRIX_PHYSICAL_RECOVERY_MODEL:-}"
-            PHYSICAL_RECOVERY_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_MODEL_SHA256:-}"
-            PHYSICAL_RECOVERY_FALLBACK_MODEL="${MATRIX_PHYSICAL_RECOVERY_FALLBACK_MODEL:-}"
-            PHYSICAL_RECOVERY_AMP_CONFIG="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG:-}"
-            PHYSICAL_RECOVERY_AMP_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL:-}"
-            PHYSICAL_RECOVERY_AMP_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_CONFIG_SHA256:-}"
-            PHYSICAL_RECOVERY_AMP_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_MODEL_SHA256:-}"
-            PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG:-}"
-            PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL:-}"
-            PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256:-}"
-            PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256="${MATRIX_PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256:-}"
-            PHYSICAL_RECOVERY_KUNGFU_MODEL="${MATRIX_KUNGFU_RECOVERY_MODEL:-}"
-            PHYSICAL_RECOVERY_KUNGFU_MOTION="${MATRIX_KUNGFU_RECOVERY_MOTION:-}"
-            PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256="${MATRIX_KUNGFU_RECOVERY_MODEL_SHA256:-}"
-            PHYSICAL_RECOVERY_KUNGFU_MODEL_DATA_SHA256="${MATRIX_KUNGFU_RECOVERY_MODEL_DATA_SHA256:-}"
-            PHYSICAL_RECOVERY_KUNGFU_MOTION_SHA256="${MATRIX_KUNGFU_RECOVERY_MOTION_SHA256:-}"
-            PHYSICAL_RECOVERY_KUNGFU_REFERENCE_FRAME="${MATRIX_KUNGFU_RECOVERY_REFERENCE_FRAME:-0}"
-            PHYSICAL_RECOVERY_KUNGFU_GAIN_SCALE="${MATRIX_KUNGFU_RECOVERY_GAIN_SCALE:-1.0}"
-            PHYSICAL_RECOVERY_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_CONTROL_SOCKET:-}"
-            PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET="${MATRIX_PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET:-}"
-            case "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" in
-                host|amp|amp-flat-v3|kungfu) ;;
-                *)
-                    echo "[ERROR] Physical recovery initial controller must be host, amp, amp-flat-v3, or kungfu" >&2
-                    exit 1
-                    ;;
-            esac
-            case "$PHYSICAL_RECOVERY_HANDOFF" in
-                amp|sonic) ;;
-                *)
-                    echo "[ERROR] Physical recovery handoff must be amp or sonic" >&2
-                    exit 1
-                    ;;
-            esac
-            case "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" in
-                cuda|cpu) ;;
-                *)
-                    echo "[ERROR] Physical recovery execution provider must be cuda or cpu" >&2
-                    exit 1
-                    ;;
-            esac
-            if [[ "$PHYSICAL_RECOVERY_RESIDENT_POLICIES" == "1" ]]; then
-                if [[ "$PHYSICAL_RECOVERY_HANDOFF" != "sonic" \
-                    || "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" != "cuda" ]]; then
-                    echo "[ERROR] Resident recovery requires sonic handoff with CUDA" >&2
-                    exit 1
-                fi
-            fi
-            for required in \
-                "$PHYSICAL_RECOVERY_WORKER" \
-                "$PHYSICAL_RECOVERY_PYTHON" \
-                "$PHYSICAL_RECOVERY_MODEL" \
-                "$PHYSICAL_RECOVERY_AMP_CONFIG" \
-                "$PHYSICAL_RECOVERY_AMP_MODEL"; do
-                if [[ -z "$required" || ! -f "$required" ]]; then
-                    echo "[ERROR] Physical recovery dependency is missing: $required" >&2
-                    exit 1
-                fi
-            done
-            if [[ ! -x "$PHYSICAL_RECOVERY_PYTHON" ]]; then
-                echo "[ERROR] Physical recovery Python is not executable:" \
-                    "$PHYSICAL_RECOVERY_PYTHON" >&2
-                exit 1
-            fi
-            if [[ -n "$PHYSICAL_RECOVERY_FALLBACK_MODEL" \
-                && ! -f "$PHYSICAL_RECOVERY_FALLBACK_MODEL" ]]; then
-                echo "[ERROR] Physical recovery fallback model is missing:" \
-                    "$PHYSICAL_RECOVERY_FALLBACK_MODEL" >&2
-                exit 1
-            fi
-            if [[ -n "$PHYSICAL_RECOVERY_MODEL_SHA256" ]]; then
-                actual_recovery_sha256="$(/usr/bin/python3 -I - "$PHYSICAL_RECOVERY_MODEL" <<'PY'
-import hashlib
-from pathlib import Path
-import sys
-print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
-PY
-)"
-                if [[ ! "$PHYSICAL_RECOVERY_MODEL_SHA256" =~ ^[0-9a-f]{64}$ \
-                    || "$actual_recovery_sha256" != "$PHYSICAL_RECOVERY_MODEL_SHA256" ]]; then
-                    echo "[ERROR] Physical recovery model SHA256 mismatch" >&2
-                    exit 1
-                fi
-            fi
-            if [[ "$PHYSICAL_RECOVERY_CONTROL_SOCKET" != /* ]]; then
-                echo "[ERROR] Physical recovery control socket must be absolute" >&2
-                exit 1
-            fi
-            if [[ "$PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET" != /* ]]; then
-                echo "[ERROR] SONIC writer control socket must be absolute" >&2
-                exit 1
-            fi
-            for digest in \
-                "$PHYSICAL_RECOVERY_AMP_CONFIG_SHA256" \
-                "$PHYSICAL_RECOVERY_AMP_MODEL_SHA256"; do
-                if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
-                    echo "[ERROR] Physical recovery AMP SHA256 is invalid" >&2
-                    exit 1
-                fi
-            done
-            flat_v3_present=0
-            for value in \
-                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
-                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL" \
-                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
-                "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
-                if [[ -n "$value" ]]; then
-                    flat_v3_present=$((flat_v3_present + 1))
-                fi
-            done
-            if ((flat_v3_present != 0 && flat_v3_present != 4)); then
-                echo "[ERROR] AMP flat_v3 requires config, model, and both SHA256 values" >&2
-                exit 1
-            fi
-            if ((flat_v3_present == 4)); then
-                for flat_v3_file in \
-                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG" \
-                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"; do
-                    if [[ ! -f "$flat_v3_file" ]]; then
-                        echo "[ERROR] AMP flat_v3 artifact is missing: $flat_v3_file" >&2
-                        exit 1
-                    fi
-                done
-                for digest in \
-                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256" \
-                    "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"; do
-                    if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
-                        echo "[ERROR] AMP flat_v3 SHA256 is invalid" >&2
-                        exit 1
-                    fi
-                done
-            elif [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "amp-flat-v3" ]]; then
-                echo "[ERROR] amp-flat-v3 initial recovery requires its locked artifacts" >&2
-                exit 1
-            fi
-            if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then
-                for kungfu_file in \
-                    "$PHYSICAL_RECOVERY_KUNGFU_MODEL" \
-                    "${PHYSICAL_RECOVERY_KUNGFU_MODEL}.data" \
-                    "$PHYSICAL_RECOVERY_KUNGFU_MOTION"; do
-                    if [[ -z "$kungfu_file" || ! -f "$kungfu_file" ]]; then
-                        echo "[ERROR] KungFu recovery artifact is missing: $kungfu_file" >&2
-                        exit 1
-                    fi
-                done
-                for digest in \
-                    "$PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256" \
-                    "$PHYSICAL_RECOVERY_KUNGFU_MODEL_DATA_SHA256" \
-                    "$PHYSICAL_RECOVERY_KUNGFU_MOTION_SHA256"; do
-                    if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
-                        echo "[ERROR] KungFu recovery SHA256 is invalid" >&2
-                        exit 1
-                    fi
-                done
-                if [[ ! "$PHYSICAL_RECOVERY_KUNGFU_REFERENCE_FRAME" =~ ^[0-9]+$ ]]; then
-                    echo "[ERROR] KungFu reference frame must be a non-negative integer" >&2
-                    exit 1
-                fi
-            fi
-            if ! PYTHONNOUSERSITE=1 \
-                PYTHONPATH="$MATRIX_SONIC_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-                "$PHYSICAL_RECOVERY_PYTHON" -c \
-                'import numpy, onnxruntime; from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber; from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_; from unitree_sdk2py.utils.crc import CRC' \
-                >/dev/null 2>&1; then
-                echo "[ERROR] Physical recovery Python cannot import numpy," \
-                    "onnxruntime, and unitree_sdk2py:" \
-                    "$PHYSICAL_RECOVERY_PYTHON" >&2
-                exit 1
-            fi
-            if [[ "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER" == "cuda" ]] \
-                && ! PYTHONNOUSERSITE=1 \
-                    "$PHYSICAL_RECOVERY_PYTHON" -c \
-                    'import onnxruntime as ort; assert "CUDAExecutionProvider" in ort.get_available_providers()' \
-                    >/dev/null 2>&1; then
-                echo "[ERROR] Physical recovery Python has no CUDAExecutionProvider:" \
-                    "$PHYSICAL_RECOVERY_PYTHON" >&2
-                exit 1
-            fi
-            SONIC_ACCEPTANCE_ARGS+=(
-                --game-fall-recovery physical
-                --game-fall-recovery-timeout "${MATRIX_GAME_FALL_RECOVERY_TIMEOUT:-15.0}"
-            )
-            PHYSICAL_RECOVERY_ARGS+=(
-                --physical-recovery-worker "$PHYSICAL_RECOVERY_WORKER"
-                --physical-recovery-initial-controller "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER"
-                --physical-recovery-handoff "$PHYSICAL_RECOVERY_HANDOFF"
-                --physical-recovery-python "$PHYSICAL_RECOVERY_PYTHON"
-                --physical-recovery-execution-provider "$PHYSICAL_RECOVERY_EXECUTION_PROVIDER"
-                --physical-recovery-model "$PHYSICAL_RECOVERY_MODEL"
-                --physical-recovery-amp-config "$PHYSICAL_RECOVERY_AMP_CONFIG"
-                --physical-recovery-amp-model "$PHYSICAL_RECOVERY_AMP_MODEL"
-                --physical-recovery-amp-config-sha256 "$PHYSICAL_RECOVERY_AMP_CONFIG_SHA256"
-                --physical-recovery-amp-model-sha256 "$PHYSICAL_RECOVERY_AMP_MODEL_SHA256"
-                --physical-recovery-fallback-after-seconds "${MATRIX_PHYSICAL_RECOVERY_FALLBACK_AFTER_SECONDS:-10.0}"
-                --physical-recovery-stable-hold-seconds "${MATRIX_PHYSICAL_RECOVERY_STABLE_HOLD_SECONDS:-1.5}"
-                --physical-recovery-policy-exit-hold-seconds "${MATRIX_PHYSICAL_RECOVERY_POLICY_EXIT_HOLD_SECONDS:-0}"
-                --physical-recovery-control-socket "$PHYSICAL_RECOVERY_CONTROL_SOCKET"
-                --physical-recovery-sonic-control-socket "$PHYSICAL_RECOVERY_SONIC_CONTROL_SOCKET"
-                --physical-recovery-sonic-prewarm-timeout-seconds "${MATRIX_PHYSICAL_RECOVERY_SONIC_PREWARM_TIMEOUT_SECONDS:-35.0}"
-            )
-            if [[ "$PHYSICAL_RECOVERY_RESIDENT_POLICIES" == "1" ]]; then
-                PHYSICAL_RECOVERY_ARGS+=(--physical-recovery-resident-policies)
-            fi
-            if [[ -n "$PHYSICAL_RECOVERY_FALLBACK_MODEL" ]]; then
-                PHYSICAL_RECOVERY_ARGS+=(
-                    --physical-recovery-fallback-model "$PHYSICAL_RECOVERY_FALLBACK_MODEL"
-                )
-            fi
-            if ((flat_v3_present == 4)); then
-                PHYSICAL_RECOVERY_ARGS+=(
-                    --physical-recovery-amp-flat-v3-config "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG"
-                    --physical-recovery-amp-flat-v3-model "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL"
-                    --physical-recovery-amp-flat-v3-config-sha256 "$PHYSICAL_RECOVERY_AMP_FLAT_V3_CONFIG_SHA256"
-                    --physical-recovery-amp-flat-v3-model-sha256 "$PHYSICAL_RECOVERY_AMP_FLAT_V3_MODEL_SHA256"
-                )
-            fi
-            if [[ "$PHYSICAL_RECOVERY_INITIAL_CONTROLLER" == "kungfu" ]]; then
-                PHYSICAL_RECOVERY_ARGS+=(
-                    --physical-recovery-kungfu-model "$PHYSICAL_RECOVERY_KUNGFU_MODEL"
-                    --physical-recovery-kungfu-motion "$PHYSICAL_RECOVERY_KUNGFU_MOTION"
-                    --physical-recovery-kungfu-model-sha256 "$PHYSICAL_RECOVERY_KUNGFU_MODEL_SHA256"
-                    --physical-recovery-kungfu-model-data-sha256 "$PHYSICAL_RECOVERY_KUNGFU_MODEL_DATA_SHA256"
-                    --physical-recovery-kungfu-motion-sha256 "$PHYSICAL_RECOVERY_KUNGFU_MOTION_SHA256"
-                    --physical-recovery-kungfu-reference-frame "$PHYSICAL_RECOVERY_KUNGFU_REFERENCE_FRAME"
-                    --physical-recovery-kungfu-gain-scale "$PHYSICAL_RECOVERY_KUNGFU_GAIN_SCALE"
-                )
-            fi
-            ;;
-        *)
-            echo "[ERROR] MATRIX_GAME_FALL_RECOVERY must be off, sonic, or physical" >&2
             exit 1
             ;;
     esac
@@ -2385,44 +1736,6 @@ PY
     if [[ "${MATRIX_SONIC_MIN_DISPLACEMENT_M:-0}" != "0" ]]; then
         SONIC_ACCEPTANCE_ARGS+=(--min-displacement-m "${MATRIX_SONIC_MIN_DISPLACEMENT_M}")
     fi
-    INITIAL_LOCOMOTION_ARGS=()
-    if [[ -n "${MATRIX_INITIAL_LOCOMOTION_POLICY:-}" ]]; then
-        case "$MATRIX_INITIAL_LOCOMOTION_POLICY" in
-            sonic|bfm-sonic-teacher50k) ;;
-            *)
-                echo "[ERROR] MATRIX_INITIAL_LOCOMOTION_POLICY must be sonic or bfm-sonic-teacher50k" >&2
-                exit 1
-                ;;
-        esac
-        INITIAL_LOCOMOTION_ARGS+=(
-            --initial-locomotion-policy "$MATRIX_INITIAL_LOCOMOTION_POLICY"
-        )
-    fi
-    BFM_TRACE_ARGS=()
-    if [[ -n "${MATRIX_BFM_POLICY_TRACE_FILE:-}" ]]; then
-        if [[ "$MATRIX_BFM_POLICY_TRACE_FILE" != /* ]]; then
-            echo "[ERROR] MATRIX_BFM_POLICY_TRACE_FILE must be absolute" >&2
-            exit 1
-        fi
-        BFM_TRACE_TICKS="${MATRIX_BFM_POLICY_TRACE_TICKS:-200}"
-        if [[ ! "$BFM_TRACE_TICKS" =~ ^[0-9]+$ ]]; then
-            echo "[ERROR] MATRIX_BFM_POLICY_TRACE_TICKS must be non-negative" >&2
-            exit 1
-        fi
-        BFM_TRACE_ARGS+=(
-            --bfm-trace-file "$MATRIX_BFM_POLICY_TRACE_FILE"
-            --bfm-trace-ticks "$BFM_TRACE_TICKS"
-        )
-    fi
-    BFM_DIRECT_ARGS=()
-    case "${MATRIX_BFM_DIRECT:-0}" in
-        1|true|yes|on) BFM_DIRECT_ARGS+=(--bfm-direct) ;;
-        0|false|no|off|"") ;;
-        *)
-            echo "[ERROR] MATRIX_BFM_DIRECT must be a boolean" >&2
-            exit 1
-            ;;
-    esac
     SONIC_QUALIFICATION_ARGS=()
     if [[ "${MATRIX_SONIC_QUALIFIED_RUNTIME:-0}" == "1" ]]; then
         SONIC_QUALIFICATION_ARGS+=(
@@ -2439,59 +1752,8 @@ PY
         && "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
         GAME_INPUT_PROVIDER_PYTHON="$MATRIX_SONIC_PYTHON"
     fi
-    GAME_INPUT_SOCKET_VALUE="${MATRIX_GAME_INPUT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}.sock}"
-    GAME_EXTERNAL_CONTROL_ARGS=()
-    if [[ "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" == "game" ]]; then
-        EXTERNAL_CONTROL_SOCKET="${MATRIX_GAME_EXTERNAL_CONTROL_SOCKET:-}"
-        EXTERNAL_CONTROL_CAPABILITY_FILE="${MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE:-}"
-        if [[ -n "$EXTERNAL_CONTROL_SOCKET" \
-            && -z "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]] \
-            || [[ -z "$EXTERNAL_CONTROL_SOCKET" \
-                && -n "$EXTERNAL_CONTROL_CAPABILITY_FILE" ]]; then
-            echo "[ERROR] Matrix external-control socket/capability are all-or-none" >&2
-            exit 1
-        fi
-        if [[ -z "$EXTERNAL_CONTROL_SOCKET" ]]; then
-            EXTERNAL_CONTROL_PROFILE="${MATRIX_PROFILE:-local}"
-            if [[ ! "$EXTERNAL_CONTROL_PROFILE" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
-                echo "[ERROR] Invalid Matrix external-control profile: $EXTERNAL_CONTROL_PROFILE" >&2
-                exit 1
-            fi
-            EXTERNAL_CONTROL_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/matrix-external-control-${UID}"
-            if ! /usr/bin/python3 -I - "$EXTERNAL_CONTROL_RUNTIME_DIR" <<'PY'
-import os
-from pathlib import Path
-import stat
-import sys
-
-path = Path(sys.argv[1])
-try:
-    path.mkdir(mode=0o700)
-except FileExistsError:
-    pass
-metadata = path.stat(follow_symlinks=False)
-if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
-    raise SystemExit("external-control runtime path is not an owned directory")
-os.chmod(path, 0o700, follow_symlinks=False)
-PY
-            then
-                echo "[ERROR] Could not prepare private Matrix external-control runtime directory" >&2
-                exit 1
-            fi
-            EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.sock"
-            EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_RUNTIME_DIR/$EXTERNAL_CONTROL_PROFILE.cap"
-        fi
-        export MATRIX_GAME_EXTERNAL_CONTROL_SOCKET="$EXTERNAL_CONTROL_SOCKET"
-        export MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE="$EXTERNAL_CONTROL_CAPABILITY_FILE"
-        export MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS="${MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS:-0.15}"
-        GAME_EXTERNAL_CONTROL_ARGS=(
-            --game-external-control-socket "$MATRIX_GAME_EXTERNAL_CONTROL_SOCKET"
-            --game-external-control-capability-file "$MATRIX_GAME_EXTERNAL_CONTROL_CAPABILITY_FILE"
-            --game-external-control-deadman-seconds "$MATRIX_GAME_EXTERNAL_CONTROL_DEADMAN_SECONDS"
-        )
-    fi
     GAME_INPUT_ARGS=(
-        --game-input-socket "$GAME_INPUT_SOCKET_VALUE"
+        --game-input-socket "${MATRIX_GAME_INPUT_SOCKET:-${XDG_RUNTIME_DIR:-/tmp}/matrix-game-control-${UID}-${MATRIX_SONIC_LAUNCHER_PID:-$$}.sock}"
         --game-input-provider "$PROJECT_ROOT/scripts/matrix_game_control_input.py"
         --game-input-provider-python "$GAME_INPUT_PROVIDER_PYTHON"
         --game-input-source "${MATRIX_GAME_INPUT_SOURCE:-auto}"
@@ -2499,20 +1761,19 @@ PY
         --game-look-button "${MATRIX_GAME_LOOK_BUTTON:-left}"
         --game-initial-camera-yaw-deg "${MATRIX_GAME_INITIAL_CAMERA_YAW_DEG:-0.0}"
         --game-mouse-sensitivity-deg "${MATRIX_GAME_MOUSE_SENSITIVITY_DEG:-0.12}"
-        --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/mouse-control.json}"
-        --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/motion-control.json}"
-        --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_HOST_PROFILE:-${MATRIX_PROFILE:-local}}/video-settings.json}"
-        --game-applied-video-settings-json "$VIDEO_APPLIED_JSON"
+        --game-mouse-settings-file "${MATRIX_MOUSE_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/mouse-control.json}"
+        --game-ui-settings-file "${MATRIX_UI_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/ui-settings.json}"
+        --game-motion-settings-file "${MATRIX_MOTION_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/motion-control.json}"
+        --game-video-settings-file "${MATRIX_VIDEO_SETTINGS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/video-settings.json}"
+        --game-function-directory "${MATRIX_GAME_FUNCTION_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/matrix/hosts/${MATRIX_SETTINGS_PROFILE:-local}/functions}"
+        --game-applied-video-settings-json "${MATRIX_GAME_APPLIED_VIDEO_SETTINGS_JSON:-}"
         --game-applied-mouse-profile "${MATRIX_MOUSE_APPLIED_PROFILE:-local}"
         --game-applied-mouse-speed-scale "${MATRIX_MOUSE_APPLIED_SPEED_SCALE:-1.0}"
+        --game-keyboard-camera-look-rate-deg-s "${MATRIX_GAME_KEYBOARD_CAMERA_LOOK_RATE_DEG_S:-120.0}"
         --game-camera-yaw-sign "${MATRIX_GAME_CAMERA_YAW_SIGN:--1}"
         --game-camera-yaw-offset-deg "${MATRIX_GAME_CAMERA_YAW_OFFSET_DEG:-0.0}"
         --game-carla-host "${MATRIX_GAME_CARLA_HOST:-127.0.0.1}"
         --game-carla-port "${MATRIX_GAME_CARLA_PORT:-2000}"
-        --game-celestial-lighting-bridge "${MATRIX_CELESTIAL_LIGHTING_BRIDGE:-state-only}"
-        --game-celestial-assets-manifest "$PROJECT_ROOT/config/universe/de440s-2080.lock.json"
-        --game-celestial-visual-catalog "$PROJECT_ROOT/config/universe/celestial-visual-profiles-v1.json"
-        --game-celestial-visual-profile "${MATRIX_CELESTIAL_VISUAL_PROFILE:-auto}"
         --gamepad-look-yaw-rate-deg-s "${MATRIX_GAMEPAD_LOOK_YAW_RATE_DEG_S:-120.0}"
         --gamepad-look-pitch-rate-deg-s "${MATRIX_GAMEPAD_LOOK_PITCH_RATE_DEG_S:-90.0}"
         --gamepad-look-deadzone "${MATRIX_GAMEPAD_LOOK_DEADZONE:-0.12}"
@@ -2524,40 +1785,13 @@ PY
         --game-max-acceleration "${MATRIX_GAME_MAX_ACCELERATION:-1.20}"
         --game-max-deceleration "${MATRIX_GAME_MAX_DECELERATION:-2.40}"
         --game-max-turn-rate "${MATRIX_GAME_MAX_TURN_RATE:-2.50}"
-        --game-keyboard-slow-speed "${MATRIX_GAME_KEYBOARD_SLOW_SPEED:-0.20}"
-        --game-keyboard-slow-boost-speed "${MATRIX_GAME_KEYBOARD_SLOW_BOOST_SPEED:-0.30}"
-        --game-keyboard-walk-speed "${MATRIX_GAME_KEYBOARD_WALK_SPEED:-0.80}"
-        --game-keyboard-walk-boost-speed "${MATRIX_GAME_KEYBOARD_WALK_BOOST_SPEED:-1.00}"
-        --game-keyboard-run-speed "${MATRIX_GAME_KEYBOARD_RUN_SPEED:-2.50}"
-        --game-keyboard-run-boost-speed "${MATRIX_GAME_KEYBOARD_RUN_BOOST_SPEED:-2.75}"
-        --game-keyboard-double-tap-window "${MATRIX_GAME_KEYBOARD_DOUBLE_TAP_WINDOW:-0.30}"
         --game-stick-deadzone "${MATRIX_GAME_STICK_DEADZONE:-0.15}"
         --game-input-timeout "${MATRIX_GAME_INPUT_TIMEOUT:-0.15}"
         --game-max-snapshot-age "${MATRIX_GAME_MAX_SNAPSHOT_AGE:-0.15}"
         --game-max-future-skew "${MATRIX_GAME_MAX_FUTURE_SKEW:-0.05}"
     )
-    GAME_INPUT_ARGS+=("${GAME_EXTERNAL_CONTROL_ARGS[@]}")
-    GAME_GRAB_ESCAPE_VALUE="${MATRIX_GAME_GRAB_ESCAPE:-0}"
-    case "${GAME_GRAB_ESCAPE_VALUE,,}" in
-        1|true|yes|on) GAME_INPUT_ARGS+=(--game-grab-escape) ;;
-        0|false|no|off|"") ;;
-        *)
-            echo "[ERROR] MATRIX_GAME_GRAB_ESCAPE must be a boolean" >&2
-            exit 1
-            ;;
-    esac
-    if [[ -n "${MATRIX_CELESTIAL_SPK:-}" \
-        || -n "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
-        if [[ -z "${MATRIX_CELESTIAL_SPK:-}" \
-            || -z "${MATRIX_CELESTIAL_JPLEPHEM_WHEEL:-}" ]]; then
-            echo "[ERROR] MATRIX_CELESTIAL_SPK and " \
-                "MATRIX_CELESTIAL_JPLEPHEM_WHEEL are all-or-none" >&2
-            exit 1
-        fi
-        GAME_INPUT_ARGS+=(
-            --game-celestial-de440s-kernel "$MATRIX_CELESTIAL_SPK"
-            --game-celestial-jplephem-wheel "$MATRIX_CELESTIAL_JPLEPHEM_WHEEL"
-        )
+    if [[ "${MATRIX_GAME_GRAB_UI_KEYS:-1}" == "1" ]]; then
+        GAME_INPUT_ARGS+=(--game-grab-ui-keys)
     fi
     if [[ "${MATRIX_GAME_CAMERA_YAW_SOURCE:-fixed}" == "ue-final-pov" ]]; then
         if [[ -z "$UE_CAMERA_STATE_FILE" ]]; then
@@ -2586,12 +1820,46 @@ PY
             exit 1
             ;;
     esac
+    PICO_GAMEPAD_BRIDGE_VALUE="${MATRIX_PICO_GAMEPAD_BRIDGE:-0}"
+    case "${PICO_GAMEPAD_BRIDGE_VALUE,,}" in
+        1|true|yes|on)
+            GAME_INPUT_ARGS+=(
+                --pico-gamepad-bridge
+                --pico-gamepad-python "${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}"
+            )
+            if [[ -n "${MATRIX_PICO_GAMEPAD_STATUS_FILE:-}" ]]; then
+                GAME_INPUT_ARGS+=(
+                    --pico-gamepad-status-file "$MATRIX_PICO_GAMEPAD_STATUS_FILE"
+                )
+            fi
+            ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_PICO_GAMEPAD_BRIDGE must be a boolean" >&2
+            exit 1
+            ;;
+    esac
+    PICO_AUTOSTART_MODE_VALUE="${MATRIX_PICO_AUTOSTART_MODE:-off}"
+    case "$PICO_AUTOSTART_MODE_VALUE" in
+        off|planner)
+            GAME_INPUT_ARGS+=(--pico-autostart-mode "$PICO_AUTOSTART_MODE_VALUE")
+            ;;
+        *)
+            echo "[ERROR] MATRIX_PICO_AUTOSTART_MODE must be off or planner" >&2
+            exit 1
+            ;;
+    esac
+    if [[ -n "${MATRIX_PICO_MANAGER_COMMAND_PORT:-}" ]]; then
+        GAME_INPUT_ARGS+=(
+            --pico-manager-command-port "$MATRIX_PICO_MANAGER_COMMAND_PORT"
+        )
+    fi
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         --model "$SONIC_PHYSICS_DIR/$SCENE" \
         --sonic-root "$MATRIX_SONIC_ROOT" \
         --control-source "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" \
         --planner-bind "${MATRIX_SONIC_PLANNER_BIND:-tcp://127.0.0.1:5556}" \
-        --pico-python "${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}" \
+        --pico-python "${MATRIX_PICO_MANAGER_PYTHON:-${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}}" \
         --expected-parent-pid "$$" \
         --external-failure-file "$UE_FAILURE_FILE" \
         --ue-pid "$UE_PID" \
@@ -2604,22 +1872,16 @@ PY
         --low-cmd-fresh-timeout-seconds "${MATRIX_SONIC_LOW_CMD_FRESH_TIMEOUT_SECONDS:-0.1}" \
         --min-physics-hz "${MATRIX_SONIC_MIN_PHYSICS_HZ:-195}" \
         --min-rtf "${MATRIX_SONIC_MIN_RTF:-0.95}" \
-        --max-resets "${MATRIX_SONIC_MAX_RESETS:-0}" \
-        "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
+        --max-resets "${MATRIX_SONIC_MAX_RESETS:-$SONIC_MAX_RESETS_DEFAULT}" \
         "${SONIC_ACCEPTANCE_ARGS[@]}" \
-        "${INITIAL_LOCOMOTION_ARGS[@]}" \
-        "${BFM_DIRECT_ARGS[@]}" \
-        "${BFM_TRACE_ARGS[@]}" \
-        "${PHYSICAL_RECOVERY_ARGS[@]}" \
         "${SONIC_QUALIFICATION_ARGS[@]}" \
         "${SONIC_STARTUP_ARGS[@]}" \
         --startup-band-hold "${MATRIX_SONIC_STARTUP_BAND_HOLD:-4}" \
         --startup-band-fade "${MATRIX_SONIC_STARTUP_BAND_FADE:-3}" \
         "${GAME_INPUT_ARGS[@]}" \
         "${SONIC_WORLD_ARGS[@]}" \
+        "${SONIC_DYNAMIC_GROUND_ARGS[@]}" \
         --status-file "$SONIC_STATUS_FILE" \
-        --state-trace-file "$SONIC_STATE_TRACE_FILE" \
-        --state-trace-every "${MATRIX_SONIC_STATE_TRACE_EVERY:-0.2}" \
         > "$PROJECT_ROOT/outputs/logs/matrix_sonic_runtime.log" 2>&1 &
     SONIC_PID=$!
     PIDS+=("$SONIC_PID")
@@ -2700,39 +1962,16 @@ PY
         then
             echo "[ERROR] Failed to merge the UE lifecycle failure into status" >&2
         fi
-        # Exit 75 is authority only for a clean, status-verified world reload;
-        # exit 76 is only a proposal to quarantine one failed resume checkpoint.
-        # A UE failure observed at this late boundary invalidates both before the
-        # outer launcher can restart or commit the proposed state mutation.
-        if [[ "$SONIC_EXIT_CODE" == "0" \
-            || "$SONIC_EXIT_CODE" == "75" \
-            || "$SONIC_EXIT_CODE" == "76" ]]; then
+        # Exit 75 is authority only for a clean, status-verified world reload.
+        # A UE failure observed at this late boundary must invalidate it just as
+        # it invalidates an otherwise-successful zero exit; otherwise the outer
+        # launcher can mistake a concurrent UE crash for an authorized teleport
+        # or fall respawn.
+        if [[ "$SONIC_EXIT_CODE" == "0" || "$SONIC_EXIT_CODE" == "75" ]]; then
             SONIC_EXIT_CODE=2
         fi
     fi
-    # Privileged runner exits (75=verified world reload, 76=resume rollback
-    # proposal) are not allowed to cross the process-cleanup boundary on their
-    # own.  Run cleanup explicitly while its return value is still observable;
-    # Bash preserves an explicit exit status even when an EXIT trap later
-    # returns non-zero.  cleanup() is idempotent, so the EXIT trap becomes a
-    # no-op after this call.
-    if ! cleanup; then
-        SONIC_EXIT_CODE=2
-    fi
     echo "[INFO] Matrix SONIC runtime exited with code $SONIC_EXIT_CODE"
     exit "$SONIC_EXIT_CODE"
-fi
-if $MATRIX_EXTERNAL_STATE_ENABLED; then
-    set +e
-    wait_for_managed_child "$UE_SUPERVISOR_PID"
-    EXTERNAL_UE_EXIT_CODE="$WAITED_CHILD_STATUS"
-    set -e
-    UE_SUPERVISOR_REAPED=1
-    UE_SUPERVISOR_PID=""
-    if [[ "$EXTERNAL_UE_EXIT_CODE" != "0" ]]; then
-        record_ue_supervisor_failure
-    fi
-    echo "[INFO] Matrix external-state renderer exited with code $EXTERNAL_UE_EXIT_CODE"
-    exit "$EXTERNAL_UE_EXIT_CODE"
 fi
 wait

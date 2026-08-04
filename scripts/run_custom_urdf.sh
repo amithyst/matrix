@@ -9,28 +9,12 @@ MUJOCORUNNING="${5:-0}"
 CUSTOM_URDF="${6:-}"
 CUSTOM_NAME="${7:-}"
 FORCE_REIMPORT="${SIM_LAUNCHER_FORCE_REIMPORT_CUSTOM_URDF:-0}"
-MATRIX_PYTHON="${MATRIX_CUSTOM_URDF_PYTHON:-${MATRIX_SONIC_PYTHON:-$(command -v python3)}}"
-PIPELINE_VERSION=22
+MATRIX_PYTHON="${MATRIX_SONIC_PYTHON:-$(command -v python3)}"
+PIPELINE_VERSION=18
 MAP_KEY="custom"
 MAP_ASSET="/Game/Maps/CustomWorld"
 G1_MATERIAL_PALETTE=""
 G1_MATERIAL_SCOPE_ALPHA=""
-MATRIX_ITEM_INVENTORY_CATALOG="${MATRIX_ITEM_INVENTORY_CATALOG:-}"
-MATRIX_CREATIVE_INVENTORY_CATALOG="${MATRIX_CREATIVE_INVENTORY_CATALOG:-}"
-if [[ -n "$MATRIX_ITEM_INVENTORY_CATALOG" \
-    && -n "$MATRIX_CREATIVE_INVENTORY_CATALOG" \
-    && "$(realpath -m "$MATRIX_ITEM_INVENTORY_CATALOG")" \
-        != "$(realpath -m "$MATRIX_CREATIVE_INVENTORY_CATALOG")" ]]; then
-    echo "[ERROR] MATRIX_ITEM_INVENTORY_CATALOG conflicts with the legacy" \
-        "MATRIX_CREATIVE_INVENTORY_CATALOG alias" >&2
-    exit 1
-fi
-if [[ -z "$MATRIX_ITEM_INVENTORY_CATALOG" ]]; then
-    MATRIX_ITEM_INVENTORY_CATALOG="$MATRIX_CREATIVE_INVENTORY_CATALOG"
-fi
-MATRIX_CREATIVE_INVENTORY_CATALOG="$MATRIX_ITEM_INVENTORY_CATALOG"
-export MATRIX_ITEM_INVENTORY_CATALOG MATRIX_CREATIVE_INVENTORY_CATALOG
-CREATIVE_INVENTORY_CATALOG="$MATRIX_ITEM_INVENTORY_CATALOG"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_LAUNCHER_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -49,11 +33,6 @@ fi
 
 if [[ ! -f "$CUSTOM_URDF" ]]; then
     echo "[ERROR] Custom URDF file not found: $CUSTOM_URDF" >&2
-    exit 1
-fi
-
-if [[ -n "$CREATIVE_INVENTORY_CATALOG" && ! -f "$CREATIVE_INVENTORY_CATALOG" ]]; then
-    echo "[ERROR] Creative inventory catalog not found: $CREATIVE_INVENTORY_CATALOG" >&2
     exit 1
 fi
 
@@ -123,72 +102,6 @@ resolve_g1_skin() {
 }
 
 resolve_g1_skin
-
-append_source_material_palette() {
-    local urdf_path="$1"
-    local base_palette="$2"
-    "$MATRIX_PYTHON" - "$urdf_path" "$base_palette" <<'PY'
-import math
-from pathlib import Path
-import sys
-import xml.etree.ElementTree as ET
-
-urdf_path = Path(sys.argv[1])
-base_palette = sys.argv[2]
-existing = {entry for entry in base_palette.split(";") if entry}
-additional = []
-root = ET.parse(urdf_path).getroot()
-for material in root.iter("material"):
-    if not material.get("name", "").startswith("matrix_source_"):
-        continue
-    color = material.find("color")
-    if color is None or not color.get("rgba"):
-        continue
-    parts = color.get("rgba", "").split()
-    if len(parts) not in {3, 4}:
-        raise SystemExit("matrix_source_ material must have RGB or RGBA")
-    values = [float(value) for value in parts[:3]]
-    if any(not math.isfinite(value) or value < 0 or value > 1 for value in values):
-        raise SystemExit("matrix_source_ RGB values must be within [0, 1]")
-    entry = ",".join(f"{value:.9g}" for value in values)
-    if entry not in existing:
-        existing.add(entry)
-        additional.append(entry)
-print(";".join(additional))
-PY
-}
-
-if [[ "${MATRIX_CUSTOM_MATERIAL_PROFILE:-auto}" != "urdf" ]]; then
-    SOURCE_MATERIAL_PALETTE="$(
-        append_source_material_palette "$CUSTOM_URDF" "$G1_MATERIAL_PALETTE"
-    )"
-    if [[ -n "$SOURCE_MATERIAL_PALETTE" ]]; then
-        G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE;$SOURCE_MATERIAL_PALETTE"
-        echo "[INFO] Added source attachment colors to UE material palette: $SOURCE_MATERIAL_PALETTE"
-    fi
-    if [[ -n "$CREATIVE_INVENTORY_CATALOG" ]]; then
-        INVENTORY_MATERIAL_PALETTE="$(
-            "$MATRIX_PYTHON" "$SCRIPT_DIR/inject_creative_inventory.py" \
-                --catalog "$CREATIVE_INVENTORY_CATALOG" --print-palette
-        )"
-        if [[ -n "$INVENTORY_MATERIAL_PALETTE" ]]; then
-            G1_MATERIAL_PALETTE="$G1_MATERIAL_PALETTE;$INVENTORY_MATERIAL_PALETTE"
-            echo "[INFO] Added creative inventory colors to UE material palette: $INVENTORY_MATERIAL_PALETTE"
-        fi
-    fi
-fi
-
-inject_creative_inventory() {
-    local target_xml="$1"
-    local target_assets="$2"
-    if [[ -z "$CREATIVE_INVENTORY_CATALOG" ]]; then
-        return 0
-    fi
-    "$MATRIX_PYTHON" "$SCRIPT_DIR/inject_creative_inventory.py" \
-        --catalog "$CREATIVE_INVENTORY_CATALOG" \
-        --mjcf "$target_xml" \
-        --assets-dir "$target_assets"
-}
 
 MODEL_DIR="$MATRIX_ROOT/src/UeSim/Linux/zsibot_mujoco_ue/Content/model"
 UE_CUSTOM_ROOT="$MODEL_DIR/custom"
@@ -804,6 +717,8 @@ write_scene_terrain_custom_template() {
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300" />
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2" />
+    <hfield name="perlin_hfield" size="1.0 0.75 0.2 0.2" file="../height_field.png" />
+    <hfield name="image_hfield" size="1.0 1.0 0.02 0.1" file="../unitree_hfield.png" />
   </asset>
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true" />
@@ -888,11 +803,9 @@ sync_runtime_layout() {
         echo "[INFO] synced assets to: $active_assets_dir"
     fi
 
-    # This is a generated handoff entry. Local-physics launches compose their
-    # requested scene over it later; external-state launches keep this minimal
-    # model because Isaac owns terrain/collision. Rewriting it also removes
-    # stale references to optional height-field PNGs that made mj_loadXML fail.
-    write_scene_terrain_custom_template "$active_root/scene_terrain_custom.xml"
+    if [[ ! -f "$active_root/scene_terrain_custom.xml" ]]; then
+        write_scene_terrain_custom_template "$active_root/scene_terrain_custom.xml"
+    fi
 
     # Ensure height-field PNGs are present in active_root
     # (needed because meshdir="assets" makes MuJoCo resolve "../height_field.png" as
@@ -924,31 +837,6 @@ sync_runtime_layout() {
             echo "[WARN] Simulation may behave incorrectly. Check violations above." >&2
         fi
     fi
-}
-
-validate_mujoco_model_load() {
-    local model_path="$1"
-    if [[ ! -f "$model_path" ]]; then
-        echo "[ERROR] MuJoCo model-load gate is missing: $model_path" >&2
-        return 1
-    fi
-    "$MATRIX_PYTHON" - "$model_path" <<'PY'
-from pathlib import Path
-import sys
-
-import mujoco
-
-path = Path(sys.argv[1]).resolve()
-try:
-    model = mujoco.MjModel.from_xml_path(str(path))
-except Exception as exc:
-    print(f"[ERROR] MuJoCo model-load gate failed for {path}: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-print(
-    "[PASS] MuJoCo model-load gate: "
-    f"{path} nq={model.nq} nv={model.nv} nu={model.nu}"
-)
-PY
 }
 
 restore_urdf_visual_meshes() {
@@ -1169,78 +1057,6 @@ def parse_quat_from_rpy(value: str | None) -> str:
     except ValueError:
         return "1 0 0 0"
 
-def parse_rpy(value: str | None) -> tuple[float, float, float]:
-    if not value:
-        return (0.0, 0.0, 0.0)
-    parts = value.split()
-    if len(parts) != 3:
-        return (0.0, 0.0, 0.0)
-    try:
-        return tuple(float(part) for part in parts)
-    except ValueError:
-        return (0.0, 0.0, 0.0)
-
-def rotate_inertia_to_body_frame(
-    values: tuple[float, float, float, float, float, float],
-    rpy: tuple[float, float, float],
-) -> tuple[float, float, float, float, float, float]:
-    ixx, iyy, izz, ixy, ixz, iyz = values
-    inertia = (
-        (ixx, ixy, ixz),
-        (ixy, iyy, iyz),
-        (ixz, iyz, izz),
-    )
-    roll, pitch, yaw = rpy
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    rotation = (
-        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
-        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
-        (-sp, cp * sr, cp * cr),
-    )
-    rotated = tuple(
-        tuple(
-            sum(
-                rotation[row][a] * inertia[a][b] * rotation[col][b]
-                for a in range(3)
-                for b in range(3)
-            )
-            for col in range(3)
-        )
-        for row in range(3)
-    )
-    return (
-        rotated[0][0],
-        rotated[1][1],
-        rotated[2][2],
-        rotated[0][1],
-        rotated[0][2],
-        rotated[1][2],
-    )
-
-def urdf_inertia_attrs(inertia: ET.Element, origin: ET.Element | None) -> dict | None:
-    names = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")
-    raw_values = [inertia.get(name) for name in names]
-    if any(value is None for value in raw_values):
-        return None
-    try:
-        values = tuple(float(value) for value in raw_values)
-    except (TypeError, ValueError):
-        return None
-    if any(abs(value) > 0.0 for value in values[3:]):
-        rotated = rotate_inertia_to_body_frame(
-            values,
-            parse_rpy(origin.get("rpy") if origin is not None else None),
-        )
-        return {"fullinertia": " ".join(f"{value:.17g}" for value in rotated)}
-    return {
-        "quat": parse_quat_from_rpy(
-            origin.get("rpy") if origin is not None else None
-        ),
-        "diaginertia": " ".join(raw_values[:3]),
-    }
-
 def add_inertial_from_urdf(body: ET.Element, link: ET.Element) -> None:
     inertial = link.find("inertial")
     if inertial is None:
@@ -1251,18 +1067,23 @@ def add_inertial_from_urdf(body: ET.Element, link: ET.Element) -> None:
         return
     origin = inertial.find("origin")
     pos = parse_xyz(origin.get("xyz") if origin is not None else None)
-    inertia_attrs = urdf_inertia_attrs(inertia, origin)
-    if inertia_attrs is None:
+    quat = parse_quat_from_rpy(origin.get("rpy") if origin is not None else None)
+    diag = [
+        inertia.get("ixx"),
+        inertia.get("iyy"),
+        inertia.get("izz"),
+    ]
+    if any(v is None for v in diag):
         return
-    attrs = {
-        "pos": pos,
-        "mass": mass.get("value"),
-        **inertia_attrs,
-    }
     ET.SubElement(
         body,
         "inertial",
-        attrib=attrs,
+        attrib={
+            "pos": pos,
+            "quat": quat,
+            "mass": mass.get("value"),
+            "diaginertia": f"{diag[0]} {diag[1]} {diag[2]}",
+        },
     )
 
 def add_visual_mesh_geom(body: ET.Element, link: ET.Element) -> None:
@@ -1334,22 +1155,6 @@ def add_fixed_collision_geom(body: ET.Element, link: ET.Element) -> None:
         insert_before_child_bodies(body, geom)
         return
 
-def remove_flattened_visual_only_geoms(root: ET.Element, link: ET.Element) -> int:
-    if link.find("inertial") is not None or link.findall("collision"):
-        return 0
-    mesh_names = {
-        Path(mesh.get("filename")).stem
-        for mesh in link.findall("visual/geometry/mesh")
-        if mesh.get("filename")
-    }
-    removed = 0
-    for body in root.iter("body"):
-        for geom in list(body.findall("geom")):
-            if geom.get("mesh") in mesh_names:
-                body.remove(geom)
-                removed += 1
-    return removed
-
 for link in urdf_root.findall("link"):
     link_name = link.get("name")
     if not link_name:
@@ -1368,8 +1173,6 @@ for link in urdf_root.findall("link"):
     parent_body = find_body(mjcf_root, parent_link)
     if parent_body is None:
         continue
-
-    remove_flattened_visual_only_geoms(mjcf_root, link)
 
     origin = joint.find("origin")
     pos = parse_xyz(origin.get("xyz") if origin is not None else None)
@@ -1411,7 +1214,6 @@ restore_generic_runtime_layout() {
     "$MATRIX_PYTHON" - "$mjcf_path" "$urdf_path" <<'PY'
 from pathlib import Path
 import math
-import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -1424,15 +1226,23 @@ root = tree.getroot()
 urdf_root = ET.parse(urdf_path).getroot() if urdf_path is not None and urdf_path.is_file() else None
 urdf_links = {}
 urdf_joint_effort = {}  # joint_name -> effort (float), from URDF <limit effort="...">
-urdf_visual_meshes = {}
-urdf_collision_specs = {}
-collision_profile = os.environ.get("MATRIX_URDF_COLLISION_PROFILE", "").strip()
 if urdf_root is not None:
     urdf_links = {
         link.get("name"): link
         for link in urdf_root.findall("link")
         if link.get("name")
     }
+    urdf_child_links = {
+        child.get("link")
+        for ujoint in urdf_root.findall("joint")
+        for child in [ujoint.find("child")]
+        if child is not None and child.get("link")
+    }
+    urdf_root_links = [
+        name
+        for name in urdf_links
+        if name not in urdf_child_links
+    ]
     for ujoint in urdf_root.findall("joint"):
         jname = ujoint.get("name")
         limit_elem = ujoint.find("limit")
@@ -1441,6 +1251,9 @@ if urdf_root is not None:
                 urdf_joint_effort[jname] = float(limit_elem.get("effort", "0"))
             except (ValueError, TypeError):
                 pass
+else:
+    urdf_root_links = []
+
 def rpy_to_quat(roll: float, pitch: float, yaw: float) -> str:
     cr = math.cos(roll * 0.5)
     sr = math.sin(roll * 0.5)
@@ -1472,131 +1285,6 @@ def parse_quat_from_rpy(value: str | None) -> str:
         return rpy_to_quat(float(parts[0]), float(parts[1]), float(parts[2]))
     except ValueError:
         return "1 0 0 0"
-
-def parse_rpy(value: str | None) -> tuple[float, float, float]:
-    if not value:
-        return (0.0, 0.0, 0.0)
-    parts = value.split()
-    if len(parts) != 3:
-        return (0.0, 0.0, 0.0)
-    try:
-        return tuple(float(part) for part in parts)
-    except ValueError:
-        return (0.0, 0.0, 0.0)
-
-def rotate_inertia_to_body_frame(
-    values: tuple[float, float, float, float, float, float],
-    rpy: tuple[float, float, float],
-) -> tuple[float, float, float, float, float, float]:
-    ixx, iyy, izz, ixy, ixz, iyz = values
-    inertia = (
-        (ixx, ixy, ixz),
-        (ixy, iyy, iyz),
-        (ixz, iyz, izz),
-    )
-    roll, pitch, yaw = rpy
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    rotation = (
-        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
-        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
-        (-sp, cp * sr, cp * cr),
-    )
-    rotated = tuple(
-        tuple(
-            sum(
-                rotation[row][a] * inertia[a][b] * rotation[col][b]
-                for a in range(3)
-                for b in range(3)
-            )
-            for col in range(3)
-        )
-        for row in range(3)
-    )
-    return (
-        rotated[0][0],
-        rotated[1][1],
-        rotated[2][2],
-        rotated[0][1],
-        rotated[0][2],
-        rotated[1][2],
-    )
-
-def urdf_inertia_attrs(inertia: ET.Element, origin: ET.Element | None) -> dict | None:
-    names = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")
-    raw_values = [inertia.get(name) for name in names]
-    if any(value is None for value in raw_values):
-        return None
-    try:
-        values = tuple(float(value) for value in raw_values)
-    except (TypeError, ValueError):
-        return None
-    if any(abs(value) > 0.0 for value in values[3:]):
-        rotated = rotate_inertia_to_body_frame(
-            values,
-            parse_rpy(origin.get("rpy") if origin is not None else None),
-        )
-        return {"fullinertia": " ".join(f"{value:.17g}" for value in rotated)}
-    return {
-        "quat": parse_quat_from_rpy(
-            origin.get("rpy") if origin is not None else None
-        ),
-        "diaginertia": " ".join(raw_values[:3]),
-    }
-
-if urdf_root is not None:
-    for link_name, link in urdf_links.items():
-        visual_meshes = set()
-        for visual in link.findall("visual"):
-            mesh = visual.find("geometry/mesh")
-            filename = mesh.get("filename") if mesh is not None else None
-            if filename:
-                visual_meshes.add(Path(filename).stem)
-        urdf_visual_meshes[link_name] = visual_meshes
-
-        collision_specs = []
-        for index, collision in enumerate(link.findall("collision")):
-            geometry = collision.find("geometry")
-            if geometry is None or len(geometry) != 1:
-                raise RuntimeError(
-                    f"URDF collision {link_name}[{index}] must contain exactly one geometry"
-                )
-            shape = list(geometry)[0]
-            origin = collision.find("origin")
-            attrib = {
-                "name": f"{link_name}_urdf_collision_{index}",
-                "class": "collision",
-                "pos": parse_xyz(origin.get("xyz") if origin is not None else None),
-                "quat": parse_quat_from_rpy(origin.get("rpy") if origin is not None else None),
-            }
-            if shape.tag == "sphere":
-                attrib.update(type="sphere", size=shape.get("radius", ""))
-            elif shape.tag == "cylinder":
-                radius = float(shape.get("radius", "nan"))
-                length = float(shape.get("length", "nan"))
-                if not math.isfinite(radius) or not math.isfinite(length) or radius <= 0.0 or length <= 0.0:
-                    raise RuntimeError(f"invalid URDF cylinder collision {link_name}[{index}]")
-                if collision_profile == "isaac-model12":
-                    attrib.update(type="capsule", size=f"{radius:.17g} {0.5 * length:.17g}")
-                else:
-                    attrib.update(type="cylinder", size=f"{radius:.17g} {0.5 * length:.17g}")
-            elif shape.tag == "box":
-                values = [float(value) for value in shape.get("size", "").split()]
-                if len(values) != 3 or any(not math.isfinite(value) or value <= 0.0 for value in values):
-                    raise RuntimeError(f"invalid URDF box collision {link_name}[{index}]")
-                attrib.update(type="box", size=" ".join(f"{0.5 * value:.17g}" for value in values))
-            elif shape.tag == "mesh":
-                filename = shape.get("filename")
-                if not filename:
-                    raise RuntimeError(f"invalid URDF mesh collision {link_name}[{index}]")
-                attrib.update(type="mesh", mesh=Path(filename).stem)
-            else:
-                raise RuntimeError(
-                    f"unsupported URDF collision geometry {shape.tag!r} for {link_name}[{index}]"
-                )
-            collision_specs.append(attrib)
-        urdf_collision_specs[link_name] = collision_specs
 
 def xyz_to_tuple(value: str) -> tuple[float, float, float]:
     parts = value.split()
@@ -1662,6 +1350,15 @@ def ensure_site(body: ET.Element, attrib: dict) -> None:
             return
     insert_before_child_bodies(body, ET.Element("site", attrib=attrib))
 
+def find_body_by_name(body_name: str) -> ET.Element | None:
+    for body in worldbody.iter("body"):
+        if body.get("name") == body_name:
+            return body
+    return None
+
+def has_descendant_joint(body: ET.Element) -> bool:
+    return any(child.tag == "joint" for child in body.iter())
+
 def replace_inertial_from_urdf(body: ET.Element, link_name: str) -> bool:
     link = urdf_links.get(link_name)
     if link is None:
@@ -1673,16 +1370,20 @@ def replace_inertial_from_urdf(body: ET.Element, link_name: str) -> bool:
     inertia = inertial.find("inertia")
     if mass is None or inertia is None or not mass.get("value"):
         return False
-    origin = inertial.find("origin")
-    inertia_attrs = urdf_inertia_attrs(inertia, origin)
-    if inertia_attrs is None:
-        return False
     for old in list(body.findall("inertial")):
         body.remove(old)
+    origin = inertial.find("origin")
     attrs = {
         "mass": mass.get("value"),
         "pos": parse_xyz(origin.get("xyz") if origin is not None else None),
-        **inertia_attrs,
+        "quat": parse_quat_from_rpy(origin.get("rpy") if origin is not None else None),
+        "diaginertia": " ".join(
+            [
+                inertia.get("ixx", "0"),
+                inertia.get("iyy", "0"),
+                inertia.get("izz", "0"),
+            ]
+        ),
     }
     body.insert(0, ET.Element("inertial", attrib=attrs))
     return True
@@ -1692,16 +1393,6 @@ def is_visual_geom(geom: ET.Element) -> bool:
         return True
     if geom.get("group") == "2":
         return True
-    mesh_name = geom.get("mesh")
-    if mesh_name and urdf_root is not None:
-        collision_meshes = {
-            spec.get("mesh")
-            for specs in urdf_collision_specs.values()
-            for spec in specs
-            if spec.get("type") == "mesh"
-        }
-        if mesh_name not in collision_meshes:
-            return True
     return geom.get("contype") == "0" and geom.get("conaffinity") == "0"
 
 def strip_geom_attrs(geom: ET.Element, keep: set[str]) -> None:
@@ -1712,8 +1403,6 @@ def strip_geom_attrs(geom: ET.Element, keep: set[str]) -> None:
 def derive_motor_name(joint_name: str) -> str:
     if joint_name.endswith("_JOINT"):
         return joint_name[:-6] + "_LINK"
-    if joint_name.endswith("_joint"):
-        return joint_name[:-6]
     return joint_name
 
 def derive_sensor_base(joint_name: str) -> str:
@@ -1756,7 +1445,7 @@ else:
 
 robot_default = ET.SubElement(default_top, "default", attrib={"class": "robot"})
 motor_default = ET.SubElement(robot_default, "default", attrib={"class": "motor"})
-ET.SubElement(motor_default, "joint", attrib={"armature": "0.01"})
+ET.SubElement(motor_default, "joint")
 ET.SubElement(motor_default, "motor")
 visual_default = ET.SubElement(robot_default, "default", attrib={"class": "visual"})
 ET.SubElement(
@@ -1771,7 +1460,7 @@ ET.SubElement(
     attrib={
         "material": "default_material",
         "condim": "3",
-        "contype": "1" if collision_profile == "isaac-model12" else "0",
+        "contype": "0",
         "conaffinity": "1",
         "priority": "1",
         "group": "1",
@@ -1807,41 +1496,38 @@ worldbody = root.find("worldbody")
 if worldbody is None:
     worldbody = ET.SubElement(root, "worldbody")
 
-urdf_child_links = {
-    child.get("link")
-    for joint in urdf_root.findall("joint")
-    for child in [joint.find("child")]
-    if child is not None and child.get("link")
-} if urdf_root is not None else set()
-urdf_root_link = next(
-    (name for name in urdf_links if name not in urdf_child_links),
-    None,
-)
-root_candidates = {"BASE_LINK", "base_link", "ROOT_LINK", "root"}
-if urdf_root_link:
-    root_candidates.add(urdf_root_link)
 root_body = None
 for body in worldbody.findall("body"):
-    if body.get("name") in root_candidates:
+    if body.get("name") in {"BASE_LINK", "base_link", "ROOT_LINK", "root"}:
         root_body = body
         break
 if root_body is None:
+    for root_link_name_candidate in urdf_root_links:
+        candidate = find_body_by_name(root_link_name_candidate)
+        if candidate is not None:
+            root_body = candidate
+            break
+if root_body is None:
+    for body in worldbody.findall("body"):
+        if body.find("freejoint") is not None and has_descendant_joint(body):
+            root_body = body
+            break
+if root_body is None:
     root_body = ET.SubElement(worldbody, "body", attrib={"name": "BASE_LINK", "pos": "0 0 0", "quat": "1 0 0 0"})
 
-root_link_name = next(
-    (name for name in ("BASE_LINK", "base_link", "ROOT_LINK") if name in urdf_links),
-    urdf_root_link or root_body.get("name", "BASE_LINK"),
-)
+root_link_name = root_body.get("name", "BASE_LINK")
+if root_link_name not in urdf_links:
+    root_link_name = next((name for name in ("BASE_LINK", "base_link", "ROOT_LINK") if name in urdf_links), root_link_name)
 root_body.set("name", root_link_name)
 root_body.set("childclass", "robot")
 
 freejoints = root_body.findall("freejoint")
 if freejoints:
-    freejoints[0].set("name", "floating_base_joint")
+    freejoints[0].set("name", "floating_base")
     for redundant in freejoints[1:]:
         root_body.remove(redundant)
 elif not any(child.tag == "joint" for child in root_body):
-    root_body.insert(0, ET.Element("freejoint", attrib={"name": "floating_base_joint"}))
+    root_body.insert(0, ET.Element("freejoint", attrib={"name": "floating_base"}))
 
 restored_inertials = 0
 for body in root.iter("body"):
@@ -1856,71 +1542,6 @@ ensure_site(root_body, {"name": "imu", "pos": "0 0 0"})
 ensure_site(root_body, {"name": "livox_imu", "pos": "0.13011 0.02329 0.17598", "quat": "1 0 0 0"})
 ensure_site(root_body, {"name": "camera_imu", "pos": "0.29 0 0.01"})
 
-if collision_profile == "isaac-model12":
-    restored_collisions = 0
-    body_candidates = {}
-    for candidate in root.iter("body"):
-        candidate_name = candidate.get("name")
-        if candidate_name in urdf_links:
-            body_candidates.setdefault(candidate_name, []).append(candidate)
-    primary_bodies = {
-        name: max(
-            candidates,
-            key=lambda candidate: (
-                candidate.find("joint") is not None
-                or candidate.find("freejoint") is not None,
-                len(candidate.findall("body")),
-                len(candidate.findall("geom")),
-            ),
-        )
-        for name, candidates in body_candidates.items()
-    }
-    body_parents = {
-        child: parent
-        for parent in root.iter()
-        for child in parent.findall("body")
-    }
-    for name, candidates in body_candidates.items():
-        for duplicate in candidates:
-            if duplicate is primary_bodies[name]:
-                continue
-            if duplicate.findall("body"):
-                raise RuntimeError(
-                    f"cannot remove duplicate URDF body with children: {name}"
-                )
-            parent = body_parents.get(duplicate)
-            if parent is None:
-                raise RuntimeError(f"cannot locate duplicate URDF body parent: {name}")
-            parent.remove(duplicate)
-    for body in root.iter("body"):
-        body_name = body.get("name")
-        if body_name not in urdf_links:
-            continue
-        visual_meshes = urdf_visual_meshes.get(body_name, set())
-        for geom in list(body.findall("geom")):
-            mesh_name = geom.get("mesh")
-            if mesh_name and mesh_name in visual_meshes:
-                geom.set("class", "visual")
-                geom.set("contype", "0")
-                geom.set("conaffinity", "0")
-                geom.set("density", "0")
-                geom.set("group", "2")
-                continue
-            body.remove(geom)
-        for spec in urdf_collision_specs.get(body_name, ()):
-            insert_before_child_bodies(body, ET.Element("geom", attrib=dict(spec)))
-            restored_collisions += 1
-    expected_collisions = sum(len(specs) for specs in urdf_collision_specs.values())
-    if restored_collisions != expected_collisions:
-        raise RuntimeError(
-            "failed to restore every URDF collision geometry: "
-            f"expected={expected_collisions} restored={restored_collisions}"
-        )
-    print(
-        "[INFO] restored Isaac Model12 collision contract: "
-        f"collisions={restored_collisions} cylinders_as_capsules=true self_collision=true"
-    )
-
 for body in root.iter("body"):
     body_name = body.get("name", "body")
     collision_index = 0
@@ -1929,8 +1550,7 @@ for body in root.iter("body"):
         if geom_type == "mesh":
             if is_visual_geom(geom):
                 geom.set("class", "visual")
-                if not geom.get("material", "").startswith("matrix_source_"):
-                    geom.set("material", "default_material")
+                geom.set("material", "default_material")
                 if "name" not in geom.attrib and geom.get("mesh"):
                     geom.set("name", f"{geom.get('mesh')}_visual")
                 strip_geom_attrs(geom, {"name", "pos", "quat", "type", "mesh", "class", "material"})
@@ -1992,7 +1612,6 @@ for joint_elem in root.iter("joint"):
             joint_elem.set("axis", " ".join("0" if v == 0.0 else f"{v:g}" for v in parts))
     for attr in ("damping", "armature", "limited", "ctrllimited", "ctrlrange", "gear"):
         joint_elem.attrib.pop(attr, None)
-    joint_elem.set("armature", "0.01")
     # Derive actuatorfrcrange from URDF <limit effort=...> instead of deleting it
     jname = joint_elem.get("name", "")
     effort = urdf_joint_effort.get(jname, 0.0)
@@ -2539,8 +2158,6 @@ PY
         restore_urdf_fixed_links "$UE_TARGET_URDF" "$UE_TARGET_XML"
         echo "[INFO] restoring generic runtime layout in: $UE_TARGET_XML"
         restore_generic_runtime_layout "$UE_TARGET_XML" "$UE_TARGET_URDF"
-        inject_creative_inventory "$TARGET_XML" "$TMP_ASSET_DIR"
-        inject_creative_inventory "$UE_TARGET_XML" "$UE_ASSET_DIR"
         echo "[INFO] copied xml to UE side: $UE_TARGET_XML"
     fi
 
@@ -2555,21 +2172,6 @@ PY
         "$UE_TARGET_XML" "$UE_TARGET_URDF" "$UE_ASSET_DIR"
     echo "[INFO] wrote metadata: $TARGET_METADATA"
     echo "[INFO] wrote metadata: $UE_TARGET_METADATA"
-fi
-
-# The static XML validator cannot detect every mj_loadXML failure. In particular,
-# a previously duplicated free root body passed the shape/count checks but made
-# the cooked UE abort StartSimulation and render only the background world.
-validate_mujoco_model_load "$MUJOCO_ACTIVE_SCENE_XML"
-validate_mujoco_model_load "$UE_ACTIVE_SCENE_XML"
-validate_mujoco_model_load "$MUJOCO_CUSTOM_ROOT/scene_terrain_custom.xml"
-validate_mujoco_model_load "$UE_CUSTOM_ROOT/scene_terrain_custom.xml"
-
-if [[ "${MATRIX_CUSTOM_URDF_IMPORT_ONLY:-0}" == "1" ]]; then
-    echo "[INFO] Custom URDF import-only mode completed: $CUSTOM_NAME"
-    echo "[INFO] MuJoCo active XML: $MUJOCO_ACTIVE_XML"
-    echo "[INFO] UE active XML: $UE_ACTIVE_XML"
-    exit 0
 fi
 
 CUSTOM_URDF_RELATIVE="custom/scene_terrain_custom.xml"

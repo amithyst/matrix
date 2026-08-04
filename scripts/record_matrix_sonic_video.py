@@ -427,16 +427,6 @@ def _encoder_works(ffmpeg: Path, encoder_args: Sequence[str]) -> tuple[bool, str
     return result.returncode == 0, result.stderr.strip()
 
 
-def encoded_capture_size(window: WindowInfo) -> tuple[int, int]:
-    width = window.width - (window.width % 2)
-    height = window.height - (window.height % 2)
-    if width <= 0 or height <= 0:
-        raise VideoCaptureError(
-            f"window is too small for H.264 yuv420p capture: {window.width}x{window.height}"
-        )
-    return width, height
-
-
 def select_encoder(
     ffmpeg: Path,
     requested: str,
@@ -479,10 +469,6 @@ def build_capture_command(
     draw_mouse: bool,
     encoder_args: Sequence[str],
 ) -> list[str]:
-    encoded_width, encoded_height = encoded_capture_size(window)
-    video_filter: list[str] = []
-    if (encoded_width, encoded_height) != (window.width, window.height):
-        video_filter = ["-vf", f"crop={encoded_width}:{encoded_height}:0:0"]
     return [
         str(ffmpeg),
         "-hide_banner",
@@ -502,7 +488,6 @@ def build_capture_command(
         display,
         "-t",
         f"{duration_s:g}",
-        *video_filter,
         *encoder_args,
         "-pix_fmt",
         "yuv420p",
@@ -556,12 +541,6 @@ def _parse_signal_stats(text: str) -> dict[str, float]:
     return values
 
 
-def signalstats_sample_offset_s(duration_s: float) -> float:
-    if duration_s <= 0.0 or not math.isfinite(duration_s):
-        return 0.0
-    return min(duration_s * 0.5, max(duration_s - 0.05, 0.0))
-
-
 def inspect_video(
     ffmpeg: Path, path: Path, *, sample_fps: float
 ) -> VideoProbe:
@@ -582,13 +561,10 @@ def inspect_video(
         ]
     )
     parsed = parse_ffmpeg_probe(decode.stderr, decode.stdout)
-    signal_offset_s = signalstats_sample_offset_s(float(parsed["duration_s"]))
     signal_result = _run_text(
         [
             str(ffmpeg),
             "-hide_banner",
-            "-ss",
-            f"{signal_offset_s:g}",
             "-i",
             str(path),
             "-map",
@@ -681,11 +657,9 @@ def evaluate_video_quality(
     allow_short: bool,
 ) -> dict[str, Any]:
     failures: list[str] = []
-    expected_width, expected_height = encoded_capture_size(window)
-    if (probe.width, probe.height) != (expected_width, expected_height):
+    if (probe.width, probe.height) != (window.width, window.height):
         failures.append(
-            f"resolution {probe.width}x{probe.height} != expected capture "
-            f"{expected_width}x{expected_height} from window {window.width}x{window.height}"
+            f"resolution {probe.width}x{probe.height} != window {window.width}x{window.height}"
         )
     if not allow_short and probe.duration_s < requested_duration_s * 0.90:
         failures.append(
@@ -714,7 +688,7 @@ def evaluate_video_quality(
         failures.append(f"video is too small: {file_size} bytes")
     if probe.y_avg <= 2.0 or probe.y_avg >= 253.0 or probe.y_max - probe.y_min < 8.0:
         failures.append(
-            "sampled frame is visually uniform or clipped: "
+            "first frame is visually uniform or clipped: "
             f"YMIN={probe.y_min:g} YAVG={probe.y_avg:g} YMAX={probe.y_max:g}"
         )
     if (
@@ -729,8 +703,6 @@ def evaluate_video_quality(
         "failures": failures,
         "resolution_matches_window": (probe.width, probe.height)
         == (window.width, window.height),
-        "resolution_matches_capture": (probe.width, probe.height)
-        == (expected_width, expected_height),
         "duration_ratio": round(probe.duration_s / requested_duration_s, 6),
         "fps_ratio": round(probe.fps / requested_fps, 6),
         "decoded_frame_ratio": round(probe.decoded_frames / requested_frames, 6),

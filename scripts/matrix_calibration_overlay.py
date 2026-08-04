@@ -41,6 +41,12 @@ from matrix_mouse_settings import (
 )
 from matrix_build_info import BuildInfoError, validate_build_info
 from matrix_mc_commands import MAX_COMMAND_CHARS
+from matrix_game_control import (
+    SONIC_NATIVE_MANUAL_MODE_MAX,
+    SONIC_NATIVE_MANUAL_MODE_MIN,
+    native_mode_description_zh,
+    native_mode_label_zh,
+)
 from matrix_ui_settings import (
     DEFAULT_FONT_SCALE,
     MAX_FONT_SIZE,
@@ -48,11 +54,25 @@ from matrix_ui_settings import (
     canonical_font_scale,
     canonical_font_size,
 )
-from matrix_motion_settings import (
+from matrix_overlay_motion_settings import (
+    BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+    BFM_TURN_COMMAND_YAW_LIMIT_PATH,
+    CAMERA_HEADING_SNAP_ERROR_FIELD,
+    CAMERA_HEADING_SNAP_ERROR_PATH,
     DOUBLE_TAP_SPEED_FIELD,
     GEARS,
+    GAIT_START_HEADING_ERROR_FIELD,
+    GAIT_START_HEADING_ERROR_PATH,
+    GAIT_STOP_HEADING_ERROR_FIELD,
+    GAIT_STOP_HEADING_ERROR_PATH,
     KEYBOARD_LOOK_RATE_FIELD,
     KEYBOARD_LOOK_RATE_PATH,
+    KEYBOARD_SPEED_CAP_FIELD,
+    KEYBOARD_SPEED_CAP_PATH,
+    KEYBOARD_TURN_BOOST_RATE_FIELD,
+    KEYBOARD_TURN_BOOST_RATE_PATH,
+    KEYBOARD_TURN_RATE_FIELD,
+    KEYBOARD_TURN_RATE_PATH,
     MAX_TURN_RATE_FIELD,
     MAX_TURN_RATE_PATH,
     MotionSettings,
@@ -101,12 +121,13 @@ _MAX_RUNTIME_PAUSE_EPOCH = 2_147_483_647
 _MAX_LOCOMOTION_POLICY_BUTTONS = 3
 _MAX_RECOVERY_POLICY_BUTTONS = 4
 _POLICY_STATUS_DISPLAY_SECONDS = 4.0
-_STARTUP_MEDIA_FRAME_RATE_HZ = 2.0
-_STARTUP_MEDIA_MAX_FRAMES = 24
-_STARTUP_MEDIA_MAX_PIXELS = 640 * 360
+_STARTUP_MEDIA_FRAME_RATE_HZ = 10.0
+_STARTUP_MEDIA_MAX_FRAMES = 2_400
+_STARTUP_MEDIA_MAX_PIXELS = 1280 * 720
 _STARTUP_MEDIA_GRID_COLUMNS = 72
 _STARTUP_MEDIA_GRID_ROWS = 42
 _STARTUP_MEDIA_COLOUR_STEP = 32
+_X11_Z_PIXMAP_FORMAT = 2
 _MIN_OVERLAY_FONT_SIZE = 1
 _DEFAULT_OVERLAY_FONT_SIZE = 13
 _MAX_OVERLAY_FONT_SIZE = 22
@@ -461,8 +482,8 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     centre_x, centre_y = geometry.centre
     compact = geometry.width < 900 or geometry.height < 650
     outer_margin = 16 if compact else 32
-    panel_width = min(1180, geometry.width - 2 * outer_margin)
-    panel_height = min(790, geometry.height - 2 * outer_margin)
+    panel_width = min(1500, geometry.width - 2 * outer_margin)
+    panel_height = min(900, geometry.height - 2 * outer_margin)
     panel_x = centre_x - panel_width // 2
     panel_y = centre_y - panel_height // 2
     margin = max(18, min(64, panel_width // 18))
@@ -476,20 +497,34 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     tab_height = 32 if compact else 46
     tab_y = panel_y + (30 if compact else 76)
     tab_gap = 4 if compact else 8
-    tab_width = max(1, (panel_width - 2 * margin - 6 * tab_gap) // 7)
-    profile_y = centre_panel_y - safe_half_size - gap - button_height
-    speed_y = centre_panel_y + safe_half_size + gap
-    profile_gap = max(4, min(10, gap // 2))
-    profile_width = max(
-        1,
-        (panel_width - 2 * margin - 4 * profile_gap) // 5,
-    )
-    settings_content_width = panel_width - 2 * margin
-    settings_group_width = max(1, (settings_content_width - gap) // 2)
-    speed_width = max(42, min(112, settings_group_width // 4))
+    tab_count = 9
+    tab_width = max(1, (panel_width - 2 * margin - (tab_count - 1) * tab_gap) // tab_count)
+    back_width = max(128, min(260, panel_width // 5))
     apply_height = max(42, min(80, button_height + 6))
     footer_space = 8 if compact else 42
     apply_y = panel_y + panel_height - footer_space - apply_height
+    settings_top = tab_y + tab_height + gap
+    settings_bottom = apply_y - gap
+    settings_dense = compact or panel_height < 820
+    profile_y = settings_top + (6 if settings_dense else 48)
+    speed_y = max(
+        profile_y + button_height + gap,
+        settings_bottom - button_height,
+    )
+    profile_gap = max(4, min(10, gap // 2))
+    profile_button_count = 2 + len(MOVEMENT_MODES)
+    profile_width = max(
+        1,
+        (
+            panel_width
+            - 2 * margin
+            - (profile_button_count - 1) * profile_gap
+        )
+        // profile_button_count,
+    )
+    settings_content_width = panel_width - 2 * margin
+    settings_group_width = max(1, (settings_content_width - 2 * gap) // 3)
+    speed_width = max(42, min(112, settings_group_width // 4))
     footer_width = panel_width - 2 * margin
     pause_width = max(108, min(220, (footer_width - 2 * gap) // 4))
     quit_width = max(112, min(240, (footer_width - 2 * gap) // 4))
@@ -511,7 +546,14 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         settings_group_width - 2 * speed_width,
         button_height,
     )
-    font_left = panel_x + margin + settings_group_width + gap
+    cap_left = panel_x + margin + settings_group_width + gap
+    font_left = panel_x + margin + 2 * (settings_group_width + gap)
+    cap_value = (
+        cap_left + speed_width,
+        speed_y,
+        settings_group_width - 2 * speed_width,
+        button_height,
+    )
     font_value = (
         font_left + speed_width,
         speed_y,
@@ -559,14 +601,20 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     )
     motion_outer_gap = 6 if compact else 12
     motion_row_gap = 4 if compact else 8
+    settings_help_lines = 0 if settings_dense else 3
+    settings_help_space = settings_help_lines * (24 if compact else 28)
     motion_top = max(
         tab_y + tab_height + motion_outer_gap,
-        profile_y + button_height + motion_outer_gap,
+        profile_y
+        + button_height
+        + motion_outer_gap
+        + settings_help_space
+        + (0 if settings_help_lines == 0 else motion_outer_gap),
     )
     motion_bottom = speed_y - motion_outer_gap
     motion_row_height = max(
         1,
-        (motion_bottom - motion_top - 3 * motion_row_gap) // 4,
+        (motion_bottom - motion_top - 6 * motion_row_gap) // 7,
     )
     motion_left_x = panel_x + margin
     motion_left_width = max(
@@ -621,6 +669,12 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             font_slider_width,
             24 if compact else 32,
         ),
+        "back_to_directory": (
+            panel_x + margin,
+            tab_y,
+            back_width,
+            tab_height,
+        ),
         "tab_loadout": (
             panel_x + margin,
             tab_y,
@@ -639,26 +693,38 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             tab_width,
             tab_height,
         ),
-        "tab_inventory": (
+        "tab_functions": (
             panel_x + margin + 3 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
         ),
-        "tab_navigation": (
+        "tab_keybindings": (
             panel_x + margin + 4 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
         ),
-        "tab_video": (
+        "tab_inventory": (
             panel_x + margin + 5 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
         ),
-        "tab_system": (
+        "tab_navigation": (
             panel_x + margin + 6 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_video": (
+            panel_x + margin + 7 * (tab_width + tab_gap),
+            tab_y,
+            tab_width,
+            tab_height,
+        ),
+        "tab_system": (
+            panel_x + margin + 8 * (tab_width + tab_gap),
             tab_y,
             tab_width,
             tab_height,
@@ -685,14 +751,20 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             profile_width,
             button_height,
         ),
-        "movement_mode_camera_strafe": (
+        "movement_mode_camera_face_strafe": (
             panel_x + margin + 3 * (profile_width + profile_gap),
             profile_y,
             profile_width,
             button_height,
         ),
-        "movement_mode_body_relative": (
+        "movement_mode_camera_strafe": (
             panel_x + margin + 4 * (profile_width + profile_gap),
+            profile_y,
+            profile_width,
+            button_height,
+        ),
+        "movement_mode_body_relative": (
+            panel_x + margin + 5 * (profile_width + profile_gap),
             profile_y,
             profile_width,
             button_height,
@@ -701,6 +773,19 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         "speed_value": speed_value,
         "speed_up": (
             panel_x + margin + settings_group_width - speed_width,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "motion_keyboard_speed_cap_down": (
+            cap_left,
+            speed_y,
+            speed_width,
+            button_height,
+        ),
+        "motion_keyboard_speed_cap_value": cap_value,
+        "motion_keyboard_speed_cap_up": (
+            cap_left + settings_group_width - speed_width,
             speed_y,
             speed_width,
             button_height,
@@ -798,6 +883,41 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             navigation_destinations_height,
         ),
     }
+    directory_names = (
+        "tab_loadout",
+        "tab_settings",
+        "tab_console",
+        "tab_functions",
+        "tab_sonic_modes",
+        "tab_keybindings",
+        "tab_inventory",
+        "tab_navigation",
+        "tab_video",
+        "tab_system",
+    )
+    directory_top = console_top
+    directory_bottom = apply_y - gap
+    directory_gap = 8 if compact else 16
+    directory_columns = 3
+    directory_rows = max(1, math.ceil(len(directory_names) / directory_columns))
+    directory_width = max(
+        1,
+        (console_width - (directory_columns - 1) * directory_gap)
+        // directory_columns,
+    )
+    directory_height = max(
+        1,
+        (directory_bottom - directory_top - (directory_rows - 1) * directory_gap)
+        // directory_rows,
+    )
+    for index, name in enumerate(directory_names):
+        row, column = divmod(index, directory_columns)
+        result[name] = (
+            console_left + column * (directory_width + directory_gap),
+            directory_top + row * (directory_height + directory_gap),
+            directory_width,
+            directory_height,
+        )
     for index in range(_MAX_RECOVERY_POLICY_BUTTONS):
         result[f"recovery_policy_{index}"] = (
             panel_x + margin + index * (candidate_width + candidate_gap),
@@ -816,6 +936,90 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             inventory_top + row * (inventory_height + inventory_gap),
             inventory_width,
             inventory_height,
+        )
+    function_top = console_top + (62 if compact else 114)
+    function_gap = 6 if compact else 12
+    function_button_height = max(28, min(button_height, 60))
+    function_button_width = max(1, (console_width - function_gap) // 2)
+    result["function_nav_files"] = (
+        console_left,
+        function_top,
+        function_button_width,
+        function_button_height,
+    )
+    result["function_nav_presets"] = (
+        console_left + function_button_width + function_gap,
+        function_top,
+        function_button_width,
+        function_button_height,
+    )
+    result["function_nav_sonic"] = (
+        console_left,
+        function_top + function_button_height + function_gap,
+        function_button_width,
+        function_button_height,
+    )
+    result["functions_open_dir"] = (
+        console_left + function_button_width + function_gap,
+        function_top + function_button_height + function_gap,
+        function_button_width,
+        function_button_height,
+    )
+    result["function_back"] = (
+        console_left,
+        function_top,
+        function_button_width,
+        function_button_height,
+    )
+    result["function_run_selected"] = (
+        console_left + function_button_width + function_gap,
+        function_top,
+        function_button_width,
+        function_button_height,
+    )
+    function_preset_top = function_top + 2 * (function_button_height + function_gap)
+    for index in range(4):
+        row, column = divmod(index, 2)
+        result[f"function_preset_{index}"] = (
+            console_left + column * (function_button_width + function_gap),
+            function_preset_top + row * (function_button_height + function_gap),
+            function_button_width,
+            function_button_height,
+        )
+    for index in range(_MAX_FUNCTION_FILE_BUTTONS):
+        row, column = divmod(index, 2)
+        result[f"function_file_{index}"] = (
+            console_left + column * (function_button_width + function_gap),
+            function_preset_top + row * (function_button_height + function_gap),
+            function_button_width,
+            function_button_height,
+        )
+    native_top = function_top + function_button_height + function_gap + (
+        6 if compact else 16
+    )
+    native_gap = 4 if compact else 8
+    native_columns = 10
+    native_cell_width = max(
+        1,
+        (console_width - (native_columns - 1) * native_gap) // native_columns,
+    )
+    native_cell_height = max(24, min(42, function_button_height))
+    result["native_mode_auto"] = (
+        console_left,
+        native_top,
+        max(1, 2 * native_cell_width + native_gap),
+        native_cell_height,
+    )
+    native_grid_top = native_top + native_cell_height + native_gap
+    for order, index in enumerate(
+        range(SONIC_NATIVE_MANUAL_MODE_MIN, SONIC_NATIVE_MANUAL_MODE_MAX + 1)
+    ):
+        row, column = divmod(order, native_columns)
+        result[f"native_mode_{index}"] = (
+            console_left + column * (native_cell_width + native_gap),
+            native_grid_top + row * (native_cell_height + native_gap),
+            native_cell_width,
+            native_cell_height,
         )
     for index in range(_MAX_LOCOMOTION_POLICY_BUTTONS):
         result[f"locomotion_policy_{index}"] = (
@@ -861,48 +1065,60 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
                 motion_row_height,
             )
     turn_y = motion_top + 3 * (motion_row_height + motion_row_gap)
-    turn_width = motion_left_width
-    turn_button_width = 24 if compact else max(32, min(52, turn_width // 4))
-    turn_value_width = max(1, turn_width - 2 * turn_button_width)
-    result["motion_turn_rate_down"] = (
-        motion_left_x,
-        turn_y,
-        turn_button_width,
-        motion_row_height,
+    boost_y = motion_top + 4 * (motion_row_height + motion_row_gap)
+    look_y = motion_top + 5 * (motion_row_height + motion_row_gap)
+    gait_y = motion_top + 6 * (motion_row_height + motion_row_gap)
+    turn_specs = (
+        ("motion_turn_rate", motion_left_x, motion_left_width, turn_y),
+        ("motion_keyboard_turn_rate", motion_right_x, motion_right_width, turn_y),
+        (
+            "motion_keyboard_turn_boost_rate",
+            motion_left_x,
+            motion_left_width,
+            boost_y,
+        ),
+        (
+            "motion_bfm_turn_command_yaw_limit",
+            motion_right_x,
+            motion_right_width,
+            boost_y,
+        ),
+        ("motion_camera_look_rate", motion_left_x, motion_left_width, look_y),
+        (
+            "motion_camera_heading_snap_error",
+            motion_right_x,
+            motion_right_width,
+            look_y,
+        ),
+        (
+            "motion_gait_start_heading_error",
+            motion_left_x,
+            motion_left_width,
+            gait_y,
+        ),
+        ("motion_gait_stop_heading_error", motion_right_x, motion_right_width, gait_y),
     )
-    result["motion_turn_rate_value"] = (
-        motion_left_x + turn_button_width,
-        turn_y,
-        turn_value_width,
-        motion_row_height,
-    )
-    result["motion_turn_rate_up"] = (
-        motion_left_x + turn_button_width + turn_value_width,
-        turn_y,
-        turn_button_width,
-        motion_row_height,
-    )
-    look_width = motion_right_width
-    look_button_width = 24 if compact else max(32, min(52, look_width // 4))
-    look_value_width = max(1, look_width - 2 * look_button_width)
-    result["motion_camera_look_rate_down"] = (
-        motion_right_x,
-        turn_y,
-        look_button_width,
-        motion_row_height,
-    )
-    result["motion_camera_look_rate_value"] = (
-        motion_right_x + look_button_width,
-        turn_y,
-        look_value_width,
-        motion_row_height,
-    )
-    result["motion_camera_look_rate_up"] = (
-        motion_right_x + look_button_width + look_value_width,
-        turn_y,
-        look_button_width,
-        motion_row_height,
-    )
+    for stem, cell_x, cell_width, row_y in turn_specs:
+        button_width = 24 if compact else max(32, min(52, cell_width // 4))
+        value_width = max(1, cell_width - 2 * button_width)
+        result[f"{stem}_down"] = (
+            cell_x,
+            row_y,
+            button_width,
+            motion_row_height,
+        )
+        result[f"{stem}_value"] = (
+            cell_x + button_width,
+            row_y,
+            value_width,
+            motion_row_height,
+        )
+        result[f"{stem}_up"] = (
+            cell_x + button_width + value_width,
+            row_y,
+            button_width,
+            motion_row_height,
+        )
     for index in range(3):
         result[f"navigation_destination_{index}"] = (
             panel_x
@@ -915,9 +1131,10 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
     video_top = tab_y + tab_height + gap
     video_bottom = apply_y - gap
     video_row_gap = 4 if compact else 8
+    video_rows = max(1, len(_VIDEO_SETTING_PRESETS) + 3)
     video_row_height = max(
         24,
-        (video_bottom - video_top - 4 * video_row_gap) // 5,
+        (video_bottom - video_top - (video_rows - 1) * video_row_gap) // video_rows,
     )
     video_button_width = max(34, min(64, panel_width // 14))
     for index, field in enumerate(_VIDEO_SETTING_PRESETS):
@@ -941,6 +1158,33 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             video_button_width,
             video_row_height,
         )
+    camera_start = len(_VIDEO_SETTING_PRESETS)
+    for offset, field in enumerate(_VIDEO_CAMERA_DISTANCE_FIELDS):
+        row_y = video_top + (camera_start + offset) * (
+            video_row_height + video_row_gap
+        )
+        stem = f"video_{field}"
+        result[f"{stem}_down"] = (
+            panel_x + margin,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
+        result[f"{stem}_value"] = (
+            panel_x + margin + video_button_width,
+            row_y,
+            max(1, panel_width - 2 * margin - 2 * video_button_width),
+            video_row_height,
+        )
+        result[f"{stem}_up"] = (
+            panel_x + panel_width - margin - video_button_width,
+            row_y,
+            video_button_width,
+            video_row_height,
+        )
+    result["video_camera_distance_cm_slider"] = result[
+        "video_camera_distance_cm_value"
+    ]
     return result
 
 
@@ -969,6 +1213,21 @@ def font_size_from_slider(
     span = _MAX_OVERLAY_FONT_SIZE - _MIN_OVERLAY_FONT_SIZE
     step = int(math.floor((offset / usable_width) * span + 0.5))
     return _MIN_OVERLAY_FONT_SIZE + step
+
+
+def camera_distance_from_slider(
+    rectangle: tuple[int, int, int, int],
+    root_x: int,
+    minimum_cm: int,
+    maximum_cm: int,
+) -> int:
+    track_x, _track_y, track_width, _track_height = font_slider_track(rectangle)
+    if maximum_cm <= minimum_cm:
+        return minimum_cm
+    usable_width = max(1, track_width - 1)
+    offset = max(0, min(usable_width, root_x - track_x))
+    span = maximum_cm - minimum_cm
+    return minimum_cm + int(math.floor((offset / usable_width) * span + 0.5))
 
 
 _PANEL_ACTIONS = (
@@ -1008,6 +1267,46 @@ _MOTION_STEP_ACTION_DETAILS.update(
 )
 _MOTION_STEP_ACTION_DETAILS.update(
     {
+        f"motion_keyboard_turn_rate_{suffix}": (
+            "turn",
+            KEYBOARD_TURN_RATE_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_keyboard_turn_boost_rate_{suffix}": (
+            "turn",
+            KEYBOARD_TURN_BOOST_RATE_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_bfm_turn_command_yaw_limit_{suffix}": (
+            "bfm",
+            BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_keyboard_speed_cap_{suffix}": (
+            "keyboard",
+            KEYBOARD_SPEED_CAP_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
         f"motion_camera_look_rate_{suffix}": (
             "camera",
             KEYBOARD_LOOK_RATE_FIELD,
@@ -1016,14 +1315,59 @@ _MOTION_STEP_ACTION_DETAILS.update(
         for suffix, direction in (("down", -1), ("up", 1))
     }
 )
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_camera_heading_snap_error_{suffix}": (
+            "camera",
+            CAMERA_HEADING_SNAP_ERROR_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_gait_start_heading_error_{suffix}": (
+            "gait",
+            GAIT_START_HEADING_ERROR_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
+_MOTION_STEP_ACTION_DETAILS.update(
+    {
+        f"motion_gait_stop_heading_error_{suffix}": (
+            "gait",
+            GAIT_STOP_HEADING_ERROR_FIELD,
+            direction,
+        )
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
+)
 _MOTION_STEP_ACTIONS = tuple(_MOTION_STEP_ACTION_DETAILS)
+_MOTION_VALUE_HOVER_TARGETS = tuple(
+    f"motion_{gear}_{field}_value"
+    for gear, field in _MOTION_CONTROL_SPECS
+) + (
+    "motion_turn_rate_value",
+    "motion_keyboard_turn_rate_value",
+    "motion_keyboard_turn_boost_rate_value",
+    "motion_bfm_turn_command_yaw_limit_value",
+    "motion_keyboard_speed_cap_value",
+    "motion_camera_look_rate_value",
+    "motion_camera_heading_snap_error_value",
+    "motion_gait_start_heading_error_value",
+    "motion_gait_stop_heading_error_value",
+)
 _MOVEMENT_MODE_ACTIONS = tuple(
     f"movement_mode_{movement_mode}" for movement_mode in MOVEMENT_MODES
 )
 _MOVEMENT_MODE_LABELS = {
-    "camera_face": "相机朝向",
-    "camera_strafe": "相机侧移",
-    "body_relative": "机身相对",
+    "camera_face": "相机朝向前行",
+    "camera_face_strafe": "相机朝向侧移",
+    "camera_strafe": "相机不转侧移",
+    "body_relative": "机身不转侧移",
 }
 
 _VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
@@ -1033,12 +1377,28 @@ _VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
     "quality": ("low", "medium", "high", "epic"),
     "camera_smoothing": ("off", "low", "medium", "high"),
 }
+_VIDEO_CAMERA_DISTANCE_FIELDS = (
+    "camera_distance_cm",
+    "camera_distance_min_cm",
+    "camera_distance_max_cm",
+)
+_VIDEO_CAMERA_DISTANCE_BOUND_FIELDS = (
+    "camera_distance_min_cm",
+    "camera_distance_max_cm",
+)
+_VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS = tuple(
+    f"video_{field}_value" for field in _VIDEO_CAMERA_DISTANCE_BOUND_FIELDS
+)
+_VIDEO_CAMERA_DISTANCE_RANGE = (80, 500)
 _VIDEO_SETTING_LABELS = {
     "resolution": "分辨率",
     "window_mode": "窗口模式",
     "fps_limit": "帧率上限",
     "quality": "画质档位",
     "camera_smoothing": "相机平滑",
+    "camera_distance_cm": "相机距离",
+    "camera_distance_min_cm": "距离下限",
+    "camera_distance_max_cm": "距离上限",
 }
 _VIDEO_VALUE_LABELS = {
     "windowed": "窗口",
@@ -1055,18 +1415,130 @@ _VIDEO_STEP_ACTION_DETAILS = {
     for field in _VIDEO_SETTING_PRESETS
     for suffix, direction in (("down", -1), ("up", 1))
 }
-_VIDEO_STEP_ACTIONS = tuple(_VIDEO_STEP_ACTION_DETAILS)
-
-_PANEL_TABS = (
-    "tab_loadout",
-    "tab_settings",
-    "tab_console",
-    "tab_inventory",
-    "tab_navigation",
-    "tab_video",
-    "tab_system",
+_VIDEO_STEP_ACTION_DETAILS.update(
+    {
+        f"video_{field}_{suffix}": (field, direction)
+        for field in ("camera_distance_min_cm", "camera_distance_max_cm")
+        for suffix, direction in (("down", -1), ("up", 1))
+    }
 )
-_OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider",)
+_VIDEO_STEP_ACTIONS = tuple(_VIDEO_STEP_ACTION_DETAILS)
+_VIDEO_VALUE_HOVER_TARGETS = tuple(
+    f"video_{field}_value"
+    for field in tuple(_VIDEO_SETTING_PRESETS) + _VIDEO_CAMERA_DISTANCE_FIELDS
+)
+
+_PANEL_DIRECTORY_PAGE = "directory"
+_BACK_TO_DIRECTORY_ACTION = "back_to_directory"
+_PANEL_DIRECTORY_ENTRIES = (
+    (
+        "tab_loadout",
+        "策略装配",
+        "查看 SONIC 策略槽与运行策略状态",
+        "loadout",
+    ),
+    (
+        "tab_settings",
+        "控制设置",
+        "调 WASD、转向、相机与行走阈值",
+        "settings",
+    ),
+    (
+        "tab_console",
+        "命令台",
+        "输入局内命令并查看执行反馈",
+        "console",
+    ),
+    (
+        "tab_functions",
+        "函数命令",
+        "MC 风格 .mcfunction 组合命令",
+        "functions",
+    ),
+    (
+        "tab_sonic_modes",
+        "SONIC模式",
+        "切换 SONIC 原生 AUTO/4-19 单档",
+        "sonic_modes",
+    ),
+    (
+        "tab_keybindings",
+        "按键绑定",
+        "查看热键与运控模式说明",
+        "keybindings",
+    ),
+    (
+        "tab_inventory",
+        "创造物品",
+        "生成可交互物品与场景调试件",
+        "inventory",
+    ),
+    (
+        "tab_navigation",
+        "星体导航",
+        "查看目标点并执行导航刷新",
+        "navigation",
+    ),
+    (
+        "tab_video",
+        "视频设置",
+        "调画面质量、窗口与相机距离",
+        "video",
+    ),
+    (
+        "tab_system",
+        "运行信息",
+        "查看构建、进程和运行诊断",
+        "system",
+    ),
+)
+_PANEL_TABS = tuple(entry[0] for entry in _PANEL_DIRECTORY_ENTRIES)
+_PANEL_PAGE_NAMES = {_PANEL_DIRECTORY_PAGE} | {
+    entry[3] for entry in _PANEL_DIRECTORY_ENTRIES
+}
+_FUNCTION_PRESETS = (
+    ("原地站立恢复", "/function recover_here"),
+    ("当前位置面向北", "/function pose/north"),
+    ("当前位置右转90", "/function pose/right_90"),
+    ("TP+姿态示例", "/function tp_pose_example"),
+)
+_MAX_FUNCTION_FILE_BUTTONS = 8
+_FUNCTION_HOME_HIT_TARGETS = (
+    "function_nav_files",
+    "function_nav_presets",
+    "function_nav_sonic",
+    "functions_open_dir",
+)
+_FUNCTION_FILE_HIT_TARGETS = tuple(
+    f"function_file_{index}" for index in range(_MAX_FUNCTION_FILE_BUTTONS)
+)
+_FUNCTION_COMMON_SUBPAGE_HIT_TARGETS = ("function_back",)
+_FUNCTION_DETAIL_HIT_TARGETS = (
+    "function_back",
+    "function_run_selected",
+    "functions_open_dir",
+)
+_FUNCTION_PRESET_HIT_TARGETS = tuple(
+    f"function_preset_{index}" for index in range(len(_FUNCTION_PRESETS))
+)
+_NATIVE_MODE_BUTTON_INDICES = tuple(
+    range(SONIC_NATIVE_MANUAL_MODE_MIN, SONIC_NATIVE_MANUAL_MODE_MAX + 1)
+)
+_NATIVE_MODE_HIT_TARGETS = ("native_mode_auto",) + tuple(
+    f"native_mode_{index}" for index in _NATIVE_MODE_BUTTON_INDICES
+)
+_NATIVE_MODE_BUTTON_LABELS_ZH = {
+    None: native_mode_label_zh(None),
+    **{index: native_mode_label_zh(index) for index in _NATIVE_MODE_BUTTON_INDICES},
+}
+_NATIVE_MODE_LEGEND_LINES_ZH = (
+    "AUTO 自动负责 0 空闲 / 1 慢走 / 2 行走 / 3 跑步；按住 X 进入趴下AUTO。",
+    "趴下AUTO：X 空闲=7 俯卧；X+WASD=8 爬行；松开 X 回普通 AUTO。",
+    "手动单档从 4 开始：4 蹲姿；5 双膝跪；6 单膝跪；7 俯卧；8 爬行",
+    "9 拳击待机；10 拳击行走；11 左直拳；12 右直拳",
+    "13 随机出拳；14 肘部爬行；15 左勾拳；16 右勾拳；17-19 风格动作",
+)
+_OVERLAY_LOCAL_HIT_TARGETS = ("font_size_slider", "video_camera_distance_cm_slider")
 _LOCOMOTION_POLICY_HIT_TARGETS = tuple(
     f"locomotion_policy_{index}"
     for index in range(_MAX_LOCOMOTION_POLICY_BUTTONS)
@@ -1085,7 +1557,7 @@ _NAVIGATION_HIT_TARGETS = (
 _PANEL_HIT_TARGETS = (
     _PANEL_TABS
     + _PANEL_ACTIONS
-    + ("runtime_pause", "quit_game")
+    + (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game")
     + _MOVEMENT_MODE_ACTIONS
     + _MOTION_STEP_ACTIONS
     + ("command_input",)
@@ -1094,8 +1566,134 @@ _PANEL_HIT_TARGETS = (
     + _POLICY_HIT_TARGETS
     + _INVENTORY_HIT_TARGETS
     + _NAVIGATION_HIT_TARGETS
+    + ("functions_open_dir",)
+    + _FUNCTION_HOME_HIT_TARGETS
+    + _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS
+    + _FUNCTION_DETAIL_HIT_TARGETS
+    + _FUNCTION_FILE_HIT_TARGETS
+    + _FUNCTION_PRESET_HIT_TARGETS
+    + _NATIVE_MODE_HIT_TARGETS
     + _VIDEO_STEP_ACTIONS
+    + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
 )
+
+_SETTINGS_VALUE_HOVER_TARGETS = (
+    "speed_value",
+    "font_value",
+    "font_size_slider",
+) + _MOTION_VALUE_HOVER_TARGETS
+
+
+def _targets_for_panel_page(
+    page: str | None,
+    *,
+    function_subpage: str | None = None,
+    include_hover_only: bool = False,
+) -> tuple[str, ...]:
+    effective_page = _PANEL_DIRECTORY_PAGE if page is None else page
+    if effective_page == _PANEL_DIRECTORY_PAGE:
+        return _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
+    if effective_page == "loadout":
+        return (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + _LOCOMOTION_POLICY_HIT_TARGETS
+            + _POLICY_HIT_TARGETS
+        )
+    if effective_page == "settings":
+        targets = (
+            (_BACK_TO_DIRECTORY_ACTION,)
+            + _PANEL_ACTIONS
+            + ("runtime_pause", "quit_game")
+            + _MOVEMENT_MODE_ACTIONS
+            + _MOTION_STEP_ACTIONS
+            + _OVERLAY_LOCAL_HIT_TARGETS
+        )
+        if include_hover_only:
+            targets = targets + _SETTINGS_VALUE_HOVER_TARGETS
+        return targets
+    if effective_page == "console":
+        return (
+            _BACK_TO_DIRECTORY_ACTION,
+            "runtime_pause",
+            "quit_game",
+            "apply_return",
+            "command_input",
+        )
+    if effective_page == "functions":
+        subpage = function_subpage or "home"
+        if subpage == "files":
+            function_targets = (
+                _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS
+                + ("functions_open_dir",)
+                + _FUNCTION_FILE_HIT_TARGETS
+            )
+        elif subpage == "detail":
+            function_targets = _FUNCTION_DETAIL_HIT_TARGETS
+        elif subpage == "presets":
+            function_targets = (
+                _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS + _FUNCTION_PRESET_HIT_TARGETS
+            )
+        elif subpage == "sonic":
+            function_targets = (
+                _FUNCTION_COMMON_SUBPAGE_HIT_TARGETS + _NATIVE_MODE_HIT_TARGETS
+            )
+        else:
+            function_targets = _FUNCTION_HOME_HIT_TARGETS
+        return (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + function_targets
+        )
+    if effective_page == "sonic_modes":
+        return (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + _NATIVE_MODE_HIT_TARGETS
+        )
+    if effective_page == "keybindings":
+        return (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + _MOVEMENT_MODE_ACTIONS
+        )
+    if effective_page == "inventory":
+        return (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + _INVENTORY_HIT_TARGETS
+        )
+    if effective_page == "navigation":
+        return (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + _NAVIGATION_HIT_TARGETS
+        )
+    if effective_page == "video":
+        targets = (
+            (_BACK_TO_DIRECTORY_ACTION, "runtime_pause", "quit_game", "apply_return")
+            + ("video_camera_distance_cm_slider",)
+            + _VIDEO_STEP_ACTIONS
+            + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
+        )
+        if include_hover_only:
+            targets = targets + _VIDEO_VALUE_HOVER_TARGETS
+        return targets
+    if effective_page == "system":
+        return (
+            _BACK_TO_DIRECTORY_ACTION,
+            "runtime_pause",
+            "quit_game",
+            "apply_return",
+        )
+    return _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
+
+
+def _panel_target_at(
+    layout: dict[str, tuple[int, int, int, int]],
+    root_x: int,
+    root_y: int,
+    targets: tuple[str, ...],
+) -> str | None:
+    for action in targets:
+        rectangle = layout.get(action)
+        if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
+            return action
+    return None
 
 
 def point_in_rectangle(
@@ -1112,58 +1710,225 @@ def panel_action_at(
     root_y: int,
     *,
     page: str | None = None,
+    function_subpage: str | None = None,
 ) -> str | None:
     """Hit-test X11 root coordinates, including remote-desktop absolute input."""
 
-    targets = _PANEL_HIT_TARGETS
-    if page == "loadout":
-        targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
-            + _LOCOMOTION_POLICY_HIT_TARGETS
-            + _POLICY_HIT_TARGETS
+    return _panel_target_at(
+        layout,
+        root_x,
+        root_y,
+        _targets_for_panel_page(page, function_subpage=function_subpage),
+    )
+
+
+def panel_hover_action_at(
+    layout: dict[str, tuple[int, int, int, int]],
+    root_x: int,
+    root_y: int,
+    *,
+    page: str | None = None,
+    function_subpage: str | None = None,
+) -> str | None:
+    """Hit-test controls and read-only value cells for hover help."""
+
+    return _panel_target_at(
+        layout,
+        root_x,
+        root_y,
+        _targets_for_panel_page(
+            page,
+            function_subpage=function_subpage,
+            include_hover_only=True,
+        ),
+    )
+
+
+_BASIC_TOOLTIP_LINES = {
+    "profile_local": ("本机控制：鼠标和键盘按本机输入比例运行。",),
+    "profile_remote": ("远程控制：给远程桌面鼠标输入使用的缩放配置。",),
+    "speed_down": (
+        "降低远程鼠标速度缩放；只影响远程鼠标灵敏度。",
+        "低档精细步进 0.01-0.10，高档粗调 0.20-1.00。",
+    ),
+    "speed_up": (
+        "提高远程鼠标速度缩放；只影响远程鼠标灵敏度。",
+        "低档精细步进 0.01-0.10，高档粗调 0.20-1.00。",
+    ),
+    "speed_value": (
+        "远程鼠标速度缩放当前值；本机控制时通常不用调。",
+        "低档精细步进 0.01-0.10，高档粗调 0.20-1.00。",
+    ),
+    "font_down": ("减小 ESC 面板字号。",),
+    "font_up": ("增大 ESC 面板字号。",),
+    "font_value": ("当前 ESC 面板字号。",),
+    "font_size_slider": ("拖动调整 ESC 面板字号；过大容易挤压布局。",),
+    "apply_return": ("保存设置并返回游戏；需要重启的设置会安全应用。",),
+    "runtime_pause": ("暂停/继续仿真；执行 TP、姿态控制前建议先暂停。",),
+    "quit_game": ("结束当前 Matrix 游戏/仿真进程。",),
+    _BACK_TO_DIRECTORY_ACTION: ("返回 ESC 目录页；当前子页面会收起。",),
+    "command_input": ("点击后输入局内命令；Enter 提交，Esc 退出输入。",),
+    "functions_open_dir": ("打开 .mcfunction 文件目录；一行就是一条命令。",),
+    "function_nav_files": ("进入函数文件列表，选择一个 .mcfunction 查看或运行。",),
+    "function_nav_presets": ("进入常用恢复/姿态组合命令。",),
+    "function_nav_sonic": ("进入 SONIC 原生模式按钮；AUTO 或 4-19 单档。",),
+    "function_back": ("返回函数命令的上一级菜单。",),
+    "function_run_selected": ("运行当前选中的 .mcfunction 文件。",),
+    "navigation_refresh": ("刷新机器人/场景坐标和可用传送点。",),
+    "video_camera_distance_cm_slider": ("拖动调整相机距离；受距离上下限约束。",),
+}
+
+_MOVEMENT_MODE_TOOLTIP_LINES = {
+    "camera_face": (
+        "相机朝向前行：WASD 按镜头方向移动。",
+        "机器人身体会自动转到运动方向；A/D 会转向侧方再前进。",
+    ),
+    "camera_face_strafe": (
+        "相机朝向侧移：WASD 按镜头方向平移。",
+        "机器人身体自动朝向相机正前方；A/D 保持侧移。",
+    ),
+    "camera_strafe": (
+        "相机不转侧移：WASD 仍按镜头方向平移。",
+        "身体朝向尽量保持，不跟随相机自动转向。",
+    ),
+    "body_relative": (
+        "机身不转侧移：WASD 按机器人自身前后左右。",
+        "不跟随相机 yaw，适合排查坐标系问题。",
+    ),
+}
+
+_MOTION_TOOLTIP_LINES = {
+    **{
+        f"motion_{gear}_{SPEED_FIELD}": (
+            f"{_MOTION_GEAR_LABELS[gear][0]}基础速度：单按 WASD 时的目标速度。",
         )
-    elif page == "settings":
-        targets = (
-            _PANEL_TABS
-            + _PANEL_ACTIONS
-            + ("runtime_pause", "quit_game")
-            + _MOVEMENT_MODE_ACTIONS
-            + _MOTION_STEP_ACTIONS
-            + _OVERLAY_LOCAL_HIT_TARGETS
+        for gear in GEARS
+    },
+    **{
+        f"motion_{gear}_{DOUBLE_TAP_SPEED_FIELD}": (
+            f"{_MOTION_GEAR_LABELS[gear][0]}双击速度：双击方向键后的目标速度。",
         )
-    elif page == "console":
-        targets = _PANEL_TABS + (
-            "runtime_pause",
-            "quit_game",
-            "apply_return",
-            "command_input",
-        )
-    elif page == "inventory":
-        targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
-            + _INVENTORY_HIT_TARGETS
-        )
-    elif page == "navigation":
-        targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
-            + _NAVIGATION_HIT_TARGETS
-        )
-    elif page == "video":
-        targets = (
-            _PANEL_TABS
-            + ("runtime_pause", "quit_game", "apply_return")
-            + _VIDEO_STEP_ACTIONS
-        )
-    elif page == "system":
-        targets = _PANEL_TABS + ("runtime_pause", "quit_game", "apply_return")
-    for action in targets:
-        rectangle = layout.get(action)
-        if rectangle is not None and point_in_rectangle((root_x, root_y), rectangle):
-            return action
+        for gear in GEARS
+    },
+    "motion_keyboard_speed_cap": (
+        "键盘速度上限：WASD 最终速度不会超过这里。",
+        "如果跑步/走路忽快忽停，可先检查这个上限。",
+    ),
+    "motion_turn_rate": ("身体最大转向速度上限；限制自动转身有多快。",),
+    "motion_keyboard_turn_rate": (
+        "Q/E 普通转向速度；对齐 PICO 右摇杆的左右旋转语义。",
+    ),
+    "motion_keyboard_turn_boost_rate": (
+        "Q/E 加速转向速度；用于更快的手动左右旋转。",
+    ),
+    "motion_bfm_turn_command_yaw_limit": (
+        "外部策略转向限幅；SONIC-only 默认路径通常不用调大。",
+    ),
+    "motion_camera_look_rate": (
+        "方向键/鼠标拖拽调整相机朝向的速度。",
+        "转相机时 WASD 会读取最新相机 yaw。",
+    ),
+    "motion_camera_heading_snap_error": (
+        "对齐精度：最后差几度以内直接贴到相机方向。",
+        "它不决定能不能边走；建议初始保持 2-3°。",
+    ),
+    "motion_gait_start_heading_error": (
+        "边走转向：方向差在这个范围内，WASD 边走边转。",
+        "例：相机转 15°，机器人应继续走并慢慢转过去。",
+    ),
+    "motion_gait_stop_heading_error": (
+        "原地转向：方向差超过这里，才先停下原地转。",
+        "用于接近反向时避免边走边硬拧摔倒。",
+    ),
+}
+
+
+def _control_stem_from_adjust_action(action: str) -> str:
+    for suffix in ("_down", "_up", "_value"):
+        if action.endswith(suffix):
+            return action[: -len(suffix)]
+    return action
+
+
+def _video_field_from_action(action: str) -> str | None:
+    if not action.startswith("video_"):
+        return None
+    for suffix in ("_down", "_up", "_value"):
+        if action.endswith(suffix):
+            return action[len("video_") : -len(suffix)]
+    if action == "video_camera_distance_cm_slider":
+        return "camera_distance_cm"
     return None
+
+
+def tooltip_lines_for_action(action: str | None) -> tuple[str, ...]:
+    """Return concise hover-only Chinese help for a panel target."""
+
+    if not action:
+        return ()
+    if action in _BASIC_TOOLTIP_LINES:
+        return _BASIC_TOOLTIP_LINES[action]
+    for tab, label, description, _target_page in _PANEL_DIRECTORY_ENTRIES:
+        if action == tab:
+            return (f"{label}：{description}",)
+    if action in _MOVEMENT_MODE_ACTIONS:
+        movement_mode = action.removeprefix("movement_mode_")
+        return _MOVEMENT_MODE_TOOLTIP_LINES.get(movement_mode, ())
+    stem = _control_stem_from_adjust_action(action)
+    if stem in _MOTION_TOOLTIP_LINES:
+        return _MOTION_TOOLTIP_LINES[stem]
+    if action.startswith("locomotion_policy_"):
+        return ("运动策略槽：当前稳定版只保留 SONIC。",)
+    if action.startswith("recovery_policy_"):
+        return ("起身策略槽：当前稳定版默认关闭，仅保留状态位。",)
+    if action.startswith("creative_item_"):
+        return ("创造物品：点击后在机器人前方生成调试物体。",)
+    if action.startswith("navigation_destination_"):
+        return ("星体导航：点击后安全重载到对应星体/地图；不是无缝切图。",)
+    if action.startswith("function_file_"):
+        return ("函数文件：点击进入详情页；文件内容可在目录中热编辑。",)
+    if action.startswith("function_preset_"):
+        try:
+            index = int(action.rsplit("_", 1)[1])
+            label, command = _FUNCTION_PRESETS[index]
+        except (IndexError, ValueError):
+            return ("预置函数：点击后提交一组恢复/姿态命令。",)
+        return (f"{label}：提交 {command}",)
+    if action == "native_mode_auto":
+        return (
+            "AUTO：" + native_mode_description_zh(None),
+            "自动合并 0-3，由运动输入选择空闲/走/跑。",
+        )
+    if action.startswith("native_mode_"):
+        try:
+            index = int(action.rsplit("_", 1)[1])
+        except ValueError:
+            return ()
+        if index not in _NATIVE_MODE_BUTTON_INDICES:
+            return ()
+        if index == 7:
+            return (
+                "SONIC 7：静态俯卧；也可按住 X 临时进入。",
+                "趴下AUTO：X 空闲=7，X+WASD=8 爬行。",
+            )
+        if index == 8:
+            return (
+                "SONIC 8：趴下前进/爬行；也可按住 X+WASD 临时进入。",
+                "松开 X 会回到普通 AUTO。",
+            )
+        return (
+            f"SONIC {index}：{native_mode_description_zh(index)}",
+            f"点击提交 /sonic mode {index}。",
+        )
+    video_field = _video_field_from_action(action)
+    if video_field is not None:
+        label = _VIDEO_SETTING_LABELS.get(video_field, video_field)
+        if video_field == "camera_distance_min_cm":
+            return (f"{label}：相机距离允许的最近值；可点击数字直接输入。",)
+        if video_field == "camera_distance_max_cm":
+            return (f"{label}：相机距离允许的最远值；可点击数字直接输入。",)
+        return (f"{label}：调整下一次运行使用的视频/相机设置。",)
+    return ()
 
 
 @dataclass(frozen=True)
@@ -1173,6 +1938,7 @@ class StrategyPolicyModel:
     available: bool
     display_name: str | None = None
     unavailable_reason: str | None = None
+    switch_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1208,12 +1974,17 @@ class StrategyLoadoutModel:
         )
         if policy_id == selected:
             return False
-        return any(
-            candidate.policy_id == policy_id
-            and candidate.available
-            and candidate.resident
-            for candidate in candidates
-        )
+        for candidate in candidates:
+            if candidate.policy_id != policy_id or not candidate.available:
+                continue
+            if candidate.resident:
+                return True
+            if (
+                slot == "locomotion"
+                and candidate.switch_mode == "paused_boundary_restart"
+            ):
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -1316,7 +2087,7 @@ def startup_loading_model(state: dict[str, object]) -> StartupLoadingModel:
     if isinstance(frame_rate_raw, bool) or not isinstance(frame_rate_raw, (int, float)):
         media_frame_rate_hz = _STARTUP_MEDIA_FRAME_RATE_HZ
     else:
-        media_frame_rate_hz = max(0.1, min(12.0, float(frame_rate_raw)))
+        media_frame_rate_hz = max(0.1, min(30.0, float(frame_rate_raw)))
     return StartupLoadingModel(
         True,
         message[:80],
@@ -1420,7 +2191,13 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
             None,
         )
     status = raw.get("status")
-    if status not in {"unavailable", "loading", "ready", "switching"}:
+    if status not in {
+        "unavailable",
+        "loading",
+        "ready",
+        "switching",
+        "locked",
+    }:
         status = "unavailable"
     active_slot = raw.get("active_slot")
     if active_slot not in {"locomotion", "recovery"}:
@@ -1468,6 +2245,11 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                                     )
                                     else None
                                 ),
+                                switch_mode=(
+                                    candidate.get("switch_mode")
+                                    if isinstance(candidate.get("switch_mode"), str)
+                                    else None
+                                ),
                             )
                         )
             elif slot_id == "recovery" and isinstance(selected, str):
@@ -1498,6 +2280,11 @@ def strategy_loadout_model(state: dict[str, object]) -> StrategyLoadoutModel:
                                     if isinstance(
                                         candidate.get("unavailable_reason"), str
                                     )
+                                    else None
+                                ),
+                                switch_mode=(
+                                    candidate.get("switch_mode")
+                                    if isinstance(candidate.get("switch_mode"), str)
                                     else None
                                 ),
                             )
@@ -2308,7 +3095,6 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
     for destination in destinations:
         contract = (
             destination.body_name,
-            destination.runtime_status,
             destination.gravity_m_s2,
             destination.atmosphere,
         )
@@ -2319,7 +3105,10 @@ def celestial_navigation_model(state: dict[str, object]) -> CelestialNavigationM
         if (
             body_model is None
             or body_model.display_name != destination.body_name
-            or body_model.runtime_status != destination.runtime_status
+            or (
+                destination.runtime_status == "active"
+                and body_model.runtime_status != "active"
+            )
         ):
             return fallback
     if (
@@ -2534,8 +3323,22 @@ class MotionSettingsPanelModel:
     def value(self, gear: str, field: str) -> float:
         if gear == "turn" and field == MAX_TURN_RATE_FIELD:
             return self.settings.value_for_path(MAX_TURN_RATE_PATH)
+        if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+            return self.settings.value_for_path(KEYBOARD_TURN_RATE_PATH)
+        if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+            return self.settings.value_for_path(KEYBOARD_TURN_BOOST_RATE_PATH)
+        if gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+            return self.settings.value_for_path(BFM_TURN_COMMAND_YAW_LIMIT_PATH)
+        if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+            return self.settings.value_for_path(KEYBOARD_SPEED_CAP_PATH)
+        if gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+            return self.settings.value_for_path(GAIT_START_HEADING_ERROR_PATH)
+        if gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+            return self.settings.value_for_path(GAIT_STOP_HEADING_ERROR_PATH)
         if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
             return self.settings.value_for_path(KEYBOARD_LOOK_RATE_PATH)
+        if gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+            return self.settings.value_for_path(CAMERA_HEADING_SNAP_ERROR_PATH)
         return self.settings.value_for_path(f"control.motion.gears.{gear}.{field}")
 
     def action_enabled(self, action: str) -> bool:
@@ -2567,8 +3370,26 @@ class VideoSettingsPanelModel:
         if detail is None or not self.available or self.error is not None:
             return None
         field, direction = detail
-        presets = _VIDEO_SETTING_PRESETS[field]
         current = self.value(field)
+        if field in {"camera_distance_min_cm", "camera_distance_max_cm"}:
+            if not isinstance(current, int):
+                return None
+            lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
+            target = max(lower, min(upper, current + 10 * direction))
+            values = dict(self.next_launch)
+            values[field] = target
+            distance = values["camera_distance_cm"]
+            minimum = values["camera_distance_min_cm"]
+            maximum = values["camera_distance_max_cm"]
+            if not (
+                isinstance(distance, int)
+                and isinstance(minimum, int)
+                and isinstance(maximum, int)
+                and minimum <= distance <= maximum
+            ):
+                return None
+            return target if target != current else None
+        presets = _VIDEO_SETTING_PRESETS[field]
         try:
             index = presets.index(current)
         except ValueError:
@@ -2576,9 +3397,23 @@ class VideoSettingsPanelModel:
         target = index + direction
         return presets[target] if 0 <= target < len(presets) else None
 
+    def camera_distance_value_from_slider(
+        self,
+        rectangle: tuple[int, int, int, int],
+        root_x: int,
+    ) -> int | None:
+        if not self.available or self.error is not None:
+            return None
+        minimum = self.value("camera_distance_min_cm")
+        maximum = self.value("camera_distance_max_cm")
+        if not isinstance(minimum, int) or not isinstance(maximum, int):
+            return None
+        return camera_distance_from_slider(rectangle, root_x, minimum, maximum)
+
 
 def _canonical_video_settings_mapping(value: object) -> dict[str, object] | None:
-    if not isinstance(value, dict) or set(value) != set(_VIDEO_SETTING_PRESETS):
+    expected_fields = set(_VIDEO_SETTING_PRESETS) | set(_VIDEO_CAMERA_DISTANCE_FIELDS)
+    if not isinstance(value, dict) or set(value) != expected_fields:
         return None
     result: dict[str, object] = {}
     for field, presets in _VIDEO_SETTING_PRESETS.items():
@@ -2586,6 +3421,22 @@ def _canonical_video_settings_mapping(value: object) -> dict[str, object] | None
         if candidate not in presets or type(candidate) is not type(presets[0]):
             return None
         result[field] = candidate
+    lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
+    for field in _VIDEO_CAMERA_DISTANCE_FIELDS:
+        candidate = value.get(field)
+        if isinstance(candidate, bool) or not isinstance(candidate, int):
+            return None
+        if not lower <= candidate <= upper:
+            return None
+        result[field] = candidate
+    if result["camera_distance_min_cm"] > result["camera_distance_max_cm"]:
+        return None
+    if not (
+        result["camera_distance_min_cm"]
+        <= result["camera_distance_cm"]
+        <= result["camera_distance_max_cm"]
+    ):
+        return None
     return result
 
 
@@ -2612,6 +3463,13 @@ def video_settings_panel_model(state: dict[str, object]) -> VideoSettingsPanelMo
         current = {
             field: presets[0] for field, presets in _VIDEO_SETTING_PRESETS.items()
         }
+        current.update(
+            {
+                "camera_distance_cm": 150,
+                "camera_distance_min_cm": 80,
+                "camera_distance_max_cm": 500,
+            }
+        )
     if next_launch is None:
         next_launch = dict(current)
     return VideoSettingsPanelModel(
@@ -2705,17 +3563,32 @@ def motion_step_target(
     if not model.available:
         return None
     gear, field, direction = details
-    if gear == "camera" and model.camera_control_available is False:
+    if (
+        gear == "camera"
+        and field == KEYBOARD_LOOK_RATE_FIELD
+        and model.camera_control_available is False
+    ):
         return None
-    path = (
-        MAX_TURN_RATE_PATH
-        if gear is None
-        else (
-            KEYBOARD_LOOK_RATE_PATH
-            if gear == "camera"
-            else f"control.motion.gears.{gear}.{field}"
-        )
-    )
+    if gear is None:
+        path = MAX_TURN_RATE_PATH
+    elif gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
+        path = KEYBOARD_LOOK_RATE_PATH
+    elif gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+        path = CAMERA_HEADING_SNAP_ERROR_PATH
+    elif gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+        path = KEYBOARD_SPEED_CAP_PATH
+    elif gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+        path = KEYBOARD_TURN_RATE_PATH
+    elif gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+        path = KEYBOARD_TURN_BOOST_RATE_PATH
+    elif gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+        path = BFM_TURN_COMMAND_YAW_LIMIT_PATH
+    elif gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+        path = GAIT_START_HEADING_ERROR_PATH
+    elif gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+        path = GAIT_STOP_HEADING_ERROR_PATH
+    else:
+        path = f"control.motion.gears.{gear}.{field}"
     current = model.settings.value_for_path(path)
     target = step_motion_speed(model.settings, path, direction)
     return None if math.isclose(target, current, rel_tol=0.0, abs_tol=1e-12) else target
@@ -2736,10 +3609,45 @@ def motion_step_command(
             f"/data modify entity @s {MAX_TURN_RATE_PATH} "
             f"set value {target:.2f}"
         )
-    if gear == "camera":
+    if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+        return (
+            f"/data modify entity @s {KEYBOARD_TURN_RATE_PATH} "
+            f"set value {target:.2f}"
+        )
+    if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+        return (
+            f"/data modify entity @s {KEYBOARD_TURN_BOOST_RATE_PATH} "
+            f"set value {target:.2f}"
+        )
+    if gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+        return (
+            f"/data modify entity @s {BFM_TURN_COMMAND_YAW_LIMIT_PATH} "
+            f"set value {target:.2f}"
+        )
+    if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
         return (
             f"/data modify entity @s {KEYBOARD_LOOK_RATE_PATH} "
             f"set value {target:.2f}"
+        )
+    if gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+        return (
+            f"/data modify entity @s {CAMERA_HEADING_SNAP_ERROR_PATH} "
+            f"set value {target:.10f}"
+        )
+    if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+        return (
+            f"/data modify entity @s {KEYBOARD_SPEED_CAP_PATH} "
+            f"set value {target:.2f}"
+        )
+    if gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+        return (
+            f"/data modify entity @s {GAIT_START_HEADING_ERROR_PATH} "
+            f"set value {target:.10f}"
+        )
+    if gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+        return (
+            f"/data modify entity @s {GAIT_STOP_HEADING_ERROR_PATH} "
+            f"set value {target:.10f}"
         )
     return (
         f"/data modify entity @s control.motion.gears.{gear}.{field} "
@@ -2758,12 +3666,33 @@ def motion_value_label(
 
     if gear == "turn" and field == MAX_TURN_RATE_FIELD:
         value = model.value(gear, field)
-        return f"转{value:.2f}" if compact else f"转向上限 {value:.2f} rad/s"
+        return f"上{value:.2f}" if compact else f"全局转向上限 {value:.2f} rad/s"
+    if gear == "turn" and field == KEYBOARD_TURN_RATE_FIELD:
+        value = model.value(gear, field)
+        return f"单{value:.2f}" if compact else f"单按 Q/E {value:.2f} rad/s"
+    if gear == "turn" and field == KEYBOARD_TURN_BOOST_RATE_FIELD:
+        value = model.value(gear, field)
+        return f"双{value:.2f}" if compact else f"双击 Q/E {value:.2f} rad/s"
+    if gear == "bfm" and field == BFM_TURN_COMMAND_YAW_LIMIT_FIELD:
+        value = model.value(gear, field)
+        return f"BFM{value:.2f}" if compact else f"BFM纯转限幅 {value:.2f} rad/s"
     if gear == "camera" and field == KEYBOARD_LOOK_RATE_FIELD:
         if model.camera_control_available is False:
             return "相机不可用" if compact else "方向键相机不可用"
         value = model.value(gear, field)
         return f"相{value:.0f}" if compact else f"相机标称转速 {value:.0f}"
+    if gear == "camera" and field == CAMERA_HEADING_SNAP_ERROR_FIELD:
+        value_deg = math.degrees(model.value(gear, field))
+        return f"准{value_deg:.0f}°" if compact else f"对齐精度 {value_deg:.0f}°"
+    if gear == "keyboard" and field == KEYBOARD_SPEED_CAP_FIELD:
+        value = model.value(gear, field)
+        return f"限{value:.2f}" if compact else f"键盘速度上限 {value:.2f} m/s"
+    if gear == "gait" and field == GAIT_START_HEADING_ERROR_FIELD:
+        value_deg = math.degrees(model.value(gear, field))
+        return f"走≤{value_deg:.0f}°" if compact else f"边走≤{value_deg:.0f}°"
+    if gear == "gait" and field == GAIT_STOP_HEADING_ERROR_FIELD:
+        value_deg = math.degrees(model.value(gear, field))
+        return f"停≥{value_deg:.0f}°" if compact else f"原地≥{value_deg:.0f}°"
     if (gear, field) not in _MOTION_CONTROL_SPECS:
         raise ValueError("unsupported motion value label")
     value = model.value(gear, field)
@@ -2835,6 +3764,38 @@ class CommandConsoleStatus:
             self.restart_required,
             self.outcome_unknown,
         )
+
+
+@dataclass(frozen=True)
+class FunctionLibraryModel:
+    directory: str | None
+    available: bool
+    open_available: bool
+    files: tuple[str, ...]
+    open_error: str | None
+    open_count: int
+
+
+def function_library_model(state: dict[str, object]) -> FunctionLibraryModel:
+    raw = state.get("function_library")
+    raw = raw if isinstance(raw, dict) else {}
+    directory = _bounded_status_text(raw.get("directory"), maximum=512)
+    files_value = raw.get("files")
+    files: list[str] = []
+    if isinstance(files_value, list):
+        for item in files_value[:64]:
+            name = _bounded_status_text(item, maximum=160)
+            if name is not None:
+                files.append(name)
+    open_count = raw.get("open_count")
+    return FunctionLibraryModel(
+        directory=directory,
+        available=raw.get("available") is True,
+        open_available=raw.get("open_available") is True,
+        files=tuple(files),
+        open_error=_bounded_status_text(raw.get("open_error"), maximum=256),
+        open_count=open_count if type(open_count) is int and open_count >= 0 else 0,
+    )
 
 
 def _command_console_candidate(state: dict[str, object]) -> dict[str, object]:
@@ -3074,6 +4035,125 @@ def runtime_pause_panel_model(state: dict[str, object]) -> RuntimePausePanelMode
 class CommandEditOutcome:
     action: str | None = None
     command: str | None = None
+
+
+@dataclass(frozen=True)
+class CameraDistanceBoundEditOutcome:
+    action: str | None = None
+    field: str | None = None
+    value: int | None = None
+
+
+class CameraDistanceBoundEditor:
+    """Integer editor for live camera distance slider bounds."""
+
+    def __init__(self) -> None:
+        self.field: str | None = None
+        self.text = ""
+        self.revision = 0
+
+    @property
+    def editing(self) -> bool:
+        return self.field is not None
+
+    def _changed(self) -> None:
+        self.revision += 1
+
+    def begin(self, field: str, value: object) -> bool:
+        if field not in _VIDEO_CAMERA_DISTANCE_BOUND_FIELDS:
+            return False
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+        self.field = field
+        self.text = str(value)
+        self._changed()
+        return True
+
+    def end(self) -> bool:
+        if not self.editing:
+            return False
+        self.field = None
+        self.text = ""
+        self._changed()
+        return True
+
+    def _submit(
+        self,
+        model: VideoSettingsPanelModel | None,
+    ) -> CameraDistanceBoundEditOutcome:
+        field = self.field
+        if (
+            field is None
+            or model is None
+            or not model.available
+            or model.error is not None
+        ):
+            return CameraDistanceBoundEditOutcome()
+        if not self.text or not self.text.isascii() or not self.text.isdecimal():
+            return CameraDistanceBoundEditOutcome()
+        value = int(self.text, 10)
+        lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
+        if not lower <= value <= upper:
+            return CameraDistanceBoundEditOutcome()
+        values = dict(model.next_launch)
+        values[field] = value
+        distance = values.get("camera_distance_cm")
+        minimum = values.get("camera_distance_min_cm")
+        maximum = values.get("camera_distance_max_cm")
+        if not (
+            isinstance(distance, int)
+            and isinstance(minimum, int)
+            and isinstance(maximum, int)
+            and minimum <= distance <= maximum
+        ):
+            return CameraDistanceBoundEditOutcome()
+        self.end()
+        return CameraDistanceBoundEditOutcome(
+            action="submit",
+            field=field,
+            value=value,
+        )
+
+    def handle_key(
+        self,
+        *,
+        keysym: int,
+        printable: str,
+        model: VideoSettingsPanelModel | None,
+    ) -> CameraDistanceBoundEditOutcome:
+        if not self.editing:
+            return CameraDistanceBoundEditOutcome()
+        if keysym == _XK_ESCAPE:
+            self.end()
+            return CameraDistanceBoundEditOutcome(action="end")
+        if keysym in {_XK_RETURN, _XK_KP_ENTER}:
+            return self._submit(model)
+        if keysym == _XK_BACK_SPACE:
+            if self.text:
+                self.text = self.text[:-1]
+                self._changed()
+            return CameraDistanceBoundEditOutcome()
+        if keysym == _XK_DELETE:
+            if self.text:
+                self.text = ""
+                self._changed()
+            return CameraDistanceBoundEditOutcome()
+        if printable and printable.isascii():
+            digits = "".join(
+                character for character in printable if character.isdigit()
+            )
+            available = 3 - len(self.text)
+            addition = digits[:available]
+            if addition:
+                self.text += addition
+                self._changed()
+        return CameraDistanceBoundEditOutcome()
+
+    def display_text(self, field: str, fallback: object) -> str:
+        if self.field == field:
+            text = self.text if self.text else ""
+            return f"{text}|"
+        return str(fallback)
 
 
 class CommandLineEditor:
@@ -3475,7 +4555,12 @@ class PointerActionPublisher:
     def publish(self, action: str) -> None:
         """Compatibility entry point for the existing pointer actions."""
 
-        if action not in _PANEL_ACTIONS:
+        if (
+            action not in _PANEL_ACTIONS
+            and action not in _MOVEMENT_MODE_ACTIONS
+            and action not in _MOTION_STEP_ACTIONS
+            and action != "functions_open_dir"
+        ):
             raise ValueError(f"unsupported pointer action: {action}")
         self._publish("action", {"action": action})
 
@@ -3496,6 +4581,19 @@ class PointerActionPublisher:
         ):
             raise ValueError("command submit text must be bounded printable ASCII")
         self._publish("command_submit", {"command": command})
+
+    def publish_command_quick_submit(self, command: str) -> None:
+        if (
+            not isinstance(command, str)
+            or not command
+            or len(command) > MAX_COMMAND_CHARS
+            or any(
+                ord(character) < 0x20 or ord(character) > 0x7E
+                for character in command
+            )
+        ):
+            raise ValueError("quick command text must be bounded printable ASCII")
+        self._publish("command_quick_submit", {"command": command})
 
     def publish_movement_mode_select(self, movement_mode: object) -> None:
         mode = validate_movement_mode(movement_mode)
@@ -3531,7 +4629,7 @@ class PointerActionPublisher:
         self._publish("creative_spawn", {"item_id": item_id})
 
     def publish_navigation_refresh(self) -> None:
-        self._publish("navigation_refresh", {})
+        self._publish("action", {"action": "navigation_refresh"})
 
     def publish_navigation_select(self, destination_id: str) -> None:
         normalized = _celestial_identifier(destination_id, maximum=64)
@@ -3550,10 +4648,22 @@ class PointerActionPublisher:
         expected_revision: int,
     ) -> None:
         presets = _VIDEO_SETTING_PRESETS.get(field)
+        camera_distance_field = field in _VIDEO_CAMERA_DISTANCE_FIELDS
+        lower, upper = _VIDEO_CAMERA_DISTANCE_RANGE
         if (
-            presets is None
-            or value not in presets
-            or type(value) is not type(presets[0])
+            (
+                presets is None
+                and not (
+                    camera_distance_field
+                    and not isinstance(value, bool)
+                    and isinstance(value, int)
+                    and lower <= value <= upper
+                )
+            )
+            or (
+                presets is not None
+                and (value not in presets or type(value) is not type(presets[0]))
+            )
             or type(expected_revision) is not int
             or not 0 <= expected_revision < 2**63
         ):
@@ -3684,10 +4794,11 @@ class X11CalibrationOverlay:
         self._install_x_error_handler()
         self._screen = int(self._x11.XDefaultScreen(self._display))
         self._root = int(self._x11.XRootWindow(self._display, self._screen))
-        self._visual = (
-            self._x11.XDefaultVisual(self._display, self._screen)
-            if self._xft is not None
-            else None
+        self._visual = self._x11.XDefaultVisual(self._display, self._screen)
+        self._depth = (
+            int(self._x11.XDefaultDepth(self._display, self._screen))
+            if hasattr(self._x11, "XDefaultDepth")
+            else 24
         )
         self._colormap = int(
             self._x11.XDefaultColormap(self._display, self._screen)
@@ -3731,9 +4842,13 @@ class X11CalibrationOverlay:
         self._font_slider_dragging = False
         self._pending_font_slider_action: str | None = None
         self._pending_font_slider_size: int | None = None
+        self._camera_distance_slider_dragging = False
+        self._pending_camera_distance_cm: int | None = None
         self._colours: dict[str, int] = {}
         self._startup_media_frame_dir: str | None = None
-        self._startup_media_frames: tuple[StartupMediaFrame, ...] = ()
+        self._startup_media_frame_paths: tuple[Path, ...] = ()
+        self._startup_media_cached_path: str | None = None
+        self._startup_media_cached_frame: StartupMediaFrame | None = None
         self._startup_media_colour_cache: dict[tuple[int, int, int], int] = {}
         self._visible = False
         self._cursor_visible = False
@@ -3745,13 +4860,16 @@ class X11CalibrationOverlay:
         self._last_inventory_model: CreativeInventoryModel | None = None
         self._last_navigation_model: CelestialNavigationModel | None = None
         self._last_video_model: VideoSettingsPanelModel | None = None
+        self._last_function_model: FunctionLibraryModel | None = None
         self._last_build_info_model: BuildInfoPanelModel | None = None
         self._last_startup_loading_model = startup_loading_model({})
         self._last_runtime_pause_model = runtime_pause_panel_model({})
         self._last_page: str | None = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = -1
+        self._last_video_distance_bound_revision = -1
         self._last_pointer: tuple[int, int] | None = None
+        self._last_hover_action: str | None = None
         self._last_raise_s: float | None = None
         self._pressed_action: str | None = None
         self._pressed_window: int | None = None
@@ -3759,17 +4877,30 @@ class X11CalibrationOverlay:
         self._pressed_runtime_pause_epoch: int | None = None
         self._polled_pointer_valid = False
         self._polled_left_pressed = False
+        self._polled_left_mask = 0
         self._polled_left_initialized = False
         self._polled_left_was_down = False
+        self._polled_pressed_action: str | None = None
+        self._polled_pressed_runtime_pause_target: str | None = None
+        self._polled_pressed_runtime_pause_epoch: int | None = None
         self._polled_left_transition_count = 0
         self._polled_left_fallback_events = 0
+        self._polled_left_emitted_intents = 0
+        self._last_polled_action: str | None = None
+        self._cooked_left_button_events = 0
+        self._last_cooked_action: str | None = None
         self._recovered_pause_release_count = 0
         self._pointer_recenter_count = 0
         self._target_window: int | None = None
         self._command_editor = CommandLineEditor()
+        self._video_distance_bound_editor = CameraDistanceBoundEditor()
         self._keyboard_grabbed = False
         self._deferred_ungrab_keycode: int | None = None
-        self._active_page = "loadout"
+        self._active_page = _PANEL_DIRECTORY_PAGE
+        self._functions_subpage = "home"
+        self._selected_function_name: str | None = None
+        self._last_functions_subpage: str | None = None
+        self._last_selected_function_name: str | None = None
         self._create_windows()
 
     def _configure_signatures(self) -> None:
@@ -4044,6 +5175,46 @@ class X11CalibrationOverlay:
             function = getattr(self._x11, name)
             function.argtypes = argtypes
             function.restype = restype
+        optional_signatures = {
+            "XDefaultDepth": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_int),
+            "XCreateImage": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                ],
+                ctypes.c_void_p,
+            ),
+            "XPutImage": (
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_ulong,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                    ctypes.c_uint,
+                ],
+                ctypes.c_int,
+            ),
+            "XDestroyImage": ([ctypes.c_void_p], ctypes.c_int),
+        }
+        for name, (argtypes, restype) in optional_signatures.items():
+            if not hasattr(self._x11, name):
+                continue
+            function = getattr(self._x11, name)
+            function.argtypes = argtypes
+            function.restype = restype
         fix_signatures = {
             "XFixesQueryExtension": (
                 [
@@ -4287,6 +5458,25 @@ class X11CalibrationOverlay:
             "polled_left_fallback_events": getattr(
                 self, "_polled_left_fallback_events", 0
             ),
+            "polled_left_emitted_intents": getattr(
+                self, "_polled_left_emitted_intents", 0
+            ),
+            "polled_pointer_valid": getattr(self, "_polled_pointer_valid", False),
+            "polled_left_pressed": getattr(self, "_polled_left_pressed", False),
+            "polled_left_mask": getattr(self, "_polled_left_mask", 0),
+            "polled_left_initialized": getattr(
+                self, "_polled_left_initialized", False
+            ),
+            "polled_left_was_down": getattr(self, "_polled_left_was_down", False),
+            "polled_pressed_action": getattr(
+                self, "_polled_pressed_action", None
+            ),
+            "last_polled_action": getattr(self, "_last_polled_action", None),
+            "last_pointer": getattr(self, "_last_pointer", None),
+            "cooked_left_button_events": getattr(
+                self, "_cooked_left_button_events", 0
+            ),
+            "last_cooked_action": getattr(self, "_last_cooked_action", None),
             "recovered_pause_release_count": getattr(
                 self, "_recovered_pause_release_count", 0
             ),
@@ -4510,8 +5700,10 @@ class X11CalibrationOverlay:
                     self._make_click_through(window)
                 if name == "cursor-shadow":
                     self._set_bounding_shape(window, _CURSOR_SHADOW_RECTANGLES)
+                    self._make_click_through(window)
                 elif name == "cursor":
                     self._set_bounding_shape(window, _CURSOR_FOREGROUND_RECTANGLES)
+                    self._make_click_through(window)
             panel = self._windows["panel"]
             gc = self._x11.XCreateGC(self._display, panel, 0, None)
             if not gc:
@@ -4879,23 +6071,69 @@ class X11CalibrationOverlay:
         ):
             self._polled_pointer_valid = False
             self._polled_left_pressed = False
+            self._polled_left_mask = 0
             self._polled_left_initialized = False
             return None
         self._polled_pointer_valid = True
+        self._polled_left_mask = int(mask.value)
         self._polled_left_pressed = bool(mask.value & _BUTTON_1_MASK)
         return (root_x.value, root_y.value)
 
-    def _queue_polled_left_transition(self, *, cooked_button_seen: bool) -> None:
+    def _handle_function_navigation_action(self, action: str | None) -> bool:
+        if getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "functions":
+            return False
+        if action == "function_nav_files":
+            self._functions_subpage = "files"
+            self._last_functions_subpage = None
+            return True
+        if action == "function_nav_presets":
+            self._functions_subpage = "presets"
+            self._last_functions_subpage = None
+            return True
+        if action == "function_nav_sonic":
+            self._functions_subpage = "sonic"
+            self._last_functions_subpage = None
+            return True
+        if action == "function_back":
+            self._functions_subpage = (
+                "files"
+                if getattr(self, "_functions_subpage", "home") == "detail"
+                else "home"
+            )
+            self._last_functions_subpage = None
+            return True
+        if action is not None and action.startswith("function_file_"):
+            try:
+                index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return True
+            function_model = getattr(self, "_last_function_model", None)
+            files = function_model.files if function_model is not None else ()
+            if 0 <= index < len(files):
+                self._selected_function_name = files[index]
+                self._functions_subpage = "detail"
+                self._last_functions_subpage = None
+                self._last_selected_function_name = None
+            return True
+        return False
+
+    def _queue_polled_left_transition(
+        self,
+        publisher: PointerActionPublisher,
+        *,
+        cooked_button_seen: bool,
+    ) -> int:
         """Recover clicks whose cooked X11 events are held by another client.
 
         Remote desktop/browser stacks can leave the Matrix override-redirect
         panel visible while an older client still owns the cooked pointer
         grab.  XQueryPointer nevertheless exposes the authoritative core
-        Button1 level.  Convert only observed level edges into this client's
-        own event queue; ordinary cooked events remain authoritative and
+        Button1 level.  Convert only observed level edges directly into the
+        same panel intents; ordinary cooked events remain authoritative and
         suppress the fallback for that frame.
         """
 
+        emitted = 0
         valid = bool(getattr(self, "_polled_pointer_valid", False))
         current = bool(getattr(self, "_polled_left_pressed", False))
         initialized = bool(getattr(self, "_polled_left_initialized", False))
@@ -4906,59 +6144,320 @@ class X11CalibrationOverlay:
             or getattr(self, "_last_pointer", None) is None
         ):
             self._polled_left_initialized = False
-            return
+            self._polled_pressed_action = None
+            self._polled_pressed_runtime_pause_target = None
+            self._polled_pressed_runtime_pause_epoch = None
+            return emitted
         if cooked_button_seen:
             self._polled_left_initialized = True
             self._polled_left_was_down = current
-            return
+            if not current:
+                self._polled_pressed_action = None
+                self._polled_pressed_runtime_pause_target = None
+                self._polled_pressed_runtime_pause_epoch = None
+            return emitted
+
+        root_x, root_y = self._last_pointer
+        layout = self._last_layout
+        action = panel_action_at(
+            layout,
+            root_x,
+            root_y,
+            page=getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE),
+            function_subpage=getattr(self, "_functions_subpage", "home"),
+        )
+        self._last_polled_action = action
+        if getattr(
+            self,
+            "_last_startup_loading_model",
+            startup_loading_model({}),
+        ).active:
+            action = None
+
         if not initialized:
-            # A button already held when the panel appears cannot prove that
-            # its press began on a visible Matrix control.
             self._polled_left_initialized = True
             self._polled_left_was_down = current
-            return
+            if current:
+                self._polled_pressed_action = action
+                self._polled_pressed_runtime_pause_target = None
+                self._polled_pressed_runtime_pause_epoch = None
+                if action == "runtime_pause":
+                    pause_model = getattr(self, "_last_runtime_pause_model", None)
+                    pause_target = (
+                        pause_model.pause_target
+                        if isinstance(pause_model, RuntimePausePanelModel)
+                        else None
+                    )
+                    if pause_target is not None:
+                        self._polled_pressed_runtime_pause_target = pause_target
+                        self._polled_pressed_runtime_pause_epoch = pause_model.epoch
+            return emitted
+
         previous = bool(getattr(self, "_polled_left_was_down", current))
         self._polled_left_was_down = current
         if current == previous:
-            return
+            return emitted
 
-        root_x, root_y = self._last_pointer
-        panel_x, panel_y, _panel_width, _panel_height = self._last_layout["panel"]
-        event = XEvent()
-        event.type = _BUTTON_PRESS if current else _BUTTON_RELEASE
-        event.xbutton.type = event.type
-        event.xbutton.send_event = 1
-        event.xbutton.display = self._display
-        event.xbutton.window = self._windows["panel"]
-        event.xbutton.root = self._root
-        event.xbutton.x = root_x - panel_x
-        event.xbutton.y = root_y - panel_y
-        event.xbutton.x_root = root_x
-        event.xbutton.y_root = root_y
-        event.xbutton.state = 0 if current else _BUTTON_1_MASK
-        event.xbutton.button = 1
-        event.xbutton.same_screen = 1
-        event_mask = (
-            _BUTTON_PRESS_MASK if current else _BUTTON_RELEASE_MASK
-        )
-        if (
-            self._x11.XSendEvent(
-                self._display,
-                self._windows["panel"],
-                0,
-                event_mask,
-                ctypes.byref(event),
-            )
-            == 0
-        ):
-            raise RuntimeError("XSendEvent rejected pointer-level fallback")
-        self._x11.XFlush(self._display)
         self._polled_left_transition_count = (
             getattr(self, "_polled_left_transition_count", 0) + 1
         )
         self._polled_left_fallback_events = (
             getattr(self, "_polled_left_fallback_events", 0) + 1
         )
+        if current:
+            self._polled_pressed_action = action
+            self._polled_pressed_runtime_pause_target = None
+            self._polled_pressed_runtime_pause_epoch = None
+            if action == "runtime_pause":
+                pause_model = getattr(self, "_last_runtime_pause_model", None)
+                pause_target = (
+                    pause_model.pause_target
+                    if isinstance(pause_model, RuntimePausePanelModel)
+                    else None
+                )
+                if pause_target is not None:
+                    self._polled_pressed_runtime_pause_target = pause_target
+                    self._polled_pressed_runtime_pause_epoch = pause_model.epoch
+            return emitted
+
+        pressed = self._polled_pressed_action
+        pressed_pause_target = self._polled_pressed_runtime_pause_target
+        pressed_pause_epoch = self._polled_pressed_runtime_pause_epoch
+        self._polled_pressed_action = None
+        self._polled_pressed_runtime_pause_target = None
+        self._polled_pressed_runtime_pause_epoch = None
+        if pressed is None or action != pressed or not self._visible:
+            return emitted
+        if self._video_distance_bound_editing() and action not in (
+            (_BACK_TO_DIRECTORY_ACTION,) + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
+        ):
+            return emitted
+
+        if action == _BACK_TO_DIRECTORY_ACTION:
+            if (
+                getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
+                != _PANEL_DIRECTORY_PAGE
+            ):
+                if self._force_end_command_editing(publisher):
+                    emitted += 1
+                self._force_end_video_distance_bound_editing()
+                self._active_page = _PANEL_DIRECTORY_PAGE
+                self._functions_subpage = "home"
+                self._last_page = None
+                self._last_functions_subpage = None
+            return emitted
+        if action in _PANEL_TABS:
+            next_page = action.removeprefix("tab_")
+            if next_page != getattr(
+                self,
+                "_active_page",
+                _PANEL_DIRECTORY_PAGE,
+            ):
+                if self._force_end_command_editing(publisher):
+                    emitted += 1
+                self._force_end_video_distance_bound_editing()
+                self._active_page = next_page
+                if next_page == "functions":
+                    self._functions_subpage = "home"
+                self._last_page = None
+                self._last_functions_subpage = None
+            return emitted
+        if self._handle_function_navigation_action(action):
+            return emitted
+        quick_command = self._quick_command_for_current_action(action)
+        if quick_command is not None:
+            if self._quick_command_allowed():
+                publisher.publish_command_quick_submit(quick_command)
+                emitted += 1
+            return emitted
+        if action == "functions_open_dir":
+            panel_model = self._last_panel_model
+            if (
+                panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+            ):
+                publisher.publish(action)
+                emitted += 1
+            return emitted
+        if action == "navigation_refresh":
+            navigation = getattr(self, "_last_navigation_model", None)
+            if (
+                navigation is not None
+                and navigation.refresh_enabled
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish_navigation_refresh()
+                emitted += 1
+            return emitted
+        if action.startswith("navigation_destination_"):
+            navigation = getattr(self, "_last_navigation_model", None)
+            try:
+                destination_index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return emitted
+            if (
+                navigation is not None
+                and destination_index < len(navigation.destinations)
+            ):
+                destination = navigation.destinations[destination_index]
+                if (
+                    navigation.destination_enabled(destination.destination_id)
+                    and self._last_command_status.available
+                    and not self._last_command_status.in_flight
+                    and not self._last_command_status.restart_required
+                    and not self._last_command_status.outcome_unknown
+                    and self._last_command_status.status
+                    not in {"pending", "restarting", "unavailable"}
+                ):
+                    publisher.publish_command_quick_submit(
+                        f"/world {destination.destination_id}"
+                    )
+                    emitted += 1
+            return emitted
+        if action == "runtime_pause":
+            panel_model = self._last_panel_model
+            if (
+                pressed_pause_target is not None
+                and type(pressed_pause_epoch) is int
+                and panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish_runtime_pause(
+                    pressed_pause_target,
+                    expected_epoch=pressed_pause_epoch,
+                )
+                emitted += 1
+            return emitted
+        if action == "quit_game":
+            panel_model = self._last_panel_model
+            if (
+                panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish_game_quit()
+                emitted += 1
+            return emitted
+        if action in _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS:
+            self._begin_video_distance_bound_editing(action)
+            return emitted
+        if action.startswith("recovery_policy_"):
+            strategy = getattr(self, "_last_strategy_model", None)
+            try:
+                policy_index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return emitted
+            if strategy is not None and policy_index < len(strategy.recovery_candidates):
+                candidate = strategy.recovery_candidates[policy_index]
+                if strategy.policy_enabled(candidate.policy_id):
+                    publisher.publish_strategy_select(
+                        "recovery",
+                        candidate.policy_id,
+                    )
+                    emitted += 1
+            return emitted
+        if action.startswith("locomotion_policy_"):
+            strategy = getattr(self, "_last_strategy_model", None)
+            try:
+                policy_index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return emitted
+            if strategy is not None and policy_index < len(
+                strategy.locomotion_candidates
+            ):
+                candidate = strategy.locomotion_candidates[policy_index]
+                if strategy.policy_enabled(candidate.policy_id, slot="locomotion"):
+                    publisher.publish_strategy_select(
+                        "locomotion",
+                        candidate.policy_id,
+                    )
+                    emitted += 1
+            return emitted
+        if action in _MOVEMENT_MODE_ACTIONS:
+            movement_mode = action.removeprefix("movement_mode_")
+            motion_model = getattr(self, "_last_motion_model", None)
+            panel_model = self._last_panel_model
+            if (
+                motion_model is not None
+                and motion_model.available
+                and panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting", "unavailable"}
+            ):
+                publisher.publish(action)
+                emitted += 1
+            return emitted
+        if action in _MOTION_STEP_ACTIONS:
+            motion_model = getattr(self, "_last_motion_model", None)
+            panel_model = self._last_panel_model
+            command = (
+                motion_step_command(motion_model, action)
+                if motion_model is not None
+                else None
+            )
+            if (
+                command is not None
+                and panel_model is not None
+                and not panel_model.restart_requested
+                and panel_model.status != "restarting"
+                and not self._command_editor.editing
+                and not self._command_editor.pending
+                and self._last_command_status.available
+                and not self._last_command_status.in_flight
+                and not self._last_command_status.restart_required
+                and not self._last_command_status.outcome_unknown
+                and self._last_command_status.status
+                not in {"pending", "restarting"}
+            ):
+                publisher.publish(action)
+                emitted += 1
+            return emitted
+        if (
+            self._last_panel_model is not None
+            and self._last_panel_model.action_enabled(action)
+            and not self._command_editor.editing
+            and not self._command_editor.pending
+            and not self._last_command_status.in_flight
+            and not self._last_command_status.restart_required
+            and not self._last_command_status.outcome_unknown
+            and self._last_command_status.status not in {"pending", "restarting"}
+        ):
+            publisher.publish(action)
+            emitted += 1
+        return emitted
 
     def _panel_rectangle(
         self,
@@ -5074,6 +6573,74 @@ class X11CalibrationOverlay:
             large=height >= 38,
             centred_in=(x, y, width, height),
         )
+
+    @staticmethod
+    def _estimated_text_width_px(value: str) -> int:
+        return sum(14 if ord(character) > 0x7F else 8 for character in value)
+
+    def _draw_hover_tooltip(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        hover_action: str | None,
+        pointer: tuple[int, int] | None,
+    ) -> None:
+        lines = tooltip_lines_for_action(hover_action)
+        if not lines or pointer is None:
+            return
+        panel_x, panel_y, panel_width, panel_height = layout["panel"]
+        local_pointer_x = pointer[0] - panel_x
+        local_pointer_y = pointer[1] - panel_y
+        if (
+            local_pointer_x < 0
+            or local_pointer_y < 0
+            or local_pointer_x >= panel_width
+            or local_pointer_y >= panel_height
+        ):
+            return
+        font_size = getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
+        line_height = max(18, min(28, font_size + 8))
+        margin = 12
+        max_width = max(220, min(620, panel_width - 2 * margin))
+        box_width = min(
+            max_width,
+            max(260, max(self._estimated_text_width_px(line) for line in lines) + 28),
+        )
+        box_height = 18 + line_height * len(lines)
+        x = local_pointer_x + 18
+        y = local_pointer_y + 18
+        if x + box_width > panel_width - margin:
+            x = max(margin, local_pointer_x - box_width - 18)
+        if y + box_height > panel_height - margin:
+            y = max(margin, local_pointer_y - box_height - 18)
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        self._x11.XSetForeground(self._display, gc, self._colours["button"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            box_width,
+            box_height,
+        )
+        self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, box_width - 1),
+            max(1, box_height - 1),
+        )
+        for offset, line in enumerate(lines):
+            self._draw_text(
+                self._clip_console_line(line, box_width - 24),
+                x=x + 12,
+                y=y + 14 + offset * line_height,
+                colour=self._colours["white" if offset == 0 else "muted"],
+            )
 
     def _draw_progress_bar(
         self,
@@ -5426,6 +6993,8 @@ class X11CalibrationOverlay:
             ("tab_loadout", "策略装配", "策略", "loadout"),
             ("tab_settings", "控制设置", "控制", "settings"),
             ("tab_console", "命令台", "命令", "console"),
+            ("tab_functions", "函数命令", "函数", "functions"),
+            ("tab_keybindings", "按键绑定", "按键", "keybindings"),
             ("tab_inventory", "创造物品", "物品", "inventory"),
             ("tab_navigation", "星体导航", "导航", "navigation"),
             ("tab_video", "视频设置", "视频", "video"),
@@ -5439,6 +7008,52 @@ class X11CalibrationOverlay:
                     "selected" if page == target_page else "button"
                 ],
             )
+
+    def _draw_directory_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+    ) -> None:
+        back_rect = self._panel_rectangle(layout, _BACK_TO_DIRECTORY_ACTION)
+        self._draw_text(
+            "ESC 目录",
+            x=back_rect[0],
+            y=back_rect[1] + back_rect[3] - 8,
+            colour=self._colours["muted"],
+        )
+        for action, label, _description, _target_page in _PANEL_DIRECTORY_ENTRIES:
+            self._draw_button(
+                layout,
+                action,
+                label,
+                fill=self._colours["button"],
+            )
+
+    def _draw_back_to_directory(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        page: str,
+    ) -> None:
+        self._draw_button(
+            layout,
+            _BACK_TO_DIRECTORY_ACTION,
+            "返回目录",
+            fill=self._colours["button"],
+        )
+        page_label = next(
+            (
+                label
+                for _action, label, _description, target_page in _PANEL_DIRECTORY_ENTRIES
+                if target_page == page
+            ),
+            page,
+        )
+        x, y, width, height = self._panel_rectangle(layout, _BACK_TO_DIRECTORY_ACTION)
+        self._draw_text(
+            f"当前页面：{page_label}",
+            x=x + width + 16,
+            y=y + height - 10,
+            colour=self._colours["muted"],
+        )
 
     def _draw_font_size_slider(
         self,
@@ -5589,7 +7204,10 @@ class X11CalibrationOverlay:
             )
             if pending:
                 label = f"{label} · 切换中"
-            elif not candidate.available or not candidate.resident:
+            elif not candidate.available or (
+                not candidate.resident
+                and candidate.switch_mode != "paused_boundary_restart"
+            ):
                 label = f"{label} · 未就绪"
             self._draw_button(
                 layout,
@@ -5677,12 +7295,47 @@ class X11CalibrationOverlay:
             )
         if not candidates:
             self._draw_text(
-                "起身策略尚未就绪",
+                "起身策略已关闭" if model.recovery_locked else "起身策略尚未就绪",
                 x=0,
                 y=0,
-                colour=self._colours["pending"],
+                colour=self._colours[
+                    "muted" if model.recovery_locked else "pending"
+                ],
                 centred_in=recovery,
             )
+
+    def _draw_metric_tile(
+        self,
+        rectangle: tuple[int, int, int, int],
+        *,
+        label: str,
+        value: str,
+        available: bool = True,
+    ) -> None:
+        x, y, width, height = rectangle
+        label_height = max(14, min(24, height // 3))
+        label_box = (x, y + 4, width, label_height)
+        value_box = (
+            x,
+            y + label_height + 8,
+            width,
+            max(1, height - label_height - 10),
+        )
+        self._draw_text(
+            label,
+            x=0,
+            y=0,
+            colour=self._colours["muted"],
+            centred_in=label_box,
+        )
+        self._draw_text(
+            value,
+            x=0,
+            y=0,
+            colour=self._colours["white" if available else "muted"],
+            large=height >= 60,
+            centred_in=value_box,
+        )
 
     def _draw_control_settings_page(
         self,
@@ -5693,14 +7346,6 @@ class X11CalibrationOverlay:
     ) -> None:
         local_selected = model.next_profile == "Local"
         controls_disabled = model.restart_requested or model.status == "restarting"
-        command_blocked = bool(
-            command_status.in_flight
-            or command_status.restart_required
-            or command_status.outcome_unknown
-            or command_status.status in {"pending", "restarting"}
-            or self._command_editor.editing
-            or self._command_editor.pending
-        )
         self._draw_button(
             layout,
             "profile_local",
@@ -5716,7 +7361,7 @@ class X11CalibrationOverlay:
             disabled=controls_disabled,
         )
         movement_controls_disabled = bool(
-            controls_disabled or command_blocked or not motion_model.available
+            controls_disabled or not motion_model.available
         )
         for movement_mode in MOVEMENT_MODES:
             selected = movement_mode == motion_model.settings.movement_mode
@@ -5763,57 +7408,42 @@ class X11CalibrationOverlay:
             fill=self._colours["disabled" if font_up_disabled else "button"],
             disabled=font_up_disabled,
         )
+        for suffix in ("down", "up"):
+            action = f"motion_keyboard_speed_cap_{suffix}"
+            disabled = bool(
+                controls_disabled or not motion_model.action_enabled(action)
+            )
+            self._draw_button(
+                layout,
+                action,
+                "-" if suffix == "down" else "+",
+                fill=self._colours["disabled" if disabled else "button"],
+                disabled=disabled,
+            )
         speed_value = self._panel_rectangle(layout, "speed_value")
-        self._draw_text(
-            "远程鼠标速度",
-            x=0,
-            y=0,
-            colour=self._colours["muted"],
-            centred_in=(
-                speed_value[0],
-                speed_value[1] - 10,
-                speed_value[2],
-                speed_value[3],
-            ),
+        self._draw_metric_tile(
+            speed_value,
+            label="远程鼠标速度",
+            value=f"{model.next_scale:.2f}x",
         )
-        self._draw_text(
-            f"{model.next_scale:.2f}x",
-            x=0,
-            y=0,
-            colour=self._colours["white"],
-            large=True,
-            centred_in=(
-                speed_value[0],
-                speed_value[1] + 10,
-                speed_value[2],
-                speed_value[3],
-            ),
+        cap_value = self._panel_rectangle(layout, "motion_keyboard_speed_cap_value")
+        cap_available = bool(motion_model.available)
+        cap_label = (
+            f"{motion_model.value('keyboard', KEYBOARD_SPEED_CAP_FIELD):.2f} m/s"
+            if motion_model.available
+            else "--"
+        )
+        self._draw_metric_tile(
+            cap_value,
+            label="键盘速度上限",
+            value=cap_label,
+            available=cap_available,
         )
         font_value = self._panel_rectangle(layout, "font_value")
-        self._draw_text(
-            "界面字体",
-            x=0,
-            y=0,
-            colour=self._colours["muted"],
-            centred_in=(
-                font_value[0],
-                font_value[1] - 10,
-                font_value[2],
-                font_value[3],
-            ),
-        )
-        self._draw_text(
-            f"{model.font_size:d}px",
-            x=0,
-            y=0,
-            colour=self._colours["white"],
-            large=True,
-            centred_in=(
-                font_value[0],
-                font_value[1] + 10,
-                font_value[2],
-                font_value[3],
-            ),
+        self._draw_metric_tile(
+            font_value,
+            label="界面字体",
+            value=f"{model.font_size:d}px",
         )
         compact_motion_labels = bool(
             layout["panel"][2] < 800 or layout["panel"][3] < 600
@@ -5823,9 +7453,7 @@ class X11CalibrationOverlay:
             for suffix in ("down", "up"):
                 action = f"{stem}_{suffix}"
                 disabled = bool(
-                    controls_disabled
-                    or command_blocked
-                    or not motion_model.action_enabled(action)
+                    controls_disabled or not motion_model.action_enabled(action)
                 )
                 self._draw_button(
                     layout,
@@ -5850,14 +7478,38 @@ class X11CalibrationOverlay:
             )
         for stem, gear, field in (
             ("motion_turn_rate", "turn", MAX_TURN_RATE_FIELD),
+            ("motion_keyboard_turn_rate", "turn", KEYBOARD_TURN_RATE_FIELD),
+            (
+                "motion_keyboard_turn_boost_rate",
+                "turn",
+                KEYBOARD_TURN_BOOST_RATE_FIELD,
+            ),
+            (
+                "motion_bfm_turn_command_yaw_limit",
+                "bfm",
+                BFM_TURN_COMMAND_YAW_LIMIT_FIELD,
+            ),
             ("motion_camera_look_rate", "camera", KEYBOARD_LOOK_RATE_FIELD),
+            (
+                "motion_camera_heading_snap_error",
+                "camera",
+                CAMERA_HEADING_SNAP_ERROR_FIELD,
+            ),
+            (
+                "motion_gait_start_heading_error",
+                "gait",
+                GAIT_START_HEADING_ERROR_FIELD,
+            ),
+            (
+                "motion_gait_stop_heading_error",
+                "gait",
+                GAIT_STOP_HEADING_ERROR_FIELD,
+            ),
         ):
             for suffix in ("down", "up"):
                 action = f"{stem}_{suffix}"
                 disabled = bool(
-                    controls_disabled
-                    or command_blocked
-                    or not motion_model.action_enabled(action)
+                    controls_disabled or not motion_model.action_enabled(action)
                 )
                 self._draw_button(
                     layout,
@@ -5870,6 +7522,7 @@ class X11CalibrationOverlay:
                 motion_model.available
                 and not (
                     gear == "camera"
+                    and field == KEYBOARD_LOOK_RATE_FIELD
                     and motion_model.camera_control_available is False
                 )
             )
@@ -5909,11 +7562,336 @@ class X11CalibrationOverlay:
                     else ("pending" if model.pending_restart else "muted")
                 ],
             )
+    def _draw_native_modes_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        command_status: CommandConsoleStatus,
+        *,
+        title: str = "SONIC 原生模式",
+    ) -> None:
+        content = self._panel_rectangle(layout, "system_content")
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        quick_disabled = not self._quick_command_allowed()
+        auto_rect = self._panel_rectangle(layout, "native_mode_auto")
+        self._draw_text(
+            title,
+            x=content[0],
+            y=max(auto_rect[1] - 12, content[1] + (44 if compact else 56)),
+            colour=self._colours["muted"],
+        )
+        self._draw_button(
+            layout,
+            "native_mode_auto",
+            _NATIVE_MODE_BUTTON_LABELS_ZH[None],
+            fill=self._colours["disabled" if quick_disabled else "button"],
+            disabled=quick_disabled,
+        )
+        for index in _NATIVE_MODE_BUTTON_INDICES:
+            self._draw_button(
+                layout,
+                f"native_mode_{index}",
+                _NATIVE_MODE_BUTTON_LABELS_ZH.get(index, f"{index} 单档"),
+                fill=self._colours["disabled" if quick_disabled else "button"],
+                disabled=quick_disabled,
+            )
+        if command_status.message:
             self._draw_text(
-                "精细 0.01-0.10 / 粗调 0.20-1.00",
-                x=self._panel_rectangle(layout, "profile_local")[0],
-                y=max(112, self._panel_rectangle(layout, "profile_local")[1] - 40),
+                self._clip_console_line(command_status.message, content[2]),
+                x=content[0],
+                y=content[1] + content[3] - (30 if compact else 42),
+                colour=self._colours[
+                    "error" if command_status.status == "error" else "cyan"
+                ],
+            )
+
+    def _draw_functions_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        command_status: CommandConsoleStatus,
+        function_model: FunctionLibraryModel,
+    ) -> None:
+        content = self._panel_rectangle(layout, "system_content")
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        quick_disabled = not self._quick_command_allowed()
+        subpage = getattr(self, "_functions_subpage", "home")
+        if subpage not in {"home", "files", "detail", "presets", "sonic"}:
+            subpage = "home"
+        selected_function = getattr(self, "_selected_function_name", None)
+        if selected_function not in function_model.files:
+            selected_function = None
+        self._draw_text(
+            "函数命令",
+            x=content[0],
+            y=content[1] + (18 if compact else 26),
+            colour=self._colours["muted"],
+        )
+        open_disabled = not function_model.open_available or not function_model.directory
+        path_line = (
+            f"目录：{function_model.directory}"
+            if function_model.directory
+            else "目录：本次运行未配置函数目录"
+        )
+        if function_model.open_error:
+            path_line = f"{path_line}  打开失败：{function_model.open_error}"
+        elif function_model.open_count:
+            path_line = f"{path_line}  已打开 {function_model.open_count} 次"
+        info_y = content[1] + (44 if compact else 56)
+        self._draw_text(
+            self._clip_console_line(path_line, content[2]),
+            x=content[0],
+            y=info_y,
+            colour=self._colours["muted"],
+        )
+        def draw_command_message() -> None:
+            if command_status.message:
+                self._draw_text(
+                    self._clip_console_line(command_status.message, content[2]),
+                    x=content[0],
+                    y=content[1] + content[3] - (30 if compact else 42),
+                    colour=self._colours[
+                        "error" if command_status.status == "error" else "cyan"
+                    ],
+                )
+
+        if subpage == "home":
+            for action, label in (
+                ("function_nav_files", "函数文件"),
+                ("function_nav_presets", "恢复/姿态函数"),
+                ("function_nav_sonic", "SONIC 原生模式"),
+                ("functions_open_dir", "打开函数目录"),
+            ):
+                self._draw_button(
+                    layout,
+                    action,
+                    label,
+                    fill=self._colours[
+                        "disabled"
+                        if action == "functions_open_dir" and open_disabled
+                        else "button"
+                    ],
+                    disabled=action == "functions_open_dir" and open_disabled,
+                )
+            summary_y = self._panel_rectangle(layout, "function_file_4")[1] + (
+                46 if compact else 64
+            )
+            self._draw_text(
+                f"函数文件：{len(function_model.files)} 个",
+                x=content[0],
+                y=summary_y,
                 colour=self._colours["muted"],
+            )
+            draw_command_message()
+            return
+
+        if subpage in {"files", "detail", "presets", "sonic"}:
+            self._draw_button(
+                layout,
+                "function_back",
+                "返回",
+                fill=self._colours["button"],
+            )
+
+        if subpage == "files":
+            self._draw_button(
+                layout,
+                "functions_open_dir",
+                "打开目录编辑",
+                fill=self._colours["disabled" if open_disabled else "button"],
+                disabled=open_disabled,
+            )
+            files = function_model.files[:_MAX_FUNCTION_FILE_BUTTONS]
+            if not files:
+                self._draw_text(
+                    "未发现 .mcfunction 文件。",
+                    x=content[0],
+                    y=self._panel_rectangle(layout, "function_file_0")[1] + 18,
+                    colour=self._colours["muted"],
+                )
+            for index in range(_MAX_FUNCTION_FILE_BUTTONS):
+                label = files[index] if index < len(files) else "空"
+                self._draw_button(
+                    layout,
+                    f"function_file_{index}",
+                    label,
+                    fill=self._colours["button" if index < len(files) else "disabled"],
+                    disabled=index >= len(files),
+                )
+            more_count = max(0, len(function_model.files) - _MAX_FUNCTION_FILE_BUTTONS)
+            note = (
+                f"只显示前 {_MAX_FUNCTION_FILE_BUTTONS} 个；还有 {more_count} 个文件。"
+                if more_count
+                else "函数文件状态会自动刷新。"
+            )
+            self._draw_text(
+                self._clip_console_line(note, content[2]),
+                x=content[0],
+                y=self._panel_rectangle(layout, "function_file_6")[1]
+                + (46 if compact else 64),
+                colour=self._colours["muted"],
+            )
+            draw_command_message()
+            return
+
+        if subpage == "detail":
+            self._draw_button(
+                layout,
+                "function_run_selected",
+                "运行函数",
+                fill=self._colours[
+                    "disabled" if quick_disabled or selected_function is None else "button"
+                ],
+                disabled=quick_disabled or selected_function is None,
+            )
+            self._draw_button(
+                layout,
+                "functions_open_dir",
+                "打开目录编辑此文件",
+                fill=self._colours["disabled" if open_disabled else "button"],
+                disabled=open_disabled,
+            )
+            preview_top = self._panel_rectangle(layout, "function_file_0")[1]
+            if selected_function is None:
+                lines = ("未选择函数文件；返回列表选择一个 .mcfunction。",)
+            else:
+                lines = (
+                    f"文件：{selected_function}.mcfunction",
+                    f"执行：/function {selected_function}",
+                    "内容预览：",
+                    *self._function_file_preview_lines(
+                        function_model,
+                        selected_function,
+                        maximum_lines=6 if compact else 8,
+                    ),
+                )
+            for offset, line in enumerate(lines[:10]):
+                self._draw_text(
+                    self._clip_console_line(line, content[2]),
+                    x=content[0],
+                    y=preview_top + offset * (18 if compact else 24),
+                    colour=self._colours[
+                        "white" if offset in {0, 1} and selected_function else "muted"
+                    ],
+                )
+            draw_command_message()
+            return
+
+        if subpage == "presets":
+            for index, (label, _command) in enumerate(_FUNCTION_PRESETS):
+                self._draw_button(
+                    layout,
+                    f"function_preset_{index}",
+                    label,
+                    fill=self._colours["disabled" if quick_disabled else "button"],
+                    disabled=quick_disabled,
+                )
+            draw_command_message()
+            return
+
+        if subpage == "sonic":
+            self._draw_native_modes_page(layout, command_status)
+            return
+
+    def _function_file_preview_lines(
+        self,
+        function_model: FunctionLibraryModel,
+        function_name: str,
+        *,
+        maximum_lines: int,
+    ) -> tuple[str, ...]:
+        if not function_model.directory:
+            return ("- 本次运行没有函数目录。",)
+        try:
+            root = Path(function_model.directory).resolve()
+            path = (root / f"{function_name}.mcfunction").resolve()
+            path.relative_to(root)
+        except (OSError, ValueError):
+            return ("- 文件路径不可用。",)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ("- 文件不存在；可能刚被删除。",)
+        except (OSError, UnicodeError) as exc:
+            return (f"- 读取失败：{exc}",)
+        lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lines.append(f"- {line}")
+            if len(lines) >= maximum_lines:
+                break
+        return tuple(lines or ("- 文件暂无可执行命令。",))
+
+    def _draw_keybindings_page(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        motion_model: MotionSettingsPanelModel,
+        command_status: CommandConsoleStatus,
+    ) -> None:
+        content = self._panel_rectangle(layout, "system_content")
+        compact = layout["panel"][2] < 900 or layout["panel"][3] < 650
+        panel_model = getattr(self, "_last_panel_model", None)
+        controls_disabled = bool(
+            panel_model is None
+            or panel_model.restart_requested
+            or panel_model.status == "restarting"
+        )
+        movement_controls_disabled = bool(
+            controls_disabled or not motion_model.available
+        )
+        self._draw_text(
+            "按键绑定 / 热切换",
+            x=content[0],
+            y=content[1] + (18 if compact else 26),
+            colour=self._colours["muted"],
+        )
+        for movement_mode in MOVEMENT_MODES:
+            selected = movement_mode == motion_model.settings.movement_mode
+            self._draw_button(
+                layout,
+                f"movement_mode_{movement_mode}",
+                _MOVEMENT_MODE_LABELS[movement_mode],
+                fill=self._colours[
+                    "selected"
+                    if selected
+                    else "disabled" if movement_controls_disabled else "button"
+                ],
+                disabled=movement_controls_disabled,
+            )
+        key_y = self._panel_rectangle(layout, "movement_mode_camera_face")[1] + (
+            58 if compact else 88
+        )
+        current_mode = _MOVEMENT_MODE_LABELS.get(
+            motion_model.settings.movement_mode,
+            motion_model.settings.movement_mode,
+        )
+        lines = (
+            f"移动：当前 WASD 坐标模式 {current_mode}",
+            "移动：WASD 移动 | Shift 跑步 | Ctrl/Alt 精细慢走",
+            "相机：Q/E 左右转向 | 方向键/鼠标 调相机 | V 切 WASD 模式",
+            "趴下：按住 X=7 俯卧 | X+WASD=8 爬行 | 松开回普通 AUTO",
+            "拳击：按住 J=10 拳击态；松开回普通 AUTO",
+            "拳击：按住 K=11 左直拳 | L=12 右直拳 | U=13 随机出拳",
+            "拳击：按住 I=15 左勾拳 | O=16 右勾拳；兼容 Shift/Ctrl/Alt+WASD",
+            "系统：ESC 面板 | F6 安全重启 | 回车/按钮提交命令",
+        )
+        for offset, line in enumerate(lines):
+            self._draw_text(
+                line,
+                x=content[0],
+                y=key_y + offset * (18 if compact else 26),
+                colour=self._colours[
+                    "pending" if movement_controls_disabled and offset == 0 else "muted"
+                ],
+            )
+        if command_status.message:
+            self._draw_text(
+                self._clip_console_line(command_status.message, content[2]),
+                x=content[0],
+                y=content[1] + content[3] - (30 if compact else 42),
+                colour=self._colours[
+                    "error" if command_status.status == "error" else "cyan"
+                ],
             )
 
     def _draw_inventory_page(
@@ -5930,7 +7908,7 @@ class X11CalibrationOverlay:
             "render_sync_disabled": "UE 画面同步未启用",
         }
         heading = (
-            "点击物品会在机器人前方放置独立刚体"
+            "创造物品"
             if model.available
             else unavailable_labels.get(
                 model.unavailable_reason,
@@ -5968,6 +7946,7 @@ class X11CalibrationOverlay:
         layout: dict[str, tuple[int, int, int, int]],
         model: VideoSettingsPanelModel,
     ) -> None:
+        bound_editor = getattr(self, "_video_distance_bound_editor", None)
         for field, presets in _VIDEO_SETTING_PRESETS.items():
             stem = f"video_{field}"
             current = model.value(field)
@@ -5990,6 +7969,8 @@ class X11CalibrationOverlay:
             label_value = _VIDEO_VALUE_LABELS.get(str(current), str(current))
             if field == "fps_limit":
                 label_value = f"{current} FPS"
+            elif field == "camera_distance_cm":
+                label_value = f"{current} cm"
             self._draw_text(
                 f"{_VIDEO_SETTING_LABELS[field]}  ·  {label_value}",
                 x=0,
@@ -5997,6 +7978,35 @@ class X11CalibrationOverlay:
                 colour=self._colours["white" if model.available else "muted"],
                 centred_in=self._panel_rectangle(layout, f"{stem}_value"),
             )
+        for field in ("camera_distance_min_cm", "camera_distance_max_cm"):
+            stem = f"video_{field}"
+            current = model.value(field)
+            for suffix, direction in (("down", -1), ("up", 1)):
+                target = model.stepped_value(f"{stem}_{suffix}")
+                enabled = bool(model.available and model.error is None and target is not None)
+                self._draw_button(
+                    layout,
+                    f"{stem}_{suffix}",
+                    "‹" if direction < 0 else "›",
+                    fill=self._colours["button" if enabled else "disabled"],
+                    disabled=not enabled,
+                )
+            self._draw_text(
+                (
+                    f"{_VIDEO_SETTING_LABELS[field]}  ·  "
+                    f"{bound_editor.display_text(field, current) if bound_editor is not None else current}"
+                    " cm"
+                ),
+                x=0,
+                y=0,
+                colour=self._colours[
+                    "cyan"
+                    if bound_editor is not None and bound_editor.field == field
+                    else ("white" if model.available else "muted")
+                ],
+                centred_in=self._panel_rectangle(layout, f"{stem}_value"),
+            )
+        self._draw_camera_distance_slider(layout, model)
         first_row = self._panel_rectangle(layout, "video_resolution_value")
         status = (
             f"保存失败：{model.error}"
@@ -6016,6 +8026,94 @@ class X11CalibrationOverlay:
                 if model.error is not None
                 else ("pending" if model.pending_restart else "muted")
             ],
+        )
+
+    def _draw_camera_distance_slider(
+        self,
+        layout: dict[str, tuple[int, int, int, int]],
+        model: VideoSettingsPanelModel,
+    ) -> None:
+        rectangle = self._panel_rectangle(layout, "video_camera_distance_cm_slider")
+        x, y, width, height = rectangle
+        panel = self._windows["panel"]
+        gc = ctypes.c_void_p(self._panel_gc)
+        enabled = bool(model.available and model.error is None)
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["button" if enabled else "disabled"],
+        )
+        self._x11.XFillRectangle(self._display, panel, gc, x, y, width, height)
+        self._x11.XSetForeground(self._display, gc, self._colours["outline"])
+        self._x11.XDrawRectangle(
+            self._display,
+            panel,
+            gc,
+            x,
+            y,
+            max(1, width - 1),
+            max(1, height - 1),
+        )
+        distance = model.value("camera_distance_cm")
+        minimum = model.value("camera_distance_min_cm")
+        maximum = model.value("camera_distance_max_cm")
+        panel_x, panel_y, _panel_width, _panel_height = layout["panel"]
+        track_root = font_slider_track(rectangle)
+        track_x = track_root[0] - panel_x
+        track_y = track_root[1] - panel_y
+        track_width = track_root[2]
+        track_height = track_root[3]
+        self._x11.XSetForeground(self._display, gc, self._colours["muted"])
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            track_x,
+            track_y,
+            track_width,
+            track_height,
+        )
+        fraction = 0.0
+        if (
+            isinstance(distance, int)
+            and isinstance(minimum, int)
+            and isinstance(maximum, int)
+            and maximum > minimum
+        ):
+            fraction = (distance - minimum) / (maximum - minimum)
+        knob_x = track_x + int(round(max(0, track_width - 1) * fraction))
+        if enabled:
+            self._x11.XSetForeground(self._display, gc, self._colours["cyan"])
+            self._x11.XFillRectangle(
+                self._display,
+                panel,
+                gc,
+                track_x,
+                track_y,
+                max(1, knob_x - track_x + 1),
+                track_height,
+            )
+        knob_width = 9
+        knob_height = max(10, height - 10)
+        self._x11.XSetForeground(
+            self._display,
+            gc,
+            self._colours["white" if enabled else "disabled"],
+        )
+        self._x11.XFillRectangle(
+            self._display,
+            panel,
+            gc,
+            knob_x - knob_width // 2,
+            y + (height - knob_height) // 2,
+            knob_width,
+            knob_height,
+        )
+        self._draw_text(
+            f"相机距离 {distance} cm",
+            x=x + 8,
+            y=y + height // 2 + 6,
+            colour=self._colours["white" if enabled else "muted"],
         )
 
     @staticmethod
@@ -6292,13 +8390,15 @@ class X11CalibrationOverlay:
             return "返回游戏并应用"
         return "返回游戏"
 
-    def _load_startup_media_frames(
+    def _load_startup_media_frame_paths(
         self,
         media_frames_dir: str | None,
-    ) -> tuple[StartupMediaFrame, ...]:
+    ) -> tuple[Path, ...]:
         if not media_frames_dir:
             self._startup_media_frame_dir = None
-            self._startup_media_frames = ()
+            self._startup_media_frame_paths = ()
+            self._startup_media_cached_path = None
+            self._startup_media_cached_frame = None
             return ()
         try:
             directory = Path(media_frames_dir).expanduser().resolve(strict=False)
@@ -6307,22 +8407,30 @@ class X11CalibrationOverlay:
         directory_key = os.fspath(directory)
         if (
             getattr(self, "_startup_media_frame_dir", None) == directory_key
-            and getattr(self, "_startup_media_frames", ())
+            and getattr(self, "_startup_media_frame_paths", ())
         ):
-            return self._startup_media_frames
-        frames: list[StartupMediaFrame] = []
+            return self._startup_media_frame_paths
         try:
             paths = sorted(directory.glob("*.ppm"))[:_STARTUP_MEDIA_MAX_FRAMES]
         except OSError:
             paths = []
-        for path in paths:
-            try:
-                frames.append(read_startup_media_ppm(path))
-            except (OSError, ValueError):
-                continue
         self._startup_media_frame_dir = directory_key
-        self._startup_media_frames = tuple(frames)
-        return self._startup_media_frames
+        self._startup_media_frame_paths = tuple(paths)
+        self._startup_media_cached_path = None
+        self._startup_media_cached_frame = None
+        return self._startup_media_frame_paths
+
+    def _load_startup_media_frame(self, path: Path) -> StartupMediaFrame | None:
+        path_key = os.fspath(path)
+        if getattr(self, "_startup_media_cached_path", None) == path_key:
+            return getattr(self, "_startup_media_cached_frame", None)
+        try:
+            frame = read_startup_media_ppm(path)
+        except (OSError, ValueError):
+            return None
+        self._startup_media_cached_path = path_key
+        self._startup_media_cached_frame = frame
+        return frame
 
     def _startup_media_pixel(self, red: int, green: int, blue: int) -> int:
         luminance = max(
@@ -6346,6 +8454,111 @@ class X11CalibrationOverlay:
             )
         return cache[tinted]
 
+    @staticmethod
+    def _startup_media_bgrx_bytes(frame: StartupMediaFrame) -> bytes:
+        source = frame.pixels
+        target = bytearray(frame.width * frame.height * 4)
+        target[0::4] = source[2::3]
+        target[1::4] = source[1::3]
+        target[2::4] = source[0::3]
+        return bytes(target)
+
+    def _draw_startup_media_image(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        panel_width: int,
+        panel_height: int,
+        frame: StartupMediaFrame,
+    ) -> bool:
+        if (
+            not getattr(self, "_visual", None)
+            or getattr(self, "_depth", 0) not in {24, 32}
+            or not hasattr(self._x11, "XCreateImage")
+            or not hasattr(self._x11, "XPutImage")
+        ):
+            return False
+        copy_width = max(1, min(panel_width, frame.width))
+        copy_height = max(1, min(panel_height, frame.height))
+        source_x = max(0, (frame.width - copy_width) // 2)
+        source_y = max(0, (frame.height - copy_height) // 2)
+        dest_x = max(0, (panel_width - copy_width) // 2)
+        dest_y = max(0, (panel_height - copy_height) // 2)
+        image_bytes = self._startup_media_bgrx_bytes(frame)
+        buffer = ctypes.create_string_buffer(image_bytes)
+        image = self._x11.XCreateImage(
+            self._display,
+            self._visual,
+            int(getattr(self, "_depth", 24)),
+            _X11_Z_PIXMAP_FORMAT,
+            0,
+            ctypes.cast(buffer, ctypes.c_void_p),
+            frame.width,
+            frame.height,
+            32,
+            frame.width * 4,
+        )
+        if not image:
+            return False
+        try:
+            self._x11.XPutImage(
+                self._display,
+                panel,
+                gc,
+                image,
+                source_x,
+                source_y,
+                dest_x,
+                dest_y,
+                copy_width,
+                copy_height,
+            )
+        finally:
+            # Avoid letting XDestroyImage free Python-owned pixel memory.
+            self._x11.XFree(image)
+        return True
+
+    def _draw_startup_media_grid(
+        self,
+        panel: int,
+        gc: ctypes.c_void_p,
+        panel_width: int,
+        panel_height: int,
+        frame: StartupMediaFrame,
+    ) -> None:
+        columns = min(_STARTUP_MEDIA_GRID_COLUMNS, max(24, panel_width // 14))
+        rows = min(_STARTUP_MEDIA_GRID_ROWS, max(18, panel_height // 14))
+        for row in range(rows):
+            sample_y = min(
+                frame.height - 1,
+                max(0, int((row + 0.5) * frame.height / rows)),
+            )
+            top = row * panel_height // rows
+            bottom = max(top + 1, (row + 1) * panel_height // rows)
+            for column in range(columns):
+                sample_x = min(
+                    frame.width - 1,
+                    max(0, int((column + 0.5) * frame.width / columns)),
+                )
+                offset = (sample_y * frame.width + sample_x) * 3
+                pixel = self._startup_media_pixel(
+                    frame.pixels[offset],
+                    frame.pixels[offset + 1],
+                    frame.pixels[offset + 2],
+                )
+                left = column * panel_width // columns
+                right = max(left + 1, (column + 1) * panel_width // columns)
+                self._x11.XSetForeground(self._display, gc, pixel)
+                self._x11.XFillRectangle(
+                    self._display,
+                    panel,
+                    gc,
+                    left,
+                    top,
+                    right - left,
+                    bottom - top,
+                )
+
     def _draw_startup_background(
         self,
         panel: int,
@@ -6364,44 +8577,20 @@ class X11CalibrationOverlay:
             panel_width,
             panel_height,
         )
-        frames = self._load_startup_media_frames(model.media_frames_dir)
-        if frames:
+        frame_paths = self._load_startup_media_frame_paths(model.media_frames_dir)
+        if frame_paths:
             frame_index = int(time.monotonic() * model.media_frame_rate_hz) % len(
-                frames
+                frame_paths
             )
-            frame = frames[frame_index]
-            columns = min(_STARTUP_MEDIA_GRID_COLUMNS, max(24, panel_width // 14))
-            rows = min(_STARTUP_MEDIA_GRID_ROWS, max(18, panel_height // 14))
-            for row in range(rows):
-                sample_y = min(
-                    frame.height - 1,
-                    max(0, int((row + 0.5) * frame.height / rows)),
-                )
-                top = row * panel_height // rows
-                bottom = max(top + 1, (row + 1) * panel_height // rows)
-                for column in range(columns):
-                    sample_x = min(
-                        frame.width - 1,
-                        max(0, int((column + 0.5) * frame.width / columns)),
-                    )
-                    offset = (sample_y * frame.width + sample_x) * 3
-                    pixel = self._startup_media_pixel(
-                        frame.pixels[offset],
-                        frame.pixels[offset + 1],
-                        frame.pixels[offset + 2],
-                    )
-                    left = column * panel_width // columns
-                    right = max(left + 1, (column + 1) * panel_width // columns)
-                    self._x11.XSetForeground(self._display, gc, pixel)
-                    self._x11.XFillRectangle(
-                        self._display,
-                        panel,
-                        gc,
-                        left,
-                        top,
-                        right - left,
-                        bottom - top,
-                    )
+            frame = self._load_startup_media_frame(frame_paths[frame_index])
+            if frame is not None and not self._draw_startup_media_image(
+                panel,
+                gc,
+                panel_width,
+                panel_height,
+                frame,
+            ):
+                self._draw_startup_media_grid(panel, gc, panel_width, panel_height, frame)
 
         self._x11.XSetForeground(self._display, gc, self._colours["button"])
         for y in range(0, panel_height, 18):
@@ -6437,7 +8626,7 @@ class X11CalibrationOverlay:
                 panel_width,
                 1,
             )
-        return bool(frames)
+        return bool(frame_paths)
 
     def _draw_startup_corner_brackets(
         self,
@@ -6649,9 +8838,12 @@ class X11CalibrationOverlay:
         inventory_model: CreativeInventoryModel | None = None,
         navigation_model: CelestialNavigationModel | None = None,
         video_model: VideoSettingsPanelModel | None = None,
+        function_model: FunctionLibraryModel | None = None,
         runtime_pause_model: RuntimePausePanelModel | None = None,
         build_info_model: BuildInfoPanelModel | None = None,
         startup_loading: StartupLoadingModel | None = None,
+        hover_action: str | None = None,
+        pointer: tuple[int, int] | None = None,
     ) -> None:
         _panel_x, _panel_y, panel_width, panel_height = layout["panel"]
         panel = self._windows["panel"]
@@ -6659,7 +8851,10 @@ class X11CalibrationOverlay:
         if startup_loading is not None and startup_loading.active:
             self._draw_startup_loading(layout, startup_loading)
             return
-        page = getattr(self, "_active_page", "settings")
+        page = getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
+        if page not in _PANEL_PAGE_NAMES:
+            page = _PANEL_DIRECTORY_PAGE
+            self._active_page = page
         title_x, title_y, _title_width, title_height = self._panel_rectangle(
             layout, "title"
         )
@@ -6672,7 +8867,11 @@ class X11CalibrationOverlay:
         )
         if page == "settings":
             self._draw_font_size_slider(layout)
-        self._draw_tabs(layout, page)
+        if page == _PANEL_DIRECTORY_PAGE:
+            self._draw_directory_page(layout)
+        else:
+            self._draw_back_to_directory(layout, page)
+
         if page == "loadout":
             self._draw_loadout_page(
                 layout,
@@ -6691,6 +8890,27 @@ class X11CalibrationOverlay:
         elif page == "console":
             self._draw_command_console(
                 layout,
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+            )
+        elif page == "functions":
+            self._draw_functions_page(
+                layout,
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+                function_model or function_library_model({}),
+            )
+        elif page == "sonic_modes":
+            self._draw_native_modes_page(
+                layout,
+                command_status
+                or getattr(self, "_last_command_status", command_console_status({})),
+                title="SONIC 模式切换",
+            )
+        elif page == "keybindings":
+            self._draw_keybindings_page(
+                layout,
+                motion_model or motion_settings_panel_model({}),
                 command_status
                 or getattr(self, "_last_command_status", command_console_status({})),
             )
@@ -6725,6 +8945,7 @@ class X11CalibrationOverlay:
             or visible_command_status.status in {"pending", "restarting", "unavailable"}
             or self._command_editor.editing
             or self._command_editor.pending
+            or self._video_distance_bound_editing()
             or model.restart_requested
         )
         strategy_switch_busy = bool(
@@ -6786,6 +9007,7 @@ class X11CalibrationOverlay:
             or visible_command_status.status in {"pending", "restarting", "unavailable"}
             or self._command_editor.editing
             or self._command_editor.pending
+            or self._video_distance_bound_editing()
             or model.restart_requested
         )
         self._draw_button(
@@ -6807,6 +9029,11 @@ class X11CalibrationOverlay:
             ],
             disabled=apply_disabled,
         )
+        self._draw_hover_tooltip(layout, hover_action, pointer)
+
+    def _video_distance_bound_editing(self) -> bool:
+        editor = getattr(self, "_video_distance_bound_editor", None)
+        return bool(editor is not None and editor.editing)
 
     def _begin_command_editing(self, publisher: PointerActionPublisher) -> bool:
         status = self._last_command_status
@@ -6820,6 +9047,7 @@ class X11CalibrationOverlay:
             or status.status in {"pending", "restarting", "unavailable"}
             or self._deferred_ungrab_keycode is not None
             or self._keyboard_grabbed
+            or self._video_distance_bound_editing()
             or not self._command_editor.begin()
         ):
             return False
@@ -6832,11 +9060,106 @@ class X11CalibrationOverlay:
             raise
         return True
 
+    def _quick_command_allowed(self) -> bool:
+        status = self._last_command_status
+        panel_model = self._last_panel_model
+        return bool(
+            self._visible
+            and status.available
+            and not status.in_flight
+            and not status.restart_required
+            and not status.outcome_unknown
+            and status.status not in {"pending", "restarting", "unavailable"}
+            and panel_model is not None
+            and not panel_model.restart_requested
+            and panel_model.status != "restarting"
+            and not self._command_editor.editing
+            and not self._command_editor.pending
+            and not self._video_distance_bound_editing()
+        )
+
+    def _selected_function_command(self) -> str | None:
+        name = getattr(self, "_selected_function_name", None)
+        function_model = getattr(self, "_last_function_model", None)
+        files = function_model.files if function_model is not None else ()
+        if (
+            not isinstance(name, str)
+            or name not in files
+            or not name
+            or len(name) > MAX_COMMAND_CHARS - len("/function ")
+            or any(ord(character) < 0x20 or ord(character) > 0x7E for character in name)
+        ):
+            return None
+        return f"/function {name}"
+
+    def _quick_command_for_current_action(self, action: str | None) -> str | None:
+        if action == "function_run_selected":
+            return self._selected_function_command()
+        return self._quick_command_for_action(action)
+
+    @staticmethod
+    def _quick_command_for_action(action: str | None) -> str | None:
+        if action is None:
+            return None
+        if action.startswith("function_preset_"):
+            try:
+                index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return None
+            if 0 <= index < len(_FUNCTION_PRESETS):
+                return _FUNCTION_PRESETS[index][1]
+            return None
+        if action == "native_mode_auto":
+            return "/sonic mode auto"
+        if action.startswith("native_mode_"):
+            try:
+                index = int(action.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                return None
+            if index in _NATIVE_MODE_BUTTON_INDICES:
+                return f"/sonic mode {index}"
+        return None
+
+    def _begin_video_distance_bound_editing(self, action: str) -> bool:
+        if (
+            not self._visible
+            or self._deferred_ungrab_keycode is not None
+            or self._keyboard_grabbed
+            or self._command_editor.editing
+            or self._command_editor.pending
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "video"
+        ):
+            return False
+        if not hasattr(self, "_video_distance_bound_editor"):
+            self._video_distance_bound_editor = CameraDistanceBoundEditor()
+        field = action.removeprefix("video_").removesuffix("_value")
+        video_model = getattr(self, "_last_video_model", None)
+        if (
+            field not in _VIDEO_CAMERA_DISTANCE_BOUND_FIELDS
+            or video_model is None
+            or not video_model.available
+            or video_model.error is not None
+            or not self._video_distance_bound_editor.begin(
+                field,
+                video_model.value(field),
+            )
+        ):
+            return False
+        try:
+            self._grab_keyboard()
+        except Exception:
+            self._video_distance_bound_editor.end()
+            self._ungrab_keyboard()
+            raise
+        return True
+
     def _force_end_command_editing(
         self,
         publisher: PointerActionPublisher | None,
     ) -> bool:
         was_editing = self._command_editor.editing
+        if not was_editing and self._video_distance_bound_editing():
+            return False
         if not was_editing and not self._keyboard_grabbed:
             return False
         self._command_editor.end(force=True)
@@ -6844,6 +9167,17 @@ class X11CalibrationOverlay:
             if was_editing and publisher is not None:
                 publisher.publish_command_edit(False)
         finally:
+            self._ungrab_keyboard()
+        return True
+
+    def _force_end_video_distance_bound_editing(self) -> bool:
+        editor = getattr(self, "_video_distance_bound_editor", None)
+        was_editing = bool(editor is not None and editor.editing)
+        if not was_editing:
+            return False
+        assert editor is not None
+        editor.end()
+        if not self._command_editor.editing:
             self._ungrab_keyboard()
         return True
 
@@ -6876,6 +9210,32 @@ class X11CalibrationOverlay:
         if not self._visible or not self._keyboard_grabbed:
             return 0
         keysym, printable = self._lookup_key(event)
+        video_bound_editor = getattr(self, "_video_distance_bound_editor", None)
+        if video_bound_editor is not None and video_bound_editor.editing:
+            outcome = video_bound_editor.handle_key(
+                keysym=keysym,
+                printable=printable,
+                model=getattr(self, "_last_video_model", None),
+            )
+            if outcome.action == "submit":
+                assert outcome.field is not None
+                assert outcome.value is not None
+                video_model = getattr(self, "_last_video_model", None)
+                if video_model is not None:
+                    publisher.publish_video_setting(
+                        outcome.field,
+                        outcome.value,
+                        expected_revision=video_model.revision,
+                    )
+                self._ungrab_keyboard()
+                return 1
+            if outcome.action == "end":
+                keycode = int(event.keycode)
+                if not 8 <= keycode <= 255:
+                    raise RuntimeError(f"invalid Escape keycode from X11: {keycode}")
+                self._deferred_ungrab_keycode = keycode
+                return 1
+            return 0
         outcome = self._command_editor.handle_key(
             keysym=keysym,
             printable=printable,
@@ -6915,7 +9275,7 @@ class X11CalibrationOverlay:
         layout = self._last_layout
         if (
             layout is None
-            or getattr(self, "_active_page", "loadout") != "settings"
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "settings"
             or getattr(self, "_xft", None) is None
             or getattr(self, "_xft_draw", None) is None
         ):
@@ -6933,6 +9293,27 @@ class X11CalibrationOverlay:
             return False
         self._pending_font_slider_action = None
         self._pending_font_slider_size = target_size
+        return True
+
+    def _set_camera_distance_from_root_x(self, root_x: int) -> bool:
+        layout = self._last_layout
+        video_model = getattr(self, "_last_video_model", None)
+        if (
+            layout is None
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE) != "video"
+            or video_model is None
+        ):
+            return False
+        target = video_model.camera_distance_value_from_slider(
+            layout["video_camera_distance_cm_slider"],
+            root_x,
+        )
+        if target is None or target == video_model.value("camera_distance_cm"):
+            self._pending_camera_distance_cm = None
+            return False
+        if target == getattr(self, "_pending_camera_distance_cm", None):
+            return False
+        self._pending_camera_distance_cm = target
         return True
 
     def drain_pointer_actions(self, publisher: PointerActionPublisher) -> int:
@@ -6953,6 +9334,8 @@ class X11CalibrationOverlay:
             if event_type == _MOTION_NOTIFY:
                 if self._font_slider_dragging and self._visible:
                     self._set_font_size_from_root_x(event.xmotion.x_root)
+                if self._camera_distance_slider_dragging and self._visible:
+                    self._set_camera_distance_from_root_x(event.xmotion.x_root)
                 continue
             if event_type not in {_BUTTON_PRESS, _BUTTON_RELEASE}:
                 continue
@@ -6960,17 +9343,22 @@ class X11CalibrationOverlay:
             if button.button != 1:
                 continue
             cooked_button_seen = True
+            self._cooked_left_button_events = (
+                getattr(self, "_cooked_left_button_events", 0) + 1
+            )
             layout = self._last_layout
             action = (
                 panel_action_at(
                     layout,
                     button.x_root,
                     button.y_root,
-                    page=getattr(self, "_active_page", "loadout"),
+                    page=getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE),
+                    function_subpage=getattr(self, "_functions_subpage", "home"),
                 )
                 if layout is not None
                 else None
             )
+            self._last_cooked_action = action
             if getattr(
                 self,
                 "_last_startup_loading_model",
@@ -6999,6 +9387,9 @@ class X11CalibrationOverlay:
                     )
                     if self._font_slider_dragging:
                         self._set_font_size_from_root_x(button.x_root)
+                if action == "video_camera_distance_cm_slider":
+                    self._camera_distance_slider_dragging = True
+                    self._set_camera_distance_from_root_x(button.x_root)
             elif event_type == _BUTTON_RELEASE:
                 pressed = self._pressed_action
                 pressed_window = self._pressed_window
@@ -7028,8 +9419,23 @@ class X11CalibrationOverlay:
                         publisher.publish(action)
                         emitted += 1
                     continue
+                if pressed == "video_camera_distance_cm_slider":
+                    if self._camera_distance_slider_dragging and self._visible:
+                        self._set_camera_distance_from_root_x(button.x_root)
+                    self._camera_distance_slider_dragging = False
+                    distance_cm = getattr(self, "_pending_camera_distance_cm", None)
+                    self._pending_camera_distance_cm = None
+                    video_model = getattr(self, "_last_video_model", None)
+                    if type(distance_cm) is int and video_model is not None:
+                        publisher.publish_video_setting(
+                            "camera_distance_cm",
+                            distance_cm,
+                            expected_revision=video_model.revision,
+                        )
+                        emitted += 1
+                    continue
                 release_matches_press = bool(
-                    action == pressed and pressed_window == int(button.window)
+                    action == pressed
                 )
                 recovered_pause_release = bool(
                     pressed == "runtime_pause"
@@ -7042,6 +9448,24 @@ class X11CalibrationOverlay:
                     or not self._visible
                 ):
                     continue
+                if self._video_distance_bound_editing() and action not in (
+                    (_BACK_TO_DIRECTORY_ACTION,)
+                    + _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS
+                ):
+                    continue
+                if action == _BACK_TO_DIRECTORY_ACTION:
+                    if (
+                        getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
+                        != _PANEL_DIRECTORY_PAGE
+                    ):
+                        if self._force_end_command_editing(publisher):
+                            emitted += 1
+                        self._force_end_video_distance_bound_editing()
+                        self._active_page = _PANEL_DIRECTORY_PAGE
+                        self._functions_subpage = "home"
+                        self._last_page = None
+                        self._last_functions_subpage = None
+                    continue
                 if recovered_pause_release:
                     # SDL/remote-desktop pointer lock can warp the core pointer
                     # after a valid Pause press but before its release.  Pause
@@ -7050,14 +9474,42 @@ class X11CalibrationOverlay:
                     action = pressed
                     self._recovered_pause_release_count = (
                         getattr(self, "_recovered_pause_release_count", 0) + 1
-                    )
+                )
                 if action in _PANEL_TABS:
                     next_page = action.removeprefix("tab_")
-                    if next_page != getattr(self, "_active_page", "loadout"):
+                    if next_page != getattr(
+                        self,
+                        "_active_page",
+                        _PANEL_DIRECTORY_PAGE,
+                    ):
                         if self._force_end_command_editing(publisher):
                             emitted += 1
+                        self._force_end_video_distance_bound_editing()
                         self._active_page = next_page
+                        if next_page == "functions":
+                            self._functions_subpage = "home"
                         self._last_page = None
+                        self._last_functions_subpage = None
+                    continue
+                if self._handle_function_navigation_action(action):
+                    continue
+                quick_command = self._quick_command_for_current_action(action)
+                if quick_command is not None:
+                    if self._quick_command_allowed():
+                        publisher.publish_command_quick_submit(quick_command)
+                        emitted += 1
+                    continue
+                if action == "functions_open_dir":
+                    panel_model = self._last_panel_model
+                    if (
+                        panel_model is not None
+                        and not panel_model.restart_requested
+                        and panel_model.status != "restarting"
+                        and not self._command_editor.editing
+                        and not self._command_editor.pending
+                    ):
+                        publisher.publish(action)
+                        emitted += 1
                     continue
                 if action == "runtime_pause":
                     panel_model = self._last_panel_model
@@ -7101,6 +9553,8 @@ class X11CalibrationOverlay:
                 elif action == "command_input":
                     if self._begin_command_editing(publisher):
                         emitted += 1
+                elif action in _VIDEO_CAMERA_DISTANCE_BOUND_INPUT_ACTIONS:
+                    self._begin_video_distance_bound_editing(action)
                 elif action == "navigation_refresh":
                     navigation = getattr(self, "_last_navigation_model", None)
                     if (
@@ -7137,8 +9591,8 @@ class X11CalibrationOverlay:
                             and self._last_command_status.status
                             not in {"pending", "restarting", "unavailable"}
                         ):
-                            publisher.publish_navigation_select(
-                                destination.destination_id
+                            publisher.publish_command_quick_submit(
+                                f"/world {destination.destination_id}"
                             )
                             emitted += 1
                 elif action.startswith("recovery_policy_"):
@@ -7211,8 +9665,8 @@ class X11CalibrationOverlay:
                         and self._last_command_status.status
                         not in {"pending", "restarting", "unavailable"}
                     ):
-                        publisher.publish_movement_mode_select(movement_mode)
-                        emitted += 1
+                            publisher.publish(action)
+                            emitted += 1
                 elif action in _VIDEO_STEP_ACTIONS:
                     video_model = getattr(self, "_last_video_model", None)
                     panel_model = self._last_panel_model
@@ -7263,7 +9717,7 @@ class X11CalibrationOverlay:
                         and self._last_command_status.status
                         not in {"pending", "restarting"}
                     ):
-                        publisher.publish_command_submit(command)
+                        publisher.publish(action)
                         emitted += 1
                 elif (
                     self._last_panel_model is not None
@@ -7278,9 +9732,15 @@ class X11CalibrationOverlay:
                 ):
                     publisher.publish(action)
                     emitted += 1
-        self._queue_polled_left_transition(
+        polled_emitted = self._queue_polled_left_transition(
+            publisher,
             cooked_button_seen=cooked_button_seen
         )
+        if polled_emitted:
+            self._polled_left_emitted_intents = (
+                getattr(self, "_polled_left_emitted_intents", 0) + polled_emitted
+            )
+        emitted += polled_emitted
         return emitted
 
     def show(
@@ -7302,6 +9762,14 @@ class X11CalibrationOverlay:
         inventory_model = creative_inventory_model(state)
         navigation_model = celestial_navigation_model(state)
         video_model = video_settings_panel_model(state)
+        function_model = function_library_model(state)
+        selected_function = getattr(self, "_selected_function_name", None)
+        if selected_function is not None and selected_function not in function_model.files:
+            self._selected_function_name = None
+            self._last_selected_function_name = None
+            if getattr(self, "_functions_subpage", "home") == "detail":
+                self._functions_subpage = "files"
+                self._last_functions_subpage = None
         build_info_model = build_info_panel_model(state)
         startup_model = startup_loading_model(state)
         command_status = command_console_status(state)
@@ -7316,6 +9784,7 @@ class X11CalibrationOverlay:
             or inventory_model != getattr(self, "_last_inventory_model", None)
             or navigation_model != getattr(self, "_last_navigation_model", None)
             or video_model != getattr(self, "_last_video_model", None)
+            or function_model != getattr(self, "_last_function_model", None)
             or build_info_model != getattr(self, "_last_build_info_model", None)
             or startup_model
             != getattr(self, "_last_startup_loading_model", startup_loading_model({}))
@@ -7323,15 +9792,37 @@ class X11CalibrationOverlay:
             != getattr(self, "_last_runtime_pause_model", runtime_pause_panel_model({}))
             or getattr(self, "_font_size", _DEFAULT_OVERLAY_FONT_SIZE)
             != getattr(self, "_last_rendered_font_size", None)
-            or getattr(self, "_active_page", "loadout")
+            or getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
             != getattr(self, "_last_page", None)
+            or getattr(self, "_functions_subpage", "home")
+            != getattr(self, "_last_functions_subpage", None)
+            or getattr(self, "_selected_function_name", None)
+            != getattr(self, "_last_selected_function_name", None)
             or command_status != self._last_command_status
             or self._command_editor.revision != self._last_command_revision
+            or getattr(
+                self,
+                "_video_distance_bound_editor",
+                CameraDistanceBoundEditor(),
+            ).revision
+            != self._last_video_distance_bound_revision
         )
         if geometry_changed or self._last_layout is None:
             layout = overlay_layout(geometry)
         else:
             layout = self._last_layout
+        hover_action = None
+        if not startup_model.active:
+            hover_action = panel_hover_action_at(
+                layout,
+                pointer[0],
+                pointer[1],
+                page=getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE),
+                function_subpage=getattr(self, "_functions_subpage", "home"),
+            )
+            if not tooltip_lines_for_action(hover_action):
+                hover_action = None
+        hover_changed = hover_action != getattr(self, "_last_hover_action", None)
         modal_shield = bool(getattr(self, "_modal_shield", True))
         pointer_recenter = bool(getattr(self, "_pointer_recenter", True))
         keep_raised = bool(getattr(self, "_keep_raised", True))
@@ -7348,13 +9839,7 @@ class X11CalibrationOverlay:
         raise_due = bool(
             first_show
             or geometry_changed
-            or (
-                keep_raised
-                and (
-                    self._last_raise_s is None
-                    or now - self._last_raise_s >= self._RAISE_INTERVAL_S
-                )
-            )
+            or keep_raised
         )
         if first_show:
             for name in static_order:
@@ -7362,7 +9847,7 @@ class X11CalibrationOverlay:
         elif raise_due:
             for name in static_order:
                 self._x11.XRaiseWindow(self._display, self._windows[name])
-        if first_show or geometry_changed or model_changed:
+        if first_show or geometry_changed or model_changed or hover_changed:
             self._draw_panel(
                 layout,
                 model,
@@ -7372,9 +9857,12 @@ class X11CalibrationOverlay:
                 inventory_model,
                 navigation_model,
                 video_model,
+                function_model,
                 runtime_pause_model,
                 build_info_model,
                 startup_model,
+                hover_action,
+                pointer,
             )
         pointer_recentered = False
         game_rectangle = (
@@ -7436,6 +9924,7 @@ class X11CalibrationOverlay:
             first_show
             or geometry_changed
             or model_changed
+            or hover_changed
             or pointer_changed
             or raise_due
             or pointer_recentered
@@ -7449,6 +9938,7 @@ class X11CalibrationOverlay:
         self._last_inventory_model = inventory_model
         self._last_navigation_model = navigation_model
         self._last_video_model = video_model
+        self._last_function_model = function_model
         self._last_build_info_model = build_info_model
         self._last_startup_loading_model = startup_model
         self._last_runtime_pause_model = runtime_pause_model
@@ -7457,10 +9947,22 @@ class X11CalibrationOverlay:
             "_font_size",
             _DEFAULT_OVERLAY_FONT_SIZE,
         )
-        self._last_page = getattr(self, "_active_page", "loadout")
+        self._last_page = getattr(self, "_active_page", _PANEL_DIRECTORY_PAGE)
+        self._last_functions_subpage = getattr(self, "_functions_subpage", "home")
+        self._last_selected_function_name = getattr(
+            self,
+            "_selected_function_name",
+            None,
+        )
         self._last_command_status = command_status
         self._last_command_revision = self._command_editor.revision
+        self._last_video_distance_bound_revision = getattr(
+            self,
+            "_video_distance_bound_editor",
+            CameraDistanceBoundEditor(),
+        ).revision
         self._last_pointer = pointer
+        self._last_hover_action = hover_action
         if raise_due:
             self._last_raise_s = now
         self._visible = True
@@ -7468,6 +9970,7 @@ class X11CalibrationOverlay:
 
     def hide(self, publisher: PointerActionPublisher | None = None) -> None:
         self._force_end_command_editing(publisher)
+        self._force_end_video_distance_bound_editing()
         if not self._visible and not self._cursor_visible:
             return
         for window in self._windows.values():
@@ -7483,22 +9986,36 @@ class X11CalibrationOverlay:
         self._last_inventory_model = None
         self._last_navigation_model = None
         self._last_video_model = None
+        self._last_function_model = None
         self._last_build_info_model = None
         self._last_startup_loading_model = startup_loading_model({})
         self._last_page = None
+        self._last_functions_subpage = None
+        self._last_selected_function_name = None
         self._last_command_status = command_console_status({})
         self._last_command_revision = self._command_editor.revision
+        self._last_video_distance_bound_revision = getattr(
+            self,
+            "_video_distance_bound_editor",
+            CameraDistanceBoundEditor(),
+        ).revision
         self._last_pointer = None
+        self._last_hover_action = None
         self._last_raise_s = None
         self._pressed_action = None
         self._pressed_window = None
         self._pressed_runtime_pause_target = None
         self._pressed_runtime_pause_epoch = None
+        self._polled_pressed_action = None
+        self._polled_pressed_runtime_pause_target = None
+        self._polled_pressed_runtime_pause_epoch = None
         self._font_slider_dragging = False
         self._pending_font_slider_action = None
         self._pending_font_slider_size = None
+        self._camera_distance_slider_dragging = False
+        self._pending_camera_distance_cm = None
         self._last_rendered_font_size = None
-        self._active_page = "loadout"
+        self._active_page = _PANEL_DIRECTORY_PAGE
 
     def close(self) -> None:
         display = getattr(self, "_display", None)
@@ -7507,6 +10024,9 @@ class X11CalibrationOverlay:
         editor = getattr(self, "_command_editor", None)
         if editor is not None:
             editor.end(force=True)
+        video_editor = getattr(self, "_video_distance_bound_editor", None)
+        if video_editor is not None:
+            video_editor.end()
         self._ungrab_keyboard()
         xft = getattr(self, "_xft", None)
         visual = getattr(self, "_visual", None)
@@ -7658,6 +10178,7 @@ def main() -> int:
             },
         )
         interval = 1.0 / args.poll_hz
+        last_status_update_s = time.monotonic()
         while running:
             if os.getppid() != args.expected_parent_pid:
                 exit_reason = "parent_exit"
@@ -7680,6 +10201,21 @@ def main() -> int:
                 overlay.hide(action_publisher)
                 assert action_publisher is not None
                 overlay.drain_pointer_actions(action_publisher)
+            now_s = time.monotonic()
+            if now_s - last_status_update_s >= 0.5:
+                font_diagnostics = overlay.font_diagnostics
+                x11_diagnostics = overlay.x11_diagnostics
+                atomic_json(
+                    args.status_file,
+                    {
+                        "ready": True,
+                        "pid": os.getpid(),
+                        "expected_ue_pid": args.expected_ue_pid,
+                        "fonts": font_diagnostics,
+                        "x11": x11_diagnostics,
+                    },
+                )
+                last_status_update_s = now_s
             time.sleep(interval)
     except Exception as exc:
         return_code = 1

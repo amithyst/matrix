@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared movement-mode identifiers and stable operator-facing metadata."""
+"""Shared Matrix movement-mode identifiers and operator-facing metadata."""
 
 from __future__ import annotations
 
@@ -7,15 +7,25 @@ from typing import Final
 
 
 CAMERA_FACE: Final = "camera_face"
+CAMERA_FACE_STRAFE: Final = "camera_face_strafe"
 CAMERA_STRAFE: Final = "camera_strafe"
 BODY_RELATIVE: Final = "body_relative"
-MOVEMENT_MODES: Final = (CAMERA_FACE, CAMERA_STRAFE, BODY_RELATIVE)
+MOVEMENT_MODES: Final = (
+    CAMERA_FACE,
+    CAMERA_FACE_STRAFE,
+    CAMERA_STRAFE,
+    BODY_RELATIVE,
+)
 DEFAULT_MOVEMENT_MODE: Final = CAMERA_FACE
 
 _MODE_METADATA: Final = {
     CAMERA_FACE: {
         "translation_frame": "camera",
         "facing_policy": "face_movement",
+    },
+    CAMERA_FACE_STRAFE: {
+        "translation_frame": "camera",
+        "facing_policy": "face_camera_forward",
     },
     CAMERA_STRAFE: {
         "translation_frame": "camera",
@@ -49,6 +59,7 @@ def movement_mode_metadata(value: object) -> dict[str, str]:
 __all__ = [
     "BODY_RELATIVE",
     "CAMERA_FACE",
+    "CAMERA_FACE_STRAFE",
     "CAMERA_STRAFE",
     "DEFAULT_MOVEMENT_MODE",
     "MOVEMENT_MODES",

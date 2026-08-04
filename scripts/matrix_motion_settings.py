@@ -33,6 +33,31 @@ MAX_TURN_RATE_PATH = f"control.motion.{MAX_TURN_RATE_FIELD}"
 DEFAULT_MAX_TURN_RATE_RAD_S = 2.50
 MAX_TURN_RATE_RANGE_RAD_S = (0.25, 2.50)
 MAX_TURN_RATE_STEP_RAD_S = 0.25
+KEYBOARD_TURN_RATE_FIELD = "keyboard_turn_rate_rad_s"
+KEYBOARD_TURN_RATE_PATH = f"control.motion.{KEYBOARD_TURN_RATE_FIELD}"
+DEFAULT_KEYBOARD_TURN_RATE_RAD_S = 1.50
+KEYBOARD_TURN_BOOST_RATE_FIELD = "keyboard_turn_boost_rate_rad_s"
+KEYBOARD_TURN_BOOST_RATE_PATH = f"control.motion.{KEYBOARD_TURN_BOOST_RATE_FIELD}"
+DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S = 3.00
+KEYBOARD_TURN_RATE_RANGE_RAD_S = (0.25, 4.00)
+KEYBOARD_TURN_RATE_STEP_RAD_S = 0.25
+GAIT_START_HEADING_ERROR_FIELD = "gait_start_heading_error_rad"
+GAIT_START_HEADING_ERROR_PATH = f"control.motion.{GAIT_START_HEADING_ERROR_FIELD}"
+DEFAULT_GAIT_START_HEADING_ERROR_RAD = math.radians(10.0)
+GAIT_STOP_HEADING_ERROR_FIELD = "gait_stop_heading_error_rad"
+GAIT_STOP_HEADING_ERROR_PATH = f"control.motion.{GAIT_STOP_HEADING_ERROR_FIELD}"
+DEFAULT_GAIT_STOP_HEADING_ERROR_RAD = math.radians(90.0)
+GAIT_HEADING_ERROR_RANGE_RAD = (math.radians(1.0), math.radians(90.0))
+GAIT_HEADING_ERROR_STEP_RAD = math.radians(1.0)
+GAIT_HEADING_ERROR_MIN_GAP_RAD = GAIT_HEADING_ERROR_STEP_RAD
+GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD = 1e-9
+CAMERA_HEADING_SNAP_ERROR_FIELD = "camera_heading_snap_error_rad"
+CAMERA_HEADING_SNAP_ERROR_PATH = (
+    f"control.motion.{CAMERA_HEADING_SNAP_ERROR_FIELD}"
+)
+DEFAULT_CAMERA_HEADING_SNAP_ERROR_RAD = math.radians(2.0)
+CAMERA_HEADING_SNAP_ERROR_RANGE_RAD = (math.radians(1.0), math.radians(15.0))
+CAMERA_HEADING_SNAP_ERROR_STEP_RAD = math.radians(1.0)
 KEYBOARD_LOOK_RATE_FIELD = "keyboard_look_rate_deg_s"
 KEYBOARD_LOOK_RATE_PATH = f"control.camera.{KEYBOARD_LOOK_RATE_FIELD}"
 DEFAULT_KEYBOARD_LOOK_RATE_DEG_S = 120.0
@@ -69,7 +94,15 @@ GEAR_STEP_MPS: Mapping[str, float] = {
 
 _PATH_PREFIX = "control.motion.gears"
 MOTION_SETTING_PATHS = frozenset(
-    [MAX_TURN_RATE_PATH, KEYBOARD_LOOK_RATE_PATH]
+    [
+        MAX_TURN_RATE_PATH,
+        KEYBOARD_TURN_RATE_PATH,
+        KEYBOARD_TURN_BOOST_RATE_PATH,
+        GAIT_START_HEADING_ERROR_PATH,
+        GAIT_STOP_HEADING_ERROR_PATH,
+        CAMERA_HEADING_SNAP_ERROR_PATH,
+        KEYBOARD_LOOK_RATE_PATH,
+    ]
     + [
         f"{_PATH_PREFIX}.{gear}.{field}"
         for gear in GEARS
@@ -187,12 +220,34 @@ def _is_turn_rate_path(path: object) -> bool:
     return path == MAX_TURN_RATE_PATH
 
 
+def _is_keyboard_turn_rate_path(path: object) -> bool:
+    if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
+        raise MotionSettingsError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
+        )
+    return path in {KEYBOARD_TURN_RATE_PATH, KEYBOARD_TURN_BOOST_RATE_PATH}
+
+
+def _is_gait_heading_error_path(path: object) -> bool:
+    if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
+        raise MotionSettingsError(
+            "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
+        )
+    return path in {GAIT_START_HEADING_ERROR_PATH, GAIT_STOP_HEADING_ERROR_PATH}
+
+
 def _is_keyboard_look_rate_path(path: object) -> bool:
     if not isinstance(path, str) or path not in MOTION_SETTING_PATHS:
         raise MotionSettingsError(
             "E_DATA_PATH_UNKNOWN", f"unsupported motion settings path: {path!r}"
         )
     return path == KEYBOARD_LOOK_RATE_PATH
+
+
+def _is_camera_heading_snap_error_path(path: object) -> bool:
+    if type(path) is not str:
+        raise MotionSettingsError("E_DATA_PATH", "motion setting path must be a string")
+    return path == CAMERA_HEADING_SNAP_ERROR_PATH
 
 
 @dataclass(frozen=True)
@@ -202,6 +257,11 @@ class MotionSettings:
     revision: int = 0
     movement_mode: str = DEFAULT_MOVEMENT_MODE
     max_turn_rate_rad_s: float = DEFAULT_MAX_TURN_RATE_RAD_S
+    keyboard_turn_rate_rad_s: float = DEFAULT_KEYBOARD_TURN_RATE_RAD_S
+    keyboard_turn_boost_rate_rad_s: float = DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S
+    gait_start_heading_error_rad: float = DEFAULT_GAIT_START_HEADING_ERROR_RAD
+    gait_stop_heading_error_rad: float = DEFAULT_GAIT_STOP_HEADING_ERROR_RAD
+    camera_heading_snap_error_rad: float = DEFAULT_CAMERA_HEADING_SNAP_ERROR_RAD
     keyboard_look_rate_deg_s: float = DEFAULT_KEYBOARD_LOOK_RATE_DEG_S
     slow_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][0]
     slow_double_tap_speed_mps: float = DEFAULT_GEAR_SPEEDS_MPS[GEAR_SLOW][1]
@@ -229,6 +289,89 @@ class MotionSettings:
                 f"[{turn_minimum:.2f}, {turn_maximum:.2f}]",
             )
         object.__setattr__(self, MAX_TURN_RATE_FIELD, turn_rate)
+        keyboard_turn = _finite_speed(
+            self.keyboard_turn_rate_rad_s,
+            name=KEYBOARD_TURN_RATE_FIELD,
+        )
+        keyboard_turn_boost = _finite_speed(
+            self.keyboard_turn_boost_rate_rad_s,
+            name=KEYBOARD_TURN_BOOST_RATE_FIELD,
+        )
+        keyboard_turn_minimum, keyboard_turn_maximum = KEYBOARD_TURN_RATE_RANGE_RAD_S
+        for name, value in (
+            (KEYBOARD_TURN_RATE_FIELD, keyboard_turn),
+            (KEYBOARD_TURN_BOOST_RATE_FIELD, keyboard_turn_boost),
+        ):
+            if not keyboard_turn_minimum <= value <= keyboard_turn_maximum:
+                raise MotionSettingsError(
+                    "E_DATA_RANGE",
+                    f"{name} must be in "
+                    f"[{keyboard_turn_minimum:.2f}, {keyboard_turn_maximum:.2f}]",
+                )
+        if keyboard_turn_boost < keyboard_turn:
+            raise MotionSettingsError(
+                "E_DATA_CONSTRAINT",
+                f"{KEYBOARD_TURN_BOOST_RATE_FIELD} must be >= {KEYBOARD_TURN_RATE_FIELD}",
+            )
+        object.__setattr__(self, KEYBOARD_TURN_RATE_FIELD, keyboard_turn)
+        object.__setattr__(self, KEYBOARD_TURN_BOOST_RATE_FIELD, keyboard_turn_boost)
+        gait_start_heading_error = _finite_speed(
+            self.gait_start_heading_error_rad,
+            name=GAIT_START_HEADING_ERROR_FIELD,
+        )
+        gait_stop_heading_error = _finite_speed(
+            self.gait_stop_heading_error_rad,
+            name=GAIT_STOP_HEADING_ERROR_FIELD,
+        )
+        heading_minimum, heading_maximum = GAIT_HEADING_ERROR_RANGE_RAD
+        for name, value in (
+            (GAIT_START_HEADING_ERROR_FIELD, gait_start_heading_error),
+            (GAIT_STOP_HEADING_ERROR_FIELD, gait_stop_heading_error),
+        ):
+            if not heading_minimum <= value <= heading_maximum:
+                raise MotionSettingsError(
+                    "E_DATA_RANGE",
+                    f"{name} must be in "
+                    f"[{math.degrees(heading_minimum):.0f}deg, "
+                    f"{math.degrees(heading_maximum):.0f}deg]",
+                )
+        if not (
+            gait_start_heading_error + GAIT_HEADING_ERROR_MIN_GAP_RAD
+            <= gait_stop_heading_error + 1e-12
+        ):
+            raise MotionSettingsError(
+                "E_DATA_CONSTRAINT",
+                f"{GAIT_START_HEADING_ERROR_FIELD} must be at least "
+                f"{math.degrees(GAIT_HEADING_ERROR_MIN_GAP_RAD):.0f}deg below "
+                f"{GAIT_STOP_HEADING_ERROR_FIELD}",
+            )
+        object.__setattr__(
+            self,
+            GAIT_START_HEADING_ERROR_FIELD,
+            gait_start_heading_error,
+        )
+        object.__setattr__(
+            self,
+            GAIT_STOP_HEADING_ERROR_FIELD,
+            gait_stop_heading_error,
+        )
+        snap_error = _finite_speed(
+            self.camera_heading_snap_error_rad,
+            name=CAMERA_HEADING_SNAP_ERROR_FIELD,
+        )
+        snap_minimum, snap_maximum = CAMERA_HEADING_SNAP_ERROR_RANGE_RAD
+        if not snap_minimum <= snap_error <= snap_maximum:
+            raise MotionSettingsError(
+                "E_DATA_RANGE",
+                f"{CAMERA_HEADING_SNAP_ERROR_FIELD} must be in "
+                f"[{math.degrees(snap_minimum):.0f}deg, "
+                f"{math.degrees(snap_maximum):.0f}deg]",
+            )
+        object.__setattr__(
+            self,
+            CAMERA_HEADING_SNAP_ERROR_FIELD,
+            snap_error,
+        )
         look_rate = _finite_speed(
             self.keyboard_look_rate_deg_s,
             name=KEYBOARD_LOOK_RATE_FIELD,
@@ -268,6 +411,16 @@ class MotionSettings:
     def value_for_path(self, path: object) -> float:
         if _is_turn_rate_path(path):
             return self.max_turn_rate_rad_s
+        if path == KEYBOARD_TURN_RATE_PATH:
+            return self.keyboard_turn_rate_rad_s
+        if path == KEYBOARD_TURN_BOOST_RATE_PATH:
+            return self.keyboard_turn_boost_rate_rad_s
+        if path == GAIT_START_HEADING_ERROR_PATH:
+            return self.gait_start_heading_error_rad
+        if path == GAIT_STOP_HEADING_ERROR_PATH:
+            return self.gait_stop_heading_error_rad
+        if path == CAMERA_HEADING_SNAP_ERROR_PATH:
+            return self.camera_heading_snap_error_rad
         if _is_keyboard_look_rate_path(path):
             return self.keyboard_look_rate_deg_s
         gear, field = _path_parts(path)
@@ -282,6 +435,16 @@ class MotionSettings:
     ) -> "MotionSettings":
         if _is_turn_rate_path(path):
             field_name = MAX_TURN_RATE_FIELD
+        elif path == KEYBOARD_TURN_RATE_PATH:
+            field_name = KEYBOARD_TURN_RATE_FIELD
+        elif path == KEYBOARD_TURN_BOOST_RATE_PATH:
+            field_name = KEYBOARD_TURN_BOOST_RATE_FIELD
+        elif path == GAIT_START_HEADING_ERROR_PATH:
+            field_name = GAIT_START_HEADING_ERROR_FIELD
+        elif path == GAIT_STOP_HEADING_ERROR_PATH:
+            field_name = GAIT_STOP_HEADING_ERROR_FIELD
+        elif path == CAMERA_HEADING_SNAP_ERROR_PATH:
+            field_name = CAMERA_HEADING_SNAP_ERROR_FIELD
         elif _is_keyboard_look_rate_path(path):
             field_name = KEYBOARD_LOOK_RATE_FIELD
         else:
@@ -309,6 +472,11 @@ class MotionSettings:
             "version": SETTINGS_VERSION,
             "revision": self.revision,
             MAX_TURN_RATE_FIELD: self.max_turn_rate_rad_s,
+            KEYBOARD_TURN_RATE_FIELD: self.keyboard_turn_rate_rad_s,
+            KEYBOARD_TURN_BOOST_RATE_FIELD: self.keyboard_turn_boost_rate_rad_s,
+            GAIT_START_HEADING_ERROR_FIELD: self.gait_start_heading_error_rad,
+            GAIT_STOP_HEADING_ERROR_FIELD: self.gait_stop_heading_error_rad,
+            CAMERA_HEADING_SNAP_ERROR_FIELD: self.camera_heading_snap_error_rad,
             "movement": movement_mode_metadata(self.movement_mode),
             "camera": {
                 KEYBOARD_LOOK_RATE_FIELD: self.keyboard_look_rate_deg_s,
@@ -327,7 +495,16 @@ class MotionSettings:
     @classmethod
     def from_mapping(cls, value: object) -> "MotionSettings":
         required = {"version", "revision", "gears"}
-        allowed = required | {MAX_TURN_RATE_FIELD, "camera", "movement"}
+        allowed = required | {
+            MAX_TURN_RATE_FIELD,
+            KEYBOARD_TURN_RATE_FIELD,
+            KEYBOARD_TURN_BOOST_RATE_FIELD,
+            GAIT_START_HEADING_ERROR_FIELD,
+            GAIT_STOP_HEADING_ERROR_FIELD,
+            CAMERA_HEADING_SNAP_ERROR_FIELD,
+            "camera",
+            "movement",
+        }
         if not isinstance(value, dict) or not required <= set(value) <= allowed:
             raise MotionSettingsError(
                 "E_DATA_SCHEMA", "motion settings must contain version/revision/gears"
@@ -341,11 +518,40 @@ class MotionSettings:
             raise MotionSettingsError(
                 "E_DATA_SCHEMA", "motion settings must define exactly slow/walk/run"
             )
+        max_turn_rate = value.get(
+            MAX_TURN_RATE_FIELD,
+            DEFAULT_MAX_TURN_RATE_RAD_S,
+        )
+        keyboard_turn_rate = value.get(KEYBOARD_TURN_RATE_FIELD, max_turn_rate)
+        if (
+            isinstance(keyboard_turn_rate, (int, float))
+            and not isinstance(keyboard_turn_rate, bool)
+        ):
+            keyboard_turn_boost_default = min(
+                KEYBOARD_TURN_RATE_RANGE_RAD_S[1],
+                max(float(keyboard_turn_rate), DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S),
+            )
+        else:
+            keyboard_turn_boost_default = DEFAULT_KEYBOARD_TURN_BOOST_RATE_RAD_S
         fields: dict[str, object] = {
             "revision": value.get("revision"),
-            MAX_TURN_RATE_FIELD: value.get(
-                MAX_TURN_RATE_FIELD,
-                DEFAULT_MAX_TURN_RATE_RAD_S,
+            MAX_TURN_RATE_FIELD: max_turn_rate,
+            KEYBOARD_TURN_RATE_FIELD: keyboard_turn_rate,
+            KEYBOARD_TURN_BOOST_RATE_FIELD: value.get(
+                KEYBOARD_TURN_BOOST_RATE_FIELD,
+                keyboard_turn_boost_default,
+            ),
+            GAIT_START_HEADING_ERROR_FIELD: value.get(
+                GAIT_START_HEADING_ERROR_FIELD,
+                DEFAULT_GAIT_START_HEADING_ERROR_RAD,
+            ),
+            GAIT_STOP_HEADING_ERROR_FIELD: value.get(
+                GAIT_STOP_HEADING_ERROR_FIELD,
+                DEFAULT_GAIT_STOP_HEADING_ERROR_RAD,
+            ),
+            CAMERA_HEADING_SNAP_ERROR_FIELD: value.get(
+                CAMERA_HEADING_SNAP_ERROR_FIELD,
+                DEFAULT_CAMERA_HEADING_SNAP_ERROR_RAD,
             ),
             KEYBOARD_LOOK_RATE_FIELD: DEFAULT_KEYBOARD_LOOK_RATE_DEG_S,
             "movement_mode": DEFAULT_MOVEMENT_MODE,
@@ -530,6 +736,63 @@ _KEYBOARD_LOOK_RATE_STEP_PRESETS = tuple(
         + 1
     )
 )
+_KEYBOARD_TURN_RATE_STEP_PRESETS = tuple(
+    round(
+        KEYBOARD_TURN_RATE_RANGE_RAD_S[0]
+        + index * KEYBOARD_TURN_RATE_STEP_RAD_S,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (KEYBOARD_TURN_RATE_RANGE_RAD_S[1] - KEYBOARD_TURN_RATE_RANGE_RAD_S[0])
+                / KEYBOARD_TURN_RATE_STEP_RAD_S
+            )
+        )
+        + 1
+    )
+)
+_GAIT_HEADING_ERROR_STEP_PRESETS = tuple(
+    round(
+        GAIT_HEADING_ERROR_RANGE_RAD[0] + index * GAIT_HEADING_ERROR_STEP_RAD,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (GAIT_HEADING_ERROR_RANGE_RAD[1] - GAIT_HEADING_ERROR_RANGE_RAD[0])
+                / GAIT_HEADING_ERROR_STEP_RAD
+            )
+        )
+        + 1
+    )
+)
+_CAMERA_HEADING_SNAP_ERROR_STEP_PRESETS = tuple(
+    round(
+        CAMERA_HEADING_SNAP_ERROR_RANGE_RAD[0]
+        + index * CAMERA_HEADING_SNAP_ERROR_STEP_RAD,
+        10,
+    )
+    for index in range(
+        int(
+            round(
+                (
+                    CAMERA_HEADING_SNAP_ERROR_RANGE_RAD[1]
+                    - CAMERA_HEADING_SNAP_ERROR_RANGE_RAD[0]
+                )
+                / CAMERA_HEADING_SNAP_ERROR_STEP_RAD
+            )
+        )
+        + 1
+    )
+)
+
+
+def _settings_file_mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
 
 
 def step_motion_speed(
@@ -552,6 +815,82 @@ def step_motion_speed(
             candidates = tuple(value for value in presets if value > current + 1e-12)
             return candidates[0] if candidates else presets[-1]
         candidates = tuple(value for value in presets if value < current - 1e-12)
+        return candidates[-1] if candidates else presets[0]
+    if _is_keyboard_turn_rate_path(path):
+        current = settings.value_for_path(path)
+        presets = _KEYBOARD_TURN_RATE_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(value for value in presets if value > current + 1e-12)
+            result = candidates[0] if candidates else presets[-1]
+        else:
+            candidates = tuple(value for value in presets if value < current - 1e-12)
+            result = candidates[-1] if candidates else presets[0]
+        if path == KEYBOARD_TURN_RATE_PATH:
+            boost = settings.value_for_path(KEYBOARD_TURN_BOOST_RATE_PATH)
+            allowed = tuple(value for value in presets if value <= boost + 1e-12)
+            if not allowed:
+                return current
+            return min(result, allowed[-1])
+        base = settings.value_for_path(KEYBOARD_TURN_RATE_PATH)
+        allowed = tuple(value for value in presets if value >= base - 1e-12)
+        if not allowed:
+            return current
+        return max(result, allowed[0])
+    if _is_gait_heading_error_path(path):
+        current = settings.value_for_path(path)
+        presets = _GAIT_HEADING_ERROR_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(
+                value
+                for value in presets
+                if value > current + GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+            )
+            result = candidates[0] if candidates else presets[-1]
+        else:
+            candidates = tuple(
+                value
+                for value in presets
+                if value < current - GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+            )
+            result = candidates[-1] if candidates else presets[0]
+        if path == GAIT_START_HEADING_ERROR_PATH:
+            stop = settings.value_for_path(GAIT_STOP_HEADING_ERROR_PATH)
+            allowed = tuple(
+                value
+                for value in presets
+                if value + GAIT_HEADING_ERROR_MIN_GAP_RAD
+                <= stop + GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+            )
+            if not allowed:
+                return current
+            return min(result, allowed[-1])
+        start = settings.value_for_path(GAIT_START_HEADING_ERROR_PATH)
+        allowed = tuple(
+            value
+            for value in presets
+            if value
+            >= start
+            + GAIT_HEADING_ERROR_MIN_GAP_RAD
+            - GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+        )
+        if not allowed:
+            return current
+        return max(result, allowed[0])
+    if _is_camera_heading_snap_error_path(path):
+        current = settings.value_for_path(path)
+        presets = _CAMERA_HEADING_SNAP_ERROR_STEP_PRESETS
+        if direction > 0:
+            candidates = tuple(
+                value
+                for value in presets
+                if value > current + GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+            )
+            return candidates[0] if candidates else presets[-1]
+        candidates = tuple(
+            value
+            for value in presets
+            if value < current - GAIT_HEADING_ERROR_PRESET_TOLERANCE_RAD
+        )
         return candidates[-1] if candidates else presets[0]
     if _is_keyboard_look_rate_path(path):
         current = settings.value_for_path(path)
@@ -621,6 +960,7 @@ class MotionSettingsStore:
             raise TypeError("initial settings must be MotionSettings")
         if fallback is not None and not isinstance(fallback, MotionSettings):
             raise TypeError("fallback settings must be MotionSettings")
+        self._fallback = fallback
         loaded = load_settings(path) if initial is None else None
         self.path = path
         self._settings = (
@@ -636,6 +976,7 @@ class MotionSettingsStore:
         self.load_error = loaded.error if loaded is not None else None
         self._saver = saver
         self._lock = threading.RLock()
+        self._mtime_ns = _settings_file_mtime_ns(path)
 
     @property
     def settings(self) -> MotionSettings:
@@ -691,6 +1032,7 @@ class MotionSettingsStore:
                     f"could not persist motion settings: {exc}"
                 ) from exc
             self._settings = candidate
+            self._mtime_ns = _settings_file_mtime_ns(self.path)
             self.load_status = "saved"
             self.load_error = None
             return MotionSettingsModification(
@@ -755,6 +1097,7 @@ class MotionSettingsStore:
                     f"could not persist motion settings: {exc}"
                 ) from exc
             self._settings = candidate
+            self._mtime_ns = _settings_file_mtime_ns(self.path)
             self.load_status = "saved"
             self.load_error = None
             return MotionSettingsModification(
@@ -764,6 +1107,30 @@ class MotionSettingsStore:
                 candidate.movement_mode,
                 True,
             )
+
+    def reload_if_changed(self) -> bool:
+        """Reload if another cooperating Matrix process replaced the settings file."""
+
+        with self._lock:
+            mtime_ns = _settings_file_mtime_ns(self.path)
+            if mtime_ns == self._mtime_ns:
+                return False
+            loaded = load_settings(self.path)
+            candidate = (
+                loaded.settings
+                if loaded.status == "loaded" or self._fallback is None
+                else self._fallback
+            )
+            changed = (
+                candidate != self._settings
+                or loaded.status != self.load_status
+                or loaded.error != self.load_error
+            )
+            self._settings = candidate
+            self.load_status = loaded.status
+            self.load_error = loaded.error
+            self._mtime_ns = mtime_ns
+            return changed
 
     def mapping(self) -> dict[str, object]:
         with self._lock:
@@ -776,6 +1143,13 @@ class MotionSettingsStore:
 
 
 __all__ = [
+    "CAMERA_HEADING_SNAP_ERROR_FIELD",
+    "CAMERA_HEADING_SNAP_ERROR_PATH",
+    "CAMERA_HEADING_SNAP_ERROR_RANGE_RAD",
+    "CAMERA_HEADING_SNAP_ERROR_STEP_RAD",
+    "DEFAULT_CAMERA_HEADING_SNAP_ERROR_RAD",
+    "DEFAULT_GAIT_START_HEADING_ERROR_RAD",
+    "DEFAULT_GAIT_STOP_HEADING_ERROR_RAD",
     "DEFAULT_KEYBOARD_LOOK_RATE_DEG_S",
     "DEFAULT_GEAR_SPEEDS_MPS",
     "DEFAULT_MAX_TURN_RATE_RAD_S",
@@ -783,10 +1157,23 @@ __all__ = [
     "GEARS",
     "GEAR_SPEED_RANGES_MPS",
     "GEAR_STEP_MPS",
+    "GAIT_HEADING_ERROR_MIN_GAP_RAD",
+    "GAIT_HEADING_ERROR_RANGE_RAD",
+    "GAIT_HEADING_ERROR_STEP_RAD",
+    "GAIT_START_HEADING_ERROR_FIELD",
+    "GAIT_START_HEADING_ERROR_PATH",
+    "GAIT_STOP_HEADING_ERROR_FIELD",
+    "GAIT_STOP_HEADING_ERROR_PATH",
     "KEYBOARD_LOOK_RATE_FIELD",
     "KEYBOARD_LOOK_RATE_PATH",
     "KEYBOARD_LOOK_RATE_RANGE_DEG_S",
     "KEYBOARD_LOOK_RATE_STEP_DEG_S",
+    "KEYBOARD_TURN_BOOST_RATE_FIELD",
+    "KEYBOARD_TURN_BOOST_RATE_PATH",
+    "KEYBOARD_TURN_RATE_FIELD",
+    "KEYBOARD_TURN_RATE_PATH",
+    "KEYBOARD_TURN_RATE_RANGE_RAD_S",
+    "KEYBOARD_TURN_RATE_STEP_RAD_S",
     "MAX_REVISION",
     "MAX_TURN_RATE_FIELD",
     "MAX_TURN_RATE_PATH",

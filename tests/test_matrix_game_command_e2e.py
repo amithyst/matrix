@@ -63,7 +63,15 @@ class MatrixGameCommandEndToEndTest(unittest.TestCase):
             world_revision=self.WORLD_REVISION,
             checkpoint_seconds=0.75,
         )
-        self.runtime = RUNTIME.GameCommandRuntime(command_runtime, self.world)
+        self.applied_poses: list[WORLD_STATE.WorldPose] = []
+        self.runtime = RUNTIME.GameCommandRuntime(
+            command_runtime,
+            self.world,
+            pose_applier=lambda pose, reset_to_standing: self.applied_poses.append(
+                pose
+            )
+            or pose,
+        )
 
         self.addCleanup(self.runtime.close)
         self.addCleanup(self.client.close)
@@ -170,17 +178,18 @@ class MatrixGameCommandEndToEndTest(unittest.TestCase):
                 COMMANDS.TeleportSelector,
             )
             self.assertEqual(teleport_request.sequence, 2)
-            self.assertTrue(
+            self.assertFalse(
                 self.runtime.poll(current_pose=current_pose, command_allowed=True)
             )
             self.assertTrue(self.client.poll())
 
         teleport_result = self.client.mapping()
-        self.assertEqual(teleport_result["status"], "restarting")
-        self.assertEqual(teleport_result["code"], "OK_TELEPORT_RESTART")
-        self.assertIs(teleport_result["restart_required"], True)
-        self.assertTrue(self.runtime.restart_requested)
+        self.assertEqual(teleport_result["status"], "success")
+        self.assertEqual(teleport_result["code"], "OK_TELEPORT")
+        self.assertIs(teleport_result["restart_required"], False)
+        self.assertFalse(self.runtime.restart_requested)
         self.assertEqual(teleport_result["data"]["entity_id"], point.entity_id)
+        self.assertEqual(self.applied_poses, [point.pose])
 
         after_teleport = self._reload_state()
         self.assertEqual(

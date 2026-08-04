@@ -14,7 +14,7 @@
     "curated_selectable_scenes": 18,
     "custom_templates": 1,
     "unique_selectable_map_packages": 19,
-    "launcher_scene_ids": 21,
+    "launcher_scene_ids": 22,
     "internal_base_maps": 1,
     "total_packaged_map_assets": 20
   },
@@ -416,6 +416,24 @@
         "geom_types": {"plane": 1, "box": 41, "cylinder": 6},
         "dynamic_body_count": 0,
         "explicit_friction_geom_count": 0
+      }
+    }
+  ],
+  "external_candidate_scenes": [
+    {
+      "package_name": "RobotTrainingGround",
+      "display_name": "RealScan Robot Training Ground",
+      "kind": "external_candidate",
+      "launcher_ids": [18],
+      "ue_map": "/Game/Maps/RobotTrainingGround",
+      "mujoco_scene": "scene_terrain_robot_training_ground.xml",
+      "availability": "requires_verified_cooked_receipt",
+      "physics_proxy": {
+        "source_release": "realscan-navmesh-bcb26378",
+        "geom_count": 454,
+        "geom_types": {"hfield": 1, "box": 453},
+        "dynamic_body_count": 0,
+        "explicit_friction_geom_count": 454
       }
     }
   ],

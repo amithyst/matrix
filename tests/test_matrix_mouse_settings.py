@@ -7,7 +7,6 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
-from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -92,21 +91,6 @@ class MouseSettingsFileTest(unittest.TestCase):
             self.assertEqual(off_table.settings.profile, "local")
             self.assertEqual(off_table.settings.effective_scale, 1.0)
 
-    def test_duplicate_keys_are_rejected_instead_of_last_value_winning(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "mouse.json"
-            path.write_text(
-                '{"version":1,"profile":"local","profile":"remote",'
-                '"speed_scale":0.4}',
-                encoding="utf-8",
-            )
-
-            loaded = MODULE.load_settings(path)
-
-            self.assertEqual(loaded.status, "invalid")
-            self.assertEqual(loaded.settings, MODULE.MouseSettings())
-            self.assertIn("duplicate", loaded.error or "")
-
     def test_remote_file_is_atomic_private_and_strictly_versioned(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "nested/mouse.json"
@@ -138,56 +122,6 @@ class MouseSettingsFileTest(unittest.TestCase):
             self.assertEqual(loaded.status, "loaded")
             self.assertEqual(loaded.settings, settings)
             self.assertEqual(loaded.settings.effective_scale, 0.01)
-
-    def test_default_path_is_host_scoped_and_legacy_file_is_preserved(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            target = MODULE.default_settings_file("trna", config_home=root)
-            self.assertEqual(
-                target,
-                root / "matrix/hosts/trna/mouse-control.json",
-            )
-            legacy = MODULE.legacy_settings_file(config_home=root)
-            legacy.parent.mkdir(parents=True)
-            legacy.write_text(
-                '{"version":1,"profile":"remote","speed_scale":0.4}',
-                encoding="utf-8",
-            )
-
-            loaded = MODULE.load_settings_with_legacy_fallback(target)
-
-            self.assertEqual(loaded.status, "loaded_legacy")
-            self.assertEqual(loaded.settings.profile, "remote")
-            self.assertEqual(loaded.settings.effective_scale, 0.4)
-
-    def test_valid_host_is_authoritative_across_environment_and_reload(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            host = MODULE.default_settings_file("trna", config_home=root)
-            legacy = MODULE.legacy_settings_file(config_home=root)
-            legacy.parent.mkdir(parents=True)
-            legacy.write_text(
-                '{"version":1,"profile":"local","speed_scale":0.9}',
-                encoding="utf-8",
-            )
-            expected = MODULE.MouseSettings(profile="remote", speed_scale=0.3)
-            MODULE.atomic_save_settings(host, expected)
-
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "MATRIX_HOST_PROFILE": "other-host",
-                    "PROFILE": "legacy-profile",
-                    "SDL_MOUSE_RELATIVE_SPEED_SCALE": "0.01",
-                },
-                clear=False,
-            ):
-                first_launch = MODULE.load_settings_with_legacy_fallback(host)
-                restarted = MODULE.load_settings_with_legacy_fallback(host)
-
-            self.assertEqual(first_launch.status, "loaded")
-            self.assertEqual(first_launch.settings, expected)
-            self.assertEqual(restarted, first_launch)
 
 
 if __name__ == "__main__":

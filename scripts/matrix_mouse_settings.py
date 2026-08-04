@@ -15,7 +15,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import tempfile
 
 
@@ -31,15 +30,6 @@ MAX_REMOTE_SPEED_SCALE = REMOTE_SPEED_SCALE_STEPS[-1]
 REMOTE_SPEED_SCALE_DESCRIPTION = (
     "0.01-0.10 in 0.01 steps, then 0.20-1.00 in 0.10 steps"
 )
-_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-
-
-def canonical_host_profile(value: object) -> str:
-    if not isinstance(value, str) or _PROFILE_RE.fullmatch(value) is None:
-        raise ValueError(
-            "host profile must use 1-64 ASCII letters, digits, dot, underscore, or dash"
-        )
-    return value
 
 
 def canonical_remote_speed_scale(value: object) -> float:
@@ -115,61 +105,20 @@ class SettingsLoad:
     error: str | None = None
 
 
-def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate mouse settings field {key!r}")
-        result[key] = value
-    return result
-
-
-def default_settings_file(
-    profile: object | None = None,
-    *,
-    config_home: Path | str | None = None,
-) -> Path:
-    selected = (
-        os.environ.get("MATRIX_HOST_PROFILE")
-        or os.environ.get("PROFILE")
-        or "local"
-        if profile is None
-        else profile
-    )
-    host_profile = canonical_host_profile(selected)
-    if config_home is None:
-        configured = os.environ.get("XDG_CONFIG_HOME")
-        root = Path(configured) if configured else Path.home() / ".config"
-    else:
-        root = Path(config_home)
-    return root.expanduser() / "matrix" / "hosts" / host_profile / "mouse-control.json"
-
-
-def legacy_settings_file(
-    *,
-    config_home: Path | str | None = None,
-) -> Path:
-    if config_home is None:
-        configured = os.environ.get("XDG_CONFIG_HOME")
-        root = Path(configured) if configured else Path.home() / ".config"
-    else:
-        root = Path(config_home)
-    return root.expanduser() / "matrix" / "mouse-control.json"
+def default_settings_file() -> Path:
+    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return root / "matrix" / "mouse-control.json"
 
 
 def load_settings(path: Path) -> SettingsLoad:
     """Load a versioned file; missing/invalid state safely becomes Local."""
 
     try:
-        text = path.read_text(encoding="utf-8")
+        value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return SettingsLoad(MouseSettings(), "missing")
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return SettingsLoad(MouseSettings(), "invalid", f"cannot read settings: {exc}")
-    try:
-        value = json.loads(text, object_pairs_hook=_strict_object)
-    except (json.JSONDecodeError, ValueError) as exc:
-        return SettingsLoad(MouseSettings(), "invalid", f"invalid settings: {exc}")
     try:
         if not isinstance(value, dict) or set(value) != {
             "version",
@@ -186,27 +135,6 @@ def load_settings(path: Path) -> SettingsLoad:
     except (TypeError, ValueError) as exc:
         return SettingsLoad(MouseSettings(), "invalid", f"invalid settings: {exc}")
     return SettingsLoad(settings, "loaded")
-
-
-def load_settings_with_legacy_fallback(path: Path) -> SettingsLoad:
-    loaded = load_settings(path)
-    if loaded.status != "missing":
-        return loaded
-    parts = path.parts
-    matrix_index = len(parts) - 4
-    is_host_file = bool(
-        matrix_index >= 0
-        and parts[matrix_index] == "matrix"
-        and parts[matrix_index + 1] == "hosts"
-        and parts[matrix_index + 3] == "mouse-control.json"
-    )
-    if not is_host_file:
-        return loaded
-    legacy = Path(*parts[: matrix_index + 1]) / "mouse-control.json"
-    legacy_loaded = load_settings(legacy)
-    if legacy_loaded.status == "loaded":
-        return SettingsLoad(legacy_loaded.settings, "loaded_legacy")
-    return loaded
 
 
 def atomic_save_settings(path: Path, settings: MouseSettings) -> None:
@@ -248,7 +176,7 @@ def atomic_save_settings(path: Path, settings: MouseSettings) -> None:
 def _launch_fields(path: Path) -> int:
     if not path.is_absolute():
         raise SystemExit("mouse settings path must be absolute")
-    loaded = load_settings_with_legacy_fallback(path)
+    loaded = load_settings(path)
     if loaded.error:
         print(
             f"[WARN] {loaded.error}; using Local 1.00x for this launch",

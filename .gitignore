@@ -41,7 +41,6 @@ src/robot_mujoco/zsibot_robots/*
 *.py[cod]
 __pycache__/
 .venv*/
-/.venv-audit
 bin/*.log
 bin/log.txt
 
