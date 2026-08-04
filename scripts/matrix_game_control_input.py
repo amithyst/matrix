@@ -98,6 +98,7 @@ from matrix_game_control import (
 )
 from matrix_movement_modes import (
     DEFAULT_MOVEMENT_MODE,
+    MOVEMENT_MODES,
     next_movement_mode,
     validate_movement_mode,
 )
@@ -177,7 +178,7 @@ _VIDEO_PANEL_ACTIONS: dict[str, tuple[str, int]] = {
 }
 _MOVEMENT_MODE_ACTIONS = frozenset(
     f"movement_mode_{movement_mode}"
-    for movement_mode in ("camera_face", "camera_strafe", "body_relative")
+    for movement_mode in MOVEMENT_MODES
 )
 _UI_PANEL_ACTIONS = frozenset({"font_down", "font_up"})
 _JS_EVENT = struct.Struct("IhBB")

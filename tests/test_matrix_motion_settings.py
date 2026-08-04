@@ -153,6 +153,17 @@ class MotionSettingsValueTest(unittest.TestCase):
         self.assertEqual(
             MODULE.MotionSettings.from_mapping(settings.to_mapping()), settings
         )
+        camera_face_strafe = MODULE.MotionSettings(
+            movement_mode="camera_face_strafe"
+        )
+        self.assertEqual(
+            camera_face_strafe.to_mapping()["movement"],
+            {
+                "mode": "camera_face_strafe",
+                "translation_frame": "camera",
+                "facing_policy": "face_camera_forward",
+            },
+        )
         for mode in ("unknown", "CAMERA_FACE", "", True, None):
             with self.subTest(mode=mode), self.assertRaises(
                 MODULE.MotionSettingsError

@@ -536,6 +536,20 @@ class CelestialNavigationMappingTest(unittest.TestCase):
 
 
 class MovementModeSyncTest(unittest.TestCase):
+    def test_movement_mode_actions_and_cycle_include_camera_face_strafe(self) -> None:
+        self.assertIn(
+            "movement_mode_camera_face_strafe",
+            MODULE._MOVEMENT_MODE_ACTIONS,
+        )
+        self.assertEqual(
+            MODULE.next_movement_mode("camera_face"),
+            "camera_face_strafe",
+        )
+        self.assertEqual(
+            MODULE.next_movement_mode("camera_face_strafe"),
+            "camera_strafe",
+        )
+
     def test_confirmed_runtime_movement_mode_updates_motion_settings_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             settings_file = Path(temporary) / "motion-control.json"

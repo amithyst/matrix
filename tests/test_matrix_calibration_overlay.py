@@ -656,8 +656,12 @@ class OverlayStateTest(unittest.TestCase):
         self.assertIn("对齐精度", snap_lines[0])
         self.assertIn("2-3°", snap_lines[1])
         self.assertIn(
-            "相机朝向",
+            "相机朝向前行",
             MODULE.tooltip_lines_for_action("movement_mode_camera_face")[0],
+        )
+        self.assertIn(
+            "相机朝向侧移",
+            MODULE.tooltip_lines_for_action("movement_mode_camera_face_strafe")[0],
         )
         self.assertIn("AUTO", MODULE.tooltip_lines_for_action("native_mode_auto")[0])
         self.assertIn(
@@ -784,6 +788,7 @@ class OverlayStateTest(unittest.TestCase):
         }
         for action in (
             "movement_mode_camera_face",
+            "movement_mode_camera_face_strafe",
             "movement_mode_camera_strafe",
             "movement_mode_body_relative",
             "motion_gait_start_heading_error_down",

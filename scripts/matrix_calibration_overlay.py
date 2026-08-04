@@ -512,9 +512,15 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
         settings_bottom - button_height,
     )
     profile_gap = max(4, min(10, gap // 2))
+    profile_button_count = 2 + len(MOVEMENT_MODES)
     profile_width = max(
         1,
-        (panel_width - 2 * margin - 4 * profile_gap) // 5,
+        (
+            panel_width
+            - 2 * margin
+            - (profile_button_count - 1) * profile_gap
+        )
+        // profile_button_count,
     )
     settings_content_width = panel_width - 2 * margin
     settings_group_width = max(1, (settings_content_width - 2 * gap) // 3)
@@ -745,14 +751,20 @@ def overlay_layout(geometry: WindowGeometry) -> dict[str, tuple[int, int, int, i
             profile_width,
             button_height,
         ),
-        "movement_mode_camera_strafe": (
+        "movement_mode_camera_face_strafe": (
             panel_x + margin + 3 * (profile_width + profile_gap),
             profile_y,
             profile_width,
             button_height,
         ),
-        "movement_mode_body_relative": (
+        "movement_mode_camera_strafe": (
             panel_x + margin + 4 * (profile_width + profile_gap),
+            profile_y,
+            profile_width,
+            button_height,
+        ),
+        "movement_mode_body_relative": (
+            panel_x + margin + 5 * (profile_width + profile_gap),
             profile_y,
             profile_width,
             button_height,
@@ -1352,9 +1364,10 @@ _MOVEMENT_MODE_ACTIONS = tuple(
     f"movement_mode_{movement_mode}" for movement_mode in MOVEMENT_MODES
 )
 _MOVEMENT_MODE_LABELS = {
-    "camera_face": "相机朝向",
-    "camera_strafe": "相机侧移",
-    "body_relative": "机身相对",
+    "camera_face": "相机朝向前行",
+    "camera_face_strafe": "相机朝向侧移",
+    "camera_strafe": "相机不转侧移",
+    "body_relative": "机身不转侧移",
 }
 
 _VIDEO_SETTING_PRESETS: dict[str, tuple[object, ...]] = {
@@ -1767,15 +1780,19 @@ _BASIC_TOOLTIP_LINES = {
 
 _MOVEMENT_MODE_TOOLTIP_LINES = {
     "camera_face": (
-        "相机朝向：WASD 按镜头方向移动。",
-        "机器人身体会自动转到运动方向，适合正常游玩。",
+        "相机朝向前行：WASD 按镜头方向移动。",
+        "机器人身体会自动转到运动方向；A/D 会转向侧方再前进。",
+    ),
+    "camera_face_strafe": (
+        "相机朝向侧移：WASD 按镜头方向平移。",
+        "机器人身体自动朝向相机正前方；A/D 保持侧移。",
     ),
     "camera_strafe": (
-        "相机侧移：WASD 仍按镜头方向平移。",
-        "身体朝向尽量保持，适合横移观察。",
+        "相机不转侧移：WASD 仍按镜头方向平移。",
+        "身体朝向尽量保持，不跟随相机自动转向。",
     ),
     "body_relative": (
-        "机身相对：WASD 按机器人自身前后左右。",
+        "机身不转侧移：WASD 按机器人自身前后左右。",
         "不跟随相机 yaw，适合排查坐标系问题。",
     ),
 }

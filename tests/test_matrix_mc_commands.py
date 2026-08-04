@@ -68,6 +68,7 @@ class McCommandParserTest(unittest.TestCase):
         pose = MODULE.parse_mc_command("/pose @s yaw ~90deg").command
         recover = MODULE.parse_mc_command("/recover").command
         movement = MODULE.parse_mc_command("/mode camera_strafe").command
+        face_strafe = MODULE.parse_mc_command("/mode camera_face_strafe").command
         native = MODULE.parse_mc_command("/sonic mode 7").command
         auto = MODULE.parse_mc_command("/sonic mode auto").command
         pause = MODULE.parse_mc_command("/pause").command
@@ -89,6 +90,7 @@ class McCommandParserTest(unittest.TestCase):
         self.assertEqual(pose, MODULE.PoseYawSet(MODULE.Angle(math.pi / 2.0, True)))
         self.assertIsInstance(recover, MODULE.RecoverHere)
         self.assertEqual(movement, MODULE.MovementModeSet("camera_strafe"))
+        self.assertEqual(face_strafe, MODULE.MovementModeSet("camera_face_strafe"))
         self.assertEqual(native, MODULE.NativeModeSet(7))
         self.assertEqual(auto, MODULE.NativeModeSet(None))
         self.assertEqual(pause, MODULE.RuntimePauseSet("paused", expected_epoch=None))

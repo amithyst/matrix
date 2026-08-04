@@ -27,6 +27,7 @@ from typing import Any, Mapping, Sequence
 from matrix_movement_modes import (
     BODY_RELATIVE,
     CAMERA_FACE,
+    CAMERA_FACE_STRAFE,
     CAMERA_STRAFE,
     DEFAULT_MOVEMENT_MODE,
     movement_mode_metadata,
@@ -1183,9 +1184,18 @@ class GameControlCore:
 
         if input_magnitude > 1e-12:
             self._stopped_heading_latched = False
+            uses_camera_translation_frame = movement_mode in {
+                CAMERA_FACE,
+                CAMERA_FACE_STRAFE,
+                CAMERA_STRAFE,
+            }
+            uses_camera_auto_facing = movement_mode in {
+                CAMERA_FACE,
+                CAMERA_FACE_STRAFE,
+            }
             translation_frame_heading = (
                 self._snapshot.camera_yaw_rad
-                if movement_mode in {CAMERA_FACE, CAMERA_STRAFE}
+                if uses_camera_translation_frame
                 else (
                     self._measured_heading_rad
                     if self._measured_heading_rad is not None
@@ -1198,8 +1208,12 @@ class GameControlCore:
                 camera_yaw_rad=translation_frame_heading,
             )
             movement_heading = math.atan2(world_y, world_x)
-            desired_heading = movement_heading
-            if movement_mode != CAMERA_FACE:
+            desired_heading = (
+                self._snapshot.camera_yaw_rad
+                if movement_mode == CAMERA_FACE_STRAFE
+                else movement_heading
+            )
+            if not uses_camera_auto_facing:
                 alignment = 1.0
                 if self._measured_heading_rad is not None:
                     self._command_heading_rad = self._measured_heading_rad
@@ -1295,7 +1309,7 @@ class GameControlCore:
             target_speed = requested_speed * alignment
             if (
                 digital_movement
-                and movement_mode == CAMERA_FACE
+                and uses_camera_auto_facing
                 and (
                     self._measured_heading_rad is not None
                     or not camera_auto_turn_needs_native_motion
@@ -1402,7 +1416,7 @@ class GameControlCore:
         if (
             input_magnitude > 1e-12
             and self._gait_active
-            and movement_mode == CAMERA_FACE
+            and movement_mode in {CAMERA_FACE, CAMERA_FACE_STRAFE}
             and (
                 target_speed + self.config.speed_epsilon_mps
                 < self.config.gait_stop_speed_mps
@@ -1421,7 +1435,7 @@ class GameControlCore:
             and requested_speed + self.config.speed_epsilon_mps
             >= self.config.gait_start_speed_mps
             and (
-                movement_mode != CAMERA_FACE
+                movement_mode not in {CAMERA_FACE, CAMERA_FACE_STRAFE}
                 or (
                     digital_movement
                     and digital_entry_aligned
@@ -1479,7 +1493,11 @@ class GameControlCore:
         moving = output_speed > 0.0
         turning_to_heading = bool(
             manual_turn
-            or (movement_mode == CAMERA_FACE and input_magnitude > 1e-12 and not moving)
+            or (
+                movement_mode in {CAMERA_FACE, CAMERA_FACE_STRAFE}
+                and input_magnitude > 1e-12
+                and not moving
+            )
         )
         native_override = self._native_mode_override
         if turning_to_heading:

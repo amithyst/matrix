@@ -717,6 +717,35 @@ class GameControlCoreTest(unittest.TestCase):
         self.assertAlmostEqual(right_command.movement[0], 0.0, places=7)
         self.assertAlmostEqual(right_command.movement[1], -1.0, places=7)
 
+    def test_camera_face_strafe_moves_in_camera_frame_but_faces_camera_forward(
+        self,
+    ) -> None:
+        core = armed_core(
+            immediate_config(movement_mode="camera_face_strafe")
+        )
+        camera_yaw = math.radians(60.0)
+        core.accept_snapshot(
+            snapshot(yaw=camera_yaw, pressed=("d",)),
+            received_at_s=10.0,
+        )
+
+        command = core.command(now_s=10.0, dt_s=0.1)
+
+        self.assertEqual(command.mode, "move")
+        self.assertAlmostEqual(command.speed_mps, 0.10)
+        self.assertAlmostEqual(
+            math.atan2(command.facing[1], command.facing[0]),
+            camera_yaw,
+        )
+        self.assertAlmostEqual(
+            math.atan2(command.desired_facing[1], command.desired_facing[0]),
+            camera_yaw,
+        )
+        self.assertAlmostEqual(
+            math.atan2(command.movement[1], command.movement[0]),
+            math.radians(-30.0),
+        )
+
     def test_q_and_e_turn_in_place_without_translation(self) -> None:
         for key in ("q", "e", "q", "e"):
             core = armed_core(immediate_config())
