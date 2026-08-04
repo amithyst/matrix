@@ -4147,6 +4147,9 @@ class NativeProcessGroup:
     def __init__(self, sonic_root: Path, env: dict[str, str]) -> None:
         self.sonic_root = sonic_root
         self.env = env
+        self.pico_runtime_pythonpath = self.env.pop(
+            "MATRIX_PICO_RUNTIME_PYTHONPATH", ""
+        )
         self.guardian = Path(__file__).with_name(
             "exec_with_parent_death_signal.py"
         ).resolve()
@@ -4187,6 +4190,7 @@ class NativeProcessGroup:
         *,
         exec_command: bool = False,
         extra_pass_fds: tuple[int, ...] = (),
+        child_env: dict[str, str] | None = None,
     ) -> int:
         guarded_command = [
             sys.executable,
@@ -4203,7 +4207,7 @@ class NativeProcessGroup:
         process = subprocess.Popen(
             guarded_command,
             cwd=cwd,
-            env=self.env,
+            env=self.env if child_env is None else child_env,
             pass_fds=pass_fds,
             start_new_session=True,
         )
@@ -4211,6 +4215,9 @@ class NativeProcessGroup:
         return process.pid
 
     def start_pico(self, python: str, *, port: int) -> None:
+        pico_env = self.env.copy()
+        if self.pico_runtime_pythonpath:
+            pico_env["PYTHONPATH"] = self.pico_runtime_pythonpath
         self._start(
             "pico-manager",
             [
@@ -4222,6 +4229,7 @@ class NativeProcessGroup:
                 str(port),
             ],
             self.sonic_root,
+            child_env=pico_env,
         )
 
     def start_game_input(
