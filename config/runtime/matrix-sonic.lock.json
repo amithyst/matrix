@@ -144,7 +144,9 @@
     "wheel_filename": "xrobotoolkit_sdk-1.0.2-cp310-cp310-linux_x86_64.whl",
     "wheel_sha256": "6dda05341c23bcf1986148324fa86ce07b972705645b5582838259fe4ce1287c",
     "runtime_overlay": "external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib/libPXREARobotSDK.so",
-    "runtime_overlay_sha256": "2348e1b0bf7f05cd13d95d628f04237b6b9fc50c6008b82f9bf4b046fc9373e6"
+    "runtime_overlay_sha256": "2348e1b0bf7f05cd13d95d628f04237b6b9fc50c6008b82f9bf4b046fc9373e6",
+    "human_joints_info": "gear_sonic/data/human/human_joints_info.pkl",
+    "human_joints_info_sha256": "4de0bae69caf31e8829a2d3e8adecd887f29115af60a0b8d59237dfbfea1c975"
   },
   "source_revisions": {
     "gr00t_whole_body_control": {
@@ -280,6 +282,11 @@
       "root": "sonic",
       "path": "gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml",
       "sha256": "978421e9c7f42cf58a7bf74ab15e8fedb6ae5907ff85b83263d86f5a4d48d31f"
+    },
+    {
+      "root": "sonic",
+      "path": "gear_sonic/data/human/human_joints_info.pkl",
+      "sha256": "4de0bae69caf31e8829a2d3e8adecd887f29115af60a0b8d59237dfbfea1c975"
     },
     {
       "root": "sonic",

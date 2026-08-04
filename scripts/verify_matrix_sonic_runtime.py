@@ -365,6 +365,8 @@ def validate_schema(lock: dict[str, Any]) -> None:
         "wheel_sha256",
         "runtime_overlay",
         "runtime_overlay_sha256",
+        "human_joints_info",
+        "human_joints_info_sha256",
     ):
         if not isinstance(pico_lock.get(key), str) or not pico_lock[key]:
             raise ValueError(f"pico.{key} must be a non-empty string")
@@ -373,7 +375,11 @@ def validate_schema(lock: dict[str, Any]) -> None:
             "pico.delivery must be external-controlled-environment; "
             "the runtime bundle does not carry the private PICO wheel"
         )
-    for key in ("wheel_sha256", "runtime_overlay_sha256"):
+    for key in (
+        "wheel_sha256",
+        "runtime_overlay_sha256",
+        "human_joints_info_sha256",
+    ):
         if not is_sha256(pico_lock[key]):
             raise ValueError(f"pico.{key} must be a lowercase SHA256")
     if (
@@ -405,6 +411,8 @@ def validate_schema(lock: dict[str, Any]) -> None:
         raise ValueError("pico.wheel_filename is incompatible with CPython 3.10 x86_64")
     if not is_safe_relative_path(pico_lock["runtime_overlay"]):
         raise ValueError("pico.runtime_overlay must be a safe relative path")
+    if not is_safe_relative_path(pico_lock["human_joints_info"]):
+        raise ValueError("pico.human_joints_info must be a safe relative path")
 
     sonic = lock["source_revisions"].get("gr00t_whole_body_control", {})
     if not isinstance(sonic.get("commit"), str) or re.fullmatch(
@@ -432,6 +440,12 @@ def validate_schema(lock: dict[str, Any]) -> None:
         "runtime_overlay_sha256"
     ]:
         raise ValueError("pico runtime overlay must match the SONIC runtime file lock")
+    if runtime_files.get(("sonic", pico_lock["human_joints_info"])) != pico_lock[
+        "human_joints_info_sha256"
+    ]:
+        raise ValueError(
+            "pico human joint data must match the SONIC runtime file lock"
+        )
 
 
 def parse_sha256_manifest(path: Path) -> dict[str, str]:
