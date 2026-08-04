@@ -4749,6 +4749,11 @@ def main() -> int:
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
+    if args.pico_gamepad_bridge and args.control_source == "game":
+        # Shared PICO is an immediately operable state-machine source.  Keep
+        # this invariant below desktop-generator configuration so a stale
+        # launcher cannot silently restore the four-button startup chord.
+        args.pico_autostart_mode = "planner"
     args.verification_receipt_sha256 = None
     _arm_supervisor_parent_death(args.expected_parent_pid)
     run_id = uuid.uuid4().hex
