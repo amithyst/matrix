@@ -1859,7 +1859,7 @@ if $MATRIX_SONIC_ENABLED; then
         --sonic-root "$MATRIX_SONIC_ROOT" \
         --control-source "${MATRIX_SONIC_CONTROL_SOURCE:-planner}" \
         --planner-bind "${MATRIX_SONIC_PLANNER_BIND:-tcp://127.0.0.1:5556}" \
-        --pico-python "${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}" \
+        --pico-python "${MATRIX_PICO_MANAGER_PYTHON:-${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}}" \
         --expected-parent-pid "$$" \
         --external-failure-file "$UE_FAILURE_FILE" \
         --ue-pid "$UE_PID" \
