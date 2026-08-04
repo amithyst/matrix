@@ -600,6 +600,36 @@ def motion_settings_live_mapping(
     return mapping
 
 
+def sync_confirmed_movement_mode(
+    movement_mode: object,
+    *,
+    store: MotionSettingsStore | None,
+    applied: MotionSettings | None,
+) -> tuple[str, MotionSettings | None, bool, str | None]:
+    """Mirror a runtime-confirmed movement mode into the ESC settings model.
+
+    Movement-mode buttons send a hot runtime command first.  The ESC panel,
+    however, highlights the selected button from the persisted motion settings
+    model.  Keeping the sync on the confirmed response path makes button clicks
+    and keyboard cycling share the same source of truth without changing the
+    locomotion core.
+    """
+
+    confirmed = validate_movement_mode(movement_mode)
+    if store is None:
+        return confirmed, applied, False, None
+    try:
+        modification = store.modify_movement_mode(confirmed)
+    except (
+        MotionSettingsError,
+        MotionSettingsPersistenceError,
+        OSError,
+        ValueError,
+    ) as exc:
+        return confirmed, applied, False, str(exc)
+    return confirmed, modification.settings, modification.changed, None
+
+
 def locked_sonic_strategy_loadout() -> dict[str, object]:
     """Describe the fixed stable runtime without exposing switch intents.
 
@@ -5835,13 +5865,25 @@ def main() -> int:
                 except (MotionSettingsError, OSError, ValueError) as exc:
                     motion_settings_error = str(exc)
             if (
-                game_command_client.data is not None
+                command_state_changed
+                and game_command_client.ok is True
+                and game_command_client.data is not None
                 and isinstance(game_command_client.data.get("movement_mode"), str)
             ):
                 try:
-                    current_movement_mode = validate_movement_mode(
-                        game_command_client.data["movement_mode"]
+                    (
+                        current_movement_mode,
+                        applied_motion,
+                        movement_mode_synced,
+                        movement_mode_sync_error,
+                    ) = sync_confirmed_movement_mode(
+                        game_command_client.data["movement_mode"],
+                        store=motion_store,
+                        applied=applied_motion,
                     )
+                    if movement_mode_synced:
+                        motion_settings_change_count += 1
+                    motion_settings_error = movement_mode_sync_error
                 except ValueError:
                     pass
             raw_keyboard = x11.poll()

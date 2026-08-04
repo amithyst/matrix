@@ -489,6 +489,45 @@ class CelestialNavigationMappingTest(unittest.TestCase):
             self.assertEqual(moon.local_position_m, (-94.7, -65.6, 0.8))
 
 
+class MovementModeSyncTest(unittest.TestCase):
+    def test_confirmed_runtime_movement_mode_updates_motion_settings_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_file = Path(temporary) / "motion-control.json"
+            store = MODULE.MotionSettingsStore(settings_file)
+            applied = store.settings
+
+            confirmed, applied, changed, error = MODULE.sync_confirmed_movement_mode(
+                "body_relative",
+                store=store,
+                applied=applied,
+            )
+
+            self.assertEqual(confirmed, "body_relative")
+            self.assertIsNone(error)
+            self.assertTrue(changed)
+            self.assertIsNotNone(applied)
+            self.assertEqual(store.settings.movement_mode, "body_relative")
+            self.assertEqual(applied.movement_mode, "body_relative")
+            self.assertEqual(
+                json.loads(settings_file.read_text(encoding="utf-8"))["movement"][
+                    "mode"
+                ],
+                "body_relative",
+            )
+
+            confirmed, applied, changed, error = MODULE.sync_confirmed_movement_mode(
+                "body_relative",
+                store=store,
+                applied=applied,
+            )
+
+            self.assertEqual(confirmed, "body_relative")
+            self.assertIsNone(error)
+            self.assertFalse(changed)
+            self.assertIsNotNone(applied)
+            self.assertEqual(applied.movement_mode, "body_relative")
+
+
 @unittest.skipUnless(
     hasattr(socket, "SOCK_SEQPACKET"), "Unix SOCK_SEQPACKET is required"
 )
