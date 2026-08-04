@@ -332,6 +332,13 @@ def _parse_args() -> argparse.Namespace:
         help="Interpreter for SONIC's PICO manager (defaults to the simulator Python)",
     )
     parser.add_argument(
+        "--pico-autostart-mode",
+        choices=("off", "planner"),
+        default="off",
+        help="Enter the native PICO planner after startup instead of waiting for A+B+X+Y",
+    )
+    parser.add_argument("--pico-manager-command-port", type=int, default=5559)
+    parser.add_argument(
         "--pico-gamepad-bridge",
         action="store_true",
         help="Forward PICO sticks into the shared Matrix game-input state machine",
@@ -2634,6 +2641,51 @@ def _loopback_zmq_port(endpoint: str) -> int:
     return port
 
 
+def _send_pico_manager_command(
+    zmq_module: Any,
+    *,
+    port: int,
+    command: str,
+    timeout_seconds: float = 30.0,
+) -> None:
+    """Wait for the native PICO manager command socket, then send one mode request."""
+
+    if not 1 <= port <= 65535:
+        raise ValueError("PICO manager command port must be in [1, 65535]")
+    if command not in {"planner", "pose"}:
+        raise ValueError("PICO manager command must be planner or pose")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0.0:
+        raise ValueError("PICO manager command timeout must be positive and finite")
+
+    endpoint = f"tcp://127.0.0.1:{port}"
+    context = zmq_module.Context.instance()
+    client = context.socket(zmq_module.PUSH)
+    client.setsockopt(zmq_module.LINGER, 1000)
+    client.setsockopt(zmq_module.IMMEDIATE, 1)
+    client.setsockopt(zmq_module.SNDHWM, 1)
+    client.connect(endpoint)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            try:
+                client.send_string(command, flags=zmq_module.NOBLOCK)
+                break
+            except zmq_module.Again:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"PICO manager command socket did not become ready: {endpoint}"
+                    )
+                time.sleep(0.1)
+        # Let the connected ZeroMQ pipe flush before closing the one-shot client.
+        time.sleep(0.1)
+    finally:
+        client.close(linger=1000)
+    print(
+        f"matrix-pico-autostart command={command} endpoint={endpoint}",
+        flush=True,
+    )
+
+
 class NativePlannerClient:
     """Thin socket lifecycle around SONIC's canonical ZMQ wire builders."""
 
@@ -4221,10 +4273,11 @@ class NativeProcessGroup:
         self.children.append((name, process))
         return process.pid
 
-    def start_pico(self, python: str, *, port: int) -> None:
+    def start_pico(self, python: str, *, port: int, command_port: int) -> None:
         pico_env = self.env.copy()
         if self.pico_runtime_pythonpath:
             pico_env["PYTHONPATH"] = self.pico_runtime_pythonpath
+        pico_env["PICO_MANAGER_CMD_PORT"] = str(command_port)
         self._start(
             "pico-manager",
             [
@@ -4573,6 +4626,8 @@ def main() -> int:
         ("game_motion_settings_load_status", "disabled"),
         ("moon_dynamic_map", None),
         ("moon_dynamic_map_sha256", None),
+        ("pico_autostart_mode", "off"),
+        ("pico_manager_command_port", 5559),
         ("pico_gamepad_bridge", False),
         ("pico_gamepad_python", None),
         ("pico_gamepad_status_file", None),
@@ -4605,6 +4660,10 @@ def main() -> int:
         raise SystemExit("--ue-pid must identify a live UE process")
     if args.pico_gamepad_bridge and args.control_source != "game":
         raise SystemExit("PICO gamepad bridge requires --control-source game")
+    if args.pico_autostart_mode != "off" and args.control_source != "pico":
+        raise SystemExit("PICO autostart requires --control-source pico")
+    if not 1 <= args.pico_manager_command_port <= 65535:
+        raise SystemExit("--pico-manager-command-port must be in [1, 65535]")
     if (
         args.pico_gamepad_status_file is not None
         and not args.pico_gamepad_status_file.is_absolute()
@@ -5311,11 +5370,25 @@ def main() -> int:
                         capability_file=Path(capability_file),
                         status_file=args.pico_gamepad_status_file,
                     )
-        elif running and args.control_source == "pico":
-            processes.start_pico(
-                args.pico_python or sys.executable, port=planner_port
+        if running and args.control_source == "pico":
+            # Start the subscriber first so the manager's one-shot transition
+            # command cannot be published before the deploy path is listening.
+            processes.start_deploy(
+                interface=args.dds_interface, zmq_port=planner_port
             )
-        if running:
+            processes.start_pico(
+                args.pico_python or sys.executable,
+                port=planner_port,
+                command_port=args.pico_manager_command_port,
+            )
+            if args.pico_autostart_mode != "off":
+                _send_pico_manager_command(
+                    zmq,
+                    port=args.pico_manager_command_port,
+                    command=args.pico_autostart_mode,
+                )
+                poll_failed_child()
+        elif running:
             processes.start_deploy(
                 interface=args.dds_interface, zmq_port=planner_port
             )
@@ -5766,6 +5839,7 @@ def main() -> int:
                     "control_frames": control_frames,
                     "control_hz": args.control_hz,
                     "control_source": args.control_source,
+                    "pico_autostart_mode": args.pico_autostart_mode,
                     "current_fall_detected": bool(snapshot.fall_detected),
                     "elapsed_wall_s": round(now - started_wall, 3),
                     "model": str(model_path),
@@ -6058,6 +6132,7 @@ def main() -> int:
             "control_frames": control_frames,
             "control_hz": args.control_hz,
             "control_source": args.control_source,
+            "pico_autostart_mode": args.pico_autostart_mode,
             "current_fall_detected": bool(snapshot.fall_detected),
             "elapsed_wall_s": round(elapsed_wall_s, 3),
             "failed_child_exit_code": failed_child_code,

@@ -1839,6 +1839,21 @@ if $MATRIX_SONIC_ENABLED; then
             exit 1
             ;;
     esac
+    PICO_AUTOSTART_MODE_VALUE="${MATRIX_PICO_AUTOSTART_MODE:-off}"
+    case "$PICO_AUTOSTART_MODE_VALUE" in
+        off|planner)
+            GAME_INPUT_ARGS+=(--pico-autostart-mode "$PICO_AUTOSTART_MODE_VALUE")
+            ;;
+        *)
+            echo "[ERROR] MATRIX_PICO_AUTOSTART_MODE must be off or planner" >&2
+            exit 1
+            ;;
+    esac
+    if [[ -n "${MATRIX_PICO_MANAGER_COMMAND_PORT:-}" ]]; then
+        GAME_INPUT_ARGS+=(
+            --pico-manager-command-port "$MATRIX_PICO_MANAGER_COMMAND_PORT"
+        )
+    fi
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         --model "$SONIC_PHYSICS_DIR/$SCENE" \
         --sonic-root "$MATRIX_SONIC_ROOT" \

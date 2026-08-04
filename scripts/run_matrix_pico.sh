@@ -8,18 +8,18 @@ usage() {
     cat <<'EOF'
 Usage: bash scripts/run_matrix_pico.sh [--scene ID] [--dry-run] [Matrix options]
 
-Launch Matrix through the normal game-control path. Town10 (scene 2) is the
-default. Keyboard, ESC, and gamepad controls are provided by the shared Matrix
-game input runtime. PICO assets may exist in the environment, but this launcher
-does not switch Matrix to a PICO control source.
+Launch Matrix through SONIC's native PICO manager. Town10 (scene 2) is the
+default. The manager enters PLANNER automatically, so no A+B+X+Y startup chord
+is required. A+X still toggles PLANNER/POSE, A+B advances the 20-mode locomotion
+selector, the left stick translates, and the right stick rotates the robot.
 
 Options:
   --scene ID   Matrix native scene id (default: 2, Town10)
   --dry-run    Print the resolved launch without starting Matrix
   -h, --help   Show this help
 
---control-source is intentionally rejected because this launcher always reuses
-the verified game-control path. Scene 18 additionally requires a verified
+--control-source is intentionally rejected because this launcher always uses
+the verified native PICO path. Scene 18 additionally requires a verified
 RobotTrainingGround visual and physics install before launch.
 EOF
 }
@@ -42,7 +42,7 @@ while (($#)); do
             shift
             ;;
         --control-source|--control-source=*)
-            echo "[ERROR] Matrix dev launcher fixes --control-source game" >&2
+            echo "[ERROR] PICO launcher fixes --control-source pico" >&2
             exit 2
             ;;
         --dry-run)
@@ -74,14 +74,15 @@ fi
 COMMAND=(
     bash "$SCRIPT_DIR/run_matrix_sonic.sh"
     --scene "$SCENE_ID"
-    --control-source game
+    --control-source pico
     "${FORWARDED_ARGS[@]}"
 )
 if [[ "$DRY_RUN" == "1" ]]; then
-    printf 'MATRIX_DEV_LAUNCH scene=%s control_source=game command=' "$SCENE_ID"
+    printf 'PICO_LAUNCH scene=%s control_source=pico autostart=planner command=' "$SCENE_ID"
     printf '%q ' "${COMMAND[@]}"
     printf '\n'
     exit 0
 fi
 
+export MATRIX_PICO_AUTOSTART_MODE="${MATRIX_PICO_AUTOSTART_MODE:-planner}"
 exec "${COMMAND[@]}"

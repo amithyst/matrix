@@ -97,6 +97,10 @@ bash scripts/run_matrix_pico.sh --profile trna --scene 2 --dry-run
 Matrix branch/commit/dirty 状态的 build provenance。scene 18 会额外执行 RealScan
 安装验证，因此视觉包未就绪时即使 `--dry-run` 也会 fail closed。
 
+默认设置 `MATRIX_PICO_AUTOSTART_MODE=planner`：进入后直接遥操，无需
+`A+B+X+Y` 启动组合键；原生 manager 的 `A+X` PLANNER/POSE 切换、`A+B`
+升档、`X+Y` 降档、左摇杆移动和右摇杆机器人转向保持不变。
+
 场景安装验证通过后，从 tmux 或桌面 launcher 调用：
 
 ```bash
