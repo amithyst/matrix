@@ -8,16 +8,18 @@ usage() {
     cat <<'EOF'
 Usage: bash scripts/run_matrix_pico.sh [--scene ID] [--dry-run] [Matrix options]
 
-Launch Matrix with its locked native PICO control source. Town10 (scene 2) is
-the default. All remaining options are forwarded to run_matrix_sonic.sh.
+Launch Matrix through the normal game-control path. Town10 (scene 2) is the
+default. Keyboard, ESC, and gamepad controls are provided by the shared Matrix
+game input runtime. PICO assets may exist in the environment, but this launcher
+does not switch Matrix to a PICO control source.
 
 Options:
   --scene ID   Matrix native scene id (default: 2, Town10)
   --dry-run    Print the resolved launch without starting Matrix
   -h, --help   Show this help
 
---control-source is intentionally rejected because this launcher always uses
-the verified PICO path. Scene 18 additionally requires a verified
+--control-source is intentionally rejected because this launcher always reuses
+the verified game-control path. Scene 18 additionally requires a verified
 RobotTrainingGround visual and physics install before launch.
 EOF
 }
@@ -40,7 +42,7 @@ while (($#)); do
             shift
             ;;
         --control-source|--control-source=*)
-            echo "[ERROR] PICO launcher fixes --control-source pico" >&2
+            echo "[ERROR] Matrix dev launcher fixes --control-source game" >&2
             exit 2
             ;;
         --dry-run)
@@ -72,11 +74,11 @@ fi
 COMMAND=(
     bash "$SCRIPT_DIR/run_matrix_sonic.sh"
     --scene "$SCENE_ID"
-    --control-source pico
+    --control-source game
     "${FORWARDED_ARGS[@]}"
 )
 if [[ "$DRY_RUN" == "1" ]]; then
-    printf 'PICO_LAUNCH scene=%s control_source=pico command=' "$SCENE_ID"
+    printf 'MATRIX_DEV_LAUNCH scene=%s control_source=game command=' "$SCENE_ID"
     printf '%q ' "${COMMAND[@]}"
     printf '\n'
     exit 0

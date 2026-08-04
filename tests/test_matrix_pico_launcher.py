@@ -19,13 +19,13 @@ class MatrixPicoLauncherTest(unittest.TestCase):
             check=False,
         )
 
-    def test_dry_run_defaults_to_town10_and_locked_pico(self) -> None:
+    def test_dry_run_defaults_to_town10_and_locked_game_control(self) -> None:
         completed = self.run_launcher("--dry-run", "--profile", "trna")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("PICO_LAUNCH scene=2 control_source=pico", completed.stdout)
+        self.assertIn("MATRIX_DEV_LAUNCH scene=2 control_source=game", completed.stdout)
         self.assertIn("run_matrix_sonic.sh", completed.stdout)
         self.assertIn("--scene 2", completed.stdout)
-        self.assertIn("--control-source pico", completed.stdout)
+        self.assertIn("--control-source game", completed.stdout)
         self.assertIn("--profile trna", completed.stdout)
 
     def test_explicit_scene_is_canonicalized(self) -> None:
@@ -42,7 +42,7 @@ class MatrixPicoLauncherTest(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 completed = self.run_launcher(*arguments)
                 self.assertEqual(completed.returncode, 2)
-                self.assertIn("fixes --control-source pico", completed.stderr)
+                self.assertIn("fixes --control-source game", completed.stderr)
 
     def test_invalid_scene_is_rejected(self) -> None:
         for value in ("-1", "100", "town10", ""):
@@ -56,7 +56,7 @@ class MatrixPicoLauncherTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("installed physics asset", completed.stderr)
 
-    def test_pico_launch_exports_build_provenance(self) -> None:
+    def test_game_and_pico_paths_keep_build_provenance(self) -> None:
         text = (REPO_ROOT / "scripts/run_matrix_sonic.sh").read_text()
         self.assertIn(
             'if [[ "$CONTROL_SOURCE" == "game" || "$CONTROL_SOURCE" == "pico" ]]',
