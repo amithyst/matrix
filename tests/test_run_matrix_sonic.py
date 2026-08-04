@@ -95,6 +95,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                     "d": False,
                     "q": False,
                     "e": False,
+                    "x": False,
                     "v": False,
                     "j": False,
                     "k": False,
@@ -522,6 +523,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                         "d": False,
                         "q": False,
                         "e": False,
+                        "x": False,
                         "v": False,
                         "j": False,
                         "k": False,
@@ -2384,6 +2386,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
                             "d": False,
                             "q": False,
                             "e": False,
+                            "x": False,
                             "v": False,
                             "j": False,
                             "k": False,
@@ -4094,6 +4097,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_startup_failure_closes_simulator_and_started_children(self) -> None:
         events = []
         simulator = mock.Mock()
+        simulator.sim_env = None
         simulator.get_state_snapshot.return_value = self.snapshot()
         simulator.close.side_effect = lambda: events.append("simulator-close")
 
@@ -4233,6 +4237,7 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             status_file = root / "status.json"
 
             simulator = mock.Mock()
+            simulator.sim_env = None
             simulator.get_state_snapshot.return_value = self.snapshot()
             process_group = mock.Mock()
             process_group.failed_child.return_value = None
