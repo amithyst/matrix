@@ -35,9 +35,11 @@ if LEGACY_MODULE not in sys.modules:
             elbow_pose=elbow_pose_enum,
         )
         return current.RobotModel(
-            sonic_root
-            / "decoupled_wbc/control/robot_model/model_data/g1/g1_29dof_with_hand.urdf",
-            sonic_root / "gear_sonic/data/robot_model/model_data/g1",
+            str(
+                sonic_root
+                / "decoupled_wbc/control/robot_model/model_data/g1/g1_29dof_with_hand.urdf"
+            ),
+            str(sonic_root / "gear_sonic/data/robot_model/model_data/g1"),
             supplemental_info=supplemental_info,
         )
 
