@@ -3693,12 +3693,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
     def test_pico_uses_its_locked_python_and_planner_port(self, popen) -> None:
         popen.return_value = mock.Mock()
         group = MODULE.NativeProcessGroup(Path("/sonic"), {})
-        group.start_pico("/pico/bin/python", port=6000)
+        group.start_pico("/pico/bin/python", port=6000, command_port=5559)
         guarded_command = popen.call_args.args[0]
         command = guarded_command[guarded_command.index("--") + 1 :]
         self.assertEqual(command[0], "/pico/bin/python")
         self.assertEqual(command[1], "-u")
         self.assertEqual(command[command.index("--port") + 1], "6000")
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["PICO_MANAGER_CMD_PORT"], "5559"
+        )
 
     def test_parent_death_guardian_kills_native_process_group(self) -> None:
         guardian = REPO_ROOT / "scripts/exec_with_parent_death_signal.py"
@@ -4103,15 +4106,15 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
 
         process_group = mock.Mock()
         process_group.failed_child.return_value = None
-        process_group.start_pico.side_effect = lambda *_args, **_kwargs: events.append(
-            "pico-start"
-        )
-
-        def fail_deploy(**_kwargs):
+        def start_deploy(**_kwargs):
             events.append("deploy-start")
-            raise RuntimeError("deploy failed")
 
-        process_group.start_deploy.side_effect = fail_deploy
+        def fail_pico(*_args, **_kwargs):
+            events.append("pico-start")
+            raise RuntimeError("pico failed")
+
+        process_group.start_deploy.side_effect = start_deploy
+        process_group.start_pico.side_effect = fail_pico
         process_group.close.side_effect = lambda: events.append("processes-close")
 
         fake_numpy = ModuleType("numpy")
@@ -4209,11 +4212,11 @@ class MatrixSonicRuntimeTest(unittest.TestCase):
             mock.patch.object(MODULE.signal, "getsignal", return_value="previous"),
             mock.patch.object(MODULE.signal, "signal", side_effect=record_signal),
         ):
-            with self.assertRaisesRegex(RuntimeError, "deploy failed"):
+            with self.assertRaisesRegex(RuntimeError, "pico failed"):
                 MODULE.main()
 
         self.assertEqual([event[0] for event in events[:2]], ["signal", "signal"])
-        self.assertLess(events.index("pico-start"), events.index("deploy-start"))
+        self.assertLess(events.index("deploy-start"), events.index("pico-start"))
         self.assertIn("processes-close", events)
         self.assertIn("simulator-close", events)
 
