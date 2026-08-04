@@ -4775,8 +4775,14 @@ def main() -> int:
         raise SystemExit("--ue-pid must identify a live UE process")
     if args.pico_gamepad_bridge and args.control_source != "game":
         raise SystemExit("PICO gamepad bridge requires --control-source game")
-    if args.pico_autostart_mode != "off" and args.control_source != "pico":
-        raise SystemExit("PICO autostart requires --control-source pico")
+    if (
+        args.pico_autostart_mode != "off"
+        and args.control_source != "pico"
+        and not args.pico_gamepad_bridge
+    ):
+        raise SystemExit(
+            "PICO autostart requires --control-source pico or the shared PICO bridge"
+        )
     if not 1 <= args.pico_manager_command_port <= 65535:
         raise SystemExit("--pico-manager-command-port must be in [1, 65535]")
     if (
