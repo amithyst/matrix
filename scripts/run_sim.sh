@@ -1820,6 +1820,25 @@ if $MATRIX_SONIC_ENABLED; then
             exit 1
             ;;
     esac
+    PICO_GAMEPAD_BRIDGE_VALUE="${MATRIX_PICO_GAMEPAD_BRIDGE:-0}"
+    case "${PICO_GAMEPAD_BRIDGE_VALUE,,}" in
+        1|true|yes|on)
+            GAME_INPUT_ARGS+=(
+                --pico-gamepad-bridge
+                --pico-gamepad-python "${MATRIX_PICO_PYTHON:-$MATRIX_SONIC_PYTHON}"
+            )
+            if [[ -n "${MATRIX_PICO_GAMEPAD_STATUS_FILE:-}" ]]; then
+                GAME_INPUT_ARGS+=(
+                    --pico-gamepad-status-file "$MATRIX_PICO_GAMEPAD_STATUS_FILE"
+                )
+            fi
+            ;;
+        0|false|no|off|"") ;;
+        *)
+            echo "[ERROR] MATRIX_PICO_GAMEPAD_BRIDGE must be a boolean" >&2
+            exit 1
+            ;;
+    esac
     "$MATRIX_SONIC_PYTHON" "$PROJECT_ROOT/scripts/run_matrix_sonic.py" \
         --model "$SONIC_PHYSICS_DIR/$SCENE" \
         --sonic-root "$MATRIX_SONIC_ROOT" \

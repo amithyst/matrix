@@ -331,6 +331,13 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Interpreter for SONIC's PICO manager (defaults to the simulator Python)",
     )
+    parser.add_argument(
+        "--pico-gamepad-bridge",
+        action="store_true",
+        help="Forward PICO sticks into the shared Matrix game-input state machine",
+    )
+    parser.add_argument("--pico-gamepad-python", default=None)
+    parser.add_argument("--pico-gamepad-status-file", type=Path)
     parser.add_argument("--dds-interface", default="lo")
     parser.add_argument("--render-host", default="127.0.0.1")
     parser.add_argument("--render-port", type=int, default=9999)
@@ -4232,6 +4239,34 @@ class NativeProcessGroup:
             child_env=pico_env,
         )
 
+    def start_pico_gamepad(
+        self,
+        python: str,
+        *,
+        engine_socket: Path,
+        capability_file: Path,
+        status_file: Path | None,
+    ) -> None:
+        pico_env = self.env.copy()
+        pico_env.pop("PYTHONPATH", None)
+        command = [
+            python,
+            "-u",
+            str(_SCRIPT_DIR / "matrix_pico_gamepad_bridge.py"),
+            "--engine-socket",
+            str(engine_socket),
+            "--capability-file",
+            str(capability_file),
+        ]
+        if status_file is not None:
+            command.extend(("--status-file", str(status_file)))
+        self._start(
+            "pico-gamepad-bridge",
+            command,
+            _SCRIPT_DIR.parent,
+            child_env=pico_env,
+        )
+
     def start_game_input(
         self,
         python: str,
@@ -4538,6 +4573,9 @@ def main() -> int:
         ("game_motion_settings_load_status", "disabled"),
         ("moon_dynamic_map", None),
         ("moon_dynamic_map_sha256", None),
+        ("pico_gamepad_bridge", False),
+        ("pico_gamepad_python", None),
+        ("pico_gamepad_status_file", None),
     ):
         if not hasattr(args, name):
             setattr(args, name, default)
@@ -4565,6 +4603,13 @@ def main() -> int:
         raise SystemExit("--max-resets must be non-negative")
     if args.ue_pid is not None and args.ue_pid <= 1:
         raise SystemExit("--ue-pid must identify a live UE process")
+    if args.pico_gamepad_bridge and args.control_source != "game":
+        raise SystemExit("PICO gamepad bridge requires --control-source game")
+    if (
+        args.pico_gamepad_status_file is not None
+        and not args.pico_gamepad_status_file.is_absolute()
+    ):
+        raise SystemExit("--pico-gamepad-status-file must be absolute")
     game_config = None
     motion_settings_store: MotionSettingsStore | None = None
     if args.control_source == "game":
@@ -5249,6 +5294,23 @@ def main() -> int:
                         game_command_child_socket.close()
                         game_command_child_socket = None
                     game_input.bind_expected_peer_pid(provider_pid)
+                if args.pico_gamepad_bridge:
+                    engine_socket = os.environ.get("MATRIX_ENGINE_INPUT_SOCKET")
+                    capability_file = os.environ.get(
+                        "MATRIX_ENGINE_INPUT_CAPABILITY_FILE"
+                    )
+                    if not engine_socket or not capability_file:
+                        raise SystemExit(
+                            "PICO gamepad bridge requires Matrix engine-input socket"
+                        )
+                    processes.start_pico_gamepad(
+                        args.pico_gamepad_python
+                        or args.pico_python
+                        or sys.executable,
+                        engine_socket=Path(engine_socket),
+                        capability_file=Path(capability_file),
+                        status_file=args.pico_gamepad_status_file,
+                    )
         elif running and args.control_source == "pico":
             processes.start_pico(
                 args.pico_python or sys.executable, port=planner_port
